@@ -12,7 +12,10 @@ cd "$(dirname "$0")/.."
 branch="${DITTO_DEPLOY_BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
 echo "==> fetching + resetting to origin/$branch"
 git fetch --prune origin
-git checkout "$branch"
+# -fB force-(re)points the local branch at origin and checks it out, discarding
+# any host-side tracked-file drift so the deploy can't wedge. .env/.venv/logs are
+# gitignored, so they survive (NEVER `git clean -x` here).
+git checkout -fB "$branch" "origin/$branch"
 git reset --hard "origin/$branch"
 
 echo "==> syncing dependencies"

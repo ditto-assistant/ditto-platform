@@ -75,25 +75,30 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Deploy (IAP SSH -> scripts/update.sh)
-        # DITTO_UPLOAD_PAYMENT_ADDRESS is the env-scoped GitHub secret; update.sh
-        # upserts it into the VM's .env before (re)starting. It is a public
-        # on-chain receive address, not a private key, so passing it on the
-        # command line is fine.
+        # `sudo -iu deploy bash -lc` runs a LOGIN shell as deploy so uv/pm2/docker
+        # are on PATH (a bare `sudo -u deploy` uses a minimal secure_path and
+        # would fail on `uv`/`pm2`). DITTO_UPLOAD_PAYMENT_ADDRESS is the env-scoped
+        # GitHub secret (a public on-chain receive address); update.sh upserts it
+        # into the VM's .env before (re)starting.
         run: |
           gcloud compute ssh "${{ steps.target.outputs.vm }}" \
             --zone "$GCP_ZONE" \
             --tunnel-through-iap \
             --quiet \
-            --command "cd /opt/ditto-platform && sudo -u deploy env DITTO_DEPLOY_BRANCH=${{ steps.target.outputs.branch }} DITTO_UPLOAD_PAYMENT_ADDRESS='${{ secrets.DITTO_UPLOAD_PAYMENT_ADDRESS }}' ./scripts/update.sh"
+            --command "sudo -iu deploy bash -lc 'cd /opt/ditto-platform && DITTO_DEPLOY_BRANCH=${{ steps.target.outputs.branch }} DITTO_UPLOAD_PAYMENT_ADDRESS=${{ secrets.DITTO_UPLOAD_PAYMENT_ADDRESS }} ./scripts/update.sh'"
 
       - name: Health check
+        # Hits the public Caddy endpoint, so it depends on public DNS + the VM's
+        # cert being issued. Window is generous (≈3 min) for a first/cold deploy
+        # (uv build + app import + Caddy ACME). A red here after a green deploy
+        # step usually means DNS/cert, not the app.
         run: |
           host="${{ steps.target.outputs.host }}"
-          for i in $(seq 1 10); do
+          for i in $(seq 1 20); do
             if curl -fsS "https://$host/health" >/dev/null; then
               echo "healthy: https://$host/health"; exit 0
             fi
-            echo "waiting for health ($i/10)…"; sleep 6
+            echo "waiting for health ($i/20)…"; sleep 9
           done
           echo "health check failed for https://$host/health" >&2
           exit 1
