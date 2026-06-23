@@ -3,9 +3,14 @@
 # Start the Ditto Platform API on a host:
 #   1. load .env
 #   2. sync dependencies
-#   3. bring up Docker infra (postgres + minio + pylon) and wait until healthy
+#   3. bring up the Docker infra it needs and wait until healthy
 #   4. apply database migrations
 #   5. start the API under pm2 (logs -> ./logs, autorestart on)
+#
+# Docker services are env-driven via DITTO_COMPOSE_SERVICES (default: the full
+# local stack "postgres minio pylon"). A deployed host sets it to "pylon" in its
+# .env — there Postgres is the dedicated PG VM and object storage is GCS, so only
+# the Pylon sidecar runs locally.
 #
 # Idempotent: safe to re-run. Use scripts/update.sh for zero-downtime deploys.
 
@@ -26,9 +31,15 @@ set -a; . ./.env; set +a
 echo "==> syncing dependencies"
 uv sync
 
-echo "==> bringing up infra (postgres + minio + pylon)"
-docker compose up -d --wait postgres minio pylon
-docker compose up -d minio-create-bucket
+# Which compose services to run. Named explicitly so profiled (local-only)
+# services still start when requested; a deployed host narrows this to "pylon".
+compose_services="${DITTO_COMPOSE_SERVICES:-postgres minio pylon}"
+echo "==> bringing up infra ($compose_services)"
+# shellcheck disable=SC2086
+docker compose up -d --wait $compose_services
+if printf '%s' " $compose_services " | grep -q ' minio '; then
+  docker compose up -d minio-create-bucket
+fi
 
 echo "==> applying migrations"
 uv run alembic upgrade head

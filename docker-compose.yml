@@ -1,6 +1,12 @@
 services:
+  # Postgres + MinIO are LOCAL-DEV ONLY (the `local` profile). On a deployed
+  # host (GCE app VM) Postgres is the dedicated ditto-pg-platform VM and object
+  # storage is GCS, so neither runs here — only Pylon (profile-less) comes up.
+  # `make stack-up` names these services explicitly, which starts them despite
+  # the profile; a plain `docker compose up -d pylon` brings up Pylon alone.
   postgres:
     image: postgres:16-alpine
+    profiles: ["local"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-ditto}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ditto}
@@ -19,6 +25,9 @@ services:
 
   pylon:
     image: backenddevelopersltd/bittensor-pylon:latest
+    # No profile: Pylon is the one sidecar that runs everywhere (local + deployed).
+    # restart so it comes back after a VM reboot without re-running start.sh.
+    restart: unless-stopped
     environment:
       PYLON_OPEN_ACCESS_TOKEN: ${PYLON_OPEN_ACCESS_TOKEN:-dev-open-access}
       PYLON_RECENT_OBJECTS_NETUIDS: "[118]"
@@ -40,6 +49,7 @@ services:
 
   minio:
     image: minio/minio:latest
+    profiles: ["local"]
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
@@ -69,6 +79,7 @@ services:
   # mc mb is idempotent so re-runs are harmless.
   minio-create-bucket:
     image: minio/mc:latest
+    profiles: ["local"]
     depends_on:
       minio:
         condition: service_healthy
