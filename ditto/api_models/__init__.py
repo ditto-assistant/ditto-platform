@@ -25,13 +25,29 @@ from ditto.api_models.upload import (
     UploadCheckRequest,
     UploadCheckResponse,
 )
+from ditto.api_models.validator import (
+    ArtifactResponse,
+    CaseScore,
+    ScoreReport,
+    SubmitScoreRequest,
+    SubmitScoreResponse,
+    ValidatorQueueItem,
+    ValidatorQueueResponse,
+)
 
 __all__ = [
     "AgentResponse",
     "AgentStatusResponse",
+    "ArtifactResponse",
+    "CaseScore",
     "EvalPricingResponse",
     "HealthResponse",
+    "ScoreReport",
+    "SubmitScoreRequest",
+    "SubmitScoreResponse",
     "UploadAgentResponse",
     "UploadCheckRequest",
     "UploadCheckResponse",
+    "ValidatorQueueItem",
+    "ValidatorQueueResponse",
 ]

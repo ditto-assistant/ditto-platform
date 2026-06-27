@@ -22,6 +22,7 @@ from ditto.api_server.endpoints import (
     metrics_router,
     retrieval_router,
     upload_router,
+    validator_router,
 )
 from ditto.api_server.errors import ApiServerLifespanError
 from ditto.api_server.middleware import (
@@ -116,5 +117,6 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(metrics_router)
     app.include_router(upload_router, prefix="/api/v1")
     app.include_router(retrieval_router, prefix="/api/v1")
+    app.include_router(validator_router, prefix="/api/v1")
 
     return app
