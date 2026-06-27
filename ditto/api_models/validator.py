@@ -231,10 +231,12 @@ class SubmitScoreRequest(BaseModel):
 class SubmitScoreResponse(BaseModel):
     """Returned by ``POST /validator/agent/{agent_id}/score``.
 
-    ``status`` is the agent's lifecycle state *after* recording the score
-    (``scored``). ``accepted`` is ``True`` when the report was persisted;
-    it leaves room for a future soft-reject (e.g. duplicate report for the
-    same run) without changing the status code.
+    ``status`` is the agent's lifecycle state *after* recording the score:
+    ``scored`` once the first score finalizes an ``evaluating`` agent, and
+    unchanged (``live``) when a validator re-scores a promoted agent.
+    ``accepted`` is ``True`` when the report was persisted; it leaves room
+    for a future soft-reject (e.g. a stale report) without changing the
+    status code.
     """
 
     agent_id: Annotated[UUID, Field(description="Echoes the path-param id.")]

@@ -7,11 +7,13 @@ two surfaces share their dispatch on the ORM model.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
+from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
 from ditto.db.models import Agent
 
@@ -86,3 +88,26 @@ async def get_agent_by_id(
 ) -> Agent | None:
     """Return the ``agents`` row for the given id, or ``None``."""
     return await session.get(Agent, agent_id)
+
+
+async def list_agents_by_status(
+    session: AsyncSession,
+    *,
+    statuses: Sequence[AgentStatus],
+    limit: int,
+) -> list[Agent]:
+    """Return agents whose status is in ``statuses``, oldest first.
+
+    Backs the validator work queue. The default caller passes
+    ``[AgentStatus.EVALUATING]``, which is served by the partial index
+    ``agents_status_evaluating_idx`` (``WHERE status = 'evaluating'``).
+    Ordering by ``created_at`` ascending drains the queue in arrival order.
+    """
+    stmt = (
+        select(Agent)
+        .where(Agent.status.in_(statuses))
+        .order_by(Agent.created_at.asc())
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
