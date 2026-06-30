@@ -115,6 +115,42 @@ class S3StorageClient:
         )
         return StoredObject(key=key, size_bytes=len(body), sha256=sha256)
 
+    async def presigned_get_url(self, *, key: str, expires_in: int = 300) -> str:
+        """Return a pre-signed GET URL the validator daemon can stream from.
+
+        The URL embeds a time-limited signature, so the bucket can stay
+        private while the daemon pulls the tarball directly from object
+        storage (no proxying bytes through the API). ``expires_in`` bounds
+        the validity window in seconds.
+
+        Generating a pre-signed URL is a local signing operation — no
+        network round trip and no existence check — so a URL for a missing
+        key is still returned; the daemon's GET then 404s. Callers that need
+        existence semantics check the ``agents`` row first.
+
+        Raises:
+            ObjectUploadFailedError: When the underlying client cannot be
+                constructed or the signing call fails.
+        """
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            async with self._session.client(
+                "s3",
+                endpoint_url=self._config.endpoint_url,
+                use_ssl=self._config.use_tls,
+            ) as s3:
+                return await s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": self._config.bucket, "Key": key},
+                    ExpiresIn=expires_in,
+                )
+        except (ClientError, BotoCoreError) as e:
+            raise ObjectUploadFailedError(
+                f"presigned_get_url failed: bucket={self._config.bucket!r} "
+                f"key={key!r} cause={e}"
+            ) from e
+
     async def object_exists(self, *, key: str) -> bool:
         """Return ``True`` iff a HEAD against ``key`` succeeds.
 

@@ -15,6 +15,10 @@ from ditto.api_server.endpoints.retrieval import (
     AgentNotFoundError,
     HotkeyAgentNotFoundError,
 )
+from ditto.api_server.endpoints.validator import (
+    AgentNotEvaluatableError,
+    ValidatorAuthError,
+)
 from ditto.api_server.middleware.request_id import (
     REQUEST_ID_HEADER,
     request_id_var,
@@ -60,6 +64,11 @@ ERROR_CODE_PAYMENT_DESTINATION_MISMATCH = 3204
 ERROR_CODE_PAYMENT_SIGNER_MISMATCH = 3205
 ERROR_CODE_PAYMENT_CALL_TYPE_MISMATCH = 3206
 ERROR_CODE_PAYMENT_REPLAYED = 3207
+
+# Validator-side error codes (4xxx range). Surfaced to the validator daemon
+# driving the evaluate -> score loop; distinct from the agent-side 1xxx codes.
+ERROR_CODE_VALIDATOR_AUTH = 4000
+ERROR_CODE_AGENT_NOT_EVALUATABLE = 4001
 
 
 def _envelope(error_code: int, message: str) -> dict[str, Any]:
@@ -240,6 +249,24 @@ def register_exception_handlers(app: FastAPI) -> None:
         logger.info(f"no agent for hotkey: {exc}")
         return _envelope_response(
             404, ERROR_CODE_HOTKEY_AGENT_NOT_FOUND, "no agent for hotkey"
+        )
+
+    @app.exception_handler(ValidatorAuthError)
+    async def _validator_auth_handler(
+        _request: Request, exc: ValidatorAuthError
+    ) -> JSONResponse:
+        logger.info(f"validator auth rejected: {exc}")
+        return _envelope_response(
+            401, ERROR_CODE_VALIDATOR_AUTH, "validator authentication failed"
+        )
+
+    @app.exception_handler(AgentNotEvaluatableError)
+    async def _agent_not_evaluatable_handler(
+        _request: Request, exc: AgentNotEvaluatableError
+    ) -> JSONResponse:
+        logger.info(f"agent not in evaluatable state: {exc}")
+        return _envelope_response(
+            409, ERROR_CODE_AGENT_NOT_EVALUATABLE, "agent is not evaluatable"
         )
 
     @app.exception_handler(Exception)

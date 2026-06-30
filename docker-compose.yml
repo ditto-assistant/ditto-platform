@@ -25,12 +25,17 @@ services:
 
   pylon:
     image: backenddevelopersltd/bittensor-pylon:latest
+    # amd64-only image; run under emulation on Apple Silicon (colima qemu).
+    platform: linux/amd64
     # No profile: Pylon is the one sidecar that runs everywhere (local + deployed).
     # restart so it comes back after a VM reboot without re-running start.sh.
     restart: unless-stopped
     environment:
       PYLON_OPEN_ACCESS_TOKEN: ${PYLON_OPEN_ACCESS_TOKEN:-dev-open-access}
-      PYLON_RECENT_OBJECTS_NETUIDS: "[118]"
+      PYLON_RECENT_OBJECTS_NETUIDS: ${PYLON_RECENT_OBJECTS_NETUIDS:-[3]}
+      # Point Pylon at the dev local chain (env-overridable), not finney.
+      PYLON_BITTENSOR_NETWORK: ${PYLON_BITTENSOR_NETWORK:-ws://68.183.141.180:80}
+      PYLON_BITTENSOR_ARCHIVE_NETWORK: ${PYLON_BITTENSOR_ARCHIVE_NETWORK:-ws://68.183.141.180:80}
     # Host port 8001 is reserved for Pylon; 8000 is the API server's slot.
     # The container still listens on 8000 internally.
     ports:

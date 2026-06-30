@@ -119,7 +119,7 @@ class PaymentVerifier:
             )
 
         # 4. Destination address.
-        dest = _decode_dest(ext.call_args.get("dest"))
+        dest = _to_ss58(ext.call_args.get("dest"))
         if dest != self._send_address:
             raise PaymentDestinationMismatch(
                 f"destination {dest!r} does not match configured "
@@ -146,7 +146,7 @@ class PaymentVerifier:
         on_chain_coldkey = await self._chain.get_coldkey_for_hotkey(
             expected_hotkey, proof.block_hash
         )
-        if ext.signer_address != on_chain_coldkey:
+        if _to_ss58(ext.signer_address) != _to_ss58(on_chain_coldkey):
             raise PaymentSignerMismatch(
                 f"extrinsic signer {ext.signer_address!r} does not match "
                 f"on-chain coldkey {on_chain_coldkey!r} for hotkey "
@@ -188,20 +188,25 @@ class PaymentVerifier:
         return fee_tao * _RAO_PER_TAO
 
 
-def _decode_dest(raw: Any) -> str:
-    """Normalise the Pylon ``dest`` arg to a plain SS58 string.
+def _to_ss58(raw: Any) -> str:
+    """Normalise a Pylon address arg (dest or signer) to a plain SS58 string.
 
-    Pylon's flattened ``call_args`` carries the destination as either a
-    plain SS58 string (``"5..."``) or a ``{"Id": "5..."}`` dict; both
-    are the substrate-interface decode shapes for ``MultiAddress::Id``.
-    The verifier compares against a string ``send_address``, so unify
-    here. Any other shape returns an empty string and fails the
-    equality check with a clean :class:`PaymentDestinationMismatch`.
+    Pylon's flattened ``call_args`` carries the destination as an SS58
+    string (``"5..."``), a ``0x``-prefixed 32-byte public-key hex, or a
+    ``{"Id": ...}`` wrapper around either -- the substrate-interface
+    decode shapes for ``MultiAddress::Id``; which one appears depends on
+    the chain's metadata. Unify to SS58 so the equality check is
+    encoding-agnostic. Any other shape returns an empty string and fails
+    the check with a clean :class:`PaymentDestinationMismatch`.
     """
-    if isinstance(raw, str):
-        return raw
     if isinstance(raw, dict):
-        inner = raw.get("Id")
-        if isinstance(inner, str):
-            return inner
-    return ""
+        raw = raw.get("Id")
+    if not isinstance(raw, str):
+        return ""
+    raw = raw.strip()
+    if raw.startswith("0x") and len(raw) == 66:
+        # 32-byte public-key hex -> SS58 (bittensor ss58 format = 42).
+        from scalecodec.utils.ss58 import ss58_encode
+
+        return ss58_encode(bytes.fromhex(raw[2:]), 42)
+    return raw

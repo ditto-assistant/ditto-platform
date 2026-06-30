@@ -11,12 +11,11 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import (
-    UUID as SaUUID,
-)
-from sqlalchemy import (
+    JSON,
     BigInteger,
     CheckConstraint,
     Enum,
+    Float,
     ForeignKeyConstraint,
     Index,
     Integer,
@@ -27,10 +26,19 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy import (
+    UUID as SaUUID,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TIMESTAMP
 
 from ditto.api_models.agent_status import AgentStatus
+
+# Per-case detail is a JSON blob: JSONB on Postgres (indexable, compact),
+# plain JSON on the SQLite unit-test fallback. The variant keeps one model
+# working across both dialects.
+_JSON_VARIANT = JSON().with_variant(JSONB(), "postgresql")
 
 # Naming convention so alembic autogenerate produces deterministic constraint
 # names instead of random SHA suffixes.
@@ -166,4 +174,97 @@ class EvaluationPayment(Base):
             name="evaluation_payments_extrinsic_index_check",
         ),
         Index("evaluation_payments_miner_hotkey_idx", "miner_hotkey"),
+    )
+
+
+class Score(Base):
+    """One validator's DittoBench score for one agent.
+
+    The composite primary key ``(agent_id, validator_hotkey)`` keeps a
+    single current score per validator per agent: a validator re-scoring
+    the same agent (new ``run_id``) upserts this row rather than appending
+    history. ``agent_id`` is a single-column FK to ``agents.agent_id`` with
+    ``ON DELETE CASCADE`` because a score is derived data — deleting the
+    agent discards its scores.
+
+    Aggregates (``composite`` / ``tool_mean`` / ``memory_mean`` /
+    ``median_ms`` / ``n``) are first-class columns so weight computation and
+    leaderboards query them directly; ``details`` carries the optional
+    per-case breakdown verbatim for audit/dispute. The platform records what
+    the validator reports and never recomputes ``composite``.
+    """
+
+    __tablename__ = "scores"
+
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """FK to ``agents.agent_id``. PK part 1."""
+
+    validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    """SS58 hotkey of the reporting validator. PK part 2."""
+
+    run_id: Mapped[str] = mapped_column(Text, nullable=False)
+    """Scoring-engine run identifier (the value the signature is bound to)."""
+
+    seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    """Dataset seed used for the run (anti-overfit reproducibility)."""
+
+    composite: Mapped[float] = mapped_column(Float, nullable=False)
+    """Aggregate score in [0, 1] as reported (not recomputed)."""
+
+    tool_mean: Mapped[float] = mapped_column(Float, nullable=False)
+    """Mean tool accuracy in [0, 1]."""
+
+    memory_mean: Mapped[float] = mapped_column(Float, nullable=False)
+    """Mean memory recall in [0, 1]."""
+
+    median_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Median per-case latency in milliseconds."""
+
+    n: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Number of cases scored."""
+
+    details: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    """Optional per-case breakdown ``{"per_case": [...]}`` for audit."""
+
+    generated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    """When the scoring engine produced the report (UTC)."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """When this row was first inserted (UTC)."""
+
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    """When this row was last upserted (UTC)."""
+
+    __table_args__ = (
+        PrimaryKeyConstraint("agent_id", "validator_hotkey", name="scores_pkey"),
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="CASCADE",
+            name="scores_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "composite >= 0 AND composite <= 1", name="scores_composite_range_check"
+        ),
+        CheckConstraint(
+            "tool_mean >= 0 AND tool_mean <= 1", name="scores_tool_mean_range_check"
+        ),
+        CheckConstraint(
+            "memory_mean >= 0 AND memory_mean <= 1",
+            name="scores_memory_mean_range_check",
+        ),
+        CheckConstraint("n >= 0", name="scores_n_check"),
+        CheckConstraint("median_ms >= 0", name="scores_median_ms_check"),
+        Index("scores_agent_id_idx", "agent_id"),
     )

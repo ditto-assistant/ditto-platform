@@ -1,0 +1,47 @@
+flowchart LR
+    subgraph Miner["Miner (off-chain)"]
+        MCLI["miner CLI<br/>sign + package .tgz"]
+        MH["agent harness<br/>(starter-kit, Rust)<br/>serves POST /run"]
+    end
+
+    subgraph Chain["Bittensor SN118 — via Pylon"]
+        REG["register hotkey + stake"]
+        PAY["upload-fee payment<br/>transfer_keep_alive"]
+        WEIGHTS["set_weights → emissions"]
+    end
+
+    subgraph Platform["ditto-platform (API VM)"]
+        UP["POST /upload/agent<br/>verify payment + sha256"]
+        S3[("GCS<br/>agent tarballs")]
+        PG[("Postgres<br/>agents · scores")]
+        VAPI["/validator/* API<br/>queue · artifact · score"]
+    end
+
+    subgraph Worker["validator worker — co-located, separate process"]
+        LOOP["epoch sweep loop"]
+        WSIGN["hotkey 5CZq…<br/>sign score + put_weights"]
+    end
+
+    subgraph Bench["dittobench-api (Cloud Run, Go)"]
+        FETCH["fetch tarball_url — mode B<br/>build in Docker sandbox"]
+        RUN["run fresh anti-cheat dataset<br/>against harness /run"]
+        JUDGE["LLM judge — OpenRouter BYOK<br/>→ ScoreReport"]
+    end
+
+    MCLI -->|"1 · pay fee"| PAY
+    MCLI -->|"2 · upload .tgz + proof"| UP
+    UP --> S3
+    UP --> PG
+    REG -.->|permit + stake| WEIGHTS
+
+    LOOP -->|"3 · GET /queue (X-Validator-Hotkey)"| VAPI
+    LOOP -->|"4 · GET /artifact → presigned URL"| VAPI
+    VAPI --> S3
+    LOOP -->|"5 · POST /v1/submit {tarball_url, run_size=full, key}"| FETCH
+    FETCH -->|fetch tarball| S3
+    FETCH --> RUN --> JUDGE
+    JUDGE -->|"6 · ScoreReport (poll /v1/runs/{id})"| LOOP
+    LOOP -->|"7 · POST /score (signed sr25519)"| VAPI
+    VAPI --> PG
+    LOOP --> WSIGN -->|"8 · put_weights"| WEIGHTS
+    WEIGHTS -.->|emissions| MCLI
