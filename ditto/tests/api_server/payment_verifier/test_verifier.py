@@ -26,6 +26,7 @@ from ditto.api_server.payment_verifier import (
     PaymentVerifier,
     VerifiedPayment,
 )
+from ditto.api_server.payment_verifier.verifier import _to_ss58
 from ditto.api_server.pricing import PricingConfig
 from ditto.chain.errors import ChainConnectionError, ExtrinsicNotFoundError
 
@@ -33,6 +34,31 @@ from ditto.chain.errors import ChainConnectionError, ExtrinsicNotFoundError
 #   fee_tao = 5 * 1.4 / 400 = 0.0175 TAO
 #   quote_rao = 17_500_000
 QUOTE_RAO = 17_500_000
+
+# Alice's well-known account: ss58 <-> 32-byte public key. Some chains' Pylon
+# decodes extrinsic addresses as hex pubkeys, so the verifier must normalize.
+_ALICE_SS58 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+_ALICE_PUBKEY = "0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d"
+
+
+class TestToSs58:
+    """Address normalization: ss58 passthrough + hex-pubkey -> ss58."""
+
+    def test_ss58_passthrough(self):
+        assert _to_ss58(_ALICE_SS58) == _ALICE_SS58
+
+    def test_hex_pubkey_to_ss58(self):
+        assert _to_ss58(_ALICE_PUBKEY) == _ALICE_SS58
+
+    def test_dict_id_hex_pubkey_to_ss58(self):
+        assert _to_ss58({"Id": _ALICE_PUBKEY}) == _ALICE_SS58
+
+    def test_dict_id_ss58_passthrough(self):
+        assert _to_ss58({"Id": _ALICE_SS58}) == _ALICE_SS58
+
+    def test_unparseable_returns_empty(self):
+        assert _to_ss58(None) == ""
+        assert _to_ss58(12345) == ""
 
 
 def _make_pricing_config(**overrides: Any) -> PricingConfig:
