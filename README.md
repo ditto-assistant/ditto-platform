@@ -51,18 +51,21 @@ clients are validated against that schema.
 | `GET /api/v1/retrieval/agent-by-hotkey` | Look up a miner's latest agent |
 | `GET /api/v1/retrieval/agent/{id}/status` | Poll a submission's lifecycle status |
 
-> `/health` and `/metrics` are unprefixed; the upload + retrieval routes are
-> versioned under `/api/v1`. The planned validator/scoring routes below will be
-> versioned the same way.
+> `/health` and `/metrics` are unprefixed; all other routes are versioned under `/api/v1`.
 
-### Planned (validator-facing + scoring)
+### Built (validator-facing)
 
-`/validator/register` · `/validator/request-evaluation` (lease) ·
-`/validator/agent/{id}/download` · `/validator/heartbeat` ·
-`/validator/submit-score` · `/scoring/scores` · `/admin/*`
+| Method & path | Purpose |
+| --- | --- |
+| `GET /api/v1/validator/queue` | Agents awaiting evaluation |
+| `GET /api/v1/validator/agent/{id}/artifact` | Presigned download URL for an agent tarball |
+| `POST /api/v1/validator/agent/{id}/score` | Submit a signed DittoBench score (→ `scores` table) |
 
-See [`PROJECT.md`](https://github.com/ditto-assistant/ditto-subnet/blob/main/PROJECT.md)
-in `ditto-subnet` for the build order and the evaluation/scoring design.
+### Planned (scoring + ops)
+
+Weight/score aggregation (`/scoring/*`), screening transitions, and `/admin/*`. See
+[`PROJECT.md`](https://github.com/ditto-assistant/ditto-subnet/blob/main/PROJECT.md) in `ditto-subnet`
+for the evaluation/scoring design.
 
 ---
 
@@ -165,7 +168,7 @@ pm2 status                   # process state
 ```
 ditto/
   api_server/          FastAPI app
-    endpoints/         health · metrics · upload · retrieval
+    endpoints/         health · metrics · upload · retrieval · validator
     middleware/        request-id · auth pass-through · error envelope
     payment_verifier/  on-chain payment proof verification
     pricing/           CoinGecko oracle + upload-fee config
