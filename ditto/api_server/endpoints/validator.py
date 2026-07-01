@@ -10,9 +10,9 @@ the chain identity.
 Lifecycle + scope decisions (documented so they're easy to revisit):
 
 - **Queue = agents in ``evaluating``.** Honors the partial index
-  ``agents_status_evaluating_idx``. The screener (deferred) promotes
-  ``screening_passed -> evaluating``; until it lands, agents must be advanced
-  into ``evaluating`` for them to appear here.
+  ``agents_status_evaluating_idx``. The screener promotes ``uploaded ->
+  evaluating`` (see ``endpoints/screener.py``); a submission that hasn't been
+  screened yet won't appear here.
 - **Scoring is single-validator-MVP.** A score POST records one row per
   ``(agent, validator)`` and transitions ``evaluating -> scored``. A
   multi-validator subnet wants every validator to score before finalizing;

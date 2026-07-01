@@ -15,6 +15,10 @@ from ditto.api_server.endpoints.retrieval import (
     AgentNotFoundError,
     HotkeyAgentNotFoundError,
 )
+from ditto.api_server.endpoints.screener import (
+    AgentNotScreenableError,
+    ScreenerAuthError,
+)
 from ditto.api_server.endpoints.validator import (
     AgentNotEvaluatableError,
     ValidatorAuthError,
@@ -69,6 +73,11 @@ ERROR_CODE_PAYMENT_REPLAYED = 3207
 # driving the evaluate -> score loop; distinct from the agent-side 1xxx codes.
 ERROR_CODE_VALIDATOR_AUTH = 4000
 ERROR_CODE_AGENT_NOT_EVALUATABLE = 4001
+
+# Screener-side error codes (5xxx range). Surfaced to the screener worker
+# driving the uploaded -> evaluating promotion gate.
+ERROR_CODE_SCREENER_AUTH = 5000
+ERROR_CODE_AGENT_NOT_SCREENABLE = 5001
 
 
 def _envelope(error_code: int, message: str) -> dict[str, Any]:
@@ -267,6 +276,24 @@ def register_exception_handlers(app: FastAPI) -> None:
         logger.info(f"agent not in evaluatable state: {exc}")
         return _envelope_response(
             409, ERROR_CODE_AGENT_NOT_EVALUATABLE, "agent is not evaluatable"
+        )
+
+    @app.exception_handler(ScreenerAuthError)
+    async def _screener_auth_handler(
+        _request: Request, exc: ScreenerAuthError
+    ) -> JSONResponse:
+        logger.info(f"screener auth rejected: {exc}")
+        return _envelope_response(
+            401, ERROR_CODE_SCREENER_AUTH, "screener authentication failed"
+        )
+
+    @app.exception_handler(AgentNotScreenableError)
+    async def _agent_not_screenable_handler(
+        _request: Request, exc: AgentNotScreenableError
+    ) -> JSONResponse:
+        logger.info(f"agent not in screenable state: {exc}")
+        return _envelope_response(
+            409, ERROR_CODE_AGENT_NOT_SCREENABLE, "agent is not screenable"
         )
 
     @app.exception_handler(Exception)

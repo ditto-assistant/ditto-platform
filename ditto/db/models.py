@@ -108,6 +108,13 @@ class Agent(Base):
             "status",
             postgresql_where=text("status = 'evaluating'"),
         ),
+        # Screener polls for agents in the 'uploaded' state; a partial index
+        # keeps that lookup cheap (mirrors the evaluating index).
+        Index(
+            "agents_status_uploaded_idx",
+            "status",
+            postgresql_where=text("status = 'uploaded'"),
+        ),
     )
 
 
