@@ -115,9 +115,10 @@ async def get_latest_agent_by_hotkey(
     """Return the most recent ``agents`` row for the given hotkey, or ``None``.
 
     Orders by ``created_at DESC`` and takes one. Status is unfiltered;
-    callers see banned or failed rows if they are the most recent. Per
-    the retrieval design, hotkey-level banned surfacing is deferred to
-    the ban PR (Phase 5) where the ``banned_hotkeys`` table lands.
+    callers see banned or failed rows if they are the most recent. The
+    ``/retrieval/agent-by-hotkey`` endpoint additionally consults
+    :func:`ditto.db.queries.bans.is_hotkey_banned` to surface a hotkey-level
+    ban (distinct from a per-agent ``banned`` status).
     """
     stmt = (
         select(Agent)

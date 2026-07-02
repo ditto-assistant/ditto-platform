@@ -8,7 +8,6 @@ proof on chain, stores the tarball in S3, and writes the matching
 
 Deferred validations (added when their dependencies land):
 - tar manifest structure (needs Go-harness interface signatures)
-- banned-hotkey check (needs ``banned_hotkeys`` table)
 - Go-import allowlist scan (needs the allowlist file)
 - schema diff against ``schema/initial_harness.sql`` (needs the file)
 """
@@ -56,6 +55,7 @@ from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.models import AgentStatus
 from ditto.db.queries.agents import insert_agent
+from ditto.db.queries.bans import is_hotkey_banned
 from ditto.db.queries.payments import insert_evaluation_payment
 
 if TYPE_CHECKING:
@@ -71,6 +71,7 @@ router = APIRouter(prefix="/upload", tags=["upload"])
 ERROR_CODE_BAD_SIGNATURE = 1100
 ERROR_CODE_HOTKEY_NOT_REGISTERED = 1101
 ERROR_CODE_TARBALL_TOO_LARGE = 1102
+ERROR_CODE_HOTKEY_BANNED = 1103
 
 # Hard cap shared with /upload/check. Tarballs above this size are
 # rejected; /upload/check enforces it from the miner-reported header,
@@ -112,7 +113,7 @@ async def eval_pricing(request: Request, oracle: OracleDep) -> EvalPricingRespon
 
 @router.post("/check", response_model=UploadCheckResponse)
 async def check(
-    request: Request, body: UploadCheckRequest, chain: ChainDep
+    request: Request, body: UploadCheckRequest, chain: ChainDep, session: SessionDep
 ) -> UploadCheckResponse:
     """Pre-payment dry-run validation.
 
@@ -148,6 +149,12 @@ async def check(
     if body.file_size_bytes > MAX_TARBALL_SIZE_BYTES:
         codes.append(ERROR_CODE_TARBALL_TOO_LARGE)
         messages.append(f"tarball exceeds {MAX_TARBALL_SIZE_BYTES} bytes")
+
+    # 4. Hotkey-level ban. Reported here (dry run) so a banned miner learns it
+    #    before spending TAO; /upload/agent enforces it as a hard 403.
+    if await is_hotkey_banned(session, hotkey=body.hotkey):
+        codes.append(ERROR_CODE_HOTKEY_BANNED)
+        messages.append("hotkey is banned from submitting")
 
     return UploadCheckResponse(ok=not codes, error_codes=codes, messages=messages)
 
@@ -200,6 +207,12 @@ async def upload_agent(
         raise HTTPException(
             status_code=400, detail="signature did not verify against the hotkey"
         )
+
+    # 2b. Hotkey-level ban. Checked right after the (CPU-only) signature proves
+    #     the caller owns the hotkey and before any chain/payment/storage work,
+    #     so a banned miner is rejected as cheaply as possible.
+    if await is_hotkey_banned(session, hotkey=hotkey):
+        raise HTTPException(status_code=403, detail="hotkey is banned from submitting")
 
     # 3. Hotkey must be registered on this subnet. Chain outage surfaces
     # as 503; falling through would silently accept off-subnet hotkeys.

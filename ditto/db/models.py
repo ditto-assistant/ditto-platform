@@ -307,3 +307,30 @@ class Score(Base):
         CheckConstraint("median_ms >= 0", name="scores_median_ms_check"),
         Index("scores_agent_id_idx", "agent_id"),
     )
+
+
+class BannedHotkey(Base):
+    """One row of the ``banned_hotkeys`` table.
+
+    A hotkey-level ban, distinct from the per-agent :attr:`AgentStatus.BANNED`
+    status: it blocks the *miner* (all future uploads) rather than a single
+    submission. Enforced at upload (``/upload/agent`` rejects a banned hotkey
+    before any expensive chain/payment work) and surfaced on the read path
+    (``/retrieval/agent-by-hotkey``). Populated out-of-band by the owner via
+    ``scripts/ban_hotkey.py`` — there is no public write surface.
+    """
+
+    __tablename__ = "banned_hotkeys"
+
+    hotkey: Mapped[str] = mapped_column(Text, primary_key=True)
+    """SS58 hotkey of the banned miner. Primary key (a hotkey is banned once)."""
+
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Free-text audit note (e.g. "confirmed copy of agent <id>"). Nullable."""
+
+    banned_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """When the ban was recorded (UTC)."""

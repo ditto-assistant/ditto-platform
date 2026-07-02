@@ -64,6 +64,50 @@ class TestAgentByHotkey:
         body = response.json()
         assert body["error_code"] == ERROR_CODE_HOTKEY_AGENT_NOT_FOUND
 
+    async def test_banned_hotkey_surfaces_banned_status(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A hotkey-level ban is reported as ``banned`` even if the latest
+        agent's own status is ``scored``."""
+        from datetime import UTC, datetime
+        from types import SimpleNamespace
+
+        from ditto.db.models import AgentStatus
+
+        _override_session_with_dummy(app)
+
+        agent = SimpleNamespace(
+            agent_id=uuid4(),
+            miner_hotkey=_HOTKEY,
+            name="alpha",
+            status=AgentStatus.SCORED,  # the agent itself is fine...
+            sha256="ab" * 32,
+            created_at=datetime.now(UTC),
+        )
+
+        async def _agent(*_a: object, **_k: object) -> object:
+            return agent
+
+        async def _banned(*_a: object, **_k: object) -> bool:
+            return True
+
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.retrieval.get_latest_agent_by_hotkey", _agent
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.retrieval.is_hotkey_banned", _banned
+        )
+
+        response = await client.get(
+            f"/api/v1/retrieval/agent-by-hotkey?miner_hotkey={_HOTKEY}"
+        )
+        assert response.status_code == 200
+        # ...but the miner is banned, so the response says so.
+        assert response.json()["status"] == AgentStatus.BANNED.value
+
     async def test_malformed_hotkey_returns_422(
         self,
         app: FastAPI,

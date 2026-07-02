@@ -49,8 +49,24 @@ from ditto.chain.errors import ChainConnectionError
 from ditto.tests.api_server.conftest import (
     override_get_chain_client,
     override_get_price_oracle,
+    override_get_session,
     override_get_storage_client,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_ban_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default every upload test to "hotkey not banned".
+
+    The ban query is unit-tested for real against SQLite in
+    ``ditto.tests.db.queries.test_bans``; here we stub it so the endpoint
+    tests need no bans row. Ban-specific tests re-stub this to ``True``.
+    """
+    monkeypatch.setattr(
+        "ditto.api_server.endpoints.upload.is_hotkey_banned",
+        AsyncMock(return_value=False),
+    )
+
 
 _GOOD_SHA256 = "1d8a3b6f04e2c7f9a51bd3e5c8f2a7b06d4e9c1f2a3b4c5d6e7f8a9b0c1d2e3f"
 _BAD_SIG = "a" * 128  # 64 bytes of 0xaa; valid hex but won't verify
@@ -128,6 +144,11 @@ class TestEvalPricing:
 
 
 class TestUploadCheck:
+    @pytest.fixture(autouse=True)
+    def _session(self, app: FastAPI) -> None:
+        # /upload/check now reads the ban list, so it needs a session dep.
+        override_get_session(app)
+
     async def test_happy_path(self, app: FastAPI, client: httpx.AsyncClient):
         # is_registered=True by default in the fake chain client.
         override_get_chain_client(app)
@@ -138,6 +159,26 @@ class TestUploadCheck:
         assert result["ok"] is True
         assert result["error_codes"] == []
         assert result["messages"] == []
+
+    async def test_banned_hotkey_returns_1103(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from ditto.api_server.endpoints.upload import ERROR_CODE_HOTKEY_BANNED
+
+        override_get_chain_client(app)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.is_hotkey_banned",
+            AsyncMock(return_value=True),
+        )
+        body = _signed_request_body()
+        response = await client.post("/api/v1/upload/check", json=body)
+        assert response.status_code == 200
+        result = response.json()
+        assert result["ok"] is False
+        assert ERROR_CODE_HOTKEY_BANNED in result["error_codes"]
 
     async def test_bad_signature_returns_1100(
         self, app: FastAPI, client: httpx.AsyncClient
@@ -229,6 +270,7 @@ class TestUploadCheck:
         cfg = replace(base, chain=replace(base.chain, netuid=999))
         custom_app = create_api_server(cfg)
         custom_app.state.commit_hash = "test-commit"
+        override_get_session(custom_app)  # /upload/check reads the ban list
 
         recorded: dict[str, int] = {}
 
@@ -429,6 +471,27 @@ class TestUploadAgentValidationFailures:
 
         assert response.status_code == 400
         assert "signature" in response.json()["message"]
+
+    async def test_banned_hotkey_returns_403(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        # A valid signature (so the ban check is reached) from a banned hotkey
+        # is rejected 403 before any chain/payment/storage work.
+        _wire_full_stack(app)
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.is_hotkey_banned",
+            AsyncMock(return_value=True),
+        )
+        data, files = _upload_agent_form(keypair=kp)
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 403
+        assert "banned" in response.json()["message"]
 
     async def test_hotkey_not_registered_returns_400(
         self, app: FastAPI, client: httpx.AsyncClient
