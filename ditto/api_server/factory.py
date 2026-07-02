@@ -21,6 +21,7 @@ from ditto.api_server.endpoints import (
     health_router,
     metrics_router,
     retrieval_router,
+    scoring_router,
     screener_router,
     upload_router,
     validator_router,
@@ -120,5 +121,6 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(retrieval_router, prefix="/api/v1")
     app.include_router(validator_router, prefix="/api/v1")
     app.include_router(screener_router, prefix="/api/v1")
+    app.include_router(scoring_router, prefix="/api/v1")
 
     return app

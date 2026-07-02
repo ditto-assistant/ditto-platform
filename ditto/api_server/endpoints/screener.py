@@ -231,14 +231,16 @@ async def submit_result(
     """Record the screener's verdict and advance the agent's lifecycle.
 
     Ordering is cheap-before-expensive; no DB write happens until every check
-    passes: (1) signature over ``{screener_hotkey}:{agent_id}``, (2) on-chain
-    permit check, (3) one transaction that promotes ``uploaded -> evaluating``
-    (pass) or ``uploaded -> screening_failed`` (fail).
+    passes: (1) signature over ``{screener_hotkey}:{agent_id}:{passed}``, (2)
+    on-chain permit check, (3) one transaction that promotes ``uploaded ->
+    evaluating`` (pass) or ``uploaded -> screening_failed`` (fail).
     """
     response.headers["Cache-Control"] = "no-store"
 
-    # 1. Signature proves the screener owns the hotkey + bound this verdict.
-    signed = f"{payload.screener_hotkey}:{agent_id}".encode()
+    # 1. Signature proves the screener owns the hotkey and binds THIS verdict:
+    #    ``passed`` is signed, so a captured result can't be replayed with the
+    #    boolean flipped to grief (or unfairly promote) a miner.
+    signed = f"{payload.screener_hotkey}:{agent_id}:{payload.passed}".encode()
     if not _verify_signature(payload.screener_hotkey, signed, payload.signature):
         raise ScreenerAuthError(
             f"verdict signature did not verify for hotkey {payload.screener_hotkey}"
@@ -250,9 +252,10 @@ async def submit_result(
 
     target = AgentStatus.EVALUATING if payload.passed else AgentStatus.SCREENING_FAILED
 
-    # 3. Atomic: apply the verdict.
+    # 3. Atomic: apply the verdict. The row lock serializes concurrent verdicts
+    #    so the status guard + transition can't be lost-updated.
     async with session.begin():
-        agent = await get_agent_by_id(session, agent_id=agent_id)
+        agent = await get_agent_by_id(session, agent_id=agent_id, for_update=True)
         if agent is None:
             raise AgentNotFoundError(f"no agent with id={agent_id}")
         if agent.status in _SCREENABLE_STATUSES:

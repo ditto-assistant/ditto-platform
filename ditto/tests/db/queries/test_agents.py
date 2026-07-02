@@ -21,6 +21,7 @@ from ditto.db.queries.agents import (
     get_agent_by_id,
     get_latest_agent_by_hotkey,
     insert_agent,
+    resolve_review,
 )
 
 
@@ -30,6 +31,7 @@ def _make_kwargs(**overrides: object) -> dict[str, object]:
         "miner_hotkey": "5HKAlphaHotkey",
         "name": "alpha-agent",
         "sha256": "deadbeef" * 8,
+        "size_bytes": 524288,
     }
     base.update(overrides)
     return base
@@ -122,12 +124,13 @@ class TestKeywordOnlyContract:
         """All non-session args must be keyword-only so callers can't
         accidentally swap UUID + hotkey."""
         with pytest.raises(TypeError):
-            await insert_agent(  # type: ignore[misc]
+            await insert_agent(  # type: ignore[misc, call-arg]
                 session,
                 uuid4(),
                 "5HKsomething",
                 "name",
                 "deadbeef" * 8,
+                524288,
             )
 
 
@@ -205,3 +208,63 @@ class TestGetAgentById:
     async def test_returns_none_when_missing(self, session: AsyncSession):
         result = await get_agent_by_id(session, agent_id=uuid4())
         assert result is None
+
+
+async def _seed_held(session: AsyncSession, *, dup_of: UUID) -> Agent:
+    agent = await _seed_agent(session, status=AgentStatus.ATH_PENDING_REVIEW)
+    async with session.begin():
+        agent.duplicate_of = dup_of
+        agent.review_reason = "exact sha256 match"
+    return agent
+
+
+class TestResolveReview:
+    async def test_clear_returns_to_scored_and_wipes_record(
+        self, session: AsyncSession
+    ):
+        original = await _seed_agent(session)
+        held = await _seed_held(session, dup_of=original.agent_id)
+        async with session.begin():
+            updated = await resolve_review(
+                session, agent_id=held.agent_id, decision=AgentStatus.SCORED
+            )
+        assert updated is not None
+        assert updated.status == AgentStatus.SCORED
+        assert updated.duplicate_of is None
+        assert updated.review_reason is None
+
+    async def test_ban_keeps_moderation_record(self, session: AsyncSession):
+        original = await _seed_agent(session)
+        held = await _seed_held(session, dup_of=original.agent_id)
+        async with session.begin():
+            updated = await resolve_review(
+                session, agent_id=held.agent_id, decision=AgentStatus.BANNED
+            )
+        assert updated is not None
+        assert updated.status == AgentStatus.BANNED
+        assert updated.duplicate_of == original.agent_id
+        assert updated.review_reason == "exact sha256 match"
+
+    async def test_unknown_agent_returns_none(self, session: AsyncSession):
+        async with session.begin():
+            result = await resolve_review(
+                session, agent_id=uuid4(), decision=AgentStatus.SCORED
+            )
+        assert result is None
+
+    async def test_not_held_agent_raises(self, session: AsyncSession):
+        agent = await _seed_agent(session, status=AgentStatus.SCORED)
+        with pytest.raises(ValueError, match="not ath_pending_review"):
+            async with session.begin():
+                await resolve_review(
+                    session, agent_id=agent.agent_id, decision=AgentStatus.SCORED
+                )
+
+    async def test_invalid_decision_raises(self, session: AsyncSession):
+        original = await _seed_agent(session)
+        held = await _seed_held(session, dup_of=original.agent_id)
+        with pytest.raises(ValueError, match="scored or banned"):
+            async with session.begin():
+                await resolve_review(
+                    session, agent_id=held.agent_id, decision=AgentStatus.LIVE
+                )

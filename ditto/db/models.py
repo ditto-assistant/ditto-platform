@@ -79,6 +79,19 @@ class Agent(Base):
     sha256: Mapped[str] = mapped_column(Text, nullable=False)
     """SHA-256 of the uploaded tarball, hex encoded."""
 
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    """Uploaded tarball size in bytes. Nullable for rows written before the
+    ledger migration; a cheap near-dup signal (a copy has a near-identical size)."""
+
+    duplicate_of: Mapped[UUID | None] = mapped_column(
+        SaUUID(as_uuid=True), nullable=True
+    )
+    """Set when the anti-copy gate holds this agent in ``ath_pending_review``:
+    the ``agent_id`` of the earlier submission it appears to duplicate."""
+
+    review_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Human-readable reason a held agent was routed to review (audit trail)."""
+
     status: Mapped[AgentStatus] = mapped_column(
         Enum(
             AgentStatus,
@@ -114,6 +127,20 @@ class Agent(Base):
             "agents_status_uploaded_idx",
             "status",
             postgresql_where=text("status = 'uploaded'"),
+        ),
+        # The validator's ledger read (GET /scoring/scores) selects agents in
+        # 'scored'; a partial index keeps that scan cheap (mirrors the two above).
+        Index(
+            "agents_status_scored_idx",
+            "status",
+            postgresql_where=text("status = 'scored'"),
+        ),
+        # ``duplicate_of`` points at the earlier submission a held agent copies.
+        ForeignKeyConstraint(
+            ["duplicate_of"],
+            ["agents.agent_id"],
+            ondelete="SET NULL",
+            name="agents_duplicate_of_fkey",
         ),
     )
 
@@ -210,7 +237,12 @@ class Score(Base):
     """SS58 hotkey of the reporting validator. PK part 2."""
 
     run_id: Mapped[str] = mapped_column(Text, nullable=False)
-    """Scoring-engine run identifier (the value the signature is bound to)."""
+    """Scoring-engine run identifier (part of the value the signature is bound to)."""
+
+    signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """The reporting validator's sr25519 signature over the score payload, hex
+    encoded. Persisted so the exposed ledger is self-verifying. Nullable for rows
+    written before the ledger migration."""
 
     seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
     """Dataset seed used for the run (anti-overfit reproducibility)."""

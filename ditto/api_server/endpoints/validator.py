@@ -20,8 +20,11 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
   lives in one place (:data:`_SCOREABLE_STATUSES` + the handler) so widening
   it is a small change.
 - **Auth.** Only chain-registered hotkeys holding a ``validator_permit`` may
-  call these. The score POST additionally verifies an sr25519 signature over
-  ``f"{validator_hotkey}:{run_id}"``. The GET endpoints authenticate via the
+  call these. The score POST additionally verifies an sr25519 signature over a
+  **canonical payload** binding the agent id and the reported
+  ``run_id`` / ``composite`` / ``seed`` (see :func:`_score_signing_message`), so
+  a captured signature can neither be replayed against a different agent nor
+  cover an altered composite. The GET endpoints authenticate via the
   ``X-Validator-Hotkey`` header + the on-chain permit check; binding those
   reads to a per-request signature (nonce/timestamp) is a known gap.
 """
@@ -40,6 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
     ArtifactResponse,
+    ScoreReport,
     SubmitScoreRequest,
     SubmitScoreResponse,
     ValidatorQueueItem,
@@ -53,10 +57,11 @@ from ditto.api_server.dependencies import (
     get_storage_client,
 )
 from ditto.api_server.endpoints.retrieval import AgentNotFoundError
+from ditto.api_server.scoring_gate import evaluate_antidup
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.queries.agents import get_agent_by_id, list_agents_by_status
-from ditto.db.queries.scores import upsert_score
+from ditto.db.queries.scores import list_eligible_ledger, upsert_score
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -79,11 +84,14 @@ def _artifact_key(agent_id: UUID) -> str:
 _QUEUE_STATUSES = (AgentStatus.EVALUATING,)
 
 # Agents a score may be reported against. ``scored`` / ``live`` are included
-# so a validator can re-score across epochs without a 409.
+# so a validator can re-score across epochs without a 409;
+# ``ath_pending_review`` is included so a re-score of a held agent updates its
+# score row (feeding the eventual review) without un-holding it.
 _SCOREABLE_STATUSES = (
     AgentStatus.EVALUATING,
     AgentStatus.SCORED,
     AgentStatus.LIVE,
+    AgentStatus.ATH_PENDING_REVIEW,
 )
 
 
@@ -159,6 +167,24 @@ async def require_validator(
 
 
 ValidatorDep = Annotated[str, Depends(require_validator)]
+
+
+def _score_signing_message(
+    validator_hotkey: str, agent_id: UUID, report: ScoreReport
+) -> bytes:
+    """Canonical bytes a score signature is verified against.
+
+    Must match the validator's ``sign_score`` byte-for-byte:
+    ``{validator_hotkey}:{agent_id}:{run_id}:{composite!r}:{seed}``. Binding the
+    agent id + composite + seed (not just ``run_id``) means a captured signature
+    cannot be replayed for a different agent, and the recorded composite cannot
+    be altered without invalidating it. ``composite`` uses Python's shortest
+    round-trip float repr, which the JSON transport preserves exactly.
+    """
+    return (
+        f"{validator_hotkey}:{agent_id}:{report.run_id}:"
+        f"{report.composite!r}:{report.seed}"
+    ).encode()
 
 
 def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:
@@ -276,9 +302,9 @@ async def submit_score(
     response.headers["Cache-Control"] = "no-store"
     report = payload.report
 
-    # 1. Signature proves the reporting validator owns the hotkey + bound
-    #    this run. CPU-only, no I/O.
-    signed = f"{payload.validator_hotkey}:{report.run_id}".encode()
+    # 1. Signature proves the reporting validator owns the hotkey and binds the
+    #    agent + score contents (anti-replay / anti-tamper). CPU-only, no I/O.
+    signed = _score_signing_message(payload.validator_hotkey, agent_id, report)
     if not _verify_signature(payload.validator_hotkey, signed, payload.signature):
         raise ValidatorAuthError(
             f"score signature did not verify for hotkey {payload.validator_hotkey}"
@@ -288,9 +314,11 @@ async def submit_score(
     netuid = request.app.state.config.chain.netuid
     await _assert_validator_permitted(chain, netuid, payload.validator_hotkey)
 
-    # 3. Atomic: record the score + advance status together.
+    # 3. Atomic: record the score + advance status together. The row lock
+    #    serializes concurrent scorers so the status guard + transition below
+    #    can't be lost-updated.
     async with session.begin():
-        agent = await get_agent_by_id(session, agent_id=agent_id)
+        agent = await get_agent_by_id(session, agent_id=agent_id, for_update=True)
         if agent is None:
             raise AgentNotFoundError(f"no agent with id={agent_id}")
         if agent.status not in _SCOREABLE_STATUSES:
@@ -309,13 +337,37 @@ async def submit_score(
             median_ms=report.median_ms,
             n=report.n,
             generated_at=report.generated_at,
+            signature=payload.signature,
             details={"per_case": [c.model_dump(mode="json") for c in report.per_case]}
             if report.per_case
             else None,
         )
-        # Single-validator-MVP finalize: first score moves evaluating -> scored.
+        # Finalize: the first score moves evaluating -> scored, unless the
+        # anti-copy gate holds a suspected copy in ath_pending_review for review.
+        # The gate only runs on this evaluating -> scored transition; a re-score
+        # of an already-scored (or already-held) agent leaves its status put so
+        # re-reporting never thrashes the ledger. The just-scored agent is still
+        # ``evaluating`` here, so it is not yet in the eligible ledger (no
+        # self-match).
         if agent.status == AgentStatus.EVALUATING:
-            agent.status = AgentStatus.SCORED
+            eligible = await list_eligible_ledger(session)
+            decision = evaluate_antidup(
+                agent_id=agent_id,
+                miner_hotkey=agent.miner_hotkey,
+                sha256=agent.sha256,
+                composite=report.composite,
+                size_bytes=agent.size_bytes,
+                eligible=eligible,
+            )
+            if decision.held:
+                agent.status = AgentStatus.ATH_PENDING_REVIEW
+                agent.duplicate_of = decision.duplicate_of
+                agent.review_reason = decision.reason
+                logger.warning(
+                    "agent %s held for copy review: %s", agent_id, decision.reason
+                )
+            else:
+                agent.status = AgentStatus.SCORED
         result_status = agent.status
 
     logger.info(
