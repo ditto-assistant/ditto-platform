@@ -53,10 +53,11 @@ from ditto.api_server.dependencies import (
     get_storage_client,
 )
 from ditto.api_server.endpoints.retrieval import AgentNotFoundError
+from ditto.api_server.scoring_gate import evaluate_antidup
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.queries.agents import get_agent_by_id, list_agents_by_status
-from ditto.db.queries.scores import upsert_score
+from ditto.db.queries.scores import list_eligible_ledger, upsert_score
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -79,11 +80,14 @@ def _artifact_key(agent_id: UUID) -> str:
 _QUEUE_STATUSES = (AgentStatus.EVALUATING,)
 
 # Agents a score may be reported against. ``scored`` / ``live`` are included
-# so a validator can re-score across epochs without a 409.
+# so a validator can re-score across epochs without a 409;
+# ``ath_pending_review`` is included so a re-score of a held agent updates its
+# score row (feeding the eventual review) without un-holding it.
 _SCOREABLE_STATUSES = (
     AgentStatus.EVALUATING,
     AgentStatus.SCORED,
     AgentStatus.LIVE,
+    AgentStatus.ATH_PENDING_REVIEW,
 )
 
 
@@ -309,13 +313,36 @@ async def submit_score(
             median_ms=report.median_ms,
             n=report.n,
             generated_at=report.generated_at,
+            signature=payload.signature,
             details={"per_case": [c.model_dump(mode="json") for c in report.per_case]}
             if report.per_case
             else None,
         )
-        # Single-validator-MVP finalize: first score moves evaluating -> scored.
+        # Finalize: the first score moves evaluating -> scored, unless the
+        # anti-copy gate holds a suspected copy in ath_pending_review for review.
+        # The gate only runs on this evaluating -> scored transition; a re-score
+        # of an already-scored (or already-held) agent leaves its status put so
+        # re-reporting never thrashes the ledger. The just-scored agent is still
+        # ``evaluating`` here, so it is not yet in the eligible ledger (no
+        # self-match).
         if agent.status == AgentStatus.EVALUATING:
-            agent.status = AgentStatus.SCORED
+            eligible = await list_eligible_ledger(session)
+            decision = evaluate_antidup(
+                agent_id=agent_id,
+                sha256=agent.sha256,
+                composite=report.composite,
+                size_bytes=agent.size_bytes,
+                eligible=eligible,
+            )
+            if decision.held:
+                agent.status = AgentStatus.ATH_PENDING_REVIEW
+                agent.duplicate_of = decision.duplicate_of
+                agent.review_reason = decision.reason
+                logger.warning(
+                    "agent %s held for copy review: %s", agent_id, decision.reason
+                )
+            else:
+                agent.status = AgentStatus.SCORED
         result_status = agent.status
 
     logger.info(

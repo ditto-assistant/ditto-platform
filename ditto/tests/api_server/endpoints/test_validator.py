@@ -148,15 +148,19 @@ async def _seed_agent(
     name: str = "alpha-agent",
     created_at: datetime | None = None,
     agent_id: UUID | None = None,
+    miner_hotkey: str = _MINER_HOTKEY,
+    sha256: str = _SHA256,
+    size_bytes: int = 524288,
 ) -> UUID:
     aid = agent_id or uuid4()
     async with maker() as s, s.begin():
         s.add(
             Agent(
                 agent_id=aid,
-                miner_hotkey=_MINER_HOTKEY,
+                miner_hotkey=miner_hotkey,
                 name=name,
-                sha256=_SHA256,
+                sha256=sha256,
+                size_bytes=size_bytes,
                 status=status,
                 created_at=created_at or datetime.now(UTC),
             )
@@ -458,3 +462,131 @@ class TestSubmitScore:
         )
         assert response.status_code == 422
         assert response.json()["error_code"] == ERROR_CODE_VALIDATION
+
+
+_MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+
+
+class TestAntiCopyGate:
+    """The score-write path holds a suspected copy in ath_pending_review."""
+
+    async def _score(
+        self,
+        client: httpx.AsyncClient,
+        agent_id: UUID,
+        *,
+        run_id: str,
+        composite: float,
+    ) -> httpx.Response:
+        return await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(run_id=run_id, composite=composite),
+        )
+
+    async def test_exact_copy_is_held(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        # Incumbent scores + becomes eligible.
+        incumbent = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, sha256="cc" * 32
+        )
+        await self._score(client, incumbent, run_id="run_inc", composite=0.80)
+        # A byte-identical resubmission from another miner.
+        copy = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            miner_hotkey=_MINER_B,
+            sha256="cc" * 32,
+        )
+        resp = await self._score(client, copy, run_id="run_copy", composite=0.80)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == AgentStatus.ATH_PENDING_REVIEW
+
+        async with session_maker() as s:
+            held = await s.get(Agent, copy)
+            assert held is not None
+            assert held.status == AgentStatus.ATH_PENDING_REVIEW
+            assert held.duplicate_of == incumbent
+            assert "sha256" in (held.review_reason or "")
+
+    async def test_near_dup_dethroner_is_held(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        incumbent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            sha256="aa" * 32,
+            size_bytes=500000,
+        )
+        await self._score(client, incumbent, run_id="run_inc", composite=0.80)
+        # Different bytes, near-identical size, beats incumbent by a hair.
+        tweaked = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            miner_hotkey=_MINER_B,
+            sha256="bb" * 32,
+            size_bytes=500100,
+        )
+        resp = await self._score(client, tweaked, run_id="run_tweak", composite=0.805)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == AgentStatus.ATH_PENDING_REVIEW
+
+    async def test_genuine_improvement_not_held(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        incumbent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            sha256="aa" * 32,
+            size_bytes=500000,
+        )
+        await self._score(client, incumbent, run_id="run_inc", composite=0.80)
+        better = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            miner_hotkey=_MINER_B,
+            sha256="bb" * 32,
+            size_bytes=700000,
+        )
+        resp = await self._score(client, better, run_id="run_better", composite=0.92)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == AgentStatus.SCORED
+
+    async def test_rescore_of_held_agent_stays_held_no_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        incumbent = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, sha256="cc" * 32
+        )
+        await self._score(client, incumbent, run_id="run_inc", composite=0.80)
+        copy = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            miner_hotkey=_MINER_B,
+            sha256="cc" * 32,
+        )
+        await self._score(client, copy, run_id="run_copy", composite=0.80)
+        # Re-scoring a held agent must not 409 and must not un-hold it.
+        resp = await self._score(client, copy, run_id="run_copy2", composite=0.81)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == AgentStatus.ATH_PENDING_REVIEW

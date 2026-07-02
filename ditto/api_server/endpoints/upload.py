@@ -266,6 +266,7 @@ async def upload_agent(
             miner_hotkey=hotkey,
             name=name,
             sha256=sha256,
+            size_bytes=len(tar_bytes),
         )
         await insert_evaluation_payment(session, verified=verified, agent_id=agent_id)
 
