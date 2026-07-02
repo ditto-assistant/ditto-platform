@@ -82,7 +82,8 @@ all three on Python 3.11 and 3.12.
   DB transaction (orphan blobs are cheap; orphan rows break the state machine).
 - Some `/upload/*` validations are intentionally deferred (tar manifest, import
   allowlist, schema diff, banned-hotkey) pending the harness interface + the
-  `banned_hotkeys` table.
+  `banned_hotkeys` table. What miners submit and what is / isn't enforced today
+  is written up in `docs/submission-contract.md`.
 
 ## Branching
 
