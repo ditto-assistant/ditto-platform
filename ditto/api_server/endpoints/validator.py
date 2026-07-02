@@ -353,6 +353,7 @@ async def submit_score(
             eligible = await list_eligible_ledger(session)
             decision = evaluate_antidup(
                 agent_id=agent_id,
+                miner_hotkey=agent.miner_hotkey,
                 sha256=agent.sha256,
                 composite=report.composite,
                 size_bytes=agent.size_bytes,

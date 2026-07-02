@@ -42,6 +42,7 @@ class LedgerRow:
     first_seen: datetime
     sha256: str
     size_bytes: int | None
+    run_id: str
     seed: int
     validator_hotkey: str
     signature: str | None
@@ -138,18 +139,36 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
     (because scoring flips ``evaluating -> scored``) is served by the partial
     index ``agents_status_scored_idx``.
 
-    Two levels: an inner per-agent aggregate collapses each agent's score
-    row(s), then a ``ROW_NUMBER`` window keeps only each miner's single best
-    agent. Ordering (``composite DESC, first_seen ASC, agent_id ASC``) matches
-    the validator fold's champion/tail tie-breaks so the exposed order and the
-    computed weights agree by construction.
+    Three levels, all deterministic:
 
-    v1 is single-validator, so exactly one ``scores`` row backs each eligible
-    agent and the inner ``MAX`` aggregates are a no-op. When the D3 k=3 design
-    lands, ``MAX(composite)`` becomes ``median`` and ``seed`` / ``validator_hotkey``
-    / ``signature`` move to a representative-of-the-median selection — a
-    localized change to this one query.
+    1. ``agent_best`` ranks each agent's ``scores`` rows and keeps the single
+       best **whole row** — so ``composite`` / ``seed`` / ``run_id`` /
+       ``validator_hotkey`` / ``signature`` always come from the *same* physical
+       row and the exposed signature verifies against the exposed composite.
+       (Picking each column independently with ``MAX`` would stitch a mismatched
+       tuple the moment an agent has >1 score row — e.g. after a validator
+       hotkey rotation inserts a second ``(agent_id, validator_hotkey)`` row.)
+    2. join to ``agents`` filtered to ``scored``.
+    3. a ``ROW_NUMBER`` window keeps each miner's single best agent.
+
+    Ordering (``composite DESC, first_seen ASC, agent_id ASC``) matches the
+    validator fold's champion/tail tie-breaks. When the D3 k=3 design lands,
+    ``agent_best`` becomes a median-of-3 selection — a localized change here.
     """
+    agent_best = select(
+        Score.agent_id.label("agent_id"),
+        Score.composite.label("composite"),
+        Score.seed.label("seed"),
+        Score.run_id.label("run_id"),
+        Score.validator_hotkey.label("validator_hotkey"),
+        Score.signature.label("signature"),
+        func.row_number()
+        .over(
+            partition_by=Score.agent_id,
+            order_by=(Score.composite.desc(), Score.validator_hotkey.asc()),
+        )
+        .label("srn"),
+    ).subquery()
     per_agent = (
         select(
             Agent.agent_id.label("agent_id"),
@@ -158,21 +177,14 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             Agent.size_bytes.label("size_bytes"),
             Agent.created_at.label("first_seen"),
             Agent.status.label("status"),
-            func.max(Score.composite).label("composite"),
-            func.max(Score.seed).label("seed"),
-            func.max(Score.validator_hotkey).label("validator_hotkey"),
-            func.max(Score.signature).label("signature"),
+            agent_best.c.composite,
+            agent_best.c.seed,
+            agent_best.c.run_id,
+            agent_best.c.validator_hotkey,
+            agent_best.c.signature,
         )
-        .join(Score, Score.agent_id == Agent.agent_id)
-        .where(Agent.status == AgentStatus.SCORED)
-        .group_by(
-            Agent.agent_id,
-            Agent.miner_hotkey,
-            Agent.sha256,
-            Agent.size_bytes,
-            Agent.created_at,
-            Agent.status,
-        )
+        .join(agent_best, agent_best.c.agent_id == Agent.agent_id)
+        .where(Agent.status == AgentStatus.SCORED, agent_best.c.srn == 1)
         .subquery()
     )
     rn = (
@@ -206,6 +218,7 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             first_seen=row.first_seen,
             sha256=row.sha256,
             size_bytes=row.size_bytes,
+            run_id=row.run_id,
             seed=row.seed,
             validator_hotkey=row.validator_hotkey,
             signature=row.signature,

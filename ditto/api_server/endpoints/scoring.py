@@ -57,6 +57,7 @@ async def scores(
             first_seen=r.first_seen,
             sha256=r.sha256,
             size_bytes=r.size_bytes,
+            run_id=r.run_id,
             seed=r.seed,
             validator_hotkey=r.validator_hotkey,
             signature=r.signature,

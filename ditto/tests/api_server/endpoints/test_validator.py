@@ -474,6 +474,24 @@ class TestSubmitScore:
         assert response.status_code == 422
         assert response.json()["error_code"] == ERROR_CODE_VALIDATION
 
+    async def test_out_of_range_seed_returns_422(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A seed outside signed int64 would 500 at the BigInteger insert; it must
+        # be a clean 422 before signing/DB work.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id, seed=2**63),
+        )
+        assert response.status_code == 422
+        assert response.json()["error_code"] == ERROR_CODE_VALIDATION
+
     async def test_cross_agent_replay_rejected(
         self,
         app: FastAPI,

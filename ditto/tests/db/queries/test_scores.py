@@ -170,3 +170,63 @@ class TestListEligibleLedger:
         )
         ledger = await list_eligible_ledger(session)
         assert [e.miner_hotkey for e in ledger] == [_MINER_B]
+
+    async def test_multiple_score_rows_returns_consistent_row(
+        self, session: AsyncSession
+    ) -> None:
+        # An agent scored by two validators (e.g. after a hotkey rotation) has two
+        # scores rows. The ledger must return the BEST row whole — composite, seed,
+        # run_id, signature, validator_hotkey all from the same physical row — not
+        # a per-column MAX that stitches a mismatched (composite, signature) tuple.
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        agent = Agent(
+            agent_id=uuid4(),
+            miner_hotkey=_MINER,
+            name="agent",
+            sha256="ab" * 32,
+            size_bytes=524288,
+            status=AgentStatus.SCORED,
+            created_at=t0,
+        )
+        async with session.begin():
+            session.add(agent)
+            await session.flush()
+            # Low composite from an alphabetically-later validator hotkey.
+            await upsert_score(
+                session,
+                agent_id=agent.agent_id,
+                validator_hotkey="5Zzz_validator",
+                run_id="run_low",
+                seed=111,
+                composite=0.70,
+                tool_mean=0.7,
+                memory_mean=0.7,
+                median_ms=500,
+                n=20,
+                generated_at=_GEN_AT,
+                signature="11" * 64,
+            )
+            # High composite from an alphabetically-earlier validator hotkey.
+            await upsert_score(
+                session,
+                agent_id=agent.agent_id,
+                validator_hotkey="5Aaa_validator",
+                run_id="run_high",
+                seed=222,
+                composite=0.90,
+                tool_mean=0.9,
+                memory_mean=0.9,
+                median_ms=500,
+                n=20,
+                generated_at=_GEN_AT,
+                signature="99" * 64,
+            )
+        ledger = await list_eligible_ledger(session)
+        assert len(ledger) == 1
+        e = ledger[0]
+        # Every field must come from the high-composite row, not be stitched.
+        assert e.composite == pytest.approx(0.90)
+        assert e.seed == 222
+        assert e.run_id == "run_high"
+        assert e.signature == "99" * 64
+        assert e.validator_hotkey == "5Aaa_validator"

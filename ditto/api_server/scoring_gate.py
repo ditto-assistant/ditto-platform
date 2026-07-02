@@ -55,6 +55,7 @@ _NOT_HELD = ReviewDecision(held=False)
 def evaluate_antidup(
     *,
     agent_id: UUID,
+    miner_hotkey: str,
     sha256: str,
     composite: float,
     size_bytes: int | None,
@@ -64,50 +65,50 @@ def evaluate_antidup(
 ) -> ReviewDecision:
     """Decide whether a just-scored agent should be held for copy review.
 
-    Held iff either:
+    Copying is only a threat *across* miners, so both rules ignore the agent's
+    own submissions and this miner's other agents (a miner iterating on their own
+    harness is not a copier). Held iff, against **another miner's** eligible agent:
 
-    1. **Exact copy** — an eligible agent (a different ``agent_id``) has the same
-       ``sha256``. Byte-identical resubmission.
-    2. **Near-dup dethroner** — the agent surpasses an existing eligible agent by
-       only a hair (composite within ``score_tol``) *and* their tarball sizes are
-       within ``size_tol``. Compared against the *incumbent* it surpasses (the
-       highest eligible composite strictly below this one), because that is the
-       submission a tweaked copy would be cloning to dethrone.
+    1. **Exact copy** — same ``sha256``. Byte-identical resubmission.
+    2. **Near-duplicate** — composites within ``score_tol`` *and* tarball sizes
+       within ``size_tol`` (a lightly-tweaked copy barely moves either). Checked
+       against *every* other-miner eligible agent, in either score direction, so
+       a genuine unrelated agent scoring in between cannot mask the copy.
 
-    A genuine improvement (composite more than ``score_tol`` above the incumbent)
-    is never held. Pure + deterministic: the verdict depends only on the inputs.
+    A genuine improvement (composite more than ``score_tol`` from any other
+    miner's score, or a clearly different size) is never held. Pure +
+    deterministic: ``eligible`` arrives in a fixed order, so the reported
+    ``duplicate_of`` (the first match) is stable.
     """
-    # 1. Exact byte-identical copy of an already-eligible artifact.
-    for e in eligible:
-        if e.agent_id != agent_id and e.sha256 == sha256:
+    others = [
+        e for e in eligible if e.agent_id != agent_id and e.miner_hotkey != miner_hotkey
+    ]
+
+    # 1. Exact byte-identical copy of another miner's eligible artifact.
+    for e in others:
+        if e.sha256 == sha256:
             return ReviewDecision(
                 held=True,
                 duplicate_of=e.agent_id,
                 reason=f"exact sha256 match of agent {e.agent_id}",
             )
 
-    # 2. Near-dup that barely surpasses the incumbent it would dethrone.
-    incumbent: LedgerRow | None = None
-    for e in eligible:
-        if e.agent_id == agent_id or e.composite >= composite:
-            continue
-        if incumbent is None or e.composite > incumbent.composite:
-            incumbent = e
-    if (
-        incumbent is not None
-        and composite - incumbent.composite <= score_tol
-        and size_bytes is not None
-        and incumbent.size_bytes is not None
-        and abs(size_bytes - incumbent.size_bytes) <= size_tol
-    ):
-        return ReviewDecision(
-            held=True,
-            duplicate_of=incumbent.agent_id,
-            reason=(
-                f"near-duplicate of agent {incumbent.agent_id}: "
-                f"composite +{composite - incumbent.composite:.4f}, "
-                f"size delta {abs(size_bytes - incumbent.size_bytes)}B"
-            ),
-        )
+    # 2. Near-dup of another miner: close in both score and tarball size.
+    if size_bytes is not None:
+        for e in others:
+            if (
+                e.size_bytes is not None
+                and abs(composite - e.composite) <= score_tol
+                and abs(size_bytes - e.size_bytes) <= size_tol
+            ):
+                return ReviewDecision(
+                    held=True,
+                    duplicate_of=e.agent_id,
+                    reason=(
+                        f"near-duplicate of agent {e.agent_id}: "
+                        f"composite delta {abs(composite - e.composite):.4f}, "
+                        f"size delta {abs(size_bytes - e.size_bytes)}B"
+                    ),
+                )
 
     return _NOT_HELD
