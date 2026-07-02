@@ -179,9 +179,7 @@ class TestQueue:
             session_maker, status=AgentStatus.UPLOADED, name="older", created_at=base
         )
         # Already promoted -> excluded from the screener queue.
-        await _seed_agent(
-            session_maker, status=AgentStatus.EVALUATING, name="promoted"
-        )
+        await _seed_agent(session_maker, status=AgentStatus.EVALUATING, name="promoted")
         _install_db(app, session_maker)
         _install_chain(app)
 

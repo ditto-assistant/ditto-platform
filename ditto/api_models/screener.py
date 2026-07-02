@@ -127,9 +127,7 @@ class ScreenResultRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "screener_hotkey": (
-                    "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
-                ),
+                "screener_hotkey": ("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"),
                 "signature": "ab" * 64,
                 "passed": True,
                 "detail": "",

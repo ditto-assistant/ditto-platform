@@ -274,6 +274,4 @@ async def submit_result(
         result_status,
         f" detail={payload.detail!r}" if payload.detail else "",
     )
-    return ScreenResultResponse(
-        agent_id=agent_id, status=result_status, accepted=True
-    )
+    return ScreenResultResponse(agent_id=agent_id, status=result_status, accepted=True)
