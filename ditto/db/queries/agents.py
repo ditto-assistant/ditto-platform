@@ -98,9 +98,7 @@ async def resolve_review(
     if agent is None:
         return None
     if agent.status != AgentStatus.ATH_PENDING_REVIEW:
-        raise ValueError(
-            f"agent {agent_id} is {agent.status}, not ath_pending_review"
-        )
+        raise ValueError(f"agent {agent_id} is {agent.status}, not ath_pending_review")
     agent.status = decision
     if decision == AgentStatus.SCORED:
         agent.duplicate_of = None
@@ -135,9 +133,18 @@ async def get_agent_by_id(
     session: AsyncSession,
     *,
     agent_id: UUID,
+    for_update: bool = False,
 ) -> Agent | None:
-    """Return the ``agents`` row for the given id, or ``None``."""
-    return await session.get(Agent, agent_id)
+    """Return the ``agents`` row for the given id, or ``None``.
+
+    ``for_update=True`` takes a row lock (``SELECT ... FOR UPDATE``) so a
+    read-then-conditional-write transition (screener promotion, score finalize)
+    serializes against a concurrent writer instead of last-writer-wins. The lock
+    is a no-op on the SQLite unit-test fallback and a real row lock on Postgres.
+    """
+    return await session.get(
+        Agent, agent_id, with_for_update=True if for_update else None
+    )
 
 
 async def list_agents_by_status(

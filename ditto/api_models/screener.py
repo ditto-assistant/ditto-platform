@@ -94,10 +94,12 @@ class ScreenResultRequest(BaseModel):
     """Body of ``POST /screener/agent/{agent_id}/result``.
 
     The screener authenticates by signing the verdict: the signature is over
-    the UTF-8 bytes of ``f"{screener_hotkey}:{agent_id}"`` with the screener's
-    hotkey keypair. ``passed`` is the gate: ``True`` promotes the agent to
-    ``evaluating``, ``False`` moves it to ``screening_failed``. ``detail`` is an
-    optional human-readable reason (e.g. a build-log tail) for logs/audit.
+    the UTF-8 bytes of ``f"{screener_hotkey}:{agent_id}:{passed}"`` with the
+    screener's hotkey keypair. Binding ``passed`` means a captured result cannot
+    be replayed with the boolean flipped to grief (or unfairly promote) a miner.
+    ``passed`` is the gate: ``True`` promotes the agent to ``evaluating``,
+    ``False`` moves it to ``screening_failed``. ``detail`` is an optional
+    human-readable reason (e.g. a build-log tail) for logs/audit.
     """
 
     screener_hotkey: Annotated[
@@ -108,7 +110,9 @@ class ScreenResultRequest(BaseModel):
         str,
         Field(
             pattern=_SIGNATURE_HEX_PATTERN,
-            description="Hex sr25519 signature over ``{screener_hotkey}:{agent_id}``.",
+            description=(
+                "Hex sr25519 signature over ``{screener_hotkey}:{agent_id}:{passed}``."
+            ),
         ),
     ]
     passed: Annotated[

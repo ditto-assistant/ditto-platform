@@ -54,7 +54,7 @@ def _result_payload(
 ) -> dict:
     body = {
         "screener_hotkey": _SCREENER_HOTKEY,
-        "signature": _sign(f"{_SCREENER_HOTKEY}:{agent_id}"),
+        "signature": _sign(f"{_SCREENER_HOTKEY}:{agent_id}:{passed}"),
         "passed": passed,
         "detail": "",
     }
@@ -418,6 +418,25 @@ class TestSubmitResult:
         _install_chain(app)
         payload = _result_payload(agent_id)
         payload["signature"] = "ab" * 64  # well-formed but wrong
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=payload
+        )
+        assert response.status_code == 401
+        assert response.json()["error_code"] == ERROR_CODE_SCREENER_AUTH
+
+    async def test_flipped_verdict_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A pass signed by the screener must not be replayable as a fail: the
+        # signature binds the ``passed`` flag, so flipping it 401s.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        payload = _result_payload(agent_id, passed=True)
+        payload["passed"] = False  # grief attempt: replay the pass sig as a fail
         response = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result", json=payload
         )

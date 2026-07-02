@@ -51,7 +51,9 @@ def _sign(message: str) -> str:
     return _KEYPAIR.sign(message.encode()).hex()
 
 
-def _score_payload(run_id: str = "run_test_1", **overrides: object) -> dict:
+def _score_payload(
+    agent_id: UUID, run_id: str = "run_test_1", **overrides: object
+) -> dict:
     report = {
         "run_id": run_id,
         "seed": 8675309,
@@ -64,9 +66,13 @@ def _score_payload(run_id: str = "run_test_1", **overrides: object) -> dict:
         "per_case": [],
     }
     report.update(overrides)
+    signed = (
+        f"{_VALIDATOR_HOTKEY}:{agent_id}:{run_id}:"
+        f"{report['composite']!r}:{report['seed']}"
+    )
     return {
         "validator_hotkey": _VALIDATOR_HOTKEY,
-        "signature": _sign(f"{_VALIDATOR_HOTKEY}:{run_id}"),
+        "signature": _sign(signed),
         "report": report,
     }
 
@@ -325,7 +331,8 @@ class TestSubmitScore:
         _install_chain(app)
 
         response = await client.post(
-            f"/api/v1/validator/agent/{agent_id}/score", json=_score_payload()
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id),
         )
         assert response.status_code == 200
         body = response.json()
@@ -354,11 +361,11 @@ class TestSubmitScore:
 
         await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
-            json=_score_payload(run_id="run_a", composite=0.5),
+            json=_score_payload(agent_id, run_id="run_a", composite=0.5),
         )
         r2 = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
-            json=_score_payload(run_id="run_b", composite=0.9),
+            json=_score_payload(agent_id, run_id="run_b", composite=0.9),
         )
         assert r2.status_code == 200
 
@@ -380,7 +387,7 @@ class TestSubmitScore:
         _install_db(app, session_maker)
         _install_chain(app)
 
-        payload = _score_payload()
+        payload = _score_payload(agent_id)
         payload["signature"] = "ab" * 64  # well-formed but wrong
         response = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score", json=payload
@@ -398,7 +405,8 @@ class TestSubmitScore:
         _install_db(app, session_maker)
         _install_chain(app, permitted=False)
         response = await client.post(
-            f"/api/v1/validator/agent/{agent_id}/score", json=_score_payload()
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id),
         )
         assert response.status_code == 401
         assert response.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
@@ -411,8 +419,9 @@ class TestSubmitScore:
     ) -> None:
         _install_db(app, session_maker)
         _install_chain(app)
+        aid = uuid4()
         response = await client.post(
-            f"/api/v1/validator/agent/{uuid4()}/score", json=_score_payload()
+            f"/api/v1/validator/agent/{aid}/score", json=_score_payload(aid)
         )
         assert response.status_code == 404
         assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_FOUND
@@ -427,7 +436,8 @@ class TestSubmitScore:
         _install_db(app, session_maker)
         _install_chain(app)
         response = await client.post(
-            f"/api/v1/validator/agent/{agent_id}/score", json=_score_payload()
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id),
         )
         assert response.status_code == 409
         assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_EVALUATABLE
@@ -442,7 +452,8 @@ class TestSubmitScore:
         _install_db(app, session_maker)
         _install_chain(app)
         response = await client.post(
-            f"/api/v1/validator/agent/{agent_id}/score", json=_score_payload()
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id),
         )
         assert response.status_code == 200
         assert response.json()["status"] == AgentStatus.LIVE
@@ -458,10 +469,47 @@ class TestSubmitScore:
         _install_chain(app)
         response = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
-            json=_score_payload(composite=1.5),
+            json=_score_payload(agent_id, composite=1.5),
         )
         assert response.status_code == 422
         assert response.json()["error_code"] == ERROR_CODE_VALIDATION
+
+    async def test_cross_agent_replay_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A signature valid for agent A must not be accepted for agent B: the
+        # signed payload binds the agent id.
+        agent_a = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        agent_b = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        payload = _score_payload(agent_a)  # signed for A
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_b}/score", json=payload
+        )
+        assert response.status_code == 401
+        assert response.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
+
+    async def test_tampered_composite_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The composite is signed: altering it after signing invalidates the sig.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        payload = _score_payload(agent_id, composite=0.50)
+        payload["report"]["composite"] = 0.99  # tamper post-signing
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score", json=payload
+        )
+        assert response.status_code == 401
+        assert response.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
 
 
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
@@ -480,7 +528,7 @@ class TestAntiCopyGate:
     ) -> httpx.Response:
         return await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
-            json=_score_payload(run_id=run_id, composite=composite),
+            json=_score_payload(agent_id, run_id=run_id, composite=composite),
         )
 
     async def test_exact_copy_is_held(
