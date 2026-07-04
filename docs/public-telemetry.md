@@ -62,9 +62,12 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   from the KOTH fold. **No** agent_id/sha/signature/per_case.
 - `GET /api/v1/public/weights` → the last-published normalized weight vector
   (champion + tail) — mirrors what the validator set on-chain.
-- `GET /api/v1/public/health` → subnet rollup: `miners`, `scored_miners`,
-  `last_sweep_at`, `runs_24h`, `success_rate_24h`, `avg_latency_ms`. (Detailed
-  ops stay on the existing Prometheus `/metrics`.)
+- `GET /api/v1/public/health` → subnet rollup **from what the platform records**:
+  `miners`, `scored_miners`, `scored_agents`, `last_scored_at`, `scores_24h`,
+  `avg_latency_ms`. Note: no `success_rate` — the platform only ever sees a
+  *successful* score, so run started/failed counts and set-weights latency are
+  validator-side telemetry (wandb), not fabricated here. Detailed ops stay on the
+  existing Prometheus `/metrics`.
 - Per-category means: derive from the stored `scores.details.per_case` at read
   time (aggregate only) or persist a `per_category` blob on submit — either way
   the public shape exposes category means, never per-case rows.
@@ -86,8 +89,11 @@ idea); no server needed since all data comes from the public API + wandb.
 
 ## Build order
 
-1. Public API (`/api/v1/public/leaderboard` + `/weights` + `/health`) — unblocks
-   both the dashboard and external transparency. **← start here**
-2. wandb `telemetry.py` in the validator — aggregate + per-category tables.
-3. Dashboard SPA against the public API + embedded wandb.
+1. ✅ Public API — `/api/v1/public/leaderboard` + `/api/v1/public/health`.
+   `/weights` is intentionally **not** served: the KOTH weight vector is
+   validator-side (see the scoring endpoint boundary); the dashboard links wandb
+   / the chain for weights.
+2. ✅ wandb `telemetry.py` in the validator (ditto-subnet #27) — aggregate +
+   per-category tables, opt-in and off by default.
+3. ✅ Dashboard SPA (`dashboard/index.html`) against the public API + wandb link.
 4. (Optional) persist `per_category` on submit for cheaper category reads.

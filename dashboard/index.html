@@ -204,8 +204,16 @@
 
     .empty { padding: 40px; text-align: center; color: var(--text-dim); }
 
+    /* ── Health strip ───────────────────────────────────────── */
+    .health { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+    .htile { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+    .htile .hl { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+    .htile .hv { font-size: 21px; font-weight: 700; margin-top: 5px; font-variant-numeric: tabular-nums; }
+    .htile .hv small { font-size: 12px; color: var(--text-dim); font-weight: 500; }
+
     @media (max-width: 720px) {
       .cards { grid-template-columns: repeat(2, 1fr); }
+      .health { grid-template-columns: repeat(2, 1fr); }
       .hide-sm { display: none; }
       .brand h1 { font-size: 18px; }
     }
@@ -259,6 +267,18 @@
           <tr><td colspan="6" class="empty">Loading leaderboard…</td></tr>
         </tbody>
       </table>
+    </div>
+
+    <div class="section-head">
+      <h2>Subnet health</h2>
+      <span class="hint">what the platform records · run failures &amp; weight-setting live in wandb</span>
+    </div>
+    <div class="health" id="health">
+      <div class="htile"><div class="hl">Miners</div><div class="hv" id="h-miners">—</div></div>
+      <div class="htile"><div class="hl">Scored miners</div><div class="hv" id="h-scored">—</div></div>
+      <div class="htile"><div class="hl">Scores · 24h</div><div class="hv" id="h-24h">—</div></div>
+      <div class="htile"><div class="hl">Avg latency</div><div class="hv" id="h-lat">—</div></div>
+      <div class="htile"><div class="hl">Last scored</div><div class="hv" id="h-last">—</div></div>
     </div>
 
     <footer>
@@ -440,23 +460,36 @@
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeDrawer(); });
     document.getElementById("refresh").addEventListener("click", function () { load(true); });
 
+    // ── Health strip ─────────────────────────────────────────
+    function renderHealth(h) {
+      document.getElementById("h-miners").textContent = h.miners;
+      document.getElementById("h-scored").textContent = h.scored_miners;
+      document.getElementById("h-24h").textContent = h.scores_24h;
+      document.getElementById("h-lat").innerHTML =
+        h.avg_latency_ms == null ? "—" : h.avg_latency_ms + ' <small>ms</small>';
+      document.getElementById("h-last").innerHTML =
+        h.last_scored_at ? relTime(h.last_scored_at) : "—";
+    }
+
     // ── Data load ────────────────────────────────────────────
-    function load(manual) {
-      if (manual) setStatus("", "Refreshing…");
+    function getJSON(path) {
       var ctrl = new AbortController();
       var to = setTimeout(function () { ctrl.abort(); }, 8000);
-      fetch(API_BASE + "/public/leaderboard", { signal: ctrl.signal, headers: { accept: "application/json" } })
-        .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-        .then(function (data) {
-          clearTimeout(to);
-          setStatus("live", "Live");
-          render(data, false);
-        })
-        .catch(function () {
-          clearTimeout(to);
-          setStatus("sample", "Sample data");
-          render(SAMPLE, true);
-        });
+      return fetch(API_BASE + path, { signal: ctrl.signal, headers: { accept: "application/json" } })
+        .then(function (r) { clearTimeout(to); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); },
+              function (e) { clearTimeout(to); throw e; });
+    }
+
+    function load(manual) {
+      if (manual) setStatus("", "Refreshing…");
+      getJSON("/public/leaderboard")
+        .then(function (data) { setStatus("live", "Live"); render(data, false); })
+        .catch(function () { setStatus("sample", "Sample data"); render(SAMPLE, true); });
+      // Health is independent: a failure here must not flip the whole page to
+      // sample mode or blank the leaderboard.
+      getJSON("/public/health")
+        .then(function (h) { renderHealth(h); })
+        .catch(function () { renderHealth(SAMPLE_HEALTH); });
     }
 
     // ── Sample data (mirrors the real /public/leaderboard shape) ──
@@ -470,6 +503,11 @@
         { rank: 4, miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.303, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
         { rank: 5, miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.285, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
       ]
+    };
+    var SAMPLE_HEALTH = {
+      miners: 8, scored_miners: 5, scored_agents: 7,
+      scores_24h: 11, avg_latency_ms: 812,
+      last_scored_at: new Date(Date.now() - 1000 * 60 * 6).toISOString()
     };
 
     // ── Go ───────────────────────────────────────────────────

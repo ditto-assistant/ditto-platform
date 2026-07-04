@@ -62,3 +62,53 @@ class PublicLeaderboardResponse(BaseModel):
         list[PublicLeaderboardEntry],
         Field(default_factory=list, description="Ranked miners, best composite first."),
     ]
+
+
+class PublicHealthResponse(BaseModel):
+    """Aggregate subnet-health rollup for the public dashboard.
+
+    Derived only from what the platform records (submissions + reported scores).
+    Run started/failed counts, set-weights latency and per-stage timings are
+    validator-side telemetry (wandb), not served here — the platform only ever
+    sees a *successful* score, so it deliberately reports no "success rate".
+    """
+
+    generated_at: Annotated[
+        datetime, Field(description="When this snapshot was read (UTC).")
+    ]
+    miners: Annotated[
+        int, Field(ge=0, description="Distinct miners who have ever submitted.")
+    ]
+    scored_miners: Annotated[
+        int, Field(ge=0, description="Distinct miners on the leaderboard (scored).")
+    ]
+    scored_agents: Annotated[
+        int, Field(ge=0, description="Agents currently eligible (scored).")
+    ]
+    last_scored_at: Annotated[
+        datetime | None,
+        Field(default=None, description="When a validator last scored anything (UTC)."),
+    ]
+    scores_24h: Annotated[
+        int, Field(ge=0, description="Scores generated in the last 24h.")
+    ]
+    avg_latency_ms: Annotated[
+        int | None,
+        Field(
+            default=None, ge=0, description="Mean per-score median case latency (ms)."
+        ),
+    ]
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "generated_at": "2026-07-04T12:00:00Z",
+                "miners": 12,
+                "scored_miners": 5,
+                "scored_agents": 7,
+                "last_scored_at": "2026-07-04T11:52:00Z",
+                "scores_24h": 9,
+                "avg_latency_ms": 812,
+            }
+        }
+    )

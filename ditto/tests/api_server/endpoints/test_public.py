@@ -9,7 +9,7 @@ per-case detail.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import httpx
@@ -71,6 +71,8 @@ async def _seed_scored(
     tool_mean: float,
     memory_mean: float,
     status: AgentStatus = AgentStatus.SCORED,
+    median_ms: int = 500,
+    generated_at: datetime = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
 ) -> None:
     async with maker() as s, s.begin():
         agent = Agent(
@@ -93,10 +95,31 @@ async def _seed_scored(
             composite=composite,
             tool_mean=tool_mean,
             memory_mean=memory_mean,
-            median_ms=500,
+            median_ms=median_ms,
             n=20,
-            generated_at=datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
+            generated_at=generated_at,
             signature="ab" * 64,
+        )
+
+
+async def _seed_agent(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    miner: str,
+    status: AgentStatus = AgentStatus.UPLOADED,
+) -> None:
+    """Seed a submission with no score (e.g. still uploaded/evaluating)."""
+    async with maker() as s, s.begin():
+        s.add(
+            Agent(
+                agent_id=uuid4(),
+                miner_hotkey=miner,
+                name="agent",
+                sha256="cd" * 32,
+                size_bytes=524288,
+                status=status,
+                created_at=datetime.now(UTC),
+            )
         )
 
 
@@ -179,3 +202,96 @@ class TestPublicLeaderboard:
         # No X-Validator-Hotkey header, no chain override — must still succeed.
         resp = await client.get("/api/v1/public/leaderboard")
         assert resp.status_code == 200
+
+
+class TestPublicHealth:
+    async def test_counts_latency_and_window(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        # Two scored miners (recent), latencies 400 + 800 => avg 600.
+        await _seed_scored(
+            session_maker,
+            miner=_MINER_A,
+            composite=0.4,
+            tool_mean=0.5,
+            memory_mean=0.3,
+            median_ms=400,
+            generated_at=now - timedelta(minutes=5),
+        )
+        await _seed_scored(
+            session_maker,
+            miner=_MINER_B,
+            composite=0.9,
+            tool_mean=0.95,
+            memory_mean=0.8,
+            median_ms=800,
+            generated_at=now - timedelta(days=2),  # outside the 24h window
+        )
+        # A third miner who submitted but has not been scored yet.
+        await _seed_agent(
+            session_maker,
+            miner="5CFn5zVKp6taKY8T39M92cWWpsCXBQym37waFAtiKmZmznu9",
+            status=AgentStatus.UPLOADED,
+        )
+        _install_db(app, session_maker)
+
+        resp = await client.get("/api/v1/public/health")
+        assert resp.status_code == 200
+        assert resp.headers["Cache-Control"] == "public, max-age=30"
+        body = resp.json()
+        assert body["miners"] == 3
+        assert body["scored_miners"] == 2
+        assert body["scored_agents"] == 2
+        assert body["scores_24h"] == 1  # only MINER_A is within 24h
+        assert body["avg_latency_ms"] == 600
+        # last_scored_at is the newest generated_at (MINER_A, ~5 min ago).
+        last = datetime.fromisoformat(body["last_scored_at"])
+        assert abs((now - last).total_seconds()) < 3600
+
+    async def test_held_agent_not_counted_as_scored(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A held (ATH review) agent has a score but is not eligible: it counts
+        # toward total miners but not scored_miners/scored_agents.
+        await _seed_scored(
+            session_maker,
+            miner=_MINER_A,
+            composite=0.99,
+            tool_mean=0.99,
+            memory_mean=0.99,
+            status=AgentStatus.ATH_PENDING_REVIEW,
+            generated_at=datetime.now(UTC),
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/health")).json()
+        assert body["miners"] == 1
+        assert body["scored_miners"] == 0
+        assert body["scored_agents"] == 0
+
+    async def test_empty(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        resp = await client.get("/api/v1/public/health")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == {
+            "generated_at": body["generated_at"],
+            "miners": 0,
+            "scored_miners": 0,
+            "scored_agents": 0,
+            "last_scored_at": None,
+            "scores_24h": 0,
+            "avg_latency_ms": None,
+        }

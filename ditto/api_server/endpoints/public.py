@@ -20,9 +20,13 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Response
 
-from ditto.api_models import PublicLeaderboardEntry, PublicLeaderboardResponse
+from ditto.api_models import (
+    PublicHealthResponse,
+    PublicLeaderboardEntry,
+    PublicLeaderboardResponse,
+)
 from ditto.api_server.endpoints.validator import SessionDep
-from ditto.db.queries.scores import list_eligible_ledger
+from ditto.db.queries.scores import get_public_health, list_eligible_ledger
 
 logger = logging.getLogger(__name__)
 
@@ -54,4 +58,29 @@ async def leaderboard(
     ]
     return PublicLeaderboardResponse(
         generated_at=datetime.now(UTC), count=len(entries), entries=entries
+    )
+
+
+@router.get("/health", response_model=PublicHealthResponse)
+async def health(
+    response: Response,
+    session: SessionDep,
+) -> PublicHealthResponse:
+    """Aggregate subnet-health rollup (submissions + reported scores).
+
+    Aggregate-only, like the leaderboard: miner/agent counts, last-scored time,
+    24h scoring throughput, and average latency. Failure/latency-of-weights
+    telemetry lives in wandb — the platform only sees successful scores.
+    """
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    now = datetime.now(UTC)
+    roll = await get_public_health(session, now=now)
+    return PublicHealthResponse(
+        generated_at=now,
+        miners=roll.miners,
+        scored_miners=roll.scored_miners,
+        scored_agents=roll.scored_agents,
+        last_scored_at=roll.last_scored_at,
+        scores_24h=roll.scores_24h,
+        avg_latency_ms=roll.avg_latency_ms,
     )

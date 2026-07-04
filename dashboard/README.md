@@ -2,9 +2,9 @@
 
 A single self-contained `index.html` — the public "front door" for Subnet 118.
 No build step, no framework, no external requests, **no secrets**. It reads the
-platform's public, aggregate-only API (`GET /api/v1/public/leaderboard`) and
-links out to wandb for the per-epoch deep dive. This is Surface 3 in
-[`docs/public-telemetry.md`](../docs/public-telemetry.md).
+platform's public, aggregate-only API (`GET /api/v1/public/leaderboard` and
+`GET /api/v1/public/health`) and links out to wandb for the per-epoch deep dive.
+This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 
 ## What it shows
 
@@ -12,6 +12,10 @@ links out to wandb for the per-epoch deep dive. This is Surface 3 in
 - **Leaderboard** — best eligible score per miner, ranked by composite, with
   composite / tool / memory bars; the leader is highlighted. Click a row for a
   drill-down (tool-vs-memory split, first-seen, rank).
+- **Subnet health** — miners, scored miners, scores in the last 24h, average
+  latency, and when a validator last scored anything (from `/public/health`).
+  Run failures and weight-setting telemetry live in wandb, not here — the
+  platform only ever sees a successful score.
 - **Anti-overfit assurance** — states plainly that only aggregates are published
   and that dataset seeds rotate every submission.
 
