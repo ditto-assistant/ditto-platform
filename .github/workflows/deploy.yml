@@ -16,10 +16,14 @@ name: Deploy
 #     GCP_PLATFORM_DEPLOY_SA  github-actions-platform-deploy@ditto-app-dev.iam.gserviceaccount.com
 #                             (gcp-platform output `platform_deploy_sa_email`)
 #   Per-Environment (`dev` and `prod` GitHub Environments):
-#     DITTO_UPLOAD_PAYMENT_ADDRESS  the env's SS58 upload-fee receive address.
-#       Injected into the VM's .env at deploy time (NOT stored in infra). The
-#       `prod` environment is where you add required reviewers if you want a
+#     DITTO_UPLOAD_PAYMENT_ADDRESS  (secret) the env's SS58 upload-fee receive
+#       address. Injected into the VM's .env at deploy time (NOT stored in infra).
+#       The `prod` environment is where you add required reviewers if you want a
 #       manual gate before prod deploys.
+#     DITTO_DASHBOARD_WANDB_URL     (variable, optional) public wandb project URL
+#       shown as the dashboard's "full telemetry" link, e.g.
+#       https://wandb.ai/<entity>/ditto-sn118. Upserted into .env by update.sh;
+#       unset just leaves the SPA's default link.
 
 on:
   push:
@@ -85,7 +89,7 @@ jobs:
             --zone "$GCP_ZONE" \
             --tunnel-through-iap \
             --quiet \
-            --command "sudo -iu deploy bash -lc 'cd /opt/ditto-platform && DITTO_DEPLOY_BRANCH=${{ steps.target.outputs.branch }} DITTO_UPLOAD_PAYMENT_ADDRESS=${{ secrets.DITTO_UPLOAD_PAYMENT_ADDRESS }} ./scripts/update.sh'"
+            --command "sudo -iu deploy bash -lc 'cd /opt/ditto-platform && DITTO_DEPLOY_BRANCH=${{ steps.target.outputs.branch }} DITTO_UPLOAD_PAYMENT_ADDRESS=${{ secrets.DITTO_UPLOAD_PAYMENT_ADDRESS }} DITTO_DASHBOARD_WANDB_URL=${{ vars.DITTO_DASHBOARD_WANDB_URL }} ./scripts/update.sh'"
 
       - name: Health check
         # Hits the public Caddy endpoint, so it depends on public DNS + the VM's

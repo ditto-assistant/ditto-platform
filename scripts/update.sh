@@ -21,18 +21,28 @@ git reset --hard "origin/$branch"
 echo "==> syncing dependencies"
 uv sync
 
-# Deploy-supplied upload payment address (the platform repo's GitHub environment
-# secret, passed in by deploy.yml). Upsert it into .env BEFORE sourcing, so the
-# app — which requires it at boot — comes up with the right value. The Ansible
-# role deliberately leaves this key out of the rendered .env.
-if [ -n "${DITTO_UPLOAD_PAYMENT_ADDRESS:-}" ]; then
-  echo "==> setting DITTO_UPLOAD_PAYMENT_ADDRESS from deploy env"
-  if grep -q '^DITTO_UPLOAD_PAYMENT_ADDRESS=' .env 2>/dev/null; then
-    sed -i "s|^DITTO_UPLOAD_PAYMENT_ADDRESS=.*|DITTO_UPLOAD_PAYMENT_ADDRESS=${DITTO_UPLOAD_PAYMENT_ADDRESS}|" .env
+# Upsert a KEY=VALUE into .env, replacing an existing line or appending. Used for
+# deploy-supplied env the Ansible role deliberately leaves out of the rendered
+# .env; applied BEFORE sourcing so the app boots with the right values. Skips
+# when the value is empty so an unset deploy var never blanks a key.
+upsert_env() {
+  local key="$1" value="$2"
+  [ -n "$value" ] || return 0
+  echo "==> setting $key from deploy env"
+  if grep -q "^${key}=" .env 2>/dev/null; then
+    # `|` delimiter + escape any `|`/`&`/`\` in the value so URLs/addresses are safe.
+    local esc=${value//\\/\\\\}; esc=${esc//|/\\|}; esc=${esc//&/\\&}
+    sed -i "s|^${key}=.*|${key}=${esc}|" .env
   else
-    printf 'DITTO_UPLOAD_PAYMENT_ADDRESS=%s\n' "$DITTO_UPLOAD_PAYMENT_ADDRESS" >> .env
+    printf '%s=%s\n' "$key" "$value" >> .env
   fi
-fi
+}
+
+# Deploy-supplied values (GitHub Environment secret / variable, passed by
+# deploy.yml): the upload payment address (required at boot) and the public
+# wandb project URL injected into the served dashboard's telemetry link.
+upsert_env DITTO_UPLOAD_PAYMENT_ADDRESS "${DITTO_UPLOAD_PAYMENT_ADDRESS:-}"
+upsert_env DITTO_DASHBOARD_WANDB_URL "${DITTO_DASHBOARD_WANDB_URL:-}"
 
 set -a; . ./.env; set +a
 
