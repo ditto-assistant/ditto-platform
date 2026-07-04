@@ -252,6 +252,33 @@ class TestPublicHealth:
         last = datetime.fromisoformat(body["last_scored_at"])
         assert abs((now - last).total_seconds()) < 3600
 
+    async def test_orphan_scored_agent_not_counted(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A scored-STATUS agent with no score row (a stray/hand-edited state)
+        # must not inflate the scored counts — they require a real score row so
+        # health can never contradict the leaderboard.
+        await _seed_scored(
+            session_maker,
+            miner=_MINER_A,
+            composite=0.5,
+            tool_mean=0.6,
+            memory_mean=0.4,
+            generated_at=datetime.now(UTC),
+        )
+        await _seed_agent(
+            session_maker, miner=_MINER_B, status=AgentStatus.SCORED
+        )  # scored status, but no score row
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/health")).json()
+        assert body["miners"] == 2  # both submitted
+        assert body["scored_miners"] == 1  # only MINER_A is score-backed
+        assert body["scored_agents"] == 1
+
     async def test_held_agent_not_counted_as_scored(
         self,
         app: FastAPI,

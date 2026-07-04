@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import case, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
@@ -65,9 +65,10 @@ class HealthRollup:
     miners: int
     """Distinct miners who have ever submitted an agent."""
     scored_miners: int
-    """Distinct miners with at least one agent in ``scored`` (== leaderboard size)."""
+    """Distinct miners with a ``scored`` agent that has a score row (==
+    leaderboard size — a stray scored-status row with no score is excluded)."""
     scored_agents: int
-    """Agents currently in ``scored`` (eligible submissions)."""
+    """``scored`` agents that actually carry a score row (eligible submissions)."""
     last_scored_at: datetime | None
     """Newest score ``generated_at`` — when a validator last scored anything."""
     scores_24h: int
@@ -99,16 +100,23 @@ async def get_public_health(session: AsyncSession, *, now: datetime) -> HealthRo
     Postgres and the SQLite test fallback; the ``scores`` table is small at
     subnet scale (one row per agent per validator).
     """
-    scored = AgentStatus.SCORED
-    counts = (
+    total_miners = (
+        await session.execute(select(func.count(func.distinct(Agent.miner_hotkey))))
+    ).scalar_one()
+
+    # Scored counts require an actual ``scores`` row (INNER JOIN), so they can
+    # never contradict the leaderboard: a stray ``scored``-status agent with no
+    # score row is not "scored" for public purposes. Distinct-count both because
+    # the join fans out one row per validator that scored the agent.
+    scored = (
         await session.execute(
             select(
                 func.count(func.distinct(Agent.miner_hotkey)),
-                func.count(
-                    func.distinct(case((Agent.status == scored, Agent.miner_hotkey)))
-                ),
-                func.count(case((Agent.status == scored, Agent.agent_id))),
+                func.count(func.distinct(Agent.agent_id)),
             )
+            .select_from(Agent)
+            .join(Score, Score.agent_id == Agent.agent_id)
+            .where(Agent.status == AgentStatus.SCORED)
         )
     ).one()
 
@@ -116,9 +124,9 @@ async def get_public_health(session: AsyncSession, *, now: datetime) -> HealthRo
     cutoff = now - _HEALTH_WINDOW
     generated = [_as_utc(r[0]) for r in rows]
     return HealthRollup(
-        miners=int(counts[0]),
-        scored_miners=int(counts[1]),
-        scored_agents=int(counts[2]),
+        miners=int(total_miners),
+        scored_miners=int(scored[0]),
+        scored_agents=int(scored[1]),
         last_scored_at=max(generated) if generated else None,
         scores_24h=sum(1 for g in generated if g >= cutoff),
         avg_latency_ms=(round(sum(r[1] for r in rows) / len(rows)) if rows else None),
