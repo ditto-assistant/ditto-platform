@@ -39,6 +39,8 @@ class LedgerRow:
     miner_hotkey: str
     agent_id: UUID
     composite: float
+    tool_mean: float
+    memory_mean: float
     first_seen: datetime
     sha256: str
     size_bytes: int | None
@@ -158,6 +160,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
     agent_best = select(
         Score.agent_id.label("agent_id"),
         Score.composite.label("composite"),
+        Score.tool_mean.label("tool_mean"),
+        Score.memory_mean.label("memory_mean"),
         Score.seed.label("seed"),
         Score.run_id.label("run_id"),
         Score.validator_hotkey.label("validator_hotkey"),
@@ -178,6 +182,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             Agent.created_at.label("first_seen"),
             Agent.status.label("status"),
             agent_best.c.composite,
+            agent_best.c.tool_mean,
+            agent_best.c.memory_mean,
             agent_best.c.seed,
             agent_best.c.run_id,
             agent_best.c.validator_hotkey,
@@ -215,6 +221,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             miner_hotkey=row.miner_hotkey,
             agent_id=row.agent_id,
             composite=row.composite,
+            tool_mean=row.tool_mean,
+            memory_mean=row.memory_mean,
             first_seen=row.first_seen,
             sha256=row.sha256,
             size_bytes=row.size_bytes,
