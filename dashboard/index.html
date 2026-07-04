@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ditto SN118 · Subnet Leaderboard</title>
+
+  <!--
+    Public transparency dashboard for Bittensor Subnet 118 (Ditto).
+
+    Self-contained static SPA: no build step, no external requests, no secrets.
+    Drop it on object storage + a CDN and it works. All data comes from the
+    platform's PUBLIC, aggregate-only read API and (for the deep dive) wandb.
+
+    Configure the API base (in priority order):
+      1. ?api=https://api.example.com/api/v1   (query string, handy for testing)
+      2. <meta name="ditto:api-base" content="…">  (edit the tag below to bake in)
+      3. same-origin "/api/v1"                  (default: dashboard served next to the API)
+
+    wandb project link is configured the same way via ?wandb= or the meta tag.
+
+    If the API can't be reached (before deploy, offline, or in a sandbox that
+    blocks fetch) the page renders SAMPLE data behind a clearly-marked banner so
+    the layout is always previewable.
+  -->
+  <meta name="ditto:api-base" content="" />
+  <meta name="ditto:wandb-url" content="https://wandb.ai/" />
+
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%B7%3C/text%3E%3C/svg%3E" />
+
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --bg-elev: #131a26;
+      --bg-elev-2: #1a2333;
+      --border: #24304a;
+      --text: #e7ecf3;
+      --text-dim: #9aa7bd;
+      --text-faint: #64748b;
+      --accent: #5b8cff;
+      --accent-2: #22d3ee;
+      --gold: #f5c451;
+      --tool: #5b8cff;
+      --memory: #22d3ee;
+      --good: #4ade80;
+      --warn: #fbbf24;
+      --danger: #f87171;
+      --radius: 14px;
+      --shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+      --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { margin: 0; padding: 0; }
+
+    body {
+      background:
+        radial-gradient(1200px 600px at 15% -10%, rgba(91, 140, 255, 0.12), transparent 60%),
+        radial-gradient(1000px 500px at 100% 0%, rgba(34, 211, 238, 0.08), transparent 55%),
+        var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      line-height: 1.5;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 20px 80px; }
+
+    /* ── Header ─────────────────────────────────────────────── */
+    header.top {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand .mark {
+      width: 42px; height: 42px; border-radius: 12px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      display: grid; place-items: center;
+      font-size: 22px; box-shadow: var(--shadow);
+    }
+    .brand h1 { font-size: 20px; margin: 0; letter-spacing: 0.2px; }
+    .brand .sub { color: var(--text-dim); font-size: 13px; margin-top: 1px; }
+    .spacer { flex: 1 1 auto; }
+
+    .pill {
+      display: inline-flex; align-items: center; gap: 7px;
+      padding: 6px 12px; border-radius: 999px;
+      font-size: 12.5px; font-weight: 600;
+      border: 1px solid var(--border); background: var(--bg-elev);
+      color: var(--text-dim);
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
+    .pill.live .dot { background: var(--good); box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.18); animation: pulse 2s infinite; }
+    .pill.sample .dot { background: var(--warn); }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+    .btn {
+      display: inline-flex; align-items: center; gap: 7px;
+      padding: 8px 14px; border-radius: 10px; cursor: pointer;
+      font-size: 13px; font-weight: 600; font-family: inherit;
+      border: 1px solid var(--border); background: var(--bg-elev); color: var(--text);
+      text-decoration: none; transition: border-color .15s, background .15s, transform .05s;
+    }
+    .btn:hover { border-color: var(--accent); background: var(--bg-elev-2); }
+    .btn:active { transform: translateY(1px); }
+    .btn.ghost { background: transparent; }
+
+    /* ── Sample banner ──────────────────────────────────────── */
+    .banner {
+      margin: 16px 0 0; padding: 11px 15px; border-radius: 12px;
+      background: rgba(251, 191, 36, 0.08); border: 1px solid rgba(251, 191, 36, 0.35);
+      color: #fcd34d; font-size: 13px; display: none; gap: 9px; align-items: center;
+    }
+    .banner.show { display: flex; }
+    .banner b { color: #fde68a; }
+
+    /* ── Summary cards ──────────────────────────────────────── */
+    .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 22px 0; }
+    .card {
+      background: var(--bg-elev); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 16px 18px; position: relative; overflow: hidden;
+    }
+    .card .label { color: var(--text-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600; }
+    .card .value { font-size: 27px; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+    .card .value small { font-size: 14px; color: var(--text-dim); font-weight: 500; }
+    .card .glow { position: absolute; right: -30px; top: -30px; width: 90px; height: 90px; border-radius: 50%; filter: blur(28px); opacity: 0.5; }
+
+    /* ── Section heading ────────────────────────────────────── */
+    .section-head { display: flex; align-items: baseline; gap: 12px; margin: 30px 0 14px; }
+    .section-head h2 { font-size: 16px; margin: 0; letter-spacing: 0.2px; }
+    .section-head .hint { color: var(--text-faint); font-size: 12.5px; }
+
+    /* ── Leaderboard ────────────────────────────────────────── */
+    .board { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    table { width: 100%; border-collapse: collapse; }
+    thead th {
+      text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.6px;
+      color: var(--text-faint); font-weight: 600; padding: 13px 16px;
+      border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.015);
+    }
+    thead th.num, tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    tbody td { padding: 13px 16px; border-bottom: 1px solid rgba(36, 48, 74, 0.5); font-size: 14px; vertical-align: middle; }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr { cursor: pointer; transition: background .12s; }
+    tbody tr:hover { background: rgba(91, 140, 255, 0.06); }
+    tbody tr.champion { background: linear-gradient(90deg, rgba(245, 196, 81, 0.10), transparent 70%); }
+    tbody tr.champion:hover { background: linear-gradient(90deg, rgba(245, 196, 81, 0.16), rgba(91,140,255,0.05) 70%); }
+
+    .rank { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 26px; border-radius: 8px; font-weight: 700; font-size: 13px; background: var(--bg-elev-2); color: var(--text-dim); font-variant-numeric: tabular-nums; }
+    .rank.r1 { background: rgba(245, 196, 81, 0.16); color: var(--gold); }
+    .rank.r2 { background: rgba(203, 213, 225, 0.14); color: #cbd5e1; }
+    .rank.r3 { background: rgba(217, 149, 92, 0.16); color: #d9955c; }
+
+    .hotkey { font-family: var(--mono); font-size: 13px; color: var(--text); }
+    .hotkey .badge { margin-left: 8px; font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--gold); border: 1px solid rgba(245,196,81,0.4); border-radius: 6px; padding: 1px 6px; vertical-align: middle; }
+    .copy { margin-left: 6px; color: var(--text-faint); cursor: pointer; font-size: 12px; opacity: 0; transition: opacity .12s, color .12s; }
+    tr:hover .copy { opacity: 1; }
+    .copy:hover { color: var(--accent); }
+
+    .metric { display: flex; align-items: center; gap: 10px; min-width: 150px; }
+    .metric .barwrap { flex: 1; height: 7px; border-radius: 4px; background: var(--bg-elev-2); overflow: hidden; }
+    .metric .bar { height: 100%; border-radius: 4px; }
+    .metric .mval { font-variant-numeric: tabular-nums; font-size: 13px; min-width: 46px; text-align: right; color: var(--text); }
+    .bar.composite { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+    .bar.tool { background: var(--tool); }
+    .bar.memory { background: var(--memory); }
+    .muted { color: var(--text-dim); }
+
+    /* ── Drill-down ─────────────────────────────────────────── */
+    .drawer-back { position: fixed; inset: 0; background: rgba(4, 7, 12, 0.62); backdrop-filter: blur(3px); opacity: 0; pointer-events: none; transition: opacity .18s; z-index: 40; }
+    .drawer-back.open { opacity: 1; pointer-events: auto; }
+    .drawer {
+      position: fixed; top: 0; right: 0; height: 100%; width: min(420px, 92vw);
+      background: var(--bg-elev); border-left: 1px solid var(--border);
+      box-shadow: -20px 0 60px rgba(0,0,0,0.5); z-index: 50;
+      transform: translateX(100%); transition: transform .22s cubic-bezier(.4,0,.2,1);
+      padding: 24px; overflow-y: auto;
+    }
+    .drawer.open { transform: translateX(0); }
+    .drawer h3 { margin: 0 0 2px; font-size: 15px; }
+    .drawer .dk { font-family: var(--mono); font-size: 12px; color: var(--text-dim); word-break: break-all; margin-bottom: 20px; }
+    .drawer .close { position: absolute; top: 18px; right: 18px; }
+    .stat-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid rgba(36,48,74,0.5); }
+    .stat-row .k { color: var(--text-dim); font-size: 13px; }
+    .stat-row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .split { margin: 20px 0 6px; }
+    .split .seg { display: flex; height: 34px; border-radius: 9px; overflow: hidden; border: 1px solid var(--border); }
+    .split .seg > div { display: grid; place-items: center; font-size: 12px; font-weight: 700; color: #071019; }
+    .split .legend { display: flex; gap: 16px; margin-top: 10px; font-size: 12px; color: var(--text-dim); }
+    .split .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: middle; }
+
+    /* ── Footer ─────────────────────────────────────────────── */
+    footer { margin-top: 34px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 13px; }
+    footer .assure { display: flex; gap: 9px; align-items: flex-start; padding: 13px 15px; background: rgba(74, 222, 128, 0.06); border: 1px solid rgba(74, 222, 128, 0.25); border-radius: 12px; color: #a7f3d0; margin-bottom: 16px; }
+    footer a { color: var(--accent); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+    .foot-links { display: flex; gap: 18px; flex-wrap: wrap; }
+
+    .empty { padding: 40px; text-align: center; color: var(--text-dim); }
+
+    @media (max-width: 720px) {
+      .cards { grid-template-columns: repeat(2, 1fr); }
+      .hide-sm { display: none; }
+      .brand h1 { font-size: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div class="brand">
+        <div class="mark">🔷</div>
+        <div>
+          <h1>Ditto&nbsp;·&nbsp;Subnet&nbsp;118</h1>
+          <div class="sub">Public agent-memory scoring leaderboard</div>
+        </div>
+      </div>
+      <div class="spacer"></div>
+      <span id="status" class="pill"><span class="dot"></span><span id="status-text">Connecting…</span></span>
+      <a id="wandb-link" class="btn ghost" href="#" target="_blank" rel="noopener">📈 Full telemetry ↗</a>
+      <button id="refresh" class="btn" title="Refresh now">↻ Refresh</button>
+    </header>
+
+    <div id="banner" class="banner">
+      <span>⚠</span>
+      <span><b>Sample data.</b> The live API couldn't be reached, so the layout is shown with example numbers. Configure the API base with <code>?api=</code> or the <code>ditto:api-base</code> meta tag.</span>
+    </div>
+
+    <section class="cards" id="cards">
+      <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label">Scored Miners</div><div class="value" id="c-miners">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label">Top Composite</div><div class="value" id="c-top">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label">Median Composite</div><div class="value" id="c-median">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--good)"></div><div class="label">Updated</div><div class="value" id="c-updated">—</div></div>
+    </section>
+
+    <div class="section-head">
+      <h2>Leaderboard</h2>
+      <span class="hint">best eligible score per miner · ranked by composite · click a row for detail</span>
+    </div>
+    <div class="board">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:52px">#</th>
+            <th>Miner</th>
+            <th style="width:190px">Composite</th>
+            <th class="hide-sm" style="width:160px">Tool</th>
+            <th class="hide-sm" style="width:160px">Memory</th>
+            <th class="num hide-sm" style="width:110px">First seen</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="6" class="empty">Loading leaderboard…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <footer>
+      <div class="assure">
+        <span>🛡️</span>
+        <span><b>Anti-overfit by design.</b> Everything here is an <b>aggregate</b> — composite plus tool/memory means. Per-case prompts and expected tool calls (the benchmark's answer key) are never published, and dataset <b>seeds rotate every submission</b>, so a past run never unlocks a future one.</span>
+      </div>
+      <div class="foot-links">
+        <a id="foot-wandb" href="#" target="_blank" rel="noopener">Full per-epoch telemetry (wandb) ↗</a>
+        <a href="https://github.com/ditto-assistant/ditto-subnet" target="_blank" rel="noopener">Subnet & validator ↗</a>
+        <span class="muted">Composite = 0.6·tool + 0.4·memory</span>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Drill-down drawer -->
+  <div id="drawer-back" class="drawer-back"></div>
+  <aside id="drawer" class="drawer" aria-hidden="true">
+    <button class="btn ghost close" id="drawer-close">✕</button>
+    <h3 id="d-title">Miner</h3>
+    <div class="dk" id="d-hotkey"></div>
+    <div class="split">
+      <div class="seg">
+        <div id="d-tool-seg" style="background:var(--tool)"></div>
+        <div id="d-mem-seg" style="background:var(--memory)"></div>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--tool)"></i>Tool <span id="d-tool-pct" class="muted"></span></span>
+        <span><i style="background:var(--memory)"></i>Memory <span id="d-mem-pct" class="muted"></span></span>
+      </div>
+    </div>
+    <div id="d-stats"></div>
+  </aside>
+
+  <script>
+  (function () {
+    "use strict";
+
+    // ── Config resolution ────────────────────────────────────
+    var params = new URLSearchParams(location.search);
+    function meta(name) {
+      var el = document.querySelector('meta[name="' + name + '"]');
+      return el ? (el.getAttribute("content") || "").trim() : "";
+    }
+    var API_BASE = (params.get("api") || meta("ditto:api-base") || "/api/v1").replace(/\/$/, "");
+    var WANDB_URL = params.get("wandb") || meta("ditto:wandb-url") || "https://wandb.ai/";
+    document.getElementById("wandb-link").href = WANDB_URL;
+    document.getElementById("foot-wandb").href = WANDB_URL;
+
+    var REFRESH_MS = 30000; // matches the API's Cache-Control max-age
+    var lastEntries = [];
+
+    // ── Formatting helpers ───────────────────────────────────
+    function pct(x) { return (x * 100).toFixed(1) + "%"; }
+    function fx(x) { return x.toFixed(3); }
+    function shortKey(k) { return k.length > 14 ? k.slice(0, 6) + "…" + k.slice(-6) : k; }
+    function median(nums) {
+      if (!nums.length) return 0;
+      var s = nums.slice().sort(function (a, b) { return a - b; });
+      var m = Math.floor(s.length / 2);
+      return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+    }
+    function relTime(iso) {
+      var t = new Date(iso).getTime();
+      if (isNaN(t)) return "—";
+      var s = Math.max(0, (Date.now() - t) / 1000);
+      if (s < 60) return Math.floor(s) + "s ago";
+      if (s < 3600) return Math.floor(s / 60) + "m ago";
+      if (s < 86400) return Math.floor(s / 3600) + "h ago";
+      return Math.floor(s / 86400) + "d ago";
+    }
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+      });
+    }
+
+    // ── Status pill / banner ─────────────────────────────────
+    function setStatus(mode, text) {
+      var pill = document.getElementById("status");
+      pill.className = "pill " + mode;
+      document.getElementById("status-text").textContent = text;
+      document.getElementById("banner").classList.toggle("show", mode === "sample");
+    }
+
+    // ── Render ───────────────────────────────────────────────
+    function render(data, isSample) {
+      var entries = (data.entries || []).slice().sort(function (a, b) { return b.composite - a.composite; });
+      entries.forEach(function (e, i) { e.rank = i + 1; });
+      lastEntries = entries;
+
+      // Summary cards
+      var comps = entries.map(function (e) { return e.composite; });
+      document.getElementById("c-miners").textContent = entries.length;
+      document.getElementById("c-top").innerHTML = entries.length ? fx(comps[0]) : "—";
+      document.getElementById("c-median").innerHTML = entries.length ? fx(median(comps)) : "—";
+      var when = data.generated_at ? relTime(data.generated_at) : "—";
+      document.getElementById("c-updated").innerHTML = when + (isSample ? ' <small>· sample</small>' : "");
+
+      // Rows
+      var tb = document.getElementById("rows");
+      if (!entries.length) {
+        tb.innerHTML = '<tr><td colspan="6" class="empty">No miners have been scored yet. As soon as a submission clears scoring it appears here.</td></tr>';
+        return;
+      }
+      tb.innerHTML = entries.map(function (e, i) {
+        var rankCls = i < 3 ? " r" + (i + 1) : "";
+        var champ = i === 0 ? '<span class="badge">👑 LEADER</span>' : "";
+        return '' +
+          '<tr data-i="' + i + '"' + (i === 0 ? ' class="champion"' : '') + '>' +
+            '<td><span class="rank' + rankCls + '">' + (i + 1) + '</span></td>' +
+            '<td><span class="hotkey">' + esc(shortKey(e.miner_hotkey)) + '</span>' + champ +
+              '<span class="copy" data-key="' + esc(e.miner_hotkey) + '" title="Copy hotkey">⧉</span></td>' +
+            '<td>' + bar("composite", e.composite) + '</td>' +
+            '<td class="hide-sm">' + bar("tool", e.tool_mean) + '</td>' +
+            '<td class="hide-sm">' + bar("memory", e.memory_mean) + '</td>' +
+            '<td class="num hide-sm muted">' + relTime(e.first_seen) + '</td>' +
+          '</tr>';
+      }).join("");
+    }
+
+    function bar(kind, v) {
+      var w = Math.max(0, Math.min(1, v)) * 100;
+      return '<div class="metric"><div class="barwrap"><div class="bar ' + kind + '" style="width:' + w.toFixed(1) + '%"></div></div>' +
+             '<span class="mval">' + fx(v) + '</span></div>';
+    }
+
+    // ── Drill-down ───────────────────────────────────────────
+    function openDrawer(i) {
+      var e = lastEntries[i];
+      if (!e) return;
+      document.getElementById("d-title").textContent = "Rank #" + e.rank + (e.rank === 1 ? " · 👑 Leader" : "");
+      document.getElementById("d-hotkey").textContent = e.miner_hotkey;
+
+      var tool = e.tool_mean, mem = e.memory_mean, sum = tool + mem || 1;
+      var tw = (tool / sum) * 100, mw = 100 - tw;
+      document.getElementById("d-tool-seg").style.width = tw + "%";
+      document.getElementById("d-mem-seg").style.width = mw + "%";
+      document.getElementById("d-tool-seg").textContent = tw > 14 ? fx(tool) : "";
+      document.getElementById("d-mem-seg").textContent = mw > 14 ? fx(mem) : "";
+      document.getElementById("d-tool-pct").textContent = fx(tool);
+      document.getElementById("d-mem-pct").textContent = fx(mem);
+
+      document.getElementById("d-stats").innerHTML =
+        stat("Composite", fx(e.composite)) +
+        stat("Tool mean", fx(e.tool_mean) + "  (" + pct(e.tool_mean) + ")") +
+        stat("Memory mean", fx(e.memory_mean) + "  (" + pct(e.memory_mean) + ")") +
+        stat("First seen", new Date(e.first_seen).toLocaleString()) +
+        stat("Rank", "#" + e.rank + " of " + lastEntries.length);
+
+      document.getElementById("drawer").classList.add("open");
+      document.getElementById("drawer").setAttribute("aria-hidden", "false");
+      document.getElementById("drawer-back").classList.add("open");
+    }
+    function stat(k, v) {
+      return '<div class="stat-row"><span class="k">' + esc(k) + '</span><span class="v">' + esc(v) + '</span></div>';
+    }
+    function closeDrawer() {
+      document.getElementById("drawer").classList.remove("open");
+      document.getElementById("drawer").setAttribute("aria-hidden", "true");
+      document.getElementById("drawer-back").classList.remove("open");
+    }
+
+    // ── Events (delegated) ───────────────────────────────────
+    document.getElementById("rows").addEventListener("click", function (ev) {
+      var copy = ev.target.closest(".copy");
+      if (copy) {
+        ev.stopPropagation();
+        navigator.clipboard && navigator.clipboard.writeText(copy.getAttribute("data-key"));
+        var old = copy.textContent; copy.textContent = "✓";
+        setTimeout(function () { copy.textContent = old; }, 900);
+        return;
+      }
+      var tr = ev.target.closest("tr[data-i]");
+      if (tr) openDrawer(+tr.getAttribute("data-i"));
+    });
+    document.getElementById("drawer-close").addEventListener("click", closeDrawer);
+    document.getElementById("drawer-back").addEventListener("click", closeDrawer);
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeDrawer(); });
+    document.getElementById("refresh").addEventListener("click", function () { load(true); });
+
+    // ── Data load ────────────────────────────────────────────
+    function load(manual) {
+      if (manual) setStatus("", "Refreshing…");
+      var ctrl = new AbortController();
+      var to = setTimeout(function () { ctrl.abort(); }, 8000);
+      fetch(API_BASE + "/public/leaderboard", { signal: ctrl.signal, headers: { accept: "application/json" } })
+        .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+        .then(function (data) {
+          clearTimeout(to);
+          setStatus("live", "Live");
+          render(data, false);
+        })
+        .catch(function () {
+          clearTimeout(to);
+          setStatus("sample", "Sample data");
+          render(SAMPLE, true);
+        });
+    }
+
+    // ── Sample data (mirrors the real /public/leaderboard shape) ──
+    var SAMPLE = {
+      generated_at: new Date(Date.now() - 12000).toISOString(),
+      count: 5,
+      entries: [
+        { rank: 1, miner_hotkey: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", composite: 0.658, tool_mean: 0.867, memory_mean: 0.345, first_seen: new Date(Date.now() - 86400000 * 2).toISOString() },
+        { rank: 2, miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.342, first_seen: new Date(Date.now() - 86400000 * 3).toISOString() },
+        { rank: 3, miner_hotkey: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", composite: 0.587, tool_mean: 0.867, memory_mean: 0.167, first_seen: new Date(Date.now() - 86400000 * 1).toISOString() },
+        { rank: 4, miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.303, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
+        { rank: 5, miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.285, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
+      ]
+    };
+
+    // ── Go ───────────────────────────────────────────────────
+    load(false);
+    setInterval(function () { load(false); }, REFRESH_MS);
+  })();
+  </script>
+</body>
+</html>
