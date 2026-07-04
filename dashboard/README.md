@@ -52,7 +52,19 @@ marked amber banner, so the layout is always previewable before deploy.
 
 ## Deploy
 
-It's a static file: upload `index.html` to object storage (S3/MinIO/GCS) and
-front it with a CDN, or serve it next to the API (same origin → the default
-`/api/v1` base just works). The API sets `Cache-Control: public, max-age=30`;
-the dashboard auto-refreshes on the same 30s cadence.
+**Default (this repo): served by the platform, same-origin.** The API serves
+this file at `/` (see `factory.py`), so on the deployed hosts it's already live:
+
+- dev  → `https://platform-api-dev.heyditto.ai/`
+- prod → `https://platform-api.heyditto.ai/`
+
+Same-origin means the SPA's `/api/v1/public/*` calls need no CORS and the wandb
+link is injected from `DITTO_DASHBOARD_WANDB_URL` at serve time — no need to edit
+this file per environment. `DITTO_DASHBOARD_ENABLED=false` runs the API headless.
+
+**Alternative: host it yourself.** It's a plain static file — upload to object
+storage (S3/MinIO/GCS) behind a CDN, or any static host. A *cross-origin* host
+would additionally require CORS on the API's `/public/*` routes (not currently
+enabled, since the default is same-origin). The API sets
+`Cache-Control: public, max-age=30` on the data; the SPA auto-refreshes on the
+same 30s cadence.
