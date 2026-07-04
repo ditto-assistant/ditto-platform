@@ -11,11 +11,11 @@ PK still guarantees one row per ``(agent, validator)``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
@@ -39,6 +39,8 @@ class LedgerRow:
     miner_hotkey: str
     agent_id: UUID
     composite: float
+    tool_mean: float
+    memory_mean: float
     first_seen: datetime
     sha256: str
     size_bytes: int | None
@@ -47,6 +49,80 @@ class LedgerRow:
     validator_hotkey: str
     signature: str | None
     status: AgentStatus
+
+
+@dataclass(frozen=True)
+class HealthRollup:
+    """Aggregate subnet-health counters for the public dashboard.
+
+    Everything here is derived from what the platform *actually* records —
+    submissions and the scores validators report back. Run started/failed counts
+    and set-weights latency are validator-side telemetry (wandb), not stored
+    here, so this rollup deliberately omits a "success rate": the platform only
+    ever sees a *successful* score, so it cannot honestly report failures.
+    """
+
+    miners: int
+    """Distinct miners who have ever submitted an agent."""
+    scored_miners: int
+    """Distinct miners with at least one agent in ``scored`` (== leaderboard size)."""
+    scored_agents: int
+    """Agents currently in ``scored`` (eligible submissions)."""
+    last_scored_at: datetime | None
+    """Newest score ``generated_at`` — when a validator last scored anything."""
+    scores_24h: int
+    """Scores generated in the last 24h — scoring throughput."""
+    avg_latency_ms: int | None
+    """Mean of the per-score median case latency (ms), across all scores."""
+
+
+_HEALTH_WINDOW = timedelta(hours=24)
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Coerce a possibly-naive DB timestamp to aware UTC.
+
+    ``TIMESTAMP(timezone=True)`` round-trips as aware on Postgres but can come
+    back naive on the SQLite unit-test fallback; treat naive as UTC so the 24h
+    window comparison is dialect-independent.
+    """
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+async def get_public_health(session: AsyncSession, *, now: datetime) -> HealthRollup:
+    """Compute the public subnet-health rollup as of ``now`` (aware UTC).
+
+    Two cheap reads: a conditional-aggregate over ``agents`` for the miner/agent
+    counts, and a scan of ``(generated_at, median_ms)`` over ``scores`` reduced
+    in Python. The Python reduction (rather than a SQL time filter + window)
+    keeps the 24h cutoff and the naive/aware timestamp handling identical across
+    Postgres and the SQLite test fallback; the ``scores`` table is small at
+    subnet scale (one row per agent per validator).
+    """
+    scored = AgentStatus.SCORED
+    counts = (
+        await session.execute(
+            select(
+                func.count(func.distinct(Agent.miner_hotkey)),
+                func.count(
+                    func.distinct(case((Agent.status == scored, Agent.miner_hotkey)))
+                ),
+                func.count(case((Agent.status == scored, Agent.agent_id))),
+            )
+        )
+    ).one()
+
+    rows = (await session.execute(select(Score.generated_at, Score.median_ms))).all()
+    cutoff = now - _HEALTH_WINDOW
+    generated = [_as_utc(r[0]) for r in rows]
+    return HealthRollup(
+        miners=int(counts[0]),
+        scored_miners=int(counts[1]),
+        scored_agents=int(counts[2]),
+        last_scored_at=max(generated) if generated else None,
+        scores_24h=sum(1 for g in generated if g >= cutoff),
+        avg_latency_ms=(round(sum(r[1] for r in rows) / len(rows)) if rows else None),
+    )
 
 
 async def upsert_score(
@@ -158,6 +234,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
     agent_best = select(
         Score.agent_id.label("agent_id"),
         Score.composite.label("composite"),
+        Score.tool_mean.label("tool_mean"),
+        Score.memory_mean.label("memory_mean"),
         Score.seed.label("seed"),
         Score.run_id.label("run_id"),
         Score.validator_hotkey.label("validator_hotkey"),
@@ -178,6 +256,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             Agent.created_at.label("first_seen"),
             Agent.status.label("status"),
             agent_best.c.composite,
+            agent_best.c.tool_mean,
+            agent_best.c.memory_mean,
             agent_best.c.seed,
             agent_best.c.run_id,
             agent_best.c.validator_hotkey,
@@ -215,6 +295,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             miner_hotkey=row.miner_hotkey,
             agent_id=row.agent_id,
             composite=row.composite,
+            tool_mean=row.tool_mean,
+            memory_mean=row.memory_mean,
             first_seen=row.first_seen,
             sha256=row.sha256,
             size_bytes=row.size_bytes,

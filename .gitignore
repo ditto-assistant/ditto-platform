@@ -26,3 +26,8 @@ htmlcov/
 
 # IDE
 .idea/
+
+# Local operator secrets — never commit (hotkey mnemonic, OpenRouter/GitHub keys)
+docs/validator/or_gh_secrets.yml
+*secrets*.yml
+*secrets*.yaml

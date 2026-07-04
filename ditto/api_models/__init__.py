@@ -18,6 +18,11 @@ Usage:
 from __future__ import annotations
 
 from ditto.api_models.health import HealthResponse
+from ditto.api_models.public import (
+    PublicHealthResponse,
+    PublicLeaderboardEntry,
+    PublicLeaderboardResponse,
+)
 from ditto.api_models.retrieval import AgentResponse, AgentStatusResponse
 from ditto.api_models.screener import (
     ScreenerQueueItem,
@@ -52,6 +57,9 @@ __all__ = [
     "HealthResponse",
     "LedgerEntry",
     "LedgerResponse",
+    "PublicHealthResponse",
+    "PublicLeaderboardEntry",
+    "PublicLeaderboardResponse",
     "ScoreReport",
     "ScreenResultRequest",
     "ScreenResultResponse",
