@@ -68,9 +68,10 @@ _MINHASH_K = 256
 _HASH_HEX = 16
 
 # Decompression-bomb + work guards. The upload cap bounds the *compressed* tarball
-# at 2 MiB, but gzip/tar inflate far past that, so fingerprinting reads through its
-# own limits. Tripping any of them yields ``None`` ("unfingerprintable"), which the
-# gate reads as no content match (the sha256 + size signals still apply).
+# at 20 MiB by default, but gzip/tar inflate far past that, so fingerprinting
+# reads through its own limits. Tripping any of them yields ``None``
+# ("unfingerprintable"), which the gate reads as no content match (the sha256 +
+# size signals still apply).
 _MAX_TOTAL_BYTES = 64 * 1024 * 1024  # matches the dittobench sandbox extract cap
 _MAX_FILE_BYTES = 8 * 1024 * 1024
 # Bound on *every* iterated tar member, not just regular files: a tar of hundreds

@@ -32,6 +32,7 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated
@@ -129,6 +130,17 @@ async def _assert_validator_permitted(
     than a silent allow/deny; a registered-but-unpermitted or unregistered
     hotkey is a :class:`ValidatorAuthError`.
     """
+    if os.environ.get("DITTO_DEV_ALLOW_UNPERMITTED_VALIDATOR", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        logger.warning(
+            "DEV: allowing validator request without permit hotkey=%s netuid=%d",
+            hotkey,
+            netuid,
+        )
+        return
     try:
         neurons = await chain.get_recent_neurons(netuid)
     except ChainError as e:

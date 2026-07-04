@@ -22,7 +22,7 @@ top of). The platform stores the tarball in object storage keyed by agent id and
 
 | Stage | Where | Check |
 | --- | --- | --- |
-| **Upload** | `endpoints/upload.py` (`/api/v1/upload/*`) | On-chain eval-fee payment verified (replay-protected); tarball ≤ **2 MiB** (`MAX_TARBALL_SIZE_BYTES`) enforced from the *actual streamed bytes*; **SHA-256 re-verified** against the miner's claim; one payment per upload. |
+| **Upload** | `endpoints/upload.py` (`/api/v1/upload/*`) | On-chain eval-fee payment verified (replay-protected); tarball ≤ **20 MiB** by default (`MAX_TARBALL_SIZE_BYTES`, overridable with `DITTO_MAX_TARBALL_SIZE_BYTES`) enforced from the *actual streamed bytes*; **SHA-256 re-verified** against the miner's claim; one payment per upload. |
 | **Screen** | `endpoints/screener.py` (`/api/v1/screener/*`) + worker | The screener worker `docker build`s the crate as a cheap gate and reports a verdict: pass → `evaluating`, fail → `screening_failed`. This is the promotion that was formerly manual. |
 | **Evaluate** | `dittobench-api` (mode B) | Fetch the presigned tarball; safe-extract with zip-slip + gzip-bomb guards; require a `Dockerfile` at the tarball root (or a single top-level dir); `docker build` + run the container; drive `GET /health`, `POST /seed`, `POST /run`; score. |
 | **Anti-overfit** | `dittobench-api` datagen | A **fresh seed per run** (stratified categories); the miner cannot see or pin the dataset. Difficulty variance is calibrated to a between-seed stddev ≤ 0.03. |
