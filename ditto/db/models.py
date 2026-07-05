@@ -94,6 +94,17 @@ class Agent(Base):
     tarballs that were unreadable/empty at upload (the gate reads null as "no
     content match")."""
 
+    structural_fingerprint: Mapped[dict | None] = mapped_column(
+        _JSON_VARIANT, nullable=True
+    )
+    """AST-level shingle MinHash sketch of the crate, same ``{v,k,card,m}`` shape as
+    :attr:`content_fingerprint` (see the dittobench ``astfp`` package). Computed by
+    dittobench where the crate is unpacked and a Rust parser exists, it hashes only
+    the parse-tree *shape*, so it survives identifier renaming that the lexical
+    channel misses. Arrives (unsigned, advisory) on the score report and is written
+    at score time. Nullable: null before this landed, on the local harness_url
+    path, or when the crate has no parseable Rust."""
+
     duplicate_of: Mapped[UUID | None] = mapped_column(
         SaUUID(as_uuid=True), nullable=True
     )

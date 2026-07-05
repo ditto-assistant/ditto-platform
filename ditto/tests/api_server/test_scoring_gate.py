@@ -35,6 +35,7 @@ def _entry(
     sha256: str = "aa" * 32,
     size_bytes: int | None = 524288,
     content_fingerprint: dict | None = None,
+    structural_fingerprint: dict | None = None,
 ) -> LedgerRow:
     return LedgerRow(
         miner_hotkey=miner,
@@ -51,6 +52,7 @@ def _entry(
         signature="ab" * 64,
         status=AgentStatus.SCORED,
         content_fingerprint=content_fingerprint,
+        structural_fingerprint=structural_fingerprint,
     )
 
 
@@ -208,6 +210,59 @@ class TestEvaluateAntidup:
         )
         assert decision.held is True
         assert "containment" in (decision.reason or "")
+
+    def test_structural_dup_held_when_lexical_differs(self) -> None:
+        # An identifier-renamed copy: the LEXICAL sketch diverges (text changed),
+        # but the STRUCTURAL (AST) sketch still matches => held via the structural
+        # channel. Lexical fingerprints are made deliberately disjoint.
+        struct = {f"{i:016x}" for i in range(30)}
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=500000,
+            content_fingerprint=_sk({f"lex{i:013x}" for i in range(30)}),
+            structural_fingerprint=_sk(struct),
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Copier",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=700000,
+            # Different lexical text (renamed identifiers) but identical AST shape.
+            content_fingerprint=_sk({f"other{i:011x}" for i in range(30)}),
+            structural_fingerprint=_sk(struct),
+            eligible=[incumbent],
+        )
+        assert decision.held is True
+        assert decision.duplicate_of == incumbent.agent_id
+        assert "structural near-duplicate" in (decision.reason or "")
+
+    def test_structural_below_tol_not_held(self) -> None:
+        # Two crates sharing reference-harness AST scaffolding but well under the
+        # (high) structural threshold, and lexically distinct => not held.
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=500000,
+            content_fingerprint=_sk({f"lex{i:013x}" for i in range(30)}),
+            structural_fingerprint=_sk({f"{i:016x}" for i in range(30)}),
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=900000,
+            content_fingerprint=_sk({f"z{i:015x}" for i in range(30)}),
+            # 15 of 45 shingles shared => Jaccard 0.33, containment 0.5: below the
+            # 0.85 / 0.98 structural tolerances.
+            structural_fingerprint=_sk(
+                {f"{i:016x}" for i in range(15)} | {f"s{i:015x}" for i in range(15)}
+            ),
+            eligible=[incumbent],
+        )
+        assert decision.held is False
 
     def test_distinct_content_not_held_despite_close_score(self) -> None:
         # Two independent harnesses that only share reference scaffolding: close

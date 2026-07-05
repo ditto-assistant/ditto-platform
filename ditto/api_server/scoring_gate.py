@@ -6,10 +6,13 @@ dethrone the original. The KOTH+ATH fold already defeats a *verbatim* copy — i
 ties the incumbent, never clears the 1% margin, and first-seen protects the
 original. This gate adds cheap signals against a *lightly-tweaked* copy that
 nudges its score just past the incumbent: such a submission scores within a hair
-of the agent it surpasses and either has a near-identical tarball size or — after
-a re-indent/rename/reformat/edit that moves the size — a near-identical *content*
-fingerprint (the shingle MinHash sketch from :mod:`ditto.api_server.fingerprint`),
-compared by Jaccard (edit-in-place copy) or containment (padded copy).
+of the agent it surpasses and matches on tarball size or on one of two fingerprint
+channels — a *lexical* sketch of the tarball text
+(:mod:`ditto.api_server.fingerprint`), which survives reindent/rename/reformat/edit
+and padding, or a *structural* sketch of the crate's AST shape (computed by
+dittobench, arriving on the score report), which additionally survives identifier
+renaming. Both channels are compared by Jaccard (edit-in-place) or containment
+(padded copy).
 
 This is **moderation, not weight logic** — it decides only whether a suspicious
 high-scorer is held in ``ath_pending_review`` for human review (see
@@ -47,6 +50,12 @@ _DEFAULT_SIZE_TOL = 8192
 # (see the subnet's KOTH-parameter validation task).
 _DEFAULT_JACCARD_TOL = 0.75
 _DEFAULT_CONTAINMENT_TOL = 0.95
+# Structural (AST) thresholds are higher than the lexical ones: the structural
+# sketch discards identifiers + formatting, so two independent crates built on the
+# same reference harness share far more of their parse-tree shape than their text.
+# Only a near-total structural match should trip this rename-resistant channel.
+_DEFAULT_STRUCTURAL_JACCARD_TOL = 0.85
+_DEFAULT_STRUCTURAL_CONTAINMENT_TOL = 0.98
 
 
 @dataclass(frozen=True)
@@ -76,10 +85,13 @@ def evaluate_antidup(
     size_bytes: int | None,
     eligible: Sequence[LedgerRow],
     content_fingerprint: dict | None = None,
+    structural_fingerprint: dict | None = None,
     score_tol: float = _DEFAULT_SCORE_TOL,
     size_tol: int = _DEFAULT_SIZE_TOL,
     jaccard_tol: float = _DEFAULT_JACCARD_TOL,
     containment_tol: float = _DEFAULT_CONTAINMENT_TOL,
+    structural_jaccard_tol: float = _DEFAULT_STRUCTURAL_JACCARD_TOL,
+    structural_containment_tol: float = _DEFAULT_STRUCTURAL_CONTAINMENT_TOL,
 ) -> ReviewDecision:
     """Decide whether a just-scored agent should be held for copy review.
 
@@ -88,11 +100,17 @@ def evaluate_antidup(
     harness is not a copier). Held iff, against **another miner's** eligible agent:
 
     1. **Exact copy** — same ``sha256``. Byte-identical resubmission.
-    2. **Content near-duplicate** — composites within ``score_tol`` *and* the
-       shingle-sketch fingerprints either at least ``jaccard_tol`` Jaccard-similar
-       (a copy edited in place) *or* at least ``containment_tol`` contained (a copy
-       padded with junk files to dilute Jaccard). Survives re-indent/rename/reformat
-       and localized edits that the byte-level size rule (rule 3) misses.
+    2. **Near-duplicate fingerprint** — composites within ``score_tol`` *and*
+       either sketch channel matches:
+
+       - *lexical* (``content_fingerprint``, from the tarball text) at least
+         ``jaccard_tol`` Jaccard or ``containment_tol`` contained — survives
+         re-indent / rename / reformat / localized edits / junk-file padding;
+       - *structural* (``structural_fingerprint``, the AST shape from dittobench)
+         at least ``structural_jaccard_tol`` / ``structural_containment_tol`` —
+         additionally survives identifier renaming, at higher thresholds because
+         unrelated crates share more parse-tree shape than text.
+
     3. **Size near-duplicate** — composites within ``score_tol`` *and* tarball
        sizes within ``size_tol`` (a lightly-tweaked copy barely moves either).
        Retained as a cheap catch for rows with no fingerprint (uploaded before
@@ -101,7 +119,7 @@ def evaluate_antidup(
     Rules 2 and 3 check *every* other-miner eligible agent, in either score
     direction, so a genuine unrelated agent scoring in between cannot mask the
     copy. A genuine improvement (composite more than ``score_tol`` from any other
-    miner's score, with both a different size and a distinct fingerprint) is never
+    miner's score, with a different size and both fingerprints distinct) is never
     held. Pure + deterministic: ``eligible`` arrives in a fixed order, so the
     reported ``duplicate_of`` (the first match) is stable.
     """
@@ -118,25 +136,37 @@ def evaluate_antidup(
                 reason=f"exact sha256 match of agent {e.agent_id}",
             )
 
-    # 2. Content near-dup: close in score AND near-identical normalized source,
-    #    even if the tarball size drifted (re-indent / rename / reformat / edit).
-    #    Checked before the size rule because the fingerprint is the stronger,
-    #    size-independent signal.
+    # 2. Near-dup fingerprint: close in score AND a matching sketch on either the
+    #    lexical or the structural channel. Checked before the size rule because a
+    #    fingerprint is the stronger, size-independent signal. Lexical is tried
+    #    first (more precise / lower false-positive) then structural (rename-proof).
     for e in others:
-        if abs(composite - e.composite) <= score_tol:
-            jaccard, containment = content_similarity(
-                content_fingerprint, e.content_fingerprint
+        if abs(composite - e.composite) > score_tol:
+            continue
+        lex_j, lex_c = content_similarity(content_fingerprint, e.content_fingerprint)
+        if lex_j >= jaccard_tol or lex_c >= containment_tol:
+            return ReviewDecision(
+                held=True,
+                duplicate_of=e.agent_id,
+                reason=(
+                    f"content near-duplicate of agent {e.agent_id}: "
+                    f"composite delta {abs(composite - e.composite):.4f}, "
+                    f"jaccard {lex_j:.3f}, containment {lex_c:.3f}"
+                ),
             )
-            if jaccard >= jaccard_tol or containment >= containment_tol:
-                return ReviewDecision(
-                    held=True,
-                    duplicate_of=e.agent_id,
-                    reason=(
-                        f"content near-duplicate of agent {e.agent_id}: "
-                        f"composite delta {abs(composite - e.composite):.4f}, "
-                        f"jaccard {jaccard:.3f}, containment {containment:.3f}"
-                    ),
-                )
+        str_j, str_c = content_similarity(
+            structural_fingerprint, e.structural_fingerprint
+        )
+        if str_j >= structural_jaccard_tol or str_c >= structural_containment_tol:
+            return ReviewDecision(
+                held=True,
+                duplicate_of=e.agent_id,
+                reason=(
+                    f"structural near-duplicate of agent {e.agent_id}: "
+                    f"composite delta {abs(composite - e.composite):.4f}, "
+                    f"structural jaccard {str_j:.3f}, containment {str_c:.3f}"
+                ),
+            )
 
     # 3. Size near-dup of another miner: close in both score and tarball size.
     if size_bytes is not None:
