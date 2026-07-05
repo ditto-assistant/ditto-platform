@@ -14,6 +14,7 @@ Deferred validations (added when their dependencies land):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import uuid
@@ -273,9 +274,14 @@ async def upload_agent(
 
     # 7b. Content fingerprint for the anti-copy gate's content-level signal.
     # Computed only now, on an upload that has passed every check, so a rejected
-    # submission never pays the unpack cost. Best-effort: an unreadable/empty
-    # tarball yields None (the gate then relies on sha256 + size), never a 500.
-    content_fingerprint = compute_content_fingerprint(tar_bytes)
+    # submission never pays the unpack cost. Offloaded to a worker thread because
+    # it is CPU-bound (gunzip + shingle-hash the whole tree) and would otherwise
+    # block the event loop for every concurrent request. Best-effort: an
+    # unreadable/empty tarball yields None (the gate then relies on sha256 + size),
+    # never a 500.
+    content_fingerprint = await asyncio.to_thread(
+        compute_content_fingerprint, tar_bytes
+    )
 
     # 8. Atomic DB tx: agent + payment commit together or roll back
     # together. A replayed payment proof surfaces as PaymentReplayedError

@@ -7,9 +7,9 @@ ties the incumbent, never clears the 1% margin, and first-seen protects the
 original. This gate adds cheap signals against a *lightly-tweaked* copy that
 nudges its score just past the incumbent: such a submission scores within a hair
 of the agent it surpasses and either has a near-identical tarball size or — after
-a re-indent/rename that moves the size — a near-identical *content* fingerprint
-(the normalized per-file hash set from :mod:`ditto.api_server.fingerprint`), which
-ignores indentation and filenames.
+a re-indent/rename/reformat/edit that moves the size — a near-identical *content*
+fingerprint (the shingle MinHash sketch from :mod:`ditto.api_server.fingerprint`),
+compared by Jaccard (edit-in-place copy) or containment (padded copy).
 
 This is **moderation, not weight logic** — it decides only whether a suspicious
 high-scorer is held in ``ath_pending_review`` for human review (see
@@ -24,7 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ditto.api_server.fingerprint import content_jaccard
+from ditto.api_server.fingerprint import content_similarity
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -37,12 +37,16 @@ _DEFAULT_SCORE_TOL = 0.02
 # A tweaked copy differs from the original by at most a few edited lines, so its
 # gzipped tarball size barely moves. 8 KiB comfortably covers small edits.
 _DEFAULT_SIZE_TOL = 8192
-# Two content fingerprints (normalized per-file hash sets) this Jaccard-similar
-# share almost every file — a reindented/renamed copy still clears it, while two
-# genuinely different harnesses (sharing only the reference scaffolding) fall well
-# short. High on purpose: paired with score proximity below it flags copies, not
-# the common boilerplate every fork of the reference harness carries.
-_DEFAULT_CONTENT_TOL = 0.90
+# Content-fingerprint (shingle-sketch) thresholds. Jaccard catches a copy edited
+# in place; containment (overlap coefficient) catches one padded with junk files
+# to dilute Jaccard. Containment's bar is higher because it is the more
+# false-positive-prone of the two on shared reference-harness scaffolding — only a
+# near-total subset should trip it. Both are paired with score proximity below, and
+# a hold only routes to *human* review, so these are deliberately conservative
+# signals, not an autoban. They want tuning against a real score/similarity corpus
+# (see the subnet's KOTH-parameter validation task).
+_DEFAULT_JACCARD_TOL = 0.75
+_DEFAULT_CONTAINMENT_TOL = 0.95
 
 
 @dataclass(frozen=True)
@@ -71,10 +75,11 @@ def evaluate_antidup(
     composite: float,
     size_bytes: int | None,
     eligible: Sequence[LedgerRow],
-    content_fingerprint: list[str] | None = None,
+    content_fingerprint: dict | None = None,
     score_tol: float = _DEFAULT_SCORE_TOL,
     size_tol: int = _DEFAULT_SIZE_TOL,
-    content_tol: float = _DEFAULT_CONTENT_TOL,
+    jaccard_tol: float = _DEFAULT_JACCARD_TOL,
+    containment_tol: float = _DEFAULT_CONTAINMENT_TOL,
 ) -> ReviewDecision:
     """Decide whether a just-scored agent should be held for copy review.
 
@@ -83,10 +88,11 @@ def evaluate_antidup(
     harness is not a copier). Held iff, against **another miner's** eligible agent:
 
     1. **Exact copy** — same ``sha256``. Byte-identical resubmission.
-    2. **Content near-duplicate** — composites within ``score_tol`` *and* content
-       fingerprints at least ``content_tol`` Jaccard-similar. Catches a copy that
-       re-indents or renames files to move its byte size (dodging rule 3) while
-       leaving the normalized source all but unchanged.
+    2. **Content near-duplicate** — composites within ``score_tol`` *and* the
+       shingle-sketch fingerprints either at least ``jaccard_tol`` Jaccard-similar
+       (a copy edited in place) *or* at least ``containment_tol`` contained (a copy
+       padded with junk files to dilute Jaccard). Survives re-indent/rename/reformat
+       and localized edits that the byte-level size rule (rule 3) misses.
     3. **Size near-duplicate** — composites within ``score_tol`` *and* tarball
        sizes within ``size_tol`` (a lightly-tweaked copy barely moves either).
        Retained as a cheap catch for rows with no fingerprint (uploaded before
@@ -113,19 +119,22 @@ def evaluate_antidup(
             )
 
     # 2. Content near-dup: close in score AND near-identical normalized source,
-    #    even if the tarball size drifted (re-indent / rename). Checked before the
-    #    size rule because the fingerprint is the stronger, size-independent signal.
+    #    even if the tarball size drifted (re-indent / rename / reformat / edit).
+    #    Checked before the size rule because the fingerprint is the stronger,
+    #    size-independent signal.
     for e in others:
         if abs(composite - e.composite) <= score_tol:
-            jaccard = content_jaccard(content_fingerprint, e.content_fingerprint)
-            if jaccard >= content_tol:
+            jaccard, containment = content_similarity(
+                content_fingerprint, e.content_fingerprint
+            )
+            if jaccard >= jaccard_tol or containment >= containment_tol:
                 return ReviewDecision(
                     held=True,
                     duplicate_of=e.agent_id,
                     reason=(
                         f"content near-duplicate of agent {e.agent_id}: "
                         f"composite delta {abs(composite - e.composite):.4f}, "
-                        f"content jaccard {jaccard:.3f}"
+                        f"jaccard {jaccard:.3f}, containment {containment:.3f}"
                     ),
                 )
 

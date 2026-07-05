@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import io
 import tarfile
 
 from ditto.api_server.fingerprint import (
+    _FP_VERSION,
+    _MINHASH_K,
     compute_content_fingerprint,
-    content_jaccard,
+    content_similarity,
 )
 
 
@@ -23,82 +26,171 @@ def _tar_gz(files: dict[str, bytes]) -> bytes:
     return buf.getvalue()
 
 
+def _rust_file(n_fns: int, prefix: str = "f") -> bytes:
+    """A plausibly-sized Rust source file with ``n_fns`` small functions."""
+    body = "\n".join(
+        f"fn {prefix}{i}(x: i64) -> i64 {{\n    let y = x + {i};\n    y * 2\n}}"
+        for i in range(n_fns)
+    )
+    return body.encode()
+
+
+def _jaccard(a: dict | None, b: dict | None) -> float:
+    return content_similarity(a, b)[0]
+
+
+def _containment(a: dict | None, b: dict | None) -> float:
+    return content_similarity(a, b)[1]
+
+
 class TestComputeContentFingerprint:
-    def test_stable_and_sorted(self) -> None:
-        fp = compute_content_fingerprint(
-            _tar_gz({"a.py": b"print(1)\n", "b.py": b"print(2)\n"})
-        )
+    def test_shape_and_determinism(self) -> None:
+        fp = compute_content_fingerprint(_tar_gz({"src/lib.rs": _rust_file(10)}))
         assert fp is not None
-        assert fp == sorted(fp)
-        # Deterministic: same input, same fingerprint.
+        assert fp["v"] == _FP_VERSION and fp["k"] == _MINHASH_K
+        assert fp["card"] >= 1 and fp["m"] == sorted(fp["m"])
+        assert len(fp["m"]) <= _MINHASH_K
+        # Deterministic.
         assert fp == compute_content_fingerprint(
-            _tar_gz({"a.py": b"print(1)\n", "b.py": b"print(2)\n"})
+            _tar_gz({"src/lib.rs": _rust_file(10)})
         )
 
-    def test_reindent_is_invisible(self) -> None:
-        # Same logic, re-indented + trailing whitespace: identical fingerprint.
-        original = _tar_gz({"main.py": b"def f():\n    return 1\n"})
-        reindented = _tar_gz({"main.py": b"def f():\n        return 1  \n\n"})
-        assert compute_content_fingerprint(original) == compute_content_fingerprint(
-            reindented
+    def test_self_similarity_is_one(self) -> None:
+        fp = compute_content_fingerprint(_tar_gz({"a.rs": _rust_file(12)}))
+        assert _jaccard(fp, fp) == 1.0
+        assert _containment(fp, fp) == 1.0
+
+    def test_reindent_and_reformat_absorbed(self) -> None:
+        # Leading indent change, tabs, CRLF, AND operator-spacing reformat all wash
+        # out — the whole-file whitespace churn a formatter (rustfmt) produces.
+        orig = b"fn f(x: i64) -> i64 {\n    let y = x + 1;\n    y * 2\n}\n"
+        reformatted = b"fn f(x:i64)->i64{\r\n\t\tlet  y = x+1 ;\r\n\t\ty*2\r\n}\r\n"
+        a = compute_content_fingerprint(_tar_gz({"m.rs": orig}))
+        b = compute_content_fingerprint(_tar_gz({"m.rs": reformatted}))
+        assert _jaccard(a, b) == 1.0
+
+    def test_rename_and_reorder_files_invisible(self) -> None:
+        base = _tar_gz({"a.rs": _rust_file(8, "a"), "b.rs": _rust_file(8, "b")})
+        # Same contents, renamed files, packed in the other order.
+        shuffled = _tar_gz({"z.rs": _rust_file(8, "b"), "y.rs": _rust_file(8, "a")})
+        assert (
+            _jaccard(
+                compute_content_fingerprint(base), compute_content_fingerprint(shuffled)
+            )
+            == 1.0
         )
 
-    def test_rename_and_reorder_are_invisible(self) -> None:
-        # Filenames are not hashed and the fingerprint is a set: renaming the
-        # files and packing them in a different order yields the same result.
-        base = _tar_gz({"a.py": b"AAA\n", "b.py": b"BBB\n"})
-        renamed = _tar_gz({"z_renamed.py": b"BBB\n", "y_renamed.py": b"AAA\n"})
-        assert compute_content_fingerprint(base) == compute_content_fingerprint(renamed)
+    def test_sprinkled_edit_stays_high(self) -> None:
+        # Add a comment line to EVERY file — the evasion that zeroed the old
+        # whole-file-hash approach. Shingling keeps similarity high because only
+        # the few shingles spanning each new line change.
+        files = {f"m{i}.rs": _rust_file(20, f"m{i}") for i in range(4)}
+        edited = {name: data + b"\n// tweaked note\n" for name, data in files.items()}
+        j = _jaccard(
+            compute_content_fingerprint(_tar_gz(files)),
+            compute_content_fingerprint(_tar_gz(edited)),
+        )
+        assert j > 0.85, j
 
-    def test_different_content_differs(self) -> None:
-        one = compute_content_fingerprint(_tar_gz({"a.py": b"alpha\n"}))
-        two = compute_content_fingerprint(_tar_gz({"a.py": b"beta\n"}))
-        assert one != two
+    def test_padding_caught_by_containment(self) -> None:
+        # A verbatim copy that pads with junk files dilutes Jaccard but stays fully
+        # contained in the (larger) copy => containment ~1.0.
+        original = {f"m{i}.rs": _rust_file(15, f"m{i}") for i in range(3)}
+        copy = dict(original)
+        copy.update(
+            {f"pad{i}.txt": (f"lorem ipsum {i}\n" * 40).encode() for i in range(20)}
+        )
+        a = compute_content_fingerprint(_tar_gz(original))
+        b = compute_content_fingerprint(_tar_gz(copy))
+        jac, con = content_similarity(a, b)
+        assert jac < 0.9, jac  # padding did dilute Jaccard
+        assert con > 0.95, con  # but containment still flags it
+
+    def test_distinct_harnesses_low(self) -> None:
+        a = compute_content_fingerprint(_tar_gz({"a.rs": _rust_file(20, "alpha")}))
+        b = compute_content_fingerprint(_tar_gz({"b.rs": _rust_file(20, "beta")}))
+        jac, con = content_similarity(a, b)
+        assert jac < 0.3 and con < 0.3
 
     def test_only_regular_files_counted(self) -> None:
-        # A directory member carries no content and must not become a hash.
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            dir_info = tarfile.TarInfo(name="pkg")
-            dir_info.type = tarfile.DIRTYPE
-            tar.addfile(dir_info)  # directory entry, not a regular file
-            data = b"content\n"
-            info = tarfile.TarInfo(name="pkg/x.py")
+            d = tarfile.TarInfo(name="pkg")
+            d.type = tarfile.DIRTYPE
+            tar.addfile(d)
+            data = _rust_file(5)
+            info = tarfile.TarInfo(name="pkg/x.rs")
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
-        fp = compute_content_fingerprint(buf.getvalue())
-        assert fp is not None
-        assert len(fp) == 1
+        assert compute_content_fingerprint(buf.getvalue()) is not None
 
-    def test_unreadable_tarball_returns_none(self) -> None:
+    def test_member_flood_is_bounded(self) -> None:
+        # Hundreds of thousands of directory headers must not be walked to the end
+        # (the CPU-DoS the per-file cap missed). Returns None fast once the member
+        # cap trips — we assert on the result, the timeout guards the runtime.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for i in range(100000):
+                di = tarfile.TarInfo(name=f"d{i}/")
+                di.type = tarfile.DIRTYPE
+                tar.addfile(di)
+        assert compute_content_fingerprint(buf.getvalue()) is None
+
+    def test_unreadable_or_empty_returns_none(self) -> None:
         assert compute_content_fingerprint(b"not a tarball") is None
         assert compute_content_fingerprint(gzip.compress(b"plain gzip, no tar")) is None
-
-    def test_empty_tarball_returns_none(self) -> None:
         assert compute_content_fingerprint(_tar_gz({})) is None
-        # A tarball whose only file is blank-after-normalization has no hashes.
-        assert compute_content_fingerprint(_tar_gz({"blank.txt": b"\n  \n\n"})) is None
+        assert compute_content_fingerprint(_tar_gz({"blank": b"\n  \n\t\n"})) is None
 
 
-class TestContentJaccard:
-    def test_identical_sets(self) -> None:
-        fp = ["a", "b", "c"]
-        assert content_jaccard(fp, fp) == 1.0
+class TestContentSimilarity:
+    def test_missing_or_version_mismatch_scores_zero(self) -> None:
+        fp = compute_content_fingerprint(_tar_gz({"a.rs": _rust_file(6)}))
+        assert content_similarity(None, fp) == (0.0, 0.0)
+        assert content_similarity(fp, None) == (0.0, 0.0)
+        assert content_similarity({"v": 999, "k": 1, "card": 1, "m": ["x"]}, fp) == (
+            0.0,
+            0.0,
+        )
 
-    def test_disjoint_sets(self) -> None:
-        assert content_jaccard(["a", "b"], ["c", "d"]) == 0.0
+    def test_exact_when_sets_small(self) -> None:
+        # Both shingle sets fit inside k, so the bottom-k sketch is the whole set
+        # and Jaccard is exact, not estimated. Hand-build two overlapping sets.
+        def sk(vals: set[str]) -> dict:
+            return {
+                "v": _FP_VERSION,
+                "k": _MINHASH_K,
+                "card": len(vals),
+                "m": sorted(vals)[:_MINHASH_K],
+            }
 
-    def test_partial_overlap(self) -> None:
-        # {a,b,c} vs {b,c,d}: intersection 2, union 4 => 0.5.
-        assert content_jaccard(["a", "b", "c"], ["b", "c", "d"]) == 0.5
+        a = {f"{i:016x}" for i in range(10)}
+        b = {f"{i:016x}" for i in range(5, 15)}
+        # |A∩B|=5, |A∪B|=15 => J=1/3; min card=10 => containment=5/10=0.5.
+        jac, con = content_similarity(sk(a), sk(b))
+        assert abs(jac - 1 / 3) < 1e-9
+        assert abs(con - 0.5) < 1e-9
 
-    def test_one_edited_file_of_ten_is_high(self) -> None:
-        # A copy that changes exactly one of ten files: intersection 9, union 11.
-        original = [f"h{i}" for i in range(10)]
-        copy = [f"h{i}" for i in range(9)] + ["edited"]
-        assert content_jaccard(original, copy) == 9 / 11  # ~0.818
+    def test_minhash_estimator_accurate_on_large_sets(self) -> None:
+        # Sets far larger than k so the KMV approximation actually engages; the
+        # estimate must track the true Jaccard within sampling tolerance.
+        def h(tag: str, i: int) -> str:
+            return hashlib.sha256(f"{tag}{i}".encode()).hexdigest()[:16]
 
-    def test_missing_fingerprints_score_zero(self) -> None:
-        assert content_jaccard(None, ["a"]) == 0.0
-        assert content_jaccard(["a"], None) == 0.0
-        assert content_jaccard([], ["a"]) == 0.0
+        common = {h("c", i) for i in range(6000)}
+        a_vals = common | {h("a", i) for i in range(2000)}
+        b_vals = common | {h("b", i) for i in range(2000)}
+        true_j = len(a_vals & b_vals) / len(a_vals | b_vals)  # 6000/10000 = 0.6
+
+        def sk(vals: set[str]) -> dict:
+            return {
+                "v": _FP_VERSION,
+                "k": _MINHASH_K,
+                "card": len(vals),
+                "m": sorted(vals)[:_MINHASH_K],
+            }
+
+        jac, con = content_similarity(sk(a_vals), sk(b_vals))
+        assert abs(jac - true_j) < 0.1, (jac, true_j)
+        # true containment = 6000/8000 = 0.75.
+        assert abs(con - 0.75) < 0.12, con

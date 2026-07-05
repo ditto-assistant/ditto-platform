@@ -1,33 +1,40 @@
 """Content fingerprint for the anti-copy gate.
 
 The anti-copy gate in :mod:`ditto.api_server.scoring_gate` starts from two cheap
-signals: an exact ``sha256`` match and a size+score-proximity heuristic. Both are
-*byte*-level — a copier who re-indents the source or renames files moves the
-tarball size past the heuristic's tolerance and dodges it. This module adds a
-*content*-level signal that survives those edits.
+byte-level signals — an exact ``sha256`` match and a size+score-proximity
+heuristic — both of which a copier defeats by re-indenting, renaming files, or
+nudging the tarball size. This module adds a *content*-level signal that survives
+reformatting and localized edits.
 
-The fingerprint is the **set of normalized per-file content hashes** of the
-regular files in the tarball:
+**How it works.** Each regular file's text is normalized (decoded leniently, all
+intra-line whitespace removed, blank lines dropped) so indentation,
+tabs-vs-spaces, line-endings, and operator/keyword-spacing reformatting all
+wash out. The normalized lines are cut into overlapping **k-line shingles**
+(:data:`_SHINGLE_LINES`); every shingle is hashed, and the shingles from all files
+are unioned into one set. Shingling is per-file then unioned, so renaming or
+reordering files is invisible and a *localized* edit only disturbs the handful of
+shingles that span it — unlike a whole-file hash, which any single edit voids.
 
-- The filename is not part of a file's hash, so renaming files does not change
-  the fingerprint (only the *set* of contents matters, and the set is order-free
-  so reordering files is invisible too).
-- Each file's bytes are normalized before hashing — decoded leniently, every
-  line stripped of leading/trailing whitespace, blank lines dropped — so
-  re-indentation and trailing-whitespace churn collapse to the same hash.
+**Storage — a MinHash (bottom-k) sketch.** Keeping the full shingle set would grow
+with harness size; instead the fingerprint stores the ``k`` smallest shingle
+hashes (a KMV / bottom-k MinHash sketch) plus the true set cardinality. That is a
+*fixed*-size summary (:data:`_MINHASH_K` hashes) from which :func:`content_similarity`
+estimates both Jaccard and containment. For a harness whose shingle set is smaller
+than ``k`` (the common case) the sketch is the whole set, so the estimate is
+*exact*; the approximation only engages for unusually large trees.
 
-Two fingerprints are compared with Jaccard similarity (:func:`content_jaccard`):
-``|A ∩ B| / |A ∪ B|``. A lightly-tweaked copy shares almost every file with its
-source and scores near 1.0; two genuinely different harnesses share only the
-common scaffolding and score far lower.
+**What it catches / misses.** Jaccard catches sprinkled small edits; containment
+(the symmetric overlap coefficient) catches a copy that pads itself with junk
+files to dilute Jaccard. It is still a *lexical* signal: it does **not** defeat
+identifier renaming or statement reordering *within* a shingle window — that needs
+language-aware AST/token analysis, which belongs in the screener/dittobench where
+the crate is already unpacked and its Rust toolchain is available (the platform
+has no Rust parser). See ``docs`` handoff for that layer.
 
-This is a **similarity signal, not an AST/semantic detector**: it does not defeat
-identifier renaming or logic reordering *within* a file — the doc routes that
-heavier analysis to the screener/dittobench where the tree is already unpacked.
-It is computed here because ``/upload/agent`` already holds the whole tarball in
-memory (streamed for the size cap + sha256), so the platform gets the signal for
-free without a second unpack. The functions are pure + deterministic so the same
-tarball always yields the same fingerprint (and the gate the same verdict).
+Computed here because ``/upload/agent`` already holds the whole tarball in memory
+(streamed for the size cap + sha256), so the platform gets the signal without a
+second unpack. Everything is pure + deterministic: the same tarball always yields
+the same sketch, and the gate the same verdict.
 """
 
 from __future__ import annotations
@@ -40,51 +47,72 @@ import tarfile
 
 logger = logging.getLogger(__name__)
 
-# Decompression-bomb guards. The upload cap bounds the *compressed* tarball at
-# 2 MiB, but gzip/tar can inflate far past that, so fingerprinting reads through
-# its own independent limits. When either is tripped the tarball is treated as
-# unfingerprintable (returns ``None``) rather than partially hashed — a partial
-# fingerprint could spuriously match or mask a copy, and an abusive tarball is
-# not something the moderation signal should try to reason about.
+# Bump when the normalization / shingling / sketch format changes so stored
+# fingerprints from an older algorithm are not silently compared against new ones
+# (a cross-version Jaccard is meaningless). :func:`content_similarity` returns no
+# match unless both sketches carry the same version.
+_FP_VERSION = 1
+
+# A shingle is this many consecutive normalized lines. Small enough that a
+# one-line edit disturbs only a few shingles (robust to sprinkled edits), large
+# enough that a shingle is distinctive (common single lines like a lone ``}`` do
+# not collide across unrelated crates).
+_SHINGLE_LINES = 4
+# Bottom-k sketch size. 256 keeps the stored fingerprint ~4 KB and, because most
+# harness shingle sets are smaller than this, makes the similarity estimate exact
+# for the common case (the sketch is then the whole set).
+_MINHASH_K = 256
+# Width of each shingle hash: 64 bits as zero-padded hex. Fixed width so the hex
+# strings sort in the same order as the integers they encode (bottom-k == the k
+# lexicographically-smallest), and JSON-safe (no >2^53 bigints on the wire).
+_HASH_HEX = 16
+
+# Decompression-bomb + work guards. The upload cap bounds the *compressed* tarball
+# at 2 MiB, but gzip/tar inflate far past that, so fingerprinting reads through its
+# own limits. Tripping any of them yields ``None`` ("unfingerprintable"), which the
+# gate reads as no content match (the sha256 + size signals still apply).
 _MAX_TOTAL_BYTES = 64 * 1024 * 1024  # matches the dittobench sandbox extract cap
-_MAX_FILES = 5000
-# Per-file read cap: no single member may pull more than this from the stream.
 _MAX_FILE_BYTES = 8 * 1024 * 1024
+# Bound on *every* iterated tar member, not just regular files: a tar of hundreds
+# of thousands of directory/symlink headers is a cheap CPU-DoS otherwise (the
+# member walk is O(headers) regardless of file content).
+_MAX_MEMBERS = 20000
+# Hard ceiling on distinct shingles before we give up (paired with the byte caps).
+_MAX_SHINGLES = 500_000
 
 
-def compute_content_fingerprint(tar_gz_bytes: bytes) -> list[str] | None:
-    """Return the sorted set of normalized per-file content hashes, or ``None``.
+def compute_content_fingerprint(tar_gz_bytes: bytes) -> dict | None:
+    """Return a MinHash shingle sketch of the tarball's source, or ``None``.
 
-    Opens ``tar_gz_bytes`` as a gzipped tar in memory and hashes each regular
-    file's normalized contents (see module docstring). Returns the hex hashes as
-    a sorted, de-duplicated list (stable across runs, JSON-serializable for the
-    ``agents.content_fingerprint`` column).
+    The returned dict is ``{"v", "k", "card", "m"}`` — algorithm version, sketch
+    budget, true shingle-set cardinality, and the sorted bottom-``k`` shingle
+    hashes — JSON-serializable for the ``agents.content_fingerprint`` column and
+    consumed by :func:`content_similarity`.
 
-    Returns ``None`` — meaning "no usable fingerprint", which the gate treats as
-    *no content match* — when the bytes are not a readable tar.gz, contain no
-    regular files, or trip the decompression-bomb guards. Fingerprinting is a
-    best-effort moderation signal layered on top of the already-verified upload,
-    so it never raises into the upload path: a hostile or corrupt tarball that
-    defeats it simply gets no content signal (the sha256 + size signals still
-    apply, and the validator/screener still reject a broken harness downstream).
+    Returns ``None`` — "no usable fingerprint", which the gate treats as no
+    content match — when the bytes are not a readable tar.gz, contain no source
+    lines, or trip the bomb/work guards. Fingerprinting is a best-effort
+    moderation signal layered on an already-verified upload, so it never raises
+    into the upload path: a hostile or corrupt tarball simply gets no content
+    signal (the validator/screener still reject a broken harness downstream).
     """
-    hashes: set[str] = set()
+    shingles: set[str] = set()
     total = 0
-    count = 0
+    members = 0
     try:
         with tarfile.open(fileobj=io.BytesIO(tar_gz_bytes), mode="r:gz") as tar:
             for member in tar:
+                members += 1
+                if members > _MAX_MEMBERS:
+                    logger.warning("fingerprint: >%d members, skipping", _MAX_MEMBERS)
+                    return None
                 if not member.isfile():
                     continue
-                count += 1
-                if count > _MAX_FILES:
-                    logger.warning("fingerprint: >%d files, skipping", _MAX_FILES)
-                    return None
                 extracted = tar.extractfile(member)
-                if extracted is None:  # e.g. a hardlink with no data
+                if extracted is None:  # e.g. a hardlink carrying no data
                     continue
-                # Bounded read: +1 so an over-cap file is detected, not silently
-                # truncated into a hash that a smaller honest file could collide.
+                # Bounded read: +1 so an over-cap file is detected rather than
+                # silently truncated into a hash a smaller honest file could hit.
                 raw = extracted.read(_MAX_FILE_BYTES + 1)
                 if len(raw) > _MAX_FILE_BYTES:
                     logger.warning("fingerprint: file exceeds per-file cap")
@@ -93,55 +121,90 @@ def compute_content_fingerprint(tar_gz_bytes: bytes) -> list[str] | None:
                 if total > _MAX_TOTAL_BYTES:
                     logger.warning("fingerprint: >%d bytes, skipping", _MAX_TOTAL_BYTES)
                     return None
-                digest = _normalized_hash(raw)
-                if digest is not None:
-                    hashes.add(digest)
+                for shingle in _file_shingles(raw):
+                    shingles.add(shingle)
+                    if len(shingles) > _MAX_SHINGLES:
+                        logger.warning("fingerprint: >%d shingles", _MAX_SHINGLES)
+                        return None
     except (tarfile.TarError, gzip.BadGzipFile, EOFError, OSError) as e:
-        # Not a readable tar.gz. The upload already matched the miner-signed
-        # sha256, so a junk body here is the miner's problem downstream, not a
-        # reason to fail intake — fall through to "no fingerprint".
         logger.info("fingerprint: unreadable tarball (%s)", type(e).__name__)
         return None
 
-    if not hashes:
+    if not shingles:
         return None
-    return sorted(hashes)
+    return {
+        "v": _FP_VERSION,
+        "k": _MINHASH_K,
+        "card": len(shingles),
+        "m": sorted(shingles)[:_MINHASH_K],
+    }
 
 
-def _normalized_hash(raw: bytes) -> str | None:
-    """Hash file bytes after normalizing away indentation + whitespace churn.
+def _file_shingles(raw: bytes) -> list[str]:
+    """Return the hashed k-line shingles of one file's normalized text.
 
-    Decodes leniently (``errors="replace"`` so binary blobs still hash stably),
-    strips each line, and drops blank lines, so a re-indented or
-    trailing-whitespace-edited copy of a file collapses to the same digest as its
-    original. Case and token identity are preserved — this defeats reformatting,
-    not renaming-of-identifiers (that heavier analysis is deferred to the
-    screener/dittobench).
-
-    Returns ``None`` when the file is empty after normalization (blank or
-    whitespace-only): such a file carries no content, so folding the hash of the
-    empty string into every such submission's fingerprint would only add a shared
-    token that inflates Jaccard between unrelated harnesses.
+    Normalization decodes leniently (``errors="replace"`` so binary blobs still
+    hash stably), removes *all* intra-line whitespace, and drops blank lines — so
+    indentation, tabs-vs-spaces, line-endings, and operator/keyword spacing
+    reformatting (what a formatter like rustfmt churns) all normalize away. Token
+    identity, ordering, and case within a line are preserved (defeating those is
+    the AST layer's job). Two distinct files would have to share whitespace-free
+    4-line windows to collide, which in practice means the same code. A file with
+    fewer than :data:`_SHINGLE_LINES` non-blank lines yields one whole-file shingle.
     """
     text = raw.decode("utf-8", errors="replace")
-    lines = [stripped for line in text.splitlines() if (stripped := line.strip())]
+    lines = [norm for line in text.splitlines() if (norm := "".join(line.split()))]
     if not lines:
-        return None
-    normalized = "\n".join(lines).encode("utf-8")
-    return hashlib.sha256(normalized).hexdigest()
+        return []
+    k = _SHINGLE_LINES
+    if len(lines) <= k:
+        return [_hash_shingle("\n".join(lines))]
+    return [
+        _hash_shingle("\n".join(lines[i : i + k])) for i in range(len(lines) - k + 1)
+    ]
 
 
-def content_jaccard(a: list[str] | None, b: list[str] | None) -> float:
-    """Return the Jaccard similarity of two content fingerprints in ``[0, 1]``.
+def _hash_shingle(shingle: str) -> str:
+    """Hash one shingle to a fixed-width hex string (top 64 bits of sha256)."""
+    return hashlib.sha256(shingle.encode("utf-8")).hexdigest()[:_HASH_HEX]
 
-    ``|A ∩ B| / |A ∪ B|`` over the two hash sets. Returns ``0.0`` when either
-    fingerprint is missing or empty (nothing to compare ⇒ no content match), so a
-    caller can gate on the score without special-casing ``None``.
+
+def content_similarity(a: dict | None, b: dict | None) -> tuple[float, float]:
+    """Estimate ``(jaccard, containment)`` of two fingerprint sketches in ``[0, 1]``.
+
+    ``jaccard`` = ``|A ∩ B| / |A ∪ B|`` (dilutes when a copy pads itself with junk
+    files). ``containment`` = ``|A ∩ B| / min(|A|, |B|)`` (the symmetric overlap
+    coefficient — ~1.0 when the smaller shingle set is essentially a subset of the
+    larger, so it still fires on a padded copy). Both are computed from the
+    bottom-k sketches via the standard KMV estimator; when a set is small enough to
+    be fully retained (``card <= k``) the estimate is exact.
+
+    Returns ``(0.0, 0.0)`` when either sketch is missing, empty, or a different
+    algorithm version (cross-version comparison is meaningless), so the gate can
+    threshold without special-casing ``None``.
     """
-    if not a or not b:
-        return 0.0
-    sa, sb = set(a), set(b)
-    union = sa | sb
-    if not union:
-        return 0.0
-    return len(sa & sb) / len(union)
+    if not a or not b or a.get("v") != _FP_VERSION or b.get("v") != _FP_VERSION:
+        return (0.0, 0.0)
+    ma, mb = set(a.get("m", ())), set(b.get("m", ()))
+    if not ma or not mb:
+        return (0.0, 0.0)
+
+    # KMV Jaccard: over the k smallest hashes of the union (which are guaranteed to
+    # be present in one of the two bottom-k sketches), the fraction that lie in
+    # *both* sketches — i.e. in the intersection — estimates the Jaccard index.
+    k = min(int(a.get("k", _MINHASH_K)), int(b.get("k", _MINHASH_K)))
+    sample = sorted(ma | mb)[:k]
+    if not sample:
+        return (0.0, 0.0)
+    intersect = sum(1 for v in sample if v in ma and v in mb)
+    jaccard = intersect / len(sample)
+
+    # Recover containment from Jaccard + the true cardinalities: with
+    # U = |A| + |B| - I and J = I / U, the intersection I = J*(|A|+|B|)/(1+J).
+    card_a, card_b = int(a.get("card", 0)), int(b.get("card", 0))
+    smaller = min(card_a, card_b)
+    if jaccard <= 0.0 or smaller <= 0:
+        return (jaccard, 0.0)
+    inter_est = jaccard * (card_a + card_b) / (1.0 + jaccard)
+    containment = min(1.0, inter_est / smaller)
+    return (jaccard, containment)

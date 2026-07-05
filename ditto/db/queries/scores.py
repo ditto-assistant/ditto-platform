@@ -49,8 +49,8 @@ class LedgerRow:
     validator_hotkey: str
     signature: str | None
     status: AgentStatus
-    content_fingerprint: list[str] | None = None
-    """Normalized per-file content-hash set (see
+    content_fingerprint: dict | None = None
+    """Shingle MinHash sketch of the tarball source (see
     :mod:`ditto.api_server.fingerprint`); the gate's content-level anti-copy
     signal. ``None`` for rows uploaded before fingerprinting or with an
     unreadable tarball. Defaulted so it need not be threaded through the
