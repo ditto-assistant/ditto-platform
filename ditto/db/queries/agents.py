@@ -31,6 +31,7 @@ async def insert_agent(
     name: str,
     sha256: str,
     size_bytes: int,
+    content_fingerprint: list[str] | None = None,
 ) -> None:
     """Insert one ``agents`` row inside the caller-owned transaction.
 
@@ -43,6 +44,9 @@ async def insert_agent(
     ``size_bytes`` is the actual streamed tarball size; it feeds the
     anti-copy near-dup signal (a lightly-tweaked copy has a near-identical
     size + score) and is surfaced in the validator ledger.
+    ``content_fingerprint`` (:mod:`ditto.api_server.fingerprint`) is the
+    normalized per-file content-hash set feeding the gate's content-level
+    signal; ``None`` when the tarball was unreadable/empty at upload.
 
     Raises:
         DbIntegrityError: Any constraint violation on ``agents``
@@ -57,6 +61,7 @@ async def insert_agent(
         name=name,
         sha256=sha256,
         size_bytes=size_bytes,
+        content_fingerprint=content_fingerprint,
     )
     session.add(row)
     try:

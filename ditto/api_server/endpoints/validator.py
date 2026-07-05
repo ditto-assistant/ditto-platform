@@ -357,6 +357,7 @@ async def submit_score(
                 sha256=agent.sha256,
                 composite=report.composite,
                 size_bytes=agent.size_bytes,
+                content_fingerprint=agent.content_fingerprint,
                 eligible=eligible,
             )
             if decision.held:

@@ -18,6 +18,7 @@ def _entry(
     miner: str = "5Incumbent",
     sha256: str = "aa" * 32,
     size_bytes: int | None = 524288,
+    content_fingerprint: list[str] | None = None,
 ) -> LedgerRow:
     return LedgerRow(
         miner_hotkey=miner,
@@ -33,6 +34,7 @@ def _entry(
         validator_hotkey="5Validator",
         signature="ab" * 64,
         status=AgentStatus.SCORED,
+        content_fingerprint=content_fingerprint,
     )
 
 
@@ -141,6 +143,108 @@ class TestEvaluateAntidup:
         )
         assert decision.held is True
         assert decision.duplicate_of == original.agent_id
+
+    def test_content_dup_held_when_size_drifts(self) -> None:
+        # The A1 gap: a re-indented/renamed copy whose byte size moved past the
+        # size tolerance, but whose normalized content is all but identical.
+        shared = [f"h{i}" for i in range(20)]
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=500000,
+            content_fingerprint=shared,
+        )
+        # One file edited (intersection 19, union 21 => 0.905 >= 0.90) and the
+        # tarball size drifted 100 KiB past the size rule.
+        copy_fp = [f"h{i}" for i in range(19)] + ["tweaked"]
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Copier",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=600000,  # well past the 8 KiB size tolerance
+            content_fingerprint=copy_fp,
+            eligible=[incumbent],
+        )
+        assert decision.held is True
+        assert decision.duplicate_of == incumbent.agent_id
+        assert "content near-duplicate" in (decision.reason or "")
+
+    def test_distinct_content_not_held_despite_close_score(self) -> None:
+        # Two independent harnesses that only share reference scaffolding: close
+        # score but low fingerprint overlap => a genuine competitor, not a copy.
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=500000,
+            content_fingerprint=[f"h{i}" for i in range(20)],
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=900000,  # different size, so the size rule can't fire either
+            content_fingerprint=[f"h{i}" for i in range(5)]
+            + [f"x{i}" for i in range(15)],
+            eligible=[incumbent],
+        )
+        assert decision.held is False
+
+    def test_content_dup_ignored_when_score_far(self) -> None:
+        # Near-identical content but a large score gap: outside score_tol, so the
+        # content rule does not fire (a real improvement, not a copy).
+        shared = [f"h{i}" for i in range(20)]
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=500000,
+            content_fingerprint=shared,
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.90,
+            size_bytes=505000,
+            content_fingerprint=shared,
+            eligible=[incumbent],
+        )
+        assert decision.held is False
+
+    def test_same_miner_content_dup_not_held(self) -> None:
+        # A miner iterating on their own harness shares content with themselves —
+        # never a copier, so the content rule must skip same-miner entries.
+        shared = [f"h{i}" for i in range(20)]
+        incumbent = _entry(
+            composite=0.80, miner="5Mine", sha256="aa" * 32, content_fingerprint=shared
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Mine",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=600000,
+            content_fingerprint=shared,
+            eligible=[incumbent],
+        )
+        assert decision.held is False
+
+    def test_missing_fingerprints_fall_back_to_size_rule(self) -> None:
+        # No fingerprints anywhere (legacy rows): the content rule is inert
+        # (jaccard 0) and the size rule still catches a same-size near-dup.
+        incumbent = _entry(composite=0.80, sha256="aa" * 32, size_bytes=500000)
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Copier",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=500100,
+            content_fingerprint=None,
+            eligible=[incumbent],
+        )
+        assert decision.held is True
+        assert "near-duplicate" in (decision.reason or "")
 
     def test_missing_sizes_skip_near_dup(self) -> None:
         incumbent = _entry(composite=0.80, sha256="aa" * 32, size_bytes=None)

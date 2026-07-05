@@ -4,9 +4,12 @@ SN118 artifacts are downloadable, so the central threat is copying: download
 the current best harness and resubmit it (verbatim or lightly tweaked) to
 dethrone the original. The KOTH+ATH fold already defeats a *verbatim* copy — it
 ties the incumbent, never clears the 1% margin, and first-seen protects the
-original. This gate adds a cheap signal against a *lightly-tweaked* copy that
+original. This gate adds cheap signals against a *lightly-tweaked* copy that
 nudges its score just past the incumbent: such a submission scores within a hair
-of the agent it surpasses and has a near-identical tarball size.
+of the agent it surpasses and either has a near-identical tarball size or — after
+a re-indent/rename that moves the size — a near-identical *content* fingerprint
+(the normalized per-file hash set from :mod:`ditto.api_server.fingerprint`), which
+ignores indentation and filenames.
 
 This is **moderation, not weight logic** — it decides only whether a suspicious
 high-scorer is held in ``ath_pending_review`` for human review (see
@@ -21,6 +24,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from ditto.api_server.fingerprint import content_jaccard
+
 if TYPE_CHECKING:
     from uuid import UUID
 
@@ -32,6 +37,12 @@ _DEFAULT_SCORE_TOL = 0.02
 # A tweaked copy differs from the original by at most a few edited lines, so its
 # gzipped tarball size barely moves. 8 KiB comfortably covers small edits.
 _DEFAULT_SIZE_TOL = 8192
+# Two content fingerprints (normalized per-file hash sets) this Jaccard-similar
+# share almost every file — a reindented/renamed copy still clears it, while two
+# genuinely different harnesses (sharing only the reference scaffolding) fall well
+# short. High on purpose: paired with score proximity below it flags copies, not
+# the common boilerplate every fork of the reference harness carries.
+_DEFAULT_CONTENT_TOL = 0.90
 
 
 @dataclass(frozen=True)
@@ -60,25 +71,33 @@ def evaluate_antidup(
     composite: float,
     size_bytes: int | None,
     eligible: Sequence[LedgerRow],
+    content_fingerprint: list[str] | None = None,
     score_tol: float = _DEFAULT_SCORE_TOL,
     size_tol: int = _DEFAULT_SIZE_TOL,
+    content_tol: float = _DEFAULT_CONTENT_TOL,
 ) -> ReviewDecision:
     """Decide whether a just-scored agent should be held for copy review.
 
-    Copying is only a threat *across* miners, so both rules ignore the agent's
+    Copying is only a threat *across* miners, so every rule ignores the agent's
     own submissions and this miner's other agents (a miner iterating on their own
     harness is not a copier). Held iff, against **another miner's** eligible agent:
 
     1. **Exact copy** — same ``sha256``. Byte-identical resubmission.
-    2. **Near-duplicate** — composites within ``score_tol`` *and* tarball sizes
-       within ``size_tol`` (a lightly-tweaked copy barely moves either). Checked
-       against *every* other-miner eligible agent, in either score direction, so
-       a genuine unrelated agent scoring in between cannot mask the copy.
+    2. **Content near-duplicate** — composites within ``score_tol`` *and* content
+       fingerprints at least ``content_tol`` Jaccard-similar. Catches a copy that
+       re-indents or renames files to move its byte size (dodging rule 3) while
+       leaving the normalized source all but unchanged.
+    3. **Size near-duplicate** — composites within ``score_tol`` *and* tarball
+       sizes within ``size_tol`` (a lightly-tweaked copy barely moves either).
+       Retained as a cheap catch for rows with no fingerprint (uploaded before
+       fingerprinting, or an unreadable tarball).
 
-    A genuine improvement (composite more than ``score_tol`` from any other
-    miner's score, or a clearly different size) is never held. Pure +
-    deterministic: ``eligible`` arrives in a fixed order, so the reported
-    ``duplicate_of`` (the first match) is stable.
+    Rules 2 and 3 check *every* other-miner eligible agent, in either score
+    direction, so a genuine unrelated agent scoring in between cannot mask the
+    copy. A genuine improvement (composite more than ``score_tol`` from any other
+    miner's score, with both a different size and a distinct fingerprint) is never
+    held. Pure + deterministic: ``eligible`` arrives in a fixed order, so the
+    reported ``duplicate_of`` (the first match) is stable.
     """
     others = [
         e for e in eligible if e.agent_id != agent_id and e.miner_hotkey != miner_hotkey
@@ -93,7 +112,24 @@ def evaluate_antidup(
                 reason=f"exact sha256 match of agent {e.agent_id}",
             )
 
-    # 2. Near-dup of another miner: close in both score and tarball size.
+    # 2. Content near-dup: close in score AND near-identical normalized source,
+    #    even if the tarball size drifted (re-indent / rename). Checked before the
+    #    size rule because the fingerprint is the stronger, size-independent signal.
+    for e in others:
+        if abs(composite - e.composite) <= score_tol:
+            jaccard = content_jaccard(content_fingerprint, e.content_fingerprint)
+            if jaccard >= content_tol:
+                return ReviewDecision(
+                    held=True,
+                    duplicate_of=e.agent_id,
+                    reason=(
+                        f"content near-duplicate of agent {e.agent_id}: "
+                        f"composite delta {abs(composite - e.composite):.4f}, "
+                        f"content jaccard {jaccard:.3f}"
+                    ),
+                )
+
+    # 3. Size near-dup of another miner: close in both score and tarball size.
     if size_bytes is not None:
         for e in others:
             if (

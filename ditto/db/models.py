@@ -83,6 +83,16 @@ class Agent(Base):
     """Uploaded tarball size in bytes. Nullable for rows written before the
     ledger migration; a cheap near-dup signal (a copy has a near-identical size)."""
 
+    content_fingerprint: Mapped[list[str] | None] = mapped_column(
+        _JSON_VARIANT, nullable=True
+    )
+    """Sorted set of normalized per-file content hashes of the tarball (see
+    :mod:`ditto.api_server.fingerprint`). Feeds the anti-copy gate's content-level
+    signal: a reindented/renamed copy keeps a near-identical fingerprint even when
+    its byte size drifts past the ``size_bytes`` tolerance. Nullable for rows
+    written before this landed and for tarballs that were unreadable/empty at
+    upload (the gate reads null as "no content match")."""
+
     duplicate_of: Mapped[UUID | None] = mapped_column(
         SaUUID(as_uuid=True), nullable=True
     )

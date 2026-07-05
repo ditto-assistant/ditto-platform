@@ -49,6 +49,12 @@ class LedgerRow:
     validator_hotkey: str
     signature: str | None
     status: AgentStatus
+    content_fingerprint: list[str] | None = None
+    """Normalized per-file content-hash set (see
+    :mod:`ditto.api_server.fingerprint`); the gate's content-level anti-copy
+    signal. ``None`` for rows uploaded before fingerprinting or with an
+    unreadable tarball. Defaulted so it need not be threaded through the
+    validator ledger *wire* model — it is moderation-only, never exposed."""
 
 
 @dataclass(frozen=True)
@@ -261,6 +267,7 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             Agent.miner_hotkey.label("miner_hotkey"),
             Agent.sha256.label("sha256"),
             Agent.size_bytes.label("size_bytes"),
+            Agent.content_fingerprint.label("content_fingerprint"),
             Agent.created_at.label("first_seen"),
             Agent.status.label("status"),
             agent_best.c.composite,
@@ -313,6 +320,7 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             validator_hotkey=row.validator_hotkey,
             signature=row.signature,
             status=AgentStatus(row.status),
+            content_fingerprint=row.content_fingerprint,
         )
         for row in result
     ]

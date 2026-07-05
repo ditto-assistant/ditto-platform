@@ -43,6 +43,7 @@ from ditto.api_server.dependencies import (
     get_session,
     get_storage_client,
 )
+from ditto.api_server.fingerprint import compute_content_fingerprint
 from ditto.api_server.payment_verifier import (
     PaymentProof,
     PaymentVerifier,
@@ -194,7 +195,8 @@ async def upload_agent(
        payment-side rejection, 503 if chain unreachable).
     6. ``agent_id = uuid4()``.
     7. ``storage.put_object`` (orphan blob is cheap on DB failure;
-       orphan agent rows would break the state machine).
+       orphan agent rows would break the state machine), then compute the
+       content fingerprint (best-effort; ``None`` on an unreadable tarball).
     8. Atomic DB tx: ``insert_agent`` + ``insert_evaluation_payment``
        (3207 surfaces here when the PK rejects a replayed proof).
     9. Return ``UploadAgentResponse``.
@@ -269,6 +271,12 @@ async def upload_agent(
         content_type="application/gzip",
     )
 
+    # 7b. Content fingerprint for the anti-copy gate's content-level signal.
+    # Computed only now, on an upload that has passed every check, so a rejected
+    # submission never pays the unpack cost. Best-effort: an unreadable/empty
+    # tarball yields None (the gate then relies on sha256 + size), never a 500.
+    content_fingerprint = compute_content_fingerprint(tar_bytes)
+
     # 8. Atomic DB tx: agent + payment commit together or roll back
     # together. A replayed payment proof surfaces as PaymentReplayedError
     # (3207) and the envelope handler maps it to HTTP 402.
@@ -280,6 +288,7 @@ async def upload_agent(
             name=name,
             sha256=sha256,
             size_bytes=len(tar_bytes),
+            content_fingerprint=content_fingerprint,
         )
         await insert_evaluation_payment(session, verified=verified, agent_id=agent_id)
 
