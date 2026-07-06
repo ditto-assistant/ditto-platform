@@ -171,6 +171,39 @@ class TestContentSimilarity:
         assert abs(jac - 1 / 3) < 1e-9
         assert abs(con - 0.5) < 1e-9
 
+    def _sk(self, vals: set[str]) -> dict:
+        return {
+            "v": _FP_VERSION,
+            "k": _MINHASH_K,
+            "card": len(vals),
+            "m": sorted(vals)[:_MINHASH_K],
+        }
+
+    def test_containment_unbiased_on_asymmetric_sets(self) -> None:
+        # Regression: deriving containment from a noisy Jaccard used to blow up for
+        # very asymmetric cardinalities (a lean set sharing scaffolding with a fat
+        # one estimated ~0.955 vs true 0.50 -> false holds). The direct estimator
+        # must track the true value, well clear of the 0.95 gate tolerance.
+        def h(tag: str, i: int) -> str:
+            return hashlib.sha256(f"{tag}{i}".encode()).hexdigest()[:16]
+
+        shared = {h("s", i) for i in range(750)}
+        lean = shared | {h("a", i) for i in range(750)}  # 1500, 50% shared
+        fat = shared | {h("b", i) for i in range(45000)}  # 45750
+        _, containment = content_similarity(self._sk(lean), self._sk(fat))
+        assert containment < 0.85, containment  # true is 0.50; nowhere near a hold
+
+    def test_containment_still_catches_padding(self) -> None:
+        # The asymmetric case the estimator MUST keep flagging: a verbatim copy
+        # padded to dilute Jaccard is still fully contained => containment ~1.0.
+        def h(tag: str, i: int) -> str:
+            return hashlib.sha256(f"{tag}{i}".encode()).hexdigest()[:16]
+
+        incumbent = {h("x", i) for i in range(1500)}
+        padded_copy = incumbent | {h("pad", i) for i in range(44000)}
+        _, containment = content_similarity(self._sk(incumbent), self._sk(padded_copy))
+        assert containment > 0.95, containment
+
     def test_minhash_estimator_accurate_on_large_sets(self) -> None:
         # Sets far larger than k so the KMV approximation actually engages; the
         # estimate must track the true Jaccard within sampling tolerance.

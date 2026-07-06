@@ -175,36 +175,56 @@ def content_similarity(a: dict | None, b: dict | None) -> tuple[float, float]:
     ``jaccard`` = ``|A ∩ B| / |A ∪ B|`` (dilutes when a copy pads itself with junk
     files). ``containment`` = ``|A ∩ B| / min(|A|, |B|)`` (the symmetric overlap
     coefficient — ~1.0 when the smaller shingle set is essentially a subset of the
-    larger, so it still fires on a padded copy). Both are computed from the
-    bottom-k sketches via the standard KMV estimator; when a set is small enough to
-    be fully retained (``card <= k``) the estimate is exact.
+    larger, so it still fires on a padded copy). Both are estimated from the
+    bottom-k sketches and are exact when both sets are small enough to be fully
+    retained (``card <= k``).
 
-    Returns ``(0.0, 0.0)`` when either sketch is missing, empty, or a different
-    algorithm version (cross-version comparison is meaningless), so the gate can
-    threshold without special-casing ``None``.
+    Returns ``(0.0, 0.0)`` when either sketch is missing, empty, or carries a
+    different sketch-format version (a cross-version comparison is meaningless), so
+    the gate can threshold without special-casing ``None``. The two channels
+    (lexical / structural) are isolated by storage column, and each compares only
+    within its own version — hence the equality check on ``v`` rather than a
+    hard-coded constant, so a channel can version its format independently.
     """
-    if not a or not b or a.get("v") != _FP_VERSION or b.get("v") != _FP_VERSION:
+    if not a or not b:
+        return (0.0, 0.0)
+    va = a.get("v")
+    if va is None or va != b.get("v"):
         return (0.0, 0.0)
     ma, mb = set(a.get("m", ())), set(b.get("m", ()))
     if not ma or not mb:
         return (0.0, 0.0)
+    ka, kb = int(a.get("k", _MINHASH_K)), int(b.get("k", _MINHASH_K))
+    card_a, card_b = int(a.get("card", 0)), int(b.get("card", 0))
 
-    # KMV Jaccard: over the k smallest hashes of the union (which are guaranteed to
-    # be present in one of the two bottom-k sketches), the fraction that lie in
-    # *both* sketches — i.e. in the intersection — estimates the Jaccard index.
-    k = min(int(a.get("k", _MINHASH_K)), int(b.get("k", _MINHASH_K)))
-    sample = sorted(ma | mb)[:k]
+    # Jaccard (KMV): over the k smallest hashes of the union (each guaranteed to sit
+    # in one of the two bottom-k sketches), the fraction lying in *both* sketches —
+    # i.e. in the intersection — estimates the Jaccard index.
+    sample = sorted(ma | mb)[: min(ka, kb)]
     if not sample:
         return (0.0, 0.0)
-    intersect = sum(1 for v in sample if v in ma and v in mb)
-    jaccard = intersect / len(sample)
+    jaccard = sum(1 for v in sample if v in ma and v in mb) / len(sample)
 
-    # Recover containment from Jaccard + the true cardinalities: with
-    # U = |A| + |B| - I and J = I / U, the intersection I = J*(|A|+|B|)/(1+J).
-    card_a, card_b = int(a.get("card", 0)), int(b.get("card", 0))
-    smaller = min(card_a, card_b)
-    if jaccard <= 0.0 or smaller <= 0:
+    # Containment estimated DIRECTLY, not derived from Jaccard: the algebraic
+    # I = J*(|A|+|B|)/(1+J) is exact for the true J but multiplies the KMV sample
+    # error by (|A|+|B|), which is huge and one-sided exactly in the asymmetric
+    # (padded-copy) regime — biasing containment upward into false holds. Instead
+    # condition on the SMALLER set's min-hashes restricted to the range the larger
+    # set's sketch actually observes: for a min-hash x of the smaller set with
+    # x <= the larger set's k-th smallest hash, membership in the larger set is
+    # fully determined (x in larger  iff  x in larger's sketch). The shared fraction
+    # of those observable min-hashes estimates containment unbiasedly, and is exact
+    # when the larger set is fully retained.
+    if card_a <= card_b:
+        small, large, large_k, large_card = ma, mb, kb, card_b
+    else:
+        small, large, large_k, large_card = mb, ma, ka, card_a
+    if large_card <= large_k:
+        observable = small  # larger set fully retained: every membership is known
+    else:
+        tau = max(large)  # the larger set's k-th smallest hash
+        observable = {x for x in small if x <= tau}
+    if not observable:
         return (jaccard, 0.0)
-    inter_est = jaccard * (card_a + card_b) / (1.0 + jaccard)
-    containment = min(1.0, inter_est / smaller)
+    containment = sum(1 for x in observable if x in large) / len(observable)
     return (jaccard, containment)
