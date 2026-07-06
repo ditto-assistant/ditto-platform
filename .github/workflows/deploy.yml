@@ -28,6 +28,11 @@ name: Deploy
 on:
   push:
     branches: [dev, main]
+  # Manual redeploy without a code push — e.g. to pick up a changed repo
+  # variable/secret (DITTO_DASHBOARD_WANDB_URL, DITTO_UPLOAD_PAYMENT_ADDRESS)
+  # into the VM .env. Target VM follows the branch it's dispatched on
+  # (main -> prod, anything else -> dev), same as the push path.
+  workflow_dispatch:
 
 permissions:
   contents: read
