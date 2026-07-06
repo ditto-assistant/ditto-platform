@@ -342,6 +342,12 @@ async def submit_score(
             if report.per_case
             else None,
         )
+        # Persist the crate's structural (AST) fingerprint from the report, so it
+        # is available for the gate here and for future cross-miner comparison.
+        # Advisory + unsigned: only overwrite when the report actually carries one,
+        # so a re-score by a scorer that omits it never wipes a stored sketch.
+        if report.structural_fingerprint is not None:
+            agent.structural_fingerprint = report.structural_fingerprint.model_dump()
         # Finalize: the first score moves evaluating -> scored, unless the
         # anti-copy gate holds a suspected copy in ath_pending_review for review.
         # The gate only runs on this evaluating -> scored transition; a re-score
@@ -357,6 +363,8 @@ async def submit_score(
                 sha256=agent.sha256,
                 composite=report.composite,
                 size_bytes=agent.size_bytes,
+                content_fingerprint=agent.content_fingerprint,
+                structural_fingerprint=agent.structural_fingerprint,
                 eligible=eligible,
             )
             if decision.held:

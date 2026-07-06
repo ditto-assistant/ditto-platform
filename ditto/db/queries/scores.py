@@ -49,6 +49,17 @@ class LedgerRow:
     validator_hotkey: str
     signature: str | None
     status: AgentStatus
+    content_fingerprint: dict | None = None
+    """Shingle MinHash sketch of the tarball source (see
+    :mod:`ditto.api_server.fingerprint`); the gate's content-level anti-copy
+    signal. ``None`` for rows uploaded before fingerprinting or with an
+    unreadable tarball. Defaulted so it need not be threaded through the
+    validator ledger *wire* model — it is moderation-only, never exposed."""
+    structural_fingerprint: dict | None = None
+    """AST-level structural sketch of the crate (computed by dittobench, written at
+    score time); the gate's rename-resistant anti-copy signal. Same ``{v,k,card,m}``
+    shape as ``content_fingerprint``. ``None`` before this landed / no parseable
+    Rust. Moderation-only, never exposed on the wire."""
 
 
 @dataclass(frozen=True)
@@ -261,6 +272,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             Agent.miner_hotkey.label("miner_hotkey"),
             Agent.sha256.label("sha256"),
             Agent.size_bytes.label("size_bytes"),
+            Agent.content_fingerprint.label("content_fingerprint"),
+            Agent.structural_fingerprint.label("structural_fingerprint"),
             Agent.created_at.label("first_seen"),
             Agent.status.label("status"),
             agent_best.c.composite,
@@ -313,6 +326,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             validator_hotkey=row.validator_hotkey,
             signature=row.signature,
             status=AgentStatus(row.status),
+            content_fingerprint=row.content_fingerprint,
+            structural_fingerprint=row.structural_fingerprint,
         )
         for row in result
     ]
