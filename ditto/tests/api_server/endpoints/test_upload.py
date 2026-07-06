@@ -17,6 +17,7 @@ from ditto.api_server.endpoints.upload import (
     ERROR_CODE_BAD_SIGNATURE,
     ERROR_CODE_HOTKEY_NOT_REGISTERED,
     ERROR_CODE_TARBALL_TOO_LARGE,
+    MAX_TARBALL_SIZE_BYTES,
 )
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_MALFORMED_PRICE,
@@ -217,7 +218,7 @@ class TestUploadCheck:
         self, app: FastAPI, client: httpx.AsyncClient
     ):
         override_get_chain_client(app)
-        body = _signed_request_body(file_size_bytes=3 * 1024 * 1024)  # 3 MB
+        body = _signed_request_body(file_size_bytes=MAX_TARBALL_SIZE_BYTES + 1)
         response = await client.post("/api/v1/upload/check", json=body)
         assert response.status_code == 200
         result = response.json()
@@ -237,7 +238,7 @@ class TestUploadCheck:
             return chain
 
         app.dependency_overrides[get_chain_client] = _fake_chain
-        body = _signed_request_body(file_size_bytes=3 * 1024 * 1024)
+        body = _signed_request_body(file_size_bytes=MAX_TARBALL_SIZE_BYTES + 1)
         body["signature"] = _BAD_SIG
         response = await client.post("/api/v1/upload/check", json=body)
         result = response.json()
@@ -561,7 +562,7 @@ class TestUploadAgentValidationFailures:
         self, app: FastAPI, client: httpx.AsyncClient
     ):
         _wire_full_stack(app)
-        oversized = b"\x1f\x8b" + b"x" * (3 * 1024 * 1024)
+        oversized = b"\x1f\x8b" + b"x" * (MAX_TARBALL_SIZE_BYTES - 1)
         big_sha = hashlib.sha256(oversized).hexdigest()
         kp = bittensor.Keypair.create_from_uri("//Alice")
         payload = f"{kp.ss58_address}:{big_sha}".encode()
@@ -689,8 +690,6 @@ class TestUploadAgentBoundaries:
     ):
         """``_read_tar_capped_with_sha`` uses ``size > max_bytes``; this
         test pins the boundary so a refactor to ``>=`` is caught."""
-        from ditto.api_server.endpoints.upload import MAX_TARBALL_SIZE_BYTES
-
         _wire_full_stack(app)
         # gzip magic + filler up to exactly the cap.
         at_cap = b"\x1f\x8b" + b"x" * (MAX_TARBALL_SIZE_BYTES - 2)
@@ -718,8 +717,6 @@ class TestUploadAgentBoundaries:
     async def test_size_one_over_cap_rejected(
         self, app: FastAPI, client: httpx.AsyncClient
     ):
-        from ditto.api_server.endpoints.upload import MAX_TARBALL_SIZE_BYTES
-
         _wire_full_stack(app)
         over = b"\x1f\x8b" + b"x" * (MAX_TARBALL_SIZE_BYTES - 2) + b"!"
         over_sha = hashlib.sha256(over).hexdigest()

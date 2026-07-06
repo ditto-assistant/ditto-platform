@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
+import os
 import uuid
 from decimal import Decimal
 from typing import TYPE_CHECKING, Annotated
@@ -75,10 +77,40 @@ ERROR_CODE_HOTKEY_NOT_REGISTERED = 1101
 ERROR_CODE_TARBALL_TOO_LARGE = 1102
 ERROR_CODE_HOTKEY_BANNED = 1103
 
+DEFAULT_MAX_TARBALL_SIZE_BYTES = 20 * 1024 * 1024
+
+
+def _tarball_size_cap_from_env() -> int:
+    """Return upload cap, keeping the competition default explicit.
+
+    Rust starter-kit submissions with bundled model fixtures are expected to
+    stay below the launch cap. Operators may still override it explicitly for
+    local/dev runs or emergency changes.
+    """
+    raw = os.environ.get("DITTO_MAX_TARBALL_SIZE_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_TARBALL_SIZE_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "invalid DITTO_MAX_TARBALL_SIZE_BYTES=%r; falling back to 20 MiB",
+            raw,
+        )
+        return DEFAULT_MAX_TARBALL_SIZE_BYTES
+    if value <= 0:
+        logger.warning(
+            "non-positive DITTO_MAX_TARBALL_SIZE_BYTES=%r; falling back to 20 MiB",
+            raw,
+        )
+        return DEFAULT_MAX_TARBALL_SIZE_BYTES
+    return value
+
+
 # Hard cap shared with /upload/check. Tarballs above this size are
 # rejected; /upload/check enforces it from the miner-reported header,
 # /upload/agent enforces it from the actual streamed bytes.
-MAX_TARBALL_SIZE_BYTES = 2 * 1024 * 1024
+MAX_TARBALL_SIZE_BYTES = _tarball_size_cap_from_env()
 
 # Streaming read chunk size. 256 KiB keeps memory bounded while letting
 # size + sha256 update incrementally without re-reading the body.
@@ -164,7 +196,7 @@ async def check(
 @router.post("/agent", response_model=UploadAgentResponse, status_code=200)
 async def upload_agent(
     request: Request,
-    agent_tar: Annotated[UploadFile, File(description="gzipped tarball, <=2 MB")],
+    agent_tar: Annotated[UploadFile, File(description="gzipped tarball, <=20 MB")],
     hotkey: Annotated[str, Form(pattern=_SS58_PATTERN)],
     sha256: Annotated[str, Form(pattern=_SHA256_PATTERN)],
     # The 64-character cap is a chosen value rather than a spec mandate;
@@ -282,6 +314,11 @@ async def upload_agent(
     content_fingerprint = await asyncio.to_thread(
         compute_content_fingerprint, tar_bytes
     )
+
+    if session.in_transaction():
+        rollback_result = session.rollback()
+        if inspect.isawaitable(rollback_result):
+            await rollback_result
 
     # 8. Atomic DB tx: agent + payment commit together or roll back
     # together. A replayed payment proof surfaces as PaymentReplayedError
