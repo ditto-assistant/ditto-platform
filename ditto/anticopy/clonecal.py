@@ -15,10 +15,15 @@ The pieces:
   should fall to the AST / behavioral layers.
 - **Signals** (:class:`Signal`) — a named ``(tar_a, tar_b) -> similarity`` in
   ``[0, 1]``. This version wires the in-process signals: L3a normalized-source
-  hash and L1 lexical Jaccard/containment. L2 structural (dittobench), L3c
+  hash, L1 lexical Jaccard/containment, and L3b prompt Jaccard/containment (the
+  prompt-surface fingerprint, which — unlike L1/L3a — survives identifier renaming
+  because it hashes string *contents*). L2 structural (dittobench), L3c
   code-embedding, and L4 behavioral plug in later as more ``Signal``\\s.
 - **Corpus** (:func:`build_corpus`) — clone pairs (a seed vs. its ladder variant)
-  and independent pairs (distinct seeds, incl. the hard *convergent* case).
+  and independent pairs (distinct seeds). The demo corpus also carries the hard
+  *convergent* case: two independent agents on the same reference harness that
+  share a scaffolding prompt preamble but differ in strategy — the false-positive
+  surface that makes L3b a review-band signal rather than an autoreject.
 - **Evaluation** (:func:`evaluate`) — a precision/recall threshold sweep per
   signal, plus the best-F1 operating point.
 
@@ -38,6 +43,7 @@ from dataclasses import dataclass, field
 from ditto.api_server.fingerprint import (
     compute_content_fingerprint,
     compute_normalized_source_hash,
+    compute_prompt_fingerprint,
     content_similarity,
 )
 
@@ -208,12 +214,28 @@ def _lexical(a: bytes, b: bytes) -> tuple[float, float]:
     )
 
 
+def _prompt(a: bytes, b: bytes) -> tuple[float, float]:
+    return content_similarity(
+        compute_prompt_fingerprint(a), compute_prompt_fingerprint(b)
+    )
+
+
 def default_signals() -> list[Signal]:
-    """The in-process signals available today (L3a + L1). L2/L3c/L4 append here."""
+    """The in-process signals available today (L3a + L1 + L3b). L2/L3c/L4 append here.
+
+    L3b (prompt) is the rename-resistant complement to L1/L3a: it hashes the
+    prompt's string *contents*, so a copy that renames every identifier — defeating
+    the lexical and normalized-source channels — still overlaps here. It is a
+    review-band signal (honest agents share reference-harness scaffolding prompts;
+    see the convergent pair in :func:`demo_corpus`), so calibration reports where a
+    threshold separates preserved-prompt clones from that convergence.
+    """
     return [
         Signal("L3a_normalized_hash", _sig_normalized_hash),
         Signal("L1_lexical_jaccard", lambda a, b: _lexical(a, b)[0]),
         Signal("L1_lexical_containment", lambda a, b: _lexical(a, b)[1]),
+        Signal("L3b_prompt_jaccard", lambda a, b: _prompt(a, b)[0]),
+        Signal("L3b_prompt_containment", lambda a, b: _prompt(a, b)[1]),
     ]
 
 
@@ -311,8 +333,44 @@ def format_report(reports: Sequence[SignalReport], corpus: Sequence[ClonePair]) 
 
 
 # ── A tiny synthetic corpus so `python -m ditto.anticopy.clonecal` runs today ──
-def _synthetic_seed(fn_prefix: str, n_fns: int, *, flavor: int = 0) -> dict[str, bytes]:
-    """A small, plausibly-structured Rust-ish crate for the demo corpus."""
+# A reference-harness scaffolding prompt every honest agent embeds. Two independent
+# agents that share it (but differ in strategy) are the convergence surface L3b must
+# not treat as copy evidence on its own — the reason it is review-band, not
+# autoreject. Kept clear of any identifier the rename transform touches (``step`` /
+# ``NAME`` / ``SYSTEM_PROMPT`` / the fn prefixes) so a tier-2 rename cannot perturb
+# it inside the string. Single line so the reformat transform leaves it byte-intact.
+_HARNESS_PREAMBLE = (
+    "You have access to a persistent memory store and tools that search it. "
+    "Before answering, query the store for relevant saved notes and gather the "
+    "surrounding context so the reply is grounded in what the user has told you."
+)
+# Distinct per-seed strategy prompts (genuinely different, not paraphrases), so a
+# preserved-prompt clone overlaps fully while two distinct honest seeds do not.
+_SEED_PROMPTS = {
+    "alpha": (
+        "Prioritise exact recall. Return the most relevant saved note verbatim, "
+        "attach its identifier, and decline to answer when nothing matches."
+    ),
+    "beta": (
+        "Favour brevity. Collect the top few memories, fold them into a compact "
+        "briefing, and surface only the facts that change the decision."
+    ),
+    "gamma": (
+        "Plan explicitly. Split the request into parts, resolve each against the "
+        "saved notes, and assemble the pieces into an ordered final answer."
+    ),
+}
+
+
+def _synthetic_seed(
+    fn_prefix: str, n_fns: int, *, flavor: int = 0, prompt: str | None = None
+) -> dict[str, bytes]:
+    """A small, plausibly-structured Rust-ish crate for the demo corpus.
+
+    ``prompt`` is embedded as a single-line raw-string const so the L3b prompt
+    fingerprint has a surface; it defaults to ``_SEED_PROMPTS[fn_prefix]``.
+    """
+    text = prompt if prompt is not None else _SEED_PROMPTS[fn_prefix]
     fns = "\n\n".join(
         f"fn {fn_prefix}{i}(x: i64) -> i64 {{\n"
         f"    let step = x + {i + flavor};\n"
@@ -322,21 +380,43 @@ def _synthetic_seed(fn_prefix: str, n_fns: int, *, flavor: int = 0) -> dict[str,
     )
     lib = (
         f"// crate {fn_prefix}\n"
-        f'const NAME: &str = "{fn_prefix}";\n\n'
+        f'const NAME: &str = "{fn_prefix}";\n'
+        f'const SYSTEM_PROMPT: &str = r#"{text}"#;\n\n'
         f"{fns}\n"
     )
     cargo = f'[package]\nname = "{fn_prefix}"\nversion = "0.1.0"\n'
     return {"src/lib.rs": lib.encode(), "Cargo.toml": cargo.encode()}
 
 
+def _convergent_pair() -> ClonePair:
+    """Two independent agents on the same harness: shared prompt preamble, distinct
+    strategy tail — the L3b false-positive surface, labeled non-clone.
+
+    The bodies differ (different prefixes / sizes / flavors), so the lexical and
+    normalized-source channels see them as unrelated; only the shared preamble
+    gives L3b a partial (< 1.0) overlap, which is exactly the convergence a
+    threshold must sit above.
+    """
+    a = _synthetic_seed(
+        "delta", 5, flavor=3, prompt=_HARNESS_PREAMBLE + " Then draft a direct reply."
+    )
+    b = _synthetic_seed(
+        "epsilon", 7, flavor=4, prompt=_HARNESS_PREAMBLE + " Then list the key points."
+    )
+    return ClonePair(pack(a), pack(b), is_clone=False, tier=0, note="convergent")
+
+
 def demo_corpus() -> list[ClonePair]:
-    """Distinct seeds (independents) + their ladder variants (clones)."""
+    """Distinct seeds (independents) + their ladder variants (clones), plus the
+    convergent-independent pair that stresses the L3b prompt signal."""
     seeds = [
         _synthetic_seed("alpha", 6, flavor=0),
         _synthetic_seed("beta", 5, flavor=1),
         _synthetic_seed("gamma", 7, flavor=2),
     ]
-    return build_corpus(seeds, max_tier=2)
+    corpus = build_corpus(seeds, max_tier=2)
+    corpus.append(_convergent_pair())
+    return corpus
 
 
 def main() -> None:  # pragma: no cover - thin CLI wrapper
