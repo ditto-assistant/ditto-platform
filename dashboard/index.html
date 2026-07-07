@@ -159,6 +159,9 @@
 
     .hotkey { font-family: var(--mono); font-size: 13px; color: var(--text); }
     .hotkey .badge { margin-left: 8px; font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--gold); border: 1px solid rgba(245,196,81,0.4); border-radius: 6px; padding: 1px 6px; vertical-align: middle; }
+    .modelchip { display: inline-flex; align-items: center; gap: 7px; margin-top: 5px; font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+    .modelchip .bv { font-family: var(--sans); font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px; color: var(--accent-2); border: 1px solid rgba(120,160,255,0.35); border-radius: 5px; padding: 0 5px; text-transform: uppercase; }
+    .stat-head { margin: 16px 0 6px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: var(--text-dim); border-top: 1px solid var(--border); padding-top: 12px; }
     .copy { margin-left: 6px; color: var(--text-faint); cursor: pointer; font-size: 12px; opacity: 0; transition: opacity .12s, color .12s; }
     tr:hover .copy { opacity: 1; }
     .copy:hover { color: var(--accent); }
@@ -391,7 +394,8 @@
           '<tr data-i="' + i + '"' + (i === 0 ? ' class="champion"' : '') + '>' +
             '<td><span class="rank' + rankCls + '">' + (i + 1) + '</span></td>' +
             '<td><span class="hotkey">' + esc(shortKey(e.miner_hotkey)) + '</span>' + champ +
-              '<span class="copy" data-key="' + esc(e.miner_hotkey) + '" title="Copy hotkey">⧉</span></td>' +
+              '<span class="copy" data-key="' + esc(e.miner_hotkey) + '" title="Copy hotkey">⧉</span>' +
+              modelChip(e) + '</td>' +
             '<td>' + bar("composite", e.composite) + '</td>' +
             '<td class="hide-sm">' + bar("tool", e.tool_mean) + '</td>' +
             '<td class="hide-sm">' + bar("memory", e.memory_mean) + '</td>' +
@@ -404,6 +408,18 @@
       var w = Math.max(0, Math.min(1, v)) * 100;
       return '<div class="metric"><div class="barwrap"><div class="bar ' + kind + '" style="width:' + w.toFixed(1) + '%"></div></div>' +
              '<span class="mval">' + fx(v) + '</span></div>';
+    }
+
+    // Compact model chip shown under a miner's hotkey: the harness (or, absent
+    // that, the datagen) model + bench version. Empty for pre-details rows.
+    function shortModel(name) { return name.indexOf("/") >= 0 ? name.split("/").pop() : name; }
+    function modelChip(e) {
+      var m = e.models || {};
+      var name = m.harness || m.generator || "";
+      if (!name && e.bench_version == null) return "";
+      var label = name ? "🧠 " + esc(shortModel(name)) : "";
+      var bv = (e.bench_version != null) ? '<span class="bv">bench v' + e.bench_version + '</span>' : "";
+      return '<div class="modelchip" title="' + esc(name || "") + '">' + label + bv + '</div>';
     }
 
     // ── Drill-down ───────────────────────────────────────────
@@ -422,12 +438,46 @@
       document.getElementById("d-tool-pct").textContent = fx(tool);
       document.getElementById("d-mem-pct").textContent = fx(mem);
 
+      var m = e.models || {};
+      var det = "";
+      if (e.n != null) det += stat("Cases scored", String(e.n));
+      if (e.median_ms != null) det += stat("Median latency", e.median_ms + " ms");
+      if (e.bench_version != null) det += stat("Benchmark version", "v" + e.bench_version);
+      if (m.harness) det += stat("Harness model", m.harness);
+      if (m.judge) det += stat("Judge model", m.judge);
+      if (m.judge_audit) det += stat("Audit judge", m.judge_audit);
+      if (m.generator) det += stat("Dataset generator", m.generator);
+      if (e.dataset_sha256) det += stat("Dataset SHA-256", e.dataset_sha256.slice(0, 16) + "…");
+      if (e.tokens != null) det += stat("Scoring token spend", e.tokens.toLocaleString());
+      var pc = "";
+      if (e.per_category && e.per_category.length) {
+        pc = '<div class="stat-head">Per-category breakdown</div>' +
+          e.per_category.slice().sort(function (a, b) { return b.mean - a.mean; }).map(function (c) {
+            return '<div class="stat-row"><span class="k">' + esc(c.category) +
+              ' <span class="muted">×' + c.count + '</span></span><span class="v">' + fx(c.mean) + '</span></div>';
+          }).join("");
+      }
+      // Anti-overfit / scoring-integrity telemetry — how the benchmark resists
+      // gaming (paraphrase, NoLiMa lexical gap, self-report capping, seeding).
+      var ig = "", g = e.integrity || {};
+      if (g.paraphrase_applied != null)
+        ig += stat("Paraphrased cases", g.paraphrase_applied + " / " + (g.paraphrase_attempted != null ? g.paraphrase_attempted : "?") +
+          (g.paraphrase_fallback ? " (" + g.paraphrase_fallback + " fallback)" : ""));
+      if (g.lexical_gap_rewritten != null)
+        ig += stat("Lexical-gap rewrites", g.lexical_gap_rewritten + " / " + (g.lexical_gap_questions != null ? g.lexical_gap_questions : "?") +
+          (g.lexical_gap_mean_before != null && g.lexical_gap_mean_after != null
+            ? "  (overlap " + fx(g.lexical_gap_mean_before) + "→" + fx(g.lexical_gap_mean_after) + ")" : ""));
+      if (g.capped_tool_cases != null) ig += stat("Capped tool cases", String(g.capped_tool_cases));
+      if (g.seeding_waves != null) ig += stat("Memory seeding waves", String(g.seeding_waves));
       document.getElementById("d-stats").innerHTML =
         stat("Composite", fx(e.composite)) +
         stat("Tool mean", fx(e.tool_mean) + "  (" + pct(e.tool_mean) + ")") +
         stat("Memory mean", fx(e.memory_mean) + "  (" + pct(e.memory_mean) + ")") +
         stat("First seen", new Date(e.first_seen).toLocaleString()) +
-        stat("Rank", "#" + e.rank + " of " + lastEntries.length);
+        stat("Rank", "#" + e.rank + " of " + lastEntries.length) +
+        (det ? '<div class="stat-head">Benchmark run</div>' + det : "") +
+        pc +
+        (ig ? '<div class="stat-head">Benchmark integrity</div>' + ig : "");
 
       document.getElementById("drawer").classList.add("open");
       document.getElementById("drawer").setAttribute("aria-hidden", "false");

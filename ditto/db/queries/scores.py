@@ -60,6 +60,16 @@ class LedgerRow:
     score time); the gate's rename-resistant anti-copy signal. Same ``{v,k,card,m}``
     shape as ``content_fingerprint``. ``None`` before this landed / no parseable
     Rust. Moderation-only, never exposed on the wire."""
+    median_ms: int = 0
+    """Median per-case latency (ms) of the winning run — public benchmark telemetry."""
+    n: int = 0
+    """Number of cases scored in the winning run — public benchmark telemetry."""
+    details: dict | None = None
+    """The winning run's opaque telemetry blob (``scores.details``): models used,
+    bench_version, dataset_sha256, per-category means, token spend, and the
+    per-case breakdown. The public leaderboard exposes a **safe subset** (never
+    ``per_case``, which carries the answer key); validator-gated endpoints may
+    read it whole. ``None`` for rows scored before details were persisted."""
 
 
 @dataclass(frozen=True)
@@ -257,6 +267,9 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         Score.memory_mean.label("memory_mean"),
         Score.seed.label("seed"),
         Score.run_id.label("run_id"),
+        Score.median_ms.label("median_ms"),
+        Score.n.label("n"),
+        Score.details.label("details"),
         Score.validator_hotkey.label("validator_hotkey"),
         Score.signature.label("signature"),
         func.row_number()
@@ -281,6 +294,9 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             agent_best.c.memory_mean,
             agent_best.c.seed,
             agent_best.c.run_id,
+            agent_best.c.median_ms,
+            agent_best.c.n,
+            agent_best.c.details,
             agent_best.c.validator_hotkey,
             agent_best.c.signature,
         )
@@ -328,6 +344,9 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             status=AgentStatus(row.status),
             content_fingerprint=row.content_fingerprint,
             structural_fingerprint=row.structural_fingerprint,
+            median_ms=row.median_ms,
+            n=row.n,
+            details=row.details,
         )
         for row in result
     ]

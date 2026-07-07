@@ -19,9 +19,12 @@ from __future__ import annotations
 
 from ditto.api_models.health import HealthResponse
 from ditto.api_models.public import (
+    PublicBenchIntegrity,
+    PublicCategoryStat,
     PublicHealthResponse,
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
+    PublicRunModels,
 )
 from ditto.api_models.retrieval import AgentResponse, AgentStatusResponse
 from ditto.api_models.screener import (
@@ -57,9 +60,12 @@ __all__ = [
     "HealthResponse",
     "LedgerEntry",
     "LedgerResponse",
+    "PublicBenchIntegrity",
+    "PublicCategoryStat",
     "PublicHealthResponse",
     "PublicLeaderboardEntry",
     "PublicLeaderboardResponse",
+    "PublicRunModels",
     "ScoreReport",
     "ScreenResultRequest",
     "ScreenResultResponse",
