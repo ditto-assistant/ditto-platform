@@ -11,6 +11,7 @@ from ditto.api_server.fingerprint import (
     _FP_VERSION,
     _MINHASH_K,
     compute_content_fingerprint,
+    compute_normalized_source_hash,
     content_similarity,
 )
 
@@ -41,6 +42,68 @@ def _jaccard(a: dict | None, b: dict | None) -> float:
 
 def _containment(a: dict | None, b: dict | None) -> float:
     return content_similarity(a, b)[1]
+
+
+class TestNormalizedSourceHash:
+    """L3a exact-repack hash: cosmetic repackaging normalizes to the same hash,
+    genuinely different source does not, and string literals are preserved."""
+
+    def test_shape_and_determinism(self) -> None:
+        tar = _tar_gz({"src/lib.rs": _rust_file(5)})
+        h1 = compute_normalized_source_hash(tar)
+        h2 = compute_normalized_source_hash(tar)
+        assert isinstance(h1, str) and len(h1) == 64  # sha256 hex
+        assert h1 == h2
+
+    def test_comments_stripped(self) -> None:
+        plain = b"fn a(x: i64) -> i64 {\n    x + 1\n}\n"
+        commented = (
+            b"// a doc comment\n"
+            b"fn a(x: i64) -> i64 {\n"
+            b"    /* inline */ x + 1  // trailing\n"
+            b"}\n"
+            b"/* trailing\n   block */\n"
+        )
+        assert compute_normalized_source_hash(
+            _tar_gz({"lib.rs": plain})
+        ) == compute_normalized_source_hash(_tar_gz({"lib.rs": commented}))
+
+    def test_reindent_and_reformat_absorbed(self) -> None:
+        a = b"fn a(x:i64)->i64{\nx+1\n}\n"
+        b = b"fn  a( x : i64 ) -> i64 {\n\n        x  +  1\n\n}\n"
+        assert compute_normalized_source_hash(
+            _tar_gz({"lib.rs": a})
+        ) == compute_normalized_source_hash(_tar_gz({"lib.rs": b}))
+
+    def test_rename_and_reorder_files_invisible(self) -> None:
+        f1, f2 = _rust_file(3, "a"), _rust_file(4, "b")
+        original = _tar_gz({"src/one.rs": f1, "src/two.rs": f2})
+        # different file names, reverse insertion order — same source content
+        renamed = _tar_gz({"src/zzz.rs": f2, "src/aaa.rs": f1})
+        assert compute_normalized_source_hash(
+            original
+        ) == compute_normalized_source_hash(renamed)
+
+    def test_string_literal_double_slash_preserved(self) -> None:
+        # A `//` inside a string is NOT a comment; changing the URL must change
+        # the hash (proving the string body is kept, not stripped as a comment).
+        a = b'fn u() -> &\'static str { "http://a.example/x" }\n'
+        b = b'fn u() -> &\'static str { "http://b.example/y" }\n'
+        ha = compute_normalized_source_hash(_tar_gz({"lib.rs": a}))
+        hb = compute_normalized_source_hash(_tar_gz({"lib.rs": b}))
+        assert ha is not None and hb is not None and ha != hb
+
+    def test_distinct_source_differs(self) -> None:
+        ha = compute_normalized_source_hash(_tar_gz({"lib.rs": _rust_file(5, "a")}))
+        hb = compute_normalized_source_hash(_tar_gz({"lib.rs": _rust_file(5, "b")}))
+        assert ha != hb
+
+    def test_only_regular_files_and_empty_none(self) -> None:
+        assert compute_normalized_source_hash(b"not a tarball") is None
+        assert compute_normalized_source_hash(_tar_gz({})) is None
+        # a tar of only comments/whitespace normalizes to empty -> None
+        only_comment = _tar_gz({"x.rs": b"// just a comment\n"})
+        assert compute_normalized_source_hash(only_comment) is None
 
 
 class TestComputeContentFingerprint:
