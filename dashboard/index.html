@@ -165,6 +165,9 @@
     .modelcell .mname::before { content: "🧠"; font-size: 11px; }
     .modelcell .none { color: var(--text-faint); font-size: 12px; }
     .bv { font-family: var(--sans); font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px; color: var(--accent-2); border: 1px solid rgba(120,160,255,0.35); border-radius: 5px; padding: 1px 5px; text-transform: uppercase; }
+    /* Board-wide benchmark-version badge in the header subtitle. */
+    .bench-badge { display: none; margin-left: 10px; font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--accent-2); background: rgba(34,211,238,0.08); border: 1px solid rgba(34,211,238,0.4); border-radius: 6px; padding: 2px 8px; vertical-align: middle; text-transform: uppercase; }
+    .bench-badge.show { display: inline-block; }
     .stat-head { margin: 16px 0 6px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: var(--text-dim); border-top: 1px solid var(--border); padding-top: 12px; }
     .copy { margin-left: 6px; color: var(--text-faint); cursor: pointer; font-size: 12px; opacity: 0; transition: opacity .12s, color .12s; }
     tr:hover .copy { opacity: 1; }
@@ -236,7 +239,7 @@
         <div class="mark">🔷</div>
         <div>
           <h1>Ditto&nbsp;·&nbsp;Subnet&nbsp;118</h1>
-          <div class="sub">Public agent-memory scoring leaderboard</div>
+          <div class="sub">Public agent-memory scoring leaderboard<span id="bench-badge" class="bench-badge"></span></div>
         </div>
       </div>
       <div class="spacer"></div>
@@ -254,7 +257,7 @@
       <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label">Miners Scored</div><div class="value" id="c-miners">—</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label">Top Composite</div><div class="value" id="c-top">—</div></div>
       <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label">Median Composite</div><div class="value" id="c-median">—</div></div>
-      <div class="card"><div class="glow" style="background:var(--good)"></div><div class="label">Benchmark</div><div class="value" id="c-bench">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--good)"></div><div class="label">Scoring</div><div class="value" id="c-bench">—</div></div>
     </section>
 
     <div class="section-head">
@@ -385,12 +388,24 @@
       document.getElementById("c-miners").textContent = entries.length;
       document.getElementById("c-top").innerHTML = entries.length ? fx(comps[0]) : "—";
       document.getElementById("c-median").innerHTML = entries.length ? fx(median(comps)) : "—";
-      // Benchmark card: the highest bench_version present + the fixed composite
-      // weighting. Falls back to just the formula when no run carries a version.
-      var bvs = entries.map(function (e) { return e.bench_version; }).filter(function (v) { return v != null; });
-      var bv = bvs.length ? Math.max.apply(null, bvs) : null;
-      document.getElementById("c-bench").innerHTML =
-        (bv != null ? "v" + bv : "—") + ' <small>0.5·tool + 0.5·mem</small>';
+      // Scoring card: the fixed composite weighting (the benchmark version lives
+      // in the header badge below, so it isn't duplicated here).
+      document.getElementById("c-bench").innerHTML = '0.5 / 0.5 <small>tool / memory</small>';
+      // Board-wide benchmark-version badge in the header — reported whenever any
+      // run carries a version; a range (vA–vB) when the board spans versions.
+      var uniqBv = entries
+        .map(function (e) { return e.bench_version; })
+        .filter(function (v, i, a) { return v != null && a.indexOf(v) === i; })
+        .sort(function (a, b) { return a - b; });
+      var badge = document.getElementById("bench-badge");
+      if (!uniqBv.length) {
+        badge.className = "bench-badge";
+        badge.textContent = "";
+      } else {
+        badge.className = "bench-badge show";
+        badge.textContent = "Benchmark v" +
+          (uniqBv.length === 1 ? uniqBv[0] : uniqBv[0] + "–v" + uniqBv[uniqBv.length - 1]);
+      }
       // Freshness lives on the status pill (no separate card), keeping the
       // headline cards to distinct leaderboard metrics.
       var when = data.generated_at ? relTime(data.generated_at) : "—";
