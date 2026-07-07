@@ -16,12 +16,14 @@ weights from wandb or the chain.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Response
 
 from ditto.api_models import (
     PublicBenchIntegrity,
+    PublicCaseResult,
     PublicCategoryStat,
     PublicHealthResponse,
     PublicLeaderboardEntry,
@@ -29,7 +31,12 @@ from ditto.api_models import (
     PublicRunModels,
 )
 from ditto.api_server.endpoints.validator import SessionDep
-from ditto.db.queries.scores import LedgerRow, get_public_health, list_eligible_ledger
+from ditto.db.queries.scores import (
+    LedgerRow,
+    get_public_health,
+    list_eligible_ledger,
+    list_miner_composite_history,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +110,101 @@ def _safe_integrity(details: dict) -> PublicBenchIntegrity | None:
     return model
 
 
-def _public_entry(rank: int, r: LedgerRow) -> PublicLeaderboardEntry:
+def _safe_case_results(details: dict) -> list[PublicCaseResult] | None:
+    """Redact ``details.per_case`` down to the publishable per-case view.
+
+    Whitelists only ``category / kind / score / correct / latency_ms / notes`` —
+    the answer-key fields (``expected``, the agent's ``called`` tools, the
+    seed-derived ``case_id``, and any other key) are dropped by construction, not
+    filtered out, so a new per-case field can never leak by default. ``None`` when
+    there is no usable per-case data.
+    """
+    per_case = details.get("per_case")
+    if not isinstance(per_case, list):
+        return None
+    out: list[PublicCaseResult] = []
+    for c in per_case:
+        if not isinstance(c, dict):
+            continue
+        score = c.get("score")
+        category = c.get("category")
+        if not isinstance(category, str):
+            continue
+        if not isinstance(score, (int, float)) or isinstance(score, bool):
+            continue
+        kind = c.get("kind")
+        latency = c.get("latency_ms")
+        correct = c.get("correct")
+        notes = c.get("notes")
+        clean_notes = (
+            [str(n) for n in notes] if isinstance(notes, list) and notes else None
+        )
+        try:
+            out.append(
+                PublicCaseResult(
+                    category=category,
+                    kind=str(kind) if isinstance(kind, str) else "",
+                    score=float(score),
+                    correct=correct if isinstance(correct, bool) else None,
+                    latency_ms=(
+                        latency
+                        if isinstance(latency, int) and not isinstance(latency, bool)
+                        else None
+                    ),
+                    notes=clean_notes,
+                )
+            )
+        except Exception:  # noqa: BLE001 - skip a bad case, keep the rest
+            continue
+    return out or None
+
+
+def _safe_stderr(details: dict) -> float | None:
+    """Estimate the composite's standard error from the per-case score spread.
+
+    ``composite = 0.5 * tool_mean + 0.5 * memory_mean`` (B6 weighting). Treating
+    the tool and memory case sets as independent samples, the SE of that weighted
+    sum is ``sqrt(0.25*se_tool^2 + 0.25*se_memory^2)`` where each ``se`` is the
+    standard error of the mean of its kind's per-case scores. Derived from the
+    stored ``details.per_case`` (never exposed itself) — so the leaderboard can
+    show error bars / a statistical-tie band without a re-score. ``None`` when
+    there is no usable per-case data; a kind with <2 cases contributes SE 0.
+    """
+    per_case = details.get("per_case")
+    if not isinstance(per_case, list):
+        return None
+    tool: list[float] = []
+    memory: list[float] = []
+    for c in per_case:
+        if not isinstance(c, dict):
+            continue
+        score = c.get("score")
+        if not isinstance(score, (int, float)) or isinstance(score, bool):
+            continue
+        kind = c.get("kind")
+        if kind == "tool":
+            tool.append(float(score))
+        elif kind == "memory":
+            memory.append(float(score))
+    if not tool and not memory:
+        return None
+
+    def _sem(xs: list[float]) -> float:
+        n = len(xs)
+        if n < 2:
+            return 0.0
+        mean = sum(xs) / n
+        var = sum((x - mean) ** 2 for x in xs) / (n - 1)
+        return math.sqrt(var / n)
+
+    se_t = _sem(tool)
+    se_m = _sem(memory)
+    return math.sqrt(0.25 * se_t * se_t + 0.25 * se_m * se_m)
+
+
+def _public_entry(
+    rank: int, r: LedgerRow, history: list[float] | None = None
+) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
     details = r.details if isinstance(r.details, dict) else {}
@@ -115,10 +216,14 @@ def _public_entry(rank: int, r: LedgerRow) -> PublicLeaderboardEntry:
         if isinstance(raw_tokens, int) and not isinstance(raw_tokens, bool)
         else None
     )
+    # A length-1 history is just the current score — not a trend; drop it so the
+    # dashboard shows a sparkline only when there's an actual trajectory.
+    trend = history if history and len(history) >= 2 else None
     return PublicLeaderboardEntry(
         rank=rank,
         miner_hotkey=r.miner_hotkey,
         composite=r.composite,
+        composite_stderr=_safe_stderr(details),
         tool_mean=r.tool_mean,
         memory_mean=r.memory_mean,
         first_seen=r.first_seen,
@@ -130,6 +235,8 @@ def _public_entry(rank: int, r: LedgerRow) -> PublicLeaderboardEntry:
         per_category=_safe_categories(details),
         integrity=_safe_integrity(details),
         tokens=tokens,
+        history=trend,
+        case_results=_safe_case_results(details),
     )
 
 
@@ -141,7 +248,13 @@ async def leaderboard(
     """Best eligible score per miner, aggregate-only, highest composite first."""
     response.headers["Cache-Control"] = _CACHE_CONTROL
     rows = await list_eligible_ledger(session)
-    entries = [_public_entry(i, r) for i, r in enumerate(rows, start=1)]
+    histories = await list_miner_composite_history(
+        session, [r.miner_hotkey for r in rows]
+    )
+    entries = [
+        _public_entry(i, r, histories.get(r.miner_hotkey))
+        for i, r in enumerate(rows, start=1)
+    ]
     return PublicLeaderboardResponse(
         generated_at=datetime.now(UTC), count=len(entries), entries=entries
     )
