@@ -10,10 +10,30 @@ import tarfile
 from ditto.api_server.fingerprint import (
     _FP_VERSION,
     _MINHASH_K,
+    _PROMPT_VERSION,
+    _extract_string_literals,
     compute_content_fingerprint,
     compute_normalized_source_hash,
+    compute_prompt_fingerprint,
     content_similarity,
 )
+
+# A substantial prompt (>= _PROMPT_MIN_WORDS words) so it qualifies as prompt-like.
+_PROMPT = (
+    "You are a helpful memory assistant. Always search the user's stored notes "
+    "before answering, cite the source note id, and never fabricate a fact that "
+    "is not present in the retrieved context."
+)
+
+
+def _agent_src(prompt: str, prefix: str = "f", n_fns: int = 6) -> bytes:
+    """A Rust file that embeds ``prompt`` as a raw-string const plus some code."""
+    return (
+        b'const SYSTEM_PROMPT: &str = r#"'
+        + prompt.encode()
+        + b'"#;\n'
+        + _rust_file(n_fns, prefix)
+    )
 
 
 def _tar_gz(files: dict[str, bytes]) -> bytes:
@@ -290,3 +310,84 @@ class TestContentSimilarity:
         assert abs(jac - true_j) < 0.1, (jac, true_j)
         # true containment = 6000/8000 = 0.75.
         assert abs(con - 0.75) < 0.12, con
+
+
+class TestExtractStringLiterals:
+    def test_ordinary_and_raw_strings(self) -> None:
+        src = 'let a = "hello"; let b = r#"raw "quoted" text"#; let c = r"plain";'
+        assert list(_extract_string_literals(src)) == [
+            "hello",
+            'raw "quoted" text',
+            "plain",
+        ]
+
+    def test_escaped_quote_does_not_end_literal(self) -> None:
+        assert list(_extract_string_literals(r'"a\"b"')) == ['a"b']
+
+    def test_quote_in_comment_is_ignored(self) -> None:
+        assert list(_extract_string_literals('// a " here\nlet x = "real";')) == [
+            "real"
+        ]
+
+    def test_quote_in_block_comment_is_ignored(self) -> None:
+        assert list(_extract_string_literals('/* " */ "real"')) == ["real"]
+
+
+class TestComputePromptFingerprint:
+    def test_deterministic_and_shaped(self) -> None:
+        fp = compute_prompt_fingerprint(_tar_gz({"src/lib.rs": _agent_src(_PROMPT)}))
+        assert fp is not None
+        assert fp["v"] == _PROMPT_VERSION
+        assert fp["card"] > 0 and fp["m"]
+        assert fp == compute_prompt_fingerprint(
+            _tar_gz({"src/lib.rs": _agent_src(_PROMPT)})
+        )
+
+    def test_no_prompt_length_literal_yields_none(self) -> None:
+        # Code with only short strings (below the word gate) has no prompt sketch.
+        fp = compute_prompt_fingerprint(_tar_gz({"src/lib.rs": _rust_file(10)}))
+        assert fp is None
+
+    def test_prompt_survives_code_rename_and_reformat(self) -> None:
+        # Same prompt, but the surrounding code is entirely renamed + reformatted —
+        # the lexical/normalized channels diverge while the prompt sketch matches.
+        original = _tar_gz({"src/lib.rs": _agent_src(_PROMPT, prefix="orig")})
+        copy = _tar_gz({"a/b.rs": _agent_src(_PROMPT, prefix="renamed", n_fns=9)})
+        a = compute_prompt_fingerprint(original)
+        b = compute_prompt_fingerprint(copy)
+        assert content_similarity(a, b)[0] == 1.0  # identical prompt shingle sets
+        # …and the lexical channel does NOT see them as the same (code differs).
+        lex_j = content_similarity(
+            compute_content_fingerprint(original), compute_content_fingerprint(copy)
+        )[0]
+        assert lex_j < 0.75
+
+    def test_paraphrase_diverges(self) -> None:
+        paraphrase = (
+            "Act as a knowledgeable notes helper. Consult the saved records first, "
+            "reference each record identifier you rely on, and refrain from "
+            "inventing details absent from the fetched material."
+        )
+        a = compute_prompt_fingerprint(_tar_gz({"x.rs": _agent_src(_PROMPT)}))
+        b = compute_prompt_fingerprint(_tar_gz({"x.rs": _agent_src(paraphrase)}))
+        # A genuine reword shares almost no 5-word shingles.
+        assert content_similarity(a, b)[0] < 0.2
+
+    def test_light_edit_stays_high(self) -> None:
+        # Inserting a few words perturbs only the spanning shingles, not all of them.
+        edited = _PROMPT.replace("helpful memory assistant", "helpful memory aide")
+        a = compute_prompt_fingerprint(_tar_gz({"x.rs": _agent_src(_PROMPT)}))
+        b = compute_prompt_fingerprint(_tar_gz({"x.rs": _agent_src(edited)}))
+        assert content_similarity(a, b)[0] > 0.6
+
+    def test_prompt_sketch_never_matches_lexical(self) -> None:
+        # Distinct channels: a prompt sketch and a content sketch must not compare
+        # (different ``v``), even by accident.
+        tar = _tar_gz({"src/lib.rs": _agent_src(_PROMPT)})
+        prompt = compute_prompt_fingerprint(tar)
+        lexical = compute_content_fingerprint(tar)
+        assert content_similarity(prompt, lexical) == (0.0, 0.0)
+
+    def test_empty_and_unreadable_yield_none(self) -> None:
+        assert compute_prompt_fingerprint(_tar_gz({})) is None
+        assert compute_prompt_fingerprint(b"not a tarball") is None
