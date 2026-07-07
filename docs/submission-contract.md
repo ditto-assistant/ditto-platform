@@ -62,11 +62,19 @@ and `endpoints/validator.py` respectively.
 
 ## Scoring
 
-`composite = 0.6 * tool_mean + 0.4 * memory_mean` when both kinds are present.
-The platform **records what the validator reports and never recomputes it**
-(`api_models/validator.py`, `db/queries/scores.py`). The on-chain profile is
-`run_size=full` (fresh anti-cheat dataset + LLM judge); the starter kit's local
-`practice` scorer is a fast deterministic proxy, so a miner's real score differs.
+`composite = 0.5 * tool_mean + 0.5 * memory_mean` when both kinds are present
+(bench_version 3 / DittoBench v2 — rebalanced from v1's `0.6 / 0.4` because
+memory is the core product value and the raw-pairs seeding tier makes
+`memory_mean` the harder axis). The platform **records what the validator
+reports and never recomputes it** (`api_models/validator.py`,
+`db/queries/scores.py`). The on-chain profile is `run_size=full` (fresh
+anti-cheat dataset + LLM judge); the starter kit's local `practice` scorer is a
+fast deterministic proxy, so a miner's real score differs.
+
+Benchmark scoring changes are versioned: the validator stamps `bench_version`
+in the score `details`, and the weight fold only compares scores of the max
+version present (see the DittoBench v2 design). A version bump triggers a
+re-score sweep before old scores are compared to new.
 
 ## Pointers
 
