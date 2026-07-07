@@ -159,8 +159,12 @@
 
     .hotkey { font-family: var(--mono); font-size: 13px; color: var(--text); }
     .hotkey .badge { margin-left: 8px; font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--gold); border: 1px solid rgba(245,196,81,0.4); border-radius: 6px; padding: 1px 6px; vertical-align: middle; }
-    .modelchip { display: inline-flex; align-items: center; gap: 7px; margin-top: 5px; font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
-    .modelchip .bv { font-family: var(--sans); font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px; color: var(--accent-2); border: 1px solid rgba(120,160,255,0.35); border-radius: 5px; padding: 0 5px; text-transform: uppercase; }
+    /* Model column cell: harness/generator model + bench-version chip. */
+    .modelcell { display: flex; flex-direction: column; gap: 5px; align-items: flex-start; }
+    .modelcell .mname { font-family: var(--mono); font-size: 12px; color: var(--text); display: inline-flex; align-items: center; gap: 6px; }
+    .modelcell .mname::before { content: "🧠"; font-size: 11px; }
+    .modelcell .none { color: var(--text-faint); font-size: 12px; }
+    .bv { font-family: var(--sans); font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px; color: var(--accent-2); border: 1px solid rgba(120,160,255,0.35); border-radius: 5px; padding: 1px 5px; text-transform: uppercase; }
     .stat-head { margin: 16px 0 6px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: var(--text-dim); border-top: 1px solid var(--border); padding-top: 12px; }
     .copy { margin-left: 6px; color: var(--text-faint); cursor: pointer; font-size: 12px; opacity: 0; transition: opacity .12s, color .12s; }
     tr:hover .copy { opacity: 1; }
@@ -214,6 +218,9 @@
     .htile .hv { font-size: 21px; font-weight: 700; margin-top: 5px; font-variant-numeric: tabular-nums; }
     .htile .hv small { font-size: 12px; color: var(--text-dim); font-weight: 500; }
 
+    @media (max-width: 960px) {
+      .hide-md { display: none; }
+    }
     @media (max-width: 720px) {
       .cards { grid-template-columns: repeat(2, 1fr); }
       .health { grid-template-columns: repeat(2, 1fr); }
@@ -244,10 +251,10 @@
     </div>
 
     <section class="cards" id="cards">
-      <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label">Scored Miners</div><div class="value" id="c-miners">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label">Miners Scored</div><div class="value" id="c-miners">—</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label">Top Composite</div><div class="value" id="c-top">—</div></div>
       <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label">Median Composite</div><div class="value" id="c-median">—</div></div>
-      <div class="card"><div class="glow" style="background:var(--good)"></div><div class="label">Updated</div><div class="value" id="c-updated">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--good)"></div><div class="label">Benchmark</div><div class="value" id="c-bench">—</div></div>
     </section>
 
     <div class="section-head">
@@ -260,14 +267,15 @@
           <tr>
             <th style="width:52px">#</th>
             <th>Miner</th>
-            <th style="width:190px">Composite</th>
-            <th class="hide-sm" style="width:160px">Tool</th>
-            <th class="hide-sm" style="width:160px">Memory</th>
-            <th class="num hide-sm" style="width:110px">First seen</th>
+            <th class="hide-md" style="width:180px">Model</th>
+            <th style="width:180px">Composite</th>
+            <th class="hide-sm" style="width:150px">Tool</th>
+            <th class="hide-sm" style="width:150px">Memory</th>
+            <th class="num hide-sm" style="width:100px">First seen</th>
           </tr>
         </thead>
         <tbody id="rows">
-          <tr><td colspan="6" class="empty">Loading leaderboard…</td></tr>
+          <tr><td colspan="7" class="empty">Loading leaderboard…</td></tr>
         </tbody>
       </table>
     </div>
@@ -277,8 +285,8 @@
       <span class="hint">what the platform records · run failures &amp; weight-setting live in wandb</span>
     </div>
     <div class="health" id="health">
-      <div class="htile"><div class="hl">Miners</div><div class="hv" id="h-miners">—</div></div>
-      <div class="htile"><div class="hl">Scored miners</div><div class="hv" id="h-scored">—</div></div>
+      <div class="htile"><div class="hl">Miners total</div><div class="hv" id="h-miners">—</div></div>
+      <div class="htile"><div class="hl">Scored agents</div><div class="hv" id="h-agents">—</div></div>
       <div class="htile"><div class="hl">Scores · 24h</div><div class="hv" id="h-24h">—</div></div>
       <div class="htile"><div class="hl">Avg latency</div><div class="hv" id="h-lat">—</div></div>
       <div class="htile"><div class="hl">Last scored</div><div class="hv" id="h-last">—</div></div>
@@ -292,7 +300,6 @@
       <div class="foot-links">
         <a id="foot-wandb" href="#" target="_blank" rel="noopener">Full per-epoch telemetry (wandb) ↗</a>
         <a href="https://github.com/ditto-assistant/ditto-subnet" target="_blank" rel="noopener">Subnet & validator ↗</a>
-        <span class="muted">Composite = 0.6·tool + 0.4·memory</span>
       </div>
     </footer>
   </div>
@@ -378,13 +385,21 @@
       document.getElementById("c-miners").textContent = entries.length;
       document.getElementById("c-top").innerHTML = entries.length ? fx(comps[0]) : "—";
       document.getElementById("c-median").innerHTML = entries.length ? fx(median(comps)) : "—";
+      // Benchmark card: the highest bench_version present + the fixed composite
+      // weighting. Falls back to just the formula when no run carries a version.
+      var bvs = entries.map(function (e) { return e.bench_version; }).filter(function (v) { return v != null; });
+      var bv = bvs.length ? Math.max.apply(null, bvs) : null;
+      document.getElementById("c-bench").innerHTML =
+        (bv != null ? "v" + bv : "—") + ' <small>0.5·tool + 0.5·mem</small>';
+      // Freshness lives on the status pill (no separate card), keeping the
+      // headline cards to distinct leaderboard metrics.
       var when = data.generated_at ? relTime(data.generated_at) : "—";
-      document.getElementById("c-updated").innerHTML = when + (isSample ? ' <small>· sample</small>' : "");
+      if (!isSample) document.getElementById("status-text").textContent = "Live · " + when;
 
       // Rows
       var tb = document.getElementById("rows");
       if (!entries.length) {
-        tb.innerHTML = '<tr><td colspan="6" class="empty">No miners have been scored yet. As soon as a submission clears scoring it appears here.</td></tr>';
+        tb.innerHTML = '<tr><td colspan="7" class="empty">No miners have been scored yet. As soon as a submission clears scoring it appears here.</td></tr>';
         return;
       }
       tb.innerHTML = entries.map(function (e, i) {
@@ -394,8 +409,8 @@
           '<tr data-i="' + i + '"' + (i === 0 ? ' class="champion"' : '') + '>' +
             '<td><span class="rank' + rankCls + '">' + (i + 1) + '</span></td>' +
             '<td><span class="hotkey">' + esc(shortKey(e.miner_hotkey)) + '</span>' + champ +
-              '<span class="copy" data-key="' + esc(e.miner_hotkey) + '" title="Copy hotkey">⧉</span>' +
-              modelChip(e) + '</td>' +
+              '<span class="copy" data-key="' + esc(e.miner_hotkey) + '" title="Copy hotkey">⧉</span></td>' +
+            modelCell(e) +
             '<td>' + bar("composite", e.composite) + '</td>' +
             '<td class="hide-sm">' + bar("tool", e.tool_mean) + '</td>' +
             '<td class="hide-sm">' + bar("memory", e.memory_mean) + '</td>' +
@@ -410,16 +425,19 @@
              '<span class="mval">' + fx(v) + '</span></div>';
     }
 
-    // Compact model chip shown under a miner's hotkey: the harness (or, absent
-    // that, the datagen) model + bench version. Empty for pre-details rows.
+    // Model column cell: the harness (or, absent that, the datagen) model + the
+    // bench version. Renders a subtle "—" when a run predates run-provenance
+    // capture, so the column reads honestly instead of looking broken.
     function shortModel(name) { return name.indexOf("/") >= 0 ? name.split("/").pop() : name; }
-    function modelChip(e) {
+    function modelCell(e) {
       var m = e.models || {};
       var name = m.harness || m.generator || "";
-      if (!name && e.bench_version == null) return "";
-      var label = name ? "🧠 " + esc(shortModel(name)) : "";
-      var bv = (e.bench_version != null) ? '<span class="bv">bench v' + e.bench_version + '</span>' : "";
-      return '<div class="modelchip" title="' + esc(name || "") + '">' + label + bv + '</div>';
+      var bv = (e.bench_version != null) ? '<span class="bv">v' + e.bench_version + '</span>' : "";
+      if (!name && !bv) return '<td class="hide-md"><span class="none">—</span></td>';
+      var label = name
+        ? '<span class="mname" title="' + esc(name) + '">' + esc(shortModel(name)) + '</span>'
+        : "";
+      return '<td class="hide-md"><div class="modelcell">' + label + bv + '</div></td>';
     }
 
     // ── Drill-down ───────────────────────────────────────────
@@ -513,7 +531,7 @@
     // ── Health strip ─────────────────────────────────────────
     function renderHealth(h) {
       document.getElementById("h-miners").textContent = h.miners;
-      document.getElementById("h-scored").textContent = h.scored_miners;
+      document.getElementById("h-agents").textContent = h.scored_agents == null ? "—" : h.scored_agents;
       document.getElementById("h-24h").textContent = h.scores_24h;
       document.getElementById("h-lat").innerHTML =
         h.avg_latency_ms == null ? "—" : h.avg_latency_ms + ' <small>ms</small>';
@@ -547,11 +565,20 @@
       generated_at: new Date(Date.now() - 12000).toISOString(),
       count: 5,
       entries: [
-        { rank: 1, miner_hotkey: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", composite: 0.658, tool_mean: 0.867, memory_mean: 0.345, first_seen: new Date(Date.now() - 86400000 * 2).toISOString() },
-        { rank: 2, miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.342, first_seen: new Date(Date.now() - 86400000 * 3).toISOString() },
-        { rank: 3, miner_hotkey: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", composite: 0.587, tool_mean: 0.867, memory_mean: 0.167, first_seen: new Date(Date.now() - 86400000 * 1).toISOString() },
-        { rank: 4, miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.303, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
-        { rank: 5, miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.285, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
+        { rank: 1, miner_hotkey: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", composite: 0.658, tool_mean: 0.867, memory_mean: 0.449, first_seen: new Date(Date.now() - 86400000 * 2).toISOString(),
+          median_ms: 2410, n: 12, bench_version: 2, dataset_sha256: "9f2c1a77b4e35d0182ac4f6b0e2d9c3a5b7148ef22d0c6a9f1e8b3d47c05a6e1",
+          models: { generator: "google/gemini-3.1-flash-lite", judge: "google/gemini-3.1-flash-lite", judge_audit: null, harness: "anthropic/claude-haiku-4.5" },
+          per_category: [{ category: "memory_lookup", count: 3, mean: 0.83 }, { category: "web_search", count: 2, mean: 0.75 }, { category: "artifacts_create", count: 1, mean: 0.6 }],
+          integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 0, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.2, capped_tool_cases: 3, seeding_waves: 2 }, tokens: 8140 },
+        { rank: 2, miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.432, first_seen: new Date(Date.now() - 86400000 * 3).toISOString(),
+          median_ms: 3120, n: 12, bench_version: 2, dataset_sha256: "1b8e07d4c9f6a2531e0c74ab9f3d61528ac40f7e6d1b9c8a2f5e340d7b16c9a0",
+          models: { generator: "google/gemini-3.1-flash-lite", judge: "google/gemini-3.1-flash-lite", judge_audit: null, harness: "openai/gpt-4o-mini" },
+          per_category: [{ category: "memory_lookup", count: 3, mean: 0.72 }, { category: "image_create", count: 1, mean: 0.5 }],
+          integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 1, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.22, capped_tool_cases: 4, seeding_waves: 1 }, tokens: 7620 },
+        { rank: 3, miner_hotkey: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", composite: 0.587, tool_mean: 0.867, memory_mean: 0.307, first_seen: new Date(Date.now() - 86400000 * 1).toISOString(),
+          median_ms: 2880, n: 12, bench_version: 2 },
+        { rank: 4, miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.382, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
+        { rank: 5, miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.356, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
       ]
     };
     var SAMPLE_HEALTH = {
