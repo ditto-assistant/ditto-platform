@@ -44,6 +44,7 @@ import hashlib
 import io
 import logging
 import tarfile
+from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,23 @@ _MAX_FILE_BYTES = 8 * 1024 * 1024
 _MAX_MEMBERS = 20000
 # Hard ceiling on distinct shingles before we give up (paired with the byte caps).
 _MAX_SHINGLES = 500_000
+
+# --- L3b prompt fingerprint (see docs/SEMANTIC-CLONE-PREVENTION.md §4) ----------
+# Version of the prompt-sketch format. A *string* so it can never collide with the
+# integer ``_FP_VERSION`` / structural versions in :func:`content_similarity`'s
+# ``v`` equality check — a prompt sketch is a distinct channel, stored apart, and
+# must never be compared against a lexical/structural one.
+_PROMPT_VERSION = "p1"
+# A string literal must have at least this many whitespace-split words to count as
+# "prompt-like". Filters out identifiers, format specifiers, config keys, and short
+# messages (the shared-scaffolding strings that would otherwise false-match across
+# independent agents), leaving substantial instruction text.
+_PROMPT_MIN_WORDS = 8
+# Prompt literals are shingled at the *word* level (not line, like the lexical
+# channel) so a copied prompt still matches after light reflowing/editing while a
+# genuine paraphrase — which changes most n-grams — diverges. 5 words is
+# distinctive enough that unrelated prose rarely shares a shingle.
+_PROMPT_SHINGLE_WORDS = 5
 
 
 def compute_content_fingerprint(tar_gz_bytes: bytes) -> dict | None:
@@ -214,6 +232,162 @@ def compute_normalized_source_hash(tar_gz_bytes: bytes) -> str | None:
         digest.update(normalized.encode("utf-8"))
         digest.update(b"\x00")
     return digest.hexdigest()
+
+
+def compute_prompt_fingerprint(tar_gz_bytes: bytes) -> dict | None:
+    """Return a word-shingle sketch of the crate's prompt literals, or ``None``.
+
+    This is the first component of the **L3b strategy/asset fingerprint** (see
+    ``docs/SEMANTIC-CLONE-PREVENTION.md`` §4): it fingerprints the *prompt surface*
+    — the substantial string literals a copier must preserve to keep the champion's
+    score — independently of the surrounding code. A submission that refactors or
+    renames everything but reuses the prompt keeps a high overlap here even when the
+    lexical (:func:`compute_content_fingerprint`) and normalized-source
+    (:func:`compute_normalized_source_hash`) channels diverge, because identifier
+    renaming and reformatting do not touch string *contents*.
+
+    Extraction, per regular file: every string literal — ordinary ``"..."`` (with
+    ``\\`` escapes) and Rust raw strings ``r"..."`` / ``r#"..."#`` (multi-line
+    prompts are usually raw) — is collected; those with at least
+    :data:`_PROMPT_MIN_WORDS` words (lowercased, whitespace-collapsed) are cut into
+    overlapping :data:`_PROMPT_SHINGLE_WORDS`-word shingles and unioned into a
+    bottom-``k`` MinHash sketch, the same ``{v, k, card, m}`` shape as the lexical
+    channel so :func:`content_similarity` compares it directly. The ``v`` is a
+    string (:data:`_PROMPT_VERSION`) so a prompt sketch never matches a
+    lexical/structural sketch.
+
+    Returns ``None`` ("no prompt fingerprint", read as no match) when the bytes are
+    unreadable, carry no prompt-length literal, or trip the shared bomb/work guards
+    — same best-effort contract as the other fingerprints.
+
+    L3b is a *review-band* signal: honest agents on the same reference harness share
+    scaffolding prompts, so a prompt match alone is not copy evidence. It is
+    calibrated (``ditto.anticopy.clonecal``) and fused with an orthogonal signal
+    before it can hold an agent; this function only produces the sketch.
+    """
+    shingles: set[str] = set()
+    total = 0
+    members = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tar_gz_bytes), mode="r:gz") as tar:
+            for member in tar:
+                members += 1
+                if members > _MAX_MEMBERS:
+                    logger.warning("prompt-fp: >%d members, skipping", _MAX_MEMBERS)
+                    return None
+                if not member.isfile():
+                    continue
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
+                raw = extracted.read(_MAX_FILE_BYTES + 1)
+                if len(raw) > _MAX_FILE_BYTES:
+                    logger.warning("prompt-fp: file exceeds per-file cap")
+                    return None
+                total += len(raw)
+                if total > _MAX_TOTAL_BYTES:
+                    logger.warning("prompt-fp: >%d bytes, skipping", _MAX_TOTAL_BYTES)
+                    return None
+                for shingle in _prompt_shingles(raw):
+                    shingles.add(shingle)
+                    if len(shingles) > _MAX_SHINGLES:
+                        logger.warning("prompt-fp: >%d shingles", _MAX_SHINGLES)
+                        return None
+    except (tarfile.TarError, gzip.BadGzipFile, EOFError, OSError) as e:
+        logger.info("prompt-fp: unreadable tarball (%s)", type(e).__name__)
+        return None
+
+    if not shingles:
+        return None
+    return {
+        "v": _PROMPT_VERSION,
+        "k": _MINHASH_K,
+        "card": len(shingles),
+        "m": sorted(shingles)[:_MINHASH_K],
+    }
+
+
+def _prompt_shingles(raw: bytes) -> list[str]:
+    """Return the hashed word-shingles of a file's prompt-length string literals.
+
+    Each qualifying literal (``>= _PROMPT_MIN_WORDS`` words after lowercasing +
+    whitespace collapse) is shingled into overlapping ``_PROMPT_SHINGLE_WORDS``-word
+    windows so a light edit disturbs only a few shingles. Shingles carry a ``p:``
+    prefix before hashing, keeping the prompt hash-space disjoint from the lexical
+    line-shingle space as a second guard against cross-channel collision.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    out: list[str] = []
+    for literal in _extract_string_literals(text):
+        words = literal.lower().split()
+        if len(words) < _PROMPT_MIN_WORDS:
+            continue
+        w = _PROMPT_SHINGLE_WORDS
+        for i in range(len(words) - w + 1):
+            out.append(_hash_shingle("p:" + " ".join(words[i : i + w])))
+    return out
+
+
+def _extract_string_literals(text: str) -> Iterator[str]:
+    """Yield the contents of every string literal in ``text``.
+
+    Handles ordinary ``"..."`` literals (honoring ``\\`` escapes so an escaped quote
+    does not end the literal) and Rust raw strings ``r"..."`` / ``r#"..."#`` /
+    ``r##"..."##`` … (no escapes; the literal ends at ``"`` followed by the same
+    number of ``#`` that opened it). Line ``//`` and block ``/* */`` comments are
+    skipped so a ``"`` inside a comment does not open a spurious literal. Char /
+    lifetime ``'`` is not tracked (a ``"`` inside a char literal is rare and only
+    costs a spurious literal that fails the word-count gate). Best-effort and
+    tolerant: it never raises on malformed input, it just yields what it can.
+    """
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        # Skip comments so a `"` inside them doesn't open a literal.
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            if nl == -1:
+                return
+            i = nl + 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        # Raw string: r"..." or r#"..."# with a matching run of hashes.
+        if c == "r" and i + 1 < n and text[i + 1] in ('"', "#"):
+            j = i + 1
+            hashes = 0
+            while j < n and text[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and text[j] == '"':
+                close = '"' + "#" * hashes
+                end = text.find(close, j + 1)
+                if end == -1:
+                    yield text[j + 1 :]
+                    return
+                yield text[j + 1 : end]
+                i = end + len(close)
+                continue
+        # Ordinary double-quoted string.
+        if c == '"':
+            j = i + 1
+            buf: list[str] = []
+            while j < n:
+                cj = text[j]
+                if cj == "\\" and j + 1 < n:  # escape: consume the next char raw
+                    buf.append(text[j + 1])
+                    j += 2
+                    continue
+                if cj == '"':
+                    break
+                buf.append(cj)
+                j += 1
+            yield "".join(buf)
+            i = j + 1
+            continue
+        i += 1
 
 
 def _normalized_source(raw: bytes) -> str:
