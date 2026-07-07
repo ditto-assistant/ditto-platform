@@ -89,6 +89,7 @@ def evaluate_antidup(
     composite: float,
     size_bytes: int | None,
     eligible: Sequence[LedgerRow],
+    normalized_source_hash: str | None = None,
     content_fingerprint: dict | None = None,
     structural_fingerprint: dict | None = None,
     score_tol: float = _DEFAULT_SCORE_TOL,
@@ -105,6 +106,12 @@ def evaluate_antidup(
     harness is not a copier). Held iff, against **another miner's** eligible agent:
 
     1. **Exact copy** — same ``sha256``. Byte-identical resubmission.
+    1b. **Exact repack** — same ``normalized_source_hash`` (L3a): the same source
+       canonicalized (comments/whitespace stripped, files sorted), so a reformat /
+       re-comment / file rename+reorder repack that changes ``sha256`` still
+       matches. Like rule 1, held on the hash equality alone — no score proximity,
+       because an exact-source match is copy evidence regardless of the score it
+       happened to land.
     2. **Near-duplicate fingerprint** — composites within ``score_tol`` *and*
        either sketch channel matches:
 
@@ -140,6 +147,19 @@ def evaluate_antidup(
                 duplicate_of=e.agent_id,
                 reason=f"exact sha256 match of agent {e.agent_id}",
             )
+
+    # 1b. Exact-repack copy (L3a): same canonicalized source (comments/whitespace
+    #     stripped, files sorted) even when the tarball bytes differ. An equality
+    #     match, held unconditionally like sha256 — no score-proximity requirement.
+    #     Both hashes must be present (null = "no repack match", never a hit).
+    if normalized_source_hash is not None:
+        for e in others:
+            if e.normalized_source_hash == normalized_source_hash:
+                return ReviewDecision(
+                    held=True,
+                    duplicate_of=e.agent_id,
+                    reason=f"normalized-source (repack) match of agent {e.agent_id}",
+                )
 
     # 2. Near-dup fingerprint: close in score AND a matching sketch on either the
     #    lexical or the structural channel. Checked before the size rule because a

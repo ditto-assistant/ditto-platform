@@ -32,6 +32,7 @@ async def insert_agent(
     sha256: str,
     size_bytes: int,
     content_fingerprint: dict | None = None,
+    normalized_source_hash: str | None = None,
 ) -> None:
     """Insert one ``agents`` row inside the caller-owned transaction.
 
@@ -47,6 +48,9 @@ async def insert_agent(
     ``content_fingerprint`` (:mod:`ditto.api_server.fingerprint`) is the
     shingle MinHash sketch feeding the gate's content-level signal; ``None``
     when the tarball was unreadable/empty at upload.
+    ``normalized_source_hash`` (same module) is the L3a exact-repack hash of the
+    canonicalized source feeding the gate's equality signal; ``None`` on the same
+    unreadable/empty condition.
 
     Raises:
         DbIntegrityError: Any constraint violation on ``agents``
@@ -62,6 +66,7 @@ async def insert_agent(
         sha256=sha256,
         size_bytes=size_bytes,
         content_fingerprint=content_fingerprint,
+        normalized_source_hash=normalized_source_hash,
     )
     session.add(row)
     try:

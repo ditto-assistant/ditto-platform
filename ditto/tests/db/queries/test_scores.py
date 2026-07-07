@@ -95,6 +95,7 @@ async def _seed_scored(
     created_at: datetime,
     size_bytes: int = 524288,
     status: AgentStatus = AgentStatus.SCORED,
+    normalized_source_hash: str | None = None,
 ) -> Agent:
     """Seed one agent + its score row, in the given lifecycle state."""
     agent = Agent(
@@ -105,6 +106,7 @@ async def _seed_scored(
         size_bytes=size_bytes,
         status=status,
         created_at=created_at,
+        normalized_source_hash=normalized_source_hash,
     )
     async with session.begin():
         session.add(agent)
@@ -143,6 +145,22 @@ class TestListEligibleLedger:
         assert ledger[0].composite == pytest.approx(0.8)
         assert ledger[0].miner_hotkey == _MINER
         assert ledger[0].signature == "ab" * 64
+
+    async def test_normalized_source_hash_flows_through(
+        self, session: AsyncSession
+    ) -> None:
+        # The L3a exact-repack hash must reach the ledger so the gate can read it.
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        await _seed_scored(
+            session,
+            miner=_MINER,
+            composite=0.7,
+            created_at=t0,
+            normalized_source_hash="ns" * 32,
+        )
+        ledger = await list_eligible_ledger(session)
+        assert len(ledger) == 1
+        assert ledger[0].normalized_source_hash == "ns" * 32
 
     async def test_ordered_by_composite_desc(self, session: AsyncSession) -> None:
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)

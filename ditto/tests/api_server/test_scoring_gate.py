@@ -36,6 +36,7 @@ def _entry(
     size_bytes: int | None = 524288,
     content_fingerprint: dict | None = None,
     structural_fingerprint: dict | None = None,
+    normalized_source_hash: str | None = None,
 ) -> LedgerRow:
     return LedgerRow(
         miner_hotkey=miner,
@@ -53,6 +54,7 @@ def _entry(
         status=AgentStatus.SCORED,
         content_fingerprint=content_fingerprint,
         structural_fingerprint=structural_fingerprint,
+        normalized_source_hash=normalized_source_hash,
     )
 
 
@@ -84,6 +86,66 @@ class TestEvaluateAntidup:
         assert decision.held is True
         assert decision.duplicate_of == incumbent.agent_id
         assert "sha256" in (decision.reason or "")
+
+    def test_exact_repack_normalized_hash_is_held(self) -> None:
+        # Different bytes (sha256) but the same canonicalized source: a reformat /
+        # re-comment / file-reorder repack. Held on the hash equality alone, with
+        # no score proximity (a distant score must not save it).
+        incumbent = _entry(
+            composite=0.60,
+            sha256="cc" * 32,
+            normalized_source_hash="ns" * 32,
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Copier",
+            sha256="dd" * 32,  # repackaged bytes differ
+            composite=0.95,  # far from incumbent — proximity is irrelevant here
+            size_bytes=999999,
+            normalized_source_hash="ns" * 32,
+            eligible=[incumbent],
+        )
+        assert decision.held is True
+        assert decision.duplicate_of == incumbent.agent_id
+        assert "repack" in (decision.reason or "")
+
+    def test_same_miner_repack_not_held(self) -> None:
+        # A miner re-uploading their OWN agent (same normalized hash) is iterating,
+        # not copying — the other-miner filter must exempt it.
+        own = _entry(
+            composite=0.60,
+            miner="5Self",
+            sha256="cc" * 32,
+            normalized_source_hash="ns" * 32,
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Self",
+            sha256="dd" * 32,
+            composite=0.61,
+            size_bytes=500000,
+            normalized_source_hash="ns" * 32,
+            eligible=[own],
+        )
+        assert decision.held is False
+
+    def test_null_normalized_hash_never_matches(self) -> None:
+        # An incumbent with no stored hash (uploaded before L3a / unreadable
+        # tarball) must not match a challenger that also lacks one — null is
+        # "no repack match", never a hit against null.
+        incumbent = _entry(
+            composite=0.60, sha256="cc" * 32, normalized_source_hash=None
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Challenger",
+            sha256="dd" * 32,
+            composite=0.85,
+            size_bytes=700000,
+            normalized_source_hash=None,
+            eligible=[incumbent],
+        )
+        assert decision.held is False
 
     def test_near_dup_from_other_miner_is_held(self) -> None:
         incumbent = _entry(composite=0.80, sha256="aa" * 32, size_bytes=500000)
