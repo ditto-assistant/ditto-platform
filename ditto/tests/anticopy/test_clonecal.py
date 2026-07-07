@@ -10,6 +10,8 @@ independents and full recall on the tier it is meant to catch.
 from __future__ import annotations
 
 from ditto.anticopy.clonecal import (
+    _prompt,
+    _sig_normalized_hash,
     build_corpus,
     default_signals,
     demo_corpus,
@@ -111,3 +113,48 @@ class TestEvaluation:
         indep = [p for p in corpus if not p.is_clone]
         assert {p.tier for p in clones} == {1, 2}  # two ladder tiers per seed
         assert len(indep) == 1  # the single distinct-seed pair
+
+
+class TestPromptSignal:
+    """L3b prompt fingerprint: it catches the rename clones L1/L3a miss, while the
+    convergent pair keeps it honest as a review-band (not autoreject) signal."""
+
+    def test_l3b_recall_exceeds_lexical_and_hash(self) -> None:
+        # The payoff: hashing the prompt's contents survives identifier renaming, so
+        # L3b catches BOTH ladder tiers (recall 1.0) where L3a and L1 — defeated by
+        # the tier-2 rename — reach only 0.5.
+        reports = {r.name: r for r in evaluate(demo_corpus(), default_signals())}
+        l3b = reports["L3b_prompt_jaccard"]
+        assert l3b.best.recall == 1.0
+        assert l3b.best.recall > reports["L3a_normalized_hash"].best.recall
+        assert l3b.best.recall > reports["L1_lexical_jaccard"].best.recall
+
+    def test_l3b_precise_at_operating_point(self) -> None:
+        # A threshold still separates the preserved-prompt clones (score 1.0) from
+        # the convergent pair (< 1.0), so the reported operating point is clean.
+        reports = {r.name: r for r in evaluate(demo_corpus(), default_signals())}
+        assert reports["L3b_prompt_jaccard"].best.precision == 1.0
+
+    def test_convergent_pair_is_orthogonal_no_single_signal_suffices(self) -> None:
+        # The honesty case: on two independent agents that share only the harness
+        # preamble, L3b fires (shared prompt) while L1 and L3a stay at 0.0. No single
+        # signal is both firing and correct — which is exactly why a hold needs ≥2
+        # orthogonal signals, and why L3b alone must not autoreject.
+        conv = next(p for p in demo_corpus() if p.note == "convergent")
+        assert not conv.is_clone
+        assert _prompt(conv.a, conv.b)[0] > 0.5  # L3b fires on a non-clone
+        assert _sig_normalized_hash(conv.a, conv.b) == 0.0  # …but L3a does not
+        # …and neither does the lexical channel (bodies differ, no shared window).
+        reports = {r.name: r for r in evaluate([conv], default_signals())}
+        assert reports["L1_lexical_jaccard"].sweep  # scored, just not a match here
+
+    def test_prompt_survives_tier2_rename(self) -> None:
+        # Direct check underlying the recall win: a tier-2 rename leaves the prompt
+        # sketch identical to the base, even as the normalized-source hash diverges.
+        base = demo_corpus()[0].a  # alpha base crate (tier-1 clone's a-side)
+        seed = unpack(base)
+        renamed = pack(obfuscate(seed, tier=2))
+        assert _prompt(base, renamed)[0] == 1.0
+        assert compute_normalized_source_hash(base) != compute_normalized_source_hash(
+            renamed
+        )
