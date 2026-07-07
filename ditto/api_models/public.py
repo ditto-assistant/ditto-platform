@@ -85,6 +85,35 @@ class PublicBenchIntegrity(BaseModel):
     ]
 
 
+class PublicCaseResult(BaseModel):
+    """One scored case, **redacted** for public per-case analysis.
+
+    Carries only *how the agent did* on the case — its category, kind, score,
+    pass/fail, latency, and the scorer's mechanical notes (e.g. "1 extra tool
+    call", "capped: self-report untrusted"). It deliberately **omits the answer
+    key**: the ``expected`` tools/answer, the agent's ``called`` tools (which on a
+    correct case would reveal ``expected``), and the seed-derived ``case_id``.
+    Combined with per-submission seed rotation, this lets anyone inspect a run's
+    per-case strengths/weaknesses without learning anything that helps overfit.
+    """
+
+    category: Annotated[
+        str, Field(description="Case category (tool name / memory question type).")
+    ]
+    kind: Annotated[str, Field(description='"tool" or "memory".')]
+    score: Annotated[float, Field(ge=0.0, le=1.0, description="Case score in [0,1].")]
+    correct: Annotated[
+        bool | None, Field(default=None, description="Whether the case passed.")
+    ]
+    latency_ms: Annotated[
+        int | None, Field(default=None, ge=0, description="Case latency (ms).")
+    ]
+    notes: Annotated[
+        list[str] | None,
+        Field(default=None, description="Scorer's mechanical notes (no answers)."),
+    ]
+
+
 class PublicRunModels(BaseModel):
     """The LLM models a scored run was produced with (public transparency)."""
 
@@ -126,6 +155,21 @@ class PublicLeaderboardEntry(BaseModel):
     composite: Annotated[
         float, Field(ge=0.0, le=1.0, description="Best composite in [0,1].")
     ]
+    composite_stderr: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            description=(
+                "Standard error of the composite, estimated from the per-case "
+                "score spread — the measurement uncertainty behind the headline "
+                "number. Lets a consumer draw error bars and judge whether two "
+                "miners are a statistical tie (the same signal the validator's "
+                "indifference-band dethroning uses). None when the run carries no "
+                "per-case data to estimate from."
+            ),
+        ),
+    ]
     tool_mean: Annotated[
         float, Field(ge=0.0, le=1.0, description="Mean tool accuracy in [0,1].")
     ]
@@ -165,6 +209,30 @@ class PublicLeaderboardEntry(BaseModel):
         int | None,
         Field(default=None, ge=0, description="LLM tokens spent generating+judging."),
     ]
+    history: Annotated[
+        list[float] | None,
+        Field(
+            default=None,
+            description=(
+                "This miner's recent composite scores, oldest→newest (across their "
+                "submissions / re-scores), for a trend sparkline. Aggregate only — "
+                "no seeds, no per-case content. None / omitted when there is no "
+                "history beyond the current score."
+            ),
+        ),
+    ]
+    case_results: Annotated[
+        list[PublicCaseResult] | None,
+        Field(
+            default=None,
+            description=(
+                "Redacted per-case results for detailed analysis — each case's "
+                "category / kind / score / pass / latency / mechanical notes, but "
+                "never the answer key (``expected`` / ``called`` / ``case_id``). "
+                "None when the run carries no per-case data."
+            ),
+        ),
+    ]
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -172,6 +240,7 @@ class PublicLeaderboardEntry(BaseModel):
                 "rank": 1,
                 "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
                 "composite": 0.587,
+                "composite_stderr": 0.014,
                 "tool_mean": 0.867,
                 "memory_mean": 0.167,
                 "first_seen": "2026-07-03T20:00:00Z",
@@ -200,6 +269,25 @@ class PublicLeaderboardEntry(BaseModel):
                     "seeding_waves": 1,
                 },
                 "tokens": 7622,
+                "history": [0.502, 0.548, 0.571, 0.587],
+                "case_results": [
+                    {
+                        "category": "web_search",
+                        "kind": "tool",
+                        "score": 0.6,
+                        "correct": False,
+                        "latency_ms": 3382,
+                        "notes": ["1 extra/unexpected tool call(s)"],
+                    },
+                    {
+                        "category": "preference",
+                        "kind": "memory",
+                        "score": 1.0,
+                        "correct": True,
+                        "latency_ms": 1333,
+                        "notes": ["deterministic answer match (no judge call)"],
+                    },
+                ],
             }
         }
     )

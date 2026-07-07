@@ -73,6 +73,7 @@ async def _seed_scored(
     status: AgentStatus = AgentStatus.SCORED,
     median_ms: int = 500,
     generated_at: datetime = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
+    details: dict | None = None,
 ) -> None:
     async with maker() as s, s.begin():
         agent = Agent(
@@ -99,6 +100,7 @@ async def _seed_scored(
             n=20,
             generated_at=generated_at,
             signature="ab" * 64,
+            details=details,
         )
 
 
@@ -169,8 +171,31 @@ class TestPublicLeaderboard:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
+        # Seed a run whose details carry the raw per-case answer key so we can
+        # assert it is redacted out, not merely absent because it was never set.
+        details = {
+            "bench_version": 2,
+            "per_case": [
+                {
+                    "kind": "tool",
+                    "category": "web_search",
+                    "score": 0.6,
+                    "correct": False,
+                    "latency_ms": 3382,
+                    "notes": ["1 extra/unexpected tool call(s)"],
+                    "expected": ["search_web"],
+                    "called": ["search_web", "search_web"],
+                    "case_id": "web_search-8860569897825046057-0001",
+                },
+            ],
+        }
         await _seed_scored(
-            session_maker, miner=_MINER_A, composite=0.4, tool_mean=0.5, memory_mean=0.3
+            session_maker,
+            miner=_MINER_A,
+            composite=0.4,
+            tool_mean=0.5,
+            memory_mean=0.3,
+            details=details,
         )
         _install_db(app, session_maker)
 
@@ -178,6 +203,21 @@ class TestPublicLeaderboard:
         entry = resp.json()["entries"][0]
         for leaked in ("signature", "sha256", "validator_hotkey", "agent_id", "seed"):
             assert leaked not in entry
+        # The answer key must appear NOWHERE in the whole response, even nested
+        # inside the redacted per-case results. Check the quoted JSON keys (so a
+        # note like "unexpected tool call" doesn't false-match "expected") plus
+        # the expected/called tool token itself.
+        raw = resp.text
+        for answer_key in ('"expected"', '"called"', '"case_id"', "search_web"):
+            assert answer_key not in raw
+        # …but the safe, redacted per-case view IS surfaced for analysis.
+        cases = entry["case_results"]
+        assert cases and cases[0]["category"] == "web_search"
+        assert cases[0]["score"] == pytest.approx(0.6)
+        assert cases[0]["correct"] is False
+        assert set(cases[0]).issubset(
+            {"category", "kind", "score", "correct", "latency_ms", "notes"}
+        )
 
     async def test_empty_ledger(
         self,

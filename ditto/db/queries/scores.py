@@ -235,6 +235,38 @@ async def list_scores_for_agent(
     return list(result.scalars().all())
 
 
+async def list_miner_composite_history(
+    session: AsyncSession,
+    hotkeys: list[str],
+    *,
+    limit_per: int = 12,
+) -> dict[str, list[float]]:
+    """Per-miner composite trajectory (oldest→newest) for the trend sparkline.
+
+    Returns ``{miner_hotkey: [composite, ...]}`` — every score row for the
+    miner's agents, chronological, capped to the most recent ``limit_per``. This
+    is the miner's score *over time* (across submissions + re-scores), which is
+    aggregate-only (a composite series — no seeds, no per-case content). Empty
+    dict for no hotkeys; a miner with a single score simply gets a length-1 list.
+
+    One join + one pass; the ``scores`` table is small at subnet scale.
+    """
+    if not hotkeys:
+        return {}
+    stmt = (
+        select(Agent.miner_hotkey, Score.composite, Score.generated_at)
+        .select_from(Score)
+        .join(Agent, Agent.agent_id == Score.agent_id)
+        .where(Agent.miner_hotkey.in_(hotkeys))
+        .order_by(Agent.miner_hotkey, Score.generated_at.asc())
+    )
+    rows = (await session.execute(stmt)).all()
+    out: dict[str, list[float]] = {}
+    for hotkey, composite, _generated_at in rows:
+        out.setdefault(hotkey, []).append(float(composite))
+    return {hotkey: series[-limit_per:] for hotkey, series in out.items()}
+
+
 async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
     """Return the best eligible score per miner, highest composite first.
 

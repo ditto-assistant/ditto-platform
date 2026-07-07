@@ -121,7 +121,7 @@
     .banner b { color: #fde68a; }
 
     /* ── Summary cards ──────────────────────────────────────── */
-    .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 22px 0; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 14px; margin: 22px 0; }
     .card {
       background: var(--bg-elev); border: 1px solid var(--border);
       border-radius: var(--radius); padding: 16px 18px; position: relative; overflow: hidden;
@@ -174,13 +174,54 @@
     .copy:hover { color: var(--accent); }
 
     .metric { display: flex; align-items: center; gap: 10px; min-width: 150px; }
-    .metric .barwrap { flex: 1; height: 7px; border-radius: 4px; background: var(--bg-elev-2); overflow: hidden; }
-    .metric .bar { height: 100%; border-radius: 4px; }
+    .metric .barwrap { flex: 1; height: 7px; border-radius: 4px; background: var(--bg-elev-2); position: relative; }
+    .metric .bar { height: 100%; border-radius: 4px; position: relative; z-index: 1; }
     .metric .mval { font-variant-numeric: tabular-nums; font-size: 13px; min-width: 46px; text-align: right; color: var(--text); }
     .bar.composite { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
     .bar.tool { background: var(--tool); }
     .bar.memory { background: var(--memory); }
     .muted { color: var(--text-dim); }
+
+    /* Composite uncertainty: a ±SE band overlaid on the bar track, with end ticks. */
+    .err { position: absolute; top: -2px; height: 11px; z-index: 2; background: rgba(231,236,243,0.14); border-left: 1px solid rgba(231,236,243,0.55); border-right: 1px solid rgba(231,236,243,0.55); border-radius: 1px; pointer-events: none; }
+    /* Composite cell = bar row + optional sparkline + tie note stacked. */
+    .cwrap { display: flex; flex-direction: column; gap: 5px; }
+    .tie { font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; color: var(--warn); border: 1px solid rgba(251,191,36,0.4); border-radius: 5px; padding: 0 5px; white-space: nowrap; }
+    .spark { display: block; }
+    .spark path { fill: none; stroke: var(--accent-2); stroke-width: 1.5; }
+    .spark .dot { fill: var(--accent-2); }
+    .spark .area { fill: rgba(34,211,238,0.10); stroke: none; }
+
+    /* Rank movement arrow next to the rank badge (since last view). */
+    .rankmove { display: inline-block; margin-left: 6px; font-size: 10.5px; font-weight: 700; font-variant-numeric: tabular-nums; vertical-align: middle; }
+    .rankmove.up { color: var(--good); }
+    .rankmove.down { color: var(--danger); }
+    .rankmove.flat { color: var(--text-faint); }
+    .rankmove.new { color: var(--accent-2); }
+
+    /* Latency + case-count cell. */
+    .lat { font-variant-numeric: tabular-nums; }
+    .lat .cases { color: var(--text-faint); font-size: 11.5px; }
+
+    /* Drawer: redacted per-case results (collapsible). */
+    details.cases { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 8px; }
+    details.cases summary { cursor: pointer; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: var(--text-dim); padding: 6px 0; list-style: none; }
+    details.cases summary::-webkit-details-marker { display: none; }
+    details.cases summary::before { content: "▸ "; color: var(--text-faint); }
+    details.cases[open] summary::before { content: "▾ "; }
+    .crow { padding: 8px 0; border-bottom: 1px solid rgba(36,48,74,0.5); }
+    .crow .cmain { display: flex; align-items: center; gap: 8px; }
+    .crow .cmain, .crow .cscore { justify-content: space-between; }
+    .crow .cscore { display: flex; align-items: center; gap: 10px; margin-top: 2px; }
+    .ckind { font-size: 9px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; border-radius: 4px; padding: 1px 5px; }
+    .ckind.tool { color: var(--tool); border: 1px solid rgba(91,140,255,0.4); }
+    .ckind.memory { color: var(--memory); border: 1px solid rgba(34,211,238,0.4); }
+    .ccat { font-size: 12.5px; color: var(--text); flex: 1; }
+    .crow .pass { color: var(--good); font-weight: 700; }
+    .crow .fail { color: var(--danger); font-weight: 700; }
+    .cmeta { color: var(--text-faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+    .cval { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .cnote { color: var(--text-faint); font-size: 11px; margin-top: 3px; font-style: italic; }
 
     /* ── Drill-down ─────────────────────────────────────────── */
     .drawer-back { position: fixed; inset: 0; background: rgba(4, 7, 12, 0.62); backdrop-filter: blur(3px); opacity: 0; pointer-events: none; transition: opacity .18s; z-index: 40; }
@@ -257,6 +298,8 @@
       <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label">Miners Scored</div><div class="value" id="c-miners">—</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label">Top Composite</div><div class="value" id="c-top">—</div></div>
       <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label">Median Composite</div><div class="value" id="c-median">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label">Top Gap</div><div class="value" id="c-spread">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--memory)"></div><div class="label">Scoring Spend</div><div class="value" id="c-cost">—</div></div>
       <div class="card"><div class="glow" style="background:var(--good)"></div><div class="label">Scoring</div><div class="value" id="c-bench">—</div></div>
     </section>
 
@@ -271,14 +314,15 @@
             <th style="width:52px">#</th>
             <th>Miner</th>
             <th class="hide-md" style="width:180px">Model</th>
-            <th style="width:180px">Composite</th>
-            <th class="hide-sm" style="width:150px">Tool</th>
-            <th class="hide-sm" style="width:150px">Memory</th>
-            <th class="num hide-sm" style="width:100px">First seen</th>
+            <th style="width:190px">Composite</th>
+            <th class="hide-sm" style="width:140px">Tool</th>
+            <th class="hide-sm" style="width:140px">Memory</th>
+            <th class="num hide-sm" style="width:96px">Latency</th>
+            <th class="num hide-sm" style="width:92px">First seen</th>
           </tr>
         </thead>
         <tbody id="rows">
-          <tr><td colspan="7" class="empty">Loading leaderboard…</td></tr>
+          <tr><td colspan="8" class="empty">Loading leaderboard…</td></tr>
         </tbody>
       </table>
     </div>
@@ -344,6 +388,26 @@
     var REFRESH_MS = 30000; // matches the API's Cache-Control max-age
     var lastEntries = [];
 
+    // Rank-movement baseline: the ranks from the viewer's last visit. Every
+    // render compares against this snapshot (kept for the session) and then
+    // rewrites localStorage, so the arrows read "since your last visit". Guarded
+    // so a sandbox / disabled storage just yields no arrows.
+    var prevRanks = {};
+    var prevRanksHasData = false;
+    try {
+      var stored = (typeof localStorage !== "undefined") ? localStorage.getItem("ditto:ranks") : null;
+      prevRanks = JSON.parse(stored || "{}") || {};
+      prevRanksHasData = Object.keys(prevRanks).length > 0;
+    } catch (e) { prevRanks = {}; }
+    function persistRanks() {
+      try {
+        if (typeof localStorage === "undefined") return;
+        var m = {};
+        lastEntries.forEach(function (e, i) { m[e.miner_hotkey] = i + 1; });
+        localStorage.setItem("ditto:ranks", JSON.stringify(m));
+      } catch (e) { /* storage unavailable — arrows just won't persist */ }
+    }
+
     // ── Formatting helpers ───────────────────────────────────
     function pct(x) { return (x * 100).toFixed(1) + "%"; }
     function fx(x) { return x.toFixed(3); }
@@ -388,6 +452,13 @@
       document.getElementById("c-miners").textContent = entries.length;
       document.getElementById("c-top").innerHTML = entries.length ? fx(comps[0]) : "—";
       document.getElementById("c-median").innerHTML = entries.length ? fx(median(comps)) : "—";
+      // Top gap: how contested the #1 spot is (#1 minus #2 composite).
+      document.getElementById("c-spread").innerHTML = entries.length >= 2
+        ? fx(comps[0] - comps[1]) + ' <small>#1 → #2</small>' : "—";
+      // Scoring spend: total LLM tokens burned generating + judging these runs.
+      var toks = entries.map(function (e) { return e.tokens; }).filter(function (t) { return t != null; });
+      document.getElementById("c-cost").innerHTML = toks.length
+        ? fmtTokens(toks.reduce(function (a, b) { return a + b; }, 0)) + ' <small>tokens</small>' : "—";
       // Scoring card: the fixed composite weighting (the benchmark version lives
       // in the header badge below, so it isn't duplicated here).
       document.getElementById("c-bench").innerHTML = '0.5 / 0.5 <small>tool / memory</small>';
@@ -414,7 +485,8 @@
       // Rows
       var tb = document.getElementById("rows");
       if (!entries.length) {
-        tb.innerHTML = '<tr><td colspan="7" class="empty">No miners have been scored yet. As soon as a submission clears scoring it appears here.</td></tr>';
+        tb.innerHTML = '<tr><td colspan="8" class="empty">No miners have been scored yet. As soon as a submission clears scoring it appears here.</td></tr>';
+        persistRanks();
         return;
       }
       tb.innerHTML = entries.map(function (e, i) {
@@ -422,22 +494,97 @@
         var champ = i === 0 ? '<span class="badge">👑 LEADER</span>' : "";
         return '' +
           '<tr data-i="' + i + '"' + (i === 0 ? ' class="champion"' : '') + '>' +
-            '<td><span class="rank' + rankCls + '">' + (i + 1) + '</span></td>' +
+            '<td><span class="rank' + rankCls + '">' + (i + 1) + '</span>' + rankMove(e.miner_hotkey, i + 1) + '</td>' +
             '<td><span class="hotkey">' + esc(shortKey(e.miner_hotkey)) + '</span>' + champ +
               '<span class="copy" data-key="' + esc(e.miner_hotkey) + '" title="Copy hotkey">⧉</span></td>' +
             modelCell(e) +
-            '<td>' + bar("composite", e.composite) + '</td>' +
+            compositeCell(e, entries[i - 1]) +
             '<td class="hide-sm">' + bar("tool", e.tool_mean) + '</td>' +
             '<td class="hide-sm">' + bar("memory", e.memory_mean) + '</td>' +
+            latCell(e) +
             '<td class="num hide-sm muted">' + relTime(e.first_seen) + '</td>' +
           '</tr>';
       }).join("");
+      persistRanks();
     }
 
+    function fmtTokens(t) { return t >= 1e6 ? (t / 1e6).toFixed(1) + "M" : t >= 1e3 ? (t / 1e3).toFixed(1) + "k" : String(t); }
+    function fmtMs(ms) { return ms >= 1000 ? (ms / 1000).toFixed(ms >= 10000 ? 0 : 1) + " s" : ms + " ms"; }
+    function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+
     function bar(kind, v) {
-      var w = Math.max(0, Math.min(1, v)) * 100;
+      var w = clamp01(v) * 100;
       return '<div class="metric"><div class="barwrap"><div class="bar ' + kind + '" style="width:' + w.toFixed(1) + '%"></div></div>' +
              '<span class="mval">' + fx(v) + '</span></div>';
+    }
+
+    // Composite cell = bar (with a ±1-SE uncertainty band + end ticks) + value,
+    // then a second line carrying the trend sparkline and a statistical-tie chip.
+    function compositeCell(e, above) {
+      var w = clamp01(e.composite) * 100;
+      var band = errBand(e.composite, e.composite_stderr);
+      var row = '<div class="metric"><div class="barwrap">' + band +
+        '<div class="bar composite" style="width:' + w.toFixed(1) + '%"></div></div>' +
+        '<span class="mval">' + fx(e.composite) + '</span></div>';
+      var spark = sparkSvg(e.history);
+      var tie = tieChip(e, above);
+      var line2 = (spark || tie)
+        ? '<div style="display:flex;align-items:center;gap:8px;min-height:16px">' + spark + tie + '</div>' : "";
+      return '<td><div class="cwrap">' + row + line2 + '</div></td>';
+    }
+    // ±1-SE band overlaid on the composite track (clamped to [0,1]).
+    function errBand(comp, se) {
+      if (se == null || !(se > 0)) return "";
+      var lo = clamp01(comp - se) * 100;
+      var hi = clamp01(comp + se) * 100;
+      return '<div class="err" title="±' + fx(se) + ' (1 SE) — measurement uncertainty" ' +
+        'style="left:' + lo.toFixed(1) + '%;width:' + Math.max(0.6, hi - lo).toFixed(1) + '%"></div>';
+    }
+    // "≈ tie" when a miner is within measurement noise of the one ranked above —
+    // the same ±z·SE indifference band the validator uses to resist dethroning.
+    function tieChip(e, above) {
+      if (!above || e.composite_stderr == null || above.composite_stderr == null) return "";
+      var Z = 1.64;
+      var band = Z * Math.sqrt(e.composite_stderr * e.composite_stderr + above.composite_stderr * above.composite_stderr);
+      if (Math.abs(above.composite - e.composite) <= band)
+        return '<span class="tie" title="Within ±' + Z + ' SE of the miner above — a statistical tie, not a clear gap">≈ tie</span>';
+      return "";
+    }
+    // Inline composite-trend sparkline from the miner's score history. Sized for
+    // the row by default; pass W/H for the larger drawer version.
+    function sparkSvg(h, W, H) {
+      if (!h || h.length < 2) return "";
+      W = W || 62; H = H || 16;
+      var min = Math.min.apply(null, h), max = Math.max.apply(null, h), rng = (max - min) || 1;
+      var pts = h.map(function (v, i) {
+        return [(i / (h.length - 1)) * (W - 2) + 1, H - 1 - ((v - min) / rng) * (H - 3)];
+      });
+      var line = pts.map(function (p, i) { return (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1); }).join(" ");
+      var area = "M" + pts[0][0].toFixed(1) + " " + (H - 1) + " " +
+        pts.map(function (p) { return "L" + p[0].toFixed(1) + " " + p[1].toFixed(1); }).join(" ") +
+        " L" + pts[pts.length - 1][0].toFixed(1) + " " + (H - 1) + " Z";
+      var last = pts[pts.length - 1];
+      return '<svg class="spark" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' +
+        '<title>composite over time: ' + h.map(fx).join(" → ") + '</title>' +
+        '<path class="area" d="' + area + '"/><path d="' + line + '"/>' +
+        '<circle class="dot" cx="' + last[0].toFixed(1) + '" cy="' + last[1].toFixed(1) + '" r="1.7"/></svg>';
+    }
+    // Latency + case-count cell (honest "—" when a run has no latency recorded).
+    function latCell(e) {
+      if (e.median_ms == null) return '<td class="num hide-sm lat muted">—</td>';
+      var cases = e.n != null ? '<div class="cases">' + e.n + " cases</div>" : "";
+      return '<td class="num hide-sm lat">' + fmtMs(e.median_ms) + cases + "</td>";
+    }
+    // Rank movement since the viewer's last visit (baseline in localStorage).
+    function rankMove(hotkey, currRank) {
+      if (!(hotkey in prevRanks)) {
+        return prevRanksHasData
+          ? '<span class="rankmove new" title="New since your last visit">NEW</span>' : "";
+      }
+      var d = prevRanks[hotkey] - currRank;
+      if (d > 0) return '<span class="rankmove up" title="Up ' + d + ' since your last visit">▲' + d + '</span>';
+      if (d < 0) return '<span class="rankmove down" title="Down ' + (-d) + ' since your last visit">▼' + (-d) + '</span>';
+      return "";
     }
 
     // Model column cell: the harness (or, absent that, the datagen) model + the
@@ -502,15 +649,25 @@
             ? "  (overlap " + fx(g.lexical_gap_mean_before) + "→" + fx(g.lexical_gap_mean_after) + ")" : ""));
       if (g.capped_tool_cases != null) ig += stat("Capped tool cases", String(g.capped_tool_cases));
       if (g.seeding_waves != null) ig += stat("Memory seeding waves", String(g.seeding_waves));
+      // Composite trend (score history) — a larger sparkline when we have ≥2 points.
+      var trend = "";
+      if (e.history && e.history.length >= 2) {
+        trend = '<div class="stat-head">Composite trend</div>' +
+          '<div class="stat-row"><span class="k">' + e.history.length + ' scores</span>' +
+          '<span class="v">' + sparkSvg(e.history, 190, 38) + '</span></div>';
+      }
       document.getElementById("d-stats").innerHTML =
-        stat("Composite", fx(e.composite)) +
+        stat("Composite", fx(e.composite) +
+          (e.composite_stderr != null ? "  ± " + fx(e.composite_stderr) + " SE" : "")) +
         stat("Tool mean", fx(e.tool_mean) + "  (" + pct(e.tool_mean) + ")") +
         stat("Memory mean", fx(e.memory_mean) + "  (" + pct(e.memory_mean) + ")") +
         stat("First seen", new Date(e.first_seen).toLocaleString()) +
         stat("Rank", "#" + e.rank + " of " + lastEntries.length) +
         (det ? '<div class="stat-head">Benchmark run</div>' + det : "") +
         pc +
-        (ig ? '<div class="stat-head">Benchmark integrity</div>' + ig : "");
+        (ig ? '<div class="stat-head">Benchmark integrity</div>' + ig : "") +
+        casesSection(e) +
+        trend;
 
       document.getElementById("drawer").classList.add("open");
       document.getElementById("drawer").setAttribute("aria-hidden", "false");
@@ -518,6 +675,29 @@
     }
     function stat(k, v) {
       return '<div class="stat-row"><span class="k">' + esc(k) + '</span><span class="v">' + esc(v) + '</span></div>';
+    }
+    // Per-case results — redacted detail for analysis (category / kind / score /
+    // pass / latency / notes; never the answer key). Grouped tool-then-memory,
+    // worst score first so the weak spots surface. Collapsed behind a <details>.
+    function casesSection(e) {
+      var cs = e.case_results;
+      if (!cs || !cs.length) return "";
+      var rows = cs.slice().sort(function (a, b) {
+        if (a.kind !== b.kind) return a.kind === "tool" ? -1 : 1;
+        return a.score - b.score;
+      }).map(function (c) {
+        var ok = c.correct === true ? '<span class="pass">✓</span>'
+          : c.correct === false ? '<span class="fail">✗</span>' : "";
+        var lat = c.latency_ms != null ? '<span class="cmeta">' + fmtMs(c.latency_ms) + "</span>" : "";
+        var note = (c.notes && c.notes.length) ? '<div class="cnote">' + esc(c.notes.join(" · ")) + "</div>" : "";
+        return '<div class="crow">' +
+          '<div class="cmain"><span class="ckind ' + esc(c.kind) + '">' + esc(c.kind) + '</span>' +
+          '<span class="ccat">' + esc(c.category) + "</span>" + ok + "</div>" +
+          '<div class="cscore">' + lat + '<span class="cval">' + fx(c.score) + "</span></div>" +
+          note + "</div>";
+      }).join("");
+      return '<details class="cases"><summary>Per-case results <span class="muted">· ' + cs.length +
+        " cases</span></summary>" + rows + "</details>";
     }
     function closeDrawer() {
       document.getElementById("drawer").classList.remove("open");
@@ -584,14 +764,22 @@
           median_ms: 2410, n: 12, bench_version: 2, dataset_sha256: "9f2c1a77b4e35d0182ac4f6b0e2d9c3a5b7148ef22d0c6a9f1e8b3d47c05a6e1",
           models: { generator: "google/gemini-3.1-flash-lite", judge: "google/gemini-3.1-flash-lite", judge_audit: null, harness: "anthropic/claude-haiku-4.5" },
           per_category: [{ category: "memory_lookup", count: 3, mean: 0.83 }, { category: "web_search", count: 2, mean: 0.75 }, { category: "artifacts_create", count: 1, mean: 0.6 }],
-          integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 0, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.2, capped_tool_cases: 3, seeding_waves: 2 }, tokens: 8140 },
+          integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 0, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.2, capped_tool_cases: 3, seeding_waves: 2 }, tokens: 8140,
+          composite_stderr: 0.017, history: [0.481, 0.523, 0.559, 0.601, 0.658],
+          case_results: [
+            { category: "web_search", kind: "tool", score: 0.75, correct: true, latency_ms: 2410, notes: ["judged correct=true grounded=true"] },
+            { category: "artifacts_create", kind: "tool", score: 0.60, correct: false, latency_ms: 8740, notes: ["capped: observable case not executed via tool_endpoint (self-report untrusted)"] },
+            { category: "memory_lookup", kind: "memory", score: 1.0, correct: true, latency_ms: 1330, notes: ["deterministic answer match (no judge call)"] },
+            { category: "contradiction", kind: "memory", score: 0.0, correct: false, latency_ms: 2210, notes: ["judged correct=false"] }
+          ] },
         { rank: 2, miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.432, first_seen: new Date(Date.now() - 86400000 * 3).toISOString(),
           median_ms: 3120, n: 12, bench_version: 2, dataset_sha256: "1b8e07d4c9f6a2531e0c74ab9f3d61528ac40f7e6d1b9c8a2f5e340d7b16c9a0",
           models: { generator: "google/gemini-3.1-flash-lite", judge: "google/gemini-3.1-flash-lite", judge_audit: null, harness: "openai/gpt-4o-mini" },
           per_category: [{ category: "memory_lookup", count: 3, mean: 0.72 }, { category: "image_create", count: 1, mean: 0.5 }],
-          integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 1, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.22, capped_tool_cases: 4, seeding_waves: 1 }, tokens: 7620 },
+          integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 1, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.22, capped_tool_cases: 4, seeding_waves: 1 }, tokens: 7620,
+          composite_stderr: 0.021, history: [0.544, 0.578, 0.612] },
         { rank: 3, miner_hotkey: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", composite: 0.587, tool_mean: 0.867, memory_mean: 0.307, first_seen: new Date(Date.now() - 86400000 * 1).toISOString(),
-          median_ms: 2880, n: 12, bench_version: 2 },
+          median_ms: 2880, n: 12, bench_version: 2, composite_stderr: 0.019 },
         { rank: 4, miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.382, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
         { rank: 5, miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.356, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
       ]

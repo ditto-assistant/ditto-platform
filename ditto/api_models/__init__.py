@@ -20,6 +20,7 @@ from __future__ import annotations
 from ditto.api_models.health import HealthResponse
 from ditto.api_models.public import (
     PublicBenchIntegrity,
+    PublicCaseResult,
     PublicCategoryStat,
     PublicHealthResponse,
     PublicLeaderboardEntry,
@@ -61,6 +62,7 @@ __all__ = [
     "LedgerEntry",
     "LedgerResponse",
     "PublicBenchIntegrity",
+    "PublicCaseResult",
     "PublicCategoryStat",
     "PublicHealthResponse",
     "PublicLeaderboardEntry",
