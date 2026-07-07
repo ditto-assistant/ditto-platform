@@ -36,6 +36,25 @@ services:
       # Point Pylon at the dev local chain (env-overridable), not finney.
       PYLON_BITTENSOR_NETWORK: ${PYLON_BITTENSOR_NETWORK:-ws://68.183.141.180:80}
       PYLON_BITTENSOR_ARCHIVE_NETWORK: ${PYLON_BITTENSOR_ARCHIVE_NETWORK:-ws://68.183.141.180:80}
+      # --- Write identity (put_weights) ---
+      # Open-access (above) stays for reads; identities add the write path.
+      # Pylon loads the hotkey from the mounted wallet and signs set_weights
+      # itself, so the only "credential" is a self-generated bearer token
+      # (openssl rand -base64 32) shared with the validator's PYLON_IDENTITY_TOKEN.
+      # Leave PYLON_IDENTITIES empty ([]) to keep this Pylon read-only.
+      PYLON_IDENTITIES: ${PYLON_IDENTITIES:-["validator"]}
+      PYLON_ID_VALIDATOR_NETUID: ${PYLON_ID_VALIDATOR_NETUID:-3}
+      PYLON_ID_VALIDATOR_WALLET_NAME: ${PYLON_ID_VALIDATOR_WALLET_NAME:-validator}
+      PYLON_ID_VALIDATOR_HOTKEY_NAME: ${PYLON_ID_VALIDATOR_HOTKEY_NAME:-default}
+      PYLON_ID_VALIDATOR_TOKEN: ${PYLON_TOKEN:-}
+      # Where the wallet is mounted inside the container (see volumes below).
+      PYLON_BITTENSOR_WALLET_PATH: /root/.bittensor/wallets
+    # Mount the host wallet dir read-only so Pylon can load the identity
+    # hotkey to sign weight extrinsics. Override BITTENSOR_WALLET_PATH if your
+    # wallets live elsewhere. Read-only: Pylon only ever signs, never writes.
+    volumes:
+      # Must be an ABSOLUTE host path — Docker does not expand "~".
+      - ${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro
     # Host port 8001 is reserved for Pylon; 8000 is the API server's slot.
     # The container still listens on 8000 internally.
     ports:
