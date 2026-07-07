@@ -53,6 +53,12 @@ logger = logging.getLogger(__name__)
 # match unless both sketches carry the same version.
 _FP_VERSION = 1
 
+# Version of the normalized-source-hash canonicalization
+# (:func:`compute_normalized_source_hash`). Bumped independently of ``_FP_VERSION``
+# so a change to comment/whitespace/file canonicalization doesn't silently compare
+# across formats.
+_NSH_VERSION = 1
+
 # A shingle is this many consecutive normalized lines. Small enough that a
 # one-line edit disturbs only a few shingles (robust to sprinkled edits), large
 # enough that a shingle is distinctive (common single lines like a lone ``}`` do
@@ -139,6 +145,128 @@ def compute_content_fingerprint(tar_gz_bytes: bytes) -> dict | None:
         "card": len(shingles),
         "m": sorted(shingles)[:_MINHASH_K],
     }
+
+
+def compute_normalized_source_hash(tar_gz_bytes: bytes) -> str | None:
+    """Return a single hash of the tarball's *canonicalized* source, or ``None``.
+
+    This is the **L3a "exact-repack"** signal (see
+    ``docs/SEMANTIC-CLONE-PREVENTION.md``): a copy that only reformats, re-comments,
+    or reorders/renames files normalizes to the **same** hash even though its
+    ``sha256`` (and, slightly, its shingle sketch) differ. Unlike
+    :func:`content_similarity` this is an *equality* signal — a match means "the
+    same source, repackaged", the cheapest strong copy evidence after ``sha256``.
+
+    Canonicalization, per regular file: strip ``//`` line and ``/* */`` block
+    comments (string-``"``-aware so a ``//`` inside a URL literal survives),
+    remove all intra-line whitespace, drop blank lines. The per-file normalized
+    texts are then **sorted** (so renaming/reordering files is invisible) and
+    hashed together. Identifier renaming and statement reordering are *not*
+    canonicalized away — that is the AST / behavioral layer's job; this layer only
+    promises to see through cosmetic repackaging.
+
+    Returns ``None`` ("no usable hash", read by the gate as no repack match) on an
+    unreadable tarball, empty source, or a bomb/work-guard trip — same contract
+    and guards as :func:`compute_content_fingerprint`. Pure + deterministic.
+
+    Note: ``'``-delimited char literals are not tracked (Rust lifetimes such as
+    ``'a`` have no closing quote and would eat spans), so a char literal
+    containing ``"`` or a comment marker may mis-normalize. This only costs a rare
+    missed match (the copy falls through to L1/L2) — never a false match, since a
+    collision still requires near-identical code.
+    """
+    files: list[str] = []
+    total = 0
+    members = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tar_gz_bytes), mode="r:gz") as tar:
+            for member in tar:
+                members += 1
+                if members > _MAX_MEMBERS:
+                    logger.warning("nsh: >%d members, skipping", _MAX_MEMBERS)
+                    return None
+                if not member.isfile():
+                    continue
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
+                raw = extracted.read(_MAX_FILE_BYTES + 1)
+                if len(raw) > _MAX_FILE_BYTES:
+                    logger.warning("nsh: file exceeds per-file cap")
+                    return None
+                total += len(raw)
+                if total > _MAX_TOTAL_BYTES:
+                    logger.warning("nsh: >%d bytes, skipping", _MAX_TOTAL_BYTES)
+                    return None
+                normalized = _normalized_source(raw)
+                if normalized:
+                    files.append(normalized)
+    except (tarfile.TarError, gzip.BadGzipFile, EOFError, OSError) as e:
+        logger.info("nsh: unreadable tarball (%s)", type(e).__name__)
+        return None
+
+    if not files:
+        return None
+    files.sort()
+    digest = hashlib.sha256()
+    digest.update(f"nsh{_NSH_VERSION}\x00".encode())
+    for normalized in files:
+        digest.update(normalized.encode("utf-8"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def _normalized_source(raw: bytes) -> str:
+    """Canonicalize one file's text: comments stripped, whitespace/blanks removed.
+
+    Line boundaries are kept (lines joined with ``\\n``) so tokens on adjacent
+    lines don't merge into a new token; only *intra*-line whitespace is removed.
+    """
+    text = _strip_comments(raw.decode("utf-8", errors="replace"))
+    lines = [norm for line in text.splitlines() if (norm := "".join(line.split()))]
+    return "\n".join(lines)
+
+
+def _strip_comments(text: str) -> str:
+    """Remove ``//`` line and ``/* */`` block comments, preserving string literals.
+
+    A single-pass scanner that tracks double-quoted string state (so ``//`` and
+    ``/*`` inside a ``"..."`` literal are left intact). Char/lifetime ``'`` is
+    intentionally not tracked — see :func:`compute_normalized_source_hash`.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_string = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if c == "\\" and i + 1 < n:  # escape — keep the next char verbatim
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":  # line comment
+            nl = text.find("\n", i)
+            if nl == -1:
+                break
+            i = nl  # keep the newline (appended next iteration)
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":  # block comment
+            end = text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def _file_shingles(raw: bytes) -> list[str]:
