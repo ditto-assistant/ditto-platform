@@ -60,6 +60,12 @@ class LedgerRow:
     score time); the gate's rename-resistant anti-copy signal. Same ``{v,k,card,m}``
     shape as ``content_fingerprint``. ``None`` before this landed / no parseable
     Rust. Moderation-only, never exposed on the wire."""
+    normalized_source_hash: str | None = None
+    """L3a exact-repack hash of the canonicalized source (see
+    :func:`ditto.api_server.fingerprint.compute_normalized_source_hash`); the gate's
+    equality anti-copy signal, held unconditionally on a match like exact
+    ``sha256``. ``None`` before this landed or for an unreadable tarball.
+    Moderation-only, never exposed on the wire."""
     median_ms: int = 0
     """Median per-case latency (ms) of the winning run — public benchmark telemetry."""
     n: int = 0
@@ -319,6 +325,7 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             Agent.size_bytes.label("size_bytes"),
             Agent.content_fingerprint.label("content_fingerprint"),
             Agent.structural_fingerprint.label("structural_fingerprint"),
+            Agent.normalized_source_hash.label("normalized_source_hash"),
             Agent.created_at.label("first_seen"),
             Agent.status.label("status"),
             agent_best.c.composite,
@@ -376,6 +383,7 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             status=AgentStatus(row.status),
             content_fingerprint=row.content_fingerprint,
             structural_fingerprint=row.structural_fingerprint,
+            normalized_source_hash=row.normalized_source_hash,
             median_ms=row.median_ms,
             n=row.n,
             details=row.details,

@@ -383,6 +383,7 @@ async def submit_score(
                 sha256=agent.sha256,
                 composite=report.composite,
                 size_bytes=agent.size_bytes,
+                normalized_source_hash=agent.normalized_source_hash,
                 content_fingerprint=agent.content_fingerprint,
                 structural_fingerprint=agent.structural_fingerprint,
                 eligible=eligible,

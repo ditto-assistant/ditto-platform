@@ -105,6 +105,16 @@ class Agent(Base):
     at score time. Nullable: null before this landed, on the local harness_url
     path, or when the crate has no parseable Rust."""
 
+    normalized_source_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """SHA-256 (hex) of the crate's canonicalized source — comments stripped,
+    whitespace removed, files sorted (see
+    :func:`ditto.api_server.fingerprint.compute_normalized_source_hash`). Feeds the
+    anti-copy gate's L3a "exact-repack" signal: an *equality* match means the same
+    source repackaged (reformat / re-comment / file rename+reorder), which the
+    ``sha256`` and shingle sketches miss. Computed at upload. Nullable for rows
+    written before this landed and for tarballs unreadable/empty at upload (the
+    gate reads null as "no repack match")."""
+
     duplicate_of: Mapped[UUID | None] = mapped_column(
         SaUUID(as_uuid=True), nullable=True
     )

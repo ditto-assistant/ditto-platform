@@ -81,6 +81,19 @@ class TestInsertAgentHappyPath:
         assert row.name == kwargs["name"]
         assert row.sha256 == kwargs["sha256"]
 
+    async def test_persists_normalized_source_hash(self, session: AsyncSession):
+        # The L3a exact-repack hash computed at upload must round-trip to the row.
+        kwargs = _make_kwargs(normalized_source_hash="ns" * 32)
+        async with session.begin():
+            await insert_agent(session, **kwargs)  # type: ignore[arg-type]
+
+        row = (
+            await session.execute(
+                select(Agent).where(Agent.agent_id == kwargs["agent_id"])
+            )
+        ).scalar_one()
+        assert row.normalized_source_hash == "ns" * 32
+
     async def test_status_defaults_to_uploaded(self, session: AsyncSession):
         """The schema default places new rows in the initial state. The
         screener PR moves them forward; this PR must not bypass it."""

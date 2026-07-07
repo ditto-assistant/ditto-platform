@@ -46,7 +46,10 @@ from ditto.api_server.dependencies import (
     get_session,
     get_storage_client,
 )
-from ditto.api_server.fingerprint import compute_content_fingerprint
+from ditto.api_server.fingerprint import (
+    compute_content_fingerprint,
+    compute_normalized_source_hash,
+)
 from ditto.api_server.payment_verifier import (
     PaymentProof,
     PaymentVerifier,
@@ -314,6 +317,12 @@ async def upload_agent(
     content_fingerprint = await asyncio.to_thread(
         compute_content_fingerprint, tar_bytes
     )
+    # 7c. L3a exact-repack hash: the canonicalized-source equality signal for the
+    # gate (comments/whitespace stripped, files sorted). Same CPU-bound offload +
+    # best-effort None contract as the lexical fingerprint above.
+    normalized_source_hash = await asyncio.to_thread(
+        compute_normalized_source_hash, tar_bytes
+    )
 
     if session.in_transaction():
         rollback_result = session.rollback()
@@ -332,6 +341,7 @@ async def upload_agent(
             sha256=sha256,
             size_bytes=len(tar_bytes),
             content_fingerprint=content_fingerprint,
+            normalized_source_hash=normalized_source_hash,
         )
         await insert_evaluation_payment(session, verified=verified, agent_id=agent_id)
 
