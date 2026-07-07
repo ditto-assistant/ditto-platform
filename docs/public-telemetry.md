@@ -57,9 +57,24 @@ New router `endpoints/public.py`, mounted at `/api/v1/public`, **no auth**,
 rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
 
 - `GET /api/v1/public/leaderboard` → `{ generated_at, count, entries: [
-  { rank, miner_hotkey, composite, tool_mean, memory_mean, is_champion,
-    first_seen, n } ] }`. Best-per-miner, ranked by composite; `is_champion`
-  from the KOTH fold. **No** agent_id/sha/signature/per_case.
+  { rank, miner_hotkey, composite, tool_mean, memory_mean, first_seen, n,
+    median_ms, bench_version, dataset_sha256, models, per_category,
+    integrity, tokens } ] }`.
+  Best-per-miner, ranked by composite. The provenance block (`models` =
+  generator/judge/judge_audit/harness, `bench_version`, `dataset_sha256`,
+  `per_category` means, `median_ms`, `n`) is the **transparency payload**: it
+  lets anyone see *what model produced a run and how it was scored* and pins the
+  exact scored artifact (`dataset_sha256`) for a dispute re-score. All of it is
+  advisory (not signed) and lifted from the safe subset of `scores.details` —
+  extracted defensively so a malformed blob can never break the endpoint.
+  `integrity` (paraphrase applied/attempted/fallback, NoLiMa lexical-gap
+  rewrites + overlap before→after, capped tool cases, seeding waves) and
+  `tokens` (LLM spend to generate+judge) publish the benchmark's **anti-overfit
+  posture** so the community can audit *how gaming is resisted*, not just the
+  scores.
+  **Never** included: `seed` (anti-overfit), `per_case` `expected`/`called` (the
+  answer key), agent_id/sha256/signature/validator_hotkey (integrity-internal).
+  `is_champion`/weights stay validator-side (KOTH fold), not served here.
 - `GET /api/v1/public/weights` → the last-published normalized weight vector
   (champion + tail) — mirrors what the validator set on-chain.
 - `GET /api/v1/public/health` → subnet rollup **from what the platform records**:
@@ -68,9 +83,14 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   *successful* score, so run started/failed counts and set-weights latency are
   validator-side telemetry (wandb), not fabricated here. Detailed ops stay on the
   existing Prometheus `/metrics`.
-- Per-category means: derive from the stored `scores.details.per_case` at read
-  time (aggregate only) or persist a `per_category` blob on submit — either way
-  the public shape exposes category means, never per-case rows.
+- Per-category means + run provenance: the scoring engine (dittobench-api) emits
+  `models` + `per_category` (alongside `bench_version`, `dataset_sha256`,
+  `lexical_gap`, `paraphrase`, `seeding_waves`, `tokens`) in `RunDetails`; the
+  validator forwards the whole blob unsigned as `ScoreReport.details`, the
+  platform persists it verbatim to `scores.details` (merged with `per_case`, not
+  overwritten), and the public endpoint surfaces only the safe subset. Category
+  means come straight from `details.per_category`, never re-derived from
+  `per_case` at read time.
 
 ## Surface 3 — dashboard (custom front door)
 
@@ -96,4 +116,14 @@ idea); no server needed since all data comes from the public API + wandb.
 2. ✅ wandb `telemetry.py` in the validator (ditto-subnet #27) — aggregate +
    per-category tables, opt-in and off by default.
 3. ✅ Dashboard SPA (`dashboard/index.html`) against the public API + wandb link.
-4. (Optional) persist `per_category` on submit for cheaper category reads.
+   Now renders a per-row model chip (harness/generator + `bench v{N}`) and a
+   drawer "Benchmark run" section (cases, median latency, bench version,
+   harness/judge/audit/generator models, dataset SHA-256, per-category
+   breakdown).
+4. ✅ Run provenance persisted end-to-end (2026-07-07): dittobench-api
+   `RunDetails.{Models,PerCategory}` → `ScoreReport.details` → `scores.details`
+   → public leaderboard `models`/`bench_version`/`dataset_sha256`/`per_category`.
+   Verified live on localnet against a real Ollama-backed harness run. The
+   `ScoreReport.details` field is unsigned and additive — the signed tuple
+   (`run_id, seed, composite, tool_mean, memory_mean, median_ms, n`) is
+   unchanged, so this never touches the score or the signature.

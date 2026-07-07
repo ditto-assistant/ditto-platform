@@ -35,7 +35,7 @@ import logging
 import os
 import re
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 from uuid import UUID
 
 import bittensor
@@ -337,6 +337,16 @@ async def submit_score(
             raise AgentNotEvaluatableError(
                 f"agent {agent_id} is {agent.status}, not in {_SCOREABLE_STATUSES}"
             )
+        # Persist the scoring engine's opaque telemetry (models used,
+        # bench_version, dataset_sha256, per-category means, token spend, …) plus
+        # the per-case breakdown, all under scores.details. The public leaderboard
+        # surfaces a safe subset of this; the full blob (incl. per_case answer-key
+        # fields) is only ever read back through validator-gated endpoints.
+        score_details: dict[str, Any] = dict(report.details or {})
+        if report.per_case:
+            score_details["per_case"] = [
+                c.model_dump(mode="json") for c in report.per_case
+            ]
         await upsert_score(
             session,
             agent_id=agent_id,
@@ -350,9 +360,7 @@ async def submit_score(
             n=report.n,
             generated_at=report.generated_at,
             signature=payload.signature,
-            details={"per_case": [c.model_dump(mode="json") for c in report.per_case]}
-            if report.per_case
-            else None,
+            details=score_details or None,
         )
         # Persist the crate's structural (AST) fingerprint from the report, so it
         # is available for the gate here and for future cross-miner comparison.

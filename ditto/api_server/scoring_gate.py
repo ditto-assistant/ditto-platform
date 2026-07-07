@@ -35,8 +35,13 @@ if TYPE_CHECKING:
     from ditto.db.queries.scores import LedgerRow
 
 # A challenger scoring within this of the incumbent it surpasses is "a hair past"
-# — around the 1% dethrone margin a real copy needs to clear.
-_DEFAULT_SCORE_TOL = 0.02
+# — the anti-copy tolerance must exceed the benchmark's between-seed composite
+# noise so a re-rolled verbatim copy cannot clear it on a lucky seed.
+# DittoBench v2 / bench_version 3 (BENCHMARK-V2 §6.2, B8) targets between-seed
+# σ ≤ 0.01 composite and matches the validator's 5% KOTH margin: 0.03 ≈ 3σ. Bump
+# alongside the subnet VALIDATOR_KOTH_MARGIN if the hosted 30-seed σ comes in
+# higher (was 0.02 for v1).
+_DEFAULT_SCORE_TOL = 0.03
 # A tweaked copy differs from the original by at most a few edited lines, so its
 # gzipped tarball size barely moves. 8 KiB comfortably covers small edits.
 _DEFAULT_SIZE_TOL = 8192

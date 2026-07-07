@@ -17,8 +17,107 @@ from pydantic import BaseModel, ConfigDict, Field
 _SS58_PATTERN = r"^[1-9A-HJ-NP-Za-km-z]{47,48}$"
 
 
+class PublicCategoryStat(BaseModel):
+    """One category's mean in a run's per-category breakdown (public)."""
+
+    category: Annotated[
+        str, Field(description="Category name (tool name / memory type).")
+    ]
+    count: Annotated[int, Field(ge=0, description="Cases scored in this category.")]
+    mean: Annotated[float, Field(ge=0.0, le=1.0, description="Mean score in [0,1].")]
+
+
+class PublicBenchIntegrity(BaseModel):
+    """Anti-overfit / scoring-integrity telemetry for a scored run (public).
+
+    These describe *how the dataset resists gaming*, not the miner's answers:
+    the paraphrase pass (reword-or-fallback), the NoLiMa lexical-gap rewrite
+    (questions reworded to share fewer content words with the stored fact), how
+    many tool cases were capped because the harness self-reported instead of
+    calling the observable endpoint, and the memory seeding-wave count. They are
+    uniform across miners scored on the same seed/version and exist so the
+    community can audit the benchmark's anti-overfit posture.
+    """
+
+    paraphrase_applied: Annotated[
+        int | None,
+        Field(default=None, ge=0, description="Cases whose text was paraphrased."),
+    ]
+    paraphrase_attempted: Annotated[
+        int | None,
+        Field(default=None, ge=0, description="Cases the paraphraser was run on."),
+    ]
+    paraphrase_fallback: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description="Paraphrases that failed verify and fell back to template.",
+        ),
+    ]
+    lexical_gap_rewritten: Annotated[
+        int | None,
+        Field(default=None, ge=0, description="Questions reworded to drop a word."),
+    ]
+    lexical_gap_questions: Annotated[
+        int | None,
+        Field(default=None, ge=0, description="Questions considered for lexical gap."),
+    ]
+    lexical_gap_mean_before: Annotated[
+        float | None,
+        Field(default=None, ge=0.0, description="Mean shared-content overlap before."),
+    ]
+    lexical_gap_mean_after: Annotated[
+        float | None,
+        Field(default=None, ge=0.0, description="Mean shared-content overlap after."),
+    ]
+    capped_tool_cases: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description="Tool cases capped (self-report untrusted, not via endpoint).",
+        ),
+    ]
+    seeding_waves: Annotated[
+        int | None,
+        Field(default=None, ge=0, description="Memory seeding waves in this run."),
+    ]
+
+
+class PublicRunModels(BaseModel):
+    """The LLM models a scored run was produced with (public transparency)."""
+
+    generator: Annotated[
+        str | None, Field(default=None, description="Datagen model id.")
+    ]
+    judge: Annotated[
+        str | None, Field(default=None, description="Judge/scorer model id.")
+    ]
+    judge_audit: Annotated[
+        str | None,
+        Field(default=None, description="Second (audit) judge model id, if any."),
+    ]
+    harness: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Miner harness chat model id, when the operator pinned it.",
+        ),
+    ]
+
+
 class PublicLeaderboardEntry(BaseModel):
-    """One miner's best score, aggregate-only, for public display."""
+    """One miner's best score, aggregate-only, for public display.
+
+    Beyond the headline composite + tool/memory means, this carries the
+    benchmark provenance a transparent leaderboard needs — the models that
+    generated + graded the run, the ``bench_version`` and ``dataset_sha256``
+    (which pins the exact scored artifact for a dispute re-score), latency, case
+    count, and a per-category breakdown. All are advisory and deliberately
+    exclude the raw ``seed`` (anti-overfit) and any per-case answer-key content
+    (``expected`` / ``called``).
+    """
 
     rank: Annotated[int, Field(ge=1, description="1-based rank by composite.")]
     miner_hotkey: Annotated[
@@ -36,6 +135,36 @@ class PublicLeaderboardEntry(BaseModel):
     first_seen: Annotated[
         datetime, Field(description="When the winning agent was first uploaded (UTC).")
     ]
+    median_ms: Annotated[
+        int | None,
+        Field(default=None, ge=0, description="Median per-case latency (ms)."),
+    ]
+    n: Annotated[
+        int | None, Field(default=None, ge=0, description="Number of cases scored.")
+    ]
+    bench_version: Annotated[
+        int | None, Field(default=None, description="Benchmark scoring version.")
+    ]
+    dataset_sha256: Annotated[
+        str | None,
+        Field(default=None, description="SHA-256 of the scored dataset artifact."),
+    ]
+    models: Annotated[
+        PublicRunModels | None,
+        Field(default=None, description="LLM models that produced + graded the run."),
+    ]
+    per_category: Annotated[
+        list[PublicCategoryStat] | None,
+        Field(default=None, description="Per-category (per tool / memory type) means."),
+    ]
+    integrity: Annotated[
+        PublicBenchIntegrity | None,
+        Field(default=None, description="Anti-overfit / scoring-integrity telemetry."),
+    ]
+    tokens: Annotated[
+        int | None,
+        Field(default=None, ge=0, description="LLM tokens spent generating+judging."),
+    ]
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -46,6 +175,31 @@ class PublicLeaderboardEntry(BaseModel):
                 "tool_mean": 0.867,
                 "memory_mean": 0.167,
                 "first_seen": "2026-07-03T20:00:00Z",
+                "median_ms": 2720,
+                "n": 12,
+                "bench_version": 4,
+                "dataset_sha256": "9f2c…",
+                "models": {
+                    "generator": "google/gemini-3.1-flash-lite",
+                    "judge": "google/gemini-3.1-flash-lite",
+                    "harness": "google/gemini-3.1-flash-lite",
+                },
+                "per_category": [
+                    {"category": "memory_lookup", "count": 6, "mean": 1.0},
+                    {"category": "web_search", "count": 1, "mean": 0.5},
+                ],
+                "integrity": {
+                    "paraphrase_applied": 20,
+                    "paraphrase_attempted": 20,
+                    "paraphrase_fallback": 0,
+                    "lexical_gap_rewritten": 2,
+                    "lexical_gap_questions": 5,
+                    "lexical_gap_mean_before": 0.45,
+                    "lexical_gap_mean_after": 0.2,
+                    "capped_tool_cases": 4,
+                    "seeding_waves": 1,
+                },
+                "tokens": 7622,
             }
         }
     )

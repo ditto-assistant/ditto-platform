@@ -21,12 +21,15 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Response
 
 from ditto.api_models import (
+    PublicBenchIntegrity,
+    PublicCategoryStat,
     PublicHealthResponse,
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
+    PublicRunModels,
 )
 from ditto.api_server.endpoints.validator import SessionDep
-from ditto.db.queries.scores import get_public_health, list_eligible_ledger
+from ditto.db.queries.scores import LedgerRow, get_public_health, list_eligible_ledger
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,99 @@ router = APIRouter(prefix="/public", tags=["public"])
 _CACHE_CONTROL = "public, max-age=30"
 
 
+def _safe_models(details: dict) -> PublicRunModels | None:
+    """Pull the run's models from the details blob, tolerating a malformed shape."""
+    raw = details.get("models")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return PublicRunModels.model_validate(raw)
+    except Exception:  # noqa: BLE001 - a bad blob must not break the leaderboard
+        return None
+
+
+def _safe_categories(details: dict) -> list[PublicCategoryStat] | None:
+    """Pull the per-category breakdown, dropping any malformed entries."""
+    raw = details.get("per_category")
+    if not isinstance(raw, list):
+        return None
+    out: list[PublicCategoryStat] = []
+    for c in raw:
+        try:
+            out.append(PublicCategoryStat.model_validate(c))
+        except Exception:  # noqa: BLE001 - skip a bad category, keep the rest
+            continue
+    return out or None
+
+
+def _safe_integrity(details: dict) -> PublicBenchIntegrity | None:
+    """Assemble the anti-overfit / integrity telemetry from the details blob.
+
+    The scoring engine nests these under ``paraphrase`` / ``lexical_gap`` sub-dicts
+    plus flat ``capped_tool_cases`` / ``seeding_waves``; flatten defensively so a
+    partial or malformed shape yields ``None`` fields, never an error."""
+    para = details.get("paraphrase")
+    para = para if isinstance(para, dict) else {}
+    lex = details.get("lexical_gap")
+    lex = lex if isinstance(lex, dict) else {}
+
+    def _i(v: object) -> int | None:
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    def _f(v: object) -> float | None:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return float(v)
+
+    try:
+        model = PublicBenchIntegrity(
+            paraphrase_applied=_i(para.get("applied")),
+            paraphrase_attempted=_i(para.get("attempted")),
+            paraphrase_fallback=_i(para.get("fallback")),
+            lexical_gap_rewritten=_i(lex.get("rewritten")),
+            lexical_gap_questions=_i(lex.get("questions")),
+            lexical_gap_mean_before=_f(lex.get("mean_before")),
+            lexical_gap_mean_after=_f(lex.get("mean_after")),
+            capped_tool_cases=_i(details.get("capped_tool_cases")),
+            seeding_waves=_i(details.get("seeding_waves")),
+        )
+    except Exception:  # noqa: BLE001 - a bad blob must not break the leaderboard
+        return None
+    if all(v is None for v in model.model_dump().values()):
+        return None
+    return model
+
+
+def _public_entry(rank: int, r: LedgerRow) -> PublicLeaderboardEntry:
+    """Map a ledger row to the public entry, exposing only the safe subset of
+    ``details`` (never ``per_case``, which carries the answer key)."""
+    details = r.details if isinstance(r.details, dict) else {}
+    bench_version = details.get("bench_version")
+    dataset_sha256 = details.get("dataset_sha256")
+    raw_tokens = details.get("tokens")
+    tokens = (
+        raw_tokens
+        if isinstance(raw_tokens, int) and not isinstance(raw_tokens, bool)
+        else None
+    )
+    return PublicLeaderboardEntry(
+        rank=rank,
+        miner_hotkey=r.miner_hotkey,
+        composite=r.composite,
+        tool_mean=r.tool_mean,
+        memory_mean=r.memory_mean,
+        first_seen=r.first_seen,
+        median_ms=r.median_ms,
+        n=r.n,
+        bench_version=bench_version if isinstance(bench_version, int) else None,
+        dataset_sha256=dataset_sha256 if isinstance(dataset_sha256, str) else None,
+        models=_safe_models(details),
+        per_category=_safe_categories(details),
+        integrity=_safe_integrity(details),
+        tokens=tokens,
+    )
+
+
 @router.get("/leaderboard", response_model=PublicLeaderboardResponse)
 async def leaderboard(
     response: Response,
@@ -45,17 +141,7 @@ async def leaderboard(
     """Best eligible score per miner, aggregate-only, highest composite first."""
     response.headers["Cache-Control"] = _CACHE_CONTROL
     rows = await list_eligible_ledger(session)
-    entries = [
-        PublicLeaderboardEntry(
-            rank=i,
-            miner_hotkey=r.miner_hotkey,
-            composite=r.composite,
-            tool_mean=r.tool_mean,
-            memory_mean=r.memory_mean,
-            first_seen=r.first_seen,
-        )
-        for i, r in enumerate(rows, start=1)
-    ]
+    entries = [_public_entry(i, r) for i, r in enumerate(rows, start=1)]
     return PublicLeaderboardResponse(
         generated_at=datetime.now(UTC), count=len(entries), entries=entries
     )
