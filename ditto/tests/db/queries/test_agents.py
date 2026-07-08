@@ -108,6 +108,23 @@ class TestInsertAgentHappyPath:
         ).scalar_one()
         assert row.prompt_fingerprint == sketch
 
+    async def test_persists_code_embedding(self, session: AsyncSession):
+        # The L3c vector + model tag computed at upload must round-trip to the row.
+        kwargs = _make_kwargs(
+            code_embedding=[0.1, 0.2, 0.3],
+            code_embed_model="stub@test",
+        )
+        async with session.begin():
+            await insert_agent(session, **kwargs)  # type: ignore[arg-type]
+
+        row = (
+            await session.execute(
+                select(Agent).where(Agent.agent_id == kwargs["agent_id"])
+            )
+        ).scalar_one()
+        assert row.code_embedding == [0.1, 0.2, 0.3]
+        assert row.code_embed_model == "stub@test"
+
     async def test_status_defaults_to_uploaded(self, session: AsyncSession):
         """The schema default places new rows in the initial state. The
         screener PR moves them forward; this PR must not bypass it."""

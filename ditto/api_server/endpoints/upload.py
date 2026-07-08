@@ -41,13 +41,16 @@ from ditto.api_models.upload import (
 )
 from ditto.api_server.dependencies import (
     get_chain_client,
+    get_embedder,
     get_payment_verifier,
     get_price_oracle,
     get_session,
     get_storage_client,
 )
+from ditto.api_server.embedding import Embedder
 from ditto.api_server.fingerprint import (
     compute_content_fingerprint,
+    compute_embedding_input,
     compute_normalized_source_hash,
     compute_prompt_fingerprint,
 )
@@ -124,6 +127,7 @@ ChainDep = Annotated["ChainClient", Depends(get_chain_client)]
 OracleDep = Annotated[PriceOracle, Depends(get_price_oracle)]
 PaymentVerifierDep = Annotated[PaymentVerifier, Depends(get_payment_verifier)]
 StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
+EmbedderDep = Annotated[Embedder, Depends(get_embedder)]
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
@@ -214,6 +218,7 @@ async def upload_agent(
     chain: ChainDep,
     verifier: PaymentVerifierDep,
     storage: StorageDep,
+    embedder: EmbedderDep,
     session: SessionDep,
 ) -> UploadAgentResponse:
     """Full upload submission with proof of payment.
@@ -328,6 +333,15 @@ async def upload_agent(
     # calibration/retroactive analysis; not yet a hold trigger. Same offload +
     # best-effort None contract.
     prompt_fingerprint = await asyncio.to_thread(compute_prompt_fingerprint, tar_bytes)
+    # 7e. L3c code embedding (shadow mode): build the canonical input (CPU-bound,
+    # offloaded) then embed via the self-hosted service. Disabled by default
+    # (null embedder -> None) and best-effort: a slow/unreachable embedder yields a
+    # null vector rather than failing the upload. The provenance tag is stored so a
+    # model change can drive a re-embed sweep and the gate compares only same-model
+    # vectors.
+    embed_input = await asyncio.to_thread(compute_embedding_input, tar_bytes)
+    code_embedding = await embedder.embed(embed_input) if embed_input else None
+    code_embed_model = embedder.model_tag if code_embedding is not None else None
 
     if session.in_transaction():
         rollback_result = session.rollback()
@@ -348,6 +362,8 @@ async def upload_agent(
             content_fingerprint=content_fingerprint,
             normalized_source_hash=normalized_source_hash,
             prompt_fingerprint=prompt_fingerprint,
+            code_embedding=code_embedding,
+            code_embed_model=code_embed_model,
         )
         await insert_evaluation_payment(session, verified=verified, agent_id=agent_id)
 

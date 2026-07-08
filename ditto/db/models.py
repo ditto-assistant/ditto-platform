@@ -115,6 +115,22 @@ class Agent(Base):
     written before this landed and for tarballs unreadable/empty at upload (the
     gate reads null as "no repack match")."""
 
+    code_embedding: Mapped[list | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    """Unit-norm code-embedding vector (JSON float array) of the crate's canonical
+    source, from the self-hosted L3c embedding service (see
+    :mod:`ditto.api_server.embedding`). The rename/refactor-robust anti-copy signal:
+    a code embedder scores a renamed+refactored copy high but a genuinely different
+    agent low, so it is orthogonal to same-harness convergence. Stored in shadow
+    mode — computed for every agent (calibration + retroactive) but not yet a hold
+    trigger. Nullable before this landed, when the embedder is disabled
+    (``L3C_EMBEDDER_URL`` unset), or on any best-effort embed failure."""
+
+    code_embed_model: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """``model@revision`` provenance tag of :attr:`code_embedding` (see
+    :attr:`ditto.api_server.embedding.EmbeddingConfig.model_tag`). Lets a model
+    change drive a re-embed sweep, and lets the gate compare only same-model vectors
+    (a cross-model cosine is meaningless). Nullable alongside the vector."""
+
     prompt_fingerprint: Mapped[dict | None] = mapped_column(
         _JSON_VARIANT, nullable=True
     )

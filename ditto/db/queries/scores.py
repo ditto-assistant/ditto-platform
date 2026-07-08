@@ -73,6 +73,15 @@ class LedgerRow:
     reason, but not a hold trigger on its own (honest agents share harness
     scaffolding prompts). ``None`` before this landed / no prompt-length literal.
     Moderation-only, never exposed on the wire."""
+    code_embedding: list | None = None
+    """L3c code-embedding vector (see :mod:`ditto.api_server.embedding`). Shadow
+    signal: surfaced so the gate can cosine-compare it against a candidate (only
+    when ``code_embed_model`` matches — a cross-model cosine is meaningless), but not
+    yet a hold trigger. ``None`` before this landed / embedder disabled / embed
+    failed. Moderation-only, never exposed on the wire."""
+    code_embed_model: str | None = None
+    """``model@revision`` provenance tag of :attr:`code_embedding`. Gates cosine
+    comparisons to same-model vectors and drives re-embed sweeps on a model bump."""
     median_ms: int = 0
     """Median per-case latency (ms) of the winning run — public benchmark telemetry."""
     n: int = 0
@@ -334,6 +343,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             Agent.structural_fingerprint.label("structural_fingerprint"),
             Agent.normalized_source_hash.label("normalized_source_hash"),
             Agent.prompt_fingerprint.label("prompt_fingerprint"),
+            Agent.code_embedding.label("code_embedding"),
+            Agent.code_embed_model.label("code_embed_model"),
             Agent.created_at.label("first_seen"),
             Agent.status.label("status"),
             agent_best.c.composite,
@@ -393,6 +404,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             structural_fingerprint=row.structural_fingerprint,
             normalized_source_hash=row.normalized_source_hash,
             prompt_fingerprint=row.prompt_fingerprint,
+            code_embedding=row.code_embedding,
+            code_embed_model=row.code_embed_model,
             median_ms=row.median_ms,
             n=row.n,
             details=row.details,

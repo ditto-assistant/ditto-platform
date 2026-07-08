@@ -34,6 +34,8 @@ async def insert_agent(
     content_fingerprint: dict | None = None,
     normalized_source_hash: str | None = None,
     prompt_fingerprint: dict | None = None,
+    code_embedding: list | None = None,
+    code_embed_model: str | None = None,
 ) -> None:
     """Insert one ``agents`` row inside the caller-owned transaction.
 
@@ -53,7 +55,10 @@ async def insert_agent(
     canonicalized source feeding the gate's equality signal; ``None`` on the same
     unreadable/empty condition. ``prompt_fingerprint`` (same module) is the L3b
     prompt-surface sketch, stored in shadow mode; ``None`` when the crate carries no
-    prompt-length literal or the tarball is unreadable.
+    prompt-length literal or the tarball is unreadable. ``code_embedding`` /
+    ``code_embed_model`` are the L3c vector and its ``model@revision`` tag (see
+    :mod:`ditto.api_server.embedding`), stored in shadow mode; ``None`` when the
+    embedder is disabled or the embed failed.
 
     Raises:
         DbIntegrityError: Any constraint violation on ``agents``
@@ -71,6 +76,8 @@ async def insert_agent(
         content_fingerprint=content_fingerprint,
         normalized_source_hash=normalized_source_hash,
         prompt_fingerprint=prompt_fingerprint,
+        code_embedding=code_embedding,
+        code_embed_model=code_embed_model,
     )
     session.add(row)
     try:

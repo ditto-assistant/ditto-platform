@@ -21,11 +21,12 @@ from fastapi import FastAPI
 from ditto.api_server import ApiServerConfig, create_api_server
 from ditto.api_server.dependencies import (
     get_chain_client,
+    get_embedder,
     get_price_oracle,
     get_session,
     get_storage_client,
 )
-from ditto.api_server.embedding import EmbeddingConfig
+from ditto.api_server.embedding import EmbeddingConfig, NullEmbedder
 from ditto.api_server.pricing import PricingConfig
 from ditto.api_server.storage import StorageConfig
 from ditto.chain import ChainConfig
@@ -92,6 +93,9 @@ def app() -> Iterator[FastAPI]:
     # Lifespan does not run under ASGITransport, so set the bits the
     # health endpoint reads via app.state directly.
     a.state.commit_hash = "test-commit"
+    # L3c embedder is lifespan-created; default it to the disabled null embedder so
+    # upload tests get a null vector unless they override get_embedder.
+    a.state.embedder = NullEmbedder()
     yield a
     a.dependency_overrides.clear()
 
@@ -185,3 +189,26 @@ def override_get_storage_client(
 
     app.dependency_overrides[get_storage_client] = _fake_storage
     return storage
+
+
+def override_get_embedder(app: FastAPI, *, vector: list[float] | None = None) -> None:
+    """Install a ``get_embedder`` override returning a stub embedder.
+
+    Defaults to a null embedder (``None`` vector). Pass ``vector`` to simulate an
+    enabled service returning that fixed embedding with a ``stub@test`` model tag.
+    """
+
+    class _StubEmbedder:
+        model_tag = "stub@test" if vector is not None else None
+
+        async def embed(self, text: str) -> list[float] | None:
+            del text
+            return vector
+
+        async def aclose(self) -> None:
+            return None
+
+    async def _fake_embedder() -> _StubEmbedder:
+        return _StubEmbedder()
+
+    app.dependency_overrides[get_embedder] = _fake_embedder

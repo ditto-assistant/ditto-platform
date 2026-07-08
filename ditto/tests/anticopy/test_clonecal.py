@@ -9,12 +9,15 @@ independents and full recall on the tier it is meant to catch.
 
 from __future__ import annotations
 
+import pytest
+
 from ditto.anticopy.clonecal import (
     _prompt,
     _sig_normalized_hash,
     build_corpus,
     default_signals,
     demo_corpus,
+    embedding_signal,
     evaluate,
     format_report,
     obfuscate,
@@ -158,3 +161,38 @@ class TestPromptSignal:
         assert compute_normalized_source_hash(base) != compute_normalized_source_hash(
             renamed
         )
+
+
+class TestEmbeddingSignal:
+    """The L3c cosine signal plumbing, exercised with a deterministic fake embedder
+    (the real orthogonality needs the live model + real crates)."""
+
+    @staticmethod
+    def _fake_embed(text: str) -> list[float]:
+        # A char-frequency histogram: a stand-in embedder that is deterministic and
+        # gives identical vectors for identical source, lower cosine for different.
+        alphabet = "abcdefghijklmnopqrstuvwxyz0123456789_(){}<>-+*/;: "
+        return [float(text.count(c)) for c in alphabet]
+
+    def test_self_similarity_is_one(self) -> None:
+        sig = embedding_signal(self._fake_embed)
+        a = pack(_SEED)
+        assert sig.score(a, a) == pytest.approx(1.0)
+
+    def test_different_crates_below_one(self) -> None:
+        sig = embedding_signal(self._fake_embed)
+        a = pack(_SEED)
+        b = pack(
+            {
+                "src/lib.rs": b"fn totally_unrelated() -> u8 {\n    42\n}\n",
+                "Cargo.toml": b'[package]\nname = "other"\n',
+            }
+        )
+        s = sig.score(a, b)
+        assert 0.0 <= s < 1.0
+
+    def test_no_embedding_input_scores_zero(self) -> None:
+        # A crate with only comments has no embedding input -> None -> cosine 0.0.
+        sig = embedding_signal(self._fake_embed)
+        empty = pack({"x.rs": b"// only a comment\n"})
+        assert sig.score(empty, pack(_SEED)) == 0.0

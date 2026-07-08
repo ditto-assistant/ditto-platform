@@ -40,8 +40,10 @@ import tarfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
+from ditto.api_server.embedding import cosine
 from ditto.api_server.fingerprint import (
     compute_content_fingerprint,
+    compute_embedding_input,
     compute_normalized_source_hash,
     compute_prompt_fingerprint,
     content_similarity,
@@ -218,6 +220,33 @@ def _prompt(a: bytes, b: bytes) -> tuple[float, float]:
     return content_similarity(
         compute_prompt_fingerprint(a), compute_prompt_fingerprint(b)
     )
+
+
+def embedding_signal(
+    embed: Callable[[str], list[float] | None],
+    *,
+    name: str = "L3c_code_embedding",
+) -> Signal:
+    """Build the L3c cosine signal from an injected text embedder.
+
+    ``embed`` maps the crate's canonical source
+    (:func:`ditto.api_server.fingerprint.compute_embedding_input`) to a vector — in
+    production the self-hosted service (:mod:`ditto.api_server.embedding`), in tests
+    a deterministic fake. It is *not* in :func:`default_signals` because the offline
+    harness has no live model; wire it explicitly once an embedder is available:
+
+        sig = embedding_signal(lambda text: my_embedder_call(text))
+
+    A crate that yields no embedding input embeds to ``None`` and scores ``0.0``.
+    """
+
+    def score(a: bytes, b: bytes) -> float:
+        ta, tb = compute_embedding_input(a), compute_embedding_input(b)
+        va = embed(ta) if ta else None
+        vb = embed(tb) if tb else None
+        return cosine(va, vb)
+
+    return Signal(name, score)
 
 
 def default_signals() -> list[Signal]:
@@ -439,6 +468,7 @@ __all__ = [
     "build_corpus",
     "default_signals",
     "demo_corpus",
+    "embedding_signal",
     "evaluate",
     "format_report",
     "obfuscate",
