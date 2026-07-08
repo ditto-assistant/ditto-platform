@@ -44,9 +44,16 @@ class EmbeddingConfig:
     Truncating to e.g. 256 shrinks storage + cosine cost for near-neighbor use."""
 
     timeout_seconds: float
-    """Per-call HTTP timeout (``L3C_EMBEDDER_TIMEOUT_SECONDS``). Kept short: the
-    embed runs inline on the upload path and is best-effort, so a slow/unreachable
-    service degrades to a null vector rather than stalling the upload."""
+    """Per-call HTTP timeout (``L3C_EMBEDDER_TIMEOUT_SECONDS``). Best-effort: a
+    slow/unreachable service degrades to a null vector rather than stalling the
+    upload. Raise it (e.g. 30) for a scale-to-zero Cloud Run backend so a cold
+    start can complete instead of timing out into a null vector."""
+
+    auth: str
+    """How the client authenticates to the service (``L3C_EMBEDDER_AUTH``):
+    ``"none"`` (a local/unauthenticated TEI) or ``"gcp_id_token"`` (a private Cloud
+    Run service — the client mints a Google-signed identity token, audience = the
+    service URL, from the GCE/Cloud Run metadata server and sends it as a bearer)."""
 
     @property
     def enabled(self) -> bool:
@@ -59,7 +66,7 @@ class EmbeddingConfig:
         return f"{self.model}@{self.revision}"
 
 
-_TRUTHY = {"1", "true", "yes", "on"}
+_VALID_AUTH = {"none", "gcp_id_token"}
 
 
 def parse_embedding_config_from_env() -> EmbeddingConfig:
@@ -77,6 +84,7 @@ def parse_embedding_config_from_env() -> EmbeddingConfig:
     model = os.environ.get("L3C_EMBEDDER_MODEL", "").strip()
     revision = os.environ.get("L3C_EMBEDDER_REVISION", "main").strip() or "main"
 
+    auth = os.environ.get("L3C_EMBEDDER_AUTH", "none").strip().lower() or "none"
     raw_dim = os.environ.get("L3C_EMBEDDER_DIM", "").strip()
     raw_timeout = os.environ.get("L3C_EMBEDDER_TIMEOUT_SECONDS", "5.0").strip()
     try:
@@ -98,6 +106,7 @@ def parse_embedding_config_from_env() -> EmbeddingConfig:
         revision=revision,
         dim=dim,
         timeout_seconds=timeout_seconds,
+        auth=auth,
     )
     check_embedding_config(config)
     return config
@@ -123,6 +132,11 @@ def check_embedding_config(config: EmbeddingConfig) -> None:
     if config.dim is not None and config.dim <= 0:
         raise EmbeddingConfigError(
             f"L3C_EMBEDDER_DIM must be a positive integer, got {config.dim}"
+        )
+    if config.auth not in _VALID_AUTH:
+        raise EmbeddingConfigError(
+            f"L3C_EMBEDDER_AUTH must be one of {sorted(_VALID_AUTH)}, "
+            f"got {config.auth!r}"
         )
     if not config.enabled:
         return

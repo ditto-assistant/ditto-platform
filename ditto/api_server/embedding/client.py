@@ -10,8 +10,12 @@ time.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import logging
 import math
+import time
 from typing import TYPE_CHECKING, Protocol
 
 import httpx
@@ -20,6 +24,16 @@ if TYPE_CHECKING:
     from ditto.api_server.embedding.config import EmbeddingConfig
 
 logger = logging.getLogger(__name__)
+
+# GCE / Cloud Run metadata server: mints a Google-signed identity token for the
+# instance's service account, scoped to an audience (the target service URL). Used
+# to call a private (authenticated) Cloud Run embedder without any static secret.
+_METADATA_IDENTITY_URL = (
+    "http://metadata.google.internal/computeMetadata/v1/"
+    "instance/service-accounts/default/identity"
+)
+# Refresh the cached token this many seconds before it actually expires.
+_TOKEN_REFRESH_SKEW = 300.0
 
 
 class Embedder(Protocol):
@@ -68,6 +82,8 @@ class TeiEmbedder:
     def __init__(self, config: EmbeddingConfig, client: httpx.AsyncClient) -> None:
         self._config = config
         self._client = client
+        self._token: str | None = None
+        self._token_exp: float = 0.0
 
     @property
     def model_tag(self) -> str | None:
@@ -82,6 +98,7 @@ class TeiEmbedder:
             resp = await self._client.post(
                 f"{url.rstrip('/')}/embed",
                 json={"inputs": text, "normalize": True, "truncate": True},
+                headers=await self._auth_header(url),
             )
             resp.raise_for_status()
             payload = resp.json()
@@ -95,6 +112,39 @@ class TeiEmbedder:
         if self._config.dim is not None:
             vector = _l2_normalize(vector[: self._config.dim])
         return vector
+
+    async def _auth_header(self, audience: str) -> dict[str, str]:
+        """Return the ``Authorization`` header, or ``{}`` for unauthenticated mode.
+
+        For ``gcp_id_token`` auth, mints/caches a Google identity token (audience =
+        the embedder URL) from the metadata server. Best-effort: a metadata failure
+        returns no header, so the request goes out unauthenticated and — against a
+        private service — 403s into a null vector rather than raising.
+        """
+        if self._config.auth != "gcp_id_token":
+            return {}
+        now = time.time()
+        if self._token is None or now >= self._token_exp - _TOKEN_REFRESH_SKEW:
+            token = await self._fetch_id_token(audience)
+            if token is None:
+                return {}
+            self._token = token
+            self._token_exp = _jwt_expiry(token, default=now + 3000.0)
+        return {"Authorization": f"Bearer {self._token}"}
+
+    async def _fetch_id_token(self, audience: str) -> str | None:
+        try:
+            resp = await self._client.get(
+                _METADATA_IDENTITY_URL,
+                params={"audience": audience, "format": "full"},
+                headers={"Metadata-Flavor": "Google"},
+            )
+            resp.raise_for_status()
+            token = resp.text.strip()
+        except httpx.HTTPError as e:
+            logger.info("l3c-embed: id-token fetch failed (%s)", type(e).__name__)
+            return None
+        return token or None
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -159,3 +209,19 @@ def _l2_normalize(vector: list[float]) -> list[float]:
     if norm == 0.0:
         return vector
     return [x / norm for x in vector]
+
+
+def _jwt_expiry(token: str, *, default: float) -> float:
+    """Return the ``exp`` (unix seconds) from a JWT's payload, or ``default``.
+
+    Best-effort and unverified — the token is only cached, never trusted here; the
+    embedder service verifies it. A malformed token just falls back to ``default``.
+    """
+    try:
+        payload_b64 = token.split(".")[1]
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+        exp = claims.get("exp")
+        return float(exp) if isinstance(exp, (int, float)) else default
+    except (IndexError, ValueError, binascii.Error, json.JSONDecodeError):
+        return default
