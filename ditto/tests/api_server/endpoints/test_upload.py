@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import tarfile
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -49,6 +51,7 @@ from ditto.api_server.storage import ObjectUploadFailedError
 from ditto.chain.errors import ChainConnectionError
 from ditto.tests.api_server.conftest import (
     override_get_chain_client,
+    override_get_embedder,
     override_get_price_oracle,
     override_get_session,
     override_get_storage_client,
@@ -310,6 +313,18 @@ class TestOpenApiInclusion:
 
 _GOOD_TAR_BYTES = b"\x1f\x8b" + b"x" * 1024  # gzip magic + padding
 _GOOD_TAR_SHA = hashlib.sha256(_GOOD_TAR_BYTES).hexdigest()
+
+
+def _real_source_tar() -> bytes:
+    """A genuine tar.gz with a Rust source file, so the fingerprint/embedding-input
+    extractors yield real content (the junk ``_GOOD_TAR_BYTES`` decodes to None)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = b"fn handle(x: i64) -> i64 {\n    let acc = x + 1;\n    acc * 2\n}\n"
+        info = tarfile.TarInfo("src/lib.rs")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 _GOOD_BLOCK_HASH = "0x" + "ab" * 32
 
 
@@ -458,6 +473,48 @@ class TestUploadAgentHappyPath:
         assert put_kwargs["key"] == f"{agent_id}/agent.tar.gz"
         assert put_kwargs["content_type"] == "application/gzip"
         assert put_kwargs["body"] == _GOOD_TAR_BYTES
+
+    async def test_stores_l3c_embedding_when_enabled(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ):
+        # With an enabled embedder and a real-source tar, the L3c vector + model tag
+        # reach the agent row (shadow storage).
+        deps = _wire_full_stack(app)
+        override_get_embedder(app, vector=[0.1, 0.2, 0.3])
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        _override_payment_verifier(
+            app, verified=_make_verified_payment(miner_hotkey=kp.ss58_address)
+        )
+        tar = _real_source_tar()
+        data, _ = _upload_agent_form(keypair=kp, sha256=hashlib.sha256(tar).hexdigest())
+        files = {"agent_tar": ("harness.tar.gz", tar, "application/gzip")}
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 200, response.text
+        agent_row = deps["session"].add.call_args_list[0].args[0]
+        assert agent_row.code_embedding == [0.1, 0.2, 0.3]
+        assert agent_row.code_embed_model == "stub@test"
+
+    async def test_disabled_embedder_leaves_l3c_null(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ):
+        # Default null embedder: even a real-source tar stores no vector.
+        deps = _wire_full_stack(app)  # app fixture defaults to the null embedder
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        _override_payment_verifier(
+            app, verified=_make_verified_payment(miner_hotkey=kp.ss58_address)
+        )
+        tar = _real_source_tar()
+        data, _ = _upload_agent_form(keypair=kp, sha256=hashlib.sha256(tar).hexdigest())
+        files = {"agent_tar": ("harness.tar.gz", tar, "application/gzip")}
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 200, response.text
+        agent_row = deps["session"].add.call_args_list[0].args[0]
+        assert agent_row.code_embedding is None
+        assert agent_row.code_embed_model is None
 
 
 class TestUploadAgentValidationFailures:

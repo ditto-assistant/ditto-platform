@@ -97,6 +97,8 @@ async def _seed_scored(
     status: AgentStatus = AgentStatus.SCORED,
     normalized_source_hash: str | None = None,
     prompt_fingerprint: dict | None = None,
+    code_embedding: list | None = None,
+    code_embed_model: str | None = None,
 ) -> Agent:
     """Seed one agent + its score row, in the given lifecycle state."""
     agent = Agent(
@@ -109,6 +111,8 @@ async def _seed_scored(
         created_at=created_at,
         normalized_source_hash=normalized_source_hash,
         prompt_fingerprint=prompt_fingerprint,
+        code_embedding=code_embedding,
+        code_embed_model=code_embed_model,
     )
     async with session.begin():
         session.add(agent)
@@ -180,6 +184,23 @@ class TestListEligibleLedger:
         ledger = await list_eligible_ledger(session)
         assert len(ledger) == 1
         assert ledger[0].prompt_fingerprint == sketch
+
+    async def test_code_embedding_flows_through(self, session: AsyncSession) -> None:
+        # The L3c vector + its model tag must reach the ledger for the gate cosine.
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        vector = [0.1, 0.2, 0.3]
+        await _seed_scored(
+            session,
+            miner=_MINER,
+            composite=0.7,
+            created_at=t0,
+            code_embedding=vector,
+            code_embed_model="Qwen/Qwen3-Embedding-0.6B@main",
+        )
+        ledger = await list_eligible_ledger(session)
+        assert len(ledger) == 1
+        assert ledger[0].code_embedding == vector
+        assert ledger[0].code_embed_model == "Qwen/Qwen3-Embedding-0.6B@main"
 
     async def test_ordered_by_composite_desc(self, session: AsyncSession) -> None:
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
