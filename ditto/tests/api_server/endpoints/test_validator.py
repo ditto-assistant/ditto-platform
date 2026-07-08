@@ -349,6 +349,56 @@ class TestSubmitScore:
             assert agent is not None
             assert agent.status == AgentStatus.SCORED
 
+    async def test_stamps_current_bench_version_when_omitted(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A report that omits bench_version (as the default payload does) must be
+        # stamped with the current version so it is never recorded as legacy.
+        from ditto.api_server.bench import CURRENT_BENCH_VERSION
+
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id),
+        )
+        assert response.status_code == 200
+
+        async with session_maker() as s:
+            score = await s.get(Score, (agent_id, _VALIDATOR_HOTKEY))
+            assert score is not None
+            assert score.details is not None
+            assert score.details["bench_version"] == CURRENT_BENCH_VERSION
+
+    async def test_preserves_explicit_bench_version(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # An explicit (older) version in the report is honest provenance and must
+        # not be bumped — only a missing version gets defaulted.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id, details={"bench_version": 1}),
+        )
+        assert response.status_code == 200
+
+        async with session_maker() as s:
+            score = await s.get(Score, (agent_id, _VALIDATOR_HOTKEY))
+            assert score is not None
+            assert score.details is not None
+            assert score.details["bench_version"] == 1
+
     async def test_re_score_upserts_single_row(
         self,
         app: FastAPI,
