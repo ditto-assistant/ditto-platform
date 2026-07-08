@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import ColumnElement, and_, func, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 MIN_ELIGIBLE_CASES = 100
 
 
-def _is_ranked() -> object:
+def _is_ranked() -> ColumnElement[bool]:
     """SQL predicate for a *ranked* run: it administered the full benchmark AND
     scored a positive composite. Both gates mirror the validator's weight fold:
     ``filter_eligible`` drops sub-floor runs and ``compute_weights`` then drops

@@ -54,6 +54,7 @@ async def scores(
             miner_hotkey=r.miner_hotkey,
             agent_id=r.agent_id,
             composite=r.composite,
+            n=r.n,
             first_seen=r.first_seen,
             sha256=r.sha256,
             size_bytes=r.size_bytes,
