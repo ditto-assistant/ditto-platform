@@ -105,6 +105,15 @@ _PROMPT_MIN_WORDS = 8
 # distinctive enough that unrelated prose rarely shares a shingle.
 _PROMPT_SHINGLE_WORDS = 5
 
+# --- L3c code-embedding input (see docs/SEMANTIC-CLONE-PREVENTION.md §4) ---------
+# Character cap on the text handed to the code-embedding model
+# (:func:`compute_embedding_input`). Sized to fit the smaller supported backend's
+# context window (jina-embeddings-v2-base-code, 8192 tokens ≈ ~24k chars of code);
+# the primary backend (Qwen3-Embedding-0.6B, 32k tokens) has ample headroom. Deter-
+# ministic prefix truncation: the sorted-file concatenation is stable, so the same
+# crate always yields the same (possibly truncated) input.
+_EMBED_INPUT_MAX_CHARS = 24000
+
 
 def compute_content_fingerprint(tar_gz_bytes: bytes) -> dict | None:
     """Return a MinHash shingle sketch of the tarball's source, or ``None``.
@@ -305,6 +314,77 @@ def compute_prompt_fingerprint(tar_gz_bytes: bytes) -> dict | None:
         "card": len(shingles),
         "m": sorted(shingles)[:_MINHASH_K],
     }
+
+
+def compute_embedding_input(tar_gz_bytes: bytes) -> str | None:
+    """Return the canonical source text to feed the L3c code-embedding model, or None.
+
+    This is the deterministic *input builder* for the **L3c code-embedding** signal
+    (see ``docs/SEMANTIC-CLONE-PREVENTION.md`` §4). It does not embed anything — the
+    embedding model is a self-hosted service (Qwen3-Embedding-0.6B primary,
+    jina-embeddings-v2-base-code CPU fallback) called separately — it only produces
+    the stable text that service embeds, so the input is reproducible and unit-
+    testable without the model.
+
+    Unlike the L1/L3a normalization, this preserves readable code: comments and
+    blank lines are dropped (a copier changes those freely, and they carry little
+    logic), but identifiers, structure, and indentation are kept, because the model
+    reasons over natural code and derives its rename/refactor invariance
+    *semantically* — that invariance is the point of L3c and is the model's job, not
+    the input's. Per-file cleaned texts are sorted by content and joined with a blank
+    line (no path names), so renaming or reordering files does not change the input.
+    The result is prefix-truncated to :data:`_EMBED_INPUT_MAX_CHARS` to fit the
+    model's context window; the sorted concatenation makes that truncation stable.
+
+    Returns ``None`` ("no embedding input", read downstream as no L3c signal) on an
+    unreadable tarball, empty source, or a bomb/work-guard trip — same contract and
+    guards as the other extractors. Pure + deterministic.
+    """
+    files: list[str] = []
+    total = 0
+    members = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tar_gz_bytes), mode="r:gz") as tar:
+            for member in tar:
+                members += 1
+                if members > _MAX_MEMBERS:
+                    logger.warning("embed-input: >%d members, skipping", _MAX_MEMBERS)
+                    return None
+                if not member.isfile():
+                    continue
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
+                raw = extracted.read(_MAX_FILE_BYTES + 1)
+                if len(raw) > _MAX_FILE_BYTES:
+                    logger.warning("embed-input: file exceeds per-file cap")
+                    return None
+                total += len(raw)
+                if total > _MAX_TOTAL_BYTES:
+                    logger.warning("embed-input: >%d bytes, skipping", _MAX_TOTAL_BYTES)
+                    return None
+                cleaned = _embedding_source(raw)
+                if cleaned:
+                    files.append(cleaned)
+    except (tarfile.TarError, gzip.BadGzipFile, EOFError, OSError) as e:
+        logger.info("embed-input: unreadable tarball (%s)", type(e).__name__)
+        return None
+
+    if not files:
+        return None
+    files.sort()
+    return "\n\n".join(files)[:_EMBED_INPUT_MAX_CHARS]
+
+
+def _embedding_source(raw: bytes) -> str:
+    """Canonicalize one file for embedding: comments + blank lines dropped, code kept.
+
+    Keeps each surviving line verbatim (indentation and identifiers intact) so the
+    model sees natural code; only comments (via :func:`_strip_comments`) and
+    blank/whitespace-only lines are removed.
+    """
+    text = _strip_comments(raw.decode("utf-8", errors="replace"))
+    return "\n".join(line for line in text.splitlines() if line.strip())
 
 
 def _prompt_shingles(raw: bytes) -> list[str]:
