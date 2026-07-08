@@ -10,14 +10,16 @@ nothing (null column, no behavior change). Everything here is opt-in.
 
 ## Model
 
-- Primary (deployed default): `Qwen/Qwen3-Embedding-0.6B` — Apache-2.0, 32k context,
-  Matryoshka output dims 32–1024. Best quality; ~2.5–3 GB RAM under TEI. **Requires
-  TEI ≥ 1.8.2** — the Qwen3 CPU path was broken by an Intel-MKL bug on AMD hosts and
-  only fixed there (TEI issues #636 / #667), which matters because a scale-to-zero
-  Cloud Run cold start lands on whatever CPU is scheduled.
-- CPU fallback: `jinaai/jina-embeddings-v2-base-code` — Apache-2.0, 161M, 8192
-  context, 31 languages incl. Rust, trained on code↔code pairs. ~1–2 GB RAM,
-  CPU-fast. Cheaper to validate the path with; swap in via a rebuild + re-embed.
+- Deployed (CPU Cloud Run): `jinaai/jina-embeddings-v2-base-code` — Apache-2.0, 161M,
+  8192 context, 768-dim, 31 languages incl. Rust, trained on code↔code pairs.
+  CPU-fast, cheap. Warmup memory is quadratic in `MAX_BATCH_TOKENS` (TEI/Candle
+  materializes full f32 attention), so the deploy caps it to 4096 tokens (inputs
+  above ~14k chars truncate) and runs on an 8 GiB / 2-vCPU instance.
+- Higher quality, GPU-only: `Qwen/Qwen3-Embedding-0.6B` — Apache-2.0, 32k context,
+  Matryoshka dims 32–1024. Better embeddings, but **impractical on CPU**: TEI/Candle
+  needed 16 GiB and only started with inputs truncated to 4096 tokens and a >30s
+  cold start. Worth it only behind a GPU backend. If built, it needs **TEI ≥ 1.8.2**
+  (an Intel-MKL crash on AMD hosts was fixed there — TEI issues #636 / #667).
 
 Hosted APIs (voyage-code-3, zembed-1) are deliberately **not** used: agent crates
 are private miner IP, so embedding them off-platform is unacceptable egress, and
@@ -63,10 +65,10 @@ Two pieces, in two repos:
 
 ```sh
 CODE_EMBEDDER_URL=https://embedder-xxxx.a.run.app   # Cloud Run service URL (TF output)
-CODE_EMBEDDER_MODEL=Qwen/Qwen3-Embedding-0.6B       # must match the baked model
+CODE_EMBEDDER_MODEL=jinaai/jina-embeddings-v2-base-code  # must match the baked model
 CODE_EMBEDDER_AUTH=gcp_id_token                     # mint a metadata-server ID token
 CODE_EMBEDDER_TIMEOUT_SECONDS=30                    # absorb a cold-start model load
-CODE_EMBEDDER_DIM=256                               # Qwen3 Matryoshka width
+# CODE_EMBEDDER_DIM=                                # jina native 768 (set only for Qwen3 MRL)
 ```
 
 None of these are secret — the URL is public (auth is enforced by IAM, not

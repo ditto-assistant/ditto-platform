@@ -23,7 +23,7 @@ the client (`ditto/api_server/embedding/`).
 cd docker/embedder
 gcloud builds submit \
   --config cloudbuild.yaml \
-  --substitutions=_IMAGE=<region>-docker.pkg.dev/<project>/embedder/embedder:qwen3-0.6b
+  --substitutions=_IMAGE=<region>-docker.pkg.dev/<project>/embedder/embedder:jina-v2
 ```
 
 Keep the image tag tied to the model (`qwen3-0.6b`, `jina-v2`) so a rollback is a
@@ -32,11 +32,13 @@ tag change, not a rebuild. The tag Cloud Run pulls is a Terraform var
 
 ## Model choice
 
-The build defaults to the primary `Qwen/Qwen3-Embedding-0.6B`. For the cheaper CPU
-fallback, pass the build-args and a matching tag:
+The build defaults to `jinaai/jina-embeddings-v2-base-code` — the model deployed on
+CPU Cloud Run. `Qwen/Qwen3-Embedding-0.6B` is higher quality but impractical on CPU
+(TEI/Candle materializes full f32 attention → 16 GiB + truncated inputs), so build
+it only for a GPU backend:
 
 ```sh
-  --substitutions=_IMAGE=...:jina-v2,_MODEL_ID=jinaai/jina-embeddings-v2-base-code
+  --substitutions=_IMAGE=...:qwen3-0.6b,_MODEL_ID=Qwen/Qwen3-Embedding-0.6B
 ```
 
 `_MODEL_ID` must match `CODE_EMBEDDER_MODEL` in the platform env — it is the
