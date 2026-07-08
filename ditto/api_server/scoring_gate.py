@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 # A challenger scoring within this of the incumbent it surpasses is "a hair past"
 # — the anti-copy tolerance must exceed the benchmark's between-seed composite
 # noise so a re-rolled verbatim copy cannot clear it on a lucky seed.
-# DittoBench v2 / bench_version 3 (BENCHMARK-V2 §6.2, B8) targets between-seed
+# DittoBench v2 / bench_version 2 (BENCHMARK-V2 §6.2, B8) targets between-seed
 # σ ≤ 0.01 composite and matches the validator's 5% KOTH margin: 0.03 ≈ 3σ. Bump
 # alongside the subnet VALIDATOR_KOTH_MARGIN if the hosted 30-seed σ comes in
 # higher (was 0.02 for v1).
