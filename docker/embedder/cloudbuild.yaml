@@ -8,7 +8,7 @@
 # Usage (from this directory, project already selected):
 #   gcloud builds submit \
 #     --config cloudbuild.yaml \
-#     --substitutions=_IMAGE=us-central1-docker.pkg.dev/PROJECT/embedder/embedder:qwen3-0.6b
+#     --substitutions=_IMAGE=us-central1-docker.pkg.dev/PROJECT/embedder/embedder:jina-v2
 #
 # Override the model with _MODEL_ID / _MODEL_REVISION (e.g.
 # jinaai/jina-embeddings-v2-base-code + a :jina-v2 tag for the CPU fallback); keep
@@ -16,7 +16,7 @@
 
 substitutions:
   _IMAGE: "REPLACE_WITH_ARTIFACT_REGISTRY_IMAGE"
-  _MODEL_ID: "Qwen/Qwen3-Embedding-0.6B"
+  _MODEL_ID: "jinaai/jina-embeddings-v2-base-code"
   _MODEL_REVISION: "main"
 
 steps:
