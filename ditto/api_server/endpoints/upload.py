@@ -49,6 +49,7 @@ from ditto.api_server.dependencies import (
 from ditto.api_server.fingerprint import (
     compute_content_fingerprint,
     compute_normalized_source_hash,
+    compute_prompt_fingerprint,
 )
 from ditto.api_server.payment_verifier import (
     PaymentProof,
@@ -323,6 +324,10 @@ async def upload_agent(
     normalized_source_hash = await asyncio.to_thread(
         compute_normalized_source_hash, tar_bytes
     )
+    # 7d. L3b prompt-surface sketch (shadow mode): stored for every agent for
+    # calibration/retroactive analysis; not yet a hold trigger. Same offload +
+    # best-effort None contract.
+    prompt_fingerprint = await asyncio.to_thread(compute_prompt_fingerprint, tar_bytes)
 
     if session.in_transaction():
         rollback_result = session.rollback()
@@ -342,6 +347,7 @@ async def upload_agent(
             size_bytes=len(tar_bytes),
             content_fingerprint=content_fingerprint,
             normalized_source_hash=normalized_source_hash,
+            prompt_fingerprint=prompt_fingerprint,
         )
         await insert_evaluation_payment(session, verified=verified, agent_id=agent_id)
 

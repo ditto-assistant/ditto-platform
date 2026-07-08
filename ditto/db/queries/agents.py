@@ -33,6 +33,7 @@ async def insert_agent(
     size_bytes: int,
     content_fingerprint: dict | None = None,
     normalized_source_hash: str | None = None,
+    prompt_fingerprint: dict | None = None,
 ) -> None:
     """Insert one ``agents`` row inside the caller-owned transaction.
 
@@ -50,7 +51,9 @@ async def insert_agent(
     when the tarball was unreadable/empty at upload.
     ``normalized_source_hash`` (same module) is the L3a exact-repack hash of the
     canonicalized source feeding the gate's equality signal; ``None`` on the same
-    unreadable/empty condition.
+    unreadable/empty condition. ``prompt_fingerprint`` (same module) is the L3b
+    prompt-surface sketch, stored in shadow mode; ``None`` when the crate carries no
+    prompt-length literal or the tarball is unreadable.
 
     Raises:
         DbIntegrityError: Any constraint violation on ``agents``
@@ -67,6 +70,7 @@ async def insert_agent(
         size_bytes=size_bytes,
         content_fingerprint=content_fingerprint,
         normalized_source_hash=normalized_source_hash,
+        prompt_fingerprint=prompt_fingerprint,
     )
     session.add(row)
     try:

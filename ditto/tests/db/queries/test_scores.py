@@ -96,6 +96,7 @@ async def _seed_scored(
     size_bytes: int = 524288,
     status: AgentStatus = AgentStatus.SCORED,
     normalized_source_hash: str | None = None,
+    prompt_fingerprint: dict | None = None,
 ) -> Agent:
     """Seed one agent + its score row, in the given lifecycle state."""
     agent = Agent(
@@ -107,6 +108,7 @@ async def _seed_scored(
         status=status,
         created_at=created_at,
         normalized_source_hash=normalized_source_hash,
+        prompt_fingerprint=prompt_fingerprint,
     )
     async with session.begin():
         session.add(agent)
@@ -161,6 +163,23 @@ class TestListEligibleLedger:
         ledger = await list_eligible_ledger(session)
         assert len(ledger) == 1
         assert ledger[0].normalized_source_hash == "ns" * 32
+
+    async def test_prompt_fingerprint_flows_through(
+        self, session: AsyncSession
+    ) -> None:
+        # The L3b prompt sketch (shadow signal) must reach the ledger for the gate.
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        sketch = {"v": "p1", "k": 256, "card": 2, "m": ["aa", "bb"]}
+        await _seed_scored(
+            session,
+            miner=_MINER,
+            composite=0.7,
+            created_at=t0,
+            prompt_fingerprint=sketch,
+        )
+        ledger = await list_eligible_ledger(session)
+        assert len(ledger) == 1
+        assert ledger[0].prompt_fingerprint == sketch
 
     async def test_ordered_by_composite_desc(self, session: AsyncSession) -> None:
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)

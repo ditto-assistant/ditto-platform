@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_server.fingerprint import _FP_VERSION, _MINHASH_K
+from ditto.api_server.fingerprint import _FP_VERSION, _MINHASH_K, _PROMPT_VERSION
 from ditto.api_server.scoring_gate import evaluate_antidup
 from ditto.db.queries.scores import LedgerRow
 
@@ -28,6 +28,16 @@ def _sk(shingles: set[str]) -> dict:
     }
 
 
+def _psk(shingles: set[str]) -> dict:
+    """Build an L3b prompt sketch (version ``"p1"``) from a set of shingle hashes."""
+    return {
+        "v": _PROMPT_VERSION,
+        "k": _MINHASH_K,
+        "card": len(shingles),
+        "m": sorted(shingles)[:_MINHASH_K],
+    }
+
+
 def _entry(
     *,
     composite: float,
@@ -37,6 +47,7 @@ def _entry(
     content_fingerprint: dict | None = None,
     structural_fingerprint: dict | None = None,
     normalized_source_hash: str | None = None,
+    prompt_fingerprint: dict | None = None,
 ) -> LedgerRow:
     return LedgerRow(
         miner_hotkey=miner,
@@ -55,6 +66,7 @@ def _entry(
         content_fingerprint=content_fingerprint,
         structural_fingerprint=structural_fingerprint,
         normalized_source_hash=normalized_source_hash,
+        prompt_fingerprint=prompt_fingerprint,
     )
 
 
@@ -452,3 +464,95 @@ class TestEvaluateAntidup:
         )
         assert d1.held is False
         assert d1 == d2
+
+
+class TestPromptShadowSignal:
+    """L3b prompt fingerprint in the gate: shadow mode. It never creates a hold on
+    its own; it only annotates the audit reason of a hold another rule fired."""
+
+    def test_prompt_match_alone_never_holds(self) -> None:
+        # Identical prompt sketch to the incumbent, but distant score and distinct
+        # sha / size / lexical: the prompt signal must NOT hold on its own.
+        shared = {"pp" + f"{i:02d}" for i in range(20)}
+        incumbent = _entry(
+            composite=0.60,
+            sha256="cc" * 32,
+            size_bytes=400000,
+            prompt_fingerprint=_psk(shared),
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Challenger",
+            sha256="dd" * 32,
+            composite=0.90,  # far from incumbent
+            size_bytes=700000,  # far in size
+            prompt_fingerprint=_psk(shared),
+            eligible=[incumbent],
+        )
+        assert decision.held is False
+
+    def test_prompt_corroboration_annotates_lexical_hold(self) -> None:
+        # A lexical near-dup fires (rule 2); a shared prompt sketch adds a note.
+        shingles = {f"s{i:03d}" for i in range(30)}
+        shared_prompt = {"pp" + f"{i:02d}" for i in range(20)}
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=500000,
+            content_fingerprint=_sk(shingles),
+            prompt_fingerprint=_psk(shared_prompt),
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Copier",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=500100,
+            content_fingerprint=_sk(shingles),  # jaccard 1.0 -> rule 2 holds
+            prompt_fingerprint=_psk(shared_prompt),
+            eligible=[incumbent],
+        )
+        assert decision.held is True
+        assert "content near-duplicate" in (decision.reason or "")
+        assert "prompt jaccard" in (decision.reason or "")
+
+    def test_hold_without_prompt_sketch_has_no_note(self) -> None:
+        # Same lexical hold, but no prompt sketches: reason must not mention prompt.
+        shingles = {f"s{i:03d}" for i in range(30)}
+        incumbent = _entry(
+            composite=0.80, content_fingerprint=_sk(shingles), size_bytes=500000
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Copier",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=500100,
+            content_fingerprint=_sk(shingles),
+            eligible=[incumbent],
+        )
+        assert decision.held is True
+        assert "prompt" not in (decision.reason or "")
+
+    def test_low_prompt_overlap_not_noted(self) -> None:
+        # Lexical hold fires, prompt sketches present but nearly disjoint (below the
+        # advisory tolerance): no prompt note is added.
+        shingles = {f"s{i:03d}" for i in range(30)}
+        incumbent = _entry(
+            composite=0.80,
+            size_bytes=500000,
+            content_fingerprint=_sk(shingles),
+            prompt_fingerprint=_psk({f"a{i:02d}" for i in range(20)}),
+        )
+        decision = evaluate_antidup(
+            agent_id=uuid4(),
+            miner_hotkey="5Copier",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=500100,
+            content_fingerprint=_sk(shingles),
+            prompt_fingerprint=_psk({f"b{i:02d}" for i in range(20)}),  # disjoint
+            eligible=[incumbent],
+        )
+        assert decision.held is True
+        assert "prompt" not in (decision.reason or "")
