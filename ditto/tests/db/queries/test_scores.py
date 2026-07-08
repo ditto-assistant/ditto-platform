@@ -219,9 +219,7 @@ class TestListEligibleLedger:
         await _seed_scored(
             session, miner=_MINER, composite=0.5, created_at=t0, n=MIN_ELIGIBLE_CASES
         )
-        await _seed_scored(
-            session, miner=_MINER_B, composite=0.5, created_at=t0, n=12
-        )
+        await _seed_scored(session, miner=_MINER_B, composite=0.5, created_at=t0, n=12)
         by_miner = {e.miner_hotkey: e for e in await list_eligible_ledger(session)}
         assert by_miner[_MINER].eligible is True
         assert by_miner[_MINER_B].eligible is False
@@ -235,9 +233,7 @@ class TestListEligibleLedger:
         await _seed_scored(
             session, miner=_MINER, composite=0.55, created_at=t0, n=MIN_ELIGIBLE_CASES
         )
-        await _seed_scored(
-            session, miner=_MINER_B, composite=0.90, created_at=t0, n=12
-        )
+        await _seed_scored(session, miner=_MINER_B, composite=0.90, created_at=t0, n=12)
         ledger = await list_eligible_ledger(session)
         assert [e.miner_hotkey for e in ledger] == [_MINER, _MINER_B]
         assert ledger[0].eligible is True and ledger[1].eligible is False
@@ -275,9 +271,7 @@ class TestListEligibleLedger:
         await _seed_scored(
             session, miner=_MINER, composite=0.0, created_at=t0, n=MIN_ELIGIBLE_CASES
         )
-        await _seed_scored(
-            session, miner=_MINER_B, composite=0.9, created_at=t0, n=12
-        )
+        await _seed_scored(session, miner=_MINER_B, composite=0.9, created_at=t0, n=12)
         ledger = await list_eligible_ledger(session)
         by_miner = {e.miner_hotkey: e for e in ledger}
         assert by_miner[_MINER].eligible is False  # full but zero-scoring
