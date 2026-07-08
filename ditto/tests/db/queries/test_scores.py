@@ -12,6 +12,7 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
 from ditto.db.models import Agent
 from ditto.db.queries.scores import (
+    MIN_ELIGIBLE_CASES,
     list_eligible_ledger,
     list_scores_for_agent,
     upsert_score,
@@ -95,6 +96,7 @@ async def _seed_scored(
     created_at: datetime,
     size_bytes: int = 524288,
     status: AgentStatus = AgentStatus.SCORED,
+    n: int = 20,
     normalized_source_hash: str | None = None,
     prompt_fingerprint: dict | None = None,
     code_embedding: list | None = None,
@@ -127,7 +129,7 @@ async def _seed_scored(
             tool_mean=composite,
             memory_mean=composite,
             median_ms=500,
-            n=20,
+            n=n,
             generated_at=_GEN_AT,
             signature="ab" * 64,
         )
@@ -209,6 +211,59 @@ class TestListEligibleLedger:
         await _seed_scored(session, miner=_MINER_B, composite=0.9, created_at=t0)
         ledger = await list_eligible_ledger(session)
         assert [e.miner_hotkey for e in ledger] == [_MINER_B, _MINER]
+
+    async def test_eligible_flag_reflects_case_count(
+        self, session: AsyncSession
+    ) -> None:
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        await _seed_scored(
+            session, miner=_MINER, composite=0.5, created_at=t0, n=MIN_ELIGIBLE_CASES
+        )
+        await _seed_scored(
+            session, miner=_MINER_B, composite=0.5, created_at=t0, n=12
+        )
+        by_miner = {e.miner_hotkey: e for e in await list_eligible_ledger(session)}
+        assert by_miner[_MINER].eligible is True
+        assert by_miner[_MINER_B].eligible is False
+
+    async def test_eligible_ranked_above_higher_provisional(
+        self, session: AsyncSession
+    ) -> None:
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        # A full run at a *lower* composite must outrank a provisional smoke run
+        # at a higher composite — the whole point of the gate.
+        await _seed_scored(
+            session, miner=_MINER, composite=0.55, created_at=t0, n=MIN_ELIGIBLE_CASES
+        )
+        await _seed_scored(
+            session, miner=_MINER_B, composite=0.90, created_at=t0, n=12
+        )
+        ledger = await list_eligible_ledger(session)
+        assert [e.miner_hotkey for e in ledger] == [_MINER, _MINER_B]
+        assert ledger[0].eligible is True and ledger[1].eligible is False
+
+    async def test_full_run_not_shadowed_by_inflated_small(
+        self, session: AsyncSession
+    ) -> None:
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        # Same miner: a real full run (lower composite) and a lucky small run
+        # (higher composite). The miner must be represented by the *full* run so
+        # the small one cannot both hide the full result and be dropped by the
+        # emission gate.
+        await _seed_scored(
+            session, miner=_MINER, composite=0.52, created_at=t0, n=MIN_ELIGIBLE_CASES
+        )
+        await _seed_scored(
+            session,
+            miner=_MINER,
+            composite=0.95,
+            created_at=t0.replace(hour=13),
+            n=12,
+        )
+        ledger = await list_eligible_ledger(session)
+        assert len(ledger) == 1
+        assert ledger[0].eligible is True
+        assert ledger[0].composite == 0.52
 
     async def test_excludes_non_scored_states(self, session: AsyncSession) -> None:
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)

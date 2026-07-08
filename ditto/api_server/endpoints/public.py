@@ -230,6 +230,7 @@ def _public_entry(
         first_seen=r.first_seen,
         median_ms=r.median_ms,
         n=r.n,
+        eligible=r.eligible,
         bench_version=bench_version if isinstance(bench_version, int) else None,
         dataset_sha256=dataset_sha256 if isinstance(dataset_sha256, str) else None,
         models=_safe_models(details),

@@ -168,6 +168,11 @@
     /* A run scored on a previous benchmark version — muted amber so it reads as
        "not on the current benchmark / not directly comparable". */
     .bv.prev { color: #d9a441; border-color: rgba(217,164,65,0.45); background: rgba(217,164,65,0.08); }
+    /* A provisional run: scored on a smaller run-size profile (not the full
+       benchmark), so it is shown but not ranked / not emission-eligible. Muted
+       amber like a previous-version run, and the rank cell is dimmed. */
+    .prov { margin-left: 8px; font-family: var(--sans); font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; color: #d9a441; border: 1px solid rgba(217,164,65,0.45); background: rgba(217,164,65,0.08); border-radius: 5px; padding: 1px 6px; vertical-align: middle; }
+    .rank.prov-rank { background: transparent; color: var(--text-faint); font-weight: 600; }
     /* Board-wide benchmark-version badge in the header subtitle. */
     .bench-badge { display: none; margin-left: 10px; font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--accent-2); background: rgba(34,211,238,0.08); border: 1px solid rgba(34,211,238,0.4); border-radius: 6px; padding: 2px 8px; vertical-align: middle; text-transform: uppercase; }
     .bench-badge.show { display: inline-block; }
@@ -460,17 +465,30 @@
 
     // ── Render ───────────────────────────────────────────────
     function render(data, isSample) {
-      var entries = (data.entries || []).slice().sort(function (a, b) { return b.composite - a.composite; });
-      entries.forEach(function (e, i) { e.rank = i + 1; });
+      // Eligible (full-benchmark) runs rank first; provisional smoke/practice
+      // runs (a smaller run-size profile that omits the hard memory categories)
+      // sink below them regardless of composite, so an inflated 6-case "100%
+      // memory" can never present as #1. Composite orders within each tier.
+      var entries = (data.entries || []).slice().sort(function (a, b) {
+        var ae = isEligible(a), be = isEligible(b);
+        if (ae !== be) return ae ? -1 : 1;
+        return b.composite - a.composite;
+      });
+      // Competitive rank is assigned only to eligible entries; provisional runs
+      // are shown for transparency but stay unranked (rank = null).
+      var rk = 0;
+      entries.forEach(function (e) { e.rank = isEligible(e) ? (++rk) : null; });
       lastEntries = entries;
 
-      // Summary cards
-      var comps = entries.map(function (e) { return e.composite; });
+      // Summary cards reflect the ranked (eligible) field only — a provisional
+      // run is not a real headline number.
+      var elig = entries.filter(isEligible);
+      var comps = elig.map(function (e) { return e.composite; });
       document.getElementById("c-miners").textContent = entries.length;
-      document.getElementById("c-top").innerHTML = entries.length ? fx(comps[0]) : "—";
-      document.getElementById("c-median").innerHTML = entries.length ? fx(median(comps)) : "—";
+      document.getElementById("c-top").innerHTML = comps.length ? fx(comps[0]) : "—";
+      document.getElementById("c-median").innerHTML = comps.length ? fx(median(comps)) : "—";
       // Top gap: how contested the #1 spot is (#1 minus #2 composite).
-      document.getElementById("c-spread").innerHTML = entries.length >= 2
+      document.getElementById("c-spread").innerHTML = comps.length >= 2
         ? fx(comps[0] - comps[1]) + ' <small>#1 → #2</small>' : "—";
       // Scoring spend: total LLM tokens burned generating + judging these runs.
       var toks = entries.map(function (e) { return e.tokens; }).filter(function (t) { return t != null; });
@@ -509,12 +527,20 @@
         return;
       }
       tb.innerHTML = entries.map(function (e, i) {
-        var rankCls = i < 3 ? " r" + (i + 1) : "";
-        var champ = i === 0 ? '<span class="badge">👑 LEADER</span>' : "";
+        var elig = isEligible(e);
+        // Crown + rank styling only for the top *eligible* run; provisional runs
+        // are unranked and never champion.
+        var isChamp = elig && e.rank === 1;
+        var rankCls = (elig && e.rank <= 3) ? " r" + e.rank : "";
+        var champ = isChamp ? '<span class="badge">👑 LEADER</span>' : "";
+        var prov = elig ? "" : '<span class="prov" title="Provisional — scored on a smaller run-size profile that did not administer the full benchmark, so it is shown for transparency but not ranked and not emission-eligible.">provisional</span>';
+        var rankCell = elig
+          ? '<span class="rank' + rankCls + '">' + e.rank + '</span>' + rankMove(e.miner_hotkey, e.rank)
+          : '<span class="rank prov-rank" title="Not ranked (provisional run).">–</span>';
         return '' +
-          '<tr data-i="' + i + '"' + (i === 0 ? ' class="champion"' : '') + '>' +
-            '<td><span class="rank' + rankCls + '">' + (i + 1) + '</span>' + rankMove(e.miner_hotkey, i + 1) + '</td>' +
-            '<td><span class="hotkey">' + esc(shortKey(e.miner_hotkey)) + '</span>' + champ +
+          '<tr data-i="' + i + '"' + (isChamp ? ' class="champion"' : '') + '>' +
+            '<td>' + rankCell + '</td>' +
+            '<td><span class="hotkey">' + esc(shortKey(e.miner_hotkey)) + '</span>' + champ + prov +
               '<span class="copy" data-key="' + esc(e.miner_hotkey) + '" title="Copy hotkey">⧉</span></td>' +
             modelCell(e) +
             compositeCell(e, entries[i - 1]) +
@@ -530,6 +556,11 @@
     function fmtTokens(t) { return t >= 1e6 ? (t / 1e6).toFixed(1) + "M" : t >= 1e3 ? (t / 1e3).toFixed(1) + "k" : String(t); }
     function fmtMs(ms) { return ms >= 1000 ? (ms / 1000).toFixed(ms >= 10000 ? 0 : 1) + " s" : ms + " ms"; }
     function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+    // A run is eligible (ranked + emission-eligible) unless the API explicitly
+    // flags it provisional (eligible === false) — a smaller run-size profile that
+    // did not administer the full benchmark. Older APIs / sample data omit the
+    // field and are treated as eligible.
+    function isEligible(e) { return !e || e.eligible !== false; }
 
     function bar(kind, v) {
       var w = clamp01(v) * 100;
@@ -671,7 +702,9 @@
 
       var m = e.models || {};
       var det = "";
-      if (e.n != null) det += stat("Cases scored", String(e.n));
+      if (e.n != null) det += stat("Cases scored", String(e.n) +
+        (isEligible(e) ? "" : " — provisional (partial benchmark)"));
+      if (!isEligible(e)) det += stat("Ranking", "provisional — not ranked, not emission-eligible (scored on a smaller run-size profile that omits the hard memory categories)");
       if (e.median_ms != null) det += stat("Median latency", e.median_ms + " ms");
       if (e.bench_version == null) {
         det += stat("Benchmark version", "legacy (pre-versioning — not comparable to v" + currentBench + ")");
@@ -718,7 +751,9 @@
         stat("Tool mean", fx(e.tool_mean) + "  (" + pct(e.tool_mean) + ")") +
         stat("Memory mean", fx(e.memory_mean) + "  (" + pct(e.memory_mean) + ")") +
         stat("First seen", new Date(e.first_seen).toLocaleString()) +
-        stat("Rank", "#" + e.rank + " of " + lastEntries.length) +
+        stat("Rank", isEligible(e)
+          ? ("#" + e.rank + " of " + lastEntries.filter(isEligible).length)
+          : "unranked (provisional)") +
         (det ? '<div class="stat-head">Benchmark run</div>' + det : "") +
         pc +
         (ig ? '<div class="stat-head">Benchmark integrity</div>' + ig : "") +

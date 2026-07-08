@@ -26,6 +26,21 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
+# A run must administer the *full* benchmark to be ranked on the leaderboard and
+# to earn emissions. The dittobench-api run-size profiles are small = 6 tool + 6
+# memory = 12 cases, medium ~= 42, full = 60 tool + 50 memory + 4 isolation ~=
+# 114 (dittobench-api internal/gen/gen.go Profiles). A smaller profile omits the
+# hard anti-overfit memory categories (injection-resistance, aggregation-count,
+# assistant-recall) entirely — its 6-case memory suite is trivially aced (a
+# "100% memory" is a small-sample artifact), so the composite is neither
+# comparable across miners nor discriminative. This floor cleanly separates full
+# (~114) from the smoke/practice profiles (small 12, medium ~42); runs below it
+# are surfaced as "provisional" (eligible=False) but never ranked or folded into
+# weights. Keep in sync with the validator's MIN_ELIGIBLE_CASES
+# (ditto-subnet ditto/validator/weights.py).
+MIN_ELIGIBLE_CASES = 100
+
+
 @dataclass(frozen=True)
 class LedgerRow:
     """One entry of the best-eligible-score-per-miner ledger.
@@ -86,6 +101,11 @@ class LedgerRow:
     """Median per-case latency (ms) of the winning run — public benchmark telemetry."""
     n: int = 0
     """Number of cases scored in the winning run — public benchmark telemetry."""
+    eligible: bool = False
+    """Whether this run administered the full benchmark (``n >= MIN_ELIGIBLE_CASES``)
+    and is therefore ranked + emission-eligible. ``False`` marks a smoke/practice
+    run (small/medium profile) that is surfaced as *provisional* but never ranked
+    or folded into weights — see :data:`MIN_ELIGIBLE_CASES`."""
     details: dict | None = None
     """The winning run's opaque telemetry blob (``scores.details``): models used,
     bench_version, dataset_sha256, per-category means, token spend, and the
@@ -310,9 +330,20 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
     2. join to ``agents`` filtered to ``scored``.
     3. a ``ROW_NUMBER`` window keeps each miner's single best agent.
 
-    Ordering (``composite DESC, first_seen ASC, agent_id ASC``) matches the
-    validator fold's champion/tail tie-breaks. When the D3 k=3 design lands,
-    ``agent_best`` becomes a median-of-3 selection — a localized change here.
+    Two senses of "eligible" apply. *Pool* eligibility = ``status == scored``
+    (excludes ``ath_pending_review`` holds and ``banned`` agents). *Ranking*
+    eligibility = the run administered the full benchmark
+    (``n >= MIN_ELIGIBLE_CASES``), exposed per-row as ``LedgerRow.eligible``: a
+    smoke/practice run stays in the pool (surfaced as *provisional*) but is
+    ordered **below** every full run and is dropped by the validator's weight
+    fold, so it can never rank or earn emissions. Both the per-agent and
+    per-miner selections prefer an eligible row/agent, so an inflated small run
+    never shadows a miner's real full run.
+
+    Ordering (``eligible DESC, composite DESC, first_seen ASC, agent_id ASC``)
+    matches the validator fold's eligibility gate + champion/tail tie-breaks.
+    When the D3 k=3 design lands, ``agent_best`` becomes a median-of-3 selection
+    — a localized change here.
     """
     agent_best = select(
         Score.agent_id.label("agent_id"),
@@ -323,13 +354,21 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         Score.run_id.label("run_id"),
         Score.median_ms.label("median_ms"),
         Score.n.label("n"),
+        (Score.n >= MIN_ELIGIBLE_CASES).label("eligible"),
         Score.details.label("details"),
         Score.validator_hotkey.label("validator_hotkey"),
         Score.signature.label("signature"),
         func.row_number()
         .over(
             partition_by=Score.agent_id,
-            order_by=(Score.composite.desc(), Score.validator_hotkey.asc()),
+            # Prefer an eligible (full-benchmark) row over a higher-composite
+            # smoke/practice row, so a small run cannot shadow the agent's real
+            # full run and drop it out of the ranked/emission pool.
+            order_by=(
+                (Score.n >= MIN_ELIGIBLE_CASES).desc(),
+                Score.composite.desc(),
+                Score.validator_hotkey.asc(),
+            ),
         )
         .label("srn"),
     ).subquery()
@@ -354,6 +393,7 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             agent_best.c.run_id,
             agent_best.c.median_ms,
             agent_best.c.n,
+            agent_best.c.eligible,
             agent_best.c.details,
             agent_best.c.validator_hotkey,
             agent_best.c.signature,
@@ -366,7 +406,10 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         func.row_number()
         .over(
             partition_by=per_agent.c.miner_hotkey,
+            # Eligible-first so a miner is represented by their best full-benchmark
+            # agent, not an inflated smoke run; composite breaks ties within a tier.
             order_by=(
+                per_agent.c.eligible.desc(),
                 per_agent.c.composite.desc(),
                 per_agent.c.first_seen.asc(),
                 per_agent.c.agent_id.asc(),
@@ -378,7 +421,10 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
     stmt = (
         select(ranked)
         .where(ranked.c.rn == 1)
+        # Eligible (ranked) entries first, then provisional ones; the public rank
+        # and the validator fold both read this order.
         .order_by(
+            ranked.c.eligible.desc(),
             ranked.c.composite.desc(),
             ranked.c.first_seen.asc(),
             ranked.c.agent_id.asc(),
@@ -408,6 +454,7 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             code_embed_model=row.code_embed_model,
             median_ms=row.median_ms,
             n=row.n,
+            eligible=bool(row.eligible),
             details=row.details,
         )
         for row in result

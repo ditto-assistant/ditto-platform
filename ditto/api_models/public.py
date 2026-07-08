@@ -186,6 +186,20 @@ class PublicLeaderboardEntry(BaseModel):
     n: Annotated[
         int | None, Field(default=None, ge=0, description="Number of cases scored.")
     ]
+    eligible: Annotated[
+        bool,
+        Field(
+            default=True,
+            description=(
+                "Whether this run administered the full benchmark and is therefore "
+                "ranked + emission-eligible. False marks a provisional smoke/practice "
+                "run (a smaller run-size profile that omits the hard memory "
+                "categories): it is shown for transparency but is not ranked and "
+                "never earns emissions. The rank field is only meaningful for "
+                "eligible entries."
+            ),
+        ),
+    ]
     bench_version: Annotated[
         int | None, Field(default=None, description="Benchmark scoring version.")
     ]
