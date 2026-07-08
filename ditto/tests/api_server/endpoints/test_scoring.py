@@ -151,6 +151,10 @@ class TestScoringLedger:
         assert [e["miner_hotkey"] for e in body["entries"]] == [_MINER_B, _MINER]
         assert body["entries"][0]["composite"] == pytest.approx(0.9)
         assert body["entries"][0]["signature"] == "ab" * 64
+        # n rides the wire so the validator's eligibility floor can bite (a run
+        # below MIN_ELIGIBLE_CASES is dropped from the fold rather than shadowing
+        # a real full run) — see ROAD-TO-PRODUCTION X-LEDGER-N.
+        assert body["entries"][0]["n"] == 20
 
     async def test_empty_ledger(
         self,
