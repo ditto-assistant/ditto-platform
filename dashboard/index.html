@@ -121,7 +121,7 @@
     .banner b { color: #fde68a; }
 
     /* ── Summary cards ──────────────────────────────────────── */
-    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 14px; margin: 22px 0; }
+    .cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin: 22px 0; }
     .card {
       background: var(--bg-elev); border: 1px solid var(--border);
       border-radius: var(--radius); padding: 16px 18px; position: relative; overflow: hidden;
@@ -139,13 +139,15 @@
     /* ── Leaderboard ────────────────────────────────────────── */
     .board { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
     table { width: 100%; border-collapse: collapse; }
+    /* A term with a hover explanation — dotted underline + help cursor cue it. */
+    .tip { border-bottom: 1px dotted rgba(148,163,184,0.5); cursor: help; }
     thead th {
       text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.6px;
-      color: var(--text-faint); font-weight: 600; padding: 13px 16px;
+      color: var(--text-faint); font-weight: 600; padding: 10px 16px;
       border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.015);
     }
     thead th.num, tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
-    tbody td { padding: 13px 16px; border-bottom: 1px solid rgba(36, 48, 74, 0.5); font-size: 14px; vertical-align: middle; }
+    tbody td { padding: 9px 16px; border-bottom: 1px solid rgba(36, 48, 74, 0.5); font-size: 14px; vertical-align: middle; }
     tbody tr:last-child td { border-bottom: none; }
     tbody tr { cursor: pointer; transition: background .12s; }
     tbody tr:hover { background: rgba(91, 140, 255, 0.06); }
@@ -217,6 +219,16 @@
     details.cases summary::-webkit-details-marker { display: none; }
     details.cases summary::before { content: "▸ "; color: var(--text-faint); }
     details.cases[open] summary::before { content: "▾ "; }
+    /* Drawer: collapsible plain-language glossary (metric + test-category help). */
+    details.gloss { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 8px; }
+    details.gloss summary { cursor: pointer; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: var(--text-dim); padding: 6px 0; list-style: none; }
+    details.gloss summary::-webkit-details-marker { display: none; }
+    details.gloss summary::before { content: "▸ "; color: var(--text-faint); }
+    details.gloss[open] summary::before { content: "▾ "; }
+    .gitem { padding: 7px 0; border-bottom: 1px solid rgba(36,48,74,0.4); }
+    .gitem:last-child { border-bottom: none; }
+    .gterm { font-size: 12.5px; font-weight: 700; color: var(--text); }
+    .gdesc { font-size: 12.5px; color: var(--text-dim); line-height: 1.5; margin-top: 2px; }
     .crow { padding: 8px 0; border-bottom: 1px solid rgba(36,48,74,0.5); }
     .crow .cmain { display: flex; align-items: center; gap: 8px; }
     .crow .cmain, .crow .cscore { justify-content: space-between; }
@@ -311,12 +323,11 @@
     </div>
 
     <section class="cards" id="cards">
-      <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label">Miners Scored</div><div class="value" id="c-miners">—</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label">Top Composite</div><div class="value" id="c-top">—</div></div>
-      <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label">Median Composite</div><div class="value" id="c-median">—</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label">Top Gap</div><div class="value" id="c-spread">—</div></div>
-      <div class="card"><div class="glow" style="background:var(--memory)"></div><div class="label">Scoring Spend</div><div class="value" id="c-cost">—</div></div>
-      <div class="card"><div class="glow" style="background:var(--good)"></div><div class="label">Scoring</div><div class="value" id="c-bench">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label"><span class="tip" title="Distinct miners with at least one scored run on the board (provisional runs included).">Miners Scored</span></div><div class="value" id="c-miners">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="The highest composite among ranked (full-benchmark) runs. Composite = 0.5 × tool mean + 0.5 × memory mean. Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" title="Median composite across ranked (full-benchmark) runs — the middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">—</div></div>
+      <div class="card"><div class="glow" style="background:var(--memory)"></div><div class="label"><span class="tip" title="Total LLM tokens spent generating the dataset and judging responses across the runs on the board — the compute cost of scoring.">Scoring Spend</span></div><div class="value" id="c-cost">—</div></div>
     </section>
 
     <div class="section-head">
@@ -327,14 +338,14 @@
       <table>
         <thead>
           <tr>
-            <th style="width:52px">#</th>
-            <th>Miner</th>
-            <th class="hide-md" style="width:180px">Model</th>
-            <th style="width:190px">Composite</th>
-            <th class="hide-sm" style="width:140px">Tool</th>
-            <th class="hide-sm" style="width:140px">Memory</th>
-            <th class="num hide-sm" style="width:96px">Latency</th>
-            <th class="num hide-sm" style="width:92px">First seen</th>
+            <th style="width:52px"><span class="tip" title="Rank by composite among ranked (full-benchmark) runs. Provisional runs are shown but unranked (–).">#</span></th>
+            <th><span class="tip" title="The miner's on-chain hotkey (SS58). Click a row for the full run detail; click ⧉ to copy the key.">Miner</span></th>
+            <th class="hide-md" style="width:180px"><span class="tip" title="The chat model the miner's harness ran on (when disclosed) and the benchmark version the run was scored under.">Model</span></th>
+            <th style="width:190px"><span class="tip" title="Headline score in [0,1]: 0.5 × tool mean + 0.5 × memory mean. The band on the bar is ±1 standard error; the second line shows the score trend.">Composite</span></th>
+            <th class="hide-sm" style="width:140px"><span class="tip" title="Mean score across the tool-use cases — did the agent call the right tools, with grounded arguments, and route to memory vs the web correctly?">Tool</span></th>
+            <th class="hide-sm" style="width:140px"><span class="tip" title="Mean score across the memory cases — did the agent recall and reason over stored facts (across sessions, over time, resisting injected instructions)?">Memory</span></th>
+            <th class="num hide-sm" style="width:96px"><span class="tip" title="Median per-case response time for the run, and how many cases were scored (a full benchmark is ~114 cases).">Latency</span></th>
+            <th class="num hide-sm" style="width:92px"><span class="tip" title="When this miner's winning agent was first uploaded to the platform.">First seen</span></th>
           </tr>
         </thead>
         <tbody id="rows">
@@ -494,9 +505,6 @@
       var toks = entries.map(function (e) { return e.tokens; }).filter(function (t) { return t != null; });
       document.getElementById("c-cost").innerHTML = toks.length
         ? fmtTokens(toks.reduce(function (a, b) { return a + b; }, 0)) + ' <small>tokens</small>' : "—";
-      // Scoring card: the fixed composite weighting (the benchmark version lives
-      // in the header badge below, so it isn't duplicated here).
-      document.getElementById("c-bench").innerHTML = '0.5 / 0.5 <small>tool / memory</small>';
       // The latest benchmark version (single source of truth from the API), with a
       // fallback to the highest version on the board so the header still resolves
       // against the sample data / an older API.
@@ -758,6 +766,8 @@
         pc +
         (ig ? '<div class="stat-head">Benchmark integrity</div>' + ig : "") +
         casesSection(e) +
+        categoryGlossary(e) +
+        metricsGlossary(e) +
         trend;
 
       document.getElementById("modal").classList.add("open");
@@ -766,6 +776,81 @@
     }
     function stat(k, v) {
       return '<div class="stat-row"><span class="k">' + esc(k) + '</span><span class="v">' + esc(v) + '</span></div>';
+    }
+
+    // Plain-language help for the metric/telemetry terms in this drawer. Each is a
+    // short paragraph; rendered collapsed so the panel stays clean by default.
+    var TERM_HELP = [
+      ["Composite", "The headline score in [0,1]: 0.5 × tool mean + 0.5 × memory mean. This is the number miners are ranked and paid emissions on."],
+      ["Standard error (± SE)", "The uncertainty on the composite, estimated from how much the per-case scores vary. Two miners within ~1 SE of each other are a statistical tie, not a real gap."],
+      ["Tool mean", "Average score over the tool-use cases: did the agent call the right tools, with grounded arguments, and route to memory instead of the web when the fact was already known?"],
+      ["Memory mean", "Average score over the memory cases: did the agent recall and reason over stored facts — across sessions, over time, and while resisting instructions hidden in the data?"],
+      ["Benchmark version", "Which DittoBench version scored this run. Scores are only comparable within one version; a run on an older version is marked and not ranked against the current one."],
+      ["Provisional", "The run used a smaller run-size profile that did not administer the full benchmark (it omits the hard memory categories, and its few cases are easy to ace). It is shown for transparency but is not ranked and earns no emissions."],
+      ["Paraphrased cases", "Anti-overfit: how many cases had their wording regenerated so a harness that memorized answers can't match on surface text."],
+      ["Lexical-gap rewrites", "Anti-overfit (NoLiMa): questions reworded to share fewer words with the stored fact, so answering needs real retrieval rather than keyword overlap. The overlap figure is the before→after word-overlap."],
+      ["Capped tool cases", "Tool cases where the harness self-reported a result instead of calling the observable endpoint. Self-reports aren't trusted, so those cases are capped."],
+      ["Memory seeding waves", "How many staged waves the memory haystack was seeded in — more waves means a longer retention horizon between when a fact is stored and when it's asked about."],
+    ];
+
+    // One-line purpose for each test category — what the case checks, never the
+    // answer key. Keyed by the category names the API surfaces; a generic fallback
+    // covers any category not listed here.
+    var CATEGORY_PURPOSE = {
+      // memory question types
+      "multi-session": "Recalls a fact stated in an earlier session when asked in a later one — long-horizon memory across conversations.",
+      "temporal-reasoning": "Tracks how a fact changed over time and answers with the value correct for the moment asked, not just the latest.",
+      "preference-application": "Applies a stored user preference to a new request, rather than merely repeating the preference back.",
+      "preference": "Recalls a preference the user stated directly.",
+      "injection-resistance": "Ignores instructions hidden inside stored content and refuses to leak or act on them — a prompt-injection safety check.",
+      "assistant-recall": "Remembers something the assistant itself said earlier, not only what the user said.",
+      "aggregation-count": "Counts or aggregates across many stored mentions instead of answering from a single one.",
+      // tool categories
+      "web_search": "Chooses to search the web when the answer isn't already in memory.",
+      "memory_lookup": "Answers from stored memory instead of making an unnecessary tool call.",
+      "route_memory_not_web": "Routes to memory (not the web) when the fact was already stored — avoiding a needless search.",
+      "arg_hallucination": "Calls a tool using only grounded arguments and doesn't invent parameters the user never gave.",
+      "parallel_web_image": "Issues the independent tool calls a task needs (e.g. a web search and an image lookup) together rather than serially or partially.",
+    };
+    function categoryPurpose(cat) {
+      return CATEGORY_PURPOSE[cat] || ("A benchmark case in the “" + cat + "” category.");
+    }
+
+    // Collapsed glossary of the metric terms that actually appear in this run.
+    function metricsGlossary(e) {
+      var g = e.integrity || {};
+      var items = TERM_HELP.filter(function (t) {
+        var k = t[0];
+        if (k === "Standard error (± SE)") return e.composite_stderr != null;
+        if (k === "Provisional") return !isEligible(e);
+        if (k === "Paraphrased cases") return g.paraphrase_applied != null;
+        if (k === "Lexical-gap rewrites") return g.lexical_gap_rewritten != null;
+        if (k === "Capped tool cases") return g.capped_tool_cases != null;
+        if (k === "Memory seeding waves") return g.seeding_waves != null;
+        return true; // composite / tool mean / memory mean / bench version always apply
+      });
+      var body = items.map(function (t) {
+        return '<div class="gitem"><div class="gterm">' + esc(t[0]) +
+          '</div><div class="gdesc">' + esc(t[1]) + "</div></div>";
+      }).join("");
+      return '<details class="gloss"><summary>What these terms mean</summary>' + body + "</details>";
+    }
+
+    // Collapsed glossary of the purpose of each test category present in this run.
+    function categoryGlossary(e) {
+      var cats = [];
+      if (e.per_category && e.per_category.length) cats = e.per_category.map(function (c) { return c.category; });
+      else if (e.case_results && e.case_results.length) cats = e.case_results.map(function (c) { return c.category; });
+      var seen = {}, uniq = [];
+      cats.forEach(function (c) { if (c && !seen[c]) { seen[c] = 1; uniq.push(c); } });
+      if (!uniq.length) return "";
+      var body = uniq.sort().map(function (c) {
+        return '<div class="gitem"><div class="gterm">' + esc(c) +
+          '</div><div class="gdesc">' + esc(categoryPurpose(c)) + "</div></div>";
+      }).join("");
+      return '<details class="gloss"><summary>What each test category checks</summary>' +
+        '<div class="gdesc" style="padding:4px 0 6px">A short summary of each category’s purpose. The exact prompts and expected answers (the answer key) are never shown.</div>' +
+        body + "</details>";
     }
     // Per-case results — redacted detail for analysis (category / kind / score /
     // pass / latency / notes; never the answer key). Grouped tool-then-memory,
@@ -783,7 +868,7 @@
         var note = (c.notes && c.notes.length) ? '<div class="cnote">' + esc(c.notes.join(" · ")) + "</div>" : "";
         return '<div class="crow">' +
           '<div class="cmain"><span class="ckind ' + esc(c.kind) + '">' + esc(c.kind) + '</span>' +
-          '<span class="ccat">' + esc(c.category) + "</span>" + ok + "</div>" +
+          '<span class="ccat" style="cursor:help" title="' + esc(categoryPurpose(c.category)) + '">' + esc(c.category) + "</span>" + ok + "</div>" +
           '<div class="cscore">' + lat + '<span class="cval">' + fx(c.score) + "</span></div>" +
           note + "</div>";
       }).join("");
