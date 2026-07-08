@@ -25,6 +25,7 @@ from ditto.api_server.dependencies import (
     get_session,
     get_storage_client,
 )
+from ditto.api_server.embedding import EmbeddingConfig
 from ditto.api_server.pricing import PricingConfig
 from ditto.api_server.storage import StorageConfig
 from ditto.chain import ChainConfig
@@ -68,6 +69,13 @@ def make_api_server_config(**overrides: Any) -> ApiServerConfig:
             bucket="ditto-agents",
             access_key="minio",
             secret_key="miniominio",
+        ),
+        embedding=EmbeddingConfig(
+            url=None,  # L3c disabled in unit tests (null embedder)
+            model="",
+            revision="main",
+            dim=None,
+            timeout_seconds=5.0,
         ),
     )
     if overrides:
