@@ -61,6 +61,15 @@ _DEFAULT_CONTAINMENT_TOL = 0.95
 # Only a near-total structural match should trip this rename-resistant channel.
 _DEFAULT_STRUCTURAL_JACCARD_TOL = 0.85
 _DEFAULT_STRUCTURAL_CONTAINMENT_TOL = 0.98
+# L3b prompt overlap above which a hold's audit reason notes the corroboration.
+# Advisory only: the prompt sketch (``compute_prompt_fingerprint``) does *not* hold
+# an agent on its own — honest agents on the same reference harness share
+# scaffolding prompts (the convergent case in ``ditto.anticopy.clonecal`` scores
+# ~0.8 there), and the signals orthogonal to that convergence (behavioral /
+# code-embedding) are not built yet. So L3b runs in shadow mode: it enriches the
+# moderator's audit trail on a hold another rule already fired, and its per-agent
+# sketch is stored for calibration, but the active fusion hold is deferred to S2/S3.
+_PROMPT_ADVISORY_TOL = 0.5
 
 
 @dataclass(frozen=True)
@@ -81,6 +90,20 @@ class ReviewDecision:
 _NOT_HELD = ReviewDecision(held=False)
 
 
+def _prompt_note(prompt_fingerprint: dict | None, e: LedgerRow) -> str:
+    """Shadow-mode L3b suffix for a hold's audit reason.
+
+    Returns ``"; prompt jaccard X.XXX"`` when the just-scored agent and the matched
+    agent ``e`` both carry a prompt sketch overlapping at or above
+    ``_PROMPT_ADVISORY_TOL``, else ``""``. Observability only — this never affects
+    whether the agent is held.
+    """
+    j, c = content_similarity(prompt_fingerprint, e.prompt_fingerprint)
+    if max(j, c) >= _PROMPT_ADVISORY_TOL:
+        return f"; prompt jaccard {j:.3f}, containment {c:.3f}"
+    return ""
+
+
 def evaluate_antidup(
     *,
     agent_id: UUID,
@@ -92,6 +115,7 @@ def evaluate_antidup(
     normalized_source_hash: str | None = None,
     content_fingerprint: dict | None = None,
     structural_fingerprint: dict | None = None,
+    prompt_fingerprint: dict | None = None,
     score_tol: float = _DEFAULT_SCORE_TOL,
     size_tol: int = _DEFAULT_SIZE_TOL,
     jaccard_tol: float = _DEFAULT_JACCARD_TOL,
@@ -134,6 +158,14 @@ def evaluate_antidup(
     miner's score, with a different size and both fingerprints distinct) is never
     held. Pure + deterministic: ``eligible`` arrives in a fixed order, so the
     reported ``duplicate_of`` (the first match) is stable.
+
+    ``prompt_fingerprint`` (L3b) participates in **shadow mode only**: when a hold
+    fires for another reason, a high prompt overlap with the matched agent is
+    appended to the audit reason (``_PROMPT_ADVISORY_TOL``). It never creates a hold
+    on its own — a prompt match alone is not copy evidence, because honest agents on
+    the same reference harness share scaffolding prompts. The active prompt-fusion
+    hold is deferred until an orthogonal-to-convergence signal (behavioral /
+    code-embedding) exists to corroborate it.
     """
     others = [
         e for e in eligible if e.agent_id != agent_id and e.miner_hotkey != miner_hotkey
@@ -177,6 +209,7 @@ def evaluate_antidup(
                     f"content near-duplicate of agent {e.agent_id}: "
                     f"composite delta {abs(composite - e.composite):.4f}, "
                     f"jaccard {lex_j:.3f}, containment {lex_c:.3f}"
+                    + _prompt_note(prompt_fingerprint, e)
                 ),
             )
         str_j, str_c = content_similarity(
@@ -190,6 +223,7 @@ def evaluate_antidup(
                     f"structural near-duplicate of agent {e.agent_id}: "
                     f"composite delta {abs(composite - e.composite):.4f}, "
                     f"structural jaccard {str_j:.3f}, containment {str_c:.3f}"
+                    + _prompt_note(prompt_fingerprint, e)
                 ),
             )
 
@@ -208,6 +242,7 @@ def evaluate_antidup(
                         f"near-duplicate of agent {e.agent_id}: "
                         f"composite delta {abs(composite - e.composite):.4f}, "
                         f"size delta {abs(size_bytes - e.size_bytes)}B"
+                        + _prompt_note(prompt_fingerprint, e)
                     ),
                 )
 

@@ -115,6 +115,21 @@ class Agent(Base):
     written before this landed and for tarballs unreadable/empty at upload (the
     gate reads null as "no repack match")."""
 
+    prompt_fingerprint: Mapped[dict | None] = mapped_column(
+        _JSON_VARIANT, nullable=True
+    )
+    """Word-shingle MinHash sketch of the crate's prompt-length string literals
+    (see :func:`ditto.api_server.fingerprint.compute_prompt_fingerprint`), same
+    ``{v,k,card,m}`` shape as :attr:`content_fingerprint` but with a string ``v`` so
+    it never compares against the lexical/structural channels. The L3b prompt
+    surface: because it hashes string *contents*, it survives identifier renaming
+    that defeats the lexical + normalized-source channels. Computed at upload.
+    Stored in shadow mode — captured for every agent (calibration + retroactive
+    analysis) but not yet a hold trigger on its own, since honest agents on the same
+    reference harness share scaffolding prompts and the orthogonal-to-convergence
+    signals it must fuse with are not built yet. Nullable before this landed / no
+    prompt-length literal / unreadable tarball."""
+
     duplicate_of: Mapped[UUID | None] = mapped_column(
         SaUUID(as_uuid=True), nullable=True
     )

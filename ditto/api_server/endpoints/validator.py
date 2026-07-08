@@ -386,6 +386,7 @@ async def submit_score(
                 normalized_source_hash=agent.normalized_source_hash,
                 content_fingerprint=agent.content_fingerprint,
                 structural_fingerprint=agent.structural_fingerprint,
+                prompt_fingerprint=agent.prompt_fingerprint,
                 eligible=eligible,
             )
             if decision.held:

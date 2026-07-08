@@ -94,6 +94,20 @@ class TestInsertAgentHappyPath:
         ).scalar_one()
         assert row.normalized_source_hash == "ns" * 32
 
+    async def test_persists_prompt_fingerprint(self, session: AsyncSession):
+        # The L3b prompt sketch computed at upload must round-trip to the row.
+        sketch = {"v": "p1", "k": 256, "card": 2, "m": ["aa", "bb"]}
+        kwargs = _make_kwargs(prompt_fingerprint=sketch)
+        async with session.begin():
+            await insert_agent(session, **kwargs)  # type: ignore[arg-type]
+
+        row = (
+            await session.execute(
+                select(Agent).where(Agent.agent_id == kwargs["agent_id"])
+            )
+        ).scalar_one()
+        assert row.prompt_fingerprint == sketch
+
     async def test_status_defaults_to_uploaded(self, session: AsyncSession):
         """The schema default places new rows in the initial state. The
         screener PR moves them forward; this PR must not bypass it."""

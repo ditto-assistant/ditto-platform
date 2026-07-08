@@ -66,6 +66,13 @@ class LedgerRow:
     equality anti-copy signal, held unconditionally on a match like exact
     ``sha256``. ``None`` before this landed or for an unreadable tarball.
     Moderation-only, never exposed on the wire."""
+    prompt_fingerprint: dict | None = None
+    """L3b prompt-surface sketch (see
+    :func:`ditto.api_server.fingerprint.compute_prompt_fingerprint`). Shadow signal:
+    surfaced so the gate can note a corroborating prompt overlap in a hold's audit
+    reason, but not a hold trigger on its own (honest agents share harness
+    scaffolding prompts). ``None`` before this landed / no prompt-length literal.
+    Moderation-only, never exposed on the wire."""
     median_ms: int = 0
     """Median per-case latency (ms) of the winning run — public benchmark telemetry."""
     n: int = 0
@@ -326,6 +333,7 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             Agent.content_fingerprint.label("content_fingerprint"),
             Agent.structural_fingerprint.label("structural_fingerprint"),
             Agent.normalized_source_hash.label("normalized_source_hash"),
+            Agent.prompt_fingerprint.label("prompt_fingerprint"),
             Agent.created_at.label("first_seen"),
             Agent.status.label("status"),
             agent_best.c.composite,
@@ -384,6 +392,7 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             content_fingerprint=row.content_fingerprint,
             structural_fingerprint=row.structural_fingerprint,
             normalized_source_hash=row.normalized_source_hash,
+            prompt_fingerprint=row.prompt_fingerprint,
             median_ms=row.median_ms,
             n=row.n,
             details=row.details,
