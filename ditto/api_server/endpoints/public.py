@@ -30,6 +30,7 @@ from ditto.api_models import (
     PublicLeaderboardResponse,
     PublicRunModels,
 )
+from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.endpoints.validator import SessionDep
 from ditto.db.queries.scores import (
     LedgerRow,
@@ -45,13 +46,6 @@ router = APIRouter(prefix="/public", tags=["public"])
 # The ledger only moves when a sweep records a new best score, so a short shared
 # cache is safe and shields the DB from dashboard/CDN traffic.
 _CACHE_CONTROL = "public, max-age=30"
-
-# CURRENT_BENCH_VERSION is the latest DittoBench benchmark version (mirrors the
-# scorer's protocol.BenchVersion in dittobench-api). It is the single source of
-# truth for "which runs are on the current benchmark": the leaderboard reports it
-# so the UI can mark any entry with a lower bench_version as a previous-benchmark
-# run. Bump this when a new benchmark ships.
-CURRENT_BENCH_VERSION = 2
 
 
 def _safe_models(details: dict) -> PublicRunModels | None:

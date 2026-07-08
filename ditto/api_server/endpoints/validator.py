@@ -52,6 +52,7 @@ from ditto.api_models import (
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.upload import _SS58_PATTERN
+from ditto.api_server.bench import stamp_bench_version
 from ditto.api_server.dependencies import (
     get_chain_client,
     get_session,
@@ -343,6 +344,10 @@ async def submit_score(
         # surfaces a safe subset of this; the full blob (incl. per_case answer-key
         # fields) is only ever read back through validator-gated endpoints.
         score_details: dict[str, Any] = dict(report.details or {})
+        # Stamp the current benchmark version when the scorer omitted it, so no
+        # run scored from now on is ever recorded as "legacy" (null version).
+        # An explicit version in the report is left as-is (honest provenance).
+        stamp_bench_version(score_details)
         if report.per_case:
             score_details["per_case"] = [
                 c.model_dump(mode="json") for c in report.per_case

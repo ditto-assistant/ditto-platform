@@ -226,20 +226,28 @@
     .cval { font-weight: 600; font-variant-numeric: tabular-nums; }
     .cnote { color: var(--text-faint); font-size: 11px; margin-top: 3px; font-style: italic; }
 
-    /* ── Drill-down ─────────────────────────────────────────── */
-    .drawer-back { position: fixed; inset: 0; background: rgba(4, 7, 12, 0.62); backdrop-filter: blur(3px); opacity: 0; pointer-events: none; transition: opacity .18s; z-index: 40; }
-    .drawer-back.open { opacity: 1; pointer-events: auto; }
-    .drawer {
-      position: fixed; top: 0; right: 0; height: 100%; width: min(420px, 92vw);
-      background: var(--bg-elev); border-left: 1px solid var(--border);
-      box-shadow: -20px 0 60px rgba(0,0,0,0.5); z-index: 50;
-      transform: translateX(100%); transition: transform .22s cubic-bezier(.4,0,.2,1);
-      padding: 24px; overflow-y: auto;
+    /* ── Drill-down modal ───────────────────────────────────── */
+    .modal-back { position: fixed; inset: 0; background: rgba(4, 7, 12, 0.62); backdrop-filter: blur(3px); opacity: 0; pointer-events: none; transition: opacity .18s; z-index: 40; }
+    .modal-back.open { opacity: 1; pointer-events: auto; }
+    .modal {
+      position: fixed; top: 50%; left: 50%; z-index: 50;
+      width: min(560px, calc(100vw - 32px)); max-height: min(88vh, 900px);
+      background: var(--bg-elev); border: 1px solid var(--border);
+      border-radius: var(--radius); box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6);
+      padding: 26px 28px; overflow-y: auto;
+      opacity: 0; pointer-events: none;
+      transform: translate(-50%, -46%) scale(0.98);
+      transition: transform .2s cubic-bezier(.4,0,.2,1), opacity .18s;
     }
-    .drawer.open { transform: translateX(0); }
-    .drawer h3 { margin: 0 0 2px; font-size: 15px; }
-    .drawer .dk { font-family: var(--mono); font-size: 12px; color: var(--text-dim); word-break: break-all; margin-bottom: 20px; }
-    .drawer .close { position: absolute; top: 18px; right: 18px; }
+    .modal.open { opacity: 1; pointer-events: auto; transform: translate(-50%, -50%) scale(1); }
+    /* Title row: rank heading + the run's benchmark-version chip side by side. */
+    .modal .dhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-right: 28px; }
+    .modal h3 { margin: 0; font-size: 16px; }
+    .modal .dk { font-family: var(--mono); font-size: 12px; color: var(--text-dim); word-break: break-all; margin: 4px 0 20px; }
+    .modal .close { position: absolute; top: 16px; right: 16px; }
+    /* Benchmark-version chip in the modal header (larger than the row chip). */
+    #d-bench { font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; border-radius: 6px; padding: 2px 8px; color: var(--accent-2); border: 1px solid rgba(34,211,238,0.4); background: rgba(34,211,238,0.08); }
+    #d-bench.prev { color: #d9a441; border-color: rgba(217,164,65,0.45); background: rgba(217,164,65,0.08); }
     .stat-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid rgba(36,48,74,0.5); }
     .stat-row .k { color: var(--text-dim); font-size: 13px; }
     .stat-row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -354,11 +362,14 @@
     </footer>
   </div>
 
-  <!-- Drill-down drawer -->
-  <div id="drawer-back" class="drawer-back"></div>
-  <aside id="drawer" class="drawer" aria-hidden="true">
-    <button class="btn ghost close" id="drawer-close">✕</button>
-    <h3 id="d-title">Miner</h3>
+  <!-- Drill-down modal -->
+  <div id="modal-back" class="modal-back"></div>
+  <aside id="modal" class="modal" role="dialog" aria-modal="true" aria-hidden="true">
+    <button class="btn ghost close" id="modal-close">✕</button>
+    <div class="dhead">
+      <h3 id="d-title">Miner</h3>
+      <span id="d-bench"></span>
+    </div>
     <div class="dk" id="d-hotkey"></div>
     <div class="split">
       <div class="seg">
@@ -559,7 +570,7 @@
       return "";
     }
     // Inline composite-trend sparkline from the miner's score history. Sized for
-    // the row by default; pass W/H for the larger drawer version.
+    // the row by default; pass W/H for the larger modal version.
     function sparkSvg(h, W, H) {
       if (!h || h.length < 2) return "";
       W = W || 62; H = H || 16;
@@ -623,10 +634,30 @@
     }
 
     // ── Drill-down ───────────────────────────────────────────
-    function openDrawer(i) {
+    // Prominent benchmark-version chip for the modal header. "legacy" (muted
+    // amber) when a run predates benchmark versioning, "v{n} · old" for a
+    // previous benchmark, "v{n}" for the current one.
+    function benchChip(e) {
+      var el = document.getElementById("d-bench");
+      if (e.bench_version == null) {
+        el.className = "prev";
+        el.textContent = "legacy";
+        el.title = "Scored before benchmark versioning — a legacy run, not comparable to the current DittoBench v" + currentBench + ".";
+        return;
+      }
+      var old = e.bench_version < currentBench;
+      el.className = old ? "prev" : "";
+      el.textContent = "DittoBench v" + e.bench_version + (old ? " · old" : "");
+      el.title = old
+        ? "Scored on DittoBench v" + e.bench_version + " — a previous benchmark; not directly comparable to the current v" + currentBench + "."
+        : "Scored on the current benchmark (DittoBench v" + e.bench_version + ").";
+    }
+
+    function openModal(i) {
       var e = lastEntries[i];
       if (!e) return;
       document.getElementById("d-title").textContent = "Rank #" + e.rank + (e.rank === 1 ? " · 👑 Leader" : "");
+      benchChip(e);
       document.getElementById("d-hotkey").textContent = e.miner_hotkey;
 
       var tool = e.tool_mean, mem = e.memory_mean, sum = tool + mem || 1;
@@ -694,9 +725,9 @@
         casesSection(e) +
         trend;
 
-      document.getElementById("drawer").classList.add("open");
-      document.getElementById("drawer").setAttribute("aria-hidden", "false");
-      document.getElementById("drawer-back").classList.add("open");
+      document.getElementById("modal").classList.add("open");
+      document.getElementById("modal").setAttribute("aria-hidden", "false");
+      document.getElementById("modal-back").classList.add("open");
     }
     function stat(k, v) {
       return '<div class="stat-row"><span class="k">' + esc(k) + '</span><span class="v">' + esc(v) + '</span></div>';
@@ -724,10 +755,10 @@
       return '<details class="cases"><summary>Per-case results <span class="muted">· ' + cs.length +
         " cases</span></summary>" + rows + "</details>";
     }
-    function closeDrawer() {
-      document.getElementById("drawer").classList.remove("open");
-      document.getElementById("drawer").setAttribute("aria-hidden", "true");
-      document.getElementById("drawer-back").classList.remove("open");
+    function closeModal() {
+      document.getElementById("modal").classList.remove("open");
+      document.getElementById("modal").setAttribute("aria-hidden", "true");
+      document.getElementById("modal-back").classList.remove("open");
     }
 
     // ── Events (delegated) ───────────────────────────────────
@@ -741,11 +772,11 @@
         return;
       }
       var tr = ev.target.closest("tr[data-i]");
-      if (tr) openDrawer(+tr.getAttribute("data-i"));
+      if (tr) openModal(+tr.getAttribute("data-i"));
     });
-    document.getElementById("drawer-close").addEventListener("click", closeDrawer);
-    document.getElementById("drawer-back").addEventListener("click", closeDrawer);
-    document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeDrawer(); });
+    document.getElementById("modal-close").addEventListener("click", closeModal);
+    document.getElementById("modal-back").addEventListener("click", closeModal);
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeModal(); });
     document.getElementById("refresh").addEventListener("click", function () { load(true); });
 
     // ── Health strip ─────────────────────────────────────────
