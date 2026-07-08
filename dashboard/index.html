@@ -165,6 +165,9 @@
     .modelcell .mname::before { content: "🧠"; font-size: 11px; }
     .modelcell .none { color: var(--text-faint); font-size: 12px; }
     .bv { font-family: var(--sans); font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px; color: var(--accent-2); border: 1px solid rgba(120,160,255,0.35); border-radius: 5px; padding: 1px 5px; text-transform: uppercase; }
+    /* A run scored on a previous benchmark version — muted amber so it reads as
+       "not on the current benchmark / not directly comparable". */
+    .bv.prev { color: #d9a441; border-color: rgba(217,164,65,0.45); background: rgba(217,164,65,0.08); }
     /* Board-wide benchmark-version badge in the header subtitle. */
     .bench-badge { display: none; margin-left: 10px; font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--accent-2); background: rgba(34,211,238,0.08); border: 1px solid rgba(34,211,238,0.4); border-radius: 6px; padding: 2px 8px; vertical-align: middle; text-transform: uppercase; }
     .bench-badge.show { display: inline-block; }
@@ -387,6 +390,9 @@
 
     var REFRESH_MS = 30000; // matches the API's Cache-Control max-age
     var lastEntries = [];
+    // The latest DittoBench benchmark version (from the leaderboard API). Runs
+    // below this were scored on a previous benchmark and are marked as such.
+    var currentBench = 2;
 
     // Rank-movement baseline: the ranks from the viewer's last visit. Every
     // render compares against this snapshot (kept for the session) and then
@@ -462,21 +468,21 @@
       // Scoring card: the fixed composite weighting (the benchmark version lives
       // in the header badge below, so it isn't duplicated here).
       document.getElementById("c-bench").innerHTML = '0.5 / 0.5 <small>tool / memory</small>';
-      // Board-wide benchmark-version badge in the header — reported whenever any
-      // run carries a version; a range (vA–vB) when the board spans versions.
-      var uniqBv = entries
+      // The latest benchmark version (single source of truth from the API), with a
+      // fallback to the highest version on the board so the header still resolves
+      // against the sample data / an older API.
+      var maxBv = entries
         .map(function (e) { return e.bench_version; })
-        .filter(function (v, i, a) { return v != null && a.indexOf(v) === i; })
-        .sort(function (a, b) { return a - b; });
+        .filter(function (v) { return v != null; })
+        .reduce(function (a, b) { return Math.max(a, b); }, 0);
+      currentBench = data.current_bench_version || maxBv || currentBench;
+      // Header badge names the CURRENT benchmark, and notes when older runs are on
+      // the board (which are individually marked in their rows).
+      var hasOld = entries.some(function (e) { return e.bench_version != null && e.bench_version < currentBench; });
       var badge = document.getElementById("bench-badge");
-      if (!uniqBv.length) {
-        badge.className = "bench-badge";
-        badge.textContent = "";
-      } else {
-        badge.className = "bench-badge show";
-        badge.textContent = "Benchmark v" +
-          (uniqBv.length === 1 ? uniqBv[0] : uniqBv[0] + "–v" + uniqBv[uniqBv.length - 1]);
-      }
+      badge.className = "bench-badge show";
+      badge.textContent = "DittoBench v" + currentBench + " · latest" +
+        (hasOld ? " · older runs marked" : "");
       // Freshness lives on the status pill (no separate card), keeping the
       // headline cards to distinct leaderboard metrics.
       var when = data.generated_at ? relTime(data.generated_at) : "—";
@@ -594,7 +600,15 @@
     function modelCell(e) {
       var m = e.models || {};
       var name = m.harness || m.generator || "";
-      var bv = (e.bench_version != null) ? '<span class="bv">v' + e.bench_version + '</span>' : "";
+      var bv = "";
+      if (e.bench_version != null) {
+        var old = e.bench_version < currentBench;
+        var cls = old ? "bv prev" : "bv";
+        var tip = old
+          ? "Scored on DittoBench v" + e.bench_version + " — a previous benchmark; not directly comparable to the current v" + currentBench + "."
+          : "Scored on the current benchmark (DittoBench v" + e.bench_version + ").";
+        bv = '<span class="' + cls + '" title="' + esc(tip) + '">v' + e.bench_version + (old ? " · old" : "") + '</span>';
+      }
       if (!name && !bv) return '<td class="hide-md"><span class="none">—</span></td>';
       var label = name
         ? '<span class="mname" title="' + esc(name) + '">' + esc(shortModel(name)) + '</span>'
@@ -622,7 +636,10 @@
       var det = "";
       if (e.n != null) det += stat("Cases scored", String(e.n));
       if (e.median_ms != null) det += stat("Median latency", e.median_ms + " ms");
-      if (e.bench_version != null) det += stat("Benchmark version", "v" + e.bench_version);
+      if (e.bench_version != null) {
+        det += stat("Benchmark version", "v" + e.bench_version +
+          (e.bench_version < currentBench ? " (previous — not comparable to v" + currentBench + ")" : " (current)"));
+      }
       if (m.harness) det += stat("Harness model", m.harness);
       if (m.judge) det += stat("Judge model", m.judge);
       if (m.judge_audit) det += stat("Audit judge", m.judge_audit);

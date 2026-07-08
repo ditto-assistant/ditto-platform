@@ -300,6 +300,16 @@ class PublicLeaderboardResponse(BaseModel):
         datetime, Field(description="When this snapshot was read (UTC).")
     ]
     count: Annotated[int, Field(ge=0, description="Number of entries.")]
+    current_bench_version: Annotated[
+        int,
+        Field(
+            description=(
+                "The latest DittoBench benchmark version. Entries whose "
+                "bench_version is below this were scored on a previous benchmark "
+                "and are not directly comparable; the UI marks them as such."
+            )
+        ),
+    ]
     entries: Annotated[
         list[PublicLeaderboardEntry],
         Field(default_factory=list, description="Ranked miners, best composite first."),

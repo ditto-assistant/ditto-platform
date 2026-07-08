@@ -46,6 +46,13 @@ router = APIRouter(prefix="/public", tags=["public"])
 # cache is safe and shields the DB from dashboard/CDN traffic.
 _CACHE_CONTROL = "public, max-age=30"
 
+# CURRENT_BENCH_VERSION is the latest DittoBench benchmark version (mirrors the
+# scorer's protocol.BenchVersion in dittobench-api). It is the single source of
+# truth for "which runs are on the current benchmark": the leaderboard reports it
+# so the UI can mark any entry with a lower bench_version as a previous-benchmark
+# run. Bump this when a new benchmark ships.
+CURRENT_BENCH_VERSION = 2
+
 
 def _safe_models(details: dict) -> PublicRunModels | None:
     """Pull the run's models from the details blob, tolerating a malformed shape."""
@@ -256,7 +263,10 @@ async def leaderboard(
         for i, r in enumerate(rows, start=1)
     ]
     return PublicLeaderboardResponse(
-        generated_at=datetime.now(UTC), count=len(entries), entries=entries
+        generated_at=datetime.now(UTC),
+        count=len(entries),
+        current_bench_version=CURRENT_BENCH_VERSION,
+        entries=entries,
     )
 
 
