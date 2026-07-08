@@ -1,4 +1,4 @@
-"""clonecal — offline calibration harness for the anti-copy signal stack.
+"""Offline calibration harness for the anti-copy signal stack.
 
 See ``docs/SEMANTIC-CLONE-PREVENTION.md`` §6. Given a labeled corpus of agent
 **pairs** (clone vs. independent), it scores each anti-copy *signal* over the
@@ -10,20 +10,23 @@ The pieces:
 
 - **Obfuscation ladder** (:func:`obfuscate`) — takes a crate and applies a tier of
   copy-hiding transforms. Each tier is a harder clone: tier 1 is cosmetic
-  (reformat + recomment + file reorder/rename), which the L3a normalized-source
-  hash must still catch; tier 2 adds identifier renaming, which defeats L3a and
+  (reformat + recomment + file reorder/rename), which the normalized-source
+  hash must still catch; tier 2 adds identifier renaming, which defeats the
+  normalized-source hash and
   should fall to the AST / behavioral layers.
 - **Signals** (:class:`Signal`) — a named ``(tar_a, tar_b) -> similarity`` in
-  ``[0, 1]``. This version wires the in-process signals: L3a normalized-source
-  hash, L1 lexical Jaccard/containment, and L3b prompt Jaccard/containment (the
-  prompt-surface fingerprint, which — unlike L1/L3a — survives identifier renaming
-  because it hashes string *contents*). L2 structural (dittobench), L3c
-  code-embedding, and L4 behavioral plug in later as more ``Signal``\\s.
+  ``[0, 1]``. This version wires the in-process signals: normalized-source
+  hash, lexical Jaccard/containment, and prompt Jaccard/containment (the
+  prompt-surface fingerprint, which — unlike lexical/normalized-source — survives
+  identifier renaming
+  because it hashes string *contents*). Structural (dittobench), code-embedding,
+  and behavioral signals plug in later as more ``Signal``\\s.
 - **Corpus** (:func:`build_corpus`) — clone pairs (a seed vs. its ladder variant)
   and independent pairs (distinct seeds). The demo corpus also carries the hard
   *convergent* case: two independent agents on the same reference harness that
   share a scaffolding prompt preamble but differ in strategy — the false-positive
-  surface that makes L3b a review-band signal rather than an autoreject.
+  surface that makes the prompt fingerprint a review-band signal rather than an
+  autoreject.
 - **Evaluation** (:func:`evaluate`) — a precision/recall threshold sweep per
   signal, plus the best-F1 operating point.
 
@@ -225,9 +228,9 @@ def _prompt(a: bytes, b: bytes) -> tuple[float, float]:
 def embedding_signal(
     embed: Callable[[str], list[float] | None],
     *,
-    name: str = "L3c_code_embedding",
+    name: str = "code_embedding_cosine",
 ) -> Signal:
-    """Build the L3c cosine signal from an injected text embedder.
+    """Build the code-embedding cosine signal from an injected text embedder.
 
     ``embed`` maps the crate's canonical source
     (:func:`ditto.api_server.fingerprint.compute_embedding_input`) to a vector — in
@@ -250,21 +253,23 @@ def embedding_signal(
 
 
 def default_signals() -> list[Signal]:
-    """The in-process signals available today (L3a + L1 + L3b). L2/L3c/L4 append here.
+    """The in-process signals available today: normalized-source hash, lexical
+    MinHash, and the prompt fingerprint. Structural, code-embedding, and behavioral
+    signals append here as they come online.
 
-    L3b (prompt) is the rename-resistant complement to L1/L3a: it hashes the
-    prompt's string *contents*, so a copy that renames every identifier — defeating
-    the lexical and normalized-source channels — still overlaps here. It is a
+    The prompt fingerprint is the rename-resistant complement to the lexical and
+    normalized-source channels: it hashes the prompt's string *contents*, so a copy
+    that renames every identifier — defeating those two — still overlaps here. It is a
     review-band signal (honest agents share reference-harness scaffolding prompts;
     see the convergent pair in :func:`demo_corpus`), so calibration reports where a
     threshold separates preserved-prompt clones from that convergence.
     """
     return [
-        Signal("L3a_normalized_hash", _sig_normalized_hash),
-        Signal("L1_lexical_jaccard", lambda a, b: _lexical(a, b)[0]),
-        Signal("L1_lexical_containment", lambda a, b: _lexical(a, b)[1]),
-        Signal("L3b_prompt_jaccard", lambda a, b: _prompt(a, b)[0]),
-        Signal("L3b_prompt_containment", lambda a, b: _prompt(a, b)[1]),
+        Signal("normalized_source_hash", _sig_normalized_hash),
+        Signal("lexical_jaccard", lambda a, b: _lexical(a, b)[0]),
+        Signal("lexical_containment", lambda a, b: _lexical(a, b)[1]),
+        Signal("prompt_jaccard", lambda a, b: _prompt(a, b)[0]),
+        Signal("prompt_containment", lambda a, b: _prompt(a, b)[1]),
     ]
 
 
@@ -347,7 +352,7 @@ def format_report(reports: Sequence[SignalReport], corpus: Sequence[ClonePair]) 
     n_indep = len(corpus) - n_clone
     tiers = sorted({p.tier for p in corpus if p.is_clone})
     lines = [
-        f"clonecal: {len(corpus)} pairs ({n_clone} clone / {n_indep} independent), "
+        f"calibration: {len(corpus)} pairs ({n_clone} clone / {n_indep} independent), "
         f"clone tiers {tiers}",
         f"{'signal':<26} {'thr':>6} {'precision':>10} {'recall':>8} {'f1':>6}",
         "-" * 60,
@@ -361,9 +366,10 @@ def format_report(reports: Sequence[SignalReport], corpus: Sequence[ClonePair]) 
     return "\n".join(lines)
 
 
-# ── A tiny synthetic corpus so `python -m ditto.anticopy.clonecal` runs today ──
+# ── A tiny synthetic corpus so `python -m ditto.anticopy.calibration` runs today ──
 # A reference-harness scaffolding prompt every honest agent embeds. Two independent
-# agents that share it (but differ in strategy) are the convergence surface L3b must
+# agents that share it (but differ in strategy) are the convergence surface the prompt
+# fingerprint must
 # not treat as copy evidence on its own — the reason it is review-band, not
 # autoreject. Kept clear of any identifier the rename transform touches (``step`` /
 # ``NAME`` / ``SYSTEM_PROMPT`` / the fn prefixes) so a tier-2 rename cannot perturb
@@ -396,7 +402,7 @@ def _synthetic_seed(
 ) -> dict[str, bytes]:
     """A small, plausibly-structured Rust-ish crate for the demo corpus.
 
-    ``prompt`` is embedded as a single-line raw-string const so the L3b prompt
+    ``prompt`` is embedded as a single-line raw-string const so the prompt
     fingerprint has a surface; it defaults to ``_SEED_PROMPTS[fn_prefix]``.
     """
     text = prompt if prompt is not None else _SEED_PROMPTS[fn_prefix]
@@ -419,11 +425,12 @@ def _synthetic_seed(
 
 def _convergent_pair() -> ClonePair:
     """Two independent agents on the same harness: shared prompt preamble, distinct
-    strategy tail — the L3b false-positive surface, labeled non-clone.
+    strategy tail — the prompt fingerprint false-positive surface, labeled non-clone.
 
     The bodies differ (different prefixes / sizes / flavors), so the lexical and
     normalized-source channels see them as unrelated; only the shared preamble
-    gives L3b a partial (< 1.0) overlap, which is exactly the convergence a
+    gives the prompt fingerprint a partial (< 1.0) overlap, which is exactly the
+    convergence a
     threshold must sit above.
     """
     a = _synthetic_seed(
@@ -437,7 +444,7 @@ def _convergent_pair() -> ClonePair:
 
 def demo_corpus() -> list[ClonePair]:
     """Distinct seeds (independents) + their ladder variants (clones), plus the
-    convergent-independent pair that stresses the L3b prompt signal."""
+    convergent-independent pair that stresses the prompt signal."""
     seeds = [
         _synthetic_seed("alpha", 6, flavor=0),
         _synthetic_seed("beta", 5, flavor=1),

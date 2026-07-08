@@ -4,7 +4,7 @@ Revision ID: e6a3c4d20f81
 Revises: d5f2a3b91e64
 Create Date: 2026-07-07 12:00:00.000000
 
-Adds the L3a "exact-repack" channel to the anti-copy gate
+Adds the "exact-repack" channel to the anti-copy gate
 (:mod:`ditto.api_server.scoring_gate`), on top of the lexical
 ``content_fingerprint`` (``c4e8b1a06d72``) and structural
 ``structural_fingerprint`` (``d5f2a3b91e64``). The value is a single hash of the

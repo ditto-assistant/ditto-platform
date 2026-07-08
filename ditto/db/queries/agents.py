@@ -51,12 +51,13 @@ async def insert_agent(
     ``content_fingerprint`` (:mod:`ditto.api_server.fingerprint`) is the
     shingle MinHash sketch feeding the gate's content-level signal; ``None``
     when the tarball was unreadable/empty at upload.
-    ``normalized_source_hash`` (same module) is the L3a exact-repack hash of the
+    ``normalized_source_hash`` (same module) is the exact-repack hash of the
     canonicalized source feeding the gate's equality signal; ``None`` on the same
-    unreadable/empty condition. ``prompt_fingerprint`` (same module) is the L3b
+    unreadable/empty condition. ``prompt_fingerprint`` (same module) is the
     prompt-surface sketch, stored in shadow mode; ``None`` when the crate carries no
     prompt-length literal or the tarball is unreadable. ``code_embedding`` /
-    ``code_embed_model`` are the L3c vector and its ``model@revision`` tag (see
+    ``code_embed_model`` are the code-embedding vector and its ``model@revision`` tag
+    (see
     :mod:`ditto.api_server.embedding`), stored in shadow mode; ``None`` when the
     embedder is disabled or the embed failed.
 

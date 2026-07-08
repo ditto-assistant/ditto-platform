@@ -72,7 +72,7 @@ def make_api_server_config(**overrides: Any) -> ApiServerConfig:
             secret_key="miniominio",
         ),
         embedding=EmbeddingConfig(
-            url=None,  # L3c disabled in unit tests (null embedder)
+            url=None,  # code-embedding disabled in unit tests (null embedder)
             model="",
             revision="main",
             dim=None,
@@ -94,7 +94,7 @@ def app() -> Iterator[FastAPI]:
     # Lifespan does not run under ASGITransport, so set the bits the
     # health endpoint reads via app.state directly.
     a.state.commit_hash = "test-commit"
-    # L3c embedder is lifespan-created; default it to the disabled null embedder so
+    # code embedder is lifespan-created; default it to the disabled null embedder so
     # upload tests get a null vector unless they override get_embedder.
     a.state.embedder = NullEmbedder()
     yield a

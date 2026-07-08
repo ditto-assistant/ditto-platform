@@ -1,4 +1,4 @@
-"""Unit tests for the L3c embedder config (:mod:`ditto.api_server.embedding.config`)."""
+"""Unit tests for the code embedder (:mod:`ditto.api_server.embedding.config`)."""
 
 from __future__ import annotations
 
@@ -14,11 +14,11 @@ from ditto.api_server.embedding.config import check_embedding_config
 
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in (
-        "L3C_EMBEDDER_URL",
-        "L3C_EMBEDDER_MODEL",
-        "L3C_EMBEDDER_REVISION",
-        "L3C_EMBEDDER_DIM",
-        "L3C_EMBEDDER_TIMEOUT_SECONDS",
+        "CODE_EMBEDDER_URL",
+        "CODE_EMBEDDER_MODEL",
+        "CODE_EMBEDDER_REVISION",
+        "CODE_EMBEDDER_DIM",
+        "CODE_EMBEDDER_TIMEOUT_SECONDS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -33,9 +33,9 @@ class TestParse:
 
     def test_enabled_when_url_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _clear_env(monkeypatch)
-        monkeypatch.setenv("L3C_EMBEDDER_URL", "http://embedder:80")
-        monkeypatch.setenv("L3C_EMBEDDER_MODEL", "Qwen/Qwen3-Embedding-0.6B")
-        monkeypatch.setenv("L3C_EMBEDDER_DIM", "256")
+        monkeypatch.setenv("CODE_EMBEDDER_URL", "http://embedder:80")
+        monkeypatch.setenv("CODE_EMBEDDER_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+        monkeypatch.setenv("CODE_EMBEDDER_DIM", "256")
         config = parse_embedding_config_from_env()
         assert config.enabled is True
         assert config.dim == 256
@@ -44,14 +44,14 @@ class TestParse:
 
     def test_enabled_requires_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _clear_env(monkeypatch)
-        monkeypatch.setenv("L3C_EMBEDDER_URL", "http://embedder:80")
-        with pytest.raises(EmbeddingConfigError, match="L3C_EMBEDDER_MODEL"):
+        monkeypatch.setenv("CODE_EMBEDDER_URL", "http://embedder:80")
+        with pytest.raises(EmbeddingConfigError, match="CODE_EMBEDDER_MODEL"):
             parse_embedding_config_from_env()
 
     def test_bad_dim_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _clear_env(monkeypatch)
-        monkeypatch.setenv("L3C_EMBEDDER_DIM", "notanint")
-        with pytest.raises(EmbeddingConfigError, match="L3C_EMBEDDER_DIM"):
+        monkeypatch.setenv("CODE_EMBEDDER_DIM", "notanint")
+        with pytest.raises(EmbeddingConfigError, match="CODE_EMBEDDER_DIM"):
             parse_embedding_config_from_env()
 
 
@@ -93,11 +93,11 @@ class TestAuth:
 
     def test_auth_parsed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _clear_env(monkeypatch)
-        monkeypatch.setenv("L3C_EMBEDDER_AUTH", "gcp_id_token")
+        monkeypatch.setenv("CODE_EMBEDDER_AUTH", "gcp_id_token")
         assert parse_embedding_config_from_env().auth == "gcp_id_token"
 
     def test_invalid_auth_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _clear_env(monkeypatch)
-        monkeypatch.setenv("L3C_EMBEDDER_AUTH", "basic")
-        with pytest.raises(EmbeddingConfigError, match="L3C_EMBEDDER_AUTH"):
+        monkeypatch.setenv("CODE_EMBEDDER_AUTH", "basic")
+        with pytest.raises(EmbeddingConfigError, match="CODE_EMBEDDER_AUTH"):
             parse_embedding_config_from_env()

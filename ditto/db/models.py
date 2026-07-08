@@ -109,7 +109,7 @@ class Agent(Base):
     """SHA-256 (hex) of the crate's canonicalized source — comments stripped,
     whitespace removed, files sorted (see
     :func:`ditto.api_server.fingerprint.compute_normalized_source_hash`). Feeds the
-    anti-copy gate's L3a "exact-repack" signal: an *equality* match means the same
+    anti-copy gate's "exact-repack" signal: an *equality* match means the same
     source repackaged (reformat / re-comment / file rename+reorder), which the
     ``sha256`` and shingle sketches miss. Computed at upload. Nullable for rows
     written before this landed and for tarballs unreadable/empty at upload (the
@@ -117,13 +117,13 @@ class Agent(Base):
 
     code_embedding: Mapped[list | None] = mapped_column(_JSON_VARIANT, nullable=True)
     """Unit-norm code-embedding vector (JSON float array) of the crate's canonical
-    source, from the self-hosted L3c embedding service (see
+    source, from the self-hosted the code-embedding signal embedding service (see
     :mod:`ditto.api_server.embedding`). The rename/refactor-robust anti-copy signal:
     a code embedder scores a renamed+refactored copy high but a genuinely different
     agent low, so it is orthogonal to same-harness convergence. Stored in shadow
     mode — computed for every agent (calibration + retroactive) but not yet a hold
     trigger. Nullable before this landed, when the embedder is disabled
-    (``L3C_EMBEDDER_URL`` unset), or on any best-effort embed failure."""
+    (``CODE_EMBEDDER_URL`` unset), or on any best-effort embed failure."""
 
     code_embed_model: Mapped[str | None] = mapped_column(Text, nullable=True)
     """``model@revision`` provenance tag of :attr:`code_embedding` (see
@@ -137,7 +137,7 @@ class Agent(Base):
     """Word-shingle MinHash sketch of the crate's prompt-length string literals
     (see :func:`ditto.api_server.fingerprint.compute_prompt_fingerprint`), same
     ``{v,k,card,m}`` shape as :attr:`content_fingerprint` but with a string ``v`` so
-    it never compares against the lexical/structural channels. The L3b prompt
+    it never compares against the lexical/structural channels. The prompt
     surface: because it hashes string *contents*, it survives identifier renaming
     that defeats the lexical + normalized-source channels. Computed at upload.
     Stored in shadow mode — captured for every agent (calibration + retroactive

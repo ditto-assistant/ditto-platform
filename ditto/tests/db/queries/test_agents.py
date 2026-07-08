@@ -82,7 +82,7 @@ class TestInsertAgentHappyPath:
         assert row.sha256 == kwargs["sha256"]
 
     async def test_persists_normalized_source_hash(self, session: AsyncSession):
-        # The L3a exact-repack hash computed at upload must round-trip to the row.
+        # The exact-repack hash computed at upload must round-trip to the row.
         kwargs = _make_kwargs(normalized_source_hash="ns" * 32)
         async with session.begin():
             await insert_agent(session, **kwargs)  # type: ignore[arg-type]
@@ -95,7 +95,7 @@ class TestInsertAgentHappyPath:
         assert row.normalized_source_hash == "ns" * 32
 
     async def test_persists_prompt_fingerprint(self, session: AsyncSession):
-        # The L3b prompt sketch computed at upload must round-trip to the row.
+        # The prompt sketch computed at upload must round-trip to the row.
         sketch = {"v": "p1", "k": 256, "card": 2, "m": ["aa", "bb"]}
         kwargs = _make_kwargs(prompt_fingerprint=sketch)
         async with session.begin():
@@ -109,7 +109,8 @@ class TestInsertAgentHappyPath:
         assert row.prompt_fingerprint == sketch
 
     async def test_persists_code_embedding(self, session: AsyncSession):
-        # The L3c vector + model tag computed at upload must round-trip to the row.
+        # The code-embedding vector + model tag computed at upload must round-trip to
+        # the row.
         kwargs = _make_kwargs(
             code_embedding=[0.1, 0.2, 0.3],
             code_embed_model="stub@test",

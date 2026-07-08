@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.fingerprint import _FP_VERSION, _MINHASH_K, _PROMPT_VERSION
-from ditto.api_server.scoring_gate import evaluate_antidup
+from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.db.queries.scores import LedgerRow
 
 _FIRST_SEEN = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
@@ -29,7 +29,7 @@ def _sk(shingles: set[str]) -> dict:
 
 
 def _psk(shingles: set[str]) -> dict:
-    """Build an L3b prompt sketch (version ``"p1"``) from a set of shingle hashes."""
+    """Build an prompt sketch (version ``"p1"``) from a set of shingle hashes."""
     return {
         "v": _PROMPT_VERSION,
         "k": _MINHASH_K,
@@ -74,7 +74,7 @@ class TestEvaluateAntidup:
     def test_clean_submission_not_held(self) -> None:
         incumbent = _entry(composite=0.70, sha256="aa" * 32, size_bytes=500000)
         # A genuine improvement from another miner: far higher, different size+hash.
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Challenger",
             sha256="bb" * 32,
@@ -87,7 +87,7 @@ class TestEvaluateAntidup:
 
     def test_exact_sha256_copy_is_held(self) -> None:
         incumbent = _entry(composite=0.70, sha256="cc" * 32, size_bytes=500000)
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="cc" * 32,  # byte-identical resubmission
@@ -108,7 +108,7 @@ class TestEvaluateAntidup:
             sha256="cc" * 32,
             normalized_source_hash="ns" * 32,
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="dd" * 32,  # repackaged bytes differ
@@ -130,7 +130,7 @@ class TestEvaluateAntidup:
             sha256="cc" * 32,
             normalized_source_hash="ns" * 32,
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Self",
             sha256="dd" * 32,
@@ -142,13 +142,14 @@ class TestEvaluateAntidup:
         assert decision.held is False
 
     def test_null_normalized_hash_never_matches(self) -> None:
-        # An incumbent with no stored hash (uploaded before L3a / unreadable
+        # An incumbent with no stored hash (uploaded before the normalized-source hash /
+        # unreadable
         # tarball) must not match a challenger that also lacks one — null is
         # "no repack match", never a hit against null.
         incumbent = _entry(
             composite=0.60, sha256="cc" * 32, normalized_source_hash=None
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Challenger",
             sha256="dd" * 32,
@@ -162,7 +163,7 @@ class TestEvaluateAntidup:
     def test_near_dup_from_other_miner_is_held(self) -> None:
         incumbent = _entry(composite=0.80, sha256="aa" * 32, size_bytes=500000)
         # Another miner, different bytes, near-identical size + score.
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="bb" * 32,
@@ -177,7 +178,7 @@ class TestEvaluateAntidup:
     def test_large_improvement_not_held(self) -> None:
         incumbent = _entry(composite=0.80, sha256="aa" * 32, size_bytes=500000)
         # Same size but a big score jump => a real improvement, not a copy.
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Challenger",
             sha256="bb" * 32,
@@ -190,7 +191,7 @@ class TestEvaluateAntidup:
     def test_distant_score_not_held(self) -> None:
         incumbent = _entry(composite=0.80, sha256="aa" * 32, size_bytes=500000)
         # Similar size but score gap > tol => not a near-dup.
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Challenger",
             sha256="bb" * 32,
@@ -206,7 +207,7 @@ class TestEvaluateAntidup:
         incumbent = _entry(
             composite=0.80, miner="5Mine", sha256="aa" * 32, size_bytes=500000
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Mine",  # same miner
             sha256="bb" * 32,
@@ -225,7 +226,7 @@ class TestEvaluateAntidup:
         midscorer = _entry(
             composite=0.804, miner="5Mid", sha256="dd" * 32, size_bytes=900000
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="bb" * 32,
@@ -249,7 +250,7 @@ class TestEvaluateAntidup:
         # 19 of 20 shingles shared (Jaccard 19/21 = 0.905 >= 0.75) and the tarball
         # size drifted 100 KiB past the size rule.
         copy_fp = _sk({f"{i:016x}" for i in range(19)} | {"ff" * 8})
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="bb" * 32,
@@ -273,7 +274,7 @@ class TestEvaluateAntidup:
             content_fingerprint=_sk(shared),
         )
         padded = _sk(shared | {f"pad{i:013x}" for i in range(40)})  # jaccard 20/60
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="bb" * 32,
@@ -297,7 +298,7 @@ class TestEvaluateAntidup:
             content_fingerprint=_sk({f"lex{i:013x}" for i in range(30)}),
             structural_fingerprint=_sk(struct),
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="bb" * 32,
@@ -322,7 +323,7 @@ class TestEvaluateAntidup:
             content_fingerprint=_sk({f"lex{i:013x}" for i in range(30)}),
             structural_fingerprint=_sk({f"{i:016x}" for i in range(30)}),
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Challenger",
             sha256="bb" * 32,
@@ -347,7 +348,7 @@ class TestEvaluateAntidup:
             size_bytes=500000,
             content_fingerprint=_sk({f"{i:016x}" for i in range(20)}),
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Challenger",
             sha256="bb" * 32,
@@ -370,7 +371,7 @@ class TestEvaluateAntidup:
             size_bytes=500000,
             content_fingerprint=shared,
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Challenger",
             sha256="bb" * 32,
@@ -388,7 +389,7 @@ class TestEvaluateAntidup:
         incumbent = _entry(
             composite=0.80, miner="5Mine", sha256="aa" * 32, content_fingerprint=shared
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Mine",
             sha256="bb" * 32,
@@ -403,7 +404,7 @@ class TestEvaluateAntidup:
         # No fingerprints anywhere (legacy rows): the content rule is inert
         # (similarity 0) and the size rule still catches a same-size near-dup.
         incumbent = _entry(composite=0.80, sha256="aa" * 32, size_bytes=500000)
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="bb" * 32,
@@ -417,7 +418,7 @@ class TestEvaluateAntidup:
 
     def test_missing_sizes_skip_near_dup(self) -> None:
         incumbent = _entry(composite=0.80, sha256="aa" * 32, size_bytes=None)
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="bb" * 32,
@@ -446,7 +447,7 @@ class TestEvaluateAntidup:
             signature=None,
             status=AgentStatus.SCORED,
         )
-        d1 = evaluate_antidup(
+        d1 = evaluate_duplicate_signals(
             agent_id=me,
             miner_hotkey="5Me",
             sha256="dd" * 32,
@@ -454,7 +455,7 @@ class TestEvaluateAntidup:
             size_bytes=500000,
             eligible=[entry],
         )
-        d2 = evaluate_antidup(
+        d2 = evaluate_duplicate_signals(
             agent_id=me,
             miner_hotkey="5Me",
             sha256="dd" * 32,
@@ -467,7 +468,7 @@ class TestEvaluateAntidup:
 
 
 class TestPromptShadowSignal:
-    """L3b prompt fingerprint in the gate: shadow mode. It never creates a hold on
+    """Prompt fingerprint in the gate: shadow mode. It never creates a hold on
     its own; it only annotates the audit reason of a hold another rule fired."""
 
     def test_prompt_match_alone_never_holds(self) -> None:
@@ -480,7 +481,7 @@ class TestPromptShadowSignal:
             size_bytes=400000,
             prompt_fingerprint=_psk(shared),
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Challenger",
             sha256="dd" * 32,
@@ -502,7 +503,7 @@ class TestPromptShadowSignal:
             content_fingerprint=_sk(shingles),
             prompt_fingerprint=_psk(shared_prompt),
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="bb" * 32,
@@ -522,7 +523,7 @@ class TestPromptShadowSignal:
         incumbent = _entry(
             composite=0.80, content_fingerprint=_sk(shingles), size_bytes=500000
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="bb" * 32,
@@ -544,7 +545,7 @@ class TestPromptShadowSignal:
             content_fingerprint=_sk(shingles),
             prompt_fingerprint=_psk({f"a{i:02d}" for i in range(20)}),
         )
-        decision = evaluate_antidup(
+        decision = evaluate_duplicate_signals(
             agent_id=uuid4(),
             miner_hotkey="5Copier",
             sha256="bb" * 32,

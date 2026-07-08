@@ -61,14 +61,15 @@ _DEFAULT_CONTAINMENT_TOL = 0.95
 # Only a near-total structural match should trip this rename-resistant channel.
 _DEFAULT_STRUCTURAL_JACCARD_TOL = 0.85
 _DEFAULT_STRUCTURAL_CONTAINMENT_TOL = 0.98
-# L3b prompt overlap above which a hold's audit reason notes the corroboration.
+# prompt overlap above which a hold's audit reason notes the corroboration.
 # Advisory only: the prompt sketch (``compute_prompt_fingerprint``) does *not* hold
 # an agent on its own — honest agents on the same reference harness share
-# scaffolding prompts (the convergent case in ``ditto.anticopy.clonecal`` scores
+# scaffolding prompts (the convergent case in ``ditto.anticopy.calibration`` scores
 # ~0.8 there), and the signals orthogonal to that convergence (behavioral /
-# code-embedding) are not built yet. So L3b runs in shadow mode: it enriches the
-# moderator's audit trail on a hold another rule already fired, and its per-agent
-# sketch is stored for calibration, but the active fusion hold is deferred to S2/S3.
+# code-embedding) are not built yet. So the prompt fingerprint runs in shadow mode:
+# it enriches the moderator's audit trail on a hold another rule already fired, and
+# its per-agent sketch is stored for calibration, but the active fusion hold waits
+# on an orthogonal signal (the code-embedding or behavioral channel).
 _PROMPT_ADVISORY_TOL = 0.5
 
 
@@ -91,7 +92,7 @@ _NOT_HELD = ReviewDecision(held=False)
 
 
 def _prompt_note(prompt_fingerprint: dict | None, e: LedgerRow) -> str:
-    """Shadow-mode L3b suffix for a hold's audit reason.
+    """Shadow-mode the prompt fingerprint suffix for a hold's audit reason.
 
     Returns ``"; prompt jaccard X.XXX"`` when the just-scored agent and the matched
     agent ``e`` both carry a prompt sketch overlapping at or above
@@ -104,7 +105,7 @@ def _prompt_note(prompt_fingerprint: dict | None, e: LedgerRow) -> str:
     return ""
 
 
-def evaluate_antidup(
+def evaluate_duplicate_signals(
     *,
     agent_id: UUID,
     miner_hotkey: str,
@@ -130,7 +131,7 @@ def evaluate_antidup(
     harness is not a copier). Held iff, against **another miner's** eligible agent:
 
     1. **Exact copy** — same ``sha256``. Byte-identical resubmission.
-    1b. **Exact repack** — same ``normalized_source_hash`` (L3a): the same source
+    1b. **Exact repack** — same ``normalized_source_hash``: the same source
        canonicalized (comments/whitespace stripped, files sorted), so a reformat /
        re-comment / file rename+reorder repack that changes ``sha256`` still
        matches. Like rule 1, held on the hash equality alone — no score proximity,
@@ -159,7 +160,7 @@ def evaluate_antidup(
     held. Pure + deterministic: ``eligible`` arrives in a fixed order, so the
     reported ``duplicate_of`` (the first match) is stable.
 
-    ``prompt_fingerprint`` (L3b) participates in **shadow mode only**: when a hold
+    ``prompt_fingerprint`` participates in **shadow mode only**: when a hold
     fires for another reason, a high prompt overlap with the matched agent is
     appended to the audit reason (``_PROMPT_ADVISORY_TOL``). It never creates a hold
     on its own — a prompt match alone is not copy evidence, because honest agents on
@@ -180,7 +181,7 @@ def evaluate_antidup(
                 reason=f"exact sha256 match of agent {e.agent_id}",
             )
 
-    # 1b. Exact-repack copy (L3a): same canonicalized source (comments/whitespace
+    # 1b. Exact-repack copy: same canonicalized source (comments/whitespace
     #     stripped, files sorted) even when the tarball bytes differ. An equality
     #     match, held unconditionally like sha256 — no score-proximity requirement.
     #     Both hashes must be present (null = "no repack match", never a hit).
