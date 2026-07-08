@@ -66,8 +66,8 @@ class ApiServerConfig:
     """S3-compatible object store parameters for uploaded tarballs."""
 
     embedding: EmbeddingConfig
-    """L3c code-embedding client parameters. Disabled by default (no
-    ``L3C_EMBEDDER_URL``), so the platform runs unchanged until an operator points
+    """Code-embedding client parameters. Disabled by default (no
+    ``CODE_EMBEDDER_URL``), so the platform runs unchanged until an operator points
     it at a self-hosted TEI service."""
 
     dashboard_enabled: bool = True

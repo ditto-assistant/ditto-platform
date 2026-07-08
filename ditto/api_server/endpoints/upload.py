@@ -323,17 +323,17 @@ async def upload_agent(
     content_fingerprint = await asyncio.to_thread(
         compute_content_fingerprint, tar_bytes
     )
-    # 7c. L3a exact-repack hash: the canonicalized-source equality signal for the
+    # 7c. exact-repack hash: the canonicalized-source equality signal for the
     # gate (comments/whitespace stripped, files sorted). Same CPU-bound offload +
     # best-effort None contract as the lexical fingerprint above.
     normalized_source_hash = await asyncio.to_thread(
         compute_normalized_source_hash, tar_bytes
     )
-    # 7d. L3b prompt-surface sketch (shadow mode): stored for every agent for
+    # 7d. prompt-surface sketch (shadow mode): stored for every agent for
     # calibration/retroactive analysis; not yet a hold trigger. Same offload +
     # best-effort None contract.
     prompt_fingerprint = await asyncio.to_thread(compute_prompt_fingerprint, tar_bytes)
-    # 7e. L3c code embedding (shadow mode): build the canonical input (CPU-bound,
+    # 7e. code embedding (shadow mode): build the canonical input (CPU-bound,
     # offloaded) then embed via the self-hosted service. Disabled by default
     # (null embedder -> None) and best-effort: a slow/unreachable embedder yields a
     # null vector rather than failing the upload. The provenance tag is stored so a

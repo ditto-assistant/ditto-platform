@@ -1,11 +1,11 @@
-"""L3c code-embedding client: a thin, best-effort wrapper over a TEI service.
+"""Code-embedding client: a thin, best-effort wrapper over a TEI service.
 
 The embedding is a review-band moderation signal computed once per upload, so the
 client never raises into the caller: any failure (service down, timeout, malformed
-response) degrades to ``None`` — "no embedding", read downstream as no L3c signal —
-exactly like the pure fingerprint extractors. The gate does the cosine comparison
-later, in Python, over the small eligible ledger; the model is only hit at embed
-time.
+response) degrades to ``None`` — "no embedding", read downstream as no
+code-embedding signal — exactly like the pure fingerprint extractors. The gate does
+the cosine comparison later, in Python, over the small eligible ledger; the model is
+only hit at embed time.
 """
 
 from __future__ import annotations
@@ -54,9 +54,9 @@ class Embedder(Protocol):
 
 
 class NullEmbedder:
-    """The disabled embedder: embeds nothing, so the L3c column stays null.
+    """The disabled embedder: embeds nothing, so the code-embedding column stays null.
 
-    Used whenever ``L3C_EMBEDDER_URL`` is unset, so the platform runs unchanged
+    Used whenever ``CODE_EMBEDDER_URL`` is unset, so the platform runs unchanged
     until an operator points it at a live service.
     """
 
@@ -103,11 +103,11 @@ class TeiEmbedder:
             resp.raise_for_status()
             payload = resp.json()
         except (httpx.HTTPError, ValueError) as e:
-            logger.info("l3c-embed: request failed (%s)", type(e).__name__)
+            logger.info("code-embed: request failed (%s)", type(e).__name__)
             return None
         vector = _first_vector(payload)
         if vector is None:
-            logger.info("l3c-embed: unexpected response shape")
+            logger.info("code-embed: unexpected response shape")
             return None
         if self._config.dim is not None:
             vector = _l2_normalize(vector[: self._config.dim])
@@ -142,7 +142,7 @@ class TeiEmbedder:
             resp.raise_for_status()
             token = resp.text.strip()
         except httpx.HTTPError as e:
-            logger.info("l3c-embed: id-token fetch failed (%s)", type(e).__name__)
+            logger.info("code-embed: id-token fetch failed (%s)", type(e).__name__)
             return None
         return token or None
 
@@ -168,7 +168,8 @@ def create_embedder(config: EmbeddingConfig) -> Embedder:
 def cosine(a: list[float] | None, b: list[float] | None) -> float:
     """Cosine similarity of two vectors in ``[-1, 1]``; ``0.0`` on any missing input.
 
-    Returns ``0.0`` — read as "no L3c match" — when either vector is ``None``,
+    Returns ``0.0`` — read as "no code-embedding match" — when either vector is
+    ``None``,
     empty, of mismatched length, or has zero norm, so callers can threshold without
     special-casing. Pure + deterministic.
     """

@@ -61,20 +61,20 @@ class LedgerRow:
     shape as ``content_fingerprint``. ``None`` before this landed / no parseable
     Rust. Moderation-only, never exposed on the wire."""
     normalized_source_hash: str | None = None
-    """L3a exact-repack hash of the canonicalized source (see
+    """exact-repack hash of the canonicalized source (see
     :func:`ditto.api_server.fingerprint.compute_normalized_source_hash`); the gate's
     equality anti-copy signal, held unconditionally on a match like exact
     ``sha256``. ``None`` before this landed or for an unreadable tarball.
     Moderation-only, never exposed on the wire."""
     prompt_fingerprint: dict | None = None
-    """L3b prompt-surface sketch (see
+    """Prompt-surface sketch (see
     :func:`ditto.api_server.fingerprint.compute_prompt_fingerprint`). Shadow signal:
     surfaced so the gate can note a corroborating prompt overlap in a hold's audit
     reason, but not a hold trigger on its own (honest agents share harness
     scaffolding prompts). ``None`` before this landed / no prompt-length literal.
     Moderation-only, never exposed on the wire."""
     code_embedding: list | None = None
-    """L3c code-embedding vector (see :mod:`ditto.api_server.embedding`). Shadow
+    """Code-embedding vector (see :mod:`ditto.api_server.embedding`). Shadow
     signal: surfaced so the gate can cosine-compare it against a candidate (only
     when ``code_embed_model`` matches — a cross-model cosine is meaningless), but not
     yet a hold trigger. ``None`` before this landed / embedder disabled / embed

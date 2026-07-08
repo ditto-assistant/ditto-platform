@@ -1,4 +1,4 @@
-"""Unit tests for the L3c embedder client (:mod:`ditto.api_server.embedding.client`)."""
+"""Unit tests for the code embedder (:mod:`ditto.api_server.embedding.client`)."""
 
 from __future__ import annotations
 
@@ -127,9 +127,11 @@ class TestCosine:
 
 
 def _fake_id_token(exp: float = 9999999999.0) -> str:
-    payload = base64.urlsafe_b64encode(
-        json.dumps({"exp": exp}).encode()
-    ).rstrip(b"=").decode()
+    payload = (
+        base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode())
+        .rstrip(b"=")
+        .decode()
+    )
     return f"header.{payload}.sig"
 
 
