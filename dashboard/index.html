@@ -478,7 +478,9 @@
       currentBench = data.current_bench_version || maxBv || currentBench;
       // Header badge names the CURRENT benchmark, and notes when older runs are on
       // the board (which are individually marked in their rows).
-      var hasOld = entries.some(function (e) { return e.bench_version != null && e.bench_version < currentBench; });
+      // "Older" = an explicit lower version OR a legacy run with no version recorded
+      // (pre-versioning) — both are marked in their rows and neither is the current bench.
+      var hasOld = entries.some(function (e) { return e.bench_version == null || e.bench_version < currentBench; });
       var badge = document.getElementById("bench-badge");
       badge.className = "bench-badge show";
       badge.textContent = "DittoBench v" + currentBench + " · latest" +
@@ -600,8 +602,12 @@
     function modelCell(e) {
       var m = e.models || {};
       var name = m.harness || m.generator || "";
-      var bv = "";
-      if (e.bench_version != null) {
+      var bv;
+      if (e.bench_version == null) {
+        // No version recorded → a run from before benchmark versioning. Flag it as
+        // legacy so it reads as "not on the current benchmark", same as an older v.
+        bv = '<span class="bv prev" title="' + esc("Scored before benchmark versioning — a legacy run, not comparable to the current DittoBench v" + currentBench + ".") + '">legacy</span>';
+      } else {
         var old = e.bench_version < currentBench;
         var cls = old ? "bv prev" : "bv";
         var tip = old
@@ -636,7 +642,9 @@
       var det = "";
       if (e.n != null) det += stat("Cases scored", String(e.n));
       if (e.median_ms != null) det += stat("Median latency", e.median_ms + " ms");
-      if (e.bench_version != null) {
+      if (e.bench_version == null) {
+        det += stat("Benchmark version", "legacy (pre-versioning — not comparable to v" + currentBench + ")");
+      } else {
         det += stat("Benchmark version", "v" + e.bench_version +
           (e.bench_version < currentBench ? " (previous — not comparable to v" + currentBench + ")" : " (current)"));
       }
