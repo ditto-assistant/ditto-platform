@@ -648,11 +648,16 @@
         var isChamp = elig && e.rank === 1;
         var rankCls = (elig && e.rank <= 3) ? " r" + e.rank : "";
         var champ = isChamp ? '<span class="badge"><span aria-hidden="true">👑</span> LEADER</span>' : "";
-        var prov = elig ? "" : '<span class="prov" title="Provisional. It ran a smaller profile that did not administer the full benchmark, so it is shown for transparency but is not ranked and not emission-eligible.">provisional</span>';
+        var kind = unrankedKind(e);
+        var prov = kind === "zero"
+          ? '<span class="prov" title="This full run scored a composite of 0.000, so it is shown for transparency but is not ranked and not emission-eligible.">no score</span>'
+          : kind === "provisional"
+          ? '<span class="prov" title="Provisional. It ran a smaller profile that did not administer the full benchmark, so it is shown for transparency but is not ranked and not emission-eligible.">provisional</span>'
+          : "";
         var rankCell = elig
           ? '<span class="rank' + rankCls + '">' + e.rank + '</span>' + rankMove(e.miner_hotkey, e.rank)
-          : '<span class="rank prov-rank" title="Not ranked (provisional run).">–</span>';
-        var rowLabel = (elig ? "Rank " + e.rank : "Provisional, unranked") +
+          : '<span class="rank prov-rank" title="Not ranked (' + (kind === "zero" ? "scored 0.000" : "provisional run") + ').">–</span>';
+        var rowLabel = (elig ? "Rank " + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
           ", miner " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) + ". Activate for run detail.";
         return '' +
           '<tr data-i="' + i + '"' + (isChamp ? ' class="champion"' : '') +
@@ -679,6 +684,14 @@
     // did not administer the full benchmark. Older APIs / sample data omit the
     // field and are treated as eligible.
     function isEligible(e) { return !e || e.eligible !== false; }
+    // Why an unranked run is unranked. A full run (n >= 100) that is not ranked
+    // scored a non-positive composite ("no score"); otherwise it ran a smaller
+    // practice profile ("provisional"). Mirrors the backend's two-gate rule so the
+    // badge never mislabels a zero-scoring full run as a small run.
+    function unrankedKind(e) {
+      if (isEligible(e)) return null;
+      return (e && e.n != null && e.n >= 100) ? "zero" : "provisional";
+    }
 
     function bar(kind, v) {
       var w = clamp01(v) * 100;
@@ -841,10 +854,12 @@
       document.getElementById("d-mem-pct").textContent = fx(mem);
 
       var m = e.models || {};
+      var mKind = unrankedKind(e);
       var det = "";
       if (e.n != null) det += stat("Cases scored", String(e.n) +
-        (isEligible(e) ? "" : " (provisional, partial benchmark)"));
-      if (!isEligible(e)) det += stat("Ranking", "Provisional. Not ranked and not emission-eligible. It ran a smaller profile that omits the hard memory categories.");
+        (mKind === "provisional" ? " (provisional, partial benchmark)" : ""));
+      if (mKind === "zero") det += stat("Ranking", "Not ranked. This full run scored a composite of 0.000, so it earns no rank and no emissions.");
+      else if (mKind === "provisional") det += stat("Ranking", "Provisional. Not ranked and not emission-eligible. It ran a smaller profile that omits the hard memory categories.");
       if (e.median_ms != null) det += stat("Median latency", e.median_ms + " ms");
       if (e.bench_version == null) {
         det += stat("Benchmark version", "legacy (pre-versioning, not comparable to v" + currentBench + ")");
@@ -889,7 +904,7 @@
         stat("First seen", new Date(e.first_seen).toLocaleString()) +
         stat("Rank", isEligible(e)
           ? ("#" + e.rank + " of " + lastEntries.filter(isEligible).length)
-          : "unranked (provisional)");
+          : (mKind === "zero" ? "unranked (scored 0.000)" : "unranked (provisional)"));
       var colStats =
         group("Overview", overview) +
         group("Benchmark run", det) +

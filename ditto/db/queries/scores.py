@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
@@ -39,6 +39,17 @@ if TYPE_CHECKING:
 # weights. Keep in sync with the validator's MIN_ELIGIBLE_CASES
 # (ditto-subnet ditto/validator/weights.py).
 MIN_ELIGIBLE_CASES = 100
+
+
+def _is_ranked() -> object:
+    """SQL predicate for a *ranked* run: it administered the full benchmark AND
+    scored a positive composite. Both gates mirror the validator's weight fold:
+    ``filter_eligible`` drops sub-floor runs and ``compute_weights`` then drops
+    ``composite <= 0`` (a failed/zero run earns nothing). Without the second gate
+    a full run that scored 0.000 is crowned #1 over a higher provisional run,
+    which is exactly what the fold refuses to pay. Keep the two in lockstep.
+    """
+    return and_(Score.n >= MIN_ELIGIBLE_CASES, Score.composite > 0.0)
 
 
 @dataclass(frozen=True)
@@ -102,10 +113,12 @@ class LedgerRow:
     n: int = 0
     """Number of cases scored in the winning run — public benchmark telemetry."""
     eligible: bool = False
-    """Whether this run administered the full benchmark (``n >= MIN_ELIGIBLE_CASES``)
-    and is therefore ranked + emission-eligible. ``False`` marks a smoke/practice
-    run (small/medium profile) that is surfaced as *provisional* but never ranked
-    or folded into weights — see :data:`MIN_ELIGIBLE_CASES`."""
+    """Whether this run is *ranked*: it administered the full benchmark
+    (``n >= MIN_ELIGIBLE_CASES``) **and** scored a positive composite
+    (:func:`_is_ranked`). ``False`` marks either a smoke/practice run (small/medium
+    profile) or a full run that scored 0.000; both are surfaced for transparency
+    but never ranked or folded into weights, matching the validator's two-gate
+    fold — see :data:`MIN_ELIGIBLE_CASES`."""
     details: dict | None = None
     """The winning run's opaque telemetry blob (``scores.details``): models used,
     bench_version, dataset_sha256, per-category means, token spend, and the
@@ -332,13 +345,14 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
 
     Two senses of "eligible" apply. *Pool* eligibility = ``status == scored``
     (excludes ``ath_pending_review`` holds and ``banned`` agents). *Ranking*
-    eligibility = the run administered the full benchmark
-    (``n >= MIN_ELIGIBLE_CASES``), exposed per-row as ``LedgerRow.eligible``: a
-    smoke/practice run stays in the pool (surfaced as *provisional*) but is
-    ordered **below** every full run and is dropped by the validator's weight
-    fold, so it can never rank or earn emissions. Both the per-agent and
-    per-miner selections prefer an eligible row/agent, so an inflated small run
-    never shadows a miner's real full run.
+    eligibility = the run administered the full benchmark AND scored a positive
+    composite (:func:`_is_ranked`), exposed per-row as ``LedgerRow.eligible``: a
+    smoke/practice run *or* a full run that scored 0.000 stays in the pool
+    (surfaced as *provisional* / unranked) but is ordered **below** every ranked
+    run and dropped by the validator's weight fold, so it can never rank or earn
+    emissions. Both the per-agent and per-miner selections prefer a ranked
+    row/agent, so neither an inflated small run nor a zero-scoring full run
+    shadows a miner's real ranked run.
 
     Ordering (``eligible DESC, composite DESC, first_seen ASC, agent_id ASC``)
     matches the validator fold's eligibility gate + champion/tail tie-breaks.
@@ -354,18 +368,18 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         Score.run_id.label("run_id"),
         Score.median_ms.label("median_ms"),
         Score.n.label("n"),
-        (Score.n >= MIN_ELIGIBLE_CASES).label("eligible"),
+        _is_ranked().label("eligible"),
         Score.details.label("details"),
         Score.validator_hotkey.label("validator_hotkey"),
         Score.signature.label("signature"),
         func.row_number()
         .over(
             partition_by=Score.agent_id,
-            # Prefer an eligible (full-benchmark) row over a higher-composite
-            # smoke/practice row, so a small run cannot shadow the agent's real
-            # full run and drop it out of the ranked/emission pool.
+            # Prefer a ranked (full-benchmark, positive-composite) row over a
+            # higher-composite smoke/practice row, so a small run cannot shadow the
+            # agent's real full run and drop it out of the ranked/emission pool.
             order_by=(
-                (Score.n >= MIN_ELIGIBLE_CASES).desc(),
+                _is_ranked().desc(),
                 Score.composite.desc(),
                 Score.validator_hotkey.asc(),
             ),

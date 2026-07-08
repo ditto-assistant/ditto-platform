@@ -265,6 +265,43 @@ class TestListEligibleLedger:
         assert ledger[0].eligible is True
         assert ledger[0].composite == 0.52
 
+    async def test_zero_composite_full_run_is_not_ranked(
+        self, session: AsyncSession
+    ) -> None:
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        # A full run that scored 0.000 must NOT be ranked or crowned: the validator
+        # drops composite <= 0 from the fold, so a failed full run earns nothing and
+        # must never outrank a positive provisional run on the board.
+        await _seed_scored(
+            session, miner=_MINER, composite=0.0, created_at=t0, n=MIN_ELIGIBLE_CASES
+        )
+        await _seed_scored(
+            session, miner=_MINER_B, composite=0.9, created_at=t0, n=12
+        )
+        ledger = await list_eligible_ledger(session)
+        by_miner = {e.miner_hotkey: e for e in ledger}
+        assert by_miner[_MINER].eligible is False  # full but zero-scoring
+        assert by_miner[_MINER_B].eligible is False  # provisional smoke run
+        # Neither ranks; the positive provisional sorts above the zero full run.
+        assert [e.miner_hotkey for e in ledger] == [_MINER_B, _MINER]
+
+    async def test_positive_full_run_ranked_above_zero_full_run(
+        self, session: AsyncSession
+    ) -> None:
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        # Two full runs, one positive and one zero: only the positive one is ranked.
+        await _seed_scored(
+            session, miner=_MINER, composite=0.0, created_at=t0, n=MIN_ELIGIBLE_CASES
+        )
+        await _seed_scored(
+            session, miner=_MINER_B, composite=0.4, created_at=t0, n=MIN_ELIGIBLE_CASES
+        )
+        ledger = await list_eligible_ledger(session)
+        by_miner = {e.miner_hotkey: e for e in ledger}
+        assert by_miner[_MINER_B].eligible is True
+        assert by_miner[_MINER].eligible is False
+        assert ledger[0].miner_hotkey == _MINER_B
+
     async def test_excludes_non_scored_states(self, session: AsyncSession) -> None:
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
         # Held / evaluating agents must not leak into the eligible ledger.
