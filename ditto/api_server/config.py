@@ -6,6 +6,10 @@ import os
 import re
 from dataclasses import dataclass
 
+from ditto.api_server.embedding import (
+    EmbeddingConfig,
+    parse_embedding_config_from_env,
+)
 from ditto.api_server.errors import ApiServerConfigError
 from ditto.api_server.pricing import PricingConfig, parse_pricing_config_from_env
 from ditto.api_server.storage import StorageConfig, parse_storage_config_from_env
@@ -60,6 +64,11 @@ class ApiServerConfig:
 
     storage: StorageConfig
     """S3-compatible object store parameters for uploaded tarballs."""
+
+    embedding: EmbeddingConfig
+    """L3c code-embedding client parameters. Disabled by default (no
+    ``L3C_EMBEDDER_URL``), so the platform runs unchanged until an operator points
+    it at a self-hosted TEI service."""
 
     dashboard_enabled: bool = True
     """Serve the public dashboard SPA (``dashboard/index.html``) at ``/``.
@@ -129,6 +138,7 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
         chain=parse_chain_config_from_env(),
         pricing=parse_pricing_config_from_env(),
         storage=parse_storage_config_from_env(),
+        embedding=parse_embedding_config_from_env(),
         dashboard_enabled=dashboard_enabled,
         dashboard_wandb_url=dashboard_wandb_url,
     )
