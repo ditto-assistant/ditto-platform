@@ -121,6 +121,33 @@ services:
         mc anonymous set none local/"$${STORAGE_BUCKET}"
     restart: "no"
 
+  # L3c code-embedding service (anti-copy semantic tier; see
+  # docs/l3c-embedder.md and docs/SEMANTIC-CLONE-PREVENTION.md in the subnet repo).
+  # Hugging Face text-embeddings-inference (TEI) serving a small open code model.
+  # Opt-in via the `embedder` profile: `make embedder-up`, or add `embedder` to
+  # DITTO_COMPOSE_SERVICES on a deployed host. The platform stays disabled until
+  # L3C_EMBEDDER_URL is set, so a host that does not run this service is unaffected.
+  embedder:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.7.2
+    profiles: ["embedder"]
+    # amd64-only image; run under emulation on Apple Silicon (colima qemu).
+    platform: linux/amd64
+    restart: unless-stopped
+    # Default to the CPU-cheap, Rust-aware fallback; override L3C_EMBEDDER_MODEL_ID
+    # (e.g. Qwen/Qwen3-Embedding-0.6B) to serve the primary model. TEI listens on
+    # port 80 inside the container.
+    command:
+      - "--model-id"
+      - "${L3C_EMBEDDER_MODEL_ID:-jinaai/jina-embeddings-v2-base-code}"
+      - "--port"
+      - "80"
+    ports:
+      - "${L3C_EMBEDDER_HOST_PORT:-8080}:80"
+    # Persist the downloaded weights so a restart does not re-fetch from HF.
+    volumes:
+      - embedder_hf_cache:/data
+
 volumes:
   postgres_data:
   minio_data:
+  embedder_hf_cache:
