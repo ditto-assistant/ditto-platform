@@ -8,11 +8,13 @@ import io
 import tarfile
 
 from ditto.api_server.fingerprint import (
+    _EMBED_INPUT_MAX_CHARS,
     _FP_VERSION,
     _MINHASH_K,
     _PROMPT_VERSION,
     _extract_string_literals,
     compute_content_fingerprint,
+    compute_embedding_input,
     compute_normalized_source_hash,
     compute_prompt_fingerprint,
     content_similarity,
@@ -391,3 +393,60 @@ class TestComputePromptFingerprint:
     def test_empty_and_unreadable_yield_none(self) -> None:
         assert compute_prompt_fingerprint(_tar_gz({})) is None
         assert compute_prompt_fingerprint(b"not a tarball") is None
+
+
+class TestComputeEmbeddingInput:
+    def test_deterministic_and_nonempty(self) -> None:
+        tar = _tar_gz({"src/lib.rs": _rust_file(6)})
+        a = compute_embedding_input(tar)
+        assert a is not None and a.strip()
+        assert a == compute_embedding_input(tar)
+
+    def test_comments_and_blank_lines_dropped(self) -> None:
+        # Comment text and blank lines are removed (a copier changes those freely);
+        # code lines survive. Exact intra-line spacing is intentionally not
+        # normalized — it is irrelevant to the embedding model.
+        noisy = (
+            b"// header note\n"
+            b"fn a(x: i64) -> i64 {\n"
+            b"\n"
+            b"    x + 1  /* inline */ // trailing\n"
+            b"\n"
+            b"}\n"
+        )
+        out = compute_embedding_input(_tar_gz({"lib.rs": noisy}))
+        assert out is not None
+        assert "header" not in out and "inline" not in out and "trailing" not in out
+        assert "\n\n" not in out  # no blank lines survive
+        assert "fn a(x: i64) -> i64 {" in out  # code kept
+
+    def test_keeps_identifiers_and_structure(self) -> None:
+        # Unlike the normalized-source hash, code text (identifiers, indentation) is
+        # preserved so the model reads natural code.
+        out = compute_embedding_input(_tar_gz({"lib.rs": _rust_file(3, "widget")}))
+        assert out is not None
+        assert "widget0" in out
+        assert "let y = x" in out  # spacing within the line is kept
+
+    def test_file_rename_and_reorder_invisible(self) -> None:
+        f1, f2 = _rust_file(3, "a"), _rust_file(4, "b")
+        original = _tar_gz({"src/one.rs": f1, "src/two.rs": f2})
+        renamed = _tar_gz({"src/zzz.rs": f2, "src/aaa.rs": f1})
+        assert compute_embedding_input(original) == compute_embedding_input(renamed)
+
+    def test_distinct_source_differs(self) -> None:
+        a = compute_embedding_input(_tar_gz({"lib.rs": _rust_file(5, "a")}))
+        b = compute_embedding_input(_tar_gz({"lib.rs": _rust_file(5, "b")}))
+        assert a != b
+
+    def test_length_capped(self) -> None:
+        big = _tar_gz({"lib.rs": _rust_file(6000)})  # far exceeds the char cap
+        out = compute_embedding_input(big)
+        assert out is not None
+        assert len(out) == _EMBED_INPUT_MAX_CHARS
+
+    def test_empty_and_unreadable_yield_none(self) -> None:
+        assert compute_embedding_input(_tar_gz({})) is None
+        assert compute_embedding_input(b"not a tarball") is None
+        only_comment = _tar_gz({"x.rs": b"// only a comment\n"})
+        assert compute_embedding_input(only_comment) is None
