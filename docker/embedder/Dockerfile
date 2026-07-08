@@ -1,4 +1,4 @@
-# Baked-model L3c embedder image for a scale-to-zero Cloud Run deploy.
+# Baked-model code-embedding image for a scale-to-zero Cloud Run deploy.
 #
 # The stock text-embeddings-inference (TEI) image downloads the model from the
 # Hugging Face hub on first start. Under scale-to-zero that download runs on
@@ -6,15 +6,19 @@
 # network dependency to the request that triggered the wake. This image bakes the
 # weights in at build time so a cold start only loads them from local disk.
 #
-# Build arg MODEL_ID selects what gets baked; it must match L3C_EMBEDDER_MODEL /
-# L3C_EMBEDDER_MODEL_ID in the platform env (the vector's provenance tag). The
-# default is the CPU-cheap, Rust-aware fallback; pass Qwen/Qwen3-Embedding-0.6B
-# for the primary model.
+# Build arg MODEL_ID selects what gets baked; it must match CODE_EMBEDDER_MODEL /
+# CODE_EMBEDDER_MODEL_ID in the platform env (the vector's provenance tag). The
+# default is the primary Qwen3-Embedding-0.6B; pass
+# jinaai/jina-embeddings-v2-base-code for the cheaper CPU fallback.
+#
+# TEI base pinned to cpu-1.8.2+: the Qwen3 CPU path was broken by an Intel-MKL bug
+# on AMD hosts before 1.8.2 (TEI issues #636 / #667), and a scale-to-zero cold
+# start can land on any CPU, so an older tag would crash-loop the primary model.
 
 # --- stage 1: fetch the weights with the HF CLI (not present in the TEI image) ---
 FROM python:3.11-slim AS fetch
 
-ARG MODEL_ID=jinaai/jina-embeddings-v2-base-code
+ARG MODEL_ID=Qwen/Qwen3-Embedding-0.6B
 ARG MODEL_REVISION=main
 
 RUN pip install --no-cache-dir "huggingface_hub[cli]==0.25.2"
@@ -27,7 +31,7 @@ RUN huggingface-cli download "$MODEL_ID" \
     --local-dir-use-symlinks False
 
 # --- stage 2: the TEI runtime with the model already on disk ---
-FROM ghcr.io/huggingface/text-embeddings-inference:cpu-1.7.2
+FROM ghcr.io/huggingface/text-embeddings-inference:cpu-1.8.2
 
 COPY --from=fetch /model /model
 
