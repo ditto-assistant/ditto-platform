@@ -63,7 +63,7 @@ and `endpoints/validator.py` respectively.
 ## Scoring
 
 `composite = 0.5 * tool_mean + 0.5 * memory_mean` when both kinds are present
-(bench_version 3 / DittoBench v2 — rebalanced from v1's `0.6 / 0.4` because
+(bench_version 2 / DittoBench v2 — rebalanced from v1's `0.6 / 0.4` because
 memory is the core product value and the raw-pairs seeding tier makes
 `memory_mean` the harder axis). The platform **records what the validator
 reports and never recomputes it** (`api_models/validator.py`,
