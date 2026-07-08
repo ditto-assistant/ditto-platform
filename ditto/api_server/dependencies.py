@@ -42,5 +42,5 @@ async def get_storage_client(request: Request) -> S3StorageClient:
 
 
 async def get_embedder(request: Request) -> Embedder:
-    """Return the lifespan-created L3c :class:`Embedder` (null when disabled)."""
+    """Return the lifespan-created :class:`Embedder` (null when disabled)."""
     return request.app.state.embedder

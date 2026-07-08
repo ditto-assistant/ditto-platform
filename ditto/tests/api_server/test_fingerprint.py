@@ -67,7 +67,7 @@ def _containment(a: dict | None, b: dict | None) -> float:
 
 
 class TestNormalizedSourceHash:
-    """L3a exact-repack hash: cosmetic repackaging normalizes to the same hash,
+    """exact-repack hash: cosmetic repackaging normalizes to the same hash,
     genuinely different source does not, and string literals are preserved."""
 
     def test_shape_and_determinism(self) -> None:

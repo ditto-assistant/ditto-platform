@@ -58,7 +58,7 @@ from ditto.api_server.dependencies import (
     get_storage_client,
 )
 from ditto.api_server.endpoints.retrieval import AgentNotFoundError
-from ditto.api_server.scoring_gate import evaluate_antidup
+from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.queries.agents import get_agent_by_id, list_agents_by_status
@@ -377,7 +377,7 @@ async def submit_score(
         # self-match).
         if agent.status == AgentStatus.EVALUATING:
             eligible = await list_eligible_ledger(session)
-            decision = evaluate_antidup(
+            decision = evaluate_duplicate_signals(
                 agent_id=agent_id,
                 miner_hotkey=agent.miner_hotkey,
                 sha256=agent.sha256,

@@ -88,7 +88,7 @@ _MAX_MEMBERS = 20000
 # Hard ceiling on distinct shingles before we give up (paired with the byte caps).
 _MAX_SHINGLES = 500_000
 
-# --- L3b prompt fingerprint (see docs/SEMANTIC-CLONE-PREVENTION.md §4) ----------
+# --- prompt fingerprint (see docs/SEMANTIC-CLONE-PREVENTION.md §4) ----------
 # Version of the prompt-sketch format. A *string* so it can never collide with the
 # integer ``_FP_VERSION`` / structural versions in :func:`content_similarity`'s
 # ``v`` equality check — a prompt sketch is a distinct channel, stored apart, and
@@ -105,7 +105,7 @@ _PROMPT_MIN_WORDS = 8
 # distinctive enough that unrelated prose rarely shares a shingle.
 _PROMPT_SHINGLE_WORDS = 5
 
-# --- L3c code-embedding input (see docs/SEMANTIC-CLONE-PREVENTION.md §4) ---------
+# --- code-embedding input (see docs/SEMANTIC-CLONE-PREVENTION.md §4) ---------
 # Character cap on the text handed to the code-embedding model
 # (:func:`compute_embedding_input`). Sized to fit the smaller supported backend's
 # context window (jina-embeddings-v2-base-code, 8192 tokens ≈ ~24k chars of code);
@@ -177,7 +177,7 @@ def compute_content_fingerprint(tar_gz_bytes: bytes) -> dict | None:
 def compute_normalized_source_hash(tar_gz_bytes: bytes) -> str | None:
     """Return a single hash of the tarball's *canonicalized* source, or ``None``.
 
-    This is the **L3a "exact-repack"** signal (see
+    This is the **"exact-repack"** signal (see
     ``docs/SEMANTIC-CLONE-PREVENTION.md``): a copy that only reformats, re-comments,
     or reorders/renames files normalizes to the **same** hash even though its
     ``sha256`` (and, slightly, its shingle sketch) differ. Unlike
@@ -199,7 +199,8 @@ def compute_normalized_source_hash(tar_gz_bytes: bytes) -> str | None:
     Note: ``'``-delimited char literals are not tracked (Rust lifetimes such as
     ``'a`` have no closing quote and would eat spans), so a char literal
     containing ``"`` or a comment marker may mis-normalize. This only costs a rare
-    missed match (the copy falls through to L1/L2) — never a false match, since a
+    missed match (the copy falls through to lexical/structural) — never a false match,
+    since a
     collision still requires near-identical code.
     """
     files: list[str] = []
@@ -246,7 +247,8 @@ def compute_normalized_source_hash(tar_gz_bytes: bytes) -> str | None:
 def compute_prompt_fingerprint(tar_gz_bytes: bytes) -> dict | None:
     """Return a word-shingle sketch of the crate's prompt literals, or ``None``.
 
-    This is the first component of the **L3b strategy/asset fingerprint** (see
+    This is the first component of the **prompt-surface (strategy/asset) fingerprint**
+    (see
     ``docs/SEMANTIC-CLONE-PREVENTION.md`` §4): it fingerprints the *prompt surface*
     — the substantial string literals a copier must preserve to keep the champion's
     score — independently of the surrounding code. A submission that refactors or
@@ -269,9 +271,10 @@ def compute_prompt_fingerprint(tar_gz_bytes: bytes) -> dict | None:
     unreadable, carry no prompt-length literal, or trip the shared bomb/work guards
     — same best-effort contract as the other fingerprints.
 
-    L3b is a *review-band* signal: honest agents on the same reference harness share
+    the prompt fingerprint is a *review-band* signal: honest agents on the same
+    reference harness share
     scaffolding prompts, so a prompt match alone is not copy evidence. It is
-    calibrated (``ditto.anticopy.clonecal``) and fused with an orthogonal signal
+    calibrated (``ditto.anticopy.calibration``) and fused with an orthogonal signal
     before it can hold an agent; this function only produces the sketch.
     """
     shingles: set[str] = set()
@@ -317,26 +320,28 @@ def compute_prompt_fingerprint(tar_gz_bytes: bytes) -> dict | None:
 
 
 def compute_embedding_input(tar_gz_bytes: bytes) -> str | None:
-    """Return the canonical source text to feed the L3c code-embedding model, or None.
+    """Return the canonical source text to feed the code-embedding model, or None.
 
-    This is the deterministic *input builder* for the **L3c code-embedding** signal
+    This is the deterministic *input builder* for the **code-embedding** signal
     (see ``docs/SEMANTIC-CLONE-PREVENTION.md`` §4). It does not embed anything — the
     embedding model is a self-hosted service (Qwen3-Embedding-0.6B primary,
     jina-embeddings-v2-base-code CPU fallback) called separately — it only produces
     the stable text that service embeds, so the input is reproducible and unit-
     testable without the model.
 
-    Unlike the L1/L3a normalization, this preserves readable code: comments and
+    Unlike those canonicalizations, this preserves readable code: comments and
     blank lines are dropped (a copier changes those freely, and they carry little
     logic), but identifiers, structure, and indentation are kept, because the model
     reasons over natural code and derives its rename/refactor invariance
-    *semantically* — that invariance is the point of L3c and is the model's job, not
+    *semantically* — that invariance is the point of the code-embedding signal and is
+    the model's job, not
     the input's. Per-file cleaned texts are sorted by content and joined with a blank
     line (no path names), so renaming or reordering files does not change the input.
     The result is prefix-truncated to :data:`_EMBED_INPUT_MAX_CHARS` to fit the
     model's context window; the sorted concatenation makes that truncation stable.
 
-    Returns ``None`` ("no embedding input", read downstream as no L3c signal) on an
+    Returns ``None`` ("no embedding input", read downstream as no code-embedding signal)
+    on an
     unreadable tarball, empty source, or a bomb/work-guard trip — same contract and
     guards as the other extractors. Pure + deterministic.
     """

@@ -325,6 +325,8 @@ def _real_source_tar() -> bytes:
         info.size = len(data)
         tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
+
+
 _GOOD_BLOCK_HASH = "0x" + "ab" * 32
 
 
@@ -474,10 +476,11 @@ class TestUploadAgentHappyPath:
         assert put_kwargs["content_type"] == "application/gzip"
         assert put_kwargs["body"] == _GOOD_TAR_BYTES
 
-    async def test_stores_l3c_embedding_when_enabled(
+    async def test_stores_code_embedding_when_enabled(
         self, app: FastAPI, client: httpx.AsyncClient
     ):
-        # With an enabled embedder and a real-source tar, the L3c vector + model tag
+        # With an enabled embedder and a real-source tar, the code-embedding vector +
+        # model tag
         # reach the agent row (shadow storage).
         deps = _wire_full_stack(app)
         override_get_embedder(app, vector=[0.1, 0.2, 0.3])
@@ -496,7 +499,7 @@ class TestUploadAgentHappyPath:
         assert agent_row.code_embedding == [0.1, 0.2, 0.3]
         assert agent_row.code_embed_model == "stub@test"
 
-    async def test_disabled_embedder_leaves_l3c_null(
+    async def test_disabled_embedder_leaves_embedding_null(
         self, app: FastAPI, client: httpx.AsyncClient
     ):
         # Default null embedder: even a real-source tar stores no vector.

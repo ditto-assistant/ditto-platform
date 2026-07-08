@@ -155,7 +155,7 @@ class TestListEligibleLedger:
     async def test_normalized_source_hash_flows_through(
         self, session: AsyncSession
     ) -> None:
-        # The L3a exact-repack hash must reach the ledger so the gate can read it.
+        # The exact-repack hash must reach the ledger so the gate can read it.
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
         await _seed_scored(
             session,
@@ -171,7 +171,7 @@ class TestListEligibleLedger:
     async def test_prompt_fingerprint_flows_through(
         self, session: AsyncSession
     ) -> None:
-        # The L3b prompt sketch (shadow signal) must reach the ledger for the gate.
+        # The prompt sketch (shadow signal) must reach the ledger for the gate.
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
         sketch = {"v": "p1", "k": 256, "card": 2, "m": ["aa", "bb"]}
         await _seed_scored(
@@ -186,7 +186,8 @@ class TestListEligibleLedger:
         assert ledger[0].prompt_fingerprint == sketch
 
     async def test_code_embedding_flows_through(self, session: AsyncSession) -> None:
-        # The L3c vector + its model tag must reach the ledger for the gate cosine.
+        # The code-embedding vector + its model tag must reach the ledger for the gate
+        # cosine.
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
         vector = [0.1, 0.2, 0.3]
         await _seed_scored(
