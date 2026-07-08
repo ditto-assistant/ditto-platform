@@ -63,6 +63,7 @@ class TestCheck:
             "revision": "main",
             "dim": None,
             "timeout_seconds": 5.0,
+            "auth": "none",
         }
         base.update(kw)
         return EmbeddingConfig(**base)  # type: ignore[arg-type]
@@ -83,3 +84,20 @@ class TestCheck:
             check_embedding_config(
                 self._cfg(url="embedder:80", model="m")  # missing scheme
             )
+
+
+class TestAuth:
+    def test_auth_defaults_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _clear_env(monkeypatch)
+        assert parse_embedding_config_from_env().auth == "none"
+
+    def test_auth_parsed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("L3C_EMBEDDER_AUTH", "gcp_id_token")
+        assert parse_embedding_config_from_env().auth == "gcp_id_token"
+
+    def test_invalid_auth_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("L3C_EMBEDDER_AUTH", "basic")
+        with pytest.raises(EmbeddingConfigError, match="L3C_EMBEDDER_AUTH"):
+            parse_embedding_config_from_env()

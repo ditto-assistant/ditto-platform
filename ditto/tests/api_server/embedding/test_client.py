@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import json
+
 import httpx
 import pytest
 
@@ -21,6 +24,7 @@ def _cfg(**kw: object) -> EmbeddingConfig:
         "revision": "main",
         "dim": None,
         "timeout_seconds": 5.0,
+        "auth": "none",
     }
     base.update(kw)
     return EmbeddingConfig(**base)  # type: ignore[arg-type]
@@ -120,3 +124,52 @@ class TestCosine:
         assert cosine([], [1.0]) == 0.0
         assert cosine([1.0, 2.0], [1.0]) == 0.0  # length mismatch
         assert cosine([0.0, 0.0], [1.0, 1.0]) == 0.0  # zero norm
+
+
+def _fake_id_token(exp: float = 9999999999.0) -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": exp}).encode()
+    ).rstrip(b"=").decode()
+    return f"header.{payload}.sig"
+
+
+class TestGcpAuth:
+    async def test_bearer_from_metadata_added_to_embed(self) -> None:
+        seen: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "metadata.google.internal":
+                assert request.headers.get("Metadata-Flavor") == "Google"
+                assert request.url.params.get("audience") == "http://embedder:80"
+                return httpx.Response(200, text=_fake_id_token())
+            # /embed must carry the bearer minted above.
+            seen["auth"] = request.headers.get("Authorization", "")
+            return httpx.Response(200, json=[[1.0, 0.0]])
+
+        embedder = _tei(handler, _cfg(auth="gcp_id_token"))
+        vector = await embedder.embed("fn main() {}")
+        assert vector == [1.0, 0.0]
+        assert seen["auth"].startswith("Bearer header.")
+        await embedder.aclose()
+
+    async def test_metadata_failure_degrades_to_unauthenticated(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "metadata.google.internal":
+                return httpx.Response(500, text="no metadata server")
+            # No token was obtained -> a private service would 403; simulate that.
+            if not request.headers.get("Authorization"):
+                return httpx.Response(403, text="forbidden")
+            return httpx.Response(200, json=[[1.0]])  # pragma: no cover
+
+        embedder = _tei(handler, _cfg(auth="gcp_id_token"))
+        assert await embedder.embed("code") is None  # best-effort, no crash
+        await embedder.aclose()
+
+    async def test_no_auth_header_when_disabled(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert "Authorization" not in request.headers
+            return httpx.Response(200, json=[[0.5]])
+
+        embedder = _tei(handler, _cfg(auth="none"))
+        assert await embedder.embed("code") == [0.5]
+        await embedder.aclose()

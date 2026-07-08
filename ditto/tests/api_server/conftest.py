@@ -77,6 +77,7 @@ def make_api_server_config(**overrides: Any) -> ApiServerConfig:
             revision="main",
             dim=None,
             timeout_seconds=5.0,
+            auth="none",
         ),
     )
     if overrides:
