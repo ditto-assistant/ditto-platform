@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import statistics
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 from uuid import UUID
@@ -63,7 +64,12 @@ from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.queries.agents import get_agent_by_id, list_agents_by_status
-from ditto.db.queries.scores import list_eligible_ledger, upsert_score
+from ditto.db.queries.scores import (
+    SCORING_QUORUM,
+    list_eligible_ledger,
+    list_scores_for_agent,
+    upsert_score,
+)
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -310,7 +316,9 @@ async def submit_score(
     Ordering is cheap-before-expensive and no DB write happens until every
     check passes: (1) signature over ``{validator_hotkey}:{run_id}``,
     (2) on-chain validator-permit check, (3) one transaction that upserts
-    the score and transitions ``evaluating -> scored``.
+    the score and, once the k=3 quorum has reported, finalizes the agent
+    ``evaluating -> scored`` on the median composite. Below quorum the score
+    is recorded and the agent stays provisional (``evaluating``).
     """
     response.headers["Cache-Control"] = "no-store"
     report = payload.report
@@ -373,36 +381,42 @@ async def submit_score(
         # so a re-score by a scorer that omits it never wipes a stored sketch.
         if report.structural_fingerprint is not None:
             agent.structural_fingerprint = report.structural_fingerprint.model_dump()
-        # Finalize: the first score moves evaluating -> scored, unless the
-        # anti-copy gate holds a suspected copy in ath_pending_review for review.
-        # The gate only runs on this evaluating -> scored transition; a re-score
-        # of an already-scored (or already-held) agent leaves its status put so
-        # re-reporting never thrashes the ledger. The just-scored agent is still
-        # ``evaluating`` here, so it is not yet in the eligible ledger (no
-        # self-match).
+        # Finalize at quorum (k=3): an agent stays provisional (``evaluating``)
+        # until :data:`SCORING_QUORUM` validators have scored it; only the
+        # quorum-th score moves it ``evaluating -> scored``, unless the anti-copy
+        # gate holds a suspected copy in ``ath_pending_review``. Both the gate
+        # and the transition run on the **median** composite, so no single
+        # validator's score decides an agent's fate. The gate runs only on this
+        # one transition; a re-score of an already-scored (or held) agent leaves
+        # its status put so re-reporting never thrashes the ledger. The agent is
+        # still ``evaluating`` here, so it is not yet in the eligible ledger (no
+        # self-match). A below-quorum score just records the row and waits.
         if agent.status == AgentStatus.EVALUATING:
-            eligible = await list_eligible_ledger(session)
-            decision = evaluate_duplicate_signals(
-                agent_id=agent_id,
-                miner_hotkey=agent.miner_hotkey,
-                sha256=agent.sha256,
-                composite=report.composite,
-                size_bytes=agent.size_bytes,
-                normalized_source_hash=agent.normalized_source_hash,
-                content_fingerprint=agent.content_fingerprint,
-                structural_fingerprint=agent.structural_fingerprint,
-                prompt_fingerprint=agent.prompt_fingerprint,
-                eligible=eligible,
-            )
-            if decision.held:
-                agent.status = AgentStatus.ATH_PENDING_REVIEW
-                agent.duplicate_of = decision.duplicate_of
-                agent.review_reason = decision.reason
-                logger.warning(
-                    "agent %s held for copy review: %s", agent_id, decision.reason
+            agent_scores = await list_scores_for_agent(session, agent_id=agent_id)
+            if len(agent_scores) >= SCORING_QUORUM:
+                median_composite = statistics.median(s.composite for s in agent_scores)
+                eligible = await list_eligible_ledger(session)
+                decision = evaluate_duplicate_signals(
+                    agent_id=agent_id,
+                    miner_hotkey=agent.miner_hotkey,
+                    sha256=agent.sha256,
+                    composite=median_composite,
+                    size_bytes=agent.size_bytes,
+                    normalized_source_hash=agent.normalized_source_hash,
+                    content_fingerprint=agent.content_fingerprint,
+                    structural_fingerprint=agent.structural_fingerprint,
+                    prompt_fingerprint=agent.prompt_fingerprint,
+                    eligible=eligible,
                 )
-            else:
-                agent.status = AgentStatus.SCORED
+                if decision.held:
+                    agent.status = AgentStatus.ATH_PENDING_REVIEW
+                    agent.duplicate_of = decision.duplicate_of
+                    agent.review_reason = decision.reason
+                    logger.warning(
+                        "agent %s held for copy review: %s", agent_id, decision.reason
+                    )
+                else:
+                    agent.status = AgentStatus.SCORED
         result_status = agent.status
 
     logger.info(

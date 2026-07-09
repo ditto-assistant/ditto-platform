@@ -40,8 +40,13 @@ from ditto.api_server.middleware.error_envelope import (
 from ditto.chain.models import NeuronInfo
 from ditto.db.models import Agent, Base, Score
 
-# Real dev keypair: signs for real so _verify_signature runs end to end.
-_KEYPAIR = bittensor.Keypair.create_from_uri("//Alice")
+# Real dev keypairs: sign for real so _verify_signature runs end to end. The k=3
+# quorum needs three distinct permitted validators before an agent finalizes.
+_KEYPAIRS = [
+    bittensor.Keypair.create_from_uri(uri)
+    for uri in ("//Alice", "//Bob", "//Charlie")
+]
+_KEYPAIR = _KEYPAIRS[0]
 _VALIDATOR_HOTKEY = _KEYPAIR.ss58_address
 _MINER_HOTKEY = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _SHA256 = "ab" * 32
@@ -52,7 +57,11 @@ def _sign(message: str) -> str:
 
 
 def _score_payload(
-    agent_id: UUID, run_id: str = "run_test_1", **overrides: object
+    agent_id: UUID,
+    run_id: str = "run_test_1",
+    *,
+    keypair: bittensor.Keypair = _KEYPAIR,
+    **overrides: object,
 ) -> dict:
     report = {
         "run_id": run_id,
@@ -66,15 +75,40 @@ def _score_payload(
         "per_case": [],
     }
     report.update(overrides)
-    signed = (
-        f"{_VALIDATOR_HOTKEY}:{agent_id}:{run_id}:"
-        f"{report['composite']!r}:{report['seed']}"
-    )
+    hotkey = keypair.ss58_address
+    signed = f"{hotkey}:{agent_id}:{run_id}:{report['composite']!r}:{report['seed']}"
     return {
-        "validator_hotkey": _VALIDATOR_HOTKEY,
-        "signature": _sign(signed),
+        "validator_hotkey": hotkey,
+        "signature": keypair.sign(signed.encode()).hex(),
         "report": report,
     }
+
+
+async def _score_to_quorum(
+    client: httpx.AsyncClient,
+    agent_id: UUID,
+    *,
+    run_id: str = "run_q",
+    composite: float = 0.82,
+    **overrides: object,
+) -> httpx.Response:
+    """Post one score per quorum validator (all at ``composite``, so the median
+    is ``composite``) and return the final response, finalized on the last."""
+    resp: httpx.Response | None = None
+    for i, kp in enumerate(_KEYPAIRS):
+        resp = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(
+                agent_id,
+                run_id=f"{run_id}_{i}",
+                keypair=kp,
+                composite=composite,
+                **overrides,
+            ),
+        )
+        assert resp.status_code == 200, resp.text
+    assert resp is not None
+    return resp
 
 
 # --- DB + dependency wiring ------------------------------------------------
@@ -116,15 +150,16 @@ def _install_chain(
 ) -> None:
     neurons = []
     if registered:
-        neurons.append(
-            NeuronInfo(
-                hotkey=_VALIDATOR_HOTKEY,
-                coldkey="5GReceiverColdkeyPlaceholderXXXXXXXXXXXXXXXXXXX",
-                uid=1,
-                stake=1000.0,
-                validator_permit=permitted,
+        for uid, kp in enumerate(_KEYPAIRS, start=1):
+            neurons.append(
+                NeuronInfo(
+                    hotkey=kp.ss58_address,
+                    coldkey="5GReceiverColdkeyPlaceholderXXXXXXXXXXXXXXXXXXX",
+                    uid=uid,
+                    stake=1000.0,
+                    validator_permit=permitted,
+                )
             )
-        )
 
     async def _chain() -> MagicMock:
         c = MagicMock()
@@ -330,10 +365,17 @@ class TestSubmitScore:
         _install_db(app, session_maker)
         _install_chain(app)
 
-        response = await client.post(
+        # A single below-quorum score records the row but keeps the agent
+        # provisional (evaluating) — no finalization until the k=3 quorum.
+        first = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
-            json=_score_payload(agent_id),
+            json=_score_payload(agent_id, keypair=_KEYPAIRS[0]),
         )
+        assert first.status_code == 200
+        assert first.json()["status"] == AgentStatus.EVALUATING
+
+        # The quorum-th score finalizes it on the median composite.
+        response = await _score_to_quorum(client, agent_id, composite=0.82)
         assert response.status_code == 200
         body = response.json()
         assert body["agent_id"] == str(agent_id)
@@ -594,9 +636,10 @@ class TestAntiCopyGate:
         run_id: str,
         composite: float,
     ) -> httpx.Response:
-        return await client.post(
-            f"/api/v1/validator/agent/{agent_id}/score",
-            json=_score_payload(agent_id, run_id=run_id, composite=composite),
+        # Score to the k=3 quorum so the agent finalizes and the gate runs on
+        # the median (= composite, since all three validators post the same).
+        return await _score_to_quorum(
+            client, agent_id, run_id=run_id, composite=composite
         )
 
     async def test_exact_copy_is_held(
