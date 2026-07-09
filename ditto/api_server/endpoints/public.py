@@ -38,6 +38,7 @@ from ditto.api_models import (
     PublicBenchIntegrity,
     PublicCaseResult,
     PublicCategoryStat,
+    PublicDatasetReveal,
     PublicHealthResponse,
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
@@ -48,6 +49,8 @@ from ditto.api_models import (
     PublicValidatorScore,
 )
 from ditto.api_server.bench import CURRENT_BENCH_VERSION
+from ditto.api_server.datapipeline import DataPipelineError
+from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.validator import SessionDep
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.scores import (
@@ -410,6 +413,64 @@ async def agent_scores(
     if row is None:
         raise HTTPException(status_code=404, detail="no public scores for this agent")
     return _submission_scores(row)
+
+
+@router.get("/agent/{agent_id}/dataset", response_model=PublicDatasetReveal)
+async def agent_dataset(
+    response: Response,
+    session: SessionDep,
+    generator: GeneratorDep,
+    agent_id: UUID,
+) -> PublicDatasetReveal:
+    """The FULL labeled dataset a finalized submission was scored against.
+
+    Regenerated from the submission's published (on-chain-derived) seed so anyone
+    can independently re-grade its k=3 scores. The regenerated artifact's SHA-256
+    is re-verified against the hash pinned at scoring, so the revealed bytes
+    provably are the scored dataset. 404 for an unknown / not-yet-finalized agent
+    (a provisional agent's answers are never revealed); 502 if the generator drifts
+    from the pinned hash; 503 if the generate service is unavailable.
+
+    Safe despite carrying the answer key: the seed is one-time and was
+    unpredictable at submission, so a past dataset's answers cannot help overfit a
+    future (differently-seeded) run.
+    """
+    # A finalized dataset never changes (fixed seed), so it is immutable + highly
+    # cacheable.
+    response.headers["Cache-Control"] = "public, max-age=3600, immutable"
+    row = await get_submission_scores(session, agent_id=agent_id)
+    if row is None or row.dataset_seed is None or row.dataset_run_size is None:
+        raise HTTPException(
+            status_code=404, detail="no revealable dataset for this agent"
+        )
+    try:
+        artifact, sha = await generator.fetch_dataset(
+            row.dataset_seed, row.dataset_run_size
+        )
+    except DataPipelineError as e:
+        raise HTTPException(
+            status_code=503, detail="dataset generate service unavailable"
+        ) from e
+    if row.dataset_sha256 and sha.lower() != row.dataset_sha256.lower():
+        # The regenerated dataset does not hash to what was pinned at scoring —
+        # generator drift. Refuse rather than serve a dataset that is not the one
+        # that was scored.
+        raise HTTPException(
+            status_code=502,
+            detail="regenerated dataset does not match the pinned hash",
+        )
+    bench_version = artifact.get("bench_version")
+    return PublicDatasetReveal(
+        agent_id=row.agent_id,
+        miner_hotkey=row.miner_hotkey,
+        seed=row.dataset_seed,
+        run_size=row.dataset_run_size,
+        dataset_sha256=sha,
+        bench_version=bench_version if isinstance(bench_version, int) else None,
+        dataset_seed_block=row.dataset_seed_block,
+        dataset_seed_block_hash=row.dataset_seed_block_hash,
+        artifact=artifact,
+    )
 
 
 @router.get("/audit", response_model=PublicAuditResponse)

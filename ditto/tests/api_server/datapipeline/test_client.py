@@ -65,3 +65,36 @@ async def test_generate_raises_on_bad_status() -> None:
     with pytest.raises(DataPipelineError):
         await gen.generate(1)
     await gen.aclose()
+
+
+async def test_fetch_dataset_returns_body_and_hash() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["run_size"] == "medium"
+        return httpx.Response(
+            200,
+            headers={"X-Dataset-SHA256": "CD" * 32},
+            json={"seed": 7, "bench_version": 2, "tool_cases": []},
+        )
+
+    gen = _generator(handler)
+    artifact, sha = await gen.fetch_dataset(7, "medium")
+    assert sha == "cd" * 32
+    assert artifact["bench_version"] == 2
+    await gen.aclose()
+
+
+async def test_fetch_dataset_raises_on_non_object_body() -> None:
+    gen = _generator(
+        lambda _r: httpx.Response(
+            200, headers={"X-Dataset-SHA256": "cd" * 32}, json=[1, 2, 3]
+        )
+    )
+    with pytest.raises(DataPipelineError):
+        await gen.fetch_dataset(1, "full")
+    await gen.aclose()
+
+
+async def test_null_generator_fetch_dataset_raises() -> None:
+    gen = create_generator(_config(url=None))
+    with pytest.raises(DataPipelineError):
+        await gen.fetch_dataset(1, "full")

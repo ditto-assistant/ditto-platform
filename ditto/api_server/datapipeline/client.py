@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
@@ -58,6 +58,22 @@ class DatasetGenerator(Protocol):
         """
         ...
 
+    async def fetch_dataset(
+        self, seed: int, run_size: str
+    ) -> tuple[dict[str, Any], str]:
+        """Return the FULL labeled dataset artifact for ``(seed, run_size)``.
+
+        Unlike :meth:`generate` (which discards the body and keeps only the hash),
+        this returns the whole DatasetArtifact including answer keys, for the
+        public finalized-dataset reveal (independent re-grading). Returns
+        ``(artifact_json, sha256_hex)``.
+
+        Raises:
+            DataPipelineError: on any failure (service down, bad status, missing
+                hash header, unparseable body).
+        """
+        ...
+
     async def aclose(self) -> None:
         """Release the underlying connection pool."""
         ...
@@ -80,6 +96,15 @@ class NullGenerator:
             "unset); cannot generate a per-submission dataset"
         )
 
+    async def fetch_dataset(
+        self, seed: int, run_size: str
+    ) -> tuple[dict[str, Any], str]:
+        del seed, run_size
+        raise DataPipelineError(
+            "data-pipeline generate service is not configured (DATA_PIPELINE_URL "
+            "unset); cannot reveal a dataset"
+        )
+
     async def aclose(self) -> None:
         return None
 
@@ -98,13 +123,35 @@ class HttpDatasetGenerator:
         return self._config.run_size
 
     async def generate(self, seed: int) -> str:
+        assert self._config.run_size is not None  # only built when enabled
+        # generate() only needs the hash; the body (if any) is discarded, so it
+        # never requires a parseable JSON payload.
+        _, sha = await self._post_generate(seed, self._config.run_size)
+        return sha
+
+    async def fetch_dataset(
+        self, seed: int, run_size: str
+    ) -> tuple[dict[str, Any], str]:
+        resp, sha = await self._post_generate(seed, run_size)
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise DataPipelineError("generate service returned invalid JSON") from e
+        if not isinstance(body, dict):
+            raise DataPipelineError("generate service returned a non-object body")
+        return body, sha
+
+    async def _post_generate(
+        self, seed: int, run_size: str
+    ) -> tuple[httpx.Response, str]:
+        """POST ``/generate``, returning the response + its verified SHA header."""
         url = self._config.url
         assert url is not None  # only built when enabled
         endpoint = f"{url.rstrip('/')}/generate"
         try:
             resp = await self._client.post(
                 endpoint,
-                params={"seed": str(seed), "run_size": self._config.run_size},
+                params={"seed": str(seed), "run_size": run_size},
                 headers=await self._auth_header(url),
             )
             resp.raise_for_status()
@@ -117,7 +164,7 @@ class HttpDatasetGenerator:
             raise DataPipelineError(
                 f"generate service response missing {_SHA_HEADER} header"
             )
-        return sha
+        return resp, sha
 
     async def _auth_header(self, audience: str) -> dict[str, str]:
         """Return the ``Authorization`` header, or ``{}`` for unauthenticated mode.

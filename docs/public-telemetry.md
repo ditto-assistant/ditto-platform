@@ -104,6 +104,19 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   an unknown or not-yet-public agent. This is the one surface that intentionally
   exposes `validator_hotkey` + raw `seed` (see the anti-gaming posture above); it
   still omits `per_case`.
+- `GET /api/v1/public/agent/{agent_id}/dataset` → `{ agent_id, miner_hotkey,
+  seed, run_size, dataset_sha256, bench_version, dataset_seed_block(+hash),
+  artifact }`.
+  The **finalized-dataset reveal** (task A): the FULL labeled DatasetArtifact
+  (answer keys included) a finalized submission was scored against, regenerated
+  from its published on-chain-derived seed, so anyone can **independently
+  re-grade** its k=3 scores. The regenerated artifact's SHA-256 is re-verified
+  against the hash pinned at scoring (502 on drift), so the revealed bytes
+  provably are the scored dataset. Gated to finalized (scored/live) agents (404
+  otherwise — a provisional agent's answers are never revealed); 503 when the
+  generate service is unavailable. Safe despite the answer key: the seed is
+  one-time and was unpredictable at submission (see the anti-gaming posture), so a
+  past dataset's answers cannot help overfit a future run.
 - `GET /api/v1/public/audit?since_seq=&limit=` → `{ generated_at, count,
   genesis_hash, head_hash, entries: [ { seq, agent_id, validator_hotkey, event,
   payload, prev_hash, entry_hash, recorded_at } ] }`.

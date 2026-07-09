@@ -501,6 +501,52 @@ class PublicSubmissionsResponse(BaseModel):
     ]
 
 
+class PublicDatasetReveal(BaseModel):
+    """The full labeled dataset a finalized submission was scored against.
+
+    Regenerated from the submission's published (on-chain-derived) seed, so anyone
+    can **independently re-grade** the k=3 scores: the ``artifact`` carries the
+    complete DatasetArtifact including the answer keys (expected tools/answers).
+    Safe to publish because the seed is one-time and unpredictable, so revealing a
+    past submission's answers cannot help overfit any future (differently-seeded)
+    run. ``dataset_sha256`` is re-verified to match what was pinned at scoring, so
+    the revealed bytes provably are the scored dataset.
+    """
+
+    agent_id: Annotated[UUID, Field(description="The scored agent's id.")]
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
+    ]
+    seed: Annotated[int, Field(description="Dataset seed (on-chain derived).")]
+    run_size: Annotated[
+        str, Field(description="Generator profile (small|medium|full).")
+    ]
+    dataset_sha256: Annotated[
+        str, Field(description="SHA-256 of the artifact, verified against the pin.")
+    ]
+    bench_version: Annotated[
+        int | None,
+        Field(default=None, description="Benchmark version of the artifact."),
+    ]
+    dataset_seed_block: Annotated[
+        int | None,
+        Field(default=None, description="On-chain block the seed was derived from."),
+    ]
+    dataset_seed_block_hash: Annotated[
+        str | None, Field(default=None, description="Hash of the seed block.")
+    ]
+    artifact: Annotated[
+        dict[str, Any],
+        Field(
+            description=(
+                "The full labeled DatasetArtifact (tool + memory cases, seeding "
+                "waves, fixtures, AND the answer keys) so the score is "
+                "independently reproducible."
+            )
+        ),
+    ]
+
+
 class PublicAuditEntry(BaseModel):
     """One entry of the append-only, hash-chained public score audit log.
 

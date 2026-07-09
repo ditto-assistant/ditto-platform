@@ -24,7 +24,8 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_server.dependencies import get_session
+from ditto.api_server.datapipeline import DataPipelineError
+from ditto.api_server.dependencies import get_dataset_generator, get_session
 from ditto.db.models import Agent, Base
 from ditto.db.queries.audit import (
     EVENT_SCORE,
@@ -605,6 +606,110 @@ async def _seed_audit(
                 payload={"run_id": f"run_{i}", "composite": 0.5, "seed": 42},
                 recorded_at=datetime(2026, 6, 8, 12, i, 0, tzinfo=UTC),
             )
+
+
+class _FakeRevealGenerator:
+    """Stands in for the data-pipeline generate service on the reveal path."""
+
+    def __init__(
+        self,
+        *,
+        artifact: dict | None = None,
+        sha: str = "cd" * 32,
+        fail: bool = False,
+    ) -> None:
+        self._artifact = artifact if artifact is not None else {"bench_version": 2}
+        self._sha = sha
+        self._fail = fail
+        self.calls = 0
+
+    async def fetch_dataset(self, seed: int, run_size: str) -> tuple[dict, str]:
+        self.calls += 1
+        if self._fail:
+            raise DataPipelineError("generate service down")
+        return {**self._artifact, "seed": seed, "run_size": run_size}, self._sha
+
+
+def _install_generator(app: FastAPI, generator: object) -> None:
+    async def _gen() -> object:
+        return generator
+
+    app.dependency_overrides[get_dataset_generator] = _gen
+
+
+class TestPublicDatasetReveal:
+    async def test_reveals_full_labeled_dataset_for_finalized_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        _install_db(app, session_maker)
+        # The generator returns a dataset whose sha matches the pinned "cd"*32.
+        artifact = {"bench_version": 2, "tool_cases": [{"expected_tools": ["x"]}]}
+        gen = _FakeRevealGenerator(artifact=artifact, sha="cd" * 32)
+        _install_generator(app, gen)
+
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/dataset")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["agent_id"] == agent_id
+        assert body["seed"] == 987654321
+        assert body["run_size"] == "full"
+        assert body["dataset_sha256"] == "cd" * 32
+        assert body["bench_version"] == 2
+        # The FULL labeled artifact (answer keys included) is served.
+        assert body["artifact"]["tool_cases"][0]["expected_tools"] == ["x"]
+        assert gen.calls == 1
+
+    async def test_404_for_unfinalized_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4],
+            status=AgentStatus.EVALUATING,
+        )
+        _install_db(app, session_maker)
+        _install_generator(app, _FakeRevealGenerator())
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/dataset")
+        assert resp.status_code == 404
+
+    async def test_502_on_generator_hash_drift(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        _install_db(app, session_maker)
+        # Generator returns a DIFFERENT sha than the pinned "cd"*32.
+        _install_generator(app, _FakeRevealGenerator(sha="ab" * 32))
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/dataset")
+        assert resp.status_code == 502
+
+    async def test_503_when_generator_unavailable(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        _install_db(app, session_maker)
+        _install_generator(app, _FakeRevealGenerator(fail=True))
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/dataset")
+        assert resp.status_code == 503
 
 
 class TestPublicAudit:
