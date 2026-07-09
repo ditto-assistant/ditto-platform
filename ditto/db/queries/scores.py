@@ -322,6 +322,8 @@ class SubmissionRow:
     dataset_seed: int | None
     dataset_sha256: str | None
     dataset_run_size: str | None
+    dataset_seed_block: int | None
+    dataset_seed_block_hash: str | None
     last_scored_at: datetime | None
     scores: list[Score]
 
@@ -349,6 +351,8 @@ async def get_submission_scores(
         dataset_seed=agent.dataset_seed,
         dataset_sha256=agent.dataset_sha256,
         dataset_run_size=agent.dataset_run_size,
+        dataset_seed_block=agent.dataset_seed_block,
+        dataset_seed_block_hash=agent.dataset_seed_block_hash,
         last_scored_at=last_scored_at,
         scores=sorted(scores, key=lambda s: s.validator_hotkey),
     )
@@ -396,6 +400,8 @@ async def list_public_submissions(
             dataset_seed=agent.dataset_seed,
             dataset_sha256=agent.dataset_sha256,
             dataset_run_size=agent.dataset_run_size,
+            dataset_seed_block=agent.dataset_seed_block,
+            dataset_seed_block_hash=agent.dataset_seed_block_hash,
             last_scored_at=_as_utc(last_scored) if last_scored else None,
             scores=sorted(
                 by_agent.get(agent.agent_id, []), key=lambda s: s.validator_hotkey

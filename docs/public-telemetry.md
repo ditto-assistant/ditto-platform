@@ -22,9 +22,14 @@ The **aggregate leaderboard** stays aggregate (best-per-miner, no per-run seed).
 The **per-submission k=3 record** (`/submissions`, `/agent/{id}/scores`, added
 2026-07-09) goes further for trust: it publishes which validators scored an
 agent, each one's exact numbers plus signature, the finalized median, and the
-raw dataset seed. The raw seed is safe to publish here because the platform
-draws it *after* screening (the miner never sees it before submitting) and it
-rotates per submission, so a past seed can never help pre-overfit a future run.
+raw dataset seed. The raw seed is safe to publish here because it is derived from an **on-chain
+block** at job-ready (see `onchain_seed.py`), which is causally after the miner
+committed their submission, so they could not have anticipated it, and it rotates
+per submission, so a past seed can never help pre-overfit a future run. The
+per-submission record also publishes `dataset_seed_block` + `dataset_seed_block_hash`
+so anyone can recompute `derive_seed(block_hash, agent_id)` and confirm the seed
+was **not platform-chosen** (removing the last platform-trust assumption; a null
+block flags the rare CSPRNG fallback used when the chain was unavailable).
 The one line that never moves: **per-case rows stay private** (`expected` /
 `called` / `case_id` are the answer key). If we ever want research-grade
 per-case release, do it on a delay (after that dataset generation is retired),

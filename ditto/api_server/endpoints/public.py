@@ -331,6 +331,8 @@ def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
         dataset_seed=row.dataset_seed,
         dataset_sha256=row.dataset_sha256,
         dataset_run_size=row.dataset_run_size,
+        dataset_seed_block=row.dataset_seed_block,
+        dataset_seed_block_hash=row.dataset_seed_block_hash,
         scores=[
             PublicValidatorScore(
                 validator_hotkey=s.validator_hotkey,

@@ -430,6 +430,25 @@ class PublicSubmissionScores(BaseModel):
         str | None,
         Field(default=None, description="Generator profile (small|medium|full)."),
     ]
+    dataset_seed_block: Annotated[
+        int | None,
+        Field(
+            default=None,
+            description=(
+                "On-chain block number the seed was derived from. Fetch this "
+                "block's hash and recompute derive_seed(hash, agent_id) to verify "
+                "the seed was not platform-chosen. Null on the CSPRNG fallback "
+                "(chain was unavailable at job-ready)."
+            ),
+        ),
+    ]
+    dataset_seed_block_hash: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Hash of dataset_seed_block; the seed's verification input.",
+        ),
+    ]
     scores: Annotated[
         list[PublicValidatorScore],
         Field(default_factory=list, description="Per-validator scores, by hotkey."),

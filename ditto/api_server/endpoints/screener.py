@@ -30,7 +30,7 @@ import logging
 import re
 import secrets
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
@@ -61,8 +61,13 @@ from ditto.api_server.endpoints.validator import (
     _assert_validator_permitted,
     _verify_signature,
 )
+from ditto.api_server.onchain_seed import derive_seed
 from ditto.api_server.storage import S3StorageClient
+from ditto.chain import ChainError
 from ditto.db.queries.agents import get_agent_by_id, list_agents_by_status
+
+if TYPE_CHECKING:
+    from ditto.chain import ChainClient
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +90,40 @@ _SCREENABLE_STATUSES = (AgentStatus.UPLOADED, AgentStatus.SCREENING)
 
 
 def _fresh_dataset_seed() -> int:
-    """A fresh, unpredictable non-negative int64 dataset seed.
+    """Fallback local-CSPRNG seed, used only when chain derivation is unavailable.
 
     Cryptographically random so a miner cannot anticipate their dataset; bounded
     to the signed 64-bit range the ``scores.seed`` / ``agents.dataset_seed``
-    columns store (``[0, 2**63)``). Mirrors dittobench-api's ``FreshSeed``.
+    columns store (``[0, 2**63)``). Mirrors dittobench-api's ``FreshSeed``. The
+    preferred path is :func:`_derive_dataset_seed` (verifiable on-chain); a seed
+    from here is flagged by null ``dataset_seed_block`` columns so an observer can
+    see it was not chain-derived.
     """
     return secrets.randbits(63)
+
+
+async def _derive_dataset_seed(
+    chain: ChainClient, agent_id: UUID
+) -> tuple[int, int | None, str | None]:
+    """Derive the dataset seed from the latest on-chain block (verifiable).
+
+    Returns ``(seed, block_number, block_hash)``. On a chain-read failure it falls
+    back to a local CSPRNG seed with ``(None, None)`` block reference, so a chain
+    blip never halts submissions but the (non-verifiable) provenance is explicit.
+    The block is read at job-ready, which is causally after the miner committed
+    their submission, so they could not have anticipated the seed.
+    """
+    try:
+        block = await chain.get_latest_block()
+    except ChainError as e:
+        logger.warning(
+            "on-chain seed derivation unavailable (%s); falling back to a local "
+            "CSPRNG seed for agent %s (block provenance will be null)",
+            e,
+            agent_id,
+        )
+        return _fresh_dataset_seed(), None, None
+    return derive_seed(block.hash, agent_id), block.number, block.hash
 
 
 class ScreenerAuthError(Exception):
@@ -277,7 +309,7 @@ async def submit_result(
     # 3. Generate the per-submission dataset (outside the row lock). Only on a pass,
     #    when generation is enabled, and when the agent is not already pinned (a
     #    cheap pre-read guards a re-reported verdict from regenerating).
-    new_dataset: tuple[int, str, str] | None = None
+    new_dataset: tuple[int, str, str, int | None, str | None] | None = None
     if payload.passed and generator.run_size is not None:
         # Own transaction so the read commits/closes before the write txn below
         # (a bare SELECT autobegins a transaction that would collide with it).
@@ -287,9 +319,17 @@ async def submit_result(
                 raise AgentNotFoundError(f"no agent with id={agent_id}")
             needs_dataset = existing.dataset_seed is None
         if needs_dataset:
-            seed = _fresh_dataset_seed()
+            seed, block_number, block_hash = await _derive_dataset_seed(
+                chain, agent_id
+            )
             dataset_sha256 = await generator.generate(seed)
-            new_dataset = (seed, dataset_sha256, generator.run_size)
+            new_dataset = (
+                seed,
+                dataset_sha256,
+                generator.run_size,
+                block_number,
+                block_hash,
+            )
 
     # 4. Atomic: apply the verdict + pin the dataset. The row lock serializes
     #    concurrent verdicts so the status guard + transition can't be lost-updated.
@@ -313,9 +353,13 @@ async def submit_result(
             and agent.status == AgentStatus.EVALUATING
             and agent.dataset_seed is None
         ):
-            agent.dataset_seed, agent.dataset_sha256, agent.dataset_run_size = (
-                new_dataset
-            )
+            (
+                agent.dataset_seed,
+                agent.dataset_sha256,
+                agent.dataset_run_size,
+                agent.dataset_seed_block,
+                agent.dataset_seed_block_hash,
+            ) = new_dataset
         result_status = agent.status
 
     logger.info(

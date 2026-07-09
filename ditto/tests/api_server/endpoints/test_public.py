@@ -118,6 +118,8 @@ async def _seed_k3(
     dataset_seed: int | None = 987654321,
     dataset_sha256: str | None = "cd" * 32,
     dataset_run_size: str | None = "full",
+    dataset_seed_block: int | None = 4321,
+    dataset_seed_block_hash: str | None = "0x" + "9f" * 32,
     base_time: datetime = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
 ) -> str:
     """Seed one agent scored by ``len(composites)`` distinct validators.
@@ -142,6 +144,8 @@ async def _seed_k3(
             dataset_seed=dataset_seed,
             dataset_sha256=dataset_sha256,
             dataset_run_size=dataset_run_size,
+            dataset_seed_block=dataset_seed_block,
+            dataset_seed_block_hash=dataset_seed_block_hash,
             created_at=datetime.now(UTC),
         )
         s.add(agent)
@@ -451,6 +455,10 @@ class TestPublicSubmissionScores:
         assert body["dataset_seed"] == 987654321
         assert body["dataset_sha256"] == "cd" * 32
         assert body["dataset_run_size"] == "full"
+        # The on-chain seed provenance lets anyone verify the seed was not
+        # platform-chosen (recompute derive_seed(block_hash, agent_id)).
+        assert body["dataset_seed_block"] == 4321
+        assert body["dataset_seed_block_hash"] == "0x" + "9f" * 32
         # All three validators, each with hotkey + signature (self-verifying).
         assert len(body["scores"]) == 3
         hotkeys = {s["validator_hotkey"] for s in body["scores"]}

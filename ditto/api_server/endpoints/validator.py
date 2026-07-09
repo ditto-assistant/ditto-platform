@@ -544,6 +544,8 @@ async def submit_score(
                         ),
                         "dataset_seed": agent.dataset_seed,
                         "dataset_sha256": agent.dataset_sha256,
+                        "dataset_seed_block": agent.dataset_seed_block,
+                        "dataset_seed_block_hash": agent.dataset_seed_block_hash,
                         "status": agent.status.value,
                     },
                     recorded_at=audit_now,

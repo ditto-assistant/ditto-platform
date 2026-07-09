@@ -137,6 +137,18 @@ class Agent(Base):
     issued with the ticket so the validator's scoring call uses the same profile.
     Null until job-ready."""
 
+    dataset_seed_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    """Number of the on-chain block whose hash the ``dataset_seed`` was derived
+    from (see :mod:`ditto.api_server.onchain_seed`). Pinned at job-ready so anyone
+    can fetch that block, recompute ``derive_seed(block_hash, agent_id)``, and
+    verify the seed the platform published — the seed is not platform-chosen. Null
+    until job-ready, or when chain-derivation is unavailable (fallback path)."""
+
+    dataset_seed_block_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Hex hash of :attr:`dataset_seed_block`, stored alongside the number so a
+    verifier need not trust the platform's block lookup: it recomputes the seed
+    directly from this hash + the agent id. Null until job-ready / on fallback."""
+
     code_embedding: Mapped[list | None] = mapped_column(_JSON_VARIANT, nullable=True)
     """Unit-norm code-embedding vector (JSON float array) of the crate's canonical
     source, from the self-hosted the code-embedding signal embedding service (see
