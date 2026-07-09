@@ -52,6 +52,21 @@ class _LedgerSnapshot:
     generated_at: datetime
 
 
+def _composite_stderr(details: dict | None) -> float | None:
+    """Read the composite standard error stashed in a score's details blob
+    (mirroring how bench_version is surfaced). Returns None when absent or not a
+    finite non-negative number, so a malformed value degrades to the flat-margin
+    fold rather than corrupting the indifference band."""
+    if not isinstance(details, dict):
+        return None
+    v = details.get("composite_stderr")
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        f = float(v)
+        if f >= 0.0 and f == f and f != float("inf"):
+            return f
+    return None
+
+
 def _cached_snapshot(request: Request) -> _LedgerSnapshot | None:
     return getattr(request.app.state, "ledger_snapshot", None)
 
@@ -102,6 +117,7 @@ async def scores(
             seed=r.seed,
             validator_hotkey=r.validator_hotkey,
             signature=r.signature,
+            composite_stderr=_composite_stderr(r.details),
             status=r.status,
         )
         for r in rows

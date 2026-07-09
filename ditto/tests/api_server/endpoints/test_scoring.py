@@ -274,3 +274,18 @@ class TestScoringLiveness:
         resp = await client.get("/api/v1/scoring/scores", headers=_AUTH_HEADER)
         assert resp.status_code == 503
         assert "staleness limit" in resp.json()["message"]
+
+
+def test_composite_stderr_reads_details() -> None:
+    """The ledger surfaces composite_stderr from the score details blob, and
+    degrades to None for absent or malformed values (flat-margin fold)."""
+    from ditto.api_server.endpoints.scoring import _composite_stderr
+
+    assert _composite_stderr({"composite_stderr": 0.031}) == 0.031
+    assert _composite_stderr({"composite_stderr": 0}) == 0.0
+    assert _composite_stderr({}) is None
+    assert _composite_stderr(None) is None
+    assert _composite_stderr({"composite_stderr": -1.0}) is None
+    assert _composite_stderr({"composite_stderr": "0.5"}) is None
+    assert _composite_stderr({"composite_stderr": True}) is None
+    assert _composite_stderr({"composite_stderr": float("inf")}) is None

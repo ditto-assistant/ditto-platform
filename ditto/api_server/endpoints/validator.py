@@ -441,6 +441,11 @@ async def submit_score(
         # run scored from now on is ever recorded as "legacy" (null version).
         # An explicit version in the report is left as-is (honest provenance).
         stamp_bench_version(score_details)
+        # Stash the composite standard error into details so the ledger can
+        # surface it (mirroring bench_version; no schema migration). The
+        # validator reads it back for the KOTH indifference band.
+        if report.composite_stderr is not None:
+            score_details["composite_stderr"] = report.composite_stderr
         if report.per_case:
             score_details["per_case"] = [
                 c.model_dump(mode="json") for c in report.per_case

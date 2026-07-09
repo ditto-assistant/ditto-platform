@@ -294,6 +294,20 @@ class ScoreReport(BaseModel):
     ]
     median_ms: Annotated[int, Field(ge=0, description="Median per-case latency (ms).")]
     n: Annotated[int, Field(ge=0, description="Number of cases scored.")]
+    composite_stderr: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            description=(
+                "Optional standard error of the composite for this run. Surfaced "
+                "on the scoring ledger so the validator's KOTH fold can gate a "
+                "challenger on measurement uncertainty (the indifference band) "
+                "instead of a flat margin. Additive-optional; not covered by the "
+                "signature and never affects the score."
+            ),
+        ),
+    ]
     generated_at: Annotated[
         datetime, Field(description="When the report was produced (UTC).")
     ]
@@ -428,6 +442,21 @@ class LedgerEntry(BaseModel):
         Field(
             default=None,
             description="Validator's hex sr25519 signature, if stored.",
+        ),
+    ]
+    composite_stderr: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            description=(
+                "Standard error of the composite for the winning run, if the "
+                "score report carried one. The validator's KOTH fold uses it for "
+                "the measurement-uncertainty indifference band (dethrone only when "
+                "a challenger's lead exceeds z*sqrt(se_c^2 + se_champ^2)); absent "
+                "means the fold falls back to the flat relative margin. "
+                "Additive-optional, mirroring bench_version."
+            ),
         ),
     ]
     status: Annotated[
