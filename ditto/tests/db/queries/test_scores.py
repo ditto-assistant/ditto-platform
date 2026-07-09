@@ -463,4 +463,5 @@ class TestListScoresForBenchVersion:
         assert score.run_id == "r1"
         assert miner == _MINER
         # The unredacted answer key rides along for the (retired) corpus.
+        assert score.details is not None
         assert score.details["per_case"][0]["expected"] == ["x"]
