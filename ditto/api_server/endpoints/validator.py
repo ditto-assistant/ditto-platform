@@ -65,6 +65,11 @@ from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.queries.agents import get_agent_by_id, list_agents_by_status
+from ditto.db.queries.audit import (
+    EVENT_FINALIZED,
+    EVENT_SCORE,
+    append_audit_entry,
+)
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     list_eligible_ledger,
@@ -455,6 +460,29 @@ async def submit_score(
             signature=payload.signature,
             details=score_details or None,
         )
+        # Append the immutable, hash-chained audit entry for this score in the
+        # same transaction (durable iff the score is). Records the full signed
+        # tuple + signature so the entry is independently verifiable off the
+        # public audit feed, never any per-case answer-key content.
+        audit_now = datetime.now(UTC)
+        await append_audit_entry(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            event=EVENT_SCORE,
+            payload={
+                "run_id": report.run_id,
+                "seed": report.seed,
+                "composite": report.composite,
+                "tool_mean": report.tool_mean,
+                "memory_mean": report.memory_mean,
+                "median_ms": report.median_ms,
+                "n": report.n,
+                "signature": payload.signature,
+                "generated_at": report.generated_at.isoformat(),
+            },
+            recorded_at=audit_now,
+        )
         # Persist the crate's structural (AST) fingerprint from the report, so it
         # is available for the gate here and for future cross-miner comparison.
         # Advisory + unsigned: only overwrite when the report actually carries one,
@@ -497,6 +525,29 @@ async def submit_score(
                     )
                 else:
                     agent.status = AgentStatus.SCORED
+                # Append the finalize audit entry: quorum reached, the median the
+                # platform finalized on, and which validators scored it. The
+                # moderation detail (why held / duplicate_of) is deliberately kept
+                # out of the public chain — only the neutral outcome status.
+                await append_audit_entry(
+                    session,
+                    agent_id=agent_id,
+                    validator_hotkey=None,
+                    event=EVENT_FINALIZED,
+                    payload={
+                        "miner_hotkey": agent.miner_hotkey,
+                        "median_composite": median_composite,
+                        "quorum": SCORING_QUORUM,
+                        "score_count": len(agent_scores),
+                        "validator_hotkeys": sorted(
+                            s.validator_hotkey for s in agent_scores
+                        ),
+                        "dataset_seed": agent.dataset_seed,
+                        "dataset_sha256": agent.dataset_sha256,
+                        "status": agent.status.value,
+                    },
+                    recorded_at=audit_now,
+                )
         # Consume the ticket (one ticket, one score); the slot stays occupied.
         await mark_ticket_scored(
             session, agent_id=agent_id, validator_hotkey=payload.validator_hotkey

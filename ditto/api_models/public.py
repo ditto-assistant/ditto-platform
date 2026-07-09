@@ -10,7 +10,7 @@ hand a miner the benchmark's answer key (per-case ``expected``/``called``). See
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -479,6 +479,64 @@ class PublicSubmissionsResponse(BaseModel):
     submissions: Annotated[
         list[PublicSubmissionSummary],
         Field(default_factory=list, description="Recent finalized submissions."),
+    ]
+
+
+class PublicAuditEntry(BaseModel):
+    """One entry of the append-only, hash-chained public score audit log.
+
+    Each entry records a scoring event verbatim: a validator's signed ``score``
+    or an ``agent_finalized`` (quorum reached, the median + scoring validators).
+    ``entry_hash`` is the SHA-256 of the entry's canonical content (which embeds
+    ``prev_hash``); ``prev_hash`` links to the previous entry's ``entry_hash``.
+    A consumer replays the feed and recomputes each hash to prove the sequence
+    was never reordered, edited, or truncated.
+    """
+
+    seq: Annotated[int, Field(ge=1, description="Monotonic append order.")]
+    agent_id: Annotated[UUID, Field(description="Agent the event is about.")]
+    validator_hotkey: Annotated[
+        str | None,
+        Field(default=None, description="Scoring validator (null on finalize)."),
+    ]
+    event: Annotated[str, Field(description='"score" or "agent_finalized".')]
+    payload: Annotated[
+        dict[str, Any],
+        Field(description="Event content (the hash preimage's payload field)."),
+    ]
+    prev_hash: Annotated[
+        str, Field(description="Previous entry's entry_hash (hex); genesis = 64 zeros.")
+    ]
+    entry_hash: Annotated[
+        str, Field(description="SHA-256 (hex) of this entry's canonical content.")
+    ]
+    recorded_at: Annotated[
+        datetime, Field(description="When the platform appended the entry (UTC).")
+    ]
+
+
+class PublicAuditResponse(BaseModel):
+    """A page of the public audit feed, oldest first, with the chain root.
+
+    Paginate by ``seq``: replay from ``since_seq=0`` and re-request with the last
+    ``seq`` seen to stream new entries. ``genesis_hash`` is the ``prev_hash`` of
+    the very first entry, so a consumer can verify the chain from the root.
+    """
+
+    generated_at: Annotated[
+        datetime, Field(description="When this page was read (UTC).")
+    ]
+    count: Annotated[int, Field(ge=0, description="Entries in this page.")]
+    genesis_hash: Annotated[
+        str, Field(description="The chain root (first entry's prev_hash).")
+    ]
+    head_hash: Annotated[
+        str | None,
+        Field(default=None, description="entry_hash of the last entry in this page."),
+    ]
+    entries: Annotated[
+        list[PublicAuditEntry],
+        Field(default_factory=list, description="Entries with seq > since_seq."),
     ]
 
 

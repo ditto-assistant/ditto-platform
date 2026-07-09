@@ -33,6 +33,8 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Response
 
 from ditto.api_models import (
+    PublicAuditEntry,
+    PublicAuditResponse,
     PublicBenchIntegrity,
     PublicCaseResult,
     PublicCategoryStat,
@@ -47,6 +49,7 @@ from ditto.api_models import (
 )
 from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.endpoints.validator import SessionDep
+from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
@@ -405,3 +408,45 @@ async def agent_scores(
     if row is None:
         raise HTTPException(status_code=404, detail="no public scores for this agent")
     return _submission_scores(row)
+
+
+@router.get("/audit", response_model=PublicAuditResponse)
+async def audit(
+    response: Response,
+    session: SessionDep,
+    since_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> PublicAuditResponse:
+    """A page of the append-only, hash-chained score audit log, oldest first.
+
+    The tamper-evident public projection of every scoring event: each validator's
+    signed ``score`` and each ``agent_finalized`` (quorum reached, the median +
+    scoring validators), in append order. Replay from ``since_seq=0`` and
+    re-request with the last ``seq`` seen to stream new entries; recompute each
+    ``entry_hash`` and check it links to the prior ``prev_hash`` (rooted at
+    ``genesis_hash``) to prove nothing was reordered, edited, or dropped. Every
+    ``score`` entry also carries the validator's sr25519 signature, so a consumer
+    can verify authenticity against the published validator key. Never carries
+    per-case answer-key content.
+    """
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    entries = await list_audit_entries(session, since_seq=since_seq, limit=limit)
+    return PublicAuditResponse(
+        generated_at=datetime.now(UTC),
+        count=len(entries),
+        genesis_hash=GENESIS_HASH,
+        head_hash=entries[-1].entry_hash if entries else None,
+        entries=[
+            PublicAuditEntry(
+                seq=e.seq,
+                agent_id=e.agent_id,
+                validator_hotkey=e.validator_hotkey,
+                event=e.event,
+                payload=e.payload,
+                prev_hash=e.prev_hash,
+                entry_hash=e.entry_hash,
+                recorded_at=e.recorded_at,
+            )
+            for e in entries
+        ],
+    )

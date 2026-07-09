@@ -509,3 +509,67 @@ class BannedHotkey(Base):
         server_default=func.now(),
     )
     """When the ban was recorded (UTC)."""
+
+
+class ScoreAuditEntry(Base):
+    """One append-only, hash-chained entry in the public score audit log.
+
+    Every scoring *event* (a validator recording a score, and an agent
+    finalizing at the k=3 median) appends one immutable row here, in the same
+    transaction as the score write. Unlike ``scores`` (which is UPSERTed per
+    ``(agent, validator)`` and so reflects only the *current* score), this table
+    is never updated or deleted — it is the durable, ordered history.
+
+    Tamper-evidence is a hash chain: ``entry_hash`` = SHA-256 over the entry's
+    canonical JSON (which embeds ``prev_hash``), and ``prev_hash`` is the
+    previous entry's ``entry_hash`` (genesis = 64 zeros). Editing or removing any
+    historical entry breaks every subsequent link, so a public consumer that
+    replays the chain can prove nothing was silently rewritten. Each ``score``
+    entry also carries the validator's sr25519 ``signature`` verbatim, so an
+    entry is independently authenticatable against the published validator key —
+    the log adds ordering + immutability on top of the already-signed payload.
+    """
+
+    __tablename__ = "score_audit_log"
+
+    seq: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    """Monotonic append order (BIGSERIAL on Postgres, INTEGER rowid on SQLite)."""
+
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """Agent the event is about. Not FK-bound — the log outlives the agent row
+    (agents may be pruned; the audit history must not cascade away)."""
+
+    validator_hotkey: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Reporting validator for a ``score`` event; null for an ``agent_finalized``
+    event (which is the platform's own median computation, not one validator's)."""
+
+    event: Mapped[str] = mapped_column(Text, nullable=False)
+    """Event kind: ``score`` (one validator's signed score) or ``agent_finalized``
+    (quorum reached; the median + participating validators)."""
+
+    payload: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    """The event's immutable content, JSON. For ``score``: the full signed tuple
+    (run_id, seed, composite, tool/memory means, median_ms, n, signature,
+    generated_at). For ``agent_finalized``: median_composite, quorum, the
+    scoring validators, and the pinned dataset. Hashed into ``entry_hash``."""
+
+    prev_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    """The previous entry's ``entry_hash`` (hex); ``"0" * 64`` for the genesis."""
+
+    entry_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    """SHA-256 (hex) over this entry's canonical JSON, which embeds ``prev_hash``.
+    The chain link a public verifier recomputes to detect tampering."""
+
+    recorded_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    """When the platform appended the entry (UTC). Part of the hashed content."""
+
+    __table_args__ = (
+        UniqueConstraint("entry_hash", name="score_audit_log_entry_hash_key"),
+        Index("score_audit_log_agent_id_idx", "agent_id"),
+    )

@@ -26,6 +26,11 @@ from sqlalchemy.ext.asyncio import (
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.dependencies import get_session
 from ditto.db.models import Agent, Base
+from ditto.db.queries.audit import (
+    EVENT_SCORE,
+    GENESIS_HASH,
+    append_audit_entry,
+)
 from ditto.db.queries.scores import upsert_score
 
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
@@ -576,3 +581,78 @@ class TestPublicSubmissionScores:
         body = resp.json()
         assert body["count"] == 0
         assert body["submissions"] == []
+
+
+async def _seed_audit(
+    maker: async_sessionmaker[AsyncSession], *, n: int
+) -> None:
+    """Append ``n`` chained score entries to the audit log."""
+    async with maker() as s, s.begin():
+        for i in range(n):
+            await append_audit_entry(
+                s,
+                agent_id=uuid4(),
+                validator_hotkey="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+                event=EVENT_SCORE,
+                payload={"run_id": f"run_{i}", "composite": 0.5, "seed": 42},
+                recorded_at=datetime(2026, 6, 8, 12, i, 0, tzinfo=UTC),
+            )
+
+
+class TestPublicAudit:
+    async def test_feed_returns_chained_entries(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_audit(session_maker, n=3)
+        _install_db(app, session_maker)
+
+        resp = await client.get("/api/v1/public/audit")
+        assert resp.status_code == 200
+        assert resp.headers["Cache-Control"] == "public, max-age=30"
+        body = resp.json()
+        assert body["count"] == 3
+        assert body["genesis_hash"] == GENESIS_HASH
+        entries = body["entries"]
+        # Oldest first, contiguous seqs, and each links to the prior entry_hash.
+        assert [e["seq"] for e in entries] == sorted(e["seq"] for e in entries)
+        assert entries[0]["prev_hash"] == GENESIS_HASH
+        for prev, cur in zip(entries, entries[1:], strict=False):
+            assert cur["prev_hash"] == prev["entry_hash"]
+        assert body["head_hash"] == entries[-1]["entry_hash"]
+        # The signed-tuple payload is present; no per-case answer key ever is.
+        assert entries[0]["payload"]["run_id"] == "run_0"
+        assert '"per_case"' not in resp.text
+
+    async def test_feed_pages_by_since_seq(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_audit(session_maker, n=5)
+        _install_db(app, session_maker)
+
+        first = (await client.get("/api/v1/public/audit?limit=2")).json()
+        assert first["count"] == 2
+        last_seq = first["entries"][-1]["seq"]
+        nxt = (await client.get(f"/api/v1/public/audit?since_seq={last_seq}")).json()
+        assert nxt["count"] == 3
+        assert nxt["entries"][0]["seq"] > last_seq
+        # The page still links onto the first page's head.
+        assert nxt["entries"][0]["prev_hash"] == first["head_hash"]
+
+    async def test_feed_empty(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        body = (await client.get("/api/v1/public/audit")).json()
+        assert body["count"] == 0
+        assert body["entries"] == []
+        assert body["head_hash"] is None
+        assert body["genesis_hash"] == GENESIS_HASH

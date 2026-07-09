@@ -484,6 +484,50 @@ class TestSubmitScore:
             assert agent is not None
             assert agent.status == AgentStatus.SCORED
 
+    async def test_finalize_writes_verifiable_audit_chain(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from ditto.db.queries.audit import (
+            EVENT_FINALIZED,
+            EVENT_SCORE,
+            list_audit_entries,
+            verify_audit_chain,
+        )
+
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        # One below-quorum score, then the k=3 quorum (which re-scores validator 0
+        # with a fresh ticket): 4 append-only score events + 1 finalize.
+        await _seed_ticket(session_maker, agent_id, keypair=_KEYPAIRS[0])
+        await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id, keypair=_KEYPAIRS[0]),
+        )
+        await _score_to_quorum(client, agent_id, maker=session_maker, composite=0.82)
+
+        async with session_maker() as s:
+            entries = await list_audit_entries(s, limit=1000)
+        # Append-only: the re-score is its own entry even though the table upserts.
+        score_entries = [e for e in entries if e.event == EVENT_SCORE]
+        finalized = [e for e in entries if e.event == EVENT_FINALIZED]
+        assert len(score_entries) == 4
+        assert len(finalized) == 1
+        assert entries[-1].event == EVENT_FINALIZED
+        # The finalize entry carries the median + quorum + scoring validators.
+        fin = finalized[0].payload
+        assert fin["median_composite"] == pytest.approx(0.82)
+        assert fin["quorum"] == 3
+        assert fin["score_count"] == 3
+        assert len(fin["validator_hotkeys"]) == 3
+        assert fin["status"] == AgentStatus.SCORED.value
+        # The whole chain replays and verifies (tamper-evident end to end).
+        assert verify_audit_chain(entries) is True
+
     async def test_stamps_current_bench_version_when_omitted(
         self,
         app: FastAPI,

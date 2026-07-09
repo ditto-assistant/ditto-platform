@@ -99,6 +99,27 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   an unknown or not-yet-public agent. This is the one surface that intentionally
   exposes `validator_hotkey` + raw `seed` (see the anti-gaming posture above); it
   still omits `per_case`.
+- `GET /api/v1/public/audit?since_seq=&limit=` → `{ generated_at, count,
+  genesis_hash, head_hash, entries: [ { seq, agent_id, validator_hotkey, event,
+  payload, prev_hash, entry_hash, recorded_at } ] }`.
+  The **append-only, hash-chained audit log** (task #51): every scoring event in
+  order — each validator's signed `score` and each `agent_finalized` (quorum
+  reached, the median + scoring validators). `entry_hash` is SHA-256 over the
+  entry's canonical content (which embeds `prev_hash`); `prev_hash` links to the
+  previous `entry_hash`, rooted at `genesis_hash` (64 zeros). A consumer replays
+  from `since_seq=0`, re-requests with the last `seq` seen, and recomputes each
+  hash to prove nothing was reordered, edited, or dropped. Unlike `scores` (which
+  UPSERTs — a re-score overwrites the row), the log is insert-only: a re-score is
+  its own immutable entry, so the full history survives. Each `score` entry
+  carries the validator's sr25519 signature, so authenticity (who scored) and
+  integrity (nothing tampered) are both checkable off the public feed. Never
+  carries `per_case`.
+  **Storage note:** the canonical chain lives in Postgres (`score_audit_log`)
+  because the append must be *transactional with the score write* — durable iff
+  the score is, which a separate bucket object cannot guarantee. The public feed
+  above is the read surface; mirroring/anchoring entries into the results bucket
+  (or periodically checkpointing `head_hash` there for an external timestamp) is
+  an infra add-on on top of this verifiable core, not a correctness dependency.
 - `GET /api/v1/public/weights` → the last-published normalized weight vector
   (champion + tail) — mirrors what the validator set on-chain.
 - `GET /api/v1/public/health` → subnet rollup **from what the platform records**:
@@ -157,3 +178,9 @@ idea); no server needed since all data comes from the public API + wandb.
    pinned dataset (raw seed + sha256). Reads the existing `scores` rows; no
    schema change. This is the "transparency is the trust mechanism" surface for
    the decentralized k=3 model. Dashboard drill-down to consume it is TODO.
+6. ✅ Append-only hash-chained audit log (2026-07-09, task #51):
+   `score_audit_log` table (migration `d3a9f5e17c24`) + `/api/v1/public/audit`.
+   Every score submission appends one immutable, SHA-256-chained entry in the
+   score-write transaction; quorum appends an `agent_finalized` entry. Replayable
+   + verifiable off the public feed (`verify_audit_chain`); tamper (edit/reorder/
+   drop) breaks the chain. Bucket mirror/anchor is an optional infra add-on.
