@@ -34,6 +34,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TIMESTAMP
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.ticket_status import TicketStatus
 
 # Per-case detail is a JSON blob: JSONB on Postgres (indexable, compact),
 # plain JSON on the SQLite unit-test fallback. The variant keeps one model
@@ -369,6 +370,96 @@ class Score(Base):
         CheckConstraint("n >= 0", name="scores_n_check"),
         CheckConstraint("median_ms >= 0", name="scores_median_ms_check"),
         Index("scores_agent_id_idx", "agent_id"),
+    )
+
+
+class ValidatorTicket(Base):
+    """One validator's evaluation ticket for one agent (a k=3 scoring grant).
+
+    A submission is scored by exactly three validators. The platform issues at
+    most three tickets per agent, each to a *distinct* validator hotkey, and
+    refuses further requests ("no job for you"). A ticket is the right to score:
+    the validator loads the agent + the platform-generated dataset, scores it,
+    and must post the signed score back before ``deadline`` or the ticket
+    expires and its slot re-opens for another validator.
+
+    The composite primary key ``(agent_id, validator_hotkey)`` enforces
+    distinctness — a validator can hold at most one ticket per agent, so it can
+    never occupy two of the three slots and skew the median. ``agent_id`` is a
+    single-column FK to ``agents.agent_id`` with ``ON DELETE CASCADE`` because a
+    ticket is derived from a live submission.
+
+    The three composites themselves live in :class:`Score` (one row per
+    ``(agent, validator)``); a ticket tracks only issuance, the deadline, and
+    lifecycle. An agent finalizes (median-of-three) once it has three
+    ``scored`` tickets.
+    """
+
+    __tablename__ = "validator_tickets"
+
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """FK to ``agents.agent_id``. PK part 1."""
+
+    validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    """SS58 hotkey of the ticket-holding validator. PK part 2 (distinctness)."""
+
+    status: Mapped[TicketStatus] = mapped_column(
+        Enum(
+            TicketStatus,
+            name="ticketstatus",
+            values_callable=lambda enum_cls: [m.value for m in enum_cls],
+            create_constraint=True,
+        ),
+        nullable=False,
+        server_default=text("'issued'"),
+    )
+    """Current state: ``issued`` -> ``scored`` | ``expired``."""
+
+    issued_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """When the ticket was granted (UTC)."""
+
+    deadline: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    """When an unscored ticket expires and its slot re-opens (UTC)."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """When this row was first inserted (UTC)."""
+
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    """When this row was last updated (UTC)."""
+
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "agent_id", "validator_hotkey", name="validator_tickets_pkey"
+        ),
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="CASCADE",
+            name="validator_tickets_agent_id_fkey",
+        ),
+        Index("validator_tickets_agent_id_idx", "agent_id"),
+        # The expiry sweep and the live-slot count both scan open tickets only;
+        # a partial index keeps those hot paths off the full table.
+        Index(
+            "validator_tickets_open_idx",
+            "deadline",
+            postgresql_where=text("status = 'issued'"),
+        ),
     )
 
 
