@@ -448,10 +448,43 @@ class LedgerResponse(BaseModel):
         Field(description="Best eligible score per miner, highest composite first."),
     ]
     count: Annotated[int, Field(ge=0, description="Number of entries returned.")]
+    generated_at: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description=(
+                "When these entries were read from the DB (UTC). On a served "
+                "last-known-good snapshot this is the age of the cached read, not "
+                "'now'."
+            ),
+        ),
+    ] = None
+    stale: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "True when the live DB read failed and this is a served "
+                "last-known-good snapshot. A fold may still use it (the ledger is "
+                "durable and slow-moving) but should treat it as advisory."
+            ),
+        ),
+    ] = False
+    age_seconds: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description="Age of the snapshot in seconds (0 on a fresh read).",
+        ),
+    ] = 0
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
+                "generated_at": "2026-06-08T12:00:00Z",
+                "stale": False,
+                "age_seconds": 0,
                 "entries": [
                     {
                         "miner_hotkey": (
