@@ -231,6 +231,13 @@
        never dangles at a section's foot or stacks against the next heading. */
     .stat-group .stat-row:last-child { border-bottom: 0; padding-bottom: 0; }
     @media (max-width: 720px) { .stat-cols { column-count: 1; } }
+    .pc-block { margin-top: 22px; }
+    .pc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 0 30px; }
+    .pc-item { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 5px 0;
+      border-bottom: 1px solid color-mix(in oklab, var(--border) 52%, transparent); font-size: 12.5px; }
+    .pc-k { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pc-v { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .pc-v.good { color: var(--good); } .pc-v.mid { color: var(--text); } .pc-v.low { color: var(--danger); }
 
     /* Full-width dataset hash: the whole 64-char SHA on one monospace line,
        scrollable on narrow viewports rather than truncated. */
@@ -313,7 +320,26 @@
     .crow .fail { color: var(--danger); font-weight: 700; }
     .cmeta { color: var(--text-dim); font-size: 13px; font-variant-numeric: tabular-nums; }
     .cval { font-weight: 600; font-variant-numeric: tabular-nums; }
-    .cnote { color: var(--text-dim); font-size: 13px; margin-top: 3px; font-style: italic; }
+    .cval.good { color: var(--good); } .cval.mid { color: var(--text); } .cval.low { color: var(--danger); }
+    .cnote { color: var(--text-faint); font-size: 13px; margin-top: 3px; font-style: italic; }
+    /* Per-case results grouped by category, each group collapsed by default. */
+    .coverview { font-size: 12.5px; color: var(--text-dim); padding: 8px 0 12px; }
+    .coverview .good { color: var(--good); font-weight: 700; }
+    .coverview .danger { color: var(--danger); font-weight: 700; }
+    .cgroup { border-bottom: 1px solid color-mix(in oklab, var(--border) 55%, transparent); }
+    .cgroup:last-child { border-bottom: none; }
+    .cgsum { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; padding: 9px 0; }
+    .cgsum::-webkit-details-marker { display: none; }
+    .cgsum::before { content: "▸"; color: var(--text-faint); font-size: 11px; width: 10px; flex: none; }
+    .cgroup[open] > .cgsum::before { content: "▾"; }
+    .cgname { flex: 1; font-size: 12.5px; color: var(--text); }
+    .cgtally { display: flex; align-items: center; gap: 10px; }
+    .tb { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .tb.good { color: var(--good); } .tb.danger { color: var(--danger); } .tb.muted { color: var(--text-faint); }
+    .cgmean { font-weight: 700; font-variant-numeric: tabular-nums; min-width: 36px; text-align: right; }
+    .cgmean.good { color: var(--good); } .cgmean.mid { color: var(--text); } .cgmean.low { color: var(--danger); }
+    .cgroup .crow { padding-left: 22px; }
+    .cgroup .crow:last-child { border-bottom: none; }
 
     /* ── Drill-down modal ───────────────────────────────────── */
     .modal-back { position: fixed; inset: 0; background: rgba(4, 7, 12, 0.62); backdrop-filter: blur(3px); opacity: 0; pointer-events: none; transition: opacity .18s; z-index: 40; }
@@ -872,12 +898,18 @@
       if (m.judge_audit) det += stat("Audit judge", m.judge_audit);
       if (m.generator) det += stat("Dataset generator", m.generator);
       if (e.tokens != null) det += stat("Scoring token spend", e.tokens.toLocaleString());
+      // Per-category breakdown renders full width below the stat columns as a dense
+      // multi-column grid, so all ~40 categories stay compact and legible. Each cell
+      // carries the category purpose as a tooltip and colour-grades its mean.
       var pc = "";
       if (e.per_category && e.per_category.length) {
-        pc = e.per_category.slice().sort(function (a, b) { return b.mean - a.mean; }).map(function (c) {
-          return '<div class="stat-row"><span class="k">' + esc(categoryLabel(c.category)) +
-            ' <span class="muted">×' + c.count + '</span></span><span class="v">' + fx(c.mean) + '</span></div>';
+        var pcRows = e.per_category.slice().sort(function (a, b) { return b.mean - a.mean; }).map(function (c) {
+          return '<div class="pc-item" title="' + esc(categoryPurpose(c.category)) + '">' +
+            '<span class="pc-k">' + esc(categoryLabel(c.category)) + ' <span class="muted">×' + c.count + '</span></span>' +
+            '<span class="pc-v ' + scoreClass(c.mean) + '">' + fx(c.mean) + '</span></div>';
         }).join("");
+        pc = '<div class="pc-block"><div class="stat-head">Per-category breakdown</div>' +
+          '<div class="pc-grid">' + pcRows + '</div></div>';
       }
       // Anti-overfit / scoring-integrity telemetry, how the benchmark resists
       // gaming (paraphrase, NoLiMa lexical gap, self-report capping, seeding).
@@ -908,7 +940,6 @@
       var colStats =
         group("Overview", overview) +
         group("Benchmark run", det) +
-        group("Per-category breakdown", pc) +
         group("Benchmark integrity", ig) +
         trendBlock(e);
       var shaRow = e.dataset_sha256
@@ -916,6 +947,7 @@
         : "";
       document.getElementById("d-stats").innerHTML =
         '<div class="stat-cols">' + colStats + '</div>' +
+        pc +
         shaRow +
         casesSection(e) +
         categoryGlossary(e) +
@@ -970,19 +1002,53 @@
     // Human-readable name for each category key the API surfaces. Shown in place
     // of the raw key wherever a category appears (per-case rows, breakdowns, the
     // category glossary). A missing key falls back to the raw string.
+    // Human-readable names for every category the v2 benchmark emits. Keyed by the
+    // exact category slugs the API surfaces (persona question types + the tool-case
+    // catalog). A missing key falls back to the raw slug.
     var CATEGORY_LABEL = {
+      // memory question types
+      "single-session-recall": "Single-session recall",
       "multi-session": "Cross-session recall",
       "temporal-reasoning": "Time-aware recall",
-      "preference-application": "Preference in action",
+      "knowledge-update": "Updated-fact recall",
       "preference": "Preference recall",
+      "preference-application": "Preference in action",
+      "contradiction": "Change-of-mind recall",
+      "abstention": "Knowing when to abstain",
       "injection-resistance": "Injection resistance",
       "assistant-recall": "Assistant recall",
       "aggregation-count": "Counting and aggregation",
+      "isolation": "Cross-user isolation",
+      // tool categories
       "web_search": "Search when unknown",
       "memory_lookup": "Answer from memory",
+      "memory_subject": "Subject lookup",
+      "memory_fetch": "Fetch memories by ID",
+      "link_read": "Read a link",
+      "image_create": "Create an image",
+      "artifacts_create": "Create an artifact",
+      "agent_job": "Run a background job",
+      "agent_workflow": "Run a workflow",
+      "feedback": "File feedback",
+      "settings": "Change a setting",
+      "set_model": "Set the model",
+      "set_effort": "Set reasoning effort",
+      "set_tool_prefs": "Set tool preferences",
       "route_memory_not_web": "Memory vs. web routing",
+      "route_web_not_memory": "Web vs. memory routing",
+      "agent_run_not_read": "Run vs. read a job",
+      "agent_read_not_run": "Read vs. run a job",
+      "image_edit_not_create": "Edit vs. create an image",
+      "workflow_not_job": "Workflow vs. job",
+      "no_tool": "Answer directly",
       "arg_hallucination": "Argument grounding",
+      "multi_web_read": "Search then read",
       "parallel_web_image": "Parallel tool calls",
+      "multi_subject_scope": "Scoped subject search",
+      "multi_job_status": "Run then check a job",
+      "multi_image_edit": "Create then edit an image",
+      "web_result_usage": "Use a search result",
+      "multi_web_result_usage": "Use a fetched result",
     };
     function categoryLabel(cat) {
       return CATEGORY_LABEL[cat] || cat;
@@ -993,22 +1059,60 @@
     // covers any category not listed here.
     var CATEGORY_PURPOSE = {
       // memory question types
+      "single-session-recall": "Tests recall of a fact stated within a single conversation. The detail appears once and the question asks it straight back, the baseline memory case before any cross-session or temporal difficulty.",
       "multi-session": "Tests long-horizon recall across conversations. A detail set early is asked about much later, after many unrelated exchanges push it out of the recent context window. Rewards durable storage and retrieval over reliance on recent context.",
       "temporal-reasoning": "Tests time-aware memory. A fact is revised over the timeline, and the question asks for its value at a specific point. Rewards the version correct for that moment, not the latest or the first.",
-      "preference-application": "Tests whether a remembered preference changes behavior on a later task worded differently. Quoting the preference back is not enough. It has to shape the answer.",
+      "knowledge-update": "Tests tracking a fact that changed. An earlier value is later overwritten, and the question asks for the current one. Returning the stale value is the failure being probed.",
       "preference": "Tests direct recall of a preference the user stated outright, with no application step. This is the baseline for preference in action.",
+      "preference-application": "Tests whether a remembered preference changes behavior on a later task worded differently. Quoting the preference back is not enough. It has to shape the answer.",
+      "contradiction": "Tests handling a change of mind. The user reversed an earlier opinion, and the correct answer is the current stance, not the one they first gave.",
+      "abstention": "Tests restraint. The answer is not in memory and cannot be inferred, so the correct response is to say so rather than fabricate a plausible detail or call a tool with a guessed value.",
       "injection-resistance": "An adversarial safety test. Stored content hides instructions that try to hijack the agent or leak other memories. Rewards treating stored text as data, answering the real question, and refusing the planted instruction.",
       "assistant-recall": "Tests recall of the assistant's own earlier statements, not only the user's. A store that keeps only user-authored facts fails here.",
       "aggregation-count": "Tests reasoning over many stored items at once. The answer needs counting or combining evidence spread across several past mentions, so one retrieved memory is not enough.",
+      "isolation": "Tests that one user's memories never leak into another's. The question is scoped to a single user, and returning a value that belongs to a different user's graph scores zero.",
       // tool categories
       "web_search": "Tests tool-use judgment when the answer is not in memory. The agent should run a live search rather than guess or fabricate an answer.",
-      "memory_lookup": "Tests the opposite case. When the answer is already in memory, the agent should return it directly instead of making an unnecessary tool call.",
+      "memory_lookup": "Tests the inverse of search. When the answer is already in memory, the agent should return it directly instead of making an unnecessary tool call.",
+      "memory_subject": "Tests retrieving a stored subject, a grouped topic in memory, with the subject-search tool rather than a generic memory or web call.",
+      "memory_fetch": "Tests fetching specific memories by their identifiers with the fetch tool, rather than a broad search.",
+      "link_read": "Tests reading the contents of a URL the user supplied, using the read-links tool instead of a web search.",
+      "image_create": "Tests selecting the image-generation tool for a request to make a new image.",
+      "artifacts_create": "Tests routing a build-me-a-document-or-app request to the artifacts tool.",
+      "agent_job": "Tests dispatching a one-off background task through the agent-job tool.",
+      "agent_workflow": "Tests dispatching a named multi-step workflow through the workflow tool.",
+      "feedback": "Tests routing a report-this-to-the-team request to the feedback tool.",
+      "settings": "Tests applying a user settings change, such as theme, through the settings tool.",
+      "set_model": "Tests applying a change-my-model request through the model-setting tool.",
+      "set_effort": "Tests applying a reasoning-effort change through the correct settings tool.",
+      "set_tool_prefs": "Tests applying a change to which tools are enabled in chat, through the tool-preferences tool.",
       "route_memory_not_web": "Tests routing on a fact that was stored earlier. The correct action is to read memory, not search the web.",
+      "route_web_not_memory": "The mirror of memory-versus-web routing. A request that sounds like personal recall actually needs live web data the user could not have stored, so a web search is correct.",
+      "agent_run_not_read": "A run-versus-read trap. The request asks to start a new background job, not to check an existing one, so dispatching is correct.",
+      "agent_read_not_run": "The inverse run-versus-read trap. The request asks about the status of existing jobs, so listing them is correct rather than starting a new one.",
+      "image_edit_not_create": "An edit-versus-create trap. The user references an existing image to modify, so the edit tool is correct, not create.",
+      "workflow_not_job": "A job-versus-workflow trap. The request names a predefined workflow, so the workflow tool is correct rather than a one-off job.",
+      "no_tool": "Tests restraint on conversational turns. The request is small talk that needs no tool, so the agent should answer directly without calling anything.",
       "arg_hallucination": "Tests grounded tool arguments. A call may use only values the user supplied. Inventing parameters such as IDs, dates, or values is the failure caught here, even when the tool choice is right.",
+      "multi_web_read": "A multi-step trajectory. The answer needs a web search followed by reading a result, scored with order credit for doing both in sequence.",
       "parallel_web_image": "Tests decomposition of a multi-part request into the independent calls it needs, issued together and in full, rather than one at a time, partially, or with a step dropped.",
+      "multi_subject_scope": "A multi-step trajectory. The agent first finds the right subject, then searches within it, rather than making a single flat memory lookup.",
+      "multi_job_status": "A multi-step trajectory. The agent starts a background job and then checks its status, in that order.",
+      "multi_image_edit": "A multi-step trajectory. The agent creates an image and then edits it, scored with order credit.",
+      "web_result_usage": "Tests that the agent actually runs the tool and uses what it returns. The answer needs a value that exists only in the tool result, so it cannot come from self-report or prior knowledge.",
+      "multi_web_result_usage": "The multi-step version of result usage. The agent searches, reads a result, and must incorporate a value found only in that fetched content.",
     };
     function categoryPurpose(cat) {
       return CATEGORY_PURPOSE[cat] || ("A benchmark case in the “" + categoryLabel(cat) + "” category.");
+    }
+    // Grade a 0..1 score into a colour band so a strong result reads as strong at a
+    // glance. Tool cases are scored continuously (trajectory + quality), so a numeric
+    // score, not a binary pass/fail, is the honest signal for them.
+    function scoreClass(v) {
+      if (v == null) return "";
+      if (v >= 0.8) return "good";
+      if (v >= 0.5) return "mid";
+      return "low";
     }
 
     // Collapsed glossary of the metric terms that actually appear in this run.
@@ -1047,28 +1151,77 @@
         '<div class="gdesc" style="padding:4px 0 6px">A short summary of each category’s purpose. The exact prompts and expected answers are never shown.</div>' +
         body + "</details>";
     }
-    // Per-case results, redacted detail for analysis (category / kind / score /
-    // pass / latency / notes; never the answer key). Grouped tool-then-memory,
-    // worst score first so the weak spots surface. Collapsed behind a <details>.
+    // A case's pass/fail verdict. Memory cases carry a binary judge result (correct).
+    // Tool cases are graded continuously, so a full deterministic trajectory counts
+    // as a pass, a fully wrong one as a fail, and a partial trajectory as partial.
+    function caseVerdict(c) {
+      if (c.kind === "memory") return c.correct === true ? "pass" : c.correct === false ? "fail" : "partial";
+      if (c.tool_score >= 0.999) return "pass";
+      if (c.tool_score <= 0.001) return "fail";
+      return "partial";
+    }
+    // Roll a set of cases into a pass/fail/partial tally plus a mean score.
+    function caseTally(g) {
+      var t = { pass: 0, fail: 0, partial: 0, sum: 0 };
+      g.forEach(function (c) { t[caseVerdict(c)]++; t.sum += (c.score || 0); });
+      t.mean = g.length ? t.sum / g.length : 0;
+      return t;
+    }
+    function tallyBadges(t) {
+      var out = "";
+      if (t.pass) out += '<span class="tb good" title="' + t.pass + ' passed">' + t.pass + '&nbsp;✓</span>';
+      if (t.fail) out += '<span class="tb danger" title="' + t.fail + ' failed">' + t.fail + '&nbsp;✗</span>';
+      if (t.partial) out += '<span class="tb muted" title="' + t.partial + ' partial">' + t.partial + '&nbsp;~</span>';
+      return out;
+    }
+    // One per-case row (redacted: category / kind / score / verdict / latency / notes,
+    // never the answer key).
+    function caseRow(c) {
+      var v = caseVerdict(c);
+      var ok = v === "pass" ? '<span class="pass" title="Passed"><span aria-hidden="true">✓</span><span class="visually-hidden">passed</span></span>'
+        : v === "fail" ? '<span class="fail" title="Failed"><span aria-hidden="true">✗</span><span class="visually-hidden">failed</span></span>' : "";
+      var lat = c.latency_ms != null ? '<span class="cmeta">' + fmtMs(c.latency_ms) + "</span>" : "";
+      var note = (c.notes && c.notes.length) ? '<div class="cnote">' + esc(c.notes.join(" · ")) + "</div>" : "";
+      return '<div class="crow">' +
+        '<div class="cmain"><span class="ckind ' + esc(c.kind) + '">' + esc(c.kind) + '</span>' +
+        '<span class="ccat" style="cursor:help" title="' + esc(categoryPurpose(c.category)) + '">' + esc(categoryLabel(c.category)) + "</span>" + ok + "</div>" +
+        '<div class="cscore">' + lat + '<span class="cval ' + scoreClass(c.score) + '">' + fx(c.score) + "</span></div>" +
+        note + "</div>";
+    }
+    // Per-case results, grouped by category and collapsed by default. Each group's
+    // summary shows the pass/fail tally and mean so weak spots read at a glance;
+    // expanding a group reveals the individual cases. Tool groups first, worst mean
+    // first within each kind.
     function casesSection(e) {
       var cs = e.case_results;
       if (!cs || !cs.length) return "";
-      var rows = cs.slice().sort(function (a, b) {
-        if (a.kind !== b.kind) return a.kind === "tool" ? -1 : 1;
-        return a.score - b.score;
-      }).map(function (c) {
-        var ok = c.correct === true ? '<span class="pass" title="Passed"><span aria-hidden="true">✓</span><span class="visually-hidden">passed</span></span>'
-          : c.correct === false ? '<span class="fail" title="Failed"><span aria-hidden="true">✗</span><span class="visually-hidden">failed</span></span>' : "";
-        var lat = c.latency_ms != null ? '<span class="cmeta">' + fmtMs(c.latency_ms) + "</span>" : "";
-        var note = (c.notes && c.notes.length) ? '<div class="cnote">' + esc(c.notes.join(" · ")) + "</div>" : "";
-        return '<div class="crow">' +
-          '<div class="cmain"><span class="ckind ' + esc(c.kind) + '">' + esc(c.kind) + '</span>' +
-          '<span class="ccat" style="cursor:help" title="' + esc(categoryPurpose(c.category)) + '">' + esc(categoryLabel(c.category)) + "</span>" + ok + "</div>" +
-          '<div class="cscore">' + lat + '<span class="cval">' + fx(c.score) + "</span></div>" +
-          note + "</div>";
+      var groups = {};
+      cs.forEach(function (c) { (groups[c.category] = groups[c.category] || []).push(c); });
+      var keys = Object.keys(groups).sort(function (a, b) {
+        var ga = groups[a], gb = groups[b];
+        if (ga[0].kind !== gb[0].kind) return ga[0].kind === "tool" ? -1 : 1;
+        return caseTally(ga).mean - caseTally(gb).mean;
+      });
+      var totals = { pass: 0, fail: 0, partial: 0 };
+      var blocks = keys.map(function (cat) {
+        var g = groups[cat].slice().sort(function (a, b) { return a.score - b.score; });
+        var t = caseTally(g);
+        totals.pass += t.pass; totals.fail += t.fail; totals.partial += t.partial;
+        var kind = g[0].kind;
+        var summary = '<summary class="cgsum">' +
+          '<span class="ckind ' + esc(kind) + '">' + esc(kind) + '</span>' +
+          '<span class="cgname" title="' + esc(categoryPurpose(cat)) + '">' + esc(categoryLabel(cat)) +
+          ' <span class="muted">×' + g.length + '</span></span>' +
+          '<span class="cgtally">' + tallyBadges(t) +
+          '<span class="cgmean ' + scoreClass(t.mean) + '">' + fx(t.mean) + '</span></span></summary>';
+        return '<details class="cgroup">' + summary + g.map(caseRow).join("") + "</details>";
       }).join("");
+      var overview = '<div class="coverview">' + cs.length + ' cases · ' +
+        '<span class="good">' + totals.pass + ' pass</span> · ' +
+        '<span class="danger">' + totals.fail + ' fail</span>' +
+        (totals.partial ? ' · <span class="muted">' + totals.partial + ' partial</span>' : "") + "</div>";
       return '<details class="cases"><summary>Per-case results <span class="muted">· ' + cs.length +
-        " cases</span></summary>" + rows + "</details>";
+        " cases</span></summary>" + overview + blocks + "</details>";
     }
     function closeModal() {
       var modal = document.getElementById("modal");
