@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Annotated
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -327,6 +328,157 @@ class PublicLeaderboardResponse(BaseModel):
     entries: Annotated[
         list[PublicLeaderboardEntry],
         Field(default_factory=list, description="Ranked miners, best composite first."),
+    ]
+
+
+class PublicValidatorScore(BaseModel):
+    """One validator's score for a submission, published verbatim (public).
+
+    The per-validator half of the k=3 transparency record: *which* validator
+    scored the agent and the exact numbers it reported, including its sr25519
+    ``signature`` so the row is independently verifiable against the published
+    validator public key. Unlike the aggregate leaderboard this deliberately
+    exposes ``validator_hotkey`` (a public on-chain identity) and the raw
+    ``seed`` — the whole point of the record is to show *who* scored an agent on
+    *which* dataset, so an observer can reproduce and audit the number.
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Scoring validator's hotkey.")
+    ]
+    composite: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Composite this validator reported.")
+    ]
+    tool_mean: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Mean tool accuracy in [0,1].")
+    ]
+    memory_mean: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Mean memory recall in [0,1].")
+    ]
+    median_ms: Annotated[
+        int, Field(ge=0, description="Median per-case latency (ms).")
+    ]
+    n: Annotated[int, Field(ge=0, description="Number of cases scored.")]
+    seed: Annotated[
+        int,
+        Field(
+            description=(
+                "Dataset seed this validator scored on. The platform draws it "
+                "after screening (the miner never sees it before submitting), so "
+                "publishing it post-hoc enables reproduction/audit without letting "
+                "anyone pre-overfit a future submission."
+            )
+        ),
+    ]
+    run_id: Annotated[
+        str, Field(description="Scoring-engine run id the signature is bound to.")
+    ]
+    signature: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="sr25519 signature over the payload, hex (self-verifying).",
+        ),
+    ]
+    generated_at: Annotated[
+        datetime, Field(description="When the scoring engine produced the score (UTC).")
+    ]
+
+
+class PublicSubmissionScores(BaseModel):
+    """The full k=3 scoring record for one submission (public transparency).
+
+    Publishes, per agent: which validators scored it, each validator's exact
+    numbers + signature, and the ``median_composite`` the platform finalized on
+    (the canonical score no single validator controls). ``score_count`` reaching
+    ``quorum`` is what finalized the agent; a re-scored agent may carry more than
+    ``quorum`` rows (older + current runs). The dataset pin (``dataset_seed`` +
+    ``dataset_sha256``) identifies the exact bytes all validators scored.
+    """
+
+    agent_id: Annotated[UUID, Field(description="The scored agent's id.")]
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
+    ]
+    status: Annotated[
+        str, Field(description='Public status ("scored" or "live").')
+    ]
+    quorum: Annotated[
+        int, Field(ge=1, description="Validators required to finalize (k=3).")
+    ]
+    score_count: Annotated[
+        int, Field(ge=0, description="Score rows recorded for this agent.")
+    ]
+    median_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description="Median of the reported composites — the canonical score.",
+        ),
+    ]
+    dataset_seed: Annotated[
+        int | None,
+        Field(default=None, description="Platform-pinned dataset seed (regenerable)."),
+    ]
+    dataset_sha256: Annotated[
+        str | None,
+        Field(default=None, description="SHA-256 of the pinned dataset artifact."),
+    ]
+    dataset_run_size: Annotated[
+        str | None,
+        Field(default=None, description="Generator profile (small|medium|full)."),
+    ]
+    scores: Annotated[
+        list[PublicValidatorScore],
+        Field(default_factory=list, description="Per-validator scores, by hotkey."),
+    ]
+    generated_at: Annotated[
+        datetime, Field(description="When this snapshot was read (UTC).")
+    ]
+
+
+class PublicSubmissionSummary(BaseModel):
+    """One row of the public recent-submissions index (drill into the detail)."""
+
+    agent_id: Annotated[UUID, Field(description="The scored agent's id.")]
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
+    ]
+    status: Annotated[str, Field(description='Public status ("scored" or "live").')]
+    score_count: Annotated[
+        int, Field(ge=0, description="Score rows recorded for this agent.")
+    ]
+    median_composite: Annotated[
+        float | None,
+        Field(default=None, ge=0.0, le=1.0, description="Median canonical composite."),
+    ]
+    dataset_seed: Annotated[
+        int | None, Field(default=None, description="Platform-pinned dataset seed.")
+    ]
+    dataset_sha256: Annotated[
+        str | None, Field(default=None, description="SHA-256 of the pinned dataset.")
+    ]
+    last_scored_at: Annotated[
+        datetime | None,
+        Field(default=None, description="Most recent score time for this agent (UTC)."),
+    ]
+
+
+class PublicSubmissionsResponse(BaseModel):
+    """The public recent-submissions index, most recently scored first."""
+
+    generated_at: Annotated[
+        datetime, Field(description="When this snapshot was read (UTC).")
+    ]
+    count: Annotated[int, Field(ge=0, description="Number of submissions returned.")]
+    quorum: Annotated[
+        int, Field(ge=1, description="Validators required to finalize (k=3).")
+    ]
+    submissions: Annotated[
+        list[PublicSubmissionSummary],
+        Field(default_factory=list, description="Recent finalized submissions."),
     ]
 
 

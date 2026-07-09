@@ -104,6 +104,61 @@ async def _seed_scored(
         )
 
 
+async def _seed_k3(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    miner: str,
+    composites: list[float],
+    status: AgentStatus = AgentStatus.SCORED,
+    dataset_seed: int | None = 987654321,
+    dataset_sha256: str | None = "cd" * 32,
+    dataset_run_size: str | None = "full",
+    base_time: datetime = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
+) -> str:
+    """Seed one agent scored by ``len(composites)`` distinct validators.
+
+    Returns the agent_id (hex str) so a test can hit the detail endpoint.
+    """
+    validators = [
+        "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm",
+        "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp",
+    ]
+    agent_id = uuid4()
+    async with maker() as s, s.begin():
+        agent = Agent(
+            agent_id=agent_id,
+            miner_hotkey=miner,
+            name="agent",
+            sha256="ab" * 32,
+            size_bytes=524288,
+            status=status,
+            dataset_seed=dataset_seed,
+            dataset_sha256=dataset_sha256,
+            dataset_run_size=dataset_run_size,
+            created_at=datetime.now(UTC),
+        )
+        s.add(agent)
+        await s.flush()
+        for i, composite in enumerate(composites):
+            await upsert_score(
+                s,
+                agent_id=agent_id,
+                validator_hotkey=validators[i],
+                run_id=f"run_{i}",
+                seed=dataset_seed or 0,
+                composite=composite,
+                tool_mean=composite,
+                memory_mean=composite,
+                median_ms=500,
+                n=110,
+                generated_at=base_time + timedelta(minutes=i),
+                signature="ab" * 64,
+            )
+    return str(agent_id)
+
+
 async def _seed_agent(
     maker: async_sessionmaker[AsyncSession],
     *,
@@ -362,3 +417,162 @@ class TestPublicHealth:
             "scores_24h": 0,
             "avg_latency_ms": None,
         }
+
+
+class TestPublicSubmissionScores:
+    async def test_detail_exposes_k3_breakdown_and_median(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.40, 0.70, 0.55]
+        )
+        _install_db(app, session_maker)
+
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/scores")
+        assert resp.status_code == 200
+        assert resp.headers["Cache-Control"] == "public, max-age=30"
+        body = resp.json()
+        assert body["agent_id"] == agent_id
+        assert body["miner_hotkey"] == _MINER_A
+        assert body["status"] == "scored"
+        assert body["quorum"] == 3
+        assert body["score_count"] == 3
+        # Median of {0.40, 0.55, 0.70} is 0.55 — no single validator controls it.
+        assert body["median_composite"] == pytest.approx(0.55)
+        # The dataset pin + raw seed are published for reproduction/audit.
+        assert body["dataset_seed"] == 987654321
+        assert body["dataset_sha256"] == "cd" * 32
+        assert body["dataset_run_size"] == "full"
+        # All three validators, each with hotkey + signature (self-verifying).
+        assert len(body["scores"]) == 3
+        hotkeys = {s["validator_hotkey"] for s in body["scores"]}
+        assert len(hotkeys) == 3
+        for s in body["scores"]:
+            assert s["signature"] == "ab" * 64
+            assert s["seed"] == 987654321
+            assert "run_id" in s
+
+    async def test_detail_omits_per_case_answer_key(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        _install_db(app, session_maker)
+        raw = (await client.get(f"/api/v1/public/agent/{agent_id}/scores")).text
+        # The per-submission record publishes validators + seed by design, but
+        # still never the per-case answer key.
+        for answer_key in ('"expected"', '"called"', '"case_id"', '"per_case"'):
+            assert answer_key not in raw
+
+    async def test_detail_404_for_unknown_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        resp = await client.get(f"/api/v1/public/agent/{uuid4()}/scores")
+        assert resp.status_code == 404
+
+    async def test_detail_404_for_provisional_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A still-evaluating agent's partial scores must not be exposed.
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4],
+            status=AgentStatus.EVALUATING,
+        )
+        # ...nor a held (suspected-copy) agent's.
+        held_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.9, 0.9, 0.9],
+            status=AgentStatus.ATH_PENDING_REVIEW,
+        )
+        _install_db(app, session_maker)
+        assert (
+            await client.get(f"/api/v1/public/agent/{agent_id}/scores")
+        ).status_code == 404
+        assert (
+            await client.get(f"/api/v1/public/agent/{held_id}/scores")
+        ).status_code == 404
+
+    async def test_index_lists_recent_finalized_only(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+            base_time=datetime(2026, 6, 8, 10, 0, 0, tzinfo=UTC),
+        )
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.7, 0.8, 0.9],
+            base_time=datetime(2026, 6, 8, 14, 0, 0, tzinfo=UTC),
+        )
+        # Held + still-evaluating must be excluded from the index.
+        await _seed_k3(
+            session_maker,
+            miner="5HeldMinerXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            composites=[0.99, 0.99, 0.99],
+            status=AgentStatus.ATH_PENDING_REVIEW,
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/submissions")).json()
+        assert body["count"] == 2
+        assert body["quorum"] == 3
+        # Most recently scored first: MINER_B (14:00) before MINER_A (10:00).
+        assert [s["miner_hotkey"] for s in body["submissions"]] == [_MINER_B, _MINER_A]
+        top = body["submissions"][0]
+        assert top["median_composite"] == pytest.approx(0.8)
+        assert top["score_count"] == 3
+        assert top["dataset_seed"] == 987654321
+        assert top["last_scored_at"] is not None
+
+    async def test_index_respects_limit(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        for i in range(3):
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.4, 0.5, 0.6],
+                base_time=datetime(2026, 6, 8, 10 + i, 0, 0, tzinfo=UTC),
+            )
+        _install_db(app, session_maker)
+        body = (await client.get("/api/v1/public/submissions?limit=2")).json()
+        assert body["count"] == 2
+
+    async def test_index_empty(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        resp = await client.get("/api/v1/public/submissions")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["count"] == 0
+        assert body["submissions"] == []

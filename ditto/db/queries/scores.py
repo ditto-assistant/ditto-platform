@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError as SAIntegrityError
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
 from ditto.db.models import Agent, Score
+from ditto.db.queries.agents import get_agent_by_id
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -296,6 +297,112 @@ async def list_scores_for_agent(
     stmt = select(Score).where(Score.agent_id == agent_id)
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+# Agents whose scoring has settled into a public, non-provisional state. A held
+# copy (``ath_pending_review``) is deliberately excluded — its score is not yet
+# public and surfacing "under review" before resolution would be premature.
+_PUBLIC_SUBMISSION_STATUSES = (AgentStatus.SCORED, AgentStatus.LIVE)
+
+
+@dataclass(frozen=True)
+class SubmissionRow:
+    """One finalized submission plus every validator's score for it.
+
+    The value object behind the public per-submission transparency surface: the
+    agent's dataset pin (``dataset_seed`` / ``dataset_sha256`` / ``run_size``)
+    and the full set of per-validator :class:`Score` rows the median finalized
+    on. ``last_scored_at`` is the most recent score time (the recency key the
+    index sorts by).
+    """
+
+    agent_id: UUID
+    miner_hotkey: str
+    status: AgentStatus
+    dataset_seed: int | None
+    dataset_sha256: str | None
+    dataset_run_size: str | None
+    last_scored_at: datetime | None
+    scores: list[Score]
+
+
+async def get_submission_scores(
+    session: AsyncSession, *, agent_id: UUID
+) -> SubmissionRow | None:
+    """The full k=3 scoring record for one finalized agent, or ``None``.
+
+    ``None`` when the agent does not exist or has not settled into a public
+    status (still evaluating, or held for copy review) — callers map that to 404
+    so a provisional agent's partial scores are never exposed.
+    """
+    agent = await get_agent_by_id(session, agent_id=agent_id)
+    if agent is None or agent.status not in _PUBLIC_SUBMISSION_STATUSES:
+        return None
+    scores = await list_scores_for_agent(session, agent_id=agent_id)
+    last_scored_at = (
+        _as_utc(max(s.generated_at for s in scores)) if scores else None
+    )
+    return SubmissionRow(
+        agent_id=agent.agent_id,
+        miner_hotkey=agent.miner_hotkey,
+        status=agent.status,
+        dataset_seed=agent.dataset_seed,
+        dataset_sha256=agent.dataset_sha256,
+        dataset_run_size=agent.dataset_run_size,
+        last_scored_at=last_scored_at,
+        scores=sorted(scores, key=lambda s: s.validator_hotkey),
+    )
+
+
+async def list_public_submissions(
+    session: AsyncSession, *, limit: int = 50
+) -> list[SubmissionRow]:
+    """Recent finalized submissions, most recently scored first.
+
+    Two queries: pick the finalized agents by latest-score recency (capped to
+    ``limit``), then batch-fetch their score rows and group in Python. The
+    ``scores`` table is small at subnet scale, so this stays cheap.
+    """
+    recency = (
+        select(
+            Score.agent_id.label("agent_id"),
+            func.max(Score.generated_at).label("last_scored"),
+        )
+        .group_by(Score.agent_id)
+        .subquery()
+    )
+    stmt = (
+        select(Agent, recency.c.last_scored)
+        .join(recency, recency.c.agent_id == Agent.agent_id)
+        .where(Agent.status.in_(_PUBLIC_SUBMISSION_STATUSES))
+        .order_by(recency.c.last_scored.desc())
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).all()
+    if not rows:
+        return []
+    agent_ids = [agent.agent_id for agent, _ in rows]
+    score_rows = (
+        await session.execute(select(Score).where(Score.agent_id.in_(agent_ids)))
+    ).scalars().all()
+    by_agent: dict[UUID, list[Score]] = {}
+    for s in score_rows:
+        by_agent.setdefault(s.agent_id, []).append(s)
+    return [
+        SubmissionRow(
+            agent_id=agent.agent_id,
+            miner_hotkey=agent.miner_hotkey,
+            status=agent.status,
+            dataset_seed=agent.dataset_seed,
+            dataset_sha256=agent.dataset_sha256,
+            dataset_run_size=agent.dataset_run_size,
+            last_scored_at=_as_utc(last_scored) if last_scored else None,
+            scores=sorted(
+                by_agent.get(agent.agent_id, []), key=lambda s: s.validator_hotkey
+            ),
+        )
+        for agent, last_scored in rows
+    ]
 
 
 async def list_miner_composite_history(

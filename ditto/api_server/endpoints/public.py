@@ -1,14 +1,23 @@
 """Public, unauthenticated read endpoints for the subnet dashboard.
 
-Unlike ``/scoring/scores`` (validator-hotkey gated, full signed rows), this
-surface is open and **aggregate-only**: composite plus tool/memory means and
-rank, so a public leaderboard / dashboard can read scores with no credentials
-while never exposing per-case detail (the benchmark's answer key) or
-integrity-internal fields. See ``docs/public-telemetry.md``.
+Two surfaces, both open (no credentials) and both fronting the same DB the
+validator-gated ``/scoring/scores`` reads:
+
+* **Aggregate leaderboard / health** (``/leaderboard``, ``/health``): best score
+  per miner, composite plus tool/memory means and rank, never exposing per-case
+  answer-key detail. This half stays aggregate-only.
+* **Per-submission transparency** (``/submissions``, ``/agent/{id}/scores``): the
+  k=3 record for a finalized agent — *which* validators scored it, each one's
+  exact numbers + signature, the median the platform finalized on, and the pinned
+  dataset (seed + sha256). This deliberately exposes ``validator_hotkey`` (a
+  public on-chain identity) and the raw ``seed`` so anyone can reproduce and audit
+  a score; because the platform draws the seed after screening, publishing it
+  post-hoc never lets a miner pre-overfit. It still omits the per-case answer key.
+  See ``docs/public-telemetry.md``.
 
 Responses are cacheable (``max-age=30``) so a CDN / the dashboard can front this
-cheaply; the underlying ledger only changes when a sweep records a new best.
-The KOTH champion / weight vector is deliberately **not** served here — that is
+cheaply; the underlying rows only change when a sweep records a new score. The
+KOTH champion / weight vector is deliberately **not** served here — that is
 validator-side (see the scoring endpoint's boundary note); the dashboard reads
 weights from wandb or the chain.
 """
@@ -17,9 +26,11 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
 from datetime import UTC, datetime
+from uuid import UUID
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, HTTPException, Query, Response
 
 from ditto.api_models import (
     PublicBenchIntegrity,
@@ -29,14 +40,22 @@ from ditto.api_models import (
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
     PublicRunModels,
+    PublicSubmissionScores,
+    PublicSubmissionsResponse,
+    PublicSubmissionSummary,
+    PublicValidatorScore,
 )
 from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.endpoints.validator import SessionDep
 from ditto.db.queries.scores import (
+    SCORING_QUORUM,
     LedgerRow,
+    SubmissionRow,
     get_public_health,
+    get_submission_scores,
     list_eligible_ledger,
     list_miner_composite_history,
+    list_public_submissions,
 )
 
 logger = logging.getLogger(__name__)
@@ -288,3 +307,101 @@ async def health(
         scores_24h=roll.scores_24h,
         avg_latency_ms=roll.avg_latency_ms,
     )
+
+
+def _median_composite(row: SubmissionRow) -> float | None:
+    """Median of the reported composites — the canonical score, or None if unscored."""
+    if not row.scores:
+        return None
+    return statistics.median(s.composite for s in row.scores)
+
+
+def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
+    """Map a submission row to the full public k=3 record."""
+    return PublicSubmissionScores(
+        agent_id=row.agent_id,
+        miner_hotkey=row.miner_hotkey,
+        status=row.status.value,
+        quorum=SCORING_QUORUM,
+        score_count=len(row.scores),
+        median_composite=_median_composite(row),
+        dataset_seed=row.dataset_seed,
+        dataset_sha256=row.dataset_sha256,
+        dataset_run_size=row.dataset_run_size,
+        scores=[
+            PublicValidatorScore(
+                validator_hotkey=s.validator_hotkey,
+                composite=s.composite,
+                tool_mean=s.tool_mean,
+                memory_mean=s.memory_mean,
+                median_ms=s.median_ms,
+                n=s.n,
+                seed=s.seed,
+                run_id=s.run_id,
+                signature=s.signature,
+                generated_at=s.generated_at,
+            )
+            for s in row.scores
+        ],
+        generated_at=datetime.now(UTC),
+    )
+
+
+def _submission_summary(row: SubmissionRow) -> PublicSubmissionSummary:
+    """Map a submission row to the compact index entry."""
+    return PublicSubmissionSummary(
+        agent_id=row.agent_id,
+        miner_hotkey=row.miner_hotkey,
+        status=row.status.value,
+        score_count=len(row.scores),
+        median_composite=_median_composite(row),
+        dataset_seed=row.dataset_seed,
+        dataset_sha256=row.dataset_sha256,
+        last_scored_at=row.last_scored_at,
+    )
+
+
+@router.get("/submissions", response_model=PublicSubmissionsResponse)
+async def submissions(
+    response: Response,
+    session: SessionDep,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> PublicSubmissionsResponse:
+    """Recent finalized submissions, most recently scored first.
+
+    The index over the k=3 transparency records: each entry carries the median
+    composite, how many validators scored it, and the dataset pin (seed +
+    sha256); drill into ``/public/agent/{agent_id}/scores`` for the full
+    per-validator breakdown. Held-for-review and still-evaluating agents are
+    excluded — only settled public scores appear.
+    """
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    rows = await list_public_submissions(session, limit=limit)
+    return PublicSubmissionsResponse(
+        generated_at=datetime.now(UTC),
+        count=len(rows),
+        quorum=SCORING_QUORUM,
+        submissions=[_submission_summary(r) for r in rows],
+    )
+
+
+@router.get("/agent/{agent_id}/scores", response_model=PublicSubmissionScores)
+async def agent_scores(
+    response: Response,
+    session: SessionDep,
+    agent_id: UUID,
+) -> PublicSubmissionScores:
+    """The full k=3 scoring record for one finalized agent.
+
+    Publishes which validators scored the agent, each one's exact numbers +
+    signature (self-verifying against the published validator key), the median
+    composite the platform finalized on, and the pinned dataset (seed + sha256)
+    so anyone can reproduce and audit the score. 404 for an agent that does not
+    exist or has not settled into a public status (still evaluating, or held for
+    copy review) — a provisional agent's partial scores are never exposed.
+    """
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    row = await get_submission_scores(session, agent_id=agent_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no public scores for this agent")
+    return _submission_scores(row)

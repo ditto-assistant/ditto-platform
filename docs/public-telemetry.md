@@ -18,11 +18,17 @@ SN118 publishes publicly and how. Implementation tracked per section below.
 
 ## Anti-gaming posture (the load-bearing rule)
 
-Everything public is an **aggregate**. The seed is published only *after* a run
-is scored (reproducibility, not pre-disclosure); seeds already rotate per
-submission, so a past seed does not unlock a future run. Per-case rows stay
-private. If we ever want research-grade per-case release, do it on a **delay**
-(e.g. after that dataset generation is retired) — never live.
+The **aggregate leaderboard** stays aggregate (best-per-miner, no per-run seed).
+The **per-submission k=3 record** (`/submissions`, `/agent/{id}/scores`, added
+2026-07-09) goes further for trust: it publishes which validators scored an
+agent, each one's exact numbers plus signature, the finalized median, and the
+raw dataset seed. The raw seed is safe to publish here because the platform
+draws it *after* screening (the miner never sees it before submitting) and it
+rotates per submission, so a past seed can never help pre-overfit a future run.
+The one line that never moves: **per-case rows stay private** (`expected` /
+`called` / `case_id` are the answer key). If we ever want research-grade
+per-case release, do it on a delay (after that dataset generation is retired),
+never live.
 
 ## Surface 1 — wandb (validator → public project)
 
@@ -75,6 +81,24 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   **Never** included: `seed` (anti-overfit), `per_case` `expected`/`called` (the
   answer key), agent_id/sha256/signature/validator_hotkey (integrity-internal).
   `is_champion`/weights stay validator-side (KOTH fold), not served here.
+- `GET /api/v1/public/submissions?limit=` → `{ generated_at, count, quorum,
+  submissions: [ { agent_id, miner_hotkey, status, score_count,
+  median_composite, dataset_seed, dataset_sha256, last_scored_at } ] }`.
+  The index over the **k=3 transparency records**, most recently scored first.
+  Only settled public scores (`scored` / `live`) appear; held-for-review and
+  still-evaluating agents are excluded so a provisional or accused agent is never
+  surfaced.
+- `GET /api/v1/public/agent/{agent_id}/scores` → `{ agent_id, miner_hotkey,
+  status, quorum, score_count, median_composite, dataset_seed, dataset_sha256,
+  dataset_run_size, scores: [ { validator_hotkey, composite, tool_mean,
+  memory_mean, median_ms, n, seed, run_id, signature, generated_at } ] }`.
+  The full k=3 breakdown for one finalized agent: *which* validators scored it,
+  each one's exact numbers + sr25519 signature (self-verifying against the
+  published validator key), the median the platform finalized on, and the pinned
+  dataset (seed + sha256) so anyone can reproduce and audit the number. 404 for
+  an unknown or not-yet-public agent. This is the one surface that intentionally
+  exposes `validator_hotkey` + raw `seed` (see the anti-gaming posture above); it
+  still omits `per_case`.
 - `GET /api/v1/public/weights` → the last-published normalized weight vector
   (champion + tail) — mirrors what the validator set on-chain.
 - `GET /api/v1/public/health` → subnet rollup **from what the platform records**:
@@ -127,3 +151,9 @@ idea); no server needed since all data comes from the public API + wandb.
    `ScoreReport.details` field is unsigned and additive — the signed tuple
    (`run_id, seed, composite, tool_mean, memory_mean, median_ms, n`) is
    unchanged, so this never touches the score or the signature.
+5. ✅ Per-submission k=3 transparency (2026-07-09): `/api/v1/public/submissions`
+   + `/api/v1/public/agent/{id}/scores` publish which validators scored each
+   finalized agent, all k scores + signatures, the finalized median, and the
+   pinned dataset (raw seed + sha256). Reads the existing `scores` rows; no
+   schema change. This is the "transparency is the trust mechanism" surface for
+   the decentralized k=3 model. Dashboard drill-down to consume it is TODO.

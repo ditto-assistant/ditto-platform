@@ -26,6 +26,10 @@ from ditto.api_models.public import (
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
     PublicRunModels,
+    PublicSubmissionScores,
+    PublicSubmissionsResponse,
+    PublicSubmissionSummary,
+    PublicValidatorScore,
 )
 from ditto.api_models.retrieval import AgentResponse, AgentStatusResponse
 from ditto.api_models.screener import (
@@ -70,6 +74,10 @@ __all__ = [
     "PublicLeaderboardEntry",
     "PublicLeaderboardResponse",
     "PublicRunModels",
+    "PublicSubmissionScores",
+    "PublicSubmissionSummary",
+    "PublicSubmissionsResponse",
+    "PublicValidatorScore",
     "ScoreReport",
     "ScreenResultRequest",
     "ScreenResultResponse",
