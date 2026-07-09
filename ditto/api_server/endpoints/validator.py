@@ -71,7 +71,11 @@ from ditto.db.queries.scores import (
     list_scores_for_agent,
     upsert_score,
 )
-from ditto.db.queries.tickets import issue_ticket
+from ditto.db.queries.tickets import (
+    get_open_ticket,
+    issue_ticket,
+    mark_ticket_scored,
+)
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -400,6 +404,25 @@ async def submit_score(
             raise AgentNotEvaluatableError(
                 f"agent {agent_id} is {agent.status}, not in {_SCOREABLE_STATUSES}"
             )
+        # k=3 gate: a score is only accepted against a live ticket this validator
+        # holds for the agent. No ticket (never issued, expired, or already
+        # spent) means the score is unsolicited or late, so it is rejected and
+        # the slot is left for a validator that will score in time. One ticket,
+        # one score: the ticket is consumed below, so a re-score needs a new one.
+        ticket = await get_open_ticket(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            now=datetime.now(UTC),
+        )
+        if ticket is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "no open scoring ticket for this validator and agent "
+                    "(never issued, expired, or already scored)"
+                ),
+            )
         # Persist the scoring engine's opaque telemetry (models used,
         # bench_version, dataset_sha256, per-category means, token spend, …) plus
         # the per-case breakdown, all under scores.details. The public leaderboard
@@ -471,6 +494,10 @@ async def submit_score(
                     )
                 else:
                     agent.status = AgentStatus.SCORED
+        # Consume the ticket (one ticket, one score); the slot stays occupied.
+        await mark_ticket_scored(
+            session, agent_id=agent_id, validator_hotkey=payload.validator_hotkey
+        )
         result_status = agent.status
 
     logger.info(

@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.dependencies import (
     get_chain_client,
     get_session,
@@ -38,13 +39,12 @@ from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_VALIDATOR_AUTH,
 )
 from ditto.chain.models import NeuronInfo
-from ditto.db.models import Agent, Base, Score
+from ditto.db.models import Agent, Base, Score, ValidatorTicket
 
 # Real dev keypairs: sign for real so _verify_signature runs end to end. The k=3
 # quorum needs three distinct permitted validators before an agent finalizes.
 _KEYPAIRS = [
-    bittensor.Keypair.create_from_uri(uri)
-    for uri in ("//Alice", "//Bob", "//Charlie")
+    bittensor.Keypair.create_from_uri(uri) for uri in ("//Alice", "//Bob", "//Charlie")
 ]
 _KEYPAIR = _KEYPAIRS[0]
 _VALIDATOR_HOTKEY = _KEYPAIR.ss58_address
@@ -88,14 +88,17 @@ async def _score_to_quorum(
     client: httpx.AsyncClient,
     agent_id: UUID,
     *,
+    maker: async_sessionmaker[AsyncSession],
     run_id: str = "run_q",
     composite: float = 0.82,
     **overrides: object,
 ) -> httpx.Response:
-    """Post one score per quorum validator (all at ``composite``, so the median
-    is ``composite``) and return the final response, finalized on the last."""
+    """Seed a ticket for each quorum validator and post one score each (all at
+    ``composite``, so the median is ``composite``); return the final response,
+    finalized on the last."""
     resp: httpx.Response | None = None
     for i, kp in enumerate(_KEYPAIRS):
+        await _seed_ticket(maker, agent_id, keypair=kp)
         resp = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
             json=_score_payload(
@@ -207,6 +210,33 @@ async def _seed_agent(
             )
         )
     return aid
+
+
+async def _seed_ticket(
+    maker: async_sessionmaker[AsyncSession],
+    agent_id: UUID,
+    *,
+    keypair: bittensor.Keypair = _KEYPAIR,
+    ttl: timedelta = timedelta(hours=1),
+) -> None:
+    """Seat (or re-open) an issued ticket for a specific (agent, validator) so a
+    score against that agent is accepted by the k=3 gate. Upserts so a test can
+    simulate the platform re-issuing a ticket to the same validator."""
+    async with maker() as s, s.begin():
+        existing = await s.get(ValidatorTicket, (agent_id, keypair.ss58_address))
+        if existing is None:
+            s.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=keypair.ss58_address,
+                    status=TicketStatus.ISSUED,
+                    issued_at=datetime.now(UTC),
+                    deadline=datetime.now(UTC) + ttl,
+                )
+            )
+        else:
+            existing.status = TicketStatus.ISSUED
+            existing.deadline = datetime.now(UTC) + ttl
 
 
 _AUTH_HEADER = {"X-Validator-Hotkey": _VALIDATOR_HOTKEY}
@@ -427,6 +457,7 @@ class TestSubmitScore:
 
         # A single below-quorum score records the row but keeps the agent
         # provisional (evaluating) — no finalization until the k=3 quorum.
+        await _seed_ticket(session_maker, agent_id, keypair=_KEYPAIRS[0])
         first = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
             json=_score_payload(agent_id, keypair=_KEYPAIRS[0]),
@@ -435,7 +466,9 @@ class TestSubmitScore:
         assert first.json()["status"] == AgentStatus.EVALUATING
 
         # The quorum-th score finalizes it on the median composite.
-        response = await _score_to_quorum(client, agent_id, composite=0.82)
+        response = await _score_to_quorum(
+            client, agent_id, maker=session_maker, composite=0.82
+        )
         assert response.status_code == 200
         body = response.json()
         assert body["agent_id"] == str(agent_id)
@@ -465,6 +498,7 @@ class TestSubmitScore:
         _install_db(app, session_maker)
         _install_chain(app)
 
+        await _seed_ticket(session_maker, agent_id)
         response = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
             json=_score_payload(agent_id),
@@ -489,6 +523,7 @@ class TestSubmitScore:
         _install_db(app, session_maker)
         _install_chain(app)
 
+        await _seed_ticket(session_maker, agent_id)
         response = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
             json=_score_payload(agent_id, details={"bench_version": 1}),
@@ -501,33 +536,39 @@ class TestSubmitScore:
             assert score.details is not None
             assert score.details["bench_version"] == 1
 
-    async def test_re_score_upserts_single_row(
+    async def test_one_ticket_one_score_no_rescore(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
+        # One ticket, one score: a validator's first score is accepted and
+        # consumes its ticket; a second score without a fresh ticket is rejected
+        # (409), so a validator cannot re-roll for a better number.
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         _install_db(app, session_maker)
         _install_chain(app)
 
-        await client.post(
+        await _seed_ticket(session_maker, agent_id)
+        r1 = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
             json=_score_payload(agent_id, run_id="run_a", composite=0.5),
         )
+        assert r1.status_code == 200
+        # Ticket spent: the re-score has no open ticket.
         r2 = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
             json=_score_payload(agent_id, run_id="run_b", composite=0.9),
         )
-        assert r2.status_code == 200
+        assert r2.status_code == 409
 
         async with session_maker() as s:
             from ditto.db.queries.scores import list_scores_for_agent
 
             scores = await list_scores_for_agent(s, agent_id=agent_id)
             assert len(scores) == 1
-            assert scores[0].run_id == "run_b"
-            assert scores[0].composite == pytest.approx(0.9)
+            assert scores[0].run_id == "run_a"  # the first (only) score stands
+            assert scores[0].composite == pytest.approx(0.5)
 
     async def test_bad_signature_returns_401(
         self,
@@ -603,6 +644,7 @@ class TestSubmitScore:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.LIVE)
         _install_db(app, session_maker)
         _install_chain(app)
+        await _seed_ticket(session_maker, agent_id)
         response = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
             json=_score_payload(agent_id),
@@ -693,13 +735,14 @@ class TestAntiCopyGate:
         client: httpx.AsyncClient,
         agent_id: UUID,
         *,
+        maker: async_sessionmaker[AsyncSession],
         run_id: str,
         composite: float,
     ) -> httpx.Response:
         # Score to the k=3 quorum so the agent finalizes and the gate runs on
         # the median (= composite, since all three validators post the same).
         return await _score_to_quorum(
-            client, agent_id, run_id=run_id, composite=composite
+            client, agent_id, maker=maker, run_id=run_id, composite=composite
         )
 
     async def test_exact_copy_is_held(
@@ -714,7 +757,9 @@ class TestAntiCopyGate:
         incumbent = await _seed_agent(
             session_maker, status=AgentStatus.EVALUATING, sha256="cc" * 32
         )
-        await self._score(client, incumbent, run_id="run_inc", composite=0.80)
+        await self._score(
+            client, incumbent, maker=session_maker, run_id="run_inc", composite=0.80
+        )
         # A byte-identical resubmission from another miner.
         copy = await _seed_agent(
             session_maker,
@@ -722,7 +767,9 @@ class TestAntiCopyGate:
             miner_hotkey=_MINER_B,
             sha256="cc" * 32,
         )
-        resp = await self._score(client, copy, run_id="run_copy", composite=0.80)
+        resp = await self._score(
+            client, copy, maker=session_maker, run_id="run_copy", composite=0.80
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == AgentStatus.ATH_PENDING_REVIEW
 
@@ -747,7 +794,9 @@ class TestAntiCopyGate:
             sha256="aa" * 32,
             size_bytes=500000,
         )
-        await self._score(client, incumbent, run_id="run_inc", composite=0.80)
+        await self._score(
+            client, incumbent, maker=session_maker, run_id="run_inc", composite=0.80
+        )
         # Different bytes, near-identical size, beats incumbent by a hair.
         tweaked = await _seed_agent(
             session_maker,
@@ -756,7 +805,9 @@ class TestAntiCopyGate:
             sha256="bb" * 32,
             size_bytes=500100,
         )
-        resp = await self._score(client, tweaked, run_id="run_tweak", composite=0.805)
+        resp = await self._score(
+            client, tweaked, maker=session_maker, run_id="run_tweak", composite=0.805
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == AgentStatus.ATH_PENDING_REVIEW
 
@@ -774,7 +825,9 @@ class TestAntiCopyGate:
             sha256="aa" * 32,
             size_bytes=500000,
         )
-        await self._score(client, incumbent, run_id="run_inc", composite=0.80)
+        await self._score(
+            client, incumbent, maker=session_maker, run_id="run_inc", composite=0.80
+        )
         better = await _seed_agent(
             session_maker,
             status=AgentStatus.EVALUATING,
@@ -782,7 +835,9 @@ class TestAntiCopyGate:
             sha256="bb" * 32,
             size_bytes=700000,
         )
-        resp = await self._score(client, better, run_id="run_better", composite=0.92)
+        resp = await self._score(
+            client, better, maker=session_maker, run_id="run_better", composite=0.92
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == AgentStatus.SCORED
 
@@ -797,15 +852,21 @@ class TestAntiCopyGate:
         incumbent = await _seed_agent(
             session_maker, status=AgentStatus.EVALUATING, sha256="cc" * 32
         )
-        await self._score(client, incumbent, run_id="run_inc", composite=0.80)
+        await self._score(
+            client, incumbent, maker=session_maker, run_id="run_inc", composite=0.80
+        )
         copy = await _seed_agent(
             session_maker,
             status=AgentStatus.EVALUATING,
             miner_hotkey=_MINER_B,
             sha256="cc" * 32,
         )
-        await self._score(client, copy, run_id="run_copy", composite=0.80)
+        await self._score(
+            client, copy, maker=session_maker, run_id="run_copy", composite=0.80
+        )
         # Re-scoring a held agent must not 409 and must not un-hold it.
-        resp = await self._score(client, copy, run_id="run_copy2", composite=0.81)
+        resp = await self._score(
+            client, copy, maker=session_maker, run_id="run_copy2", composite=0.81
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == AgentStatus.ATH_PENDING_REVIEW

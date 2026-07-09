@@ -48,15 +48,26 @@ async def expire_overdue_tickets(session: AsyncSession, *, now: datetime) -> int
     so another validator can pick the agent up. Runs inside the caller's
     transaction. Idempotent: a second call over the same window flips nothing.
     """
-    result = await session.execute(
-        update(ValidatorTicket)
-        .where(
-            ValidatorTicket.status == TicketStatus.ISSUED,
-            ValidatorTicket.deadline < now,
+    overdue = (
+        await session.execute(
+            select(
+                ValidatorTicket.agent_id, ValidatorTicket.validator_hotkey
+            ).where(
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.deadline < now,
+            )
         )
-        .values(status=TicketStatus.EXPIRED)
-    )
-    return result.rowcount or 0
+    ).all()
+    if overdue:
+        await session.execute(
+            update(ValidatorTicket)
+            .where(
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.deadline < now,
+            )
+            .values(status=TicketStatus.EXPIRED)
+        )
+    return len(overdue)
 
 
 async def issue_ticket(
