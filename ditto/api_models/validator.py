@@ -130,8 +130,11 @@ class JobResponse(BaseModel):
     A ticket grants this validator the right to score one agent by ``deadline``;
     the platform issues at most three per agent (the k=3 pool) and answers 204
     (no body) when there is no work. The validator fetches the tarball via
-    ``/artifact`` and scores it. The platform-generated dataset is shipped here
-    once the data-pipeline split lands (#46); until then it is fetched/omitted.
+    ``/artifact`` and scores it against the platform-pinned dataset: ``seed`` +
+    ``dataset_sha256`` identify the exact dataset all k=3 validators score (the
+    scoring API regenerates it from ``seed`` and rejects a hash mismatch), and
+    ``run_size`` is the generator profile to use. These are null only for agents
+    promoted before the data-pipeline split, or when generation is disabled.
     """
 
     agent_id: Annotated[UUID, Field(description="Agent this ticket is for.")]
@@ -143,6 +146,31 @@ class JobResponse(BaseModel):
         datetime,
         Field(description="Score before this (UTC) or the ticket lapses."),
     ]
+    seed: Annotated[
+        int | None,
+        Field(
+            default=None,
+            description="Platform-pinned dataset seed all k=3 validators score "
+            "against (regenerable, comparable). Null if unset (pre-split / "
+            "generation disabled).",
+        ),
+    ] = None
+    dataset_sha256: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="SHA-256 of the pinned dataset; the scoring API fails if "
+            "the regenerated dataset does not hash to this (tamper-evidence).",
+        ),
+    ] = None
+    run_size: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Generator profile for the pinned dataset "
+            "(small|medium|full).",
+        ),
+    ] = None
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -153,6 +181,9 @@ class JobResponse(BaseModel):
                 ),
                 "sha256": "deadbeef" * 8,
                 "deadline": "2026-07-09T12:30:00Z",
+                "seed": 8675309,
+                "dataset_sha256": "cafebabe" * 8,
+                "run_size": "full",
             }
         }
     )

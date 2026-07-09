@@ -116,6 +116,27 @@ class Agent(Base):
     written before this landed and for tarballs unreadable/empty at upload (the
     gate reads null as "no repack match")."""
 
+    dataset_seed: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    """The per-submission dataset seed the platform generated at job-ready
+    (``uploaded -> evaluating``). All k=3 validators score against THIS seed, so
+    their scores are comparable (the median-of-3 is over one dataset). Fresh and
+    unpredictable per submission, so a published run's answer key does not help the
+    miner's next (differently-seeded) submission. Null until the agent is promoted
+    to ``evaluating``. Bounded to the signed 64-bit range ``scores.seed`` stores."""
+
+    dataset_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """SHA-256 (hex) of the fully-rendered dataset the generate service produced
+    for ``dataset_seed`` (the DatasetArtifact digest). Issued to every validator in
+    the ticket; the validator's scoring call regenerates the dataset from the seed
+    and the scoring API fails if it does not hash to this — tamper-evidence that
+    all three validators scored the exact dataset the platform pinned. Null until
+    job-ready."""
+
+    dataset_run_size: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """The generator profile the dataset was built with (``small|medium|full``),
+    issued with the ticket so the validator's scoring call uses the same profile.
+    Null until job-ready."""
+
     code_embedding: Mapped[list | None] = mapped_column(_JSON_VARIANT, nullable=True)
     """Unit-norm code-embedding vector (JSON float array) of the crate's canonical
     source, from the self-hosted the code-embedding signal embedding service (see

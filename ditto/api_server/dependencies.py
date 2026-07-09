@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.embedding import Embedder
 from ditto.api_server.payment_verifier import PaymentVerifier
 from ditto.api_server.pricing import PriceOracle
@@ -44,3 +45,8 @@ async def get_storage_client(request: Request) -> S3StorageClient:
 async def get_embedder(request: Request) -> Embedder:
     """Return the lifespan-created :class:`Embedder` (null when disabled)."""
     return request.app.state.embedder
+
+
+async def get_dataset_generator(request: Request) -> DatasetGenerator:
+    """Return the lifespan-created :class:`DatasetGenerator` (null when disabled)."""
+    return request.app.state.dataset_generator

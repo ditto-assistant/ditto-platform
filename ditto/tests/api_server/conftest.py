@@ -19,6 +19,7 @@ import pytest
 from fastapi import FastAPI
 
 from ditto.api_server import ApiServerConfig, create_api_server
+from ditto.api_server.datapipeline import DataPipelineConfig, NullGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
     get_embedder,
@@ -79,6 +80,12 @@ def make_api_server_config(**overrides: Any) -> ApiServerConfig:
             timeout_seconds=5.0,
             auth="none",
         ),
+        data_pipeline=DataPipelineConfig(
+            url=None,  # generate service disabled in unit tests (null generator)
+            run_size="full",
+            timeout_seconds=30.0,
+            auth="none",
+        ),
     )
     if overrides:
         from dataclasses import replace
@@ -97,6 +104,9 @@ def app() -> Iterator[FastAPI]:
     # code embedder is lifespan-created; default it to the disabled null embedder so
     # upload tests get a null vector unless they override get_embedder.
     a.state.embedder = NullEmbedder()
+    # dataset generator is lifespan-created; default to the disabled null generator
+    # so verdict tests promote without pinning a dataset unless they override it.
+    a.state.dataset_generator = NullGenerator()
     yield a
     a.dependency_overrides.clear()
 

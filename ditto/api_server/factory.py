@@ -21,6 +21,7 @@ from ditto.api_server.config import (
     ApiServerConfig,
     parse_api_server_config_from_env,
 )
+from ditto.api_server.datapipeline import create_generator
 from ditto.api_server.embedding import create_embedder
 from ditto.api_server.endpoints import (
     health_router,
@@ -104,6 +105,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             embedder = create_embedder(config.embedding)
             stack.push_async_callback(embedder.aclose)
             app.state.embedder = embedder
+
+            generator = create_generator(config.data_pipeline)
+            stack.push_async_callback(generator.aclose)
+            app.state.dataset_generator = generator
         except Exception as e:
             raise ApiServerLifespanError(
                 f"failed to open dependencies during startup: {e}"

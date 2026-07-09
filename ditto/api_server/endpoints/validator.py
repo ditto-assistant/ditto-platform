@@ -300,6 +300,9 @@ async def request_job(
             miner_hotkey=agent.miner_hotkey,
             sha256=agent.sha256,
             deadline=ticket.deadline,
+            seed=agent.dataset_seed,
+            dataset_sha256=agent.dataset_sha256,
+            run_size=agent.dataset_run_size,
         )
     response.headers["Cache-Control"] = "no-store"
     logger.info(

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import re
+import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
@@ -44,7 +45,9 @@ from ditto.api_models import (
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.upload import _SS58_PATTERN
+from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
+    get_dataset_generator,
     get_session,
     get_storage_client,
 )
@@ -81,6 +84,16 @@ _QUEUE_STATUSES = (AgentStatus.UPLOADED,)
 _SCREENABLE_STATUSES = (AgentStatus.UPLOADED, AgentStatus.SCREENING)
 
 
+def _fresh_dataset_seed() -> int:
+    """A fresh, unpredictable non-negative int64 dataset seed.
+
+    Cryptographically random so a miner cannot anticipate their dataset; bounded
+    to the signed 64-bit range the ``scores.seed`` / ``agents.dataset_seed``
+    columns store (``[0, 2**63)``). Mirrors dittobench-api's ``FreshSeed``.
+    """
+    return secrets.randbits(63)
+
+
 class ScreenerAuthError(Exception):
     """Raised when a screener request fails authentication/authorization.
 
@@ -104,6 +117,7 @@ class AgentNotScreenableError(Exception):
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
+GeneratorDep = Annotated[DatasetGenerator, Depends(get_dataset_generator)]
 
 
 async def _assert_screener_permitted(chain: ChainDep, netuid: int, hotkey: str) -> None:
@@ -227,13 +241,21 @@ async def submit_result(
     response: Response,
     chain: ChainDep,
     session: SessionDep,
+    generator: GeneratorDep,
 ) -> ScreenResultResponse:
     """Record the screener's verdict and advance the agent's lifecycle.
 
     Ordering is cheap-before-expensive; no DB write happens until every check
     passes: (1) signature over ``{screener_hotkey}:{agent_id}:{passed}``, (2)
-    on-chain permit check, (3) one transaction that promotes ``uploaded ->
-    evaluating`` (pass) or ``uploaded -> screening_failed`` (fail).
+    on-chain permit check, (3) generate the per-submission dataset (pass +
+    generation enabled), (4) one transaction that promotes ``uploaded ->
+    evaluating`` (pass, pinning the dataset) or ``uploaded -> screening_failed``.
+
+    The dataset generation (3) is a network call to the private generate service;
+    it runs BEFORE the row-lock transaction (never hold a lock across I/O) and
+    only when the agent isn't already pinned, so a re-reported verdict doesn't
+    regenerate. If generation fails it raises and the agent is NOT promoted — the
+    verdict can be retried — so an evaluating agent always has a scoreable dataset.
     """
     response.headers["Cache-Control"] = "no-store"
 
@@ -252,8 +274,25 @@ async def submit_result(
 
     target = AgentStatus.EVALUATING if payload.passed else AgentStatus.SCREENING_FAILED
 
-    # 3. Atomic: apply the verdict. The row lock serializes concurrent verdicts
-    #    so the status guard + transition can't be lost-updated.
+    # 3. Generate the per-submission dataset (outside the row lock). Only on a pass,
+    #    when generation is enabled, and when the agent is not already pinned (a
+    #    cheap pre-read guards a re-reported verdict from regenerating).
+    new_dataset: tuple[int, str, str] | None = None
+    if payload.passed and generator.run_size is not None:
+        # Own transaction so the read commits/closes before the write txn below
+        # (a bare SELECT autobegins a transaction that would collide with it).
+        async with session.begin():
+            existing = await get_agent_by_id(session, agent_id=agent_id)
+            if existing is None:
+                raise AgentNotFoundError(f"no agent with id={agent_id}")
+            needs_dataset = existing.dataset_seed is None
+        if needs_dataset:
+            seed = _fresh_dataset_seed()
+            dataset_sha256 = await generator.generate(seed)
+            new_dataset = (seed, dataset_sha256, generator.run_size)
+
+    # 4. Atomic: apply the verdict + pin the dataset. The row lock serializes
+    #    concurrent verdicts so the status guard + transition can't be lost-updated.
     async with session.begin():
         agent = await get_agent_by_id(session, agent_id=agent_id, for_update=True)
         if agent is None:
@@ -267,14 +306,25 @@ async def submit_result(
                 f"agent {agent_id} is {agent.status}, cannot apply verdict "
                 f"passed={payload.passed} (target {target})"
             )
+        # Pin the generated dataset once, when evaluating and not yet set (the
+        # `is None` guard keeps a concurrent/duplicate verdict from overwriting).
+        if (
+            new_dataset is not None
+            and agent.status == AgentStatus.EVALUATING
+            and agent.dataset_seed is None
+        ):
+            agent.dataset_seed, agent.dataset_sha256, agent.dataset_run_size = (
+                new_dataset
+            )
         result_status = agent.status
 
     logger.info(
-        "screen verdict agent_id=%s screener=%s passed=%s status=%s%s",
+        "screen verdict agent_id=%s screener=%s passed=%s status=%s dataset=%s%s",
         agent_id,
         payload.screener_hotkey,
         payload.passed,
         result_status,
+        "pinned" if new_dataset is not None else "none",
         f" detail={payload.detail!r}" if payload.detail else "",
     )
     return ScreenResultResponse(agent_id=agent_id, status=result_status, accepted=True)
