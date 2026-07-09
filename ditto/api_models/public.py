@@ -560,6 +560,62 @@ class PublicDatasetReveal(BaseModel):
     ]
 
 
+class PublicBenchCorpusEntry(BaseModel):
+    """One scored run of a retired benchmark, with its FULL answer key.
+
+    Part of the retired-version corpus release: because a retired benchmark is
+    never scored again, its per-case answer keys (``expected`` tools/answers,
+    ``called``, ``case_id``) carry zero anti-overfit cost and are published
+    verbatim from ``scores.details`` so researchers get the complete labeled
+    benchmark.
+    """
+
+    agent_id: Annotated[UUID, Field(description="The scored agent's id.")]
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's hotkey.")
+    ]
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Scoring validator's hotkey.")
+    ]
+    seed: Annotated[int, Field(description="Dataset seed for the run.")]
+    run_id: Annotated[str, Field(description="Scoring-engine run id.")]
+    composite: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Composite this validator reported.")
+    ]
+    per_case: Annotated[
+        list[dict[str, Any]],
+        Field(
+            default_factory=list,
+            description=(
+                "Full UNREDACTED per-case records, answer keys included (retired "
+                "version, so safe). Empty when the run stored no per-case data."
+            ),
+        ),
+    ]
+
+
+class PublicBenchCorpusResponse(BaseModel):
+    """A page of a retired benchmark's full labeled corpus.
+
+    Served only for a retired ``bench_version`` (``< current``); the live version
+    is refused (409) since exposing its answer keys would be an overfit vector.
+    Paginate with ``limit`` / ``offset`` up to ``total``.
+    """
+
+    bench_version: Annotated[int, Field(description="The retired benchmark version.")]
+    generated_at: Annotated[
+        datetime, Field(description="When this page was read (UTC).")
+    ]
+    count: Annotated[int, Field(ge=0, description="Entries in this page.")]
+    total: Annotated[int, Field(ge=0, description="Total runs for this version.")]
+    limit: Annotated[int, Field(ge=1, description="Page size.")]
+    offset: Annotated[int, Field(ge=0, description="Page offset.")]
+    entries: Annotated[
+        list[PublicBenchCorpusEntry],
+        Field(default_factory=list, description="Scored runs with full answer keys."),
+    ]
+
+
 class PublicAuditEntry(BaseModel):
     """One entry of the append-only, hash-chained public score audit log.
 

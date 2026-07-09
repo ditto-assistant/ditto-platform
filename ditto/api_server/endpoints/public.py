@@ -28,6 +28,7 @@ import logging
 import math
 import statistics
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Response
@@ -35,6 +36,8 @@ from fastapi import APIRouter, HTTPException, Query, Response
 from ditto.api_models import (
     PublicAuditEntry,
     PublicAuditResponse,
+    PublicBenchCorpusEntry,
+    PublicBenchCorpusResponse,
     PublicBenchIntegrity,
     PublicCaseResult,
     PublicCategoryStat,
@@ -48,7 +51,7 @@ from ditto.api_models import (
     PublicSubmissionSummary,
     PublicValidatorScore,
 )
-from ditto.api_server.bench import CURRENT_BENCH_VERSION
+from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.validator import SessionDep
@@ -62,6 +65,7 @@ from ditto.db.queries.scores import (
     list_eligible_ledger,
     list_miner_composite_history,
     list_public_submissions,
+    list_scores_for_bench_version,
 )
 
 logger = logging.getLogger(__name__)
@@ -514,5 +518,65 @@ async def audit(
                 recorded_at=e.recorded_at,
             )
             for e in entries
+        ],
+    )
+
+
+def _corpus_per_case(details: object) -> list[dict[str, Any]]:
+    """Extract the full UNREDACTED per-case list from a score's details blob."""
+    if not isinstance(details, dict):
+        return []
+    per_case = details.get("per_case")
+    if not isinstance(per_case, list):
+        return []
+    return [c for c in per_case if isinstance(c, dict)]
+
+
+@router.get("/bench/{version}/corpus", response_model=PublicBenchCorpusResponse)
+async def bench_corpus(
+    response: Response,
+    session: SessionDep,
+    version: int,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> PublicBenchCorpusResponse:
+    """The FULL labeled corpus of a RETIRED benchmark version (answer keys included).
+
+    Once a benchmark is superseded it is never scored again, so its per-case answer
+    keys carry zero anti-overfit cost and are released verbatim from the stored
+    scores for research + audit. Refused with 409 for the current (live) version or
+    any unknown future version, so no live answer key is ever exposed here.
+    Paginate with ``limit`` / ``offset`` up to ``total``.
+    """
+    if not is_bench_version_retired(version):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"bench_version {version} is not retired (current is "
+                f"{CURRENT_BENCH_VERSION}); its answer keys are not released"
+            ),
+        )
+    response.headers["Cache-Control"] = "public, max-age=3600, immutable"
+    rows, total = await list_scores_for_bench_version(
+        session, version=version, limit=limit, offset=offset
+    )
+    return PublicBenchCorpusResponse(
+        bench_version=version,
+        generated_at=datetime.now(UTC),
+        count=len(rows),
+        total=total,
+        limit=limit,
+        offset=offset,
+        entries=[
+            PublicBenchCorpusEntry(
+                agent_id=score.agent_id,
+                miner_hotkey=miner,
+                validator_hotkey=score.validator_hotkey,
+                seed=score.seed,
+                run_id=score.run_id,
+                composite=score.composite,
+                per_case=_corpus_per_case(score.details),
+            )
+            for score, miner in rows
         ],
     )

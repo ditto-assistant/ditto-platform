@@ -411,6 +411,43 @@ async def list_public_submissions(
     ]
 
 
+async def list_scores_for_bench_version(
+    session: AsyncSession, *, version: int, limit: int = 100, offset: int = 0
+) -> tuple[list[tuple[Score, str]], int]:
+    """Score rows scored under ``bench_version == version``, plus the total count.
+
+    Returns ``([(score, miner_hotkey), ...], total)``, ordered deterministically
+    (generated_at, agent_id, validator_hotkey) and paginated. Powers the retired-
+    version corpus release, which serves the FULL unredacted per-case answer keys
+    stored in ``scores.details`` — the caller must gate this to retired versions.
+    Filters on the stamped ``details.bench_version`` JSON field, so legacy rows
+    (null version) are excluded.
+    """
+    version_col = Score.details["bench_version"].as_integer()
+    base = (
+        select(Score, Agent.miner_hotkey)
+        .join(Agent, Agent.agent_id == Score.agent_id)
+        .where(version_col == version)
+    )
+    total = (
+        await session.execute(
+            select(func.count()).select_from(base.subquery())
+        )
+    ).scalar_one()
+    rows = (
+        await session.execute(
+            base.order_by(
+                Score.generated_at.asc(),
+                Score.agent_id.asc(),
+                Score.validator_hotkey.asc(),
+            )
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    return [(score, miner) for score, miner in rows], int(total)
+
+
 async def list_miner_composite_history(
     session: AsyncSession,
     hotkeys: list[str],

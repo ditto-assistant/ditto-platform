@@ -757,6 +757,94 @@ class TestPublicDatasetReveal:
         assert resp.status_code == 503
 
 
+class TestPublicBenchCorpus:
+    async def test_retired_version_serves_full_answer_keys(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A run scored under the retired v1 (current is 2). Its full per-case
+        # answer keys are released verbatim.
+        details = {
+            "bench_version": 1,
+            "per_case": [
+                {
+                    "category": "web_search",
+                    "score": 0.6,
+                    "expected": ["search_web"],
+                    "called": ["search_web"],
+                    "case_id": "web_search-1-0001",
+                }
+            ],
+        }
+        await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6], details=details
+        )
+        _install_db(app, session_maker)
+
+        resp = await client.get("/api/v1/public/bench/1/corpus")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["bench_version"] == 1
+        assert body["total"] == 3  # three validator rows
+        entry = body["entries"][0]
+        # The FULL answer key is present (retired = safe).
+        assert entry["per_case"][0]["expected"] == ["search_web"]
+        assert entry["per_case"][0]["case_id"] == "web_search-1-0001"
+
+    async def test_live_version_is_refused(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # v2 is the current (live) version: its answer keys must never be released.
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+            details={"bench_version": 2, "per_case": [{"expected": ["x"]}]},
+        )
+        _install_db(app, session_maker)
+        resp = await client.get("/api/v1/public/bench/2/corpus")
+        assert resp.status_code == 409
+        # ...and the live answer key is not in the refusal body.
+        assert '"expected"' not in resp.text
+
+    async def test_retired_version_paginates(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+            details={"bench_version": 1, "per_case": []},
+        )
+        _install_db(app, session_maker)
+        page = (await client.get("/api/v1/public/bench/1/corpus?limit=2")).json()
+        assert page["count"] == 2
+        assert page["total"] == 3
+        page2 = (
+            await client.get("/api/v1/public/bench/1/corpus?limit=2&offset=2")
+        ).json()
+        assert page2["count"] == 1
+
+    async def test_retired_version_with_no_runs_is_empty(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        body = (await client.get("/api/v1/public/bench/1/corpus")).json()
+        assert body["total"] == 0
+        assert body["entries"] == []
+
+
 class TestPublicAudit:
     async def test_feed_returns_chained_entries(
         self,

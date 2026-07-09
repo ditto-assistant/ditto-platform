@@ -21,6 +21,8 @@ from ditto.api_models.health import HealthResponse
 from ditto.api_models.public import (
     PublicAuditEntry,
     PublicAuditResponse,
+    PublicBenchCorpusEntry,
+    PublicBenchCorpusResponse,
     PublicBenchIntegrity,
     PublicCaseResult,
     PublicCategoryStat,
@@ -72,6 +74,8 @@ __all__ = [
     "LedgerResponse",
     "PublicAuditEntry",
     "PublicAuditResponse",
+    "PublicBenchCorpusEntry",
+    "PublicBenchCorpusResponse",
     "PublicBenchIntegrity",
     "PublicCaseResult",
     "PublicCategoryStat",

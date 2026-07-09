@@ -428,3 +428,39 @@ class TestListEligibleLedger:
         assert len(ledger) == 1
         assert ledger[0].composite == pytest.approx(0.55)
         assert ledger[0].eligible is True
+
+
+class TestListScoresForBenchVersion:
+    async def test_filters_by_version_excludes_legacy(
+        self, session: AsyncSession
+    ) -> None:
+        from ditto.db.queries.scores import list_scores_for_bench_version
+
+        agent = await _seed_agent(session)
+        # Three rows: v1, v2, and a legacy (null details) row.
+        await _upsert(
+            session,
+            agent.agent_id,
+            validator_hotkey="5V1",
+            run_id="r1",
+            details={"bench_version": 1, "per_case": [{"expected": ["x"]}]},
+        )
+        await _upsert(
+            session,
+            agent.agent_id,
+            validator_hotkey="5V2",
+            run_id="r2",
+            details={"bench_version": 2},
+        )
+        await _upsert(
+            session, agent.agent_id, validator_hotkey="5V3", run_id="r3", details=None
+        )
+
+        rows, total = await list_scores_for_bench_version(session, version=1)
+        assert total == 1
+        assert len(rows) == 1
+        score, miner = rows[0]
+        assert score.run_id == "r1"
+        assert miner == _MINER
+        # The unredacted answer key rides along for the (retired) corpus.
+        assert score.details["per_case"][0]["expected"] == ["x"]

@@ -117,6 +117,15 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   generate service is unavailable. Safe despite the answer key: the seed is
   one-time and was unpredictable at submission (see the anti-gaming posture), so a
   past dataset's answers cannot help overfit a future run.
+- `GET /api/v1/public/bench/{version}/corpus?limit=&offset=` → `{ bench_version,
+  generated_at, count, total, limit, offset, entries: [ { agent_id, miner_hotkey,
+  validator_hotkey, seed, run_id, composite, per_case } ] }`.
+  The **retired-version corpus release** (task B): the FULL UNREDACTED per-case
+  answer keys (from stored `scores.details`) for a benchmark version that has been
+  superseded. Refused with 409 for the current (live) version or any unknown
+  future version, so a live answer key is never exposed here. Once a version
+  retires it is never scored again, so releasing its complete labeled corpus has
+  zero anti-overfit cost and lets researchers study the benchmark in full.
 - `GET /api/v1/public/audit?since_seq=&limit=` → `{ generated_at, count,
   genesis_hash, head_hash, entries: [ { seq, agent_id, validator_hotkey, event,
   payload, prev_hash, entry_hash, recorded_at } ] }`.
@@ -196,6 +205,12 @@ idea); no server needed since all data comes from the public API + wandb.
    pinned dataset (raw seed + sha256). Reads the existing `scores` rows; no
    schema change. This is the "transparency is the trust mechanism" surface for
    the decentralized k=3 model. Dashboard drill-down to consume it is TODO.
+7. ✅ Auditability opening (2026-07-09): on-chain seed derivation (verifiable,
+   removes platform seed-trust), `/public/agent/{id}/dataset` finalized-dataset
+   reveal (task A, independent re-grade), per-validator per-case breakdown (task
+   C), and `/public/bench/{version}/corpus` retired-version full-corpus release
+   (task B). Opening the generator itself is planned + approval-gated (see
+   dittobench-api `docs/open-generator-plan.md`), NOT done.
 6. ✅ Append-only hash-chained audit log (2026-07-09, task #51):
    `score_audit_log` table (migration `d3a9f5e17c24`) + `/api/v1/public/audit`.
    Every score submission appends one immutable, SHA-256-chained entry in the
