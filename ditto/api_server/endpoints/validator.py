@@ -45,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
     ArtifactResponse,
+    JobResponse,
     ScoreReport,
     SubmitScoreRequest,
     SubmitScoreResponse,
@@ -70,6 +71,7 @@ from ditto.db.queries.scores import (
     list_scores_for_agent,
     upsert_score,
 )
+from ditto.db.queries.tickets import issue_ticket
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -80,6 +82,10 @@ router = APIRouter(prefix="/validator", tags=["validator"])
 
 # How long a pre-signed artifact URL stays valid.
 _ARTIFACT_URL_TTL = timedelta(minutes=5)
+
+# How long a validator has to redeem a ticket with a score before it lapses and
+# the slot re-opens for another validator.
+_TICKET_TTL = timedelta(minutes=30)
 
 
 # Object-store key the upload pipeline writes the tarball under.
@@ -251,6 +257,54 @@ async def queue(
     ]
     logger.info("validator=%s polled queue: %d item(s)", validator_hotkey, len(items))
     return ValidatorQueueResponse(items=items, count=len(items))
+
+
+@router.post(
+    "/job",
+    response_model=JobResponse,
+    responses={
+        204: {"description": "No agent needs this validator right now."},
+        401: {"description": "Missing/invalid validator auth."},
+        503: {"description": "Chain unavailable for the permit check."},
+    },
+)
+async def request_job(
+    response: Response,
+    validator_hotkey: ValidatorDep,
+    session: SessionDep,
+) -> JobResponse | Response:
+    """Issue this validator a scoring ticket for the next eligible agent.
+
+    The k=3 pull: at most :data:`SCORING_QUORUM` tickets per agent go to that
+    many distinct validators, so most requests get **204 No Content** ("no job
+    for you"). An issued ticket must be redeemed with a score before its
+    deadline, or it lapses and the slot re-opens for another validator. The
+    ticket write (and the overdue-ticket sweep it runs) commit together.
+    """
+    now = datetime.now(UTC)
+    async with session.begin():
+        ticket = await issue_ticket(
+            session, validator_hotkey=validator_hotkey, now=now, ttl=_TICKET_TTL
+        )
+        if ticket is None:
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
+        agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
+        # issue_ticket selected this agent from ``agents``, so it exists.
+        assert agent is not None
+        job = JobResponse(
+            agent_id=agent.agent_id,
+            miner_hotkey=agent.miner_hotkey,
+            sha256=agent.sha256,
+            deadline=ticket.deadline,
+        )
+    response.headers["Cache-Control"] = "no-store"
+    logger.info(
+        "issued job agent=%s validator=%s deadline=%s",
+        job.agent_id,
+        validator_hotkey,
+        job.deadline.isoformat(),
+    )
+    return job
 
 
 @router.get(

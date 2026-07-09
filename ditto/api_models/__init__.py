@@ -43,6 +43,7 @@ from ditto.api_models.upload import (
 from ditto.api_models.validator import (
     ArtifactResponse,
     CaseScore,
+    JobResponse,
     LedgerEntry,
     LedgerResponse,
     ScoreReport,
@@ -59,6 +60,7 @@ __all__ = [
     "CaseScore",
     "EvalPricingResponse",
     "HealthResponse",
+    "JobResponse",
     "LedgerEntry",
     "LedgerResponse",
     "PublicBenchIntegrity",

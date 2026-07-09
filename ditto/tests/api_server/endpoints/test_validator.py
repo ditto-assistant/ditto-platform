@@ -354,6 +354,66 @@ class TestArtifact:
 # --- Submit score ----------------------------------------------------------
 
 
+class TestRequestJob:
+    async def test_issues_ticket_for_evaluating_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        resp = await client.post("/api/v1/validator/job", headers=_AUTH_HEADER)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["agent_id"] == str(agent_id)
+        assert "deadline" in body
+
+    async def test_no_work_returns_204(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        resp = await client.post("/api/v1/validator/job", headers=_AUTH_HEADER)
+        assert resp.status_code == 204
+
+    async def test_caps_at_quorum_across_validators(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        # Three distinct validators each get the single agent (fills the pool).
+        for kp in _KEYPAIRS:
+            r = await client.post(
+                "/api/v1/validator/job",
+                headers={"X-Validator-Hotkey": kp.ss58_address},
+            )
+            assert r.status_code == 200
+        # A further request finds no open slot -> no job.
+        r = await client.post("/api/v1/validator/job", headers=_AUTH_HEADER)
+        assert r.status_code == 204
+
+    async def test_unpermitted_validator_returns_401(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app, permitted=False)
+        resp = await client.post("/api/v1/validator/job", headers=_AUTH_HEADER)
+        assert resp.status_code == 401
+
+
 class TestSubmitScore:
     async def test_records_score_and_finalizes(
         self,

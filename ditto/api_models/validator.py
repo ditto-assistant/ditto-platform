@@ -124,6 +124,40 @@ class ArtifactResponse(BaseModel):
     )
 
 
+class JobResponse(BaseModel):
+    """Returned by ``POST /validator/job`` when a ticket is issued.
+
+    A ticket grants this validator the right to score one agent by ``deadline``;
+    the platform issues at most three per agent (the k=3 pool) and answers 204
+    (no body) when there is no work. The validator fetches the tarball via
+    ``/artifact`` and scores it. The platform-generated dataset is shipped here
+    once the data-pipeline split lands (#46); until then it is fetched/omitted.
+    """
+
+    agent_id: Annotated[UUID, Field(description="Agent this ticket is for.")]
+    miner_hotkey: Annotated[str, Field(description="Submitting miner's SS58 hotkey.")]
+    sha256: Annotated[
+        str, Field(description="SHA-256 of the uploaded tarball, lowercase hex.")
+    ]
+    deadline: Annotated[
+        datetime,
+        Field(description="Score before this (UTC) or the ticket lapses."),
+    ]
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+                "miner_hotkey": (
+                    "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
+                ),
+                "sha256": "deadbeef" * 8,
+                "deadline": "2026-07-09T12:30:00Z",
+            }
+        }
+    )
+
+
 class CaseScore(BaseModel):
     """Per-case breakdown inside a :class:`ScoreReport`.
 
