@@ -348,6 +348,9 @@ def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
                 run_id=s.run_id,
                 signature=s.signature,
                 generated_at=s.generated_at,
+                case_results=_safe_case_results(
+                    s.details if isinstance(s.details, dict) else {}
+                ),
             )
             for s in row.scores
         ],

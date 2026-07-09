@@ -121,6 +121,7 @@ async def _seed_k3(
     dataset_run_size: str | None = "full",
     dataset_seed_block: int | None = 4321,
     dataset_seed_block_hash: str | None = "0x" + "9f" * 32,
+    details: dict | None = None,
     base_time: datetime = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
 ) -> str:
     """Seed one agent scored by ``len(composites)`` distinct validators.
@@ -165,6 +166,7 @@ async def _seed_k3(
                 n=110,
                 generated_at=base_time + timedelta(minutes=i),
                 signature="ab" * 64,
+                details=details,
             )
     return str(agent_id)
 
@@ -468,6 +470,49 @@ class TestPublicSubmissionScores:
             assert s["signature"] == "ab" * 64
             assert s["seed"] == 987654321
             assert "run_id" in s
+
+    async def test_detail_exposes_redacted_per_case_breakdown(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # Per-validator per-case breakdown (where points were won/lost) is served,
+        # redacted: category/kind/score/pass/latency/notes but never the answer key.
+        details = {
+            "per_case": [
+                {
+                    "kind": "tool",
+                    "category": "web_search",
+                    "score": 0.6,
+                    "correct": False,
+                    "latency_ms": 3382,
+                    "notes": ["1 extra/unexpected tool call(s)"],
+                    "expected": ["search_web"],
+                    "called": ["search_web", "search_web"],
+                    "case_id": "web_search-8860569897825046057-0001",
+                },
+            ],
+        }
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+            details=details,
+        )
+        _install_db(app, session_maker)
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/scores")
+        body = resp.json()
+        cases = body["scores"][0]["case_results"]
+        assert cases and cases[0]["category"] == "web_search"
+        assert cases[0]["score"] == pytest.approx(0.6)
+        assert cases[0]["correct"] is False
+        assert set(cases[0]).issubset(
+            {"category", "kind", "score", "correct", "latency_ms", "notes"}
+        )
+        # The answer key never appears anywhere in the response.
+        for leaked in ('"expected"', '"called"', '"case_id"'):
+            assert leaked not in resp.text
 
     async def test_detail_omits_per_case_answer_key(
         self,

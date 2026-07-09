@@ -383,6 +383,19 @@ class PublicValidatorScore(BaseModel):
     generated_at: Annotated[
         datetime, Field(description="When the scoring engine produced the score (UTC).")
     ]
+    case_results: Annotated[
+        list[PublicCaseResult] | None,
+        Field(
+            default=None,
+            description=(
+                "Redacted per-case breakdown of this validator's run — each case's "
+                "category / kind / score / pass / latency / mechanical notes, so an "
+                "observer can audit exactly where the agent gained or lost points. "
+                "Never the answer key (expected / called / case_id). None when the "
+                "run carries no per-case data."
+            ),
+        ),
+    ]
 
 
 class PublicSubmissionScores(BaseModel):
