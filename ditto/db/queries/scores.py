@@ -15,12 +15,13 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, and_, func, select
+from sqlalchemy import ColumnElement, and_, func, or_, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
 from ditto.db.models import Agent, Score
+from ditto.db.queries.agents import get_agent_by_id
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,6 +40,14 @@ if TYPE_CHECKING:
 # weights. Keep in sync with the validator's MIN_ELIGIBLE_CASES
 # (ditto-subnet ditto/validator/weights.py).
 MIN_ELIGIBLE_CASES = 100
+
+# The validator pool size: a submission is scored by this many independent
+# validators (the k=3 model), and its canonical score is the MEDIAN of their
+# composites, so a single generous or harsh validator cannot move it. The
+# platform issues at most this many tickets per agent (``validator_tickets``)
+# and finalizes an agent (``evaluating -> scored``) once it has this many
+# scores. Keep in sync with the ticket-issue cap and the validator quorum.
+SCORING_QUORUM = 3
 
 
 def _is_ranked() -> ColumnElement[bool]:
@@ -290,6 +299,155 @@ async def list_scores_for_agent(
     return list(result.scalars().all())
 
 
+# Agents whose scoring has settled into a public, non-provisional state. A held
+# copy (``ath_pending_review``) is deliberately excluded — its score is not yet
+# public and surfacing "under review" before resolution would be premature.
+_PUBLIC_SUBMISSION_STATUSES = (AgentStatus.SCORED, AgentStatus.LIVE)
+
+
+@dataclass(frozen=True)
+class SubmissionRow:
+    """One finalized submission plus every validator's score for it.
+
+    The value object behind the public per-submission transparency surface: the
+    agent's dataset pin (``dataset_seed`` / ``dataset_sha256`` / ``run_size``)
+    and the full set of per-validator :class:`Score` rows the median finalized
+    on. ``last_scored_at`` is the most recent score time (the recency key the
+    index sorts by).
+    """
+
+    agent_id: UUID
+    miner_hotkey: str
+    status: AgentStatus
+    dataset_seed: int | None
+    dataset_sha256: str | None
+    dataset_run_size: str | None
+    dataset_seed_block: int | None
+    dataset_seed_block_hash: str | None
+    last_scored_at: datetime | None
+    scores: list[Score]
+
+
+async def get_submission_scores(
+    session: AsyncSession, *, agent_id: UUID
+) -> SubmissionRow | None:
+    """The full k=3 scoring record for one finalized agent, or ``None``.
+
+    ``None`` when the agent does not exist or has not settled into a public
+    status (still evaluating, or held for copy review) — callers map that to 404
+    so a provisional agent's partial scores are never exposed.
+    """
+    agent = await get_agent_by_id(session, agent_id=agent_id)
+    if agent is None or agent.status not in _PUBLIC_SUBMISSION_STATUSES:
+        return None
+    scores = await list_scores_for_agent(session, agent_id=agent_id)
+    last_scored_at = (
+        _as_utc(max(s.generated_at for s in scores)) if scores else None
+    )
+    return SubmissionRow(
+        agent_id=agent.agent_id,
+        miner_hotkey=agent.miner_hotkey,
+        status=agent.status,
+        dataset_seed=agent.dataset_seed,
+        dataset_sha256=agent.dataset_sha256,
+        dataset_run_size=agent.dataset_run_size,
+        dataset_seed_block=agent.dataset_seed_block,
+        dataset_seed_block_hash=agent.dataset_seed_block_hash,
+        last_scored_at=last_scored_at,
+        scores=sorted(scores, key=lambda s: s.validator_hotkey),
+    )
+
+
+async def list_public_submissions(
+    session: AsyncSession, *, limit: int = 50
+) -> list[SubmissionRow]:
+    """Recent finalized submissions, most recently scored first.
+
+    Two queries: pick the finalized agents by latest-score recency (capped to
+    ``limit``), then batch-fetch their score rows and group in Python. The
+    ``scores`` table is small at subnet scale, so this stays cheap.
+    """
+    recency = (
+        select(
+            Score.agent_id.label("agent_id"),
+            func.max(Score.generated_at).label("last_scored"),
+        )
+        .group_by(Score.agent_id)
+        .subquery()
+    )
+    stmt = (
+        select(Agent, recency.c.last_scored)
+        .join(recency, recency.c.agent_id == Agent.agent_id)
+        .where(Agent.status.in_(_PUBLIC_SUBMISSION_STATUSES))
+        .order_by(recency.c.last_scored.desc())
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).all()
+    if not rows:
+        return []
+    agent_ids = [agent.agent_id for agent, _ in rows]
+    score_rows = (
+        await session.execute(select(Score).where(Score.agent_id.in_(agent_ids)))
+    ).scalars().all()
+    by_agent: dict[UUID, list[Score]] = {}
+    for s in score_rows:
+        by_agent.setdefault(s.agent_id, []).append(s)
+    return [
+        SubmissionRow(
+            agent_id=agent.agent_id,
+            miner_hotkey=agent.miner_hotkey,
+            status=agent.status,
+            dataset_seed=agent.dataset_seed,
+            dataset_sha256=agent.dataset_sha256,
+            dataset_run_size=agent.dataset_run_size,
+            dataset_seed_block=agent.dataset_seed_block,
+            dataset_seed_block_hash=agent.dataset_seed_block_hash,
+            last_scored_at=_as_utc(last_scored) if last_scored else None,
+            scores=sorted(
+                by_agent.get(agent.agent_id, []), key=lambda s: s.validator_hotkey
+            ),
+        )
+        for agent, last_scored in rows
+    ]
+
+
+async def list_scores_for_bench_version(
+    session: AsyncSession, *, version: int, limit: int = 100, offset: int = 0
+) -> tuple[list[tuple[Score, str]], int]:
+    """Score rows scored under ``bench_version == version``, plus the total count.
+
+    Returns ``([(score, miner_hotkey), ...], total)``, ordered deterministically
+    (generated_at, agent_id, validator_hotkey) and paginated. Powers the retired-
+    version corpus release, which serves the FULL unredacted per-case answer keys
+    stored in ``scores.details`` — the caller must gate this to retired versions.
+    Filters on the stamped ``details.bench_version`` JSON field, so legacy rows
+    (null version) are excluded.
+    """
+    version_col = Score.details["bench_version"].as_integer()
+    base = (
+        select(Score, Agent.miner_hotkey)
+        .join(Agent, Agent.agent_id == Score.agent_id)
+        .where(version_col == version)
+    )
+    total = (
+        await session.execute(
+            select(func.count()).select_from(base.subquery())
+        )
+    ).scalar_one()
+    rows = (
+        await session.execute(
+            base.order_by(
+                Score.generated_at.asc(),
+                Score.agent_id.asc(),
+                Score.validator_hotkey.asc(),
+            )
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    return [(score, miner) for score, miner in rows], int(total)
+
+
 async def list_miner_composite_history(
     session: AsyncSession,
     hotkeys: list[str],
@@ -333,13 +491,15 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
 
     Three levels, all deterministic:
 
-    1. ``agent_best`` ranks each agent's ``scores`` rows and keeps the single
-       best **whole row** — so ``composite`` / ``seed`` / ``run_id`` /
-       ``validator_hotkey`` / ``signature`` always come from the *same* physical
-       row and the exposed signature verifies against the exposed composite.
-       (Picking each column independently with ``MAX`` would stitch a mismatched
-       tuple the moment an agent has >1 score row — e.g. after a validator
-       hotkey rotation inserts a second ``(agent_id, validator_hotkey)`` row.)
+    1. ``agent_best`` takes each agent's **median** score row: it orders the
+       agent's ``scores`` rows by composite and keeps the middle one (position
+       ``(count+1)/2``), so the k=3 pool's canonical score is the median of its
+       validators' composites and a single generous or harsh validator cannot
+       move it. It keeps the whole **row** (not a per-column ``MEDIAN``), so
+       ``composite`` / ``seed`` / ``run_id`` / ``validator_hotkey`` /
+       ``signature`` all come from the same physical row and the exposed
+       signature still verifies against the exposed composite. An agent with a
+       single score is its own median, so pre-quorum agents degrade cleanly.
     2. join to ``agents`` filtered to ``scored``.
     3. a ``ROW_NUMBER`` window keeps each miner's single best agent.
 
@@ -356,8 +516,10 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
 
     Ordering (``eligible DESC, composite DESC, first_seen ASC, agent_id ASC``)
     matches the validator fold's eligibility gate + champion/tail tie-breaks.
-    When the D3 k=3 design lands, ``agent_best`` becomes a median-of-3 selection
-    — a localized change here.
+    The per-agent selection is median-of-quorum (:data:`SCORING_QUORUM`); the
+    per-agent ``n`` is uniform across the pool because all validators score the
+    same platform-generated dataset, so the median row's ``eligible`` flag
+    represents the agent.
     """
     agent_best = select(
         Score.agent_id.label("agent_id"),
@@ -372,15 +534,17 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         Score.details.label("details"),
         Score.validator_hotkey.label("validator_hotkey"),
         Score.signature.label("signature"),
+        # Row count in the agent's pool, so the median position is (cnt+1)/2.
+        func.count(Score.agent_id)
+        .over(partition_by=Score.agent_id)
+        .label("cnt"),
+        # Ascending composite so the middle row (by srn) is the median; the
+        # validator_hotkey tie-break keeps the pick deterministic.
         func.row_number()
         .over(
             partition_by=Score.agent_id,
-            # Prefer a ranked (full-benchmark, positive-composite) row over a
-            # higher-composite smoke/practice row, so a small run cannot shadow the
-            # agent's real full run and drop it out of the ranked/emission pool.
             order_by=(
-                _is_ranked().desc(),
-                Score.composite.desc(),
+                Score.composite.asc(),
                 Score.validator_hotkey.asc(),
             ),
         )
@@ -413,7 +577,18 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             agent_best.c.signature,
         )
         .join(agent_best, agent_best.c.agent_id == Agent.agent_id)
-        .where(Agent.status == AgentStatus.SCORED, agent_best.c.srn == 1)
+        # The median row: the middle by ascending composite. Expressed as
+        # integer arithmetic (no division, so it is exact + portable across
+        # Postgres and the SQLite test path): the lower-middle index m has
+        # 2m == cnt (even) or 2m == cnt+1 (odd). A lone score picks itself; a
+        # quorum of 3 picks the 2nd (true median).
+        .where(
+            Agent.status == AgentStatus.SCORED,
+            or_(
+                agent_best.c.srn * 2 == agent_best.c.cnt,
+                agent_best.c.srn * 2 == agent_best.c.cnt + 1,
+            ),
+        )
         .subquery()
     )
     rn = (

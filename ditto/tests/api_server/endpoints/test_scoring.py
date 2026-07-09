@@ -9,7 +9,7 @@ wire shape.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -18,6 +18,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -25,6 +26,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+import ditto.api_server.endpoints.scoring as scoring_mod
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.dependencies import get_chain_client, get_session
 from ditto.api_server.middleware.error_envelope import ERROR_CODE_VALIDATOR_AUTH
@@ -166,7 +168,13 @@ class TestScoringLedger:
         _install_chain(app)
         resp = await client.get("/api/v1/scoring/scores", headers=_AUTH_HEADER)
         assert resp.status_code == 200
-        assert resp.json() == {"entries": [], "count": 0}
+        body = resp.json()
+        assert body["entries"] == []
+        assert body["count"] == 0
+        # A fresh read is never stale.
+        assert body["stale"] is False
+        assert body["age_seconds"] == 0
+        assert body["generated_at"] is not None
 
     async def test_missing_auth_returns_401(
         self,
@@ -191,3 +199,78 @@ class TestScoringLedger:
         resp = await client.get("/api/v1/scoring/scores", headers=_AUTH_HEADER)
         assert resp.status_code == 401
         assert resp.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
+
+
+class TestScoringLiveness:
+    """Serve-last-known + staleness policy on a transient DB failure."""
+
+    @staticmethod
+    def _break_db(monkeypatch: pytest.MonkeyPatch) -> None:
+        async def _boom(_session: object) -> list:
+            raise OperationalError("SELECT ...", {}, Exception("db down"))
+
+        monkeypatch.setattr(scoring_mod, "list_eligible_ledger", _boom)
+
+    async def test_db_failure_with_no_cache_returns_503(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        self._break_db(monkeypatch)
+        resp = await client.get("/api/v1/scoring/scores", headers=_AUTH_HEADER)
+        assert resp.status_code == 503
+
+    async def test_db_failure_serves_last_known_good(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _seed_scored(session_maker, miner=_MINER, composite=0.7)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        # First read succeeds and caches the snapshot.
+        ok = await client.get("/api/v1/scoring/scores", headers=_AUTH_HEADER)
+        assert ok.status_code == 200
+        assert ok.json()["stale"] is False
+
+        # A later read fails: the cached ledger is served, flagged stale.
+        self._break_db(monkeypatch)
+        stale = await client.get("/api/v1/scoring/scores", headers=_AUTH_HEADER)
+        assert stale.status_code == 200
+        body = stale.json()
+        assert body["stale"] is True
+        assert body["count"] == 1
+        assert body["entries"][0]["miner_hotkey"] == _MINER
+        assert body["age_seconds"] >= 0
+
+    async def test_cache_too_stale_returns_503(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _seed_scored(session_maker, miner=_MINER, composite=0.7)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        # Prime the cache, then age it past the staleness limit.
+        assert (
+            await client.get("/api/v1/scoring/scores", headers=_AUTH_HEADER)
+        ).status_code == 200
+        snap = app.state.ledger_snapshot
+        snap.generated_at = snap.generated_at - timedelta(
+            seconds=scoring_mod._MAX_STALE_SECONDS + 60
+        )
+
+        self._break_db(monkeypatch)
+        resp = await client.get("/api/v1/scoring/scores", headers=_AUTH_HEADER)
+        assert resp.status_code == 503
+        assert "staleness limit" in resp.json()["message"]

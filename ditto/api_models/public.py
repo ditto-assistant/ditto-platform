@@ -10,7 +10,8 @@ hand a miner the benchmark's answer key (per-case ``expected``/``called``). See
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -327,6 +328,349 @@ class PublicLeaderboardResponse(BaseModel):
     entries: Annotated[
         list[PublicLeaderboardEntry],
         Field(default_factory=list, description="Ranked miners, best composite first."),
+    ]
+
+
+class PublicValidatorScore(BaseModel):
+    """One validator's score for a submission, published verbatim (public).
+
+    The per-validator half of the k=3 transparency record: *which* validator
+    scored the agent and the exact numbers it reported, including its sr25519
+    ``signature`` so the row is independently verifiable against the published
+    validator public key. Unlike the aggregate leaderboard this deliberately
+    exposes ``validator_hotkey`` (a public on-chain identity) and the raw
+    ``seed`` — the whole point of the record is to show *who* scored an agent on
+    *which* dataset, so an observer can reproduce and audit the number.
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Scoring validator's hotkey.")
+    ]
+    composite: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Composite this validator reported.")
+    ]
+    tool_mean: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Mean tool accuracy in [0,1].")
+    ]
+    memory_mean: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Mean memory recall in [0,1].")
+    ]
+    median_ms: Annotated[
+        int, Field(ge=0, description="Median per-case latency (ms).")
+    ]
+    n: Annotated[int, Field(ge=0, description="Number of cases scored.")]
+    seed: Annotated[
+        int,
+        Field(
+            description=(
+                "Dataset seed this validator scored on. The platform draws it "
+                "after screening (the miner never sees it before submitting), so "
+                "publishing it post-hoc enables reproduction/audit without letting "
+                "anyone pre-overfit a future submission."
+            )
+        ),
+    ]
+    run_id: Annotated[
+        str, Field(description="Scoring-engine run id the signature is bound to.")
+    ]
+    signature: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="sr25519 signature over the payload, hex (self-verifying).",
+        ),
+    ]
+    generated_at: Annotated[
+        datetime, Field(description="When the scoring engine produced the score (UTC).")
+    ]
+    case_results: Annotated[
+        list[PublicCaseResult] | None,
+        Field(
+            default=None,
+            description=(
+                "Redacted per-case breakdown of this validator's run — each case's "
+                "category / kind / score / pass / latency / mechanical notes, so an "
+                "observer can audit exactly where the agent gained or lost points. "
+                "Never the answer key (expected / called / case_id). None when the "
+                "run carries no per-case data."
+            ),
+        ),
+    ]
+
+
+class PublicSubmissionScores(BaseModel):
+    """The full k=3 scoring record for one submission (public transparency).
+
+    Publishes, per agent: which validators scored it, each validator's exact
+    numbers + signature, and the ``median_composite`` the platform finalized on
+    (the canonical score no single validator controls). ``score_count`` reaching
+    ``quorum`` is what finalized the agent; a re-scored agent may carry more than
+    ``quorum`` rows (older + current runs). The dataset pin (``dataset_seed`` +
+    ``dataset_sha256``) identifies the exact bytes all validators scored.
+    """
+
+    agent_id: Annotated[UUID, Field(description="The scored agent's id.")]
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
+    ]
+    status: Annotated[
+        str, Field(description='Public status ("scored" or "live").')
+    ]
+    quorum: Annotated[
+        int, Field(ge=1, description="Validators required to finalize (k=3).")
+    ]
+    score_count: Annotated[
+        int, Field(ge=0, description="Score rows recorded for this agent.")
+    ]
+    median_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description="Median of the reported composites — the canonical score.",
+        ),
+    ]
+    dataset_seed: Annotated[
+        int | None,
+        Field(default=None, description="Platform-pinned dataset seed (regenerable)."),
+    ]
+    dataset_sha256: Annotated[
+        str | None,
+        Field(default=None, description="SHA-256 of the pinned dataset artifact."),
+    ]
+    dataset_run_size: Annotated[
+        str | None,
+        Field(default=None, description="Generator profile (small|medium|full)."),
+    ]
+    dataset_seed_block: Annotated[
+        int | None,
+        Field(
+            default=None,
+            description=(
+                "On-chain block number the seed was derived from. Fetch this "
+                "block's hash and recompute derive_seed(hash, agent_id) to verify "
+                "the seed was not platform-chosen. Null on the CSPRNG fallback "
+                "(chain was unavailable at job-ready)."
+            ),
+        ),
+    ]
+    dataset_seed_block_hash: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Hash of dataset_seed_block; the seed's verification input.",
+        ),
+    ]
+    scores: Annotated[
+        list[PublicValidatorScore],
+        Field(default_factory=list, description="Per-validator scores, by hotkey."),
+    ]
+    generated_at: Annotated[
+        datetime, Field(description="When this snapshot was read (UTC).")
+    ]
+
+
+class PublicSubmissionSummary(BaseModel):
+    """One row of the public recent-submissions index (drill into the detail)."""
+
+    agent_id: Annotated[UUID, Field(description="The scored agent's id.")]
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
+    ]
+    status: Annotated[str, Field(description='Public status ("scored" or "live").')]
+    score_count: Annotated[
+        int, Field(ge=0, description="Score rows recorded for this agent.")
+    ]
+    median_composite: Annotated[
+        float | None,
+        Field(default=None, ge=0.0, le=1.0, description="Median canonical composite."),
+    ]
+    dataset_seed: Annotated[
+        int | None, Field(default=None, description="Platform-pinned dataset seed.")
+    ]
+    dataset_sha256: Annotated[
+        str | None, Field(default=None, description="SHA-256 of the pinned dataset.")
+    ]
+    last_scored_at: Annotated[
+        datetime | None,
+        Field(default=None, description="Most recent score time for this agent (UTC)."),
+    ]
+
+
+class PublicSubmissionsResponse(BaseModel):
+    """The public recent-submissions index, most recently scored first."""
+
+    generated_at: Annotated[
+        datetime, Field(description="When this snapshot was read (UTC).")
+    ]
+    count: Annotated[int, Field(ge=0, description="Number of submissions returned.")]
+    quorum: Annotated[
+        int, Field(ge=1, description="Validators required to finalize (k=3).")
+    ]
+    submissions: Annotated[
+        list[PublicSubmissionSummary],
+        Field(default_factory=list, description="Recent finalized submissions."),
+    ]
+
+
+class PublicDatasetReveal(BaseModel):
+    """The full labeled dataset a finalized submission was scored against.
+
+    Regenerated from the submission's published (on-chain-derived) seed, so anyone
+    can **independently re-grade** the k=3 scores: the ``artifact`` carries the
+    complete DatasetArtifact including the answer keys (expected tools/answers).
+    Safe to publish because the seed is one-time and unpredictable, so revealing a
+    past submission's answers cannot help overfit any future (differently-seeded)
+    run. ``dataset_sha256`` is re-verified to match what was pinned at scoring, so
+    the revealed bytes provably are the scored dataset.
+    """
+
+    agent_id: Annotated[UUID, Field(description="The scored agent's id.")]
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
+    ]
+    seed: Annotated[int, Field(description="Dataset seed (on-chain derived).")]
+    run_size: Annotated[
+        str, Field(description="Generator profile (small|medium|full).")
+    ]
+    dataset_sha256: Annotated[
+        str, Field(description="SHA-256 of the artifact, verified against the pin.")
+    ]
+    bench_version: Annotated[
+        int | None,
+        Field(default=None, description="Benchmark version of the artifact."),
+    ]
+    dataset_seed_block: Annotated[
+        int | None,
+        Field(default=None, description="On-chain block the seed was derived from."),
+    ]
+    dataset_seed_block_hash: Annotated[
+        str | None, Field(default=None, description="Hash of the seed block.")
+    ]
+    artifact: Annotated[
+        dict[str, Any],
+        Field(
+            description=(
+                "The full labeled DatasetArtifact (tool + memory cases, seeding "
+                "waves, fixtures, AND the answer keys) so the score is "
+                "independently reproducible."
+            )
+        ),
+    ]
+
+
+class PublicBenchCorpusEntry(BaseModel):
+    """One scored run of a retired benchmark, with its FULL answer key.
+
+    Part of the retired-version corpus release: because a retired benchmark is
+    never scored again, its per-case answer keys (``expected`` tools/answers,
+    ``called``, ``case_id``) carry zero anti-overfit cost and are published
+    verbatim from ``scores.details`` so researchers get the complete labeled
+    benchmark.
+    """
+
+    agent_id: Annotated[UUID, Field(description="The scored agent's id.")]
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's hotkey.")
+    ]
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Scoring validator's hotkey.")
+    ]
+    seed: Annotated[int, Field(description="Dataset seed for the run.")]
+    run_id: Annotated[str, Field(description="Scoring-engine run id.")]
+    composite: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Composite this validator reported.")
+    ]
+    per_case: Annotated[
+        list[dict[str, Any]],
+        Field(
+            default_factory=list,
+            description=(
+                "Full UNREDACTED per-case records, answer keys included (retired "
+                "version, so safe). Empty when the run stored no per-case data."
+            ),
+        ),
+    ]
+
+
+class PublicBenchCorpusResponse(BaseModel):
+    """A page of a retired benchmark's full labeled corpus.
+
+    Served only for a retired ``bench_version`` (``< current``); the live version
+    is refused (409) since exposing its answer keys would be an overfit vector.
+    Paginate with ``limit`` / ``offset`` up to ``total``.
+    """
+
+    bench_version: Annotated[int, Field(description="The retired benchmark version.")]
+    generated_at: Annotated[
+        datetime, Field(description="When this page was read (UTC).")
+    ]
+    count: Annotated[int, Field(ge=0, description="Entries in this page.")]
+    total: Annotated[int, Field(ge=0, description="Total runs for this version.")]
+    limit: Annotated[int, Field(ge=1, description="Page size.")]
+    offset: Annotated[int, Field(ge=0, description="Page offset.")]
+    entries: Annotated[
+        list[PublicBenchCorpusEntry],
+        Field(default_factory=list, description="Scored runs with full answer keys."),
+    ]
+
+
+class PublicAuditEntry(BaseModel):
+    """One entry of the append-only, hash-chained public score audit log.
+
+    Each entry records a scoring event verbatim: a validator's signed ``score``
+    or an ``agent_finalized`` (quorum reached, the median + scoring validators).
+    ``entry_hash`` is the SHA-256 of the entry's canonical content (which embeds
+    ``prev_hash``); ``prev_hash`` links to the previous entry's ``entry_hash``.
+    A consumer replays the feed and recomputes each hash to prove the sequence
+    was never reordered, edited, or truncated.
+    """
+
+    seq: Annotated[int, Field(ge=1, description="Monotonic append order.")]
+    agent_id: Annotated[UUID, Field(description="Agent the event is about.")]
+    validator_hotkey: Annotated[
+        str | None,
+        Field(default=None, description="Scoring validator (null on finalize)."),
+    ]
+    event: Annotated[str, Field(description='"score" or "agent_finalized".')]
+    payload: Annotated[
+        dict[str, Any],
+        Field(description="Event content (the hash preimage's payload field)."),
+    ]
+    prev_hash: Annotated[
+        str, Field(description="Previous entry's entry_hash (hex); genesis = 64 zeros.")
+    ]
+    entry_hash: Annotated[
+        str, Field(description="SHA-256 (hex) of this entry's canonical content.")
+    ]
+    recorded_at: Annotated[
+        datetime, Field(description="When the platform appended the entry (UTC).")
+    ]
+
+
+class PublicAuditResponse(BaseModel):
+    """A page of the public audit feed, oldest first, with the chain root.
+
+    Paginate by ``seq``: replay from ``since_seq=0`` and re-request with the last
+    ``seq`` seen to stream new entries. ``genesis_hash`` is the ``prev_hash`` of
+    the very first entry, so a consumer can verify the chain from the root.
+    """
+
+    generated_at: Annotated[
+        datetime, Field(description="When this page was read (UTC).")
+    ]
+    count: Annotated[int, Field(ge=0, description="Entries in this page.")]
+    genesis_hash: Annotated[
+        str, Field(description="The chain root (first entry's prev_hash).")
+    ]
+    head_hash: Annotated[
+        str | None,
+        Field(default=None, description="entry_hash of the last entry in this page."),
+    ]
+    entries: Annotated[
+        list[PublicAuditEntry],
+        Field(default_factory=list, description="Entries with seq > since_seq."),
     ]
 
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import statistics
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 from uuid import UUID
@@ -44,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
     ArtifactResponse,
+    JobResponse,
     ScoreReport,
     SubmitScoreRequest,
     SubmitScoreResponse,
@@ -63,7 +65,22 @@ from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.queries.agents import get_agent_by_id, list_agents_by_status
-from ditto.db.queries.scores import list_eligible_ledger, upsert_score
+from ditto.db.queries.audit import (
+    EVENT_FINALIZED,
+    EVENT_SCORE,
+    append_audit_entry,
+)
+from ditto.db.queries.scores import (
+    SCORING_QUORUM,
+    list_eligible_ledger,
+    list_scores_for_agent,
+    upsert_score,
+)
+from ditto.db.queries.tickets import (
+    get_open_ticket,
+    issue_ticket,
+    mark_ticket_scored,
+)
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -74,6 +91,10 @@ router = APIRouter(prefix="/validator", tags=["validator"])
 
 # How long a pre-signed artifact URL stays valid.
 _ARTIFACT_URL_TTL = timedelta(minutes=5)
+
+# How long a validator has to redeem a ticket with a score before it lapses and
+# the slot re-opens for another validator.
+_TICKET_TTL = timedelta(minutes=30)
 
 
 # Object-store key the upload pipeline writes the tarball under.
@@ -247,6 +268,57 @@ async def queue(
     return ValidatorQueueResponse(items=items, count=len(items))
 
 
+@router.post(
+    "/job",
+    response_model=JobResponse,
+    responses={
+        204: {"description": "No agent needs this validator right now."},
+        401: {"description": "Missing/invalid validator auth."},
+        503: {"description": "Chain unavailable for the permit check."},
+    },
+)
+async def request_job(
+    response: Response,
+    validator_hotkey: ValidatorDep,
+    session: SessionDep,
+) -> JobResponse | Response:
+    """Issue this validator a scoring ticket for the next eligible agent.
+
+    The k=3 pull: at most :data:`SCORING_QUORUM` tickets per agent go to that
+    many distinct validators, so most requests get **204 No Content** ("no job
+    for you"). An issued ticket must be redeemed with a score before its
+    deadline, or it lapses and the slot re-opens for another validator. The
+    ticket write (and the overdue-ticket sweep it runs) commit together.
+    """
+    now = datetime.now(UTC)
+    async with session.begin():
+        ticket = await issue_ticket(
+            session, validator_hotkey=validator_hotkey, now=now, ttl=_TICKET_TTL
+        )
+        if ticket is None:
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
+        agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
+        # issue_ticket selected this agent from ``agents``, so it exists.
+        assert agent is not None
+        job = JobResponse(
+            agent_id=agent.agent_id,
+            miner_hotkey=agent.miner_hotkey,
+            sha256=agent.sha256,
+            deadline=ticket.deadline,
+            seed=agent.dataset_seed,
+            dataset_sha256=agent.dataset_sha256,
+            run_size=agent.dataset_run_size,
+        )
+    response.headers["Cache-Control"] = "no-store"
+    logger.info(
+        "issued job agent=%s validator=%s deadline=%s",
+        job.agent_id,
+        validator_hotkey,
+        job.deadline.isoformat(),
+    )
+    return job
+
+
 @router.get(
     "/agent/{agent_id}/artifact",
     response_model=ArtifactResponse,
@@ -310,7 +382,9 @@ async def submit_score(
     Ordering is cheap-before-expensive and no DB write happens until every
     check passes: (1) signature over ``{validator_hotkey}:{run_id}``,
     (2) on-chain validator-permit check, (3) one transaction that upserts
-    the score and transitions ``evaluating -> scored``.
+    the score and, once the k=3 quorum has reported, finalizes the agent
+    ``evaluating -> scored`` on the median composite. Below quorum the score
+    is recorded and the agent stays provisional (``evaluating``).
     """
     response.headers["Cache-Control"] = "no-store"
     report = payload.report
@@ -337,6 +411,25 @@ async def submit_score(
         if agent.status not in _SCOREABLE_STATUSES:
             raise AgentNotEvaluatableError(
                 f"agent {agent_id} is {agent.status}, not in {_SCOREABLE_STATUSES}"
+            )
+        # k=3 gate: a score is only accepted against a live ticket this validator
+        # holds for the agent. No ticket (never issued, expired, or already
+        # spent) means the score is unsolicited or late, so it is rejected and
+        # the slot is left for a validator that will score in time. One ticket,
+        # one score: the ticket is consumed below, so a re-score needs a new one.
+        ticket = await get_open_ticket(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            now=datetime.now(UTC),
+        )
+        if ticket is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "no open scoring ticket for this validator and agent "
+                    "(never issued, expired, or already scored)"
+                ),
             )
         # Persist the scoring engine's opaque telemetry (models used,
         # bench_version, dataset_sha256, per-category means, token spend, …) plus
@@ -367,42 +460,100 @@ async def submit_score(
             signature=payload.signature,
             details=score_details or None,
         )
+        # Append the immutable, hash-chained audit entry for this score in the
+        # same transaction (durable iff the score is). Records the full signed
+        # tuple + signature so the entry is independently verifiable off the
+        # public audit feed, never any per-case answer-key content.
+        audit_now = datetime.now(UTC)
+        await append_audit_entry(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            event=EVENT_SCORE,
+            payload={
+                "run_id": report.run_id,
+                "seed": report.seed,
+                "composite": report.composite,
+                "tool_mean": report.tool_mean,
+                "memory_mean": report.memory_mean,
+                "median_ms": report.median_ms,
+                "n": report.n,
+                "signature": payload.signature,
+                "generated_at": report.generated_at.isoformat(),
+            },
+            recorded_at=audit_now,
+        )
         # Persist the crate's structural (AST) fingerprint from the report, so it
         # is available for the gate here and for future cross-miner comparison.
         # Advisory + unsigned: only overwrite when the report actually carries one,
         # so a re-score by a scorer that omits it never wipes a stored sketch.
         if report.structural_fingerprint is not None:
             agent.structural_fingerprint = report.structural_fingerprint.model_dump()
-        # Finalize: the first score moves evaluating -> scored, unless the
-        # anti-copy gate holds a suspected copy in ath_pending_review for review.
-        # The gate only runs on this evaluating -> scored transition; a re-score
-        # of an already-scored (or already-held) agent leaves its status put so
-        # re-reporting never thrashes the ledger. The just-scored agent is still
-        # ``evaluating`` here, so it is not yet in the eligible ledger (no
-        # self-match).
+        # Finalize at quorum (k=3): an agent stays provisional (``evaluating``)
+        # until :data:`SCORING_QUORUM` validators have scored it; only the
+        # quorum-th score moves it ``evaluating -> scored``, unless the anti-copy
+        # gate holds a suspected copy in ``ath_pending_review``. Both the gate
+        # and the transition run on the **median** composite, so no single
+        # validator's score decides an agent's fate. The gate runs only on this
+        # one transition; a re-score of an already-scored (or held) agent leaves
+        # its status put so re-reporting never thrashes the ledger. The agent is
+        # still ``evaluating`` here, so it is not yet in the eligible ledger (no
+        # self-match). A below-quorum score just records the row and waits.
         if agent.status == AgentStatus.EVALUATING:
-            eligible = await list_eligible_ledger(session)
-            decision = evaluate_duplicate_signals(
-                agent_id=agent_id,
-                miner_hotkey=agent.miner_hotkey,
-                sha256=agent.sha256,
-                composite=report.composite,
-                size_bytes=agent.size_bytes,
-                normalized_source_hash=agent.normalized_source_hash,
-                content_fingerprint=agent.content_fingerprint,
-                structural_fingerprint=agent.structural_fingerprint,
-                prompt_fingerprint=agent.prompt_fingerprint,
-                eligible=eligible,
-            )
-            if decision.held:
-                agent.status = AgentStatus.ATH_PENDING_REVIEW
-                agent.duplicate_of = decision.duplicate_of
-                agent.review_reason = decision.reason
-                logger.warning(
-                    "agent %s held for copy review: %s", agent_id, decision.reason
+            agent_scores = await list_scores_for_agent(session, agent_id=agent_id)
+            if len(agent_scores) >= SCORING_QUORUM:
+                median_composite = statistics.median(s.composite for s in agent_scores)
+                eligible = await list_eligible_ledger(session)
+                decision = evaluate_duplicate_signals(
+                    agent_id=agent_id,
+                    miner_hotkey=agent.miner_hotkey,
+                    sha256=agent.sha256,
+                    composite=median_composite,
+                    size_bytes=agent.size_bytes,
+                    normalized_source_hash=agent.normalized_source_hash,
+                    content_fingerprint=agent.content_fingerprint,
+                    structural_fingerprint=agent.structural_fingerprint,
+                    prompt_fingerprint=agent.prompt_fingerprint,
+                    eligible=eligible,
                 )
-            else:
-                agent.status = AgentStatus.SCORED
+                if decision.held:
+                    agent.status = AgentStatus.ATH_PENDING_REVIEW
+                    agent.duplicate_of = decision.duplicate_of
+                    agent.review_reason = decision.reason
+                    logger.warning(
+                        "agent %s held for copy review: %s", agent_id, decision.reason
+                    )
+                else:
+                    agent.status = AgentStatus.SCORED
+                # Append the finalize audit entry: quorum reached, the median the
+                # platform finalized on, and which validators scored it. The
+                # moderation detail (why held / duplicate_of) is deliberately kept
+                # out of the public chain — only the neutral outcome status.
+                await append_audit_entry(
+                    session,
+                    agent_id=agent_id,
+                    validator_hotkey=None,
+                    event=EVENT_FINALIZED,
+                    payload={
+                        "miner_hotkey": agent.miner_hotkey,
+                        "median_composite": median_composite,
+                        "quorum": SCORING_QUORUM,
+                        "score_count": len(agent_scores),
+                        "validator_hotkeys": sorted(
+                            s.validator_hotkey for s in agent_scores
+                        ),
+                        "dataset_seed": agent.dataset_seed,
+                        "dataset_sha256": agent.dataset_sha256,
+                        "dataset_seed_block": agent.dataset_seed_block,
+                        "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+                        "status": agent.status.value,
+                    },
+                    recorded_at=audit_now,
+                )
+        # Consume the ticket (one ticket, one score); the slot stays occupied.
+        await mark_ticket_scored(
+            session, agent_id=agent_id, validator_hotkey=payload.validator_hotkey
+        )
         result_status = agent.status
 
     logger.info(

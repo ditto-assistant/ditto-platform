@@ -25,8 +25,10 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_server.datapipeline import DataPipelineError, NullGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
+    get_dataset_generator,
     get_session,
     get_storage_client,
 )
@@ -36,13 +38,16 @@ from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_SCREENER_AUTH,
     ERROR_CODE_VALIDATION,
 )
-from ditto.chain.models import NeuronInfo
+from ditto.chain import ChainError
+from ditto.chain.models import BlockInfo, NeuronInfo
 from ditto.db.models import Agent, Base
 
 _KEYPAIR = bittensor.Keypair.create_from_uri("//Alice")
 _SCREENER_HOTKEY = _KEYPAIR.ss58_address
 _MINER_HOTKEY = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _SHA256 = "ab" * 32
+# A fixed block the mocked chain returns for on-chain seed derivation.
+_BLOCK = BlockInfo(number=4321, hash="0x" + "9f" * 32, timestamp=0)
 
 
 def _sign(message: str) -> str:
@@ -88,16 +93,52 @@ def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
+class _FakeGenerator:
+    """Test double for the dataset generator: pins a fixed hash, or raises."""
+
+    def __init__(
+        self, *, run_size: str = "full", sha: str = "ca" * 32, fail: bool = False
+    ):
+        self.run_size: str | None = run_size
+        self._sha = sha
+        self._fail = fail
+        self.calls = 0
+
+    async def generate(self, _seed: int) -> str:
+        self.calls += 1
+        if self._fail:
+            raise DataPipelineError("generate service unavailable (test)")
+        return self._sha
+
+    async def aclose(self) -> None:
+        return None
+
+
 def _install_db(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
     async def _session() -> AsyncIterator[AsyncSession]:
         async with maker() as s:
             yield s
 
     app.dependency_overrides[get_session] = _session
+    # Default: generation disabled (NullGenerator) so the existing verdict tests
+    # promote without pinning a dataset. Tests that exercise the pinned path call
+    # _install_generator afterward to override.
+    app.dependency_overrides.setdefault(
+        get_dataset_generator, lambda: NullGenerator()
+    )
+
+
+def _install_generator(app: FastAPI, generator: object) -> None:
+    app.dependency_overrides[get_dataset_generator] = lambda: generator
 
 
 def _install_chain(
-    app: FastAPI, *, permitted: bool = True, registered: bool = True
+    app: FastAPI,
+    *,
+    permitted: bool = True,
+    registered: bool = True,
+    block: BlockInfo | None = _BLOCK,
+    block_error: bool = False,
 ) -> None:
     neurons = []
     if registered:
@@ -114,6 +155,10 @@ def _install_chain(
     async def _chain() -> MagicMock:
         c = MagicMock()
         c.get_recent_neurons = AsyncMock(return_value=neurons)
+        if block_error:
+            c.get_latest_block = AsyncMock(side_effect=ChainError("pylon down"))
+        else:
+            c.get_latest_block = AsyncMock(return_value=block)
         return c
 
     app.dependency_overrides[get_chain_client] = _chain
@@ -357,6 +402,122 @@ class TestSubmitResult:
         assert first.status_code == 200
         assert second.status_code == 200
         assert second.json()["status"] == AgentStatus.EVALUATING
+
+    async def test_pass_pins_dataset_when_enabled(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        gen = _FakeGenerator(run_size="full", sha="be" * 32)
+        _install_generator(app, gen)
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, passed=True),
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == AgentStatus.EVALUATING
+        assert gen.calls == 1
+
+        async with session_maker() as s:
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.status == AgentStatus.EVALUATING
+            assert agent.dataset_seed is not None and agent.dataset_seed >= 0
+            assert agent.dataset_sha256 == "be" * 32
+            assert agent.dataset_run_size == "full"
+            # The seed is derived from the on-chain block and pinned with its
+            # provenance, so anyone can recompute + verify it.
+            from ditto.api_server.onchain_seed import derive_seed
+
+            assert agent.dataset_seed_block == _BLOCK.number
+            assert agent.dataset_seed_block_hash == _BLOCK.hash
+            assert agent.dataset_seed == derive_seed(_BLOCK.hash, agent_id)
+
+    async def test_seed_falls_back_when_chain_unavailable(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A chain outage must not halt submissions: the seed falls back to a local
+        # CSPRNG value, with null block provenance flagging it as not chain-derived.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app, block_error=True)
+        _install_generator(app, _FakeGenerator(run_size="full", sha="be" * 32))
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, passed=True),
+        )
+        assert response.status_code == 200
+        async with session_maker() as s:
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.status == AgentStatus.EVALUATING
+            assert agent.dataset_seed is not None and agent.dataset_seed >= 0
+            # Fallback provenance: no block reference.
+            assert agent.dataset_seed_block is None
+            assert agent.dataset_seed_block_hash is None
+
+    async def test_generation_failure_does_not_promote(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        _install_generator(app, _FakeGenerator(fail=True))
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, passed=True),
+        )
+        # Required dataset failed to generate: the verdict must NOT have promoted
+        # the agent (it can be retried).
+        assert response.status_code == 500
+        async with session_maker() as s:
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.status == AgentStatus.UPLOADED
+            assert agent.dataset_seed is None
+
+    async def test_idempotent_repeat_does_not_regenerate(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        gen = _FakeGenerator(sha="ab" * 32)
+        _install_generator(app, gen)
+
+        first = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, passed=True),
+        )
+        second = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, passed=True),
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        # The dataset was pinned once; the re-report did not call the generator
+        # again (the pre-read guard sees dataset_seed already set).
+        assert gen.calls == 1
+        async with session_maker() as s:
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.dataset_sha256 == "ab" * 32
 
     async def test_promotes_from_screening_state(
         self,

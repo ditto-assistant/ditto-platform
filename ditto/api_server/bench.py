@@ -22,6 +22,17 @@ from typing import Any
 CURRENT_BENCH_VERSION = 2
 
 
+def is_bench_version_retired(version: int) -> bool:
+    """Whether ``version`` is a superseded (retired) benchmark.
+
+    A version is retired once a newer one ships (``version < CURRENT``). Its
+    datasets are never scored again, so their full labeled corpus (answer keys
+    included) is safe to release publicly with zero anti-overfit cost. The current
+    (live) version and any unknown future version are NOT retired.
+    """
+    return 0 < version < CURRENT_BENCH_VERSION
+
+
 def stamp_bench_version(details: dict[str, Any]) -> dict[str, Any]:
     """Ensure a score-report details blob carries a valid ``bench_version``.
 

@@ -24,8 +24,14 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_server.dependencies import get_session
+from ditto.api_server.datapipeline import DataPipelineError
+from ditto.api_server.dependencies import get_dataset_generator, get_session
 from ditto.db.models import Agent, Base
+from ditto.db.queries.audit import (
+    EVENT_SCORE,
+    GENESIS_HASH,
+    append_audit_entry,
+)
 from ditto.db.queries.scores import upsert_score
 
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
@@ -102,6 +108,67 @@ async def _seed_scored(
             signature="ab" * 64,
             details=details,
         )
+
+
+async def _seed_k3(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    miner: str,
+    composites: list[float],
+    status: AgentStatus = AgentStatus.SCORED,
+    dataset_seed: int | None = 987654321,
+    dataset_sha256: str | None = "cd" * 32,
+    dataset_run_size: str | None = "full",
+    dataset_seed_block: int | None = 4321,
+    dataset_seed_block_hash: str | None = "0x" + "9f" * 32,
+    details: dict | None = None,
+    base_time: datetime = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
+) -> str:
+    """Seed one agent scored by ``len(composites)`` distinct validators.
+
+    Returns the agent_id (hex str) so a test can hit the detail endpoint.
+    """
+    validators = [
+        "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm",
+        "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp",
+    ]
+    agent_id = uuid4()
+    async with maker() as s, s.begin():
+        agent = Agent(
+            agent_id=agent_id,
+            miner_hotkey=miner,
+            name="agent",
+            sha256="ab" * 32,
+            size_bytes=524288,
+            status=status,
+            dataset_seed=dataset_seed,
+            dataset_sha256=dataset_sha256,
+            dataset_run_size=dataset_run_size,
+            dataset_seed_block=dataset_seed_block,
+            dataset_seed_block_hash=dataset_seed_block_hash,
+            created_at=datetime.now(UTC),
+        )
+        s.add(agent)
+        await s.flush()
+        for i, composite in enumerate(composites):
+            await upsert_score(
+                s,
+                agent_id=agent_id,
+                validator_hotkey=validators[i],
+                run_id=f"run_{i}",
+                seed=dataset_seed or 0,
+                composite=composite,
+                tool_mean=composite,
+                memory_mean=composite,
+                median_ms=500,
+                n=110,
+                generated_at=base_time + timedelta(minutes=i),
+                signature="ab" * 64,
+                details=details,
+            )
+    return str(agent_id)
 
 
 async def _seed_agent(
@@ -362,3 +429,476 @@ class TestPublicHealth:
             "scores_24h": 0,
             "avg_latency_ms": None,
         }
+
+
+class TestPublicSubmissionScores:
+    async def test_detail_exposes_k3_breakdown_and_median(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.40, 0.70, 0.55]
+        )
+        _install_db(app, session_maker)
+
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/scores")
+        assert resp.status_code == 200
+        assert resp.headers["Cache-Control"] == "public, max-age=30"
+        body = resp.json()
+        assert body["agent_id"] == agent_id
+        assert body["miner_hotkey"] == _MINER_A
+        assert body["status"] == "scored"
+        assert body["quorum"] == 3
+        assert body["score_count"] == 3
+        # Median of {0.40, 0.55, 0.70} is 0.55 — no single validator controls it.
+        assert body["median_composite"] == pytest.approx(0.55)
+        # The dataset pin + raw seed are published for reproduction/audit.
+        assert body["dataset_seed"] == 987654321
+        assert body["dataset_sha256"] == "cd" * 32
+        assert body["dataset_run_size"] == "full"
+        # The on-chain seed provenance lets anyone verify the seed was not
+        # platform-chosen (recompute derive_seed(block_hash, agent_id)).
+        assert body["dataset_seed_block"] == 4321
+        assert body["dataset_seed_block_hash"] == "0x" + "9f" * 32
+        # All three validators, each with hotkey + signature (self-verifying).
+        assert len(body["scores"]) == 3
+        hotkeys = {s["validator_hotkey"] for s in body["scores"]}
+        assert len(hotkeys) == 3
+        for s in body["scores"]:
+            assert s["signature"] == "ab" * 64
+            assert s["seed"] == 987654321
+            assert "run_id" in s
+
+    async def test_detail_exposes_redacted_per_case_breakdown(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # Per-validator per-case breakdown (where points were won/lost) is served,
+        # redacted: category/kind/score/pass/latency/notes but never the answer key.
+        details = {
+            "per_case": [
+                {
+                    "kind": "tool",
+                    "category": "web_search",
+                    "score": 0.6,
+                    "correct": False,
+                    "latency_ms": 3382,
+                    "notes": ["1 extra/unexpected tool call(s)"],
+                    "expected": ["search_web"],
+                    "called": ["search_web", "search_web"],
+                    "case_id": "web_search-8860569897825046057-0001",
+                },
+            ],
+        }
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+            details=details,
+        )
+        _install_db(app, session_maker)
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/scores")
+        body = resp.json()
+        cases = body["scores"][0]["case_results"]
+        assert cases and cases[0]["category"] == "web_search"
+        assert cases[0]["score"] == pytest.approx(0.6)
+        assert cases[0]["correct"] is False
+        assert set(cases[0]).issubset(
+            {"category", "kind", "score", "correct", "latency_ms", "notes"}
+        )
+        # The answer key never appears anywhere in the response.
+        for leaked in ('"expected"', '"called"', '"case_id"'):
+            assert leaked not in resp.text
+
+    async def test_detail_omits_per_case_answer_key(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        _install_db(app, session_maker)
+        raw = (await client.get(f"/api/v1/public/agent/{agent_id}/scores")).text
+        # The per-submission record publishes validators + seed by design, but
+        # still never the per-case answer key.
+        for answer_key in ('"expected"', '"called"', '"case_id"', '"per_case"'):
+            assert answer_key not in raw
+
+    async def test_detail_404_for_unknown_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        resp = await client.get(f"/api/v1/public/agent/{uuid4()}/scores")
+        assert resp.status_code == 404
+
+    async def test_detail_404_for_provisional_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A still-evaluating agent's partial scores must not be exposed.
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4],
+            status=AgentStatus.EVALUATING,
+        )
+        # ...nor a held (suspected-copy) agent's.
+        held_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.9, 0.9, 0.9],
+            status=AgentStatus.ATH_PENDING_REVIEW,
+        )
+        _install_db(app, session_maker)
+        assert (
+            await client.get(f"/api/v1/public/agent/{agent_id}/scores")
+        ).status_code == 404
+        assert (
+            await client.get(f"/api/v1/public/agent/{held_id}/scores")
+        ).status_code == 404
+
+    async def test_index_lists_recent_finalized_only(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+            base_time=datetime(2026, 6, 8, 10, 0, 0, tzinfo=UTC),
+        )
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.7, 0.8, 0.9],
+            base_time=datetime(2026, 6, 8, 14, 0, 0, tzinfo=UTC),
+        )
+        # Held + still-evaluating must be excluded from the index.
+        await _seed_k3(
+            session_maker,
+            miner="5HeldMinerXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            composites=[0.99, 0.99, 0.99],
+            status=AgentStatus.ATH_PENDING_REVIEW,
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/submissions")).json()
+        assert body["count"] == 2
+        assert body["quorum"] == 3
+        # Most recently scored first: MINER_B (14:00) before MINER_A (10:00).
+        assert [s["miner_hotkey"] for s in body["submissions"]] == [_MINER_B, _MINER_A]
+        top = body["submissions"][0]
+        assert top["median_composite"] == pytest.approx(0.8)
+        assert top["score_count"] == 3
+        assert top["dataset_seed"] == 987654321
+        assert top["last_scored_at"] is not None
+
+    async def test_index_respects_limit(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        for i in range(3):
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.4, 0.5, 0.6],
+                base_time=datetime(2026, 6, 8, 10 + i, 0, 0, tzinfo=UTC),
+            )
+        _install_db(app, session_maker)
+        body = (await client.get("/api/v1/public/submissions?limit=2")).json()
+        assert body["count"] == 2
+
+    async def test_index_empty(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        resp = await client.get("/api/v1/public/submissions")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["count"] == 0
+        assert body["submissions"] == []
+
+
+async def _seed_audit(
+    maker: async_sessionmaker[AsyncSession], *, n: int
+) -> None:
+    """Append ``n`` chained score entries to the audit log."""
+    async with maker() as s, s.begin():
+        for i in range(n):
+            await append_audit_entry(
+                s,
+                agent_id=uuid4(),
+                validator_hotkey="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+                event=EVENT_SCORE,
+                payload={"run_id": f"run_{i}", "composite": 0.5, "seed": 42},
+                recorded_at=datetime(2026, 6, 8, 12, i, 0, tzinfo=UTC),
+            )
+
+
+class _FakeRevealGenerator:
+    """Stands in for the data-pipeline generate service on the reveal path."""
+
+    def __init__(
+        self,
+        *,
+        artifact: dict | None = None,
+        sha: str = "cd" * 32,
+        fail: bool = False,
+    ) -> None:
+        self._artifact = artifact if artifact is not None else {"bench_version": 2}
+        self._sha = sha
+        self._fail = fail
+        self.calls = 0
+
+    async def fetch_dataset(self, seed: int, run_size: str) -> tuple[dict, str]:
+        self.calls += 1
+        if self._fail:
+            raise DataPipelineError("generate service down")
+        return {**self._artifact, "seed": seed, "run_size": run_size}, self._sha
+
+
+def _install_generator(app: FastAPI, generator: object) -> None:
+    async def _gen() -> object:
+        return generator
+
+    app.dependency_overrides[get_dataset_generator] = _gen
+
+
+class TestPublicDatasetReveal:
+    async def test_reveals_full_labeled_dataset_for_finalized_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        _install_db(app, session_maker)
+        # The generator returns a dataset whose sha matches the pinned "cd"*32.
+        artifact = {"bench_version": 2, "tool_cases": [{"expected_tools": ["x"]}]}
+        gen = _FakeRevealGenerator(artifact=artifact, sha="cd" * 32)
+        _install_generator(app, gen)
+
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/dataset")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["agent_id"] == agent_id
+        assert body["seed"] == 987654321
+        assert body["run_size"] == "full"
+        assert body["dataset_sha256"] == "cd" * 32
+        assert body["bench_version"] == 2
+        # The FULL labeled artifact (answer keys included) is served.
+        assert body["artifact"]["tool_cases"][0]["expected_tools"] == ["x"]
+        assert gen.calls == 1
+
+    async def test_404_for_unfinalized_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4],
+            status=AgentStatus.EVALUATING,
+        )
+        _install_db(app, session_maker)
+        _install_generator(app, _FakeRevealGenerator())
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/dataset")
+        assert resp.status_code == 404
+
+    async def test_502_on_generator_hash_drift(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        _install_db(app, session_maker)
+        # Generator returns a DIFFERENT sha than the pinned "cd"*32.
+        _install_generator(app, _FakeRevealGenerator(sha="ab" * 32))
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/dataset")
+        assert resp.status_code == 502
+
+    async def test_503_when_generator_unavailable(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        _install_db(app, session_maker)
+        _install_generator(app, _FakeRevealGenerator(fail=True))
+        resp = await client.get(f"/api/v1/public/agent/{agent_id}/dataset")
+        assert resp.status_code == 503
+
+
+class TestPublicBenchCorpus:
+    async def test_retired_version_serves_full_answer_keys(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A run scored under the retired v1 (current is 2). Its full per-case
+        # answer keys are released verbatim.
+        details = {
+            "bench_version": 1,
+            "per_case": [
+                {
+                    "category": "web_search",
+                    "score": 0.6,
+                    "expected": ["search_web"],
+                    "called": ["search_web"],
+                    "case_id": "web_search-1-0001",
+                }
+            ],
+        }
+        await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6], details=details
+        )
+        _install_db(app, session_maker)
+
+        resp = await client.get("/api/v1/public/bench/1/corpus")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["bench_version"] == 1
+        assert body["total"] == 3  # three validator rows
+        entry = body["entries"][0]
+        # The FULL answer key is present (retired = safe).
+        assert entry["per_case"][0]["expected"] == ["search_web"]
+        assert entry["per_case"][0]["case_id"] == "web_search-1-0001"
+
+    async def test_live_version_is_refused(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # v2 is the current (live) version: its answer keys must never be released.
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+            details={"bench_version": 2, "per_case": [{"expected": ["x"]}]},
+        )
+        _install_db(app, session_maker)
+        resp = await client.get("/api/v1/public/bench/2/corpus")
+        assert resp.status_code == 409
+        # ...and the live answer key is not in the refusal body.
+        assert '"expected"' not in resp.text
+
+    async def test_retired_version_paginates(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+            details={"bench_version": 1, "per_case": []},
+        )
+        _install_db(app, session_maker)
+        page = (await client.get("/api/v1/public/bench/1/corpus?limit=2")).json()
+        assert page["count"] == 2
+        assert page["total"] == 3
+        page2 = (
+            await client.get("/api/v1/public/bench/1/corpus?limit=2&offset=2")
+        ).json()
+        assert page2["count"] == 1
+
+    async def test_retired_version_with_no_runs_is_empty(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        body = (await client.get("/api/v1/public/bench/1/corpus")).json()
+        assert body["total"] == 0
+        assert body["entries"] == []
+
+
+class TestPublicAudit:
+    async def test_feed_returns_chained_entries(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_audit(session_maker, n=3)
+        _install_db(app, session_maker)
+
+        resp = await client.get("/api/v1/public/audit")
+        assert resp.status_code == 200
+        assert resp.headers["Cache-Control"] == "public, max-age=30"
+        body = resp.json()
+        assert body["count"] == 3
+        assert body["genesis_hash"] == GENESIS_HASH
+        entries = body["entries"]
+        # Oldest first, contiguous seqs, and each links to the prior entry_hash.
+        assert [e["seq"] for e in entries] == sorted(e["seq"] for e in entries)
+        assert entries[0]["prev_hash"] == GENESIS_HASH
+        for prev, cur in zip(entries, entries[1:], strict=False):
+            assert cur["prev_hash"] == prev["entry_hash"]
+        assert body["head_hash"] == entries[-1]["entry_hash"]
+        # The signed-tuple payload is present; no per-case answer key ever is.
+        assert entries[0]["payload"]["run_id"] == "run_0"
+        assert '"per_case"' not in resp.text
+
+    async def test_feed_pages_by_since_seq(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_audit(session_maker, n=5)
+        _install_db(app, session_maker)
+
+        first = (await client.get("/api/v1/public/audit?limit=2")).json()
+        assert first["count"] == 2
+        last_seq = first["entries"][-1]["seq"]
+        nxt = (await client.get(f"/api/v1/public/audit?since_seq={last_seq}")).json()
+        assert nxt["count"] == 3
+        assert nxt["entries"][0]["seq"] > last_seq
+        # The page still links onto the first page's head.
+        assert nxt["entries"][0]["prev_hash"] == first["head_hash"]
+
+    async def test_feed_empty(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        body = (await client.get("/api/v1/public/audit")).json()
+        assert body["count"] == 0
+        assert body["entries"] == []
+        assert body["head_hash"] is None
+        assert body["genesis_hash"] == GENESIS_HASH

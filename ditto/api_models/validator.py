@@ -124,6 +124,71 @@ class ArtifactResponse(BaseModel):
     )
 
 
+class JobResponse(BaseModel):
+    """Returned by ``POST /validator/job`` when a ticket is issued.
+
+    A ticket grants this validator the right to score one agent by ``deadline``;
+    the platform issues at most three per agent (the k=3 pool) and answers 204
+    (no body) when there is no work. The validator fetches the tarball via
+    ``/artifact`` and scores it against the platform-pinned dataset: ``seed`` +
+    ``dataset_sha256`` identify the exact dataset all k=3 validators score (the
+    scoring API regenerates it from ``seed`` and rejects a hash mismatch), and
+    ``run_size`` is the generator profile to use. These are null only for agents
+    promoted before the data-pipeline split, or when generation is disabled.
+    """
+
+    agent_id: Annotated[UUID, Field(description="Agent this ticket is for.")]
+    miner_hotkey: Annotated[str, Field(description="Submitting miner's SS58 hotkey.")]
+    sha256: Annotated[
+        str, Field(description="SHA-256 of the uploaded tarball, lowercase hex.")
+    ]
+    deadline: Annotated[
+        datetime,
+        Field(description="Score before this (UTC) or the ticket lapses."),
+    ]
+    seed: Annotated[
+        int | None,
+        Field(
+            default=None,
+            description="Platform-pinned dataset seed all k=3 validators score "
+            "against (regenerable, comparable). Null if unset (pre-split / "
+            "generation disabled).",
+        ),
+    ] = None
+    dataset_sha256: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="SHA-256 of the pinned dataset; the scoring API fails if "
+            "the regenerated dataset does not hash to this (tamper-evidence).",
+        ),
+    ] = None
+    run_size: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Generator profile for the pinned dataset "
+            "(small|medium|full).",
+        ),
+    ] = None
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+                "miner_hotkey": (
+                    "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
+                ),
+                "sha256": "deadbeef" * 8,
+                "deadline": "2026-07-09T12:30:00Z",
+                "seed": 8675309,
+                "dataset_sha256": "cafebabe" * 8,
+                "run_size": "full",
+            }
+        }
+    )
+
+
 class CaseScore(BaseModel):
     """Per-case breakdown inside a :class:`ScoreReport`.
 
@@ -383,10 +448,43 @@ class LedgerResponse(BaseModel):
         Field(description="Best eligible score per miner, highest composite first."),
     ]
     count: Annotated[int, Field(ge=0, description="Number of entries returned.")]
+    generated_at: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description=(
+                "When these entries were read from the DB (UTC). On a served "
+                "last-known-good snapshot this is the age of the cached read, not "
+                "'now'."
+            ),
+        ),
+    ] = None
+    stale: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "True when the live DB read failed and this is a served "
+                "last-known-good snapshot. A fold may still use it (the ledger is "
+                "durable and slow-moving) but should treat it as advisory."
+            ),
+        ),
+    ] = False
+    age_seconds: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description="Age of the snapshot in seconds (0 on a fresh read).",
+        ),
+    ] = 0
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
+                "generated_at": "2026-06-08T12:00:00Z",
+                "stale": False,
+                "age_seconds": 0,
                 "entries": [
                     {
                         "miner_hotkey": (

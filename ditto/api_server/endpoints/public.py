@@ -1,14 +1,23 @@
 """Public, unauthenticated read endpoints for the subnet dashboard.
 
-Unlike ``/scoring/scores`` (validator-hotkey gated, full signed rows), this
-surface is open and **aggregate-only**: composite plus tool/memory means and
-rank, so a public leaderboard / dashboard can read scores with no credentials
-while never exposing per-case detail (the benchmark's answer key) or
-integrity-internal fields. See ``docs/public-telemetry.md``.
+Two surfaces, both open (no credentials) and both fronting the same DB the
+validator-gated ``/scoring/scores`` reads:
+
+* **Aggregate leaderboard / health** (``/leaderboard``, ``/health``): best score
+  per miner, composite plus tool/memory means and rank, never exposing per-case
+  answer-key detail. This half stays aggregate-only.
+* **Per-submission transparency** (``/submissions``, ``/agent/{id}/scores``): the
+  k=3 record for a finalized agent — *which* validators scored it, each one's
+  exact numbers + signature, the median the platform finalized on, and the pinned
+  dataset (seed + sha256). This deliberately exposes ``validator_hotkey`` (a
+  public on-chain identity) and the raw ``seed`` so anyone can reproduce and audit
+  a score; because the platform draws the seed after screening, publishing it
+  post-hoc never lets a miner pre-overfit. It still omits the per-case answer key.
+  See ``docs/public-telemetry.md``.
 
 Responses are cacheable (``max-age=30``) so a CDN / the dashboard can front this
-cheaply; the underlying ledger only changes when a sweep records a new best.
-The KOTH champion / weight vector is deliberately **not** served here — that is
+cheaply; the underlying rows only change when a sweep records a new score. The
+KOTH champion / weight vector is deliberately **not** served here — that is
 validator-side (see the scoring endpoint's boundary note); the dashboard reads
 weights from wandb or the chain.
 """
@@ -17,26 +26,46 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
 from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, HTTPException, Query, Response
 
 from ditto.api_models import (
+    PublicAuditEntry,
+    PublicAuditResponse,
+    PublicBenchCorpusEntry,
+    PublicBenchCorpusResponse,
     PublicBenchIntegrity,
     PublicCaseResult,
     PublicCategoryStat,
+    PublicDatasetReveal,
     PublicHealthResponse,
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
     PublicRunModels,
+    PublicSubmissionScores,
+    PublicSubmissionsResponse,
+    PublicSubmissionSummary,
+    PublicValidatorScore,
 )
-from ditto.api_server.bench import CURRENT_BENCH_VERSION
+from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
+from ditto.api_server.datapipeline import DataPipelineError
+from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.validator import SessionDep
+from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.scores import (
+    SCORING_QUORUM,
     LedgerRow,
+    SubmissionRow,
     get_public_health,
+    get_submission_scores,
     list_eligible_ledger,
     list_miner_composite_history,
+    list_public_submissions,
+    list_scores_for_bench_version,
 )
 
 logger = logging.getLogger(__name__)
@@ -287,4 +316,267 @@ async def health(
         last_scored_at=roll.last_scored_at,
         scores_24h=roll.scores_24h,
         avg_latency_ms=roll.avg_latency_ms,
+    )
+
+
+def _median_composite(row: SubmissionRow) -> float | None:
+    """Median of the reported composites — the canonical score, or None if unscored."""
+    if not row.scores:
+        return None
+    return statistics.median(s.composite for s in row.scores)
+
+
+def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
+    """Map a submission row to the full public k=3 record."""
+    return PublicSubmissionScores(
+        agent_id=row.agent_id,
+        miner_hotkey=row.miner_hotkey,
+        status=row.status.value,
+        quorum=SCORING_QUORUM,
+        score_count=len(row.scores),
+        median_composite=_median_composite(row),
+        dataset_seed=row.dataset_seed,
+        dataset_sha256=row.dataset_sha256,
+        dataset_run_size=row.dataset_run_size,
+        dataset_seed_block=row.dataset_seed_block,
+        dataset_seed_block_hash=row.dataset_seed_block_hash,
+        scores=[
+            PublicValidatorScore(
+                validator_hotkey=s.validator_hotkey,
+                composite=s.composite,
+                tool_mean=s.tool_mean,
+                memory_mean=s.memory_mean,
+                median_ms=s.median_ms,
+                n=s.n,
+                seed=s.seed,
+                run_id=s.run_id,
+                signature=s.signature,
+                generated_at=s.generated_at,
+                case_results=_safe_case_results(
+                    s.details if isinstance(s.details, dict) else {}
+                ),
+            )
+            for s in row.scores
+        ],
+        generated_at=datetime.now(UTC),
+    )
+
+
+def _submission_summary(row: SubmissionRow) -> PublicSubmissionSummary:
+    """Map a submission row to the compact index entry."""
+    return PublicSubmissionSummary(
+        agent_id=row.agent_id,
+        miner_hotkey=row.miner_hotkey,
+        status=row.status.value,
+        score_count=len(row.scores),
+        median_composite=_median_composite(row),
+        dataset_seed=row.dataset_seed,
+        dataset_sha256=row.dataset_sha256,
+        last_scored_at=row.last_scored_at,
+    )
+
+
+@router.get("/submissions", response_model=PublicSubmissionsResponse)
+async def submissions(
+    response: Response,
+    session: SessionDep,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> PublicSubmissionsResponse:
+    """Recent finalized submissions, most recently scored first.
+
+    The index over the k=3 transparency records: each entry carries the median
+    composite, how many validators scored it, and the dataset pin (seed +
+    sha256); drill into ``/public/agent/{agent_id}/scores`` for the full
+    per-validator breakdown. Held-for-review and still-evaluating agents are
+    excluded — only settled public scores appear.
+    """
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    rows = await list_public_submissions(session, limit=limit)
+    return PublicSubmissionsResponse(
+        generated_at=datetime.now(UTC),
+        count=len(rows),
+        quorum=SCORING_QUORUM,
+        submissions=[_submission_summary(r) for r in rows],
+    )
+
+
+@router.get("/agent/{agent_id}/scores", response_model=PublicSubmissionScores)
+async def agent_scores(
+    response: Response,
+    session: SessionDep,
+    agent_id: UUID,
+) -> PublicSubmissionScores:
+    """The full k=3 scoring record for one finalized agent.
+
+    Publishes which validators scored the agent, each one's exact numbers +
+    signature (self-verifying against the published validator key), the median
+    composite the platform finalized on, and the pinned dataset (seed + sha256)
+    so anyone can reproduce and audit the score. 404 for an agent that does not
+    exist or has not settled into a public status (still evaluating, or held for
+    copy review) — a provisional agent's partial scores are never exposed.
+    """
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    row = await get_submission_scores(session, agent_id=agent_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no public scores for this agent")
+    return _submission_scores(row)
+
+
+@router.get("/agent/{agent_id}/dataset", response_model=PublicDatasetReveal)
+async def agent_dataset(
+    response: Response,
+    session: SessionDep,
+    generator: GeneratorDep,
+    agent_id: UUID,
+) -> PublicDatasetReveal:
+    """The FULL labeled dataset a finalized submission was scored against.
+
+    Regenerated from the submission's published (on-chain-derived) seed so anyone
+    can independently re-grade its k=3 scores. The regenerated artifact's SHA-256
+    is re-verified against the hash pinned at scoring, so the revealed bytes
+    provably are the scored dataset. 404 for an unknown / not-yet-finalized agent
+    (a provisional agent's answers are never revealed); 502 if the generator drifts
+    from the pinned hash; 503 if the generate service is unavailable.
+
+    Safe despite carrying the answer key: the seed is one-time and was
+    unpredictable at submission, so a past dataset's answers cannot help overfit a
+    future (differently-seeded) run.
+    """
+    # A finalized dataset never changes (fixed seed), so it is immutable + highly
+    # cacheable.
+    response.headers["Cache-Control"] = "public, max-age=3600, immutable"
+    row = await get_submission_scores(session, agent_id=agent_id)
+    if row is None or row.dataset_seed is None or row.dataset_run_size is None:
+        raise HTTPException(
+            status_code=404, detail="no revealable dataset for this agent"
+        )
+    try:
+        artifact, sha = await generator.fetch_dataset(
+            row.dataset_seed, row.dataset_run_size
+        )
+    except DataPipelineError as e:
+        raise HTTPException(
+            status_code=503, detail="dataset generate service unavailable"
+        ) from e
+    if row.dataset_sha256 and sha.lower() != row.dataset_sha256.lower():
+        # The regenerated dataset does not hash to what was pinned at scoring —
+        # generator drift. Refuse rather than serve a dataset that is not the one
+        # that was scored.
+        raise HTTPException(
+            status_code=502,
+            detail="regenerated dataset does not match the pinned hash",
+        )
+    bench_version = artifact.get("bench_version")
+    return PublicDatasetReveal(
+        agent_id=row.agent_id,
+        miner_hotkey=row.miner_hotkey,
+        seed=row.dataset_seed,
+        run_size=row.dataset_run_size,
+        dataset_sha256=sha,
+        bench_version=bench_version if isinstance(bench_version, int) else None,
+        dataset_seed_block=row.dataset_seed_block,
+        dataset_seed_block_hash=row.dataset_seed_block_hash,
+        artifact=artifact,
+    )
+
+
+@router.get("/audit", response_model=PublicAuditResponse)
+async def audit(
+    response: Response,
+    session: SessionDep,
+    since_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> PublicAuditResponse:
+    """A page of the append-only, hash-chained score audit log, oldest first.
+
+    The tamper-evident public projection of every scoring event: each validator's
+    signed ``score`` and each ``agent_finalized`` (quorum reached, the median +
+    scoring validators), in append order. Replay from ``since_seq=0`` and
+    re-request with the last ``seq`` seen to stream new entries; recompute each
+    ``entry_hash`` and check it links to the prior ``prev_hash`` (rooted at
+    ``genesis_hash``) to prove nothing was reordered, edited, or dropped. Every
+    ``score`` entry also carries the validator's sr25519 signature, so a consumer
+    can verify authenticity against the published validator key. Never carries
+    per-case answer-key content.
+    """
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    entries = await list_audit_entries(session, since_seq=since_seq, limit=limit)
+    return PublicAuditResponse(
+        generated_at=datetime.now(UTC),
+        count=len(entries),
+        genesis_hash=GENESIS_HASH,
+        head_hash=entries[-1].entry_hash if entries else None,
+        entries=[
+            PublicAuditEntry(
+                seq=e.seq,
+                agent_id=e.agent_id,
+                validator_hotkey=e.validator_hotkey,
+                event=e.event,
+                payload=e.payload,
+                prev_hash=e.prev_hash,
+                entry_hash=e.entry_hash,
+                recorded_at=e.recorded_at,
+            )
+            for e in entries
+        ],
+    )
+
+
+def _corpus_per_case(details: object) -> list[dict[str, Any]]:
+    """Extract the full UNREDACTED per-case list from a score's details blob."""
+    if not isinstance(details, dict):
+        return []
+    per_case = details.get("per_case")
+    if not isinstance(per_case, list):
+        return []
+    return [c for c in per_case if isinstance(c, dict)]
+
+
+@router.get("/bench/{version}/corpus", response_model=PublicBenchCorpusResponse)
+async def bench_corpus(
+    response: Response,
+    session: SessionDep,
+    version: int,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> PublicBenchCorpusResponse:
+    """The FULL labeled corpus of a RETIRED benchmark version (answer keys included).
+
+    Once a benchmark is superseded it is never scored again, so its per-case answer
+    keys carry zero anti-overfit cost and are released verbatim from the stored
+    scores for research + audit. Refused with 409 for the current (live) version or
+    any unknown future version, so no live answer key is ever exposed here.
+    Paginate with ``limit`` / ``offset`` up to ``total``.
+    """
+    if not is_bench_version_retired(version):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"bench_version {version} is not retired (current is "
+                f"{CURRENT_BENCH_VERSION}); its answer keys are not released"
+            ),
+        )
+    response.headers["Cache-Control"] = "public, max-age=3600, immutable"
+    rows, total = await list_scores_for_bench_version(
+        session, version=version, limit=limit, offset=offset
+    )
+    return PublicBenchCorpusResponse(
+        bench_version=version,
+        generated_at=datetime.now(UTC),
+        count=len(rows),
+        total=total,
+        limit=limit,
+        offset=offset,
+        entries=[
+            PublicBenchCorpusEntry(
+                agent_id=score.agent_id,
+                miner_hotkey=miner,
+                validator_hotkey=score.validator_hotkey,
+                seed=score.seed,
+                run_id=score.run_id,
+                composite=score.composite,
+                per_case=_corpus_per_case(score.details),
+            )
+            for score, miner in rows
+        ],
     )
