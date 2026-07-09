@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, and_, func, select
+from sqlalchemy import ColumnElement, and_, func, or_, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
@@ -39,6 +39,14 @@ if TYPE_CHECKING:
 # weights. Keep in sync with the validator's MIN_ELIGIBLE_CASES
 # (ditto-subnet ditto/validator/weights.py).
 MIN_ELIGIBLE_CASES = 100
+
+# The validator pool size: a submission is scored by this many independent
+# validators (the k=3 model), and its canonical score is the MEDIAN of their
+# composites, so a single generous or harsh validator cannot move it. The
+# platform issues at most this many tickets per agent (``validator_tickets``)
+# and finalizes an agent (``evaluating -> scored``) once it has this many
+# scores. Keep in sync with the ticket-issue cap and the validator quorum.
+SCORING_QUORUM = 3
 
 
 def _is_ranked() -> ColumnElement[bool]:
@@ -333,13 +341,15 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
 
     Three levels, all deterministic:
 
-    1. ``agent_best`` ranks each agent's ``scores`` rows and keeps the single
-       best **whole row** — so ``composite`` / ``seed`` / ``run_id`` /
-       ``validator_hotkey`` / ``signature`` always come from the *same* physical
-       row and the exposed signature verifies against the exposed composite.
-       (Picking each column independently with ``MAX`` would stitch a mismatched
-       tuple the moment an agent has >1 score row — e.g. after a validator
-       hotkey rotation inserts a second ``(agent_id, validator_hotkey)`` row.)
+    1. ``agent_best`` takes each agent's **median** score row: it orders the
+       agent's ``scores`` rows by composite and keeps the middle one (position
+       ``(count+1)/2``), so the k=3 pool's canonical score is the median of its
+       validators' composites and a single generous or harsh validator cannot
+       move it. It keeps the whole **row** (not a per-column ``MEDIAN``), so
+       ``composite`` / ``seed`` / ``run_id`` / ``validator_hotkey`` /
+       ``signature`` all come from the same physical row and the exposed
+       signature still verifies against the exposed composite. An agent with a
+       single score is its own median, so pre-quorum agents degrade cleanly.
     2. join to ``agents`` filtered to ``scored``.
     3. a ``ROW_NUMBER`` window keeps each miner's single best agent.
 
@@ -356,8 +366,10 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
 
     Ordering (``eligible DESC, composite DESC, first_seen ASC, agent_id ASC``)
     matches the validator fold's eligibility gate + champion/tail tie-breaks.
-    When the D3 k=3 design lands, ``agent_best`` becomes a median-of-3 selection
-    — a localized change here.
+    The per-agent selection is median-of-quorum (:data:`SCORING_QUORUM`); the
+    per-agent ``n`` is uniform across the pool because all validators score the
+    same platform-generated dataset, so the median row's ``eligible`` flag
+    represents the agent.
     """
     agent_best = select(
         Score.agent_id.label("agent_id"),
@@ -372,15 +384,17 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         Score.details.label("details"),
         Score.validator_hotkey.label("validator_hotkey"),
         Score.signature.label("signature"),
+        # Row count in the agent's pool, so the median position is (cnt+1)/2.
+        func.count(Score.agent_id)
+        .over(partition_by=Score.agent_id)
+        .label("cnt"),
+        # Ascending composite so the middle row (by srn) is the median; the
+        # validator_hotkey tie-break keeps the pick deterministic.
         func.row_number()
         .over(
             partition_by=Score.agent_id,
-            # Prefer a ranked (full-benchmark, positive-composite) row over a
-            # higher-composite smoke/practice row, so a small run cannot shadow the
-            # agent's real full run and drop it out of the ranked/emission pool.
             order_by=(
-                _is_ranked().desc(),
-                Score.composite.desc(),
+                Score.composite.asc(),
                 Score.validator_hotkey.asc(),
             ),
         )
@@ -413,7 +427,18 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             agent_best.c.signature,
         )
         .join(agent_best, agent_best.c.agent_id == Agent.agent_id)
-        .where(Agent.status == AgentStatus.SCORED, agent_best.c.srn == 1)
+        # The median row: the middle by ascending composite. Expressed as
+        # integer arithmetic (no division, so it is exact + portable across
+        # Postgres and the SQLite test path): the lower-middle index m has
+        # 2m == cnt (even) or 2m == cnt+1 (odd). A lone score picks itself; a
+        # quorum of 3 picks the 2nd (true median).
+        .where(
+            Agent.status == AgentStatus.SCORED,
+            or_(
+                agent_best.c.srn * 2 == agent_best.c.cnt,
+                agent_best.c.srn * 2 == agent_best.c.cnt + 1,
+            ),
+        )
         .subquery()
     )
     rn = (

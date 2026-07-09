@@ -319,10 +319,10 @@ class TestListEligibleLedger:
     async def test_multiple_score_rows_returns_consistent_row(
         self, session: AsyncSession
     ) -> None:
-        # An agent scored by two validators (e.g. after a hotkey rotation) has two
-        # scores rows. The ledger must return the BEST row whole — composite, seed,
-        # run_id, signature, validator_hotkey all from the same physical row — not
-        # a per-column MAX that stitches a mismatched (composite, signature) tuple.
+        # An agent scored by the k=3 validator pool has three score rows. The
+        # ledger must return the MEDIAN row whole (composite, seed, run_id,
+        # signature, validator_hotkey all from the same physical row), not a
+        # per-column aggregate that stitches a mismatched (composite, signature).
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
         agent = Agent(
             agent_id=uuid4(),
@@ -366,12 +366,65 @@ class TestListEligibleLedger:
                 generated_at=_GEN_AT,
                 signature="99" * 64,
             )
+            # Median composite from a third validator: this is the row the
+            # ledger must surface whole under median-of-3.
+            await upsert_score(
+                session,
+                agent_id=agent.agent_id,
+                validator_hotkey="5Mmm_validator",
+                run_id="run_mid",
+                seed=333,
+                composite=0.80,
+                tool_mean=0.8,
+                memory_mean=0.8,
+                median_ms=500,
+                n=20,
+                generated_at=_GEN_AT,
+                signature="55" * 64,
+            )
         ledger = await list_eligible_ledger(session)
         assert len(ledger) == 1
         e = ledger[0]
-        # Every field must come from the high-composite row, not be stitched.
-        assert e.composite == pytest.approx(0.90)
-        assert e.seed == 222
-        assert e.run_id == "run_high"
-        assert e.signature == "99" * 64
-        assert e.validator_hotkey == "5Aaa_validator"
+        # Every field must come from the MEDIAN row (composite 0.80), whole.
+        assert e.composite == pytest.approx(0.80)
+        assert e.seed == 333
+        assert e.run_id == "run_mid"
+        assert e.signature == "55" * 64
+        assert e.validator_hotkey == "5Mmm_validator"
+
+    async def test_median_of_three_ignores_outlier_validator(
+        self, session: AsyncSession
+    ) -> None:
+        # Three validators score the same agent. The canonical score is the
+        # MEDIAN (0.55), so a single generous (0.99) or harsh (0.10) validator
+        # cannot move it — and it is the median, not the mean (~0.547).
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        agent = Agent(
+            agent_id=uuid4(),
+            miner_hotkey=_MINER,
+            name="agent",
+            sha256="cd" * 32,
+            status=AgentStatus.SCORED,
+            created_at=t0,
+        )
+        async with session.begin():
+            session.add(agent)
+            await session.flush()
+            for vh, comp in (("5A_v", 0.10), ("5B_v", 0.55), ("5C_v", 0.99)):
+                await upsert_score(
+                    session,
+                    agent_id=agent.agent_id,
+                    validator_hotkey=vh,
+                    run_id=f"run_{vh}",
+                    seed=1,
+                    composite=comp,
+                    tool_mean=comp,
+                    memory_mean=comp,
+                    median_ms=1,
+                    n=MIN_ELIGIBLE_CASES,
+                    generated_at=_GEN_AT,
+                )
+        ledger = await list_eligible_ledger(session)
+        assert len(ledger) == 1
+        assert ledger[0].composite == pytest.approx(0.55)
+        assert ledger[0].eligible is True
