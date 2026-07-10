@@ -718,3 +718,60 @@ class PublicHealthResponse(BaseModel):
             }
         }
     )
+
+
+class BenchHarnessConfig(BaseModel):
+    """How the harness model is frozen for the current benchmark version."""
+
+    locked: bool = Field(description="Every harness is scored against ONE model.")
+    canonical_id: str = Field(
+        description="Canonical locked model id (docs + score reports)."
+    )
+    serving: str = Field(
+        description="The exact served artifact (fleet standard: Chutes TEE)."
+    )
+    thinking: bool = Field(
+        description="Locked hybrid-reasoning mode; false fleet-wide."
+    )
+    enforcement: str = Field(description="How the lock is enforced around the sandbox.")
+
+
+class BenchGradingConfig(BaseModel):
+    """How runs are graded."""
+
+    judge_free: bool = Field(description="No LLM judge anywhere in scoring.")
+    grader: str = Field(description="The public grader module.")
+    description: str = Field(description="One-line grading summary.")
+
+
+class BenchDatasetConfig(BaseModel):
+    """How datasets are generated and pinned."""
+
+    generator: str = Field(description="The public generator module.")
+    seed_derivation: str = Field(description="Where a scored run's seed comes from.")
+    reproduce: str = Field(
+        description="The command reproducing any scored dataset byte-for-byte."
+    )
+
+
+class PublicBenchConfigResponse(BaseModel):
+    """The current benchmark setup (``GET /public/bench/config``).
+
+    Everything here is a consensus parameter or a public fact: the frozen
+    harness model, the judge-free grading rules, and the seed/dataset
+    reproducibility story. Values change only with coordinated fleet bumps
+    (and a bench_version change when scoring-affecting).
+    """
+
+    bench_version: int
+    harness: BenchHarnessConfig
+    grading: BenchGradingConfig
+    dataset: BenchDatasetConfig
+    public_mirror_url_template: str | None = Field(
+        description=(
+            "Anonymous-read URL template for finalized run records "
+            "(dataset pin + k=3 signed scores), or null when mirroring is off."
+        )
+    )
+    ledger_path: str = Field(description="The self-verifying signed score ledger.")
+    generated_at: datetime
