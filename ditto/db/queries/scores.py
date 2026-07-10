@@ -341,9 +341,7 @@ async def get_submission_scores(
     if agent is None or agent.status not in _PUBLIC_SUBMISSION_STATUSES:
         return None
     scores = await list_scores_for_agent(session, agent_id=agent_id)
-    last_scored_at = (
-        _as_utc(max(s.generated_at for s in scores)) if scores else None
-    )
+    last_scored_at = _as_utc(max(s.generated_at for s in scores)) if scores else None
     return SubmissionRow(
         agent_id=agent.agent_id,
         miner_hotkey=agent.miner_hotkey,
@@ -387,8 +385,10 @@ async def list_public_submissions(
         return []
     agent_ids = [agent.agent_id for agent, _ in rows]
     score_rows = (
-        await session.execute(select(Score).where(Score.agent_id.in_(agent_ids)))
-    ).scalars().all()
+        (await session.execute(select(Score).where(Score.agent_id.in_(agent_ids))))
+        .scalars()
+        .all()
+    )
     by_agent: dict[UUID, list[Score]] = {}
     for s in score_rows:
         by_agent.setdefault(s.agent_id, []).append(s)
@@ -430,9 +430,7 @@ async def list_scores_for_bench_version(
         .where(version_col == version)
     )
     total = (
-        await session.execute(
-            select(func.count()).select_from(base.subquery())
-        )
+        await session.execute(select(func.count()).select_from(base.subquery()))
     ).scalar_one()
     rows = (
         await session.execute(
@@ -535,9 +533,7 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         Score.validator_hotkey.label("validator_hotkey"),
         Score.signature.label("signature"),
         # Row count in the agent's pool, so the median position is (cnt+1)/2.
-        func.count(Score.agent_id)
-        .over(partition_by=Score.agent_id)
-        .label("cnt"),
+        func.count(Score.agent_id).over(partition_by=Score.agent_id).label("cnt"),
         # Ascending composite so the middle row (by srn) is the median; the
         # validator_hotkey tie-break keeps the pick deterministic.
         func.row_number()

@@ -319,9 +319,7 @@ async def submit_result(
                 raise AgentNotFoundError(f"no agent with id={agent_id}")
             needs_dataset = existing.dataset_seed is None
         if needs_dataset:
-            seed, block_number, block_hash = await _derive_dataset_seed(
-                chain, agent_id
-            )
+            seed, block_number, block_hash = await _derive_dataset_seed(chain, agent_id)
             dataset_sha256 = await generator.generate(seed)
             new_dataset = (
                 seed,

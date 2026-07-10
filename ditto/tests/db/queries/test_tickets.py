@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,7 +25,7 @@ _LATER = _NOW + timedelta(hours=1)
 
 async def _seed_evaluating(
     session: AsyncSession, *, created_at: datetime = _NOW, name: str = "a"
-) -> object:
+) -> UUID:
     aid = uuid4()
     async with session.begin():
         session.add(
@@ -47,9 +47,7 @@ class TestIssueTicket:
     ) -> None:
         aid = await _seed_evaluating(session)
         async with session.begin():
-            t = await issue_ticket(
-                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
-            )
+            t = await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         assert t is not None
         assert t.agent_id == aid
         assert t.status == TicketStatus.ISSUED
@@ -59,9 +57,7 @@ class TestIssueTicket:
         self, session: AsyncSession
     ) -> None:
         async with session.begin():
-            t = await issue_ticket(
-                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
-            )
+            t = await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         assert t is None
 
     async def test_caps_at_quorum(self, session: AsyncSession) -> None:
@@ -83,12 +79,8 @@ class TestIssueTicket:
     ) -> None:
         await _seed_evaluating(session)
         async with session.begin():
-            t1 = await issue_ticket(
-                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
-            )
-            t2 = await issue_ticket(
-                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
-            )
+            t1 = await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
+            t2 = await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         assert t1 is not None
         assert t2 is None  # only one agent, and this validator already holds it
 
@@ -100,12 +92,8 @@ class TestIssueTicket:
             session, created_at=_NOW + timedelta(minutes=1), name="new"
         )
         async with session.begin():
-            t1 = await issue_ticket(
-                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
-            )
-            t2 = await issue_ticket(
-                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
-            )
+            t1 = await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
+            t2 = await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         assert t1 is not None and t2 is not None
         assert t1.agent_id == a1  # oldest first
         assert {t1.agent_id, t2.agent_id} == {a1, a2}
@@ -126,14 +114,10 @@ class TestExpiry:
             )
         assert t is not None and t.agent_id == aid
 
-    async def test_expire_overdue_returns_count(
-        self, session: AsyncSession
-    ) -> None:
+    async def test_expire_overdue_returns_count(self, session: AsyncSession) -> None:
         await _seed_evaluating(session)
         async with session.begin():
-            await issue_ticket(
-                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
-            )
+            await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         async with session.begin():
             n = await expire_overdue_tickets(session, now=_LATER)
         assert n == 1
@@ -143,32 +127,24 @@ class TestTicketLifecycle:
     async def test_get_open_ticket_live(self, session: AsyncSession) -> None:
         aid = await _seed_evaluating(session)
         async with session.begin():
-            await issue_ticket(
-                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
-            )
+            await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         async with session.begin():
             t = await get_open_ticket(
                 session, agent_id=aid, validator_hotkey="5V1", now=_NOW
             )
         assert t is not None
 
-    async def test_get_open_ticket_expired_is_none(
-        self, session: AsyncSession
-    ) -> None:
+    async def test_get_open_ticket_expired_is_none(self, session: AsyncSession) -> None:
         aid = await _seed_evaluating(session)
         async with session.begin():
-            await issue_ticket(
-                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
-            )
+            await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         async with session.begin():
             t = await get_open_ticket(
                 session, agent_id=aid, validator_hotkey="5V1", now=_LATER
             )
         assert t is None
 
-    async def test_get_open_ticket_absent_is_none(
-        self, session: AsyncSession
-    ) -> None:
+    async def test_get_open_ticket_absent_is_none(self, session: AsyncSession) -> None:
         aid = await _seed_evaluating(session)
         async with session.begin():
             t = await get_open_ticket(
@@ -181,9 +157,7 @@ class TestTicketLifecycle:
     ) -> None:
         aid = await _seed_evaluating(session)
         async with session.begin():
-            await issue_ticket(
-                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
-            )
+            await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         async with session.begin():
             await mark_ticket_scored(session, agent_id=aid, validator_hotkey="5V1")
         async with session.begin():

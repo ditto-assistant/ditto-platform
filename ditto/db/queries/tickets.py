@@ -36,6 +36,7 @@ def _as_utc(dt: datetime) -> datetime:
     comparisons from mixing naive and aware datetimes."""
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
+
 # Statuses that occupy a slot: an issued (live) or already-scored ticket. An
 # expired ticket does not count, so its slot re-opens.
 _LIVE_TICKET_STATUSES = (TicketStatus.ISSUED, TicketStatus.SCORED)
@@ -50,9 +51,7 @@ async def expire_overdue_tickets(session: AsyncSession, *, now: datetime) -> int
     """
     overdue = (
         await session.execute(
-            select(
-                ValidatorTicket.agent_id, ValidatorTicket.validator_hotkey
-            ).where(
+            select(ValidatorTicket.agent_id, ValidatorTicket.validator_hotkey).where(
                 ValidatorTicket.status == TicketStatus.ISSUED,
                 ValidatorTicket.deadline < now,
             )

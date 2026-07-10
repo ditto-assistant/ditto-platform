@@ -58,8 +58,6 @@ from ditto.api_models.validator import (
     ScoreReport,
     SubmitScoreRequest,
     SubmitScoreResponse,
-    ValidatorQueueItem,
-    ValidatorQueueResponse,
 )
 
 __all__ = [
@@ -98,6 +96,4 @@ __all__ = [
     "UploadAgentResponse",
     "UploadCheckRequest",
     "UploadCheckResponse",
-    "ValidatorQueueItem",
-    "ValidatorQueueResponse",
 ]

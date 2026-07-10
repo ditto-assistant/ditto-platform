@@ -637,9 +637,7 @@ class TestPublicSubmissionScores:
         assert body["submissions"] == []
 
 
-async def _seed_audit(
-    maker: async_sessionmaker[AsyncSession], *, n: int
-) -> None:
+async def _seed_audit(maker: async_sessionmaker[AsyncSession], *, n: int) -> None:
     """Append ``n`` chained score entries to the audit log."""
     async with maker() as s, s.begin():
         for i in range(n):

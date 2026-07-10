@@ -31,16 +31,18 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import statistics
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 from uuid import UUID
 
 import bittensor
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
@@ -49,8 +51,6 @@ from ditto.api_models import (
     ScoreReport,
     SubmitScoreRequest,
     SubmitScoreResponse,
-    ValidatorQueueItem,
-    ValidatorQueueResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.upload import _SS58_PATTERN
@@ -64,7 +64,8 @@ from ditto.api_server.endpoints.retrieval import AgentNotFoundError
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
-from ditto.db.queries.agents import get_agent_by_id, list_agents_by_status
+from ditto.db.models import Agent, Score
+from ditto.db.queries.agents import get_agent_by_id
 from ditto.db.queries.audit import (
     EVENT_FINALIZED,
     EVENT_SCORE,
@@ -103,9 +104,6 @@ def _artifact_key(agent_id: UUID) -> str:
 
 
 # Agents the validator may pull as work. The partial index covers exactly
-# this set; widening it means widening the index too.
-_QUEUE_STATUSES = (AgentStatus.EVALUATING,)
-
 # Agents a score may be reported against. ``scored`` / ``live`` are included
 # so a validator can re-score across epochs without a 409;
 # ``ath_pending_review`` is included so a re-score of a held agent updates its
@@ -235,39 +233,6 @@ def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:
         return False
 
 
-@router.get(
-    "/queue",
-    response_model=ValidatorQueueResponse,
-    responses={
-        401: {"description": "Missing/invalid validator auth."},
-        422: {"description": "Malformed query parameter."},
-        503: {"description": "Chain unavailable for the permit check."},
-    },
-)
-async def queue(
-    response: Response,
-    validator_hotkey: ValidatorDep,
-    session: SessionDep,
-    limit: Annotated[int, Query(ge=1, le=200)] = 50,
-) -> ValidatorQueueResponse:
-    """List agents awaiting evaluation (status ``evaluating``), oldest first."""
-    response.headers["Cache-Control"] = "no-store"
-    agents = await list_agents_by_status(session, statuses=_QUEUE_STATUSES, limit=limit)
-    items = [
-        ValidatorQueueItem(
-            agent_id=a.agent_id,
-            miner_hotkey=a.miner_hotkey,
-            name=a.name,
-            sha256=a.sha256,
-            status=a.status,
-            created_at=a.created_at,
-        )
-        for a in agents
-    ]
-    logger.info("validator=%s polled queue: %d item(s)", validator_hotkey, len(items))
-    return ValidatorQueueResponse(items=items, count=len(items))
-
-
 @router.post(
     "/job",
     response_model=JobResponse,
@@ -376,6 +341,7 @@ async def submit_score(
     response: Response,
     chain: ChainDep,
     session: SessionDep,
+    storage: StorageDep,
 ) -> SubmitScoreResponse:
     """Record a DittoBench score report and advance the agent's lifecycle.
 
@@ -555,6 +521,15 @@ async def submit_score(
                     },
                     recorded_at=audit_now,
                 )
+                # Transparency mirror: publish the finalized run record to the
+                # public bucket so third parties can verify signatures and
+                # re-grade offline without touching the API. Additive and
+                # fail-open: the canonical record is Postgres; a publish
+                # failure logs and never fails the score write. Idempotent by
+                # key, so a retried request republishes identical content.
+                await _publish_finalized_run(
+                    storage, agent=agent, scores=agent_scores, median=median_composite
+                )
         # Consume the ticket (one ticket, one score); the slot stays occupied.
         await mark_ticket_scored(
             session, agent_id=agent_id, validator_hotkey=payload.validator_hotkey
@@ -570,3 +545,62 @@ async def submit_score(
         result_status,
     )
     return SubmitScoreResponse(agent_id=agent_id, status=result_status, accepted=True)
+
+
+async def _publish_finalized_run(
+    storage: S3StorageClient,
+    *,
+    agent: Agent,
+    scores: Sequence[Score],
+    median: float,
+) -> None:
+    """Mirror a finalized run to the public bucket (``scored/{agent_id}.json``).
+
+    The record carries everything an offline verifier needs: the dataset pin
+    (seed, sha256, seed block), the k=3 signed scores with their full details
+    (per-case breakdown included), and the median the platform finalized on.
+    Signatures cover ``{hotkey}:{agent_id}:{run_id}:{composite!r}:{seed}``, so
+    the record is self-verifying against the validators' on-chain hotkeys.
+    No-op when ``STORAGE_PUBLIC_BUCKET`` is unset; failures log only.
+    """
+    if storage.public_bucket is None:
+        return
+    record = {
+        "agent_id": str(agent.agent_id),
+        "miner_hotkey": agent.miner_hotkey,
+        "status": agent.status.value,
+        "median_composite": median,
+        "dataset_seed": agent.dataset_seed,
+        "dataset_sha256": agent.dataset_sha256,
+        "dataset_run_size": agent.dataset_run_size,
+        "dataset_seed_block": agent.dataset_seed_block,
+        "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+        "scores": [
+            {
+                "validator_hotkey": sc.validator_hotkey,
+                "run_id": sc.run_id,
+                "seed": sc.seed,
+                "composite": sc.composite,
+                "tool_mean": sc.tool_mean,
+                "memory_mean": sc.memory_mean,
+                "median_ms": sc.median_ms,
+                "n": sc.n,
+                "generated_at": sc.generated_at.isoformat()
+                if sc.generated_at
+                else None,
+                "signature": sc.signature,
+                "details": sc.details,
+            }
+            for sc in sorted(scores, key=lambda sc: sc.validator_hotkey)
+        ],
+    }
+    body = json.dumps(record, sort_keys=True, default=str).encode()
+    try:
+        await storage.put_object(
+            key=f"scored/{agent.agent_id}.json",
+            body=body,
+            content_type="application/json",
+            bucket=storage.public_bucket,
+        )
+    except Exception:  # noqa: BLE001 - additive mirror, never fail the write
+        logger.exception("public mirror publish failed for agent %s", agent.agent_id)

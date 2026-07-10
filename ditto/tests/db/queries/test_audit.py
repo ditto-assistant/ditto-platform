@@ -105,9 +105,7 @@ class TestTamperDetection:
         entries[1].payload = {"run_id": "run_1", "composite": 0.999, "seed": 42}
         assert verify_audit_chain(entries) is False
 
-    async def test_broken_link_breaks_verification(
-        self, session: AsyncSession
-    ) -> None:
+    async def test_broken_link_breaks_verification(self, session: AsyncSession) -> None:
         for i in range(3):
             await _append_score(session, seq_hint=i)
         entries = await list_audit_entries(session)
