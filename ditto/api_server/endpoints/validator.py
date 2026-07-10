@@ -31,10 +31,10 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
-import json
 import statistics
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 from uuid import UUID
 
 import bittensor
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (

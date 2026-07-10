@@ -55,8 +55,7 @@ def upgrade() -> None:
         """
     )
     op.execute(
-        "CREATE INDEX validator_tickets_agent_id_idx "
-        "ON validator_tickets (agent_id)"
+        "CREATE INDEX validator_tickets_agent_id_idx ON validator_tickets (agent_id)"
     )
     op.execute(
         "CREATE INDEX validator_tickets_open_idx "

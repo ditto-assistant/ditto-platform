@@ -123,9 +123,7 @@ def _install_db(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
     # Default: generation disabled (NullGenerator) so the existing verdict tests
     # promote without pinning a dataset. Tests that exercise the pinned path call
     # _install_generator afterward to override.
-    app.dependency_overrides.setdefault(
-        get_dataset_generator, lambda: NullGenerator()
-    )
+    app.dependency_overrides.setdefault(get_dataset_generator, lambda: NullGenerator())
 
 
 def _install_generator(app: FastAPI, generator: object) -> None:

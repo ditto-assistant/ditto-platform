@@ -8,12 +8,11 @@ keypair so the signature-verification path runs for real.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
-
-import json
 
 import bittensor
 import httpx

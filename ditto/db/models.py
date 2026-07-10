@@ -455,9 +455,7 @@ class ValidatorTicket(Base):
     )
     """When the ticket was granted (UTC)."""
 
-    deadline: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), nullable=False
-    )
+    deadline: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     """When an unscored ticket expires and its slot re-opens (UTC)."""
 
     created_at: Mapped[datetime] = mapped_column(
