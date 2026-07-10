@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import statistics
 from datetime import UTC, datetime
 from typing import Any
@@ -34,8 +35,12 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Response
 
 from ditto.api_models import (
+    BenchDatasetConfig,
+    BenchGradingConfig,
+    BenchHarnessConfig,
     PublicAuditEntry,
     PublicAuditResponse,
+    PublicBenchConfigResponse,
     PublicBenchCorpusEntry,
     PublicBenchCorpusResponse,
     PublicBenchIntegrity,
@@ -579,4 +584,59 @@ async def bench_corpus(
             )
             for score, miner in rows
         ],
+    )
+
+
+@router.get("/bench/config", response_model=PublicBenchConfigResponse)
+async def bench_config(response: Response) -> PublicBenchConfigResponse:
+    """The current benchmark setup: frozen model, judge-free grading, seeds.
+
+    The harness model is a consensus parameter: every scoring validator runs
+    the same frozen open-weight artifact through a model-pinning gateway, so
+    model choice is not a miner lever and k=3 scores are comparable. The
+    ``BENCH_*`` env overrides exist for coordinated fleet bumps only.
+    """
+    response.headers["Cache-Control"] = "public, max-age=300"
+    public_bucket = os.environ.get("STORAGE_PUBLIC_BUCKET", "")
+    mirror = (
+        f"https://storage.googleapis.com/{public_bucket}/scored/{{agent_id}}.json"
+        if public_bucket
+        else None
+    )
+    return PublicBenchConfigResponse(
+        bench_version=CURRENT_BENCH_VERSION,
+        harness=BenchHarnessConfig(
+            locked=True,
+            canonical_id=os.environ.get("BENCH_HARNESS_MODEL_ID", "qwen/qwen3-32b"),
+            serving=os.environ.get("BENCH_HARNESS_SERVING", "Qwen/Qwen3-32B-TEE"),
+            thinking=os.environ.get("BENCH_HARNESS_THINKING", "false") == "true",
+            enforcement=(
+                "model-pinning relay forces the model field and holds the "
+                "upstream key outside the sandbox; sandbox egress is deny-all "
+                "(no other model is reachable)"
+            ),
+        ),
+        grading=BenchGradingConfig(
+            judge_free=True,
+            grader="github.com/ditto-assistant/dittobench-datagen/grade",
+            description=(
+                "deterministic per-answer_kind checks with distractor and "
+                "forbidden-value zeroing; a score is a pure function of "
+                "(dataset, transcript)"
+            ),
+        ),
+        dataset=BenchDatasetConfig(
+            generator="github.com/ditto-assistant/dittobench-datagen",
+            seed_derivation=(
+                "derived from an on-chain block hash fixed AFTER the miner "
+                "commits; unpredictable, one fresh dataset per submission"
+            ),
+            reproduce=(
+                "generate -seed <seed> -run-size full -sha reproduces any "
+                "scored run's exact bytes and dataset_sha256"
+            ),
+        ),
+        public_mirror_url_template=mirror,
+        ledger_path="/api/v1/scoring/scores",
+        generated_at=datetime.now(UTC),
     )

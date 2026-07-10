@@ -900,3 +900,36 @@ class TestPublicAudit:
         assert body["entries"] == []
         assert body["head_hash"] is None
         assert body["genesis_hash"] == GENESIS_HASH
+
+
+class TestBenchConfig:
+    """GET /public/bench/config exposes the frozen-model + grading setup."""
+
+    async def test_config_shape_and_defaults(
+        self, client: httpx.AsyncClient, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("STORAGE_PUBLIC_BUCKET", raising=False)
+        resp = await client.get("/api/v1/public/bench/config")
+        assert resp.status_code == 200
+        assert "max-age=300" in resp.headers["Cache-Control"]
+        body = resp.json()
+        assert body["bench_version"] >= 2
+        h = body["harness"]
+        assert h["locked"] is True
+        assert h["canonical_id"] == "qwen/qwen3-32b"
+        assert h["serving"] == "Qwen/Qwen3-32B-TEE"
+        assert h["thinking"] is False
+        assert body["grading"]["judge_free"] is True
+        assert "dittobench-datagen" in body["grading"]["grader"]
+        assert "dataset_sha256" in body["dataset"]["reproduce"]
+        assert body["public_mirror_url_template"] is None
+        assert body["ledger_path"] == "/api/v1/scoring/scores"
+
+    async def test_mirror_template_from_env(
+        self, client: httpx.AsyncClient, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("STORAGE_PUBLIC_BUCKET", "ditto-platform-public-dev")
+        body = (await client.get("/api/v1/public/bench/config")).json()
+        assert body["public_mirror_url_template"] == (
+            "https://storage.googleapis.com/ditto-platform-public-dev/scored/{agent_id}.json"
+        )

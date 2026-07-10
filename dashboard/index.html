@@ -441,7 +441,7 @@
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="The highest composite among ranked (full-benchmark) runs. Composite = 0.5 × tool mean + 0.5 × memory mean. Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
       <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" title="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--memory)"></div><div class="label"><span class="tip" title="Total LLM tokens spent generating the dataset and judging responses across the runs on the board. This is the compute cost of scoring.">Scoring Spend</span></div><div class="value" id="c-cost">–</div></div>
+      <div class="card"><div class="glow" style="background:var(--memory)"></div><div class="label"><span class="tip" title="Total LLM tokens the runs on the board spent (the harnesses' own calls to the locked model). Generation and grading are non-LLM, so scoring itself spends nothing.">Scoring Spend</span></div><div class="value" id="c-cost">–</div></div>
     </section>
 
     <div class="section-head">
@@ -494,6 +494,16 @@
         </div>
       </div>
       <p class="note"><b>Anti-overfit and comparability.</b> Only runs that administer the <b>full</b> benchmark rank and earn emissions. Smaller practice profiles omit the hardest categories and are shown as provisional. Scores compare only within one benchmark version. Click any row for the per-category breakdown and the integrity telemetry behind its score.</p>
+      <div class="pillar" id="bench-setup" style="margin-top:14px">
+        <h3>Frozen setup <span class="tag" id="bs-version">v–</span></h3>
+        <p style="margin-bottom:8px">Every harness runs against <b>one frozen open-weight model</b> and every run is graded by <b>deterministic, judge-free rules</b> — a score is a pure function of the dataset and the transcript, and anyone can re-check it.</p>
+        <ul style="margin:0;padding-left:18px;line-height:1.7">
+          <li><b>Model</b>: <code id="bs-model">qwen/qwen3-32b</code> served as <code id="bs-serving">Qwen/Qwen3-32B-TEE</code> (hardware-attested TEE), reasoning mode locked <b id="bs-thinking">off</b>. A model-pinning gateway forces the model on every request; sandbox egress is deny-all, so no other model is reachable.</li>
+          <li><b>Grading</b>: no LLM judge. Deterministic per-kind checks from the public <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">dittobench-datagen</a> module (also the generator: dataset + answer keys are byte-reproducible from the seed).</li>
+          <li><b>Seed</b>: derived from an on-chain block hash fixed <i>after</i> the miner commits — unpredictable, one fresh dataset per submission, pinned by <code>dataset_sha256</code> in every score.</li>
+          <li id="bs-mirror-li" style="display:none"><b>Verify it yourself</b>: finalized run records (dataset pin + all signed scores) are public — <a id="bs-mirror" href="#" target="_blank" rel="noopener">run record mirror ↗</a>, plus the signed <a id="bs-ledger" href="#" target="_blank" rel="noopener">score ledger ↗</a>.</li>
+        </ul>
+      </div>
     </section>
 
     <footer>
@@ -1300,6 +1310,20 @@
       getJSON("/public/health")
         .then(function (h) { renderHealth(h); })
         .catch(function () { renderHealth(SAMPLE_HEALTH); });
+      // Frozen-setup panel; static markup doubles as the fallback.
+      getJSON("/public/bench/config").then(function (c) {
+        document.getElementById("bs-version").textContent = "v" + c.bench_version;
+        document.getElementById("bs-model").textContent = c.harness.canonical_id;
+        document.getElementById("bs-serving").textContent = c.harness.serving;
+        document.getElementById("bs-thinking").textContent = c.harness.thinking ? "on" : "off";
+        if (c.public_mirror_url_template) {
+          var li = document.getElementById("bs-mirror-li");
+          li.style.display = "";
+          document.getElementById("bs-mirror").href =
+            c.public_mirror_url_template.replace("{agent_id}", "");
+          document.getElementById("bs-ledger").href = API_BASE + c.ledger_path.replace("/api/v1", "");
+        }
+      }).catch(function () {});
     }
 
     // ── Sample data (mirrors the real /public/leaderboard shape) ──
