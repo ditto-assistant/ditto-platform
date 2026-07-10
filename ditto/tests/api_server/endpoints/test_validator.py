@@ -13,6 +13,8 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
+import json
+
 import bittensor
 import httpx
 import pytest
@@ -243,100 +245,6 @@ _AUTH_HEADER = {"X-Validator-Hotkey": _VALIDATOR_HOTKEY}
 
 
 # --- Queue -----------------------------------------------------------------
-
-
-class TestQueue:
-    async def test_lists_only_evaluating_oldest_first(
-        self,
-        app: FastAPI,
-        client: httpx.AsyncClient,
-        session_maker: async_sessionmaker[AsyncSession],
-    ) -> None:
-        base = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
-        await _seed_agent(
-            session_maker,
-            status=AgentStatus.EVALUATING,
-            name="younger",
-            created_at=base + timedelta(minutes=5),
-        )
-        await _seed_agent(
-            session_maker,
-            status=AgentStatus.EVALUATING,
-            name="older",
-            created_at=base,
-        )
-        # Not in the evaluating state -> excluded from the queue.
-        await _seed_agent(session_maker, status=AgentStatus.UPLOADED, name="pending")
-        _install_db(app, session_maker)
-        _install_chain(app)
-
-        response = await client.get("/api/v1/validator/queue", headers=_AUTH_HEADER)
-        assert response.status_code == 200
-        assert response.headers["Cache-Control"] == "no-store"
-        body = response.json()
-        assert body["count"] == 2
-        assert [i["name"] for i in body["items"]] == ["older", "younger"]
-        assert all(i["status"] == AgentStatus.EVALUATING for i in body["items"])
-
-    async def test_limit_caps_results(
-        self,
-        app: FastAPI,
-        client: httpx.AsyncClient,
-        session_maker: async_sessionmaker[AsyncSession],
-    ) -> None:
-        for i in range(3):
-            await _seed_agent(
-                session_maker, status=AgentStatus.EVALUATING, name=f"a{i}"
-            )
-        _install_db(app, session_maker)
-        _install_chain(app)
-
-        response = await client.get(
-            "/api/v1/validator/queue?limit=2", headers=_AUTH_HEADER
-        )
-        assert response.status_code == 200
-        assert response.json()["count"] == 2
-
-    async def test_missing_auth_header_returns_401(
-        self,
-        app: FastAPI,
-        client: httpx.AsyncClient,
-        session_maker: async_sessionmaker[AsyncSession],
-    ) -> None:
-        _install_db(app, session_maker)
-        _install_chain(app)
-        response = await client.get("/api/v1/validator/queue")
-        assert response.status_code == 401
-        assert response.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
-
-    async def test_unpermitted_validator_returns_401(
-        self,
-        app: FastAPI,
-        client: httpx.AsyncClient,
-        session_maker: async_sessionmaker[AsyncSession],
-    ) -> None:
-        _install_db(app, session_maker)
-        _install_chain(app, permitted=False)
-        response = await client.get("/api/v1/validator/queue", headers=_AUTH_HEADER)
-        assert response.status_code == 401
-        assert response.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
-
-    async def test_limit_out_of_range_returns_422(
-        self,
-        app: FastAPI,
-        client: httpx.AsyncClient,
-        session_maker: async_sessionmaker[AsyncSession],
-    ) -> None:
-        _install_db(app, session_maker)
-        _install_chain(app)
-        response = await client.get(
-            "/api/v1/validator/queue?limit=0", headers=_AUTH_HEADER
-        )
-        assert response.status_code == 422
-        assert response.json()["error_code"] == ERROR_CODE_VALIDATION
-
-
-# --- Artifact --------------------------------------------------------------
 
 
 class TestArtifact:
@@ -914,3 +822,49 @@ class TestAntiCopyGate:
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == AgentStatus.ATH_PENDING_REVIEW
+
+
+class TestPublicMirror:
+    """The finalize hook mirrors the run record to the public bucket."""
+
+    async def test_finalize_publishes_when_public_bucket_configured(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+        storage.public_bucket = "ditto-public"
+        storage.put_object = AsyncMock()
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _score_to_quorum(
+            client, agent_id, maker=session_maker, run_id="run_pub", composite=0.5
+        )
+        storage.put_object.assert_awaited_once()
+        kwargs = storage.put_object.await_args.kwargs
+        assert kwargs["bucket"] == "ditto-public"
+        assert kwargs["key"] == f"scored/{agent_id}.json"
+        record = json.loads(kwargs["body"])
+        assert record["median_composite"] == 0.5
+        assert len(record["scores"]) == 3
+        assert all(sc["signature"] for sc in record["scores"])
+        assert record["status"] == AgentStatus.SCORED.value
+
+    async def test_finalize_skips_publish_when_unconfigured(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+        storage.public_bucket = None
+        storage.put_object = AsyncMock()
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _score_to_quorum(
+            client, agent_id, maker=session_maker, run_id="run_nopub", composite=0.5
+        )
+        storage.put_object.assert_not_awaited()

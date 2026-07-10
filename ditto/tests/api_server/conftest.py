@@ -107,6 +107,14 @@ def app() -> Iterator[FastAPI]:
     # dataset generator is lifespan-created; default to the disabled null generator
     # so verdict tests promote without pinning a dataset unless they override it.
     a.state.dataset_generator = NullGenerator()
+    # storage is lifespan-opened; default to a mock with the public mirror OFF
+    # (public_bucket=None) so score-submit tests run without S3 unless they
+    # override get_storage_client.
+    from unittest.mock import MagicMock
+
+    default_storage = MagicMock()
+    default_storage.public_bucket = None
+    a.state.storage = default_storage
     yield a
     a.dependency_overrides.clear()
 

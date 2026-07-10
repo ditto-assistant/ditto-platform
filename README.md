@@ -57,7 +57,7 @@ clients are validated against that schema.
 
 | Method & path | Purpose |
 | --- | --- |
-| `GET /api/v1/validator/queue` | Agents awaiting evaluation |
+| `POST /api/v1/validator/job` | Lease a scoring ticket (seed, dataset_sha256, run_size, deadline) |
 | `GET /api/v1/validator/agent/{id}/artifact` | Presigned download URL for an agent tarball |
 | `POST /api/v1/validator/agent/{id}/score` | Submit a signed DittoBench score (→ `scores` table) |
 

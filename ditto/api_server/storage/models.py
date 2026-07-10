@@ -39,6 +39,12 @@ class StorageConfig:
     """Whether the endpoint speaks TLS (``STORAGE_USE_TLS``). ``False``
     for dev compose, ``True`` in prod."""
 
+    public_bucket: str | None = None
+    """Optional public-read bucket for the per-run transparency mirror
+    (``STORAGE_PUBLIC_BUCKET``). Unset disables publishing. Publicness is a
+    bucket-level policy (Terraform / mc anonymous for minio), never a
+    per-object ACL."""
+
 
 @dataclass(frozen=True)
 class StoredObject:
@@ -77,6 +83,7 @@ def parse_storage_config_from_env() -> StorageConfig:
     access_key = os.environ.get("STORAGE_ACCESS_KEY", "")
     secret_key = os.environ.get("STORAGE_SECRET_KEY", "")
     region = os.environ.get("STORAGE_REGION", "us-east-1")
+    public_bucket = os.environ.get("STORAGE_PUBLIC_BUCKET", "") or None
     use_tls_raw = os.environ.get("STORAGE_USE_TLS", "false")
 
     missing = [
@@ -101,4 +108,5 @@ def parse_storage_config_from_env() -> StorageConfig:
         secret_key=secret_key,
         region=region,
         use_tls=_parse_bool("STORAGE_USE_TLS", use_tls_raw),
+        public_bucket=public_bucket,
     )

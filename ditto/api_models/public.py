@@ -355,9 +355,7 @@ class PublicValidatorScore(BaseModel):
     memory_mean: Annotated[
         float, Field(ge=0.0, le=1.0, description="Mean memory recall in [0,1].")
     ]
-    median_ms: Annotated[
-        int, Field(ge=0, description="Median per-case latency (ms).")
-    ]
+    median_ms: Annotated[int, Field(ge=0, description="Median per-case latency (ms).")]
     n: Annotated[int, Field(ge=0, description="Number of cases scored.")]
     seed: Annotated[
         int,
@@ -413,9 +411,7 @@ class PublicSubmissionScores(BaseModel):
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
     ]
-    status: Annotated[
-        str, Field(description='Public status ("scored" or "live").')
-    ]
+    status: Annotated[str, Field(description='Public status ("scored" or "live").')]
     quorum: Annotated[
         int, Field(ge=1, description="Validators required to finalize (k=3).")
     ]
