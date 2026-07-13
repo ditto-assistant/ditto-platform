@@ -18,20 +18,23 @@ flowchart LR
 
     subgraph Platform["ditto-platform — API VM (GCP, auto-deploy from dev)"]
         UP["/upload/*<br/>verify payment · sha256 · size cap"]
-        SAPI["/screener/*  — PR #7<br/>queue · artifact · result"]:::new
+        SAPI["/screener/*<br/>queue · artifact · result"]:::new
         VAPI["/validator/*<br/>queue · artifact · score"]
         SM["agents state machine<br/>uploaded → screening_failed<br/>uploaded → evaluating → scored → live"]
         S3[("GCS<br/>agent tarballs")]:::store
         PG[("Postgres<br/>agents · scores ledger")]:::store
     end
 
-    subgraph VM["Validator VM — infra PR #4 · Docker · private · IAP SSH"]
-        SW["screener worker<br/>ditto-subnet (Dan)<br/>lint + compile + build gate"]:::new
+    subgraph ScrVM["Screener VM · platform-operated · dedicated host · Docker · private"]
+        SW["screener worker<br/>python -m ditto.screener<br/>docker build + /health gate"]:::new
+    end
+
+    subgraph VM["Validator VM · Docker · private · IAP SSH"]
         VW["validator worker<br/>python -m ditto.validator<br/>stateless · epoch sweep"]
         subgraph DBench["dittobench-api :8080 — Go host binary + host Docker"]
-            FETCH["mode B: fetch tarball_url — PR #6<br/>build + run in Docker sandbox"]:::new
+            FETCH["mode B: fetch tarball_url<br/>build + run in Docker sandbox"]:::new
             RUN["fresh anti-cheat dataset<br/>stratified datagen"]
-            JUDGE["scorer + LLM judge<br/>ScoreReport = 0.6·tool + 0.4·mem"]
+            JUDGE["deterministic scorer · judge-free<br/>ScoreReport = 0.6·tool + 0.4·mem"]
         end
         HC["miner harness container<br/>built from tarball · temp 0"]
     end
@@ -39,9 +42,9 @@ flowchart LR
     subgraph Ref["Reference · deps · off-chain practice"]
         HARNESS["ditto-harness<br/>Rust memory library"]
         SK["dittobench-starter-kit<br/>baseline harness"]
-        CAL["calibrate + refharness — PR #4/#5<br/>difficulty stddev ≤ 0.03"]
+        CAL["calibrate + refharness<br/>difficulty stddev ≤ 0.03"]
         CR["dittobench-api on Cloud Run<br/>miner practice only — no Docker"]:::practice
-        OR["OpenRouter (BYOK)<br/>paraphrase + judge"]
+        GW["locked model gateway<br/>Qwen3-32B · frozen · egress-locked"]
     end
 
     %% 1-2 upload
@@ -60,11 +63,11 @@ flowchart LR
     %% 5-8 evaluate
     VW -->|"5 poll evaluating + tarball_url"| VAPI
     VAPI --> S3
-    VW -->|"6 submit tarball_url · run_size=full · BYOK key"| FETCH
+    VW -->|"6 submit tarball_url · run_size=full"| FETCH
     FETCH -->|"presigned fetch"| S3
     FETCH -->|"docker build + run"| HC
     FETCH --> RUN --> JUDGE
-    JUDGE -->|"judge"| OR
+    HC -->|"locked model calls"| GW
     JUDGE -->|"7 ScoreReport — poll /v1/runs/id"| VW
     VW -->|"8 signed score sr25519"| VAPI
     VAPI -->|"evaluating then scored"| SM

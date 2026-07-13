@@ -62,9 +62,26 @@ clients are validated against that schema.
 | `GET /api/v1/validator/agent/{id}/artifact` | Presigned download URL for an agent tarball |
 | `POST /api/v1/validator/agent/{id}/score` | Submit a signed DittoBench score (→ `scores` table) |
 
+### Built (screener-facing)
+
+Screening is a **platform-operated** pre-evaluation gate: a dedicated host the team
+runs (not the validators). It drains `uploaded` agents, `docker build`s and
+health-checks each crate in isolation, and promotes pass → `evaluating` /
+fail → `screening_failed`, so a crate that does not compile never costs a full
+benchmark. It authenticates with a dedicated screener credential (an allowlisted
+hotkey plus a bearer token), not a validator permit, so the screener key holds no
+stake. A validator may optionally run its own screener locally, but the authoritative
+gate is the one the platform hosts.
+
+| Method & path | Purpose |
+| --- | --- |
+| `GET /api/v1/screener/queue` | List agents awaiting screening (status `uploaded`), oldest first |
+| `GET /api/v1/screener/agent/{id}/artifact` | Presigned download URL for the crate tarball |
+| `POST /api/v1/screener/agent/{id}/result` | Signed pass/fail verdict that promotes the agent |
+
 ### Planned (scoring + ops)
 
-Weight/score aggregation (`/scoring/*`), screening transitions, and `/admin/*`. See
+Weight/score aggregation (`/scoring/*`) and `/admin/*`. See
 [`PROJECT.md`](https://github.com/ditto-assistant/ditto-subnet/blob/main/PROJECT.md) in `ditto-subnet`
 for the evaluation/scoring design.
 
