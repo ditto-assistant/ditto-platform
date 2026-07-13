@@ -181,9 +181,7 @@ async def require_screener(
         raise ScreenerAuthError("missing or malformed X-Screener-Hotkey header")
     netuid = request.app.state.config.chain.netuid
     network = request.app.state.config.chain.subtensor_network
-    await _assert_screener_permitted(
-        chain, netuid, x_screener_hotkey, network=network
-    )
+    await _assert_screener_permitted(chain, netuid, x_screener_hotkey, network=network)
     return x_screener_hotkey
 
 
