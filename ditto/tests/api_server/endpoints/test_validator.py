@@ -49,6 +49,9 @@ _KEYPAIRS = [
 ]
 _KEYPAIR = _KEYPAIRS[0]
 _VALIDATOR_HOTKEY = _KEYPAIR.ss58_address
+# A fourth validator, used only to prove an expired ticket re-opens a slot for a
+# validator that was shut out when the k=3 pool was full.
+_DAVE = bittensor.Keypair.create_from_uri("//Dave")
 _MINER_HOTKEY = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _SHA256 = "ab" * 32
 
@@ -150,11 +153,15 @@ def _install_db(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
 
 
 def _install_chain(
-    app: FastAPI, *, permitted: bool = True, registered: bool = True
+    app: FastAPI,
+    *,
+    permitted: bool = True,
+    registered: bool = True,
+    extra_keypairs: tuple[bittensor.Keypair, ...] = (),
 ) -> None:
     neurons = []
     if registered:
-        for uid, kp in enumerate(_KEYPAIRS, start=1):
+        for uid, kp in enumerate((*_KEYPAIRS, *extra_keypairs), start=1):
             neurons.append(
                 NeuronInfo(
                     hotkey=kp.ss58_address,
@@ -867,3 +874,86 @@ class TestPublicMirror:
             client, agent_id, maker=session_maker, run_id="run_nopub", composite=0.5
         )
         storage.put_object.assert_not_awaited()
+
+
+class TestMultiValidatorConsensus:
+    """The k=3 consensus semantics the decentralized design promises: the
+    canonical score is the MEDIAN of the (differing) independent validator
+    composites, the full per-validator record is exposed publicly, and an
+    expired ticket re-opens the slot so a shut-out validator can pick the agent
+    up. These exercise consensus correctness end to end, complementing the
+    all-equal-composite quorum tests above."""
+
+    async def test_finalizes_on_median_of_differing_scores(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # Three independent validators disagree. The platform must finalize on the
+        # MEDIAN (0.82), never the mean (0.7067) or any single validator's number.
+        composites = {_KEYPAIRS[0]: 0.40, _KEYPAIRS[1]: 0.82, _KEYPAIRS[2]: 0.90}
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        last: httpx.Response | None = None
+        for i, (kp, comp) in enumerate(composites.items()):
+            await _seed_ticket(session_maker, agent_id, keypair=kp)
+            last = await client.post(
+                f"/api/v1/validator/agent/{agent_id}/score",
+                json=_score_payload(
+                    agent_id, run_id=f"run_med_{i}", keypair=kp, composite=comp
+                ),
+            )
+            assert last.status_code == 200, last.text
+        assert last is not None
+        assert last.json()["status"] == AgentStatus.SCORED
+
+        # Public transparency record (the diagram's "which validators / all 3
+        # scores + median"): all three validators, their exact composites +
+        # signatures, and the median the platform finalized on.
+        record = await client.get(f"/api/v1/public/agent/{agent_id}/scores")
+        assert record.status_code == 200, record.text
+        body = record.json()
+        assert body["score_count"] == 3
+        assert body["quorum"] == 3
+        assert body["median_composite"] == pytest.approx(0.82)
+        by_hotkey = {s["validator_hotkey"]: s["composite"] for s in body["scores"]}
+        assert by_hotkey == {
+            kp.ss58_address: pytest.approx(comp) for kp, comp in composites.items()
+        }
+        assert all(s["signature"] for s in body["scores"])
+
+    async def test_expired_ticket_reopens_slot_for_a_new_validator(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app, extra_keypairs=(_DAVE,))
+
+        # Three distinct validators claim the k=3 slots via the job endpoint.
+        for kp in _KEYPAIRS:
+            r = await client.post(
+                "/api/v1/validator/job",
+                headers={"X-Validator-Hotkey": kp.ss58_address},
+            )
+            assert r.status_code == 200, r.text
+        # A fourth, never-assigned validator is shut out (pool full, not
+        # already-mine): "no job for you".
+        dave_hdr = {"X-Validator-Hotkey": _DAVE.ss58_address}
+        assert (await client.post("/api/v1/validator/job", headers=dave_hdr)).status_code == 204
+
+        # One validator's ticket lapses past its deadline, re-opening its slot.
+        async with session_maker() as s, s.begin():
+            lapsed = await s.get(ValidatorTicket, (agent_id, _KEYPAIRS[0].ss58_address))
+            assert lapsed is not None
+            lapsed.deadline = datetime.now(UTC) - timedelta(minutes=1)
+
+        # The fourth validator now picks up the re-opened slot.
+        reopened = await client.post("/api/v1/validator/job", headers=dave_hdr)
+        assert reopened.status_code == 200, reopened.text
+        assert reopened.json()["agent_id"] == str(agent_id)

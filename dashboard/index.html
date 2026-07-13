@@ -943,6 +943,11 @@
           (e.composite_stderr != null ? "  ± " + fx(e.composite_stderr) + " SE" : "")) +
         stat("Tool mean", fx(e.tool_mean) + "  (" + pct(e.tool_mean) + ")") +
         stat("Memory mean", fx(e.memory_mean) + "  (" + pct(e.memory_mean) + ")") +
+        (e.calibration_brier != null
+          ? stat("Calibration (Brier)", fx(e.calibration_brier) +
+              (e.calibration_n != null ? "  over " + e.calibration_n + " case(s)" : "") +
+              " — advisory, unscored; lower is better")
+          : "") +
         stat("First seen", new Date(e.first_seen).toLocaleString()) +
         stat("Rank", isEligible(e)
           ? ("#" + e.rank + " of " + lastEntries.filter(isEligible).length)
@@ -957,11 +962,13 @@
         : "";
       document.getElementById("d-stats").innerHTML =
         '<div class="stat-cols">' + colStats + '</div>' +
+        '<div id="d-consensus"></div>' +
         pc +
         shaRow +
         casesSection(e) +
         categoryGlossary(e) +
         metricsGlossary(e);
+      renderConsensus(e);
 
       var modal = document.getElementById("modal");
       // Remember what had focus so it can be restored when the dialog closes.
@@ -992,6 +999,40 @@
     }
     function stat(k, v) {
       return '<div class="stat-row"><span class="k">' + esc(k) + '</span><span class="v">' + esc(v) + '</span></div>';
+    }
+
+    // Abbreviate an ss58 hotkey for a compact row (full value stays in the title).
+    function shortKey(k) {
+      return k && k.length > 16 ? k.slice(0, 8) + "…" + k.slice(-6) : (k || "");
+    }
+    // The k=3 consensus record: which independent validators scored this agent,
+    // each one's composite, and the median the platform finalized on. Fetched on
+    // demand from the entry's agent_id (the leaderboard carries only the median).
+    // A token guards against a stale fetch landing after the drawer reopened for
+    // another agent.
+    var consensusToken = null;
+    function renderConsensus(e) {
+      var box = document.getElementById("d-consensus");
+      if (!box || !e.agent_id) return;
+      var agentId = e.agent_id;
+      consensusToken = agentId;
+      getJSON("/public/agent/" + agentId + "/scores").then(function (r) {
+        if (consensusToken !== agentId || !r || !r.scores || !r.scores.length) return;
+        var rows = r.scores.slice()
+          .sort(function (a, b) { return b.composite - a.composite; })
+          .map(function (s) {
+            return '<div class="stat-row"><span class="k" title="' + esc(s.validator_hotkey) +
+              '">' + esc(shortKey(s.validator_hotkey)) + '</span><span class="v">' +
+              fx(s.composite) + '</span></div>';
+          }).join("");
+        var med = r.median_composite != null
+          ? stat("Median (canonical)", fx(r.median_composite))
+          : "";
+        box.innerHTML = '<div class="stat-group"><div class="stat-head">Consensus (k=' +
+          (r.quorum || r.score_count) + ')</div>' +
+          '<div class="muted" style="margin:0 0 6px">Independent validators that scored this agent; the platform finalizes on the median, so no single validator decides the score.</div>' +
+          rows + med + '</div>';
+      }).catch(function () { /* held / still-evaluating / sample mode: leave empty */ });
     }
 
     // Plain-language help for the metric and telemetry terms in this drawer. Each

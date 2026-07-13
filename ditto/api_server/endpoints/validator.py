@@ -13,12 +13,14 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
   ``agents_status_evaluating_idx``. The screener promotes ``uploaded ->
   evaluating`` (see ``endpoints/screener.py``); a submission that hasn't been
   screened yet won't appear here.
-- **Scoring is single-validator-MVP.** A score POST records one row per
-  ``(agent, validator)`` and transitions ``evaluating -> scored``. A
-  multi-validator subnet wants every validator to score before finalizing;
-  that consensus/promotion step is a documented follow-up. The transition
-  lives in one place (:data:`_SCOREABLE_STATUSES` + the handler) so widening
-  it is a small change.
+- **Scoring is k=3 multi-validator consensus.** Up to
+  :data:`~ditto.db.queries.scores.SCORING_QUORUM` distinct validators each score
+  an agent, gated by leased tickets (:mod:`ditto.db.queries.tickets`), one row
+  per ``(agent, validator)``. The agent stays ``evaluating`` until the
+  quorum-th score, then the handler finalizes it on the **median** composite and
+  transitions ``evaluating -> scored`` (or ``ath_pending_review`` if the copy
+  gate holds it). No single validator is decisive; the transition lives in one
+  place (:data:`_SCOREABLE_STATUSES` + the handler).
 - **Auth.** Only chain-registered hotkeys holding a ``validator_permit`` may
   call these. The score POST additionally verifies an sr25519 signature over a
   **canonical payload** binding the agent id and the reported
@@ -273,6 +275,8 @@ async def request_job(
             seed=agent.dataset_seed,
             dataset_sha256=agent.dataset_sha256,
             run_size=agent.dataset_run_size,
+            dataset_seed_block=agent.dataset_seed_block,
+            dataset_seed_block_hash=agent.dataset_seed_block_hash,
         )
     response.headers["Cache-Control"] = "no-store"
     logger.info(
