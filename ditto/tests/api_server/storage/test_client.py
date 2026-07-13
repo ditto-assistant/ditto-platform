@@ -68,6 +68,16 @@ def _install_mock_session(
 
 
 class TestPutObject:
+    async def test_disables_optional_botocore_checksums_for_s3_compatibility(self):
+        client = S3StorageClient(_make_config())
+        session = _install_mock_session(client)
+
+        await client.put_object(key="abc/agent.tar.gz", body=b"x")
+
+        client_config = session.client.call_args.kwargs["config"]
+        assert client_config.request_checksum_calculation == "when_required"
+        assert client_config.response_checksum_validation == "when_required"
+
     async def test_happy_path_returns_stored_object(self):
         client = S3StorageClient(_make_config())
         _install_mock_session(client)
