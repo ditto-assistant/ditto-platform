@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import logging
 from typing import TYPE_CHECKING
@@ -47,8 +48,18 @@ class S3StorageClient:
         # actual instantiation so import-time cost is paid only by the
         # api_server lifespan, not test discovery.
         import aioboto3
+        from botocore.config import Config
 
         self._config = config
+        # Botocore's optional request checksums use an ``aws-chunked`` payload
+        # encoding that GCS's S3-compatible XML API does not accept. The
+        # resulting PutObject failure is misleadingly reported by GCS as
+        # SignatureDoesNotMatch. Required checksums remain enabled, while plain
+        # PutObject requests use the interoperable content-length payload. Each
+        # upload also supplies Content-MD5 for server-side integrity validation.
+        self._client_config = Config(
+            request_checksum_calculation="when_required",
+        )
         self._session = aioboto3.Session(
             aws_access_key_id=config.access_key,
             aws_secret_access_key=config.secret_key,
@@ -102,12 +113,16 @@ class S3StorageClient:
                 "s3",
                 endpoint_url=self._config.endpoint_url,
                 use_ssl=self._config.use_tls,
+                config=self._client_config,
             ) as s3:
                 await s3.put_object(
                     Bucket=target,
                     Key=key,
                     Body=body,
                     ContentType=content_type,
+                    ContentMD5=base64.b64encode(
+                        hashlib.md5(body, usedforsecurity=False).digest()
+                    ).decode("ascii"),
                 )
         except (ClientError, BotoCoreError) as e:
             raise ObjectUploadFailedError(
@@ -145,6 +160,7 @@ class S3StorageClient:
                 "s3",
                 endpoint_url=self._config.endpoint_url,
                 use_ssl=self._config.use_tls,
+                config=self._client_config,
             ) as s3:
                 return await s3.generate_presigned_url(
                     "get_object",
@@ -175,6 +191,7 @@ class S3StorageClient:
                 "s3",
                 endpoint_url=self._config.endpoint_url,
                 use_ssl=self._config.use_tls,
+                config=self._client_config,
             ) as s3:
                 await s3.head_object(Bucket=self._config.bucket, Key=key)
         except ClientError as e:
