@@ -416,6 +416,11 @@ async def submit_score(
         # validator reads it back for the KOTH indifference band.
         if report.composite_stderr is not None:
             score_details["composite_stderr"] = report.composite_stderr
+        # Same for the P4 per-seed confirmation composites: the validator submits
+        # one median-run score carrying the K per-seed composites, and the ledger
+        # surfaces them so the KOTH fold dethrones on the median over seeds.
+        if report.confirmation_composites is not None:
+            score_details["confirmation_composites"] = report.confirmation_composites
         if report.per_case:
             score_details["per_case"] = [
                 c.model_dump(mode="json") for c in report.per_case

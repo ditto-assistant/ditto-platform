@@ -267,6 +267,21 @@ class ScoreReport(BaseModel):
             ),
         ),
     ]
+    confirmation_composites: Annotated[
+        list[float] | None,
+        Field(
+            default=None,
+            description=(
+                "Per-seed composites for a version-bump re-score (prod hardening "
+                "P4). When a validator re-scores a stale champion/tail agent on K "
+                "common CRN seeds it submits one score (this report, the median "
+                "run) and lists all K per-seed composites here so the KOTH fold "
+                "dethrones on the median over seeds. Advisory: not covered by the "
+                "signature and never affects the score. Stashed into "
+                "``scores.details`` and surfaced on the ledger."
+            ),
+        ),
+    ]
     generated_at: Annotated[
         datetime, Field(description="When the report was produced (UTC).")
     ]
@@ -415,6 +430,20 @@ class LedgerEntry(BaseModel):
                 "a challenger's lead exceeds z*sqrt(se_c^2 + se_champ^2)); absent "
                 "means the fold falls back to the flat relative margin. "
                 "Additive-optional, mirroring bench_version."
+            ),
+        ),
+    ]
+    confirmation_composites: Annotated[
+        list[float] | None,
+        Field(
+            default=None,
+            description=(
+                "Per-seed composites for this agent from a version-bump re-score "
+                "over K common CRN seeds (prod hardening P4), if the winning score "
+                "report carried them. With two or more values the validator's KOTH "
+                "fold dethrones on their median instead of the single-run "
+                "composite, so a crown flip must replicate across seeds. "
+                "Additive-optional; absent means the fold uses the raw composite."
             ),
         ),
     ]

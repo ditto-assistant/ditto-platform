@@ -289,3 +289,30 @@ def test_composite_stderr_reads_details() -> None:
     assert _composite_stderr({"composite_stderr": "0.5"}) is None
     assert _composite_stderr({"composite_stderr": True}) is None
     assert _composite_stderr({"composite_stderr": float("inf")}) is None
+
+
+def test_confirmation_composites_reads_details() -> None:
+    """The ledger surfaces the P4 per-seed confirmation composites from the score
+    details blob, and degrades to None for absent or malformed values so the
+    validator's fold falls back to the raw composite."""
+    from ditto.api_server.endpoints.scoring import _confirmation_composites
+
+    assert _confirmation_composites({"confirmation_composites": [0.7, 0.8, 0.9]}) == [
+        0.7,
+        0.8,
+        0.9,
+    ]
+    assert _confirmation_composites({"confirmation_composites": [0.5]}) == [0.5]
+    assert _confirmation_composites({}) is None
+    assert _confirmation_composites(None) is None
+    assert _confirmation_composites({"confirmation_composites": []}) is None
+    assert _confirmation_composites({"confirmation_composites": "x"}) is None
+    # Any out-of-range, non-numeric, boolean, or non-finite element voids the list.
+    assert _confirmation_composites({"confirmation_composites": [0.5, 1.5]}) is None
+    assert _confirmation_composites({"confirmation_composites": [0.5, -0.1]}) is None
+    assert _confirmation_composites({"confirmation_composites": [0.5, "0.6"]}) is None
+    assert _confirmation_composites({"confirmation_composites": [0.5, True]}) is None
+    assert (
+        _confirmation_composites({"confirmation_composites": [0.5, float("nan")]})
+        is None
+    )

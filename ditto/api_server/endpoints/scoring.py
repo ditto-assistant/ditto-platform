@@ -67,6 +67,28 @@ def _composite_stderr(details: dict | None) -> float | None:
     return None
 
 
+def _confirmation_composites(details: dict | None) -> list[float] | None:
+    """Read the P4 per-seed confirmation composites stashed in a score's details
+    blob (mirroring :func:`_composite_stderr`). Returns None unless the value is a
+    list of finite floats in [0, 1], so a malformed value degrades to the raw-
+    composite fold rather than corrupting the dethrone comparison. Surfaced
+    as-is (any length); the validator ignores lists shorter than two."""
+    if not isinstance(details, dict):
+        return None
+    v = details.get("confirmation_composites")
+    if not isinstance(v, list) or not v:
+        return None
+    out: list[float] = []
+    for x in v:
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            return None
+        f = float(x)
+        if not (0.0 <= f <= 1.0) or f != f:
+            return None
+        out.append(f)
+    return out
+
+
 def _cached_snapshot(request: Request) -> _LedgerSnapshot | None:
     return getattr(request.app.state, "ledger_snapshot", None)
 
@@ -118,6 +140,7 @@ async def scores(
             validator_hotkey=r.validator_hotkey,
             signature=r.signature,
             composite_stderr=_composite_stderr(r.details),
+            confirmation_composites=_confirmation_composites(r.details),
             status=r.status,
         )
         for r in rows
