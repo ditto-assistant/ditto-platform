@@ -150,6 +150,10 @@ class PublicLeaderboardEntry(BaseModel):
     """
 
     rank: Annotated[int, Field(ge=1, description="1-based rank by composite.")]
+    agent_id: Annotated[
+        UUID,
+        Field(description="The scored agent's id, to drill into its k=3 record at /public/agent/{id}/scores. Already public via /public/submissions."),
+    ]
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Miner's SS58 hotkey.")
     ]
@@ -168,6 +172,32 @@ class PublicLeaderboardEntry(BaseModel):
                 "miners are a statistical tie (the same signal the validator's "
                 "indifference-band dethroning uses). None when the run carries no "
                 "per-case data to estimate from."
+            ),
+        ),
+    ]
+    calibration_brier: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Mean Brier score over cases where the harness self-reported a "
+                "confidence: mean((confidence - correct)^2), lower is better. "
+                "Honest confidence minimizes it; always-100% does not. Advisory "
+                "only — never folded into the composite, so a harness that omits "
+                "confidence is unaffected. None when no case carried a confidence."
+            ),
+        ),
+    ]
+    calibration_n: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description=(
+                "How many cases carried a self-reported confidence (the sample "
+                "behind calibration_brier). None when zero."
             ),
         ),
     ]
