@@ -945,7 +945,9 @@ class TestMultiValidatorConsensus:
         # A fourth, never-assigned validator is shut out (pool full, not
         # already-mine): "no job for you".
         dave_hdr = {"X-Validator-Hotkey": _DAVE.ss58_address}
-        assert (await client.post("/api/v1/validator/job", headers=dave_hdr)).status_code == 204
+        assert (
+            await client.post("/api/v1/validator/job", headers=dave_hdr)
+        ).status_code == 204
 
         # One validator's ticket lapses past its deadline, re-opening its slot.
         async with session_maker() as s, s.begin():
