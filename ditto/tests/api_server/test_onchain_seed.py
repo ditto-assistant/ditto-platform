@@ -17,6 +17,12 @@ _HASH = "0x1234abcd" + "ef" * 28
 
 
 class TestDeriveSeed:
+    def test_cross_repo_pinned_vector(self) -> None:
+        # ditto-subnet's validator re-derives this seed independently
+        # (ditto/validator/onchain_seed.py) and pins the SAME value, so a
+        # derivation drift on either side fails a test somewhere.
+        assert derive_seed(_HASH, _AGENT) == 4688446344444921196
+
     def test_in_non_negative_int63_range(self) -> None:
         seed = derive_seed(_HASH, _AGENT)
         assert 0 <= seed < (1 << 63)
