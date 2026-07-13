@@ -19,6 +19,8 @@ services:
 
   pylon:
     image: backenddevelopersltd/bittensor-pylon:latest
+    # Keep the chain sidecar available after host or Docker restarts.
+    restart: unless-stopped
     environment:
       PYLON_OPEN_ACCESS_TOKEN: ${PYLON_OPEN_ACCESS_TOKEN:-dev-open-access}
       PYLON_RECENT_OBJECTS_NETUIDS: "[118]"
