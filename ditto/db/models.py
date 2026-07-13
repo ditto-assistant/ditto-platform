@@ -413,6 +413,42 @@ class Score(Base):
     )
 
 
+class ValidatorHeartbeat(Base):
+    """Latest signed software heartbeat for one permitted validator hotkey."""
+
+    __tablename__ = "validator_heartbeats"
+
+    validator_hotkey: Mapped[str] = mapped_column(Text, primary_key=True)
+    software_version: Mapped[str] = mapped_column(Text, nullable=False)
+    protocol_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    code_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    reported_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    seen_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    signature: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "length(software_version) BETWEEN 1 AND 64",
+            name="validator_heartbeats_software_version_length_check",
+        ),
+        CheckConstraint(
+            "protocol_version > 0",
+            name="validator_heartbeats_protocol_version_check",
+        ),
+        CheckConstraint(
+            "length(code_digest) = 64",
+            name="validator_heartbeats_code_digest_length_check",
+        ),
+        CheckConstraint(
+            "length(signature) = 128",
+            name="validator_heartbeats_signature_length_check",
+        ),
+        Index("validator_heartbeats_seen_at_idx", "seen_at"),
+    )
+
+
 class ValidatorTicket(Base):
     """One validator's evaluation ticket for one agent (a k=3 scoring grant).
 

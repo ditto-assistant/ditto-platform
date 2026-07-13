@@ -31,7 +31,7 @@ import logging
 import math
 import os
 import statistics
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -59,6 +59,8 @@ from ditto.api_models import (
     PublicSubmissionScores,
     PublicSubmissionsResponse,
     PublicSubmissionSummary,
+    PublicValidatorHeartbeat,
+    PublicValidatorHeartbeatsResponse,
     PublicValidatorScore,
 )
 from ditto.api_models.agent_status import AgentStatus
@@ -69,6 +71,7 @@ from ditto.api_server.endpoints.validator import SessionDep
 from ditto.db.models import Score
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
+from ditto.db.queries.heartbeats import list_validator_heartbeats
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
@@ -88,6 +91,7 @@ router = APIRouter(prefix="/public", tags=["public"])
 # The ledger only moves when a sweep records a new best score, so a short shared
 # cache is safe and shields the DB from dashboard/CDN traffic.
 _CACHE_CONTROL = "public, max-age=30"
+_VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 
 
 def _safe_models(details: dict) -> PublicRunModels | None:
@@ -350,6 +354,46 @@ async def health(
         last_scored_at=roll.last_scored_at,
         scores_24h=roll.scores_24h,
         avg_latency_ms=roll.avg_latency_ms,
+    )
+
+
+@router.get("/validators", response_model=PublicValidatorHeartbeatsResponse)
+async def validators(
+    response: Response,
+    session: SessionDep,
+) -> PublicValidatorHeartbeatsResponse:
+    """Signed software versions reported by heartbeat-capable validators.
+
+    This intentionally lists reporters, not every on-chain permit holder: a
+    missing hotkey means its software has not proved its version to the platform.
+    """
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    now = datetime.now(UTC)
+    cutoff = now - _VALIDATOR_ONLINE_WINDOW
+    rows = await list_validator_heartbeats(session)
+
+    def aware(value: datetime) -> datetime:
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+    entries = [
+        PublicValidatorHeartbeat(
+            validator_hotkey=row.validator_hotkey,
+            software_version=row.software_version,
+            protocol_version=row.protocol_version,
+            code_digest=row.code_digest,
+            reported_at=aware(row.reported_at),
+            seen_at=aware(row.seen_at),
+            signature=row.signature,
+            online=aware(row.seen_at) >= cutoff,
+        )
+        for row in rows
+    ]
+    return PublicValidatorHeartbeatsResponse(
+        generated_at=now,
+        online_window_seconds=int(_VALIDATOR_ONLINE_WINDOW.total_seconds()),
+        reported_count=len(entries),
+        online_count=sum(entry.online for entry in entries),
+        validators=entries,
     )
 
 

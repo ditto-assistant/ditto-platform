@@ -820,6 +820,33 @@ class PublicHealthResponse(BaseModel):
     )
 
 
+class PublicValidatorHeartbeat(BaseModel):
+    """Latest signed software report from one permitted validator."""
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Validator's public hotkey.")
+    ]
+    software_version: str
+    protocol_version: Annotated[int, Field(ge=1)]
+    code_digest: Annotated[
+        str, Field(pattern=r"^[0-9a-f]{64}$", description="Installed source digest.")
+    ]
+    reported_at: datetime
+    seen_at: datetime
+    signature: Annotated[str, Field(pattern=r"^[0-9a-fA-F]{128}$")]
+    online: bool
+
+
+class PublicValidatorHeartbeatsResponse(BaseModel):
+    """Public view of validators that run heartbeat-capable software."""
+
+    generated_at: datetime
+    online_window_seconds: Annotated[int, Field(ge=1)]
+    reported_count: Annotated[int, Field(ge=0)]
+    online_count: Annotated[int, Field(ge=0)]
+    validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)
+
+
 class BenchHarnessConfig(BaseModel):
     """How the harness model is frozen for the current benchmark version."""
 

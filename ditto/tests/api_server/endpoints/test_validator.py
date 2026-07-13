@@ -40,7 +40,7 @@ from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_VALIDATOR_AUTH,
 )
 from ditto.chain.models import NeuronInfo
-from ditto.db.models import Agent, Base, Score, ValidatorTicket
+from ditto.db.models import Agent, Base, Score, ValidatorHeartbeat, ValidatorTicket
 
 # Real dev keypairs: sign for real so _verify_signature runs end to end. The k=3
 # quorum needs three distinct permitted validators before an agent finalizes.
@@ -110,6 +110,25 @@ def _job_payload(
         "nonce": str(nonce),
         "requested_at": requested_at.isoformat(),
         "signature": keypair.sign(signed).hex(),
+    }
+
+
+def _heartbeat_payload(
+    *,
+    keypair: bittensor.Keypair = _KEYPAIR,
+    timestamp: int | None = None,
+    code_digest: str = "ab" * 32,
+) -> dict[str, object]:
+    ts = timestamp if timestamp is not None else int(datetime.now(UTC).timestamp())
+    hotkey = keypair.ss58_address
+    message = f"ditto-validator-heartbeat:v1:{hotkey}:0.1.0:1:{code_digest}:{ts}"
+    return {
+        "validator_hotkey": hotkey,
+        "software_version": "0.1.0",
+        "protocol_version": 1,
+        "code_digest": code_digest,
+        "timestamp": ts,
+        "signature": keypair.sign(message.encode()).hex(),
     }
 
 
@@ -276,6 +295,81 @@ _AUTH_HEADER = {"X-Validator-Hotkey": _VALIDATOR_HOTKEY}
 
 
 # --- Queue -----------------------------------------------------------------
+
+
+class TestHeartbeat:
+    async def test_records_signed_build_and_publishes_status(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        payload = _heartbeat_payload()
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=payload,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["accepted"] is True
+
+        async with session_maker() as session:
+            row = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert row is not None
+            assert row.software_version == "0.1.0"
+            assert row.code_digest == "ab" * 32
+
+        public = await client.get("/api/v1/public/validators")
+        assert public.status_code == 200
+        body = public.json()
+        assert body["reported_count"] == 1
+        assert body["online_count"] == 1
+        assert body["validators"][0]["validator_hotkey"] == _VALIDATOR_HOTKEY
+        assert body["validators"][0]["online"] is True
+
+        replay = await client.post(
+            "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=payload
+        )
+        assert replay.status_code == 200
+        assert replay.json()["accepted"] is False
+        assert replay.json()["seen_at"] == response.json()["seen_at"]
+
+    async def test_rejects_stale_heartbeat(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        stale = int(datetime.now(UTC).timestamp()) - 301
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(timestamp=stale),
+        )
+        assert response.status_code == 401
+        assert response.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
+
+    async def test_rejects_tampered_digest(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        payload = _heartbeat_payload()
+        payload["code_digest"] = "cd" * 32
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=payload,
+        )
+        assert response.status_code == 401
+        assert response.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
 
 
 class TestArtifact:

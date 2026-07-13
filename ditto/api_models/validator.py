@@ -33,6 +33,9 @@ from ditto.api_models.upload import (
     _SS58_PATTERN,
 )
 
+_CODE_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
+_SOFTWARE_VERSION_PATTERN = r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$"
+
 
 class ArtifactResponse(BaseModel):
     """Returned by ``GET /validator/agent/{agent_id}/artifact``.
@@ -178,6 +181,53 @@ class JobResponse(BaseModel):
             }
         }
     )
+
+
+class ValidatorHeartbeatRequest(BaseModel):
+    """Signed proof of the validator build currently serving a hotkey.
+
+    ``code_digest`` is a deterministic SHA-256 over the installed Python source,
+    so it identifies the actual worker bytes without trusting an operator-supplied
+    Git label. ``timestamp`` is Unix time and is freshness-checked by the server.
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Reporting validator hotkey.")
+    ]
+    software_version: Annotated[
+        str,
+        Field(
+            pattern=_SOFTWARE_VERSION_PATTERN,
+            description="Ditto package version.",
+        ),
+    ]
+    protocol_version: Annotated[
+        int, Field(ge=1, le=2**31 - 1, description="Heartbeat protocol version.")
+    ]
+    code_digest: Annotated[
+        str,
+        Field(
+            pattern=_CODE_DIGEST_PATTERN,
+            description="SHA-256 of the installed validator Python source.",
+        ),
+    ]
+    timestamp: Annotated[
+        int, Field(ge=0, description="Validator-reported Unix timestamp (UTC).")
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            pattern=_SIGNATURE_HEX_PATTERN,
+            description=("sr25519 signature over the canonical v1 heartbeat payload."),
+        ),
+    ]
+
+
+class ValidatorHeartbeatResponse(BaseModel):
+    """Acknowledgement that a signed heartbeat was persisted."""
+
+    accepted: bool
+    seen_at: datetime
 
 
 class CaseScore(BaseModel):

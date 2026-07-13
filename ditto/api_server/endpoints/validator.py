@@ -56,6 +56,8 @@ from ditto.api_models import (
     ScoreReport,
     SubmitScoreRequest,
     SubmitScoreResponse,
+    ValidatorHeartbeatRequest,
+    ValidatorHeartbeatResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.upload import _SS58_PATTERN
@@ -76,6 +78,7 @@ from ditto.db.queries.audit import (
     EVENT_SCORE,
     append_audit_entry,
 )
+from ditto.db.queries.heartbeats import upsert_validator_heartbeat
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     list_eligible_ledger,
@@ -110,6 +113,10 @@ _TICKET_TTL = timedelta(minutes=30)
 # the database for the same window, making replay rejection consistent across
 # every API replica without introducing another secret.
 _JOB_REQUEST_MAX_AGE = timedelta(minutes=2)
+
+# Reject captured heartbeats outside a short clock-skew/retry window. Workers
+# report every two minutes, so five minutes tolerates normal transient outages.
+_HEARTBEAT_MAX_SKEW_SECONDS = 300
 
 
 # Object-store key the upload pipeline writes the tarball under.
@@ -273,6 +280,22 @@ def _job_signing_message(
     return f"validator-job:{validator_hotkey}:{nonce}:{requested}".encode()
 
 
+def _heartbeat_signing_message(
+    *,
+    validator_hotkey: str,
+    software_version: str,
+    protocol_version: int,
+    code_digest: str,
+    timestamp: int,
+) -> bytes:
+    """Canonical v1 heartbeat payload, mirrored by ``ditto-subnet``."""
+    return (
+        "ditto-validator-heartbeat:v1:"
+        f"{validator_hotkey}:{software_version}:{protocol_version}:"
+        f"{code_digest}:{timestamp}"
+    ).encode()
+
+
 def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:
     """Return True iff ``signature_hex`` is a valid sr25519 sig over ``payload``.
 
@@ -285,6 +308,56 @@ def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:
         return bool(keypair.verify(payload, bytes.fromhex(signature_hex)))
     except (ValueError, TypeError):
         return False
+
+
+@router.post(
+    "/heartbeat",
+    response_model=ValidatorHeartbeatResponse,
+    responses={
+        401: {"description": "Invalid permit, identity, signature, or timestamp."},
+        503: {"description": "Chain unavailable for the permit check."},
+    },
+)
+async def heartbeat(
+    request_body: ValidatorHeartbeatRequest,
+    validator_hotkey: ValidatorDep,
+    session: SessionDep,
+) -> ValidatorHeartbeatResponse:
+    """Record a fresh, signed proof of the worker bytes serving this hotkey."""
+    if request_body.validator_hotkey != validator_hotkey:
+        raise ValidatorAuthError("heartbeat body hotkey does not match header")
+
+    now = datetime.now(UTC)
+    if abs(int(now.timestamp()) - request_body.timestamp) > _HEARTBEAT_MAX_SKEW_SECONDS:
+        raise ValidatorAuthError(
+            "heartbeat timestamp is stale or too far in the future"
+        )
+    payload = _heartbeat_signing_message(
+        validator_hotkey=validator_hotkey,
+        software_version=request_body.software_version,
+        protocol_version=request_body.protocol_version,
+        code_digest=request_body.code_digest,
+        timestamp=request_body.timestamp,
+    )
+    if not _verify_signature(validator_hotkey, payload, request_body.signature):
+        raise ValidatorAuthError("heartbeat signature verification failed")
+
+    reported_at = datetime.fromtimestamp(request_body.timestamp, tz=UTC)
+    async with session.begin():
+        row, accepted = await upsert_validator_heartbeat(
+            session,
+            validator_hotkey=validator_hotkey,
+            software_version=request_body.software_version,
+            protocol_version=request_body.protocol_version,
+            code_digest=request_body.code_digest,
+            reported_at=reported_at,
+            seen_at=now,
+            signature=request_body.signature,
+        )
+    seen_at = row.seen_at
+    if seen_at.tzinfo is None:
+        seen_at = seen_at.replace(tzinfo=UTC)
+    return ValidatorHeartbeatResponse(accepted=accepted, seen_at=seen_at)
 
 
 @router.post(
