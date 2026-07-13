@@ -144,29 +144,6 @@ pm2 status                   # process state
 - Logs are written to `./logs/ditto-api.{out,err}.log` and via `pm2 logs`.
 - `pm2 startup` + `pm2 save` will resurrect the process across host reboots.
 
-### Co-hosting the screener
-
-The screener (the pre-benchmark build + health gate) is a platform-operated
-role, so we run it on this host next to the API rather than pushing it onto
-independent validators. It is HTTP-decoupled and reaches the API at
-`http://localhost:8000`, and it drives the host Docker daemon for the build gate.
-Its code lives in the sibling [`ditto-subnet`](https://github.com/ditto-assistant/ditto-subnet)
-checkout (`python -m ditto.screener`).
-
-The pm2 config adds a `ditto-screener` app automatically when `SCREENER_HOTKEY`
-is set in the host env. To enable it:
-
-```sh
-git clone https://github.com/ditto-assistant/ditto-subnet ../ditto-subnet
-(cd ../ditto-subnet && uv sync)   # or set SCREENER_APP_DIR to the checkout
-# in .env: SCREENER_HOTKEY, SCREENER_WALLET_NAME, SCREENER_WALLET_HOTKEY
-./scripts/start.sh                # pm2 now runs ditto-api + ditto-screener
-pm2 logs ditto-screener
-```
-
-The screener hotkey must hold a `validator_permit` on the netuid (screeners
-reuse the validator permit set). Docker must be available to the pm2 user.
-
 ---
 
 ## Make targets
