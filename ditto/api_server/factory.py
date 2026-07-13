@@ -6,22 +6,32 @@ Per-test instantiation (no module-level ``app =`` global) keeps
 
 from __future__ import annotations
 
+import html
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 
 import ditto
 from ditto.api_server.config import (
     ApiServerConfig,
     parse_api_server_config_from_env,
 )
+from ditto.api_server.datapipeline import create_generator
+from ditto.api_server.embedding import create_embedder
 from ditto.api_server.endpoints import (
     health_router,
     metrics_router,
+    public_router,
     retrieval_router,
+    scoring_router,
+    screener_router,
     upload_router,
+    validator_router,
 )
 from ditto.api_server.errors import ApiServerLifespanError
 from ditto.api_server.middleware import (
@@ -36,6 +46,30 @@ from ditto.chain import create_chain_client
 from ditto.db import create_db_engine, create_session_maker
 
 logger = logging.getLogger(__name__)
+
+# The dashboard SPA lives at the repo root (source checkout on the deployed VM);
+# it is not packaged into the wheel, so a missing file just disables the route.
+_DASHBOARD_FILE = Path(__file__).resolve().parents[2] / "dashboard" / "index.html"
+_WANDB_META_RE = re.compile(r'(<meta name="ditto:wandb-url" content=")[^"]*(")')
+
+
+def _render_dashboard(wandb_url: str) -> str | None:
+    """Read the dashboard SPA and inject the public wandb project URL.
+
+    Returns ``None`` (route is skipped) when the file is absent — e.g. a
+    packaged/wheel install or a checkout without the ``dashboard/`` dir. The
+    ``api-base`` meta is left empty on purpose so the SPA falls back to its
+    same-origin ``/api/v1`` default when the platform serves it.
+    """
+    try:
+        page = _DASHBOARD_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return _WANDB_META_RE.sub(
+        lambda m: m.group(1) + html.escape(wandb_url, quote=True) + m.group(2),
+        page,
+        count=1,
+    )
 
 
 @asynccontextmanager
@@ -67,6 +101,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 create_storage_client(config.storage)
             )
             app.state.storage = storage
+
+            embedder = create_embedder(config.embedding)
+            stack.push_async_callback(embedder.aclose)
+            app.state.embedder = embedder
+
+            generator = create_generator(config.data_pipeline)
+            stack.push_async_callback(generator.aclose)
+            app.state.dataset_generator = generator
         except Exception as e:
             raise ApiServerLifespanError(
                 f"failed to open dependencies during startup: {e}"
@@ -116,5 +158,28 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(metrics_router)
     app.include_router(upload_router, prefix="/api/v1")
     app.include_router(retrieval_router, prefix="/api/v1")
+    app.include_router(validator_router, prefix="/api/v1")
+    app.include_router(screener_router, prefix="/api/v1")
+    app.include_router(scoring_router, prefix="/api/v1")
+    app.include_router(public_router, prefix="/api/v1")
+
+    # Serve the public dashboard SPA same-origin at ``/`` so the platform is the
+    # transparency front door (its ``/api/v1/public/*`` calls need no CORS). The
+    # HTML is rendered once at boot with the wandb link injected; a missing file
+    # just skips the route.
+    if config.dashboard_enabled:
+        dashboard_html = _render_dashboard(config.dashboard_wandb_url)
+        if dashboard_html is None:
+            logger.info(
+                "dashboard SPA not found at %s; serving API only", _DASHBOARD_FILE
+            )
+        else:
+
+            @app.get("/", include_in_schema=False, response_class=HTMLResponse)
+            async def dashboard() -> HTMLResponse:
+                return HTMLResponse(
+                    content=dashboard_html,
+                    headers={"Cache-Control": "public, max-age=300"},
+                )
 
     return app

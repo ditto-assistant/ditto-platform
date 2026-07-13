@@ -1,4 +1,4 @@
-.PHONY: lint format typecheck test test-integration smoke-pylon smoke-api stack-up stack-down migrate migrate-down migrate-history migrate-current api-up
+.PHONY: lint format typecheck test test-integration smoke-pylon smoke-api stack-up stack-down migrate migrate-down migrate-history migrate-current api-up embedder-up embedder-down smoke-embedder
 
 lint:
 	uv run ruff format --check .
@@ -37,6 +37,23 @@ stack-up:
 
 stack-down:
 	docker compose down
+
+embedder-up:
+	# code-embedding service (opt-in `embedder` profile). First boot downloads
+	# the model weights (cached in the embedder_hf_cache volume), so it may take a
+	# minute to report ready.
+	docker compose --profile embedder up -d embedder
+
+embedder-down:
+	docker compose --profile embedder down embedder
+
+smoke-embedder:
+	# Verify the embedder answers and returns a vector for a snippet of code.
+	set -a && . ./.env && set +a && \
+	curl -sf "http://localhost:$${CODE_EMBEDDER_HOST_PORT:-8080}/embed" \
+		-H 'Content-Type: application/json' \
+		-d '{"inputs": "fn main() { println!(\"hi\"); }", "normalize": true}' \
+		| head -c 80 && echo " ... embedder ok"
 
 migrate:
 	set -a && . ./.env && set +a && uv run alembic upgrade head

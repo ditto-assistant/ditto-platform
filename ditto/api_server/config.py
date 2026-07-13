@@ -6,6 +6,14 @@ import os
 import re
 from dataclasses import dataclass
 
+from ditto.api_server.datapipeline import (
+    DataPipelineConfig,
+    parse_data_pipeline_config_from_env,
+)
+from ditto.api_server.embedding import (
+    EmbeddingConfig,
+    parse_embedding_config_from_env,
+)
 from ditto.api_server.errors import ApiServerConfigError
 from ditto.api_server.pricing import PricingConfig, parse_pricing_config_from_env
 from ditto.api_server.storage import StorageConfig, parse_storage_config_from_env
@@ -61,8 +69,34 @@ class ApiServerConfig:
     storage: StorageConfig
     """S3-compatible object store parameters for uploaded tarballs."""
 
+    embedding: EmbeddingConfig
+    """Code-embedding client parameters. Disabled by default (no
+    ``CODE_EMBEDDER_URL``), so the platform runs unchanged until an operator points
+    it at a self-hosted TEI service."""
+
+    data_pipeline: DataPipelineConfig
+    """Generate-service client parameters. Disabled by default (no
+    ``DATA_PIPELINE_URL``); when set, the platform generates one dataset per
+    submission at job-ready and pins (seed, dataset_sha256, run_size) on the
+    agent."""
+
+    dashboard_enabled: bool = True
+    """Serve the public dashboard SPA (``dashboard/index.html``) at ``/``.
+
+    On by default so the platform doubles as the transparency front door
+    (same-origin with the public read API — no CORS / separate host needed).
+    Set ``DITTO_DASHBOARD_ENABLED=false`` to run headless (API only)."""
+
+    dashboard_wandb_url: str = "https://wandb.ai/"
+    """Public wandb project URL injected into the served dashboard's
+    ``ditto:wandb-url`` meta tag (``DITTO_DASHBOARD_WANDB_URL``), e.g.
+    ``https://wandb.ai/<entity>/ditto-sn118``. The committed HTML ships a bare
+    default so the link still resolves before the project exists."""
+
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+_TRUTHY = {"1", "true", "yes", "on"}
 
 
 def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
@@ -97,6 +131,13 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
             "got a value that fails the base58 / length check"
         )
 
+    dashboard_enabled = (
+        os.environ.get("DITTO_DASHBOARD_ENABLED", "true").strip().lower() in _TRUTHY
+    )
+    dashboard_wandb_url = os.environ.get(
+        "DITTO_DASHBOARD_WANDB_URL", "https://wandb.ai/"
+    )
+
     return ApiServerConfig(
         host=host,
         port=port,
@@ -107,6 +148,10 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
         chain=parse_chain_config_from_env(),
         pricing=parse_pricing_config_from_env(),
         storage=parse_storage_config_from_env(),
+        embedding=parse_embedding_config_from_env(),
+        data_pipeline=parse_data_pipeline_config_from_env(),
+        dashboard_enabled=dashboard_enabled,
+        dashboard_wandb_url=dashboard_wandb_url,
     )
 
 

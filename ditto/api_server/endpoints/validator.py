@@ -1,0 +1,643 @@
+"""Validator-facing endpoints — the daemon's epoch loop against the platform.
+
+The platform is intentionally *thin*: the validator daemon owns the chain
+identity and drives the scoring engine (``dittobench-api``) itself. These
+endpoints let it (1) pull agents awaiting evaluation, (2) fetch the uploaded
+tarball, and (3) report a DittoBench :class:`ScoreReport` back. Weight-setting
+stays on the daemon (``ChainClient.put_weights``); the platform never touches
+the chain identity.
+
+Lifecycle + scope decisions (documented so they're easy to revisit):
+
+- **Queue = agents in ``evaluating``.** Honors the partial index
+  ``agents_status_evaluating_idx``. The screener promotes ``uploaded ->
+  evaluating`` (see ``endpoints/screener.py``); a submission that hasn't been
+  screened yet won't appear here.
+- **Scoring is k=3 multi-validator consensus.** Up to
+  :data:`~ditto.db.queries.scores.SCORING_QUORUM` distinct validators each score
+  an agent, gated by leased tickets (:mod:`ditto.db.queries.tickets`), one row
+  per ``(agent, validator)``. The agent stays ``evaluating`` until the
+  quorum-th score, then the handler finalizes it on the **median** composite and
+  transitions ``evaluating -> scored`` (or ``ath_pending_review`` if the copy
+  gate holds it). No single validator is decisive; the transition lives in one
+  place (:data:`_SCOREABLE_STATUSES` + the handler).
+- **Auth.** Only chain-registered hotkeys holding a ``validator_permit`` may
+  call these. The score POST additionally verifies an sr25519 signature over a
+  **canonical payload** binding the agent id and the reported
+  ``run_id`` / ``composite`` / ``seed`` (see :func:`_score_signing_message`), so
+  a captured signature can neither be replayed against a different agent nor
+  cover an altered composite. The GET endpoints authenticate via the
+  ``X-Validator-Hotkey`` header + the on-chain permit check; binding those
+  reads to a per-request signature (nonce/timestamp) is a known gap.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import statistics
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Annotated, Any
+from uuid import UUID
+
+import bittensor
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ditto.api_models import (
+    ArtifactResponse,
+    JobResponse,
+    ScoreReport,
+    SubmitScoreRequest,
+    SubmitScoreResponse,
+)
+from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.upload import _SS58_PATTERN
+from ditto.api_server.bench import stamp_bench_version
+from ditto.api_server.dependencies import (
+    get_chain_client,
+    get_session,
+    get_storage_client,
+)
+from ditto.api_server.endpoints.retrieval import AgentNotFoundError
+from ditto.api_server.scoring_gate import evaluate_duplicate_signals
+from ditto.api_server.storage import S3StorageClient
+from ditto.chain import ChainError
+from ditto.db.models import Agent, Score
+from ditto.db.queries.agents import get_agent_by_id
+from ditto.db.queries.audit import (
+    EVENT_FINALIZED,
+    EVENT_SCORE,
+    append_audit_entry,
+)
+from ditto.db.queries.scores import (
+    SCORING_QUORUM,
+    list_eligible_ledger,
+    list_scores_for_agent,
+    upsert_score,
+)
+from ditto.db.queries.tickets import (
+    get_open_ticket,
+    issue_ticket,
+    mark_ticket_scored,
+)
+
+if TYPE_CHECKING:
+    from ditto.chain import ChainClient
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/validator", tags=["validator"])
+
+# How long a pre-signed artifact URL stays valid.
+_ARTIFACT_URL_TTL = timedelta(minutes=5)
+
+# How long a validator has to redeem a ticket with a score before it lapses and
+# the slot re-opens for another validator.
+_TICKET_TTL = timedelta(minutes=30)
+
+
+# Object-store key the upload pipeline writes the tarball under.
+def _artifact_key(agent_id: UUID) -> str:
+    return f"{agent_id}/agent.tar.gz"
+
+
+# Agents the validator may pull as work. The partial index covers exactly
+# Agents a score may be reported against. ``scored`` / ``live`` are included
+# so a validator can re-score across epochs without a 409;
+# ``ath_pending_review`` is included so a re-score of a held agent updates its
+# score row (feeding the eventual review) without un-holding it.
+_SCOREABLE_STATUSES = (
+    AgentStatus.EVALUATING,
+    AgentStatus.SCORED,
+    AgentStatus.LIVE,
+    AgentStatus.ATH_PENDING_REVIEW,
+)
+
+
+class ValidatorAuthError(Exception):
+    """Raised when a validator request fails authentication/authorization.
+
+    Covers a missing/malformed ``X-Validator-Hotkey`` header, a hotkey not
+    registered on the netuid, a hotkey without a ``validator_permit``, and
+    a score whose signature does not verify. The envelope handler maps all
+    of these to HTTP 401 + code 4000.
+    """
+
+
+class AgentNotEvaluatableError(Exception):
+    """Raised when a score is submitted for an agent not in a scoreable state.
+
+    A score is only accepted once an agent has reached evaluation
+    (``evaluating`` / ``scored`` / ``live``). Reporting against an
+    ``uploaded`` / ``screening*`` / ``banned`` agent is a no-op the daemon
+    should not retry, so it maps to HTTP 409 (code 4001).
+    """
+
+
+ChainDep = Annotated["ChainClient", Depends(get_chain_client)]
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
+
+
+def _dev_bypass_permit(network: str) -> bool:
+    """Whether the dev "skip the validator permit check" escape hatch is active.
+
+    Only when ``DITTO_DEV_ALLOW_UNPERMITTED_VALIDATOR`` is explicitly truthy AND
+    the process is not pointed at mainnet. On ``finney`` the flag is refused
+    outright (logged at ERROR) so a stray dev env var can never open the
+    validator surface on the production chain, defence-in-depth beyond keeping it
+    unset in prod."""
+    if os.environ.get("DITTO_DEV_ALLOW_UNPERMITTED_VALIDATOR", "").lower() not in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return False
+    net = network.lower()
+    if net.startswith("finney") or net == "mainnet":
+        logger.error(
+            "refusing DITTO_DEV_ALLOW_UNPERMITTED_VALIDATOR on production network=%s;"
+            " enforcing the validator permit check",
+            network,
+        )
+        return False
+    return True
+
+
+async def _assert_validator_permitted(
+    chain: ChainClient, netuid: int, hotkey: str, *, network: str
+) -> None:
+    """Raise unless ``hotkey`` is a permitted validator on ``netuid``.
+
+    A chain outage surfaces as 503 (matching the upload endpoints) rather
+    than a silent allow/deny; a registered-but-unpermitted or unregistered
+    hotkey is a :class:`ValidatorAuthError`. ``network`` is the resolved
+    subtensor network, so the dev bypass can be refused on mainnet.
+    """
+    if _dev_bypass_permit(network):
+        logger.warning(
+            "DEV: allowing validator request without permit hotkey=%s netuid=%d",
+            hotkey,
+            netuid,
+        )
+        return
+    try:
+        neurons = await chain.get_recent_neurons(netuid)
+    except ChainError as e:
+        logger.warning(f"chain unreachable during validator authz: {e}")
+        raise HTTPException(
+            status_code=503, detail="chain unavailable; retry shortly"
+        ) from e
+    for neuron in neurons:
+        if neuron.hotkey == hotkey:
+            if neuron.validator_permit:
+                return
+            raise ValidatorAuthError(
+                f"hotkey {hotkey} is registered but lacks a validator permit"
+            )
+    raise ValidatorAuthError(f"hotkey {hotkey} is not registered on netuid {netuid}")
+
+
+async def require_validator(
+    request: Request,
+    chain: ChainDep,
+    x_validator_hotkey: Annotated[str | None, Header()] = None,
+) -> str:
+    """Authenticate a validator GET via the ``X-Validator-Hotkey`` header.
+
+    Verifies the header is a well-formed SS58 hotkey and that it is a
+    permitted validator on the configured netuid. Returns the hotkey for
+    logging/audit by the route.
+    """
+    if x_validator_hotkey is None or not re.fullmatch(
+        _SS58_PATTERN, x_validator_hotkey
+    ):
+        raise ValidatorAuthError("missing or malformed X-Validator-Hotkey header")
+    netuid = request.app.state.config.chain.netuid
+    network = request.app.state.config.chain.subtensor_network
+    await _assert_validator_permitted(
+        chain, netuid, x_validator_hotkey, network=network
+    )
+    return x_validator_hotkey
+
+
+ValidatorDep = Annotated[str, Depends(require_validator)]
+
+
+def _score_signing_message(
+    validator_hotkey: str, agent_id: UUID, report: ScoreReport
+) -> bytes:
+    """Canonical bytes a score signature is verified against.
+
+    Must match the validator's ``sign_score`` byte-for-byte:
+    ``{validator_hotkey}:{agent_id}:{run_id}:{composite!r}:{seed}``. Binding the
+    agent id + composite + seed (not just ``run_id``) means a captured signature
+    cannot be replayed for a different agent, and the recorded composite cannot
+    be altered without invalidating it. ``composite`` uses Python's shortest
+    round-trip float repr, which the JSON transport preserves exactly.
+    """
+    return (
+        f"{validator_hotkey}:{agent_id}:{report.run_id}:"
+        f"{report.composite!r}:{report.seed}"
+    ).encode()
+
+
+def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:
+    """Return True iff ``signature_hex`` is a valid sr25519 sig over ``payload``.
+
+    Mirrors the upload endpoint's verification: a narrow ``(ValueError,
+    TypeError)`` catch covers malformed hex / SS58 / wrong-shape inputs;
+    anything else is a programming bug that should surface as a 500.
+    """
+    try:
+        keypair = bittensor.Keypair(ss58_address=hotkey)
+        return bool(keypair.verify(payload, bytes.fromhex(signature_hex)))
+    except (ValueError, TypeError):
+        return False
+
+
+@router.post(
+    "/job",
+    response_model=JobResponse,
+    responses={
+        204: {"description": "No agent needs this validator right now."},
+        401: {"description": "Missing/invalid validator auth."},
+        503: {"description": "Chain unavailable for the permit check."},
+    },
+)
+async def request_job(
+    response: Response,
+    validator_hotkey: ValidatorDep,
+    session: SessionDep,
+) -> JobResponse | Response:
+    """Issue this validator a scoring ticket for the next eligible agent.
+
+    The k=3 pull: at most :data:`SCORING_QUORUM` tickets per agent go to that
+    many distinct validators, so most requests get **204 No Content** ("no job
+    for you"). An issued ticket must be redeemed with a score before its
+    deadline, or it lapses and the slot re-opens for another validator. The
+    ticket write (and the overdue-ticket sweep it runs) commit together.
+    """
+    now = datetime.now(UTC)
+    async with session.begin():
+        ticket = await issue_ticket(
+            session, validator_hotkey=validator_hotkey, now=now, ttl=_TICKET_TTL
+        )
+        if ticket is None:
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
+        agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
+        # issue_ticket selected this agent from ``agents``, so it exists.
+        assert agent is not None
+        job = JobResponse(
+            agent_id=agent.agent_id,
+            miner_hotkey=agent.miner_hotkey,
+            sha256=agent.sha256,
+            deadline=ticket.deadline,
+            seed=agent.dataset_seed,
+            dataset_sha256=agent.dataset_sha256,
+            run_size=agent.dataset_run_size,
+            dataset_seed_block=agent.dataset_seed_block,
+            dataset_seed_block_hash=agent.dataset_seed_block_hash,
+        )
+    response.headers["Cache-Control"] = "no-store"
+    logger.info(
+        "issued job agent=%s validator=%s deadline=%s",
+        job.agent_id,
+        validator_hotkey,
+        job.deadline.isoformat(),
+    )
+    return job
+
+
+@router.get(
+    "/agent/{agent_id}/artifact",
+    response_model=ArtifactResponse,
+    responses={
+        401: {"description": "Missing/invalid validator auth."},
+        404: {"description": "No agent with the given id."},
+        422: {"description": "Malformed UUID path parameter."},
+        503: {"description": "Chain unavailable for the permit check."},
+    },
+)
+async def agent_artifact(
+    agent_id: UUID,
+    response: Response,
+    validator_hotkey: ValidatorDep,
+    session: SessionDep,
+    storage: StorageDep,
+) -> ArtifactResponse:
+    """Return a short-lived pre-signed download URL for the agent's tarball."""
+    response.headers["Cache-Control"] = "no-store"
+    agent = await get_agent_by_id(session, agent_id=agent_id)
+    if agent is None:
+        raise AgentNotFoundError(f"no agent with id={agent_id}")
+    url = await storage.presigned_get_url(
+        key=_artifact_key(agent_id),
+        expires_in=int(_ARTIFACT_URL_TTL.total_seconds()),
+    )
+    logger.info(
+        "validator=%s fetched artifact url for agent_id=%s",
+        validator_hotkey,
+        agent_id,
+    )
+    return ArtifactResponse(
+        agent_id=agent_id,
+        sha256=agent.sha256,
+        download_url=url,
+        expires_at=datetime.now(UTC) + _ARTIFACT_URL_TTL,
+    )
+
+
+@router.post(
+    "/agent/{agent_id}/score",
+    response_model=SubmitScoreResponse,
+    responses={
+        401: {"description": "Signature did not verify / not a permitted validator."},
+        404: {"description": "No agent with the given id."},
+        409: {"description": "Agent is not in a scoreable state."},
+        422: {"description": "Malformed request body or UUID path parameter."},
+        503: {"description": "Chain unavailable for the permit check."},
+    },
+)
+async def submit_score(
+    agent_id: UUID,
+    payload: SubmitScoreRequest,
+    request: Request,
+    response: Response,
+    chain: ChainDep,
+    session: SessionDep,
+    storage: StorageDep,
+) -> SubmitScoreResponse:
+    """Record a DittoBench score report and advance the agent's lifecycle.
+
+    Ordering is cheap-before-expensive and no DB write happens until every
+    check passes: (1) signature over ``{validator_hotkey}:{run_id}``,
+    (2) on-chain validator-permit check, (3) one transaction that upserts
+    the score and, once the k=3 quorum has reported, finalizes the agent
+    ``evaluating -> scored`` on the median composite. Below quorum the score
+    is recorded and the agent stays provisional (``evaluating``).
+    """
+    response.headers["Cache-Control"] = "no-store"
+    report = payload.report
+
+    # 1. Signature proves the reporting validator owns the hotkey and binds the
+    #    agent + score contents (anti-replay / anti-tamper). CPU-only, no I/O.
+    signed = _score_signing_message(payload.validator_hotkey, agent_id, report)
+    if not _verify_signature(payload.validator_hotkey, signed, payload.signature):
+        raise ValidatorAuthError(
+            f"score signature did not verify for hotkey {payload.validator_hotkey}"
+        )
+
+    # 2. The hotkey must be a permitted validator on this subnet.
+    netuid = request.app.state.config.chain.netuid
+    network = request.app.state.config.chain.subtensor_network
+    await _assert_validator_permitted(
+        chain, netuid, payload.validator_hotkey, network=network
+    )
+
+    # 3. Atomic: record the score + advance status together. The row lock
+    #    serializes concurrent scorers so the status guard + transition below
+    #    can't be lost-updated.
+    async with session.begin():
+        agent = await get_agent_by_id(session, agent_id=agent_id, for_update=True)
+        if agent is None:
+            raise AgentNotFoundError(f"no agent with id={agent_id}")
+        if agent.status not in _SCOREABLE_STATUSES:
+            raise AgentNotEvaluatableError(
+                f"agent {agent_id} is {agent.status}, not in {_SCOREABLE_STATUSES}"
+            )
+        # k=3 gate: a score is only accepted against a live ticket this validator
+        # holds for the agent. No ticket (never issued, expired, or already
+        # spent) means the score is unsolicited or late, so it is rejected and
+        # the slot is left for a validator that will score in time. One ticket,
+        # one score: the ticket is consumed below, so a re-score needs a new one.
+        ticket = await get_open_ticket(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            now=datetime.now(UTC),
+        )
+        if ticket is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "no open scoring ticket for this validator and agent "
+                    "(never issued, expired, or already scored)"
+                ),
+            )
+        # Persist the scoring engine's opaque telemetry (models used,
+        # bench_version, dataset_sha256, per-category means, token spend, …) plus
+        # the per-case breakdown, all under scores.details. The public leaderboard
+        # surfaces a safe subset of this; the full blob (incl. per_case answer-key
+        # fields) is only ever read back through validator-gated endpoints.
+        score_details: dict[str, Any] = dict(report.details or {})
+        # Stamp the current benchmark version when the scorer omitted it, so no
+        # run scored from now on is ever recorded as "legacy" (null version).
+        # An explicit version in the report is left as-is (honest provenance).
+        stamp_bench_version(score_details)
+        # Stash the composite standard error into details so the ledger can
+        # surface it (mirroring bench_version; no schema migration). The
+        # validator reads it back for the KOTH indifference band.
+        if report.composite_stderr is not None:
+            score_details["composite_stderr"] = report.composite_stderr
+        # Same for the P4 per-seed confirmation composites: the validator submits
+        # one median-run score carrying the K per-seed composites, and the ledger
+        # surfaces them so the KOTH fold dethrones on the median over seeds.
+        if report.confirmation_composites is not None:
+            score_details["confirmation_composites"] = report.confirmation_composites
+        if report.per_case:
+            score_details["per_case"] = [
+                c.model_dump(mode="json") for c in report.per_case
+            ]
+        await upsert_score(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            run_id=report.run_id,
+            seed=report.seed,
+            composite=report.composite,
+            tool_mean=report.tool_mean,
+            memory_mean=report.memory_mean,
+            median_ms=report.median_ms,
+            n=report.n,
+            generated_at=report.generated_at,
+            signature=payload.signature,
+            details=score_details or None,
+        )
+        # Append the immutable, hash-chained audit entry for this score in the
+        # same transaction (durable iff the score is). Records the full signed
+        # tuple + signature so the entry is independently verifiable off the
+        # public audit feed, never any per-case answer-key content.
+        audit_now = datetime.now(UTC)
+        await append_audit_entry(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            event=EVENT_SCORE,
+            payload={
+                "run_id": report.run_id,
+                "seed": report.seed,
+                "composite": report.composite,
+                "tool_mean": report.tool_mean,
+                "memory_mean": report.memory_mean,
+                "median_ms": report.median_ms,
+                "n": report.n,
+                "signature": payload.signature,
+                "generated_at": report.generated_at.isoformat(),
+            },
+            recorded_at=audit_now,
+        )
+        # Persist the crate's structural (AST) fingerprint from the report, so it
+        # is available for the gate here and for future cross-miner comparison.
+        # Advisory + unsigned: only overwrite when the report actually carries one,
+        # so a re-score by a scorer that omits it never wipes a stored sketch.
+        if report.structural_fingerprint is not None:
+            agent.structural_fingerprint = report.structural_fingerprint.model_dump()
+        # Finalize at quorum (k=3): an agent stays provisional (``evaluating``)
+        # until :data:`SCORING_QUORUM` validators have scored it; only the
+        # quorum-th score moves it ``evaluating -> scored``, unless the anti-copy
+        # gate holds a suspected copy in ``ath_pending_review``. Both the gate
+        # and the transition run on the **median** composite, so no single
+        # validator's score decides an agent's fate. The gate runs only on this
+        # one transition; a re-score of an already-scored (or held) agent leaves
+        # its status put so re-reporting never thrashes the ledger. The agent is
+        # still ``evaluating`` here, so it is not yet in the eligible ledger (no
+        # self-match). A below-quorum score just records the row and waits.
+        if agent.status == AgentStatus.EVALUATING:
+            agent_scores = await list_scores_for_agent(session, agent_id=agent_id)
+            if len(agent_scores) >= SCORING_QUORUM:
+                median_composite = statistics.median(s.composite for s in agent_scores)
+                eligible = await list_eligible_ledger(session)
+                decision = evaluate_duplicate_signals(
+                    agent_id=agent_id,
+                    miner_hotkey=agent.miner_hotkey,
+                    sha256=agent.sha256,
+                    composite=median_composite,
+                    size_bytes=agent.size_bytes,
+                    normalized_source_hash=agent.normalized_source_hash,
+                    content_fingerprint=agent.content_fingerprint,
+                    structural_fingerprint=agent.structural_fingerprint,
+                    prompt_fingerprint=agent.prompt_fingerprint,
+                    eligible=eligible,
+                )
+                if decision.held:
+                    agent.status = AgentStatus.ATH_PENDING_REVIEW
+                    agent.duplicate_of = decision.duplicate_of
+                    agent.review_reason = decision.reason
+                    logger.warning(
+                        "agent %s held for copy review: %s", agent_id, decision.reason
+                    )
+                else:
+                    agent.status = AgentStatus.SCORED
+                # Append the finalize audit entry: quorum reached, the median the
+                # platform finalized on, and which validators scored it. The
+                # moderation detail (why held / duplicate_of) is deliberately kept
+                # out of the public chain — only the neutral outcome status.
+                await append_audit_entry(
+                    session,
+                    agent_id=agent_id,
+                    validator_hotkey=None,
+                    event=EVENT_FINALIZED,
+                    payload={
+                        "miner_hotkey": agent.miner_hotkey,
+                        "median_composite": median_composite,
+                        "quorum": SCORING_QUORUM,
+                        "score_count": len(agent_scores),
+                        "validator_hotkeys": sorted(
+                            s.validator_hotkey for s in agent_scores
+                        ),
+                        "dataset_seed": agent.dataset_seed,
+                        "dataset_sha256": agent.dataset_sha256,
+                        "dataset_seed_block": agent.dataset_seed_block,
+                        "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+                        "status": agent.status.value,
+                    },
+                    recorded_at=audit_now,
+                )
+                # Transparency mirror: publish the finalized run record to the
+                # public bucket so third parties can verify signatures and
+                # re-grade offline without touching the API. Additive and
+                # fail-open: the canonical record is Postgres; a publish
+                # failure logs and never fails the score write. Idempotent by
+                # key, so a retried request republishes identical content.
+                await _publish_finalized_run(
+                    storage, agent=agent, scores=agent_scores, median=median_composite
+                )
+        # Consume the ticket (one ticket, one score); the slot stays occupied.
+        await mark_ticket_scored(
+            session, agent_id=agent_id, validator_hotkey=payload.validator_hotkey
+        )
+        result_status = agent.status
+
+    logger.info(
+        "score recorded agent_id=%s validator=%s run_id=%s composite=%.3f status=%s",
+        agent_id,
+        payload.validator_hotkey,
+        report.run_id,
+        report.composite,
+        result_status,
+    )
+    return SubmitScoreResponse(agent_id=agent_id, status=result_status, accepted=True)
+
+
+async def _publish_finalized_run(
+    storage: S3StorageClient,
+    *,
+    agent: Agent,
+    scores: Sequence[Score],
+    median: float,
+) -> None:
+    """Mirror a finalized run to the public bucket (``scored/{agent_id}.json``).
+
+    The record carries everything an offline verifier needs: the dataset pin
+    (seed, sha256, seed block), the k=3 signed scores with their full details
+    (per-case breakdown included), and the median the platform finalized on.
+    Signatures cover ``{hotkey}:{agent_id}:{run_id}:{composite!r}:{seed}``, so
+    the record is self-verifying against the validators' on-chain hotkeys.
+    No-op when ``STORAGE_PUBLIC_BUCKET`` is unset; failures log only.
+    """
+    if storage.public_bucket is None:
+        return
+    record = {
+        "agent_id": str(agent.agent_id),
+        "miner_hotkey": agent.miner_hotkey,
+        "status": agent.status.value,
+        "median_composite": median,
+        "dataset_seed": agent.dataset_seed,
+        "dataset_sha256": agent.dataset_sha256,
+        "dataset_run_size": agent.dataset_run_size,
+        "dataset_seed_block": agent.dataset_seed_block,
+        "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+        "scores": [
+            {
+                "validator_hotkey": sc.validator_hotkey,
+                "run_id": sc.run_id,
+                "seed": sc.seed,
+                "composite": sc.composite,
+                "tool_mean": sc.tool_mean,
+                "memory_mean": sc.memory_mean,
+                "median_ms": sc.median_ms,
+                "n": sc.n,
+                "generated_at": sc.generated_at.isoformat()
+                if sc.generated_at
+                else None,
+                "signature": sc.signature,
+                "details": sc.details,
+            }
+            for sc in sorted(scores, key=lambda sc: sc.validator_hotkey)
+        ],
+    }
+    body = json.dumps(record, sort_keys=True, default=str).encode()
+    try:
+        await storage.put_object(
+            key=f"scored/{agent.agent_id}.json",
+            body=body,
+            content_type="application/json",
+            bucket=storage.public_bucket,
+        )
+    except Exception:  # noqa: BLE001 - additive mirror, never fail the write
+        logger.exception("public mirror publish failed for agent %s", agent.agent_id)

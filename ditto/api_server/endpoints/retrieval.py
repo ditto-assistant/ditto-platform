@@ -20,10 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ditto.api_models import AgentResponse, AgentStatusResponse
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_server.dependencies import get_session
+from ditto.db.models import AgentStatus
 from ditto.db.queries.agents import (
     get_agent_by_id,
     get_latest_agent_by_hotkey,
 )
+from ditto.db.queries.bans import is_hotkey_banned
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +74,17 @@ async def agent_by_hotkey(
         raise HotkeyAgentNotFoundError(
             f"no agent found for miner_hotkey={miner_hotkey}"
         )
+    # Surface a hotkey-level ban: the miner is banned regardless of the latest
+    # agent's own status, so report ``banned`` through the existing status field
+    # (no wire change) rather than a possibly-stale per-agent value.
+    status = agent.status
+    if await is_hotkey_banned(session, hotkey=miner_hotkey):
+        status = AgentStatus.BANNED
     return AgentResponse(
         agent_id=agent.agent_id,
         miner_hotkey=agent.miner_hotkey,
         name=agent.name,
-        status=agent.status,
+        status=status,
         sha256=agent.sha256,
         created_at=agent.created_at,
     )

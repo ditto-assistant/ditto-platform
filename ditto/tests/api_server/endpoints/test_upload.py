@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import tarfile
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -17,6 +19,7 @@ from ditto.api_server.endpoints.upload import (
     ERROR_CODE_BAD_SIGNATURE,
     ERROR_CODE_HOTKEY_NOT_REGISTERED,
     ERROR_CODE_TARBALL_TOO_LARGE,
+    MAX_TARBALL_SIZE_BYTES,
 )
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_MALFORMED_PRICE,
@@ -48,9 +51,26 @@ from ditto.api_server.storage import ObjectUploadFailedError
 from ditto.chain.errors import ChainConnectionError
 from ditto.tests.api_server.conftest import (
     override_get_chain_client,
+    override_get_embedder,
     override_get_price_oracle,
+    override_get_session,
     override_get_storage_client,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_ban_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default every upload test to "hotkey not banned".
+
+    The ban query is unit-tested for real against SQLite in
+    ``ditto.tests.db.queries.test_bans``; here we stub it so the endpoint
+    tests need no bans row. Ban-specific tests re-stub this to ``True``.
+    """
+    monkeypatch.setattr(
+        "ditto.api_server.endpoints.upload.is_hotkey_banned",
+        AsyncMock(return_value=False),
+    )
+
 
 _GOOD_SHA256 = "1d8a3b6f04e2c7f9a51bd3e5c8f2a7b06d4e9c1f2a3b4c5d6e7f8a9b0c1d2e3f"
 _BAD_SIG = "a" * 128  # 64 bytes of 0xaa; valid hex but won't verify
@@ -128,6 +148,11 @@ class TestEvalPricing:
 
 
 class TestUploadCheck:
+    @pytest.fixture(autouse=True)
+    def _session(self, app: FastAPI) -> None:
+        # /upload/check now reads the ban list, so it needs a session dep.
+        override_get_session(app)
+
     async def test_happy_path(self, app: FastAPI, client: httpx.AsyncClient):
         # is_registered=True by default in the fake chain client.
         override_get_chain_client(app)
@@ -138,6 +163,26 @@ class TestUploadCheck:
         assert result["ok"] is True
         assert result["error_codes"] == []
         assert result["messages"] == []
+
+    async def test_banned_hotkey_returns_1103(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from ditto.api_server.endpoints.upload import ERROR_CODE_HOTKEY_BANNED
+
+        override_get_chain_client(app)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.is_hotkey_banned",
+            AsyncMock(return_value=True),
+        )
+        body = _signed_request_body()
+        response = await client.post("/api/v1/upload/check", json=body)
+        assert response.status_code == 200
+        result = response.json()
+        assert result["ok"] is False
+        assert ERROR_CODE_HOTKEY_BANNED in result["error_codes"]
 
     async def test_bad_signature_returns_1100(
         self, app: FastAPI, client: httpx.AsyncClient
@@ -176,7 +221,7 @@ class TestUploadCheck:
         self, app: FastAPI, client: httpx.AsyncClient
     ):
         override_get_chain_client(app)
-        body = _signed_request_body(file_size_bytes=3 * 1024 * 1024)  # 3 MB
+        body = _signed_request_body(file_size_bytes=MAX_TARBALL_SIZE_BYTES + 1)
         response = await client.post("/api/v1/upload/check", json=body)
         assert response.status_code == 200
         result = response.json()
@@ -196,7 +241,7 @@ class TestUploadCheck:
             return chain
 
         app.dependency_overrides[get_chain_client] = _fake_chain
-        body = _signed_request_body(file_size_bytes=3 * 1024 * 1024)
+        body = _signed_request_body(file_size_bytes=MAX_TARBALL_SIZE_BYTES + 1)
         body["signature"] = _BAD_SIG
         response = await client.post("/api/v1/upload/check", json=body)
         result = response.json()
@@ -229,6 +274,7 @@ class TestUploadCheck:
         cfg = replace(base, chain=replace(base.chain, netuid=999))
         custom_app = create_api_server(cfg)
         custom_app.state.commit_hash = "test-commit"
+        override_get_session(custom_app)  # /upload/check reads the ban list
 
         recorded: dict[str, int] = {}
 
@@ -267,6 +313,20 @@ class TestOpenApiInclusion:
 
 _GOOD_TAR_BYTES = b"\x1f\x8b" + b"x" * 1024  # gzip magic + padding
 _GOOD_TAR_SHA = hashlib.sha256(_GOOD_TAR_BYTES).hexdigest()
+
+
+def _real_source_tar() -> bytes:
+    """A genuine tar.gz with a Rust source file, so the fingerprint/embedding-input
+    extractors yield real content (the junk ``_GOOD_TAR_BYTES`` decodes to None)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = b"fn handle(x: i64) -> i64 {\n    let acc = x + 1;\n    acc * 2\n}\n"
+        info = tarfile.TarInfo("src/lib.rs")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
 _GOOD_BLOCK_HASH = "0x" + "ab" * 32
 
 
@@ -416,6 +476,49 @@ class TestUploadAgentHappyPath:
         assert put_kwargs["content_type"] == "application/gzip"
         assert put_kwargs["body"] == _GOOD_TAR_BYTES
 
+    async def test_stores_code_embedding_when_enabled(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ):
+        # With an enabled embedder and a real-source tar, the code-embedding vector +
+        # model tag
+        # reach the agent row (shadow storage).
+        deps = _wire_full_stack(app)
+        override_get_embedder(app, vector=[0.1, 0.2, 0.3])
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        _override_payment_verifier(
+            app, verified=_make_verified_payment(miner_hotkey=kp.ss58_address)
+        )
+        tar = _real_source_tar()
+        data, _ = _upload_agent_form(keypair=kp, sha256=hashlib.sha256(tar).hexdigest())
+        files = {"agent_tar": ("harness.tar.gz", tar, "application/gzip")}
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 200, response.text
+        agent_row = deps["session"].add.call_args_list[0].args[0]
+        assert agent_row.code_embedding == [0.1, 0.2, 0.3]
+        assert agent_row.code_embed_model == "stub@test"
+
+    async def test_disabled_embedder_leaves_embedding_null(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ):
+        # Default null embedder: even a real-source tar stores no vector.
+        deps = _wire_full_stack(app)  # app fixture defaults to the null embedder
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        _override_payment_verifier(
+            app, verified=_make_verified_payment(miner_hotkey=kp.ss58_address)
+        )
+        tar = _real_source_tar()
+        data, _ = _upload_agent_form(keypair=kp, sha256=hashlib.sha256(tar).hexdigest())
+        files = {"agent_tar": ("harness.tar.gz", tar, "application/gzip")}
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 200, response.text
+        agent_row = deps["session"].add.call_args_list[0].args[0]
+        assert agent_row.code_embedding is None
+        assert agent_row.code_embed_model is None
+
 
 class TestUploadAgentValidationFailures:
     async def test_bad_signature_returns_400(
@@ -429,6 +532,27 @@ class TestUploadAgentValidationFailures:
 
         assert response.status_code == 400
         assert "signature" in response.json()["message"]
+
+    async def test_banned_hotkey_returns_403(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        # A valid signature (so the ban check is reached) from a banned hotkey
+        # is rejected 403 before any chain/payment/storage work.
+        _wire_full_stack(app)
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.is_hotkey_banned",
+            AsyncMock(return_value=True),
+        )
+        data, files = _upload_agent_form(keypair=kp)
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 403
+        assert "banned" in response.json()["message"]
 
     async def test_hotkey_not_registered_returns_400(
         self, app: FastAPI, client: httpx.AsyncClient
@@ -498,7 +622,7 @@ class TestUploadAgentValidationFailures:
         self, app: FastAPI, client: httpx.AsyncClient
     ):
         _wire_full_stack(app)
-        oversized = b"\x1f\x8b" + b"x" * (3 * 1024 * 1024)
+        oversized = b"\x1f\x8b" + b"x" * (MAX_TARBALL_SIZE_BYTES - 1)
         big_sha = hashlib.sha256(oversized).hexdigest()
         kp = bittensor.Keypair.create_from_uri("//Alice")
         payload = f"{kp.ss58_address}:{big_sha}".encode()
@@ -626,8 +750,6 @@ class TestUploadAgentBoundaries:
     ):
         """``_read_tar_capped_with_sha`` uses ``size > max_bytes``; this
         test pins the boundary so a refactor to ``>=`` is caught."""
-        from ditto.api_server.endpoints.upload import MAX_TARBALL_SIZE_BYTES
-
         _wire_full_stack(app)
         # gzip magic + filler up to exactly the cap.
         at_cap = b"\x1f\x8b" + b"x" * (MAX_TARBALL_SIZE_BYTES - 2)
@@ -655,8 +777,6 @@ class TestUploadAgentBoundaries:
     async def test_size_one_over_cap_rejected(
         self, app: FastAPI, client: httpx.AsyncClient
     ):
-        from ditto.api_server.endpoints.upload import MAX_TARBALL_SIZE_BYTES
-
         _wire_full_stack(app)
         over = b"\x1f\x8b" + b"x" * (MAX_TARBALL_SIZE_BYTES - 2) + b"!"
         over_sha = hashlib.sha256(over).hexdigest()

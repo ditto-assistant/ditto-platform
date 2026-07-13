@@ -100,6 +100,7 @@ class TestInsertEvaluationPaymentHappyPath:
                 miner_hotkey=verified.miner_hotkey,
                 name="alpha-agent",
                 sha256="deadbeef" * 8,
+                size_bytes=524288,
             )
             await insert_evaluation_payment(
                 session, verified=verified, agent_id=agent_id

@@ -1,6 +1,12 @@
 services:
+  # Postgres + MinIO are LOCAL-DEV ONLY (the `local` profile). On a deployed
+  # host (GCE app VM) Postgres is the dedicated ditto-pg-platform VM and object
+  # storage is GCS, so neither runs here — only Pylon (profile-less) comes up.
+  # `make stack-up` names these services explicitly, which starts them despite
+  # the profile; a plain `docker compose up -d pylon` brings up Pylon alone.
   postgres:
     image: postgres:16-alpine
+    profiles: ["local"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-ditto}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ditto}
@@ -19,11 +25,36 @@ services:
 
   pylon:
     image: backenddevelopersltd/bittensor-pylon:latest
-    # Keep the chain sidecar available after host or Docker restarts.
+    # amd64-only image; run under emulation on Apple Silicon (colima qemu).
+    platform: linux/amd64
+    # No profile: Pylon is the one sidecar that runs everywhere (local + deployed).
+    # restart so it comes back after a VM reboot without re-running start.sh.
     restart: unless-stopped
     environment:
       PYLON_OPEN_ACCESS_TOKEN: ${PYLON_OPEN_ACCESS_TOKEN:-dev-open-access}
-      PYLON_RECENT_OBJECTS_NETUIDS: "[118]"
+      PYLON_RECENT_OBJECTS_NETUIDS: ${PYLON_RECENT_OBJECTS_NETUIDS:-[3]}
+      # Point Pylon at the dev local chain (env-overridable), not finney.
+      PYLON_BITTENSOR_NETWORK: ${PYLON_BITTENSOR_NETWORK:-ws://68.183.141.180:80}
+      PYLON_BITTENSOR_ARCHIVE_NETWORK: ${PYLON_BITTENSOR_ARCHIVE_NETWORK:-ws://68.183.141.180:80}
+      # --- Write identity (put_weights) ---
+      # Open-access (above) stays for reads; identities add the write path.
+      # Pylon loads the hotkey from the mounted wallet and signs set_weights
+      # itself, so the only "credential" is a self-generated bearer token
+      # (openssl rand -base64 32) shared with the validator's PYLON_IDENTITY_TOKEN.
+      # Leave PYLON_IDENTITIES empty ([]) to keep this Pylon read-only.
+      PYLON_IDENTITIES: ${PYLON_IDENTITIES:-["validator"]}
+      PYLON_ID_VALIDATOR_NETUID: ${PYLON_ID_VALIDATOR_NETUID:-3}
+      PYLON_ID_VALIDATOR_WALLET_NAME: ${PYLON_ID_VALIDATOR_WALLET_NAME:-validator}
+      PYLON_ID_VALIDATOR_HOTKEY_NAME: ${PYLON_ID_VALIDATOR_HOTKEY_NAME:-default}
+      PYLON_ID_VALIDATOR_TOKEN: ${PYLON_TOKEN:-}
+      # Where the wallet is mounted inside the container (see volumes below).
+      PYLON_BITTENSOR_WALLET_PATH: /root/.bittensor/wallets
+    # Mount the host wallet dir read-only so Pylon can load the identity
+    # hotkey to sign weight extrinsics. Override BITTENSOR_WALLET_PATH if your
+    # wallets live elsewhere. Read-only: Pylon only ever signs, never writes.
+    volumes:
+      # Must be an ABSOLUTE host path — Docker does not expand "~".
+      - ${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro
     # Host port 8001 is reserved for Pylon; 8000 is the API server's slot.
     # The container still listens on 8000 internally.
     ports:
@@ -42,6 +73,7 @@ services:
 
   minio:
     image: minio/minio:latest
+    profiles: ["local"]
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
@@ -71,6 +103,7 @@ services:
   # mc mb is idempotent so re-runs are harmless.
   minio-create-bucket:
     image: minio/mc:latest
+    profiles: ["local"]
     depends_on:
       minio:
         condition: service_healthy
@@ -88,6 +121,33 @@ services:
         mc anonymous set none local/"$${STORAGE_BUCKET}"
     restart: "no"
 
+  # code-embedding service (anti-copy semantic tier; see
+  # docs/code-embedder.md and docs/SEMANTIC-CLONE-PREVENTION.md in the subnet repo).
+  # Hugging Face text-embeddings-inference (TEI) serving a small open code model.
+  # Opt-in via the `embedder` profile: `make embedder-up`, or add `embedder` to
+  # DITTO_COMPOSE_SERVICES on a deployed host. The platform stays disabled until
+  # CODE_EMBEDDER_URL is set, so a host that does not run this service is unaffected.
+  embedder:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.7.2
+    profiles: ["embedder"]
+    # amd64-only image; run under emulation on Apple Silicon (colima qemu).
+    platform: linux/amd64
+    restart: unless-stopped
+    # Default to the CPU-cheap, Rust-aware fallback; override CODE_EMBEDDER_MODEL_ID
+    # (e.g. Qwen/Qwen3-Embedding-0.6B) to serve the primary model. TEI listens on
+    # port 80 inside the container.
+    command:
+      - "--model-id"
+      - "${CODE_EMBEDDER_MODEL_ID:-jinaai/jina-embeddings-v2-base-code}"
+      - "--port"
+      - "80"
+    ports:
+      - "${CODE_EMBEDDER_HOST_PORT:-8080}:80"
+    # Persist the downloaded weights so a restart does not re-fetch from HF.
+    volumes:
+      - embedder_hf_cache:/data
+
 volumes:
   postgres_data:
   minio_data:
+  embedder_hf_cache:

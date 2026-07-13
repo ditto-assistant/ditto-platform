@@ -11,6 +11,16 @@ memory harness lives in [`ditto-harness`](https://github.com/ditto-assistant/dit
 This service talks to clients over HTTP; the **OpenAPI schema is the contract**
 (there is no shared package between repos).
 
+**Validator boundary (server side lives here):** this repo owns the
+validator-*facing* API — the `/validator/*` endpoints (`endpoints/validator.py`),
+their wire models (`api_models/validator.py`), the score ledger in `ditto/db`,
+and the `4xxx` validator error codes. The validator **worker/process itself does
+not live here** — it runs in `ditto-subnet` (`ditto/validator/`), is stateless
+(no DB), and reaches this service only over HTTP. Do not add a `ditto/validator/`
+package or any weight-setting / dittobench-scoring code to this repo; that is the
+subnet's job. The two `api_models/validator.py` copies are kept in sync via the
+OpenAPI contract, not a shared import.
+
 ## Architecture in one paragraph
 
 `ditto/api_server` is a FastAPI app assembled in `factory.py:create_api_server()`
@@ -72,7 +82,8 @@ all three on Python 3.11 and 3.12.
   DB transaction (orphan blobs are cheap; orphan rows break the state machine).
 - Some `/upload/*` validations are intentionally deferred (tar manifest, import
   allowlist, schema diff, banned-hotkey) pending the harness interface + the
-  `banned_hotkeys` table.
+  `banned_hotkeys` table. What miners submit and what is / isn't enforced today
+  is written up in `docs/submission-contract.md`.
 
 ## Branching
 

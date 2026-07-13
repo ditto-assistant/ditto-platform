@@ -169,6 +169,16 @@ def _config_to_log_dict(config: ApiServerConfig) -> dict[str, object]:
             "access_key": _redact(config.storage.access_key),
             "secret_key": _redact(config.storage.secret_key),
         },
+        "embedding": {
+            "enabled": config.embedding.enabled,
+            "url": config.embedding.url or "<unset>",
+            "model": config.embedding.model or "<unset>",
+            "revision": config.embedding.revision,
+            "dim": (
+                config.embedding.dim if config.embedding.dim is not None else "native"
+            ),
+            "timeout_seconds": config.embedding.timeout_seconds,
+        },
     }
 
 

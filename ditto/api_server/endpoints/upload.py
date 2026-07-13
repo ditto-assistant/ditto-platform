@@ -8,15 +8,17 @@ proof on chain, stores the tarball in S3, and writes the matching
 
 Deferred validations (added when their dependencies land):
 - tar manifest structure (needs Go-harness interface signatures)
-- banned-hotkey check (needs ``banned_hotkeys`` table)
 - Go-import allowlist scan (needs the allowlist file)
 - schema diff against ``schema/initial_harness.sql`` (needs the file)
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import logging
+import os
 import uuid
 from decimal import Decimal
 from typing import TYPE_CHECKING, Annotated
@@ -39,10 +41,18 @@ from ditto.api_models.upload import (
 )
 from ditto.api_server.dependencies import (
     get_chain_client,
+    get_embedder,
     get_payment_verifier,
     get_price_oracle,
     get_session,
     get_storage_client,
+)
+from ditto.api_server.embedding import Embedder
+from ditto.api_server.fingerprint import (
+    compute_content_fingerprint,
+    compute_embedding_input,
+    compute_normalized_source_hash,
+    compute_prompt_fingerprint,
 )
 from ditto.api_server.payment_verifier import (
     PaymentProof,
@@ -56,6 +66,7 @@ from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.models import AgentStatus
 from ditto.db.queries.agents import insert_agent
+from ditto.db.queries.bans import is_hotkey_banned
 from ditto.db.queries.payments import insert_evaluation_payment
 
 if TYPE_CHECKING:
@@ -71,11 +82,42 @@ router = APIRouter(prefix="/upload", tags=["upload"])
 ERROR_CODE_BAD_SIGNATURE = 1100
 ERROR_CODE_HOTKEY_NOT_REGISTERED = 1101
 ERROR_CODE_TARBALL_TOO_LARGE = 1102
+ERROR_CODE_HOTKEY_BANNED = 1103
+
+DEFAULT_MAX_TARBALL_SIZE_BYTES = 20 * 1024 * 1024
+
+
+def _tarball_size_cap_from_env() -> int:
+    """Return upload cap, keeping the competition default explicit.
+
+    Rust starter-kit submissions with bundled model fixtures are expected to
+    stay below the launch cap. Operators may still override it explicitly for
+    local/dev runs or emergency changes.
+    """
+    raw = os.environ.get("DITTO_MAX_TARBALL_SIZE_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_TARBALL_SIZE_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "invalid DITTO_MAX_TARBALL_SIZE_BYTES=%r; falling back to 20 MiB",
+            raw,
+        )
+        return DEFAULT_MAX_TARBALL_SIZE_BYTES
+    if value <= 0:
+        logger.warning(
+            "non-positive DITTO_MAX_TARBALL_SIZE_BYTES=%r; falling back to 20 MiB",
+            raw,
+        )
+        return DEFAULT_MAX_TARBALL_SIZE_BYTES
+    return value
+
 
 # Hard cap shared with /upload/check. Tarballs above this size are
 # rejected; /upload/check enforces it from the miner-reported header,
 # /upload/agent enforces it from the actual streamed bytes.
-MAX_TARBALL_SIZE_BYTES = 2 * 1024 * 1024
+MAX_TARBALL_SIZE_BYTES = _tarball_size_cap_from_env()
 
 # Streaming read chunk size. 256 KiB keeps memory bounded while letting
 # size + sha256 update incrementally without re-reading the body.
@@ -85,6 +127,7 @@ ChainDep = Annotated["ChainClient", Depends(get_chain_client)]
 OracleDep = Annotated[PriceOracle, Depends(get_price_oracle)]
 PaymentVerifierDep = Annotated[PaymentVerifier, Depends(get_payment_verifier)]
 StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
+EmbedderDep = Annotated[Embedder, Depends(get_embedder)]
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
@@ -112,7 +155,7 @@ async def eval_pricing(request: Request, oracle: OracleDep) -> EvalPricingRespon
 
 @router.post("/check", response_model=UploadCheckResponse)
 async def check(
-    request: Request, body: UploadCheckRequest, chain: ChainDep
+    request: Request, body: UploadCheckRequest, chain: ChainDep, session: SessionDep
 ) -> UploadCheckResponse:
     """Pre-payment dry-run validation.
 
@@ -149,13 +192,19 @@ async def check(
         codes.append(ERROR_CODE_TARBALL_TOO_LARGE)
         messages.append(f"tarball exceeds {MAX_TARBALL_SIZE_BYTES} bytes")
 
+    # 4. Hotkey-level ban. Reported here (dry run) so a banned miner learns it
+    #    before spending TAO; /upload/agent enforces it as a hard 403.
+    if await is_hotkey_banned(session, hotkey=body.hotkey):
+        codes.append(ERROR_CODE_HOTKEY_BANNED)
+        messages.append("hotkey is banned from submitting")
+
     return UploadCheckResponse(ok=not codes, error_codes=codes, messages=messages)
 
 
 @router.post("/agent", response_model=UploadAgentResponse, status_code=200)
 async def upload_agent(
     request: Request,
-    agent_tar: Annotated[UploadFile, File(description="gzipped tarball, <=2 MB")],
+    agent_tar: Annotated[UploadFile, File(description="gzipped tarball, <=20 MB")],
     hotkey: Annotated[str, Form(pattern=_SS58_PATTERN)],
     sha256: Annotated[str, Form(pattern=_SHA256_PATTERN)],
     # The 64-character cap is a chosen value rather than a spec mandate;
@@ -169,6 +218,7 @@ async def upload_agent(
     chain: ChainDep,
     verifier: PaymentVerifierDep,
     storage: StorageDep,
+    embedder: EmbedderDep,
     session: SessionDep,
 ) -> UploadAgentResponse:
     """Full upload submission with proof of payment.
@@ -187,7 +237,8 @@ async def upload_agent(
        payment-side rejection, 503 if chain unreachable).
     6. ``agent_id = uuid4()``.
     7. ``storage.put_object`` (orphan blob is cheap on DB failure;
-       orphan agent rows would break the state machine).
+       orphan agent rows would break the state machine), then compute the
+       content fingerprint (best-effort; ``None`` on an unreadable tarball).
     8. Atomic DB tx: ``insert_agent`` + ``insert_evaluation_payment``
        (3207 surfaces here when the PK rejects a replayed proof).
     9. Return ``UploadAgentResponse``.
@@ -200,6 +251,12 @@ async def upload_agent(
         raise HTTPException(
             status_code=400, detail="signature did not verify against the hotkey"
         )
+
+    # 2b. Hotkey-level ban. Checked right after the (CPU-only) signature proves
+    #     the caller owns the hotkey and before any chain/payment/storage work,
+    #     so a banned miner is rejected as cheaply as possible.
+    if await is_hotkey_banned(session, hotkey=hotkey):
+        raise HTTPException(status_code=403, detail="hotkey is banned from submitting")
 
     # 3. Hotkey must be registered on this subnet. Chain outage surfaces
     # as 503; falling through would silently accept off-subnet hotkeys.
@@ -256,6 +313,41 @@ async def upload_agent(
         content_type="application/gzip",
     )
 
+    # 7b. Content fingerprint for the anti-copy gate's content-level signal.
+    # Computed only now, on an upload that has passed every check, so a rejected
+    # submission never pays the unpack cost. Offloaded to a worker thread because
+    # it is CPU-bound (gunzip + shingle-hash the whole tree) and would otherwise
+    # block the event loop for every concurrent request. Best-effort: an
+    # unreadable/empty tarball yields None (the gate then relies on sha256 + size),
+    # never a 500.
+    content_fingerprint = await asyncio.to_thread(
+        compute_content_fingerprint, tar_bytes
+    )
+    # 7c. exact-repack hash: the canonicalized-source equality signal for the
+    # gate (comments/whitespace stripped, files sorted). Same CPU-bound offload +
+    # best-effort None contract as the lexical fingerprint above.
+    normalized_source_hash = await asyncio.to_thread(
+        compute_normalized_source_hash, tar_bytes
+    )
+    # 7d. prompt-surface sketch (shadow mode): stored for every agent for
+    # calibration/retroactive analysis; not yet a hold trigger. Same offload +
+    # best-effort None contract.
+    prompt_fingerprint = await asyncio.to_thread(compute_prompt_fingerprint, tar_bytes)
+    # 7e. code embedding (shadow mode): build the canonical input (CPU-bound,
+    # offloaded) then embed via the self-hosted service. Disabled by default
+    # (null embedder -> None) and best-effort: a slow/unreachable embedder yields a
+    # null vector rather than failing the upload. The provenance tag is stored so a
+    # model change can drive a re-embed sweep and the gate compares only same-model
+    # vectors.
+    embed_input = await asyncio.to_thread(compute_embedding_input, tar_bytes)
+    code_embedding = await embedder.embed(embed_input) if embed_input else None
+    code_embed_model = embedder.model_tag if code_embedding is not None else None
+
+    if session.in_transaction():
+        rollback_result = session.rollback()
+        if inspect.isawaitable(rollback_result):
+            await rollback_result
+
     # 8. Atomic DB tx: agent + payment commit together or roll back
     # together. A replayed payment proof surfaces as PaymentReplayedError
     # (3207) and the envelope handler maps it to HTTP 402.
@@ -266,6 +358,12 @@ async def upload_agent(
             miner_hotkey=hotkey,
             name=name,
             sha256=sha256,
+            size_bytes=len(tar_bytes),
+            content_fingerprint=content_fingerprint,
+            normalized_source_hash=normalized_source_hash,
+            prompt_fingerprint=prompt_fingerprint,
+            code_embedding=code_embedding,
+            code_embed_model=code_embed_model,
         )
         await insert_evaluation_payment(session, verified=verified, agent_id=agent_id)
 
