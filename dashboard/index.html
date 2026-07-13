@@ -199,7 +199,7 @@
 
     .hotkey { font-family: var(--mono); font-size: 13px; color: var(--text); }
     .hotkey .badge { margin-left: 8px; font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--gold); border: 1px solid color-mix(in oklab, var(--gold) 42%, transparent); border-radius: 6px; padding: 1px 6px; vertical-align: middle; }
-    /* Model column cell: harness/generator model + bench-version chip. */
+    /* Model column cell: harness model + bench-version chip. */
     .modelcell { display: flex; flex-direction: column; gap: 5px; align-items: flex-start; }
     .modelcell .mname { font-family: var(--mono); font-size: 12px; color: var(--text); display: inline-flex; align-items: center; gap: 6px; }
     .modelcell .mname::before { content: "🧠"; font-size: 11px; }
@@ -438,7 +438,7 @@
 
     <section class="cards" id="cards">
       <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label"><span class="tip" title="Distinct miners with at least one scored run on the board (provisional runs included).">Miners Scored</span></div><div class="value" id="c-miners">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="The highest composite among ranked (full-benchmark) runs. Composite = 0.5 × tool mean + 0.5 × memory mean. Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
+      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="The highest composite among ranked (full-benchmark) runs. Composite = (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates (efficiency, consistency); a canary miss zeroes the run. Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
       <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" title="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
       <div class="card"><div class="glow" style="background:var(--memory)"></div><div class="label"><span class="tip" title="Total LLM tokens the runs on the board spent (the harnesses' own calls to the locked model). Generation and grading are non-LLM, so scoring itself spends nothing.">Scoring Spend</span></div><div class="value" id="c-cost">–</div></div>
@@ -454,8 +454,8 @@
           <tr>
             <th scope="col" style="width:52px"><span class="tip" title="Rank by composite among ranked (full-benchmark) runs. Provisional runs are shown but unranked (–).">#</span></th>
             <th scope="col"><span class="tip" title="The miner's on-chain hotkey (SS58). Click a row for the full run detail, or ⧉ to copy the key.">Miner</span></th>
-            <th scope="col" class="hide-md" style="width:180px"><span class="tip" title="The chat model the miner's harness ran on (when disclosed) and the benchmark version the run was scored under.">Model</span></th>
-            <th scope="col" style="width:190px"><span class="tip" title="Headline score in [0,1]: 0.5 × tool mean + 0.5 × memory mean. The band on the bar is ±1 standard error. The second line shows the score trend.">Composite</span></th>
+            <th scope="col" class="hide-md" style="width:180px"><span class="tip" title="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under.">Model</span></th>
+            <th scope="col" style="width:190px"><span class="tip" title="Headline score in [0,1]: (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates. The band on the bar is ±1 standard error. The second line shows the score trend.">Composite</span></th>
             <th scope="col" class="hide-sm" style="width:140px"><span class="tip" title="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span></th>
             <th scope="col" class="hide-sm" style="width:140px"><span class="tip" title="Mean score across the memory cases. Did the agent recall and reason over stored facts across sessions, over time, and while resisting injected instructions?">Memory</span></th>
             <th scope="col" class="num hide-sm" style="width:96px"><span class="tip" title="Median per-case response time for the run, and how many cases were scored (a full benchmark is ~114 cases).">Latency</span></th>
@@ -509,7 +509,11 @@
     <footer>
       <div class="foot-links">
         <a id="foot-wandb" href="#" target="_blank" rel="noopener">Full per-epoch telemetry (wandb) ↗</a>
-        <a href="https://github.com/ditto-assistant/ditto-subnet" target="_blank" rel="noopener">Subnet & validator ↗</a>
+        <a href="https://github.com/ditto-assistant/ditto-subnet" target="_blank" rel="noopener">Subnet &amp; validator ↗</a>
+        <a href="https://github.com/ditto-assistant/dittobench-api" target="_blank" rel="noopener">Scoring engine ↗</a>
+        <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">Dataset &amp; grader ↗</a>
+        <a href="https://github.com/ditto-assistant/dittobench-starter-kit" target="_blank" rel="noopener">Miner starter kit ↗</a>
+        <a href="https://github.com/ditto-assistant/ditto-harness" target="_blank" rel="noopener">Memory harness ↗</a>
       </div>
     </footer>
   </div>
@@ -832,7 +836,7 @@
     function shortModel(name) { return name.indexOf("/") >= 0 ? name.split("/").pop() : name; }
     function modelCell(e) {
       var m = e.models || {};
-      var name = m.harness || m.generator || "";
+      var name = m.harness || "";
       var bv;
       if (e.bench_version == null) {
         // No version recorded → a run from before benchmark versioning. Flag it as
@@ -904,9 +908,6 @@
           (e.bench_version < currentBench ? " (previous, not comparable to v" + currentBench + ")" : " (current)"));
       }
       if (m.harness) det += stat("Harness model", m.harness);
-      if (m.judge) det += stat("Judge model", m.judge);
-      if (m.judge_audit) det += stat("Audit judge", m.judge_audit);
-      if (m.generator) det += stat("Dataset generator", m.generator);
       if (e.tokens != null) det += stat("Scoring token spend", e.tokens.toLocaleString());
       // Per-category breakdown renders full width below the stat columns as a dense
       // multi-column grid, so all ~40 categories stay compact and legible. Each cell
@@ -1038,7 +1039,7 @@
     // Plain-language help for the metric and telemetry terms in this drawer. Each
     // is a short paragraph, rendered collapsed so the panel stays clean by default.
     var TERM_HELP = [
-      ["Composite", "The headline score from 0 to 1, computed as 0.5 × tool mean + 0.5 × memory mean. Miners are ranked and paid emissions on it."],
+      ["Composite", "The headline score from 0 to 1: (0.5 × tool mean + 0.5 × memory mean) scaled by the integrity gates (efficiency and consistency), with a canary miss zeroing the run. Miners are ranked and paid emissions on it."],
       ["Standard error (± SE)", "The uncertainty on the composite, estimated from how much the per-case scores vary. Two miners within about 1 SE of each other are a statistical tie, not a real gap."],
       ["Tool mean", "Average score over the tool-use cases. Did the agent call the right tools, ground its arguments, and read memory instead of the web when the fact was already known?"],
       ["Memory mean", "Average score over the memory cases. Did the agent recall and reason over stored facts across sessions, over time, and while resisting instructions hidden in the data?"],
@@ -1202,7 +1203,7 @@
         '<div class="gdesc" style="padding:4px 0 6px">A short summary of each category’s purpose. The exact prompts and expected answers are never shown.</div>' +
         body + "</details>";
     }
-    // A case's pass/fail verdict. Memory cases carry a binary judge result (correct).
+    // A case's pass/fail verdict. Memory cases carry a binary deterministic result (correct).
     // Tool cases are graded continuously, so a full deterministic trajectory counts
     // as a pass, a fully wrong one as a fail, and a partial trajectory as partial.
     function caseVerdict(c) {
@@ -1374,19 +1375,19 @@
       entries: [
         { rank: 1, miner_hotkey: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", composite: 0.658, tool_mean: 0.867, memory_mean: 0.449, first_seen: new Date(Date.now() - 86400000 * 2).toISOString(),
           median_ms: 2410, n: 12, bench_version: 2, dataset_sha256: "9f2c1a77b4e35d0182ac4f6b0e2d9c3a5b7148ef22d0c6a9f1e8b3d47c05a6e1",
-          models: { generator: "google/gemini-3.1-flash-lite", judge: "google/gemini-3.1-flash-lite", judge_audit: null, harness: "anthropic/claude-haiku-4.5" },
+          models: { harness: "qwen/qwen3-32b" },
           per_category: [{ category: "memory_lookup", count: 3, mean: 0.83 }, { category: "web_search", count: 2, mean: 0.75 }, { category: "artifacts_create", count: 1, mean: 0.6 }],
           integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 0, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.2, capped_tool_cases: 3, seeding_waves: 2 }, tokens: 8140,
           composite_stderr: 0.017, history: [0.481, 0.523, 0.559, 0.601, 0.658],
           case_results: [
-            { category: "web_search", kind: "tool", score: 0.75, correct: true, latency_ms: 2410, notes: ["judged correct=true grounded=true"] },
+            { category: "web_search", kind: "tool", score: 0.75, correct: true, latency_ms: 2410, notes: ["deterministic trajectory match; args grounded"] },
             { category: "artifacts_create", kind: "tool", score: 0.60, correct: false, latency_ms: 8740, notes: ["capped: observable case not executed via tool_endpoint (self-report untrusted)"] },
             { category: "memory_lookup", kind: "memory", score: 1.0, correct: true, latency_ms: 1330, notes: ["deterministic answer match (no judge call)"] },
-            { category: "contradiction", kind: "memory", score: 0.0, correct: false, latency_ms: 2210, notes: ["judged correct=false"] }
+            { category: "contradiction", kind: "memory", score: 0.0, correct: false, latency_ms: 2210, notes: ["deterministic answer mismatch (no judge call)"] }
           ] },
         { rank: 2, miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.432, first_seen: new Date(Date.now() - 86400000 * 3).toISOString(),
           median_ms: 3120, n: 12, bench_version: 2, dataset_sha256: "1b8e07d4c9f6a2531e0c74ab9f3d61528ac40f7e6d1b9c8a2f5e340d7b16c9a0",
-          models: { generator: "google/gemini-3.1-flash-lite", judge: "google/gemini-3.1-flash-lite", judge_audit: null, harness: "openai/gpt-4o-mini" },
+          models: { harness: "qwen/qwen3-32b" },
           per_category: [{ category: "memory_lookup", count: 3, mean: 0.72 }, { category: "image_create", count: 1, mean: 0.5 }],
           integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 1, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.22, capped_tool_cases: 4, seeding_waves: 1 }, tokens: 7620,
           composite_stderr: 0.021, history: [0.544, 0.578, 0.612] },
