@@ -439,7 +439,7 @@
 
     <section class="cards" id="cards">
       <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label"><span class="tip" title="Distinct miners with at least one scored run on the board (provisional runs included).">Miners Scored</span></div><div class="value" id="c-miners">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="The highest composite among ranked (full-benchmark) runs. Composite = (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates (efficiency, consistency); a canary miss zeroes the run. Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
+      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="The highest composite among ranked (full-benchmark) runs. Composite = (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates (efficiency, consistency, and canary integrity: a canary leak ×0.5, an honest miss ×0.85). Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
       <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" title="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 24 seeds at run_size=full. The score a submission must beat. Source: dittobench-api docs/BASELINES.md (bench_version 2).">Reference Baseline</span></div><div class="value" id="c-baseline">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
@@ -1050,7 +1050,7 @@
     // Plain-language help for the metric and telemetry terms in this drawer. Each
     // is a short paragraph, rendered collapsed so the panel stays clean by default.
     var TERM_HELP = [
-      ["Composite", "The headline score from 0 to 1: (0.5 × tool mean + 0.5 × memory mean) scaled by the integrity gates (efficiency and consistency), with a canary miss zeroing the run. Miners are ranked and paid emissions on it."],
+      ["Composite", "The headline score from 0 to 1: (0.5 × tool mean + 0.5 × memory mean) scaled by the integrity gates (efficiency, consistency, and canary integrity: a canary leak ×0.5, an honest miss ×0.85). Miners are ranked and paid emissions on it."],
       ["Standard error (± SE)", "The uncertainty on the composite, estimated from how much the per-case scores vary. Two miners within about 1 SE of each other are a statistical tie, not a real gap."],
       ["Tool mean", "Average score over the tool-use cases. Did the agent call the right tools, ground its arguments, and read memory instead of the web when the fact was already known?"],
       ["Memory mean", "Average score over the memory cases. Did the agent recall and reason over stored facts across sessions, over time, and while resisting instructions hidden in the data?"],
