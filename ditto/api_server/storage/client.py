@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import logging
 from typing import TYPE_CHECKING
@@ -54,10 +55,10 @@ class S3StorageClient:
         # encoding that GCS's S3-compatible XML API does not accept. The
         # resulting PutObject failure is misleadingly reported by GCS as
         # SignatureDoesNotMatch. Required checksums remain enabled, while plain
-        # PutObject requests use the interoperable content-length payload.
+        # PutObject requests use the interoperable content-length payload. Each
+        # upload also supplies Content-MD5 for server-side integrity validation.
         self._client_config = Config(
             request_checksum_calculation="when_required",
-            response_checksum_validation="when_required",
         )
         self._session = aioboto3.Session(
             aws_access_key_id=config.access_key,
@@ -119,6 +120,9 @@ class S3StorageClient:
                     Key=key,
                     Body=body,
                     ContentType=content_type,
+                    ContentMD5=base64.b64encode(
+                        hashlib.md5(body, usedforsecurity=False).digest()
+                    ).decode("ascii"),
                 )
         except (ClientError, BotoCoreError) as e:
             raise ObjectUploadFailedError(

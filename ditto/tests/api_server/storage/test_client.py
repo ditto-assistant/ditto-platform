@@ -8,6 +8,7 @@ methods are :class:`AsyncMock` instances.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from contextlib import asynccontextmanager
 from typing import Any
@@ -76,7 +77,6 @@ class TestPutObject:
 
         client_config = session.client.call_args.kwargs["config"]
         assert client_config.request_checksum_calculation == "when_required"
-        assert client_config.response_checksum_validation == "when_required"
 
     async def test_happy_path_returns_stored_object(self):
         client = S3StorageClient(_make_config())
@@ -112,6 +112,9 @@ class TestPutObject:
         assert kwargs["Key"] == "abc/agent.tar.gz"
         assert kwargs["ContentType"] == "application/gzip"
         assert kwargs["Body"] == b"x"
+        assert kwargs["ContentMD5"] == base64.b64encode(
+            hashlib.md5(b"x", usedforsecurity=False).digest()
+        ).decode("ascii")
 
     async def test_default_content_type_octet_stream(self):
         client = S3StorageClient(_make_config())
