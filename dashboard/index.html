@@ -158,7 +158,7 @@
     .banner b { color: #fde68a; }
 
     /* ── Summary cards ──────────────────────────────────────── */
-    .cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin: 22px 0; }
+    .cards { display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px; margin: 22px 0; }
     .card {
       background: var(--bg-elev); border: 1px solid var(--border);
       border-radius: var(--radius); padding: 16px 18px; position: relative; overflow: hidden;
@@ -405,6 +405,7 @@
 
     @media (max-width: 960px) {
       .hide-md { display: none; }
+      .cards { grid-template-columns: repeat(3, 1fr); }
     }
     @media (max-width: 720px) {
       .cards { grid-template-columns: repeat(2, 1fr); }
@@ -440,6 +441,7 @@
       <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label"><span class="tip" title="Distinct miners with at least one scored run on the board (provisional runs included).">Miners Scored</span></div><div class="value" id="c-miners">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="The highest composite among ranked (full-benchmark) runs. Composite = (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates (efficiency, consistency); a canary miss zeroes the run. Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
       <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" title="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
+      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 24 seeds at run_size=full. The score a submission must beat. Source: dittobench-api docs/BASELINES.md (bench_version 2).">Reference Baseline</span></div><div class="value" id="c-baseline">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
       <div class="card"><div class="glow" style="background:var(--memory)"></div><div class="label"><span class="tip" title="Total LLM tokens the runs on the board spent (the harnesses' own calls to the locked model). Generation and grading are non-LLM, so scoring itself spends nothing.">Scoring Spend</span></div><div class="value" id="c-cost">–</div></div>
     </section>
@@ -567,6 +569,11 @@
     // The latest DittoBench benchmark version (from the leaderboard API). Runs
     // below this were scored on a previous benchmark and are marked as such.
     var currentBench = 2;
+    // Stock reference-harness baseline (dittobench-api docs/BASELINES.md): the
+    // composite a submission must beat, from 24 seeds at run_size=full on the
+    // locked model. Tied to the bench_version it was measured on; refresh from a
+    // new calibration run when the benchmark version bumps.
+    var REFERENCE_BASELINE = { bench_version: 2, composite: 0.492 };
 
     // Rank-movement baseline: the ranks from the viewer's last visit. Every
     // render compares against this snapshot (kept for the session) and then
@@ -648,7 +655,7 @@
       // Top gap: how contested the #1 spot is (#1 minus #2 composite).
       document.getElementById("c-spread").innerHTML = comps.length >= 2
         ? fx(comps[0] - comps[1]) + ' <small>#1 → #2</small>' : "–";
-      // Scoring spend: total LLM tokens burned generating + judging these runs.
+      // Scoring spend: total LLM tokens the harnesses' own calls burned (generation and grading are non-LLM).
       var toks = entries.map(function (e) { return e.tokens; }).filter(function (t) { return t != null; });
       document.getElementById("c-cost").innerHTML = toks.length
         ? fmtTokens(toks.reduce(function (a, b) { return a + b; }, 0)) + ' <small>tokens</small>' : "–";
@@ -660,6 +667,10 @@
         .filter(function (v) { return v != null; })
         .reduce(function (a, b) { return Math.max(a, b); }, 0);
       currentBench = data.current_bench_version || maxBv || currentBench;
+      // Reference-baseline card: only meaningful while the board runs the
+      // bench_version the baseline was measured on; otherwise it would mislead.
+      document.getElementById("c-baseline").innerHTML =
+        REFERENCE_BASELINE.bench_version === currentBench ? fx(REFERENCE_BASELINE.composite) : "–";
       // Header badge names the CURRENT benchmark, and notes when older runs are on
       // the board (which are individually marked in their rows).
       // "Older" = an explicit lower version OR a legacy run with no version recorded
