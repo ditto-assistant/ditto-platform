@@ -143,20 +143,42 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
 
 
+def _dev_bypass_permit(network: str) -> bool:
+    """Whether the dev "skip the validator permit check" escape hatch is active.
+
+    Only when ``DITTO_DEV_ALLOW_UNPERMITTED_VALIDATOR`` is explicitly truthy AND
+    the process is not pointed at mainnet. On ``finney`` the flag is refused
+    outright (logged at ERROR) so a stray dev env var can never open the
+    validator surface on the production chain, defence-in-depth beyond keeping it
+    unset in prod."""
+    if os.environ.get("DITTO_DEV_ALLOW_UNPERMITTED_VALIDATOR", "").lower() not in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return False
+    net = network.lower()
+    if net.startswith("finney") or net == "mainnet":
+        logger.error(
+            "refusing DITTO_DEV_ALLOW_UNPERMITTED_VALIDATOR on production network=%s;"
+            " enforcing the validator permit check",
+            network,
+        )
+        return False
+    return True
+
+
 async def _assert_validator_permitted(
-    chain: ChainClient, netuid: int, hotkey: str
+    chain: ChainClient, netuid: int, hotkey: str, *, network: str
 ) -> None:
     """Raise unless ``hotkey`` is a permitted validator on ``netuid``.
 
     A chain outage surfaces as 503 (matching the upload endpoints) rather
     than a silent allow/deny; a registered-but-unpermitted or unregistered
-    hotkey is a :class:`ValidatorAuthError`.
+    hotkey is a :class:`ValidatorAuthError`. ``network`` is the resolved
+    subtensor network, so the dev bypass can be refused on mainnet.
     """
-    if os.environ.get("DITTO_DEV_ALLOW_UNPERMITTED_VALIDATOR", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }:
+    if _dev_bypass_permit(network):
         logger.warning(
             "DEV: allowing validator request without permit hotkey=%s netuid=%d",
             hotkey,
@@ -196,7 +218,10 @@ async def require_validator(
     ):
         raise ValidatorAuthError("missing or malformed X-Validator-Hotkey header")
     netuid = request.app.state.config.chain.netuid
-    await _assert_validator_permitted(chain, netuid, x_validator_hotkey)
+    network = request.app.state.config.chain.subtensor_network
+    await _assert_validator_permitted(
+        chain, netuid, x_validator_hotkey, network=network
+    )
     return x_validator_hotkey
 
 
@@ -369,7 +394,10 @@ async def submit_score(
 
     # 2. The hotkey must be a permitted validator on this subnet.
     netuid = request.app.state.config.chain.netuid
-    await _assert_validator_permitted(chain, netuid, payload.validator_hotkey)
+    network = request.app.state.config.chain.subtensor_network
+    await _assert_validator_permitted(
+        chain, netuid, payload.validator_hotkey, network=network
+    )
 
     # 3. Atomic: record the score + advance status together. The row lock
     #    serializes concurrent scorers so the status guard + transition below

@@ -152,7 +152,9 @@ StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
 GeneratorDep = Annotated[DatasetGenerator, Depends(get_dataset_generator)]
 
 
-async def _assert_screener_permitted(chain: ChainDep, netuid: int, hotkey: str) -> None:
+async def _assert_screener_permitted(
+    chain: ChainDep, netuid: int, hotkey: str, *, network: str
+) -> None:
     """Permit check reusing the validator's, re-flavoured as a screener error.
 
     A chain outage still surfaces as the validator helper's 503; a
@@ -160,7 +162,7 @@ async def _assert_screener_permitted(chain: ChainDep, netuid: int, hotkey: str) 
     :class:`ScreenerAuthError` (code 5000) rather than a validator one.
     """
     try:
-        await _assert_validator_permitted(chain, netuid, hotkey)
+        await _assert_validator_permitted(chain, netuid, hotkey, network=network)
     except ValidatorAuthError as e:
         raise ScreenerAuthError(str(e)) from e
 
@@ -178,7 +180,10 @@ async def require_screener(
     if x_screener_hotkey is None or not re.fullmatch(_SS58_PATTERN, x_screener_hotkey):
         raise ScreenerAuthError("missing or malformed X-Screener-Hotkey header")
     netuid = request.app.state.config.chain.netuid
-    await _assert_screener_permitted(chain, netuid, x_screener_hotkey)
+    network = request.app.state.config.chain.subtensor_network
+    await _assert_screener_permitted(
+        chain, netuid, x_screener_hotkey, network=network
+    )
     return x_screener_hotkey
 
 
@@ -302,7 +307,10 @@ async def submit_result(
 
     # 2. The hotkey must be a permitted validator on this subnet.
     netuid = request.app.state.config.chain.netuid
-    await _assert_screener_permitted(chain, netuid, payload.screener_hotkey)
+    network = request.app.state.config.chain.subtensor_network
+    await _assert_screener_permitted(
+        chain, netuid, payload.screener_hotkey, network=network
+    )
 
     target = AgentStatus.EVALUATING if payload.passed else AgentStatus.SCREENING_FAILED
 

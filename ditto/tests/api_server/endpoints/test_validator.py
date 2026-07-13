@@ -957,3 +957,23 @@ class TestMultiValidatorConsensus:
         reopened = await client.post("/api/v1/validator/job", headers=dave_hdr)
         assert reopened.status_code == 200, reopened.text
         assert reopened.json()["agent_id"] == str(agent_id)
+
+
+def test_dev_bypass_permit_refused_on_mainnet(monkeypatch) -> None:
+    """The dev permit-bypass flag is honored off mainnet but refused on finney,
+    so a stray env var can never open the validator surface on production."""
+    from ditto.api_server.endpoints.validator import _dev_bypass_permit
+
+    # Unset: never bypass, regardless of network.
+    monkeypatch.delenv("DITTO_DEV_ALLOW_UNPERMITTED_VALIDATOR", raising=False)
+    assert _dev_bypass_permit("finney") is False
+    assert _dev_bypass_permit("ws://localhost:9944") is False
+
+    # Set: honored on a dev/local network...
+    monkeypatch.setenv("DITTO_DEV_ALLOW_UNPERMITTED_VALIDATOR", "true")
+    assert _dev_bypass_permit("ws://localhost:9944") is True
+    assert _dev_bypass_permit("test") is True
+    # ...but refused on mainnet even when explicitly set.
+    assert _dev_bypass_permit("finney") is False
+    assert _dev_bypass_permit("Finney") is False
+    assert _dev_bypass_permit("mainnet") is False
