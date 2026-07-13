@@ -232,6 +232,39 @@ class TestPublicLeaderboard:
         assert top["tool_mean"] == pytest.approx(0.95)
         assert top["memory_mean"] == pytest.approx(0.8)
 
+    async def test_exposes_advisory_calibration(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # P5: the advisory Brier calibration telemetry surfaces as an unscored
+        # column; a run without it (or with a malformed value) shows null.
+        await _seed_scored(
+            session_maker,
+            miner=_MINER_A,
+            composite=0.7,
+            tool_mean=0.7,
+            memory_mean=0.7,
+            details={"calibration_brier": 0.12, "calibration_n": 34},
+        )
+        await _seed_scored(
+            session_maker,
+            miner=_MINER_B,
+            composite=0.6,
+            tool_mean=0.6,
+            memory_mean=0.6,
+            details={"calibration_brier": 7.5},  # out of range → dropped
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+        by_miner = {e["miner_hotkey"]: e for e in body["entries"]}
+        assert by_miner[_MINER_A]["calibration_brier"] == pytest.approx(0.12)
+        assert by_miner[_MINER_A]["calibration_n"] == 34
+        assert by_miner[_MINER_B]["calibration_brier"] is None
+        assert by_miner[_MINER_B]["calibration_n"] is None
+
     async def test_never_leaks_integrity_fields(
         self,
         app: FastAPI,
@@ -268,7 +301,11 @@ class TestPublicLeaderboard:
 
         resp = await client.get("/api/v1/public/leaderboard")
         entry = resp.json()["entries"][0]
-        for leaked in ("signature", "sha256", "validator_hotkey", "agent_id", "seed"):
+        # agent_id is deliberately exposed (already public via /submissions and the
+        # per-agent drill-in endpoints) so the dashboard can link a row to its k=3
+        # record; the seed and the per-validator/artifact identifiers stay hidden.
+        assert "agent_id" in entry
+        for leaked in ("signature", "sha256", "validator_hotkey", "seed"):
             assert leaked not in entry
         # The answer key must appear NOWHERE in the whole response, even nested
         # inside the redacted per-case results. Check the quoted JSON keys (so a

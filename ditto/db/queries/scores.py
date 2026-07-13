@@ -4,8 +4,10 @@ A score is upserted per ``(agent_id, validator_hotkey)``: a validator
 re-scoring an agent overwrites its prior row rather than appending. The
 upsert is a read-then-write inside the caller's transaction (portable
 across the Postgres runtime and the SQLite unit-test fallback) rather than
-a dialect-specific ``ON CONFLICT``; at MVP single-validator concurrency the
-PK still guarantees one row per ``(agent, validator)``.
+a dialect-specific ``ON CONFLICT``. Under the k=3 quorum several validators
+score the same agent, so the ``(agent_id, validator_hotkey)`` PK is what holds
+each validator to one row; finalization takes the median across the rows
+(:func:`list_eligible_ledger`).
 """
 
 from __future__ import annotations

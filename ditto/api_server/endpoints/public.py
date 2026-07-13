@@ -194,6 +194,23 @@ def _safe_case_results(details: dict) -> list[PublicCaseResult] | None:
     return out or None
 
 
+def _safe_calibration(details: dict) -> tuple[float | None, int | None]:
+    """Pull the advisory calibration telemetry (prod hardening P5): the mean
+    Brier score over confidence-reporting cases and its sample size. Tolerates
+    a malformed blob — anything out of range degrades to ``(None, None)``.
+    Never scored; surfacing it costs nothing to harnesses that omit confidence.
+    """
+    brier = details.get("calibration_brier")
+    n = details.get("calibration_n")
+    if isinstance(brier, bool) or not isinstance(brier, (int, float)):
+        return None, None
+    b = float(brier)
+    if not 0.0 <= b <= 1.0:
+        return None, None
+    count = n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
+    return b, count
+
+
 def _safe_stderr(details: dict) -> float | None:
     """Estimate the composite's standard error from the per-case score spread.
 
@@ -254,11 +271,15 @@ def _public_entry(
     # A length-1 history is just the current score — not a trend; drop it so the
     # dashboard shows a sparkline only when there's an actual trajectory.
     trend = history if history and len(history) >= 2 else None
+    calibration_brier, calibration_n = _safe_calibration(details)
     return PublicLeaderboardEntry(
         rank=rank,
+        agent_id=r.agent_id,
         miner_hotkey=r.miner_hotkey,
         composite=r.composite,
         composite_stderr=_safe_stderr(details),
+        calibration_brier=calibration_brier,
+        calibration_n=calibration_n,
         tool_mean=r.tool_mean,
         memory_mean=r.memory_mean,
         first_seen=r.first_seen,

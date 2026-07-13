@@ -114,6 +114,24 @@ class JobResponse(BaseModel):
             description="Generator profile for the pinned dataset (small|medium|full).",
         ),
     ] = None
+    dataset_seed_block: Annotated[
+        int | None,
+        Field(
+            default=None,
+            description="Chain block number the dataset seed derives from "
+            "(trustless verification; null for pre-derivation agents).",
+        ),
+    ] = None
+    dataset_seed_block_hash: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Hash of ``dataset_seed_block``. Lets the validator "
+            "independently re-derive ``seed = derive_seed(block_hash, agent_id)`` "
+            "and refuse a ticket whose seed the platform could have chosen "
+            "(anti-grind, prod hardening P2). Null for pre-derivation agents.",
+        ),
+    ] = None
 
     model_config = ConfigDict(
         json_schema_extra={
