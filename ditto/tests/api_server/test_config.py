@@ -25,6 +25,13 @@ def _set_minimum_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STORAGE_BUCKET", "ditto-agents")
     monkeypatch.setenv("STORAGE_ACCESS_KEY", "minio")
     monkeypatch.setenv("STORAGE_SECRET_KEY", "miniominio")
+    monkeypatch.setenv(
+        "SCREENER_HOTKEY",
+        "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+    )
+    monkeypatch.setenv(
+        "SCREENER_API_TOKEN", "test-screener-token-at-least-32-characters"
+    )
     # Override unset by default; tested explicitly elsewhere.
     monkeypatch.delenv("TAO_PRICE_OVERRIDE_USD", raising=False)
 
@@ -148,4 +155,39 @@ class TestCheckConfig:
     def test_unknown_log_level_raises(self):
         config = replace(make_api_server_config(), log_level="loud")
         with pytest.raises(ApiServerConfigError, match="log_level"):
+            check_config(config)
+
+    def test_screener_auth_may_be_disabled(self):
+        from ditto.api_server import ScreenerAuthConfig
+
+        config = replace(
+            make_api_server_config(),
+            screener_auth=ScreenerAuthConfig(hotkey=None, api_token=None),
+        )
+        check_config(config)
+
+    def test_screener_auth_rejects_partial_config(self):
+        from ditto.api_server import ScreenerAuthConfig
+
+        config = replace(
+            make_api_server_config(),
+            screener_auth=ScreenerAuthConfig(
+                hotkey="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+                api_token=None,
+            ),
+        )
+        with pytest.raises(ApiServerConfigError, match="must be set together"):
+            check_config(config)
+
+    def test_screener_auth_rejects_short_token(self):
+        from ditto.api_server import ScreenerAuthConfig
+
+        config = replace(
+            make_api_server_config(),
+            screener_auth=ScreenerAuthConfig(
+                hotkey="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+                api_token="too-short",
+            ),
+        )
+        with pytest.raises(ApiServerConfigError, match="at least 32"):
             check_config(config)

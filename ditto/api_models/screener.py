@@ -16,8 +16,8 @@ same to an operator:
 
 The platform stays thin: it owns only the state machine + the queue. The build
 check itself lives in the screener worker (``ditto-subnet``). The screener
-authenticates exactly like the validator (a permitted hotkey; the result POST is
-signed) — a distinct ``screener_permit`` is a future refinement.
+authenticates with a dedicated bearer token and allowlisted hotkey; result POSTs
+are additionally signed by that hotkey.
 """
 
 from __future__ import annotations

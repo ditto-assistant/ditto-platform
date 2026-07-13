@@ -149,6 +149,11 @@ def _config_to_log_dict(config: ApiServerConfig) -> dict[str, object]:
         "upload": {
             "payment_address": config.upload_payment_address,
         },
+        "screener": {
+            "enabled": config.screener_auth.enabled,
+            "hotkey": config.screener_auth.hotkey or "<unset>",
+            "api_token": _redact(config.screener_auth.api_token),
+        },
         "pricing": {
             "fee_usd": str(config.pricing.fee_usd),
             "fee_buffer": str(config.pricing.fee_buffer),
