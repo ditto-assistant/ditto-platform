@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import (
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import get_dataset_generator, get_session
-from ditto.db.models import Agent, Base
+from ditto.db.models import Agent, Base, Score
 from ditto.db.queries.audit import (
     EVENT_SCORE,
     GENESIS_HASH,
@@ -79,6 +79,7 @@ async def _seed_scored(
     status: AgentStatus = AgentStatus.SCORED,
     median_ms: int = 500,
     generated_at: datetime = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
+    recorded_at: datetime | None = None,
     details: dict | None = None,
 ) -> None:
     async with maker() as s, s.begin():
@@ -108,6 +109,14 @@ async def _seed_scored(
             signature="ab" * 64,
             details=details,
         )
+        if recorded_at is not None:
+            score = await s.get(
+                Score,
+                (agent.agent_id, "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"),
+            )
+            assert score is not None
+            score.created_at = recorded_at
+            score.updated_at = recorded_at
 
 
 async def _seed_k3(
@@ -366,7 +375,9 @@ class TestPublicHealth:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         now = datetime.now(UTC)
-        # Two scored miners (recent), latencies 400 + 800 => avg 600.
+        # Two scored miners, latencies 400 + 800 => avg 600. The signed report
+        # timestamps are deliberately stale: public activity must use when the
+        # platform recorded each score, not validator-controlled provenance.
         await _seed_scored(
             session_maker,
             miner=_MINER_A,
@@ -374,7 +385,8 @@ class TestPublicHealth:
             tool_mean=0.5,
             memory_mean=0.3,
             median_ms=400,
-            generated_at=now - timedelta(minutes=5),
+            generated_at=datetime(2026, 1, 1, tzinfo=UTC),
+            recorded_at=now - timedelta(minutes=5),
         )
         await _seed_scored(
             session_maker,
@@ -383,7 +395,8 @@ class TestPublicHealth:
             tool_mean=0.95,
             memory_mean=0.8,
             median_ms=800,
-            generated_at=now - timedelta(days=2),  # outside the 24h window
+            generated_at=datetime(2026, 1, 1, tzinfo=UTC),
+            recorded_at=now - timedelta(days=2),  # outside the 24h window
         )
         # A third miner who submitted but has not been scored yet.
         await _seed_agent(
@@ -402,7 +415,7 @@ class TestPublicHealth:
         assert body["scored_agents"] == 2
         assert body["scores_24h"] == 1  # only MINER_A is within 24h
         assert body["avg_latency_ms"] == 600
-        # last_scored_at is the newest generated_at (MINER_A, ~5 min ago).
+        # last_scored_at is the newest platform write (MINER_A, ~5 min ago).
         last = datetime.fromisoformat(body["last_scored_at"])
         assert abs((now - last).total_seconds()) < 3600
 
