@@ -98,6 +98,9 @@ class ApiServerConfig:
     screener_auth: ScreenerAuthConfig
     """Dedicated signer and bearer token for the platform-operated screener."""
 
+    admin_api_token: str | None = None
+    """Bearer token for private Backroom/operator administration endpoints."""
+
     dashboard_enabled: bool = True
     """Serve the public dashboard SPA (``dashboard/index.html``) at ``/``.
 
@@ -174,6 +177,7 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
             hotkey=screener_hotkey,
             api_token=screener_api_token,
         ),
+        admin_api_token=os.environ.get("DITTO_ADMIN_API_TOKEN") or None,
         dashboard_enabled=dashboard_enabled,
         dashboard_wandb_url=dashboard_wandb_url,
     )
@@ -202,3 +206,7 @@ def check_config(config: ApiServerConfig) -> None:
         raise ApiServerConfigError("SCREENER_HOTKEY is not a valid SS58 address")
     if auth.api_token is not None and len(auth.api_token) < 32:
         raise ApiServerConfigError("SCREENER_API_TOKEN must be at least 32 characters")
+    if config.admin_api_token is not None and len(config.admin_api_token) < 32:
+        raise ApiServerConfigError(
+            "DITTO_ADMIN_API_TOKEN must be at least 32 characters"
+        )

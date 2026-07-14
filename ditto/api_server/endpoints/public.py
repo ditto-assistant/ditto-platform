@@ -740,7 +740,7 @@ def _public_activity_status(
         return "waiting_screening"
     if status in (AgentStatus.SCREENING_PASSED, AgentStatus.EVALUATING):
         return "evaluating" if has_active_validation else "waiting_validator"
-    if status == AgentStatus.ATH_PENDING_REVIEW:
+    if status in (AgentStatus.ATH_PENDING_REVIEW, AgentStatus.QUARANTINED):
         return "under_review"
     if status == AgentStatus.BANNED:
         return "rejected"

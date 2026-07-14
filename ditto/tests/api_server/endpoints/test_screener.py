@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
@@ -50,8 +51,14 @@ from ditto.api_server.middleware.error_envelope import (
 )
 from ditto.chain import ChainError
 from ditto.chain.models import BlockInfo, NeuronInfo
-from ditto.db.models import Agent, Base, ScreenerHeartbeat, ScreeningAttempt
-from ditto_screening_protocol import verdict_signing_message
+from ditto.db.models import (
+    Agent,
+    Base,
+    ScreenerHeartbeat,
+    ScreeningAttempt,
+    ScreeningQuarantine,
+)
+from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
 
 _KEYPAIR = bittensor.Keypair.create_from_uri("//Alice")
 _SCREENER_HOTKEY = _KEYPAIR.ss58_address
@@ -75,6 +82,8 @@ def _result_payload(
     **overrides: object,
 ) -> dict:
     attempt_id = overrides.get("attempt_id")
+    outcome_raw = overrides.get("outcome")
+    outcome = ScreenResultOutcome(outcome_raw) if isinstance(outcome_raw, str) else None
     signed = (
         verdict_signing_message(
             screener_hotkey=_SCREENER_HOTKEY,
@@ -82,6 +91,16 @@ def _result_payload(
             attempt_id=attempt_id,
             passed=passed,
             policy_version=policy_version,
+            outcome=outcome,
+            manifest_digest=overrides.get("manifest_digest")
+            if isinstance(overrides.get("manifest_digest"), str)
+            else None,
+            finding_digest=overrides.get("finding_digest")
+            if isinstance(overrides.get("finding_digest"), str)
+            else None,
+            reason_code=overrides.get("reason_code")
+            if isinstance(overrides.get("reason_code"), str)
+            else None,
         )
         if isinstance(attempt_id, UUID)
         else f"{_SCREENER_HOTKEY}:{agent_id}:{passed}:{policy_version}"
@@ -379,9 +398,28 @@ class TestHeartbeat:
             started.isoformat().replace("+00:00", "")
         )
 
+        review = await client.post(
+            "/api/v1/screener/heartbeat",
+            json=_heartbeat_payload(
+                timestamp=timestamp + 1,
+                state="screening",
+                active_agent_id=agent_id,
+                protocol_version=2,
+                progress={
+                    "stage": "source_review_30",
+                    "started_at": int(started.timestamp()),
+                },
+            ),
+        )
+        assert review.status_code == 200, review.text
+        review_entry = (await client.get("/api/v1/public/screeners")).json()[
+            "screeners"
+        ][0]
+        assert review_entry["screening_progress"]["stage"] == "source_review_30"
+
         idle = await client.post(
             "/api/v1/screener/heartbeat",
-            json=_heartbeat_payload(timestamp=timestamp + 1, protocol_version=2),
+            json=_heartbeat_payload(timestamp=timestamp + 2, protocol_version=2),
         )
         assert idle.status_code == 200
         idle_entry = (await client.get("/api/v1/public/screeners")).json()["screeners"][
@@ -394,7 +432,7 @@ class TestHeartbeat:
         legacy = await client.post(
             "/api/v1/screener/heartbeat",
             json=_heartbeat_payload(
-                timestamp=timestamp + 2,
+                timestamp=timestamp + 3,
                 state="screening",
                 active_agent_id=agent_id,
                 protocol_version=1,
@@ -410,7 +448,7 @@ class TestHeartbeat:
         active = await client.post(
             "/api/v1/screener/heartbeat",
             json=_heartbeat_payload(
-                timestamp=timestamp + 3,
+                timestamp=timestamp + 4,
                 state="screening",
                 active_agent_id=agent_id,
                 protocol_version=2,
@@ -926,6 +964,111 @@ class TestClaim:
 
         assert response.status_code == 409
         assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+
+    async def test_attempt_bound_quarantine_is_durable_and_idempotent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        payload = _result_payload(
+            agent_id,
+            passed=False,
+            attempt_id=attempt_id,
+            outcome="quarantine",
+            manifest_digest="12" * 32,
+            finding_digest="34" * 32,
+            reason_code="agentic-source-review-tripwire",
+        )
+        first = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=payload
+        )
+        replay = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=payload
+        )
+        assert first.status_code == replay.status_code == 200
+        assert replay.json()["status"] == AgentStatus.QUARANTINED
+        async with session_maker() as session:
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            quarantines = (await session.scalars(select(ScreeningQuarantine))).all()
+            assert attempt is not None and attempt.status == "quarantined"
+            assert len(quarantines) == 1
+
+
+class TestQuarantineAdmin:
+    async def test_list_release_and_conflicting_second_resolution(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        quarantine_payload = _result_payload(
+            agent_id,
+            passed=False,
+            attempt_id=attempt_id,
+            outcome="quarantine",
+            manifest_digest="56" * 32,
+            finding_digest="78" * 32,
+            reason_code="agentic-source-review-tripwire",
+        )
+        held = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=quarantine_payload
+        )
+        assert held.status_code == 200
+
+        admin_headers = {
+            "Authorization": "Bearer test-admin-token-at-least-32-characters",
+            "X-Admin-Actor": "backroom:test-user",
+        }
+        listing = await client.get(
+            "/api/v1/admin/screening-quarantines", headers=admin_headers
+        )
+        assert listing.status_code == 200
+        item = listing.json()["items"][0]
+        assert item["agent_id"] == str(agent_id)
+        assert item["reason_code"] == "agentic-source-review-tripwire"
+        assert "source" not in item
+
+        resolved = await client.post(
+            f"/api/v1/admin/screening-quarantines/{item['quarantine_id']}/resolve",
+            headers=admin_headers,
+            json={"resolution": "release", "reason": "Reviewed and approved"},
+        )
+        conflict = await client.post(
+            f"/api/v1/admin/screening-quarantines/{item['quarantine_id']}/resolve",
+            headers=admin_headers,
+            json={"resolution": "reject", "reason": "Conflicting action"},
+        )
+        assert resolved.status_code == 200
+        assert resolved.json()["agent_status"] == AgentStatus.EVALUATING
+        assert conflict.status_code == 409
+
+    async def test_admin_auth_is_required(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        response = await client.get(
+            "/api/v1/admin/screening-quarantines",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert response.status_code == 401
 
 
 # --- Artifact --------------------------------------------------------------
