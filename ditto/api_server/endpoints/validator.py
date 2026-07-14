@@ -117,9 +117,10 @@ _ARTIFACT_URL_TTL = timedelta(minutes=5)
 
 # How long a validator has to redeem a ticket with a score before it lapses and
 # the slot re-opens for another validator.
-# Keep the lease longer than the validator's locked 40-minute benchmark cap.
-# The five-minute margin leaves enough time to sign and submit a completed run.
-_TICKET_TTL = timedelta(minutes=45)
+# Keep the lease longer than the validator's locked 75-minute benchmark cap.
+# The 15-minute margin leaves enough time to fetch, sign, and submit a
+# completed run.
+_TICKET_TTL = timedelta(minutes=90)
 
 # Signed job claims outside this window are stale. A consumed nonce remains in
 # the database for the same window, making replay rejection consistent across
