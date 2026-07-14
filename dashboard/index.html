@@ -777,7 +777,11 @@
     .banner .ic { width: 16px; height: 16px; flex: none; }
     a .ic.ext { width: 12px; height: 12px; opacity: 0.7; margin-left: 2px; }
     .side-theme { margin-top: 4px; }
-    .side-theme .theme-switch { width: 100%; }
+    /* In the vertical sidebar the four options wrap to a 2x2 grid so "Time"
+       can't overflow the 240px rail; the mobile top bar keeps the compact row. */
+    .side-theme .theme-switch { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
+    .side-theme .theme-option { justify-content: center; min-width: 0; }
+    .side-theme .theme-option span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .side-foot { margin-top: auto; display: flex; flex-direction: column; gap: 8px; }
     .side-foot .btn { justify-content: center; }
     .page { display: none; }
@@ -1251,6 +1255,7 @@
       .sidebar { position: sticky; top: 0; z-index: 60; height: auto; flex: none; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 12px; border-right: none; border-bottom: 1px solid var(--border); }
       .sidebar .brand { flex: 1 1 auto; min-width: 0; order: 0; }
       .side-theme { order: 1; margin-top: 0; }
+      .side-theme .theme-switch { display: inline-flex; width: auto; }
       .nav { order: 2; flex-basis: 100%; width: 100%; flex-direction: row; flex-wrap: nowrap; overflow-x: auto; gap: 4px; margin-top: 2px; }
       .nav-item { flex: 0 0 auto; padding: 7px 11px; border-radius: 8px; }
       .nav-item .ni-desc { display: none; }
