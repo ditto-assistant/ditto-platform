@@ -485,12 +485,10 @@
     .fleet-table { min-width: 940px; }
     .fleet-table tbody tr { cursor: default; }
     .fleet-node { display: block; color: var(--text); font-family: var(--mono); font-size: 12px; }
-    .fleet-role { display: block; margin-top: 3px; color: var(--text-faint); font-size: 11px; }
     .fleet-version { display: block; font-family: var(--mono); font-size: 12px; color: var(--text); }
     .fleet-protocol { display: block; margin-top: 3px; font-size: 11px; color: var(--text-faint); }
     .fleet-time { display: block; font-variant-numeric: tabular-nums; white-space: nowrap; }
     .fleet-connected { display: block; margin-top: 3px; color: var(--text-faint); font-size: 11px; white-space: nowrap; }
-    .fleet-health-note { display: block; margin-top: 4px; color: var(--text-faint); font-size: 10.5px; }
     .fleet-metrics { display: grid; grid-template-columns: repeat(4, minmax(52px, 1fr)); gap: 4px; min-width: 270px; }
     .fleet-metric { min-width: 0; padding: 5px 6px; border: 1px solid color-mix(in oklab, var(--border) 68%, transparent); border-radius: 5px; background: color-mix(in oklab, var(--bg-elev-2) 45%, transparent); }
     .fleet-metric .k { display: block; color: var(--text-faint); font-size: 9px; font-weight: 700; letter-spacing: .25px; text-transform: uppercase; }
@@ -871,10 +869,7 @@
       margin-bottom: 16px;
     }
     .operations-copy { min-width: 0; }
-    .operations-kicker,
-    .atlas-title,
-    .atlas-cadence,
-    .privacy-note {
+    .atlas-title {
       color: var(--text-dim);
       font: 700 10px/1.2 var(--mono);
       letter-spacing: .07em;
@@ -882,21 +877,13 @@
     }
     .operations-copy h2 {
       max-width: 900px;
-      margin: 8px 0 0;
+      margin: 0;
       font-family: var(--display);
       font-size: 46px;
       font-weight: 400;
       line-height: 1.02;
       letter-spacing: -.025em;
       text-wrap: balance;
-    }
-    .operations-copy p {
-      max-width: 72ch;
-      margin: 10px 0 0;
-      color: var(--text-dim);
-      font-size: 13px;
-      line-height: 1.55;
-      text-wrap: pretty;
     }
     .fleet-toggle {
       position: relative;
@@ -945,7 +932,6 @@
     .atlas-label { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
     .atlas-title { display: block; color: var(--text); }
     .atlas-note { display: block; margin-top: 5px; color: var(--text-dim); font-size: 11px; line-height: 1.4; }
-    .atlas-cadence { white-space: nowrap; }
     .pipeline-overview {
       display: grid;
       grid-template-columns: repeat(5, minmax(148px, 1fr));
@@ -1049,7 +1035,6 @@
     .fleet-table-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; margin: 18px 0 9px; }
     .fleet-table-head h3 { margin: 0; font-family: var(--display); font-size: 22px; font-weight: 400; line-height: 1.1; }
     .fleet-table-head .hint { display: block; margin-top: 5px; color: var(--text-dim); font: 400 10px/1.4 var(--mono); }
-    .privacy-note { white-space: nowrap; }
     .fleet-table { min-width: 1250px; }
     .fleet-table tbody td { padding-block: 9px; }
     .fleet-node-wrap { display: grid; grid-template-columns: 25px 1fr; align-items: center; gap: 9px; }
@@ -1065,13 +1050,11 @@
       font: 700 10px/1 var(--mono);
     }
     .fleet-node { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .fleet-role { font-size: 9.5px; }
     .fleet-time { font-family: var(--mono); font-size: 11px; }
     .fleet-connected { margin-top: 0; font-size: 10px; }
     .stage { border-radius: 3px; padding: 4px 7px; }
     .stage.paused { color: var(--accent-2); border-color: color-mix(in oklch, var(--accent-2) 40%, var(--border)); background: color-mix(in oklch, var(--accent-2) 10%, var(--bg-elev)); }
     .stage.unknown { color: var(--text-dim); border-color: var(--border); background: var(--bg-elev-2); }
-    .fleet-health-note { max-width: 17ch; line-height: 1.35; }
     .fleet-meter { display: grid; grid-template-columns: minmax(36px, 1fr) auto; align-items: center; gap: 7px; min-width: 82px; }
     .fleet-meter-track { display: block; height: 6px; border: 1px solid var(--border); background: var(--bg-elev-2); overflow: hidden; }
     .fleet-meter-track i { display: block; width: calc(var(--value) * 1%); height: 100%; background: var(--good); }
@@ -1103,7 +1086,6 @@
       .fleet-ledger-row { padding: 5px 0; }
       .fleet-ledger p { grid-column: 1 / -1; }
       .fleet-table-head { align-items: flex-start; flex-direction: column; }
-      .privacy-note { white-space: normal; }
       .validators { margin-inline: -16px; border-right: 0; border-left: 0; border-radius: 0; }
     }
     @media (prefers-reduced-motion: reduce) {
@@ -1183,9 +1165,7 @@
     <section class="operations" aria-labelledby="operations-title">
       <div class="operations-head">
         <div class="operations-copy">
-          <div class="operations-kicker">Public status · Subnet 118</div>
-          <h2 id="operations-title">The machines behind the work.</h2>
-          <p>Signed, privacy-safe health from the validators and platform screeners moving submissions through DittoBench.</p>
+          <h2 id="operations-title">Network operations</h2>
         </div>
         <label class="fleet-toggle" for="show-screeners">
           <input id="show-screeners" type="checkbox" />
@@ -1200,9 +1180,8 @@
           <div class="atlas-label">
             <div>
               <span class="atlas-title">Submission pipeline</span>
-              <span class="atlas-note">Live queues · select a submission for its history</span>
+              <span class="atlas-note">Select a submission for history</span>
             </div>
-            <span class="atlas-cadence">Current work</span>
           </div>
           <div class="pipeline-overview" id="pipeline-overview" aria-label="Live submission queues">
             <section class="pipeline-column" data-pipeline-stage="waiting_screening" aria-labelledby="pipeline-wait-screen-title">
@@ -1246,16 +1225,15 @@
       <div class="fleet-table-head">
         <div>
           <h3>Fleet health</h3>
-          <span class="hint" id="fleet-summary" aria-live="polite">signed validator heartbeat status · loading…</span>
+          <span class="hint" id="fleet-summary" aria-live="polite">Loading validator status…</span>
         </div>
-        <span class="privacy-note">Rounded · allowlisted · 60 sec cadence</span>
       </div>
       <div class="board validators" tabindex="0" aria-label="Fleet health table, horizontally scrollable on small screens">
         <table class="fleet-table" aria-label="Validator fleet health" id="fleet-table">
           <thead>
             <tr>
               <th scope="col" style="width:160px">Node</th>
-              <th scope="col" style="width:118px">Availability</th>
+              <th scope="col" style="width:118px">Status</th>
               <th scope="col" style="width:105px">First seen</th>
               <th scope="col" style="width:110px">Last heartbeat</th>
               <th scope="col" style="width:165px">Current work</th>
@@ -2514,11 +2492,11 @@
     }
 
     function fleetStatus(entry) {
-      if (entry.availability === "offline" || entry.online === false) return ["Offline", "bad", "Heartbeat stale"];
-      if (entry.availability === "paused") return ["Paused", "paused", "Reporter paused"];
-      if (entry.health === "warning") return ["Warning", "warn", "System or worker needs attention"];
-      if (entry.health === "healthy") return ["Healthy", "good", "Available"];
-      return ["Not reported", "unknown", entry.system_metrics ? "Some optional telemetry missing" : "Heartbeat available; system health not reported"];
+      if (entry.availability === "offline" || entry.online === false) return ["Offline", "bad"];
+      if (entry.availability === "paused") return ["Paused", "paused"];
+      if (entry.health === "warning") return ["Warning", "warn"];
+      if (entry.health === "healthy") return ["Healthy", "good"];
+      return ["Not reported", "unknown"];
     }
 
     function fleetMeter(value, tone) {
@@ -2528,7 +2506,7 @@
     }
 
     function renderFleetMetricCells(metrics) {
-      if (!metrics) return '<td class="fleet-unreported" colspan="4">Not reported by this software version</td>';
+      if (!metrics) return '<td class="fleet-unreported" colspan="4">System metrics unavailable</td>';
       var dockerValue = "Not reported";
       var dockerTone = "";
       if (metrics.docker_status === "healthy") dockerValue = metrics.running_containers + " running";
@@ -2577,13 +2555,13 @@
       table.setAttribute("aria-label", (showScreeners ? "Screener" : "Validator") + " fleet health");
       if (unavailable) {
         resetFleetLedger();
-        summary.textContent = "signed " + singular + " heartbeat status · unavailable";
+        summary.textContent = (showScreeners ? "Screener" : "Validator") + " status unavailable";
         rows.innerHTML = '<tr><td colspan="10" class="empty">' + (showScreeners ? "Screener" : "Validator") + ' status is temporarily unavailable.</td></tr>';
         return;
       }
       if (data === null) {
         resetFleetLedger();
-        summary.textContent = "signed " + singular + " heartbeat status · loading…";
+        summary.textContent = "Loading " + singular + " status…";
         rows.innerHTML = '<tr><td colspan="10" class="empty">Loading ' + kind + '…</td></tr>';
         return;
       }
@@ -2594,8 +2572,8 @@
         return entry.availability === "available";
       }).length;
       summary.textContent = entries.length
-        ? available + " of " + reported + " reporting " + kind + " available"
-        : "no heartbeat-capable " + kind + " have reported yet";
+        ? available + " of " + reported + " " + kind + " available"
+        : "No " + kind + " reporting";
       if (!entries.length) {
         rows.innerHTML = '<tr><td colspan="10" class="empty">No ' + singular + ' software reports yet.</td></tr>';
         return;
@@ -2607,7 +2585,7 @@
         var version = String(entry.software_version || "Unknown");
         if (version !== "Unknown" && version.charAt(0).toLowerCase() !== "v") version = "v" + version;
         var reportedAt = entry.seen_at || entry.reported_at;
-        var firstSeen = entry.first_seen_at ? relTime(entry.first_seen_at) : "Not available";
+        var firstSeen = entry.first_seen_at ? relTime(entry.first_seen_at) : "–";
         var active = entry.active_agent_id
           ? '<span class="current-agent" title="' + esc(entry.active_agent_id) + '">Agent ' + esc(String(entry.active_agent_id).slice(0, 8)) + '</span>'
           : '';
@@ -2616,9 +2594,8 @@
           : "Protocol " + entry.protocol_version;
         return '<tr>' +
           '<td><span class="fleet-node-wrap"><span class="fleet-type" aria-label="' + (singular === "screener" ? "Screener" : "Validator") + '">' + (singular === "screener" ? "S" : "V") + '</span><span>' +
-            '<span class="fleet-node" title="' + esc(hotkey) + '">' + esc(shortKey(hotkey)) + '</span>' +
-            '<span class="fleet-role">' + (singular === "screener" ? "Platform screener" : "Independent validator") + '</span></span></span></td>' +
-          '<td><span class="stage ' + status[1] + '">' + status[0] + '</span><span class="fleet-health-note">' + esc(status[2]) + '</span></td>' +
+            '<span class="fleet-node" title="' + esc(hotkey) + '">' + esc(shortKey(hotkey)) + '</span></span></span></td>' +
+          '<td><span class="stage ' + status[1] + '">' + status[0] + '</span></td>' +
           '<td><span class="fleet-time" title="' + esc(entry.first_seen_at || "") + '">' + esc(firstSeen) + '</span></td>' +
           '<td><span class="fleet-time" title="' + esc(reportedAt) + '">' + relTime(reportedAt) + '</span></td>' +
           '<td><span class="stage ' + work[1] + '">' + esc(work[0]) + '</span>' + active + '</td>' +
