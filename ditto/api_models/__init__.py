@@ -40,6 +40,8 @@ from ditto.api_models.public import (
     PublicSubmissionScores,
     PublicSubmissionsResponse,
     PublicSubmissionSummary,
+    PublicValidatorHeartbeat,
+    PublicValidatorHeartbeatsResponse,
     PublicValidatorScore,
 )
 from ditto.api_models.retrieval import AgentResponse, AgentStatusResponse
@@ -65,6 +67,8 @@ from ditto.api_models.validator import (
     ScoreReport,
     SubmitScoreRequest,
     SubmitScoreResponse,
+    ValidatorHeartbeatRequest,
+    ValidatorHeartbeatResponse,
 )
 
 __all__ = [
@@ -100,6 +104,8 @@ __all__ = [
     "PublicSubmissionSummary",
     "PublicSubmissionsResponse",
     "PublicValidatorScore",
+    "PublicValidatorHeartbeat",
+    "PublicValidatorHeartbeatsResponse",
     "ScoreReport",
     "ScreenResultRequest",
     "ScreenResultResponse",
@@ -107,6 +113,8 @@ __all__ = [
     "ScreenerQueueResponse",
     "SubmitScoreRequest",
     "SubmitScoreResponse",
+    "ValidatorHeartbeatRequest",
+    "ValidatorHeartbeatResponse",
     "UploadAgentResponse",
     "UploadCheckRequest",
     "UploadCheckResponse",
