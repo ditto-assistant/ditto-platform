@@ -519,6 +519,9 @@
     .fleet-metric.bad .v { color: var(--danger); }
     .fleet-metrics-empty { min-width: 270px; color: var(--text-faint); font-size: 11.5px; }
     .current-agent { display: block; margin-top: 4px; font-family: var(--mono); font-size: 11px; color: var(--accent-2); }
+    .screener-progress { display: block; min-width: 0; }
+    .screener-progress-stage { display: block; color: var(--text); font-size: 11.5px; font-weight: 700; line-height: 1.35; }
+    .screener-progress-time { color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
     .benchmark-progress { display: block; min-width: 0; margin-top: 6px; }
     .benchmark-progress:first-child { margin-top: 0; }
     .benchmark-stage-label { display: block; color: var(--text); font-size: 11.5px; font-weight: 700; line-height: 1.35; }
@@ -1123,6 +1126,7 @@
       .fleet-ledger p { grid-column: 1 / -1; }
       .fleet-table-head { align-items: flex-start; flex-direction: column; }
       .validators { margin-inline: -16px; border-right: 0; border-left: 0; border-radius: 0; }
+      .fleet-work-col { min-width: 190px; }
     }
     @media (prefers-reduced-motion: reduce) {
       .fleet-option { transition: none; }
@@ -2619,6 +2623,46 @@
       return states[state] || [fallback, ""];
     }
 
+    function screenerStageLabel(stage) {
+      var labels = {
+        preparing: "Preparing",
+        downloading: "Downloading submission",
+        validating: "Validating submission",
+        building: "Building image",
+        starting: "Starting service",
+        health_check: "Checking health",
+        submitting: "Submitting result"
+      };
+      return labels[stage] || "Screening";
+    }
+
+    function elapsedDuration(startedAt) {
+      var started = Date.parse(startedAt || "");
+      if (!Number.isFinite(started)) return "";
+      var seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
+      var hours = Math.floor(seconds / 3600);
+      var minutes = Math.floor((seconds % 3600) / 60);
+      var remainder = seconds % 60;
+      return (hours ? hours + "h " : "") + (hours || minutes ? minutes + "m " : "") + remainder + "s";
+    }
+
+    function renderScreenerProgress(entry) {
+      var progress = entry.screening_progress;
+      if (!progress) return "";
+      var label = screenerStageLabel(progress.stage);
+      var agent = entry.active_agent_name || "Unnamed agent";
+      var agentId = String(entry.active_agent_id || "");
+      return '<span class="screener-progress">' +
+        '<span class="screener-progress-stage">' + esc(label) + ' · <span class="screener-progress-time" data-started-at="' + esc(progress.started_at) + '">' + esc(elapsedDuration(progress.started_at)) + '</span></span>' +
+        '<span class="current-agent" title="' + esc(agentId) + '">' + esc(agent) + (agentId ? " · " + esc(agentId.slice(0, 8)) : "") + '</span></span>';
+    }
+
+    function updateScreenerElapsed() {
+      document.querySelectorAll(".screener-progress-time[data-started-at]").forEach(function (node) {
+        node.textContent = elapsedDuration(node.getAttribute("data-started-at"));
+      });
+    }
+
     function fleetStatus(entry) {
       if (entry.availability === "offline" || entry.online === false) return ["Offline", "bad"];
       if (entry.availability === "paused") return ["Paused", "paused"];
@@ -2715,12 +2759,15 @@
         var reportedAt = entry.seen_at || entry.reported_at;
         var firstSeen = entry.first_seen_at ? relTime(entry.first_seen_at) : "–";
         var active = entry.active_agent_id
-          ? '<span class="current-agent" title="' + esc(entry.active_agent_id) + '">Agent ' + esc(String(entry.active_agent_id).slice(0, 8)) + '</span>'
+          ? '<span class="current-agent" title="' + esc(entry.active_agent_id) + '">' + esc(entry.active_agent_name || "Agent") + ' · ' + esc(String(entry.active_agent_id).slice(0, 8)) + '</span>'
           : '';
-        var benchmark = singular === "validator" && entry.active_benchmark
+        var currentWork = singular === "validator" && entry.active_benchmark
           ? renderBenchmarkProgress(entry.active_benchmark, true)
-          : active;
-        var workStatus = singular === "validator" && entry.active_benchmark && entry.active_benchmark.stage
+          : (singular === "screener" && entry.screening_progress ? renderScreenerProgress(entry) : active);
+        var hasGranularProgress =
+          (singular === "validator" && entry.active_benchmark && entry.active_benchmark.stage) ||
+          (singular === "screener" && entry.screening_progress);
+        var workStatus = hasGranularProgress
           ? ""
           : '<span class="stage ' + work[1] + '">' + esc(work[0]) + '</span>';
         var protocol = singular === "screener"
@@ -2732,7 +2779,7 @@
           '<td><span class="stage ' + status[1] + '">' + status[0] + '</span></td>' +
           '<td><span class="fleet-time" title="' + esc(entry.first_seen_at || "") + '">' + esc(firstSeen) + '</span></td>' +
           '<td><span class="fleet-time" title="' + esc(reportedAt) + '">' + relTime(reportedAt) + '</span></td>' +
-          '<td class="fleet-work-col">' + workStatus + benchmark + '</td>' +
+          '<td class="fleet-work-col">' + workStatus + currentWork + '</td>' +
           '<td><span class="fleet-version">' + esc(version) + '</span><span class="fleet-protocol">' + esc(protocol) + '</span></td>' +
           renderFleetMetricCells(entry.system_metrics) +
           '</tr>';
@@ -2740,6 +2787,7 @@
     }
 
     document.getElementById("show-screeners").addEventListener("change", renderFleet);
+    setInterval(updateScreenerElapsed, 1000);
 
     // ── Data load ────────────────────────────────────────────
     function getJSON(path) {

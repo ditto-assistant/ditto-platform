@@ -211,6 +211,21 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   returned. Five-minute freshness determines availability; missing optional
   metrics determine only `health: unknown`. Values are sampled at most every two
   minutes and rounded to five-point buckets.
+
+  Screener heartbeat protocol v2 may also sign a current-job start time and one
+  coarse stage: `preparing`, `downloading`, `validating`, `building`, `starting`,
+  `health_check`, or `submitting`. The public view adds the already public agent
+  identity/name, and the dashboard derives elapsed time. Progress appears only
+  while the heartbeat is fresh and its screener, agent, and live screening lease
+  still match; idle, terminal, expired, and offline rows clear it. Protocol v1
+  remains accepted and shows neutral screening state without granular progress.
+  The signed pair uses the existing screener telemetry JSON column, so no
+  migration or secret is required.
+
+  Progress never accepts or returns source, build output, dependency or image
+  metadata, Docker layers, policy modules or rules, fingerprints, prompts,
+  challenges, verdict evidence, secrets, paths, or arbitrary display text.
+  Heartbeats remain best-effort and do not gate claims, screening, or verdicts.
 - Per-category means + run provenance: the scoring engine (dittobench-api) emits
   `models` + `per_category` (alongside `bench_version`, `dataset_sha256`,
   `lexical_gap`, `paraphrase`, `seeding_waves`, `tokens`) in `RunDetails`; the

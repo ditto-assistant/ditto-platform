@@ -26,7 +26,10 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.screener import (
+    SCREENING_POLICY_VERSION,
+    ScreenerHeartbeatRequest,
+)
 from ditto.api_models.system_health import (
     SystemMetrics,
     system_metrics_signing_token,
@@ -38,6 +41,7 @@ from ditto.api_server.dependencies import (
     get_session,
     get_storage_client,
 )
+from ditto.api_server.endpoints.screener import _heartbeat_signing_message
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_AGENT_NOT_FOUND,
     ERROR_CODE_AGENT_NOT_SCREENABLE,
@@ -100,6 +104,8 @@ def _heartbeat_payload(
     timestamp: int | None = None,
     state: str = "polling",
     active_agent_id: UUID | None = None,
+    protocol_version: int = 1,
+    progress: dict[str, object] | None = None,
     system_metrics: dict[str, object] | None = None,
 ) -> dict[str, object]:
     ts = timestamp if timestamp is not None else int(datetime.now(UTC).timestamp())
@@ -108,15 +114,26 @@ def _heartbeat_payload(
         if system_metrics is not None
         else None
     )
-    message = (
-        "ditto-screener-heartbeat:v1:"
-        f"{_SCREENER_HOTKEY}:0.4.2:1:{SCREENING_POLICY_VERSION}:{state}:"
-        f"{active_agent_id or ''}:{system_metrics_signing_token(metrics)}:{ts}"
-    ).encode()
+    if protocol_version == 1:
+        message = (
+            "ditto-screener-heartbeat:v1:"
+            f"{_SCREENER_HOTKEY}:0.4.2:1:{SCREENING_POLICY_VERSION}:{state}:"
+            f"{active_agent_id or ''}:{system_metrics_signing_token(metrics)}:{ts}"
+        ).encode()
+    else:
+        progress_token = (
+            f"{progress['stage']},{progress['started_at']}" if progress else "-"
+        )
+        message = (
+            "ditto-screener-heartbeat:v2:"
+            f"{_SCREENER_HOTKEY}:0.4.2:{protocol_version}:"
+            f"{SCREENING_POLICY_VERSION}:{state}:{active_agent_id or ''}:"
+            f"{progress_token}:{system_metrics_signing_token(metrics)}:{ts}"
+        ).encode()
     payload: dict[str, object] = {
         "screener_hotkey": _SCREENER_HOTKEY,
         "software_version": "0.4.2",
-        "protocol_version": 1,
+        "protocol_version": protocol_version,
         "policy_version": SCREENING_POLICY_VERSION,
         "state": state,
         "timestamp": ts,
@@ -124,9 +141,42 @@ def _heartbeat_payload(
     }
     if active_agent_id is not None:
         payload["active_agent_id"] = str(active_agent_id)
+    if progress is not None:
+        payload["progress"] = progress
     if system_metrics is not None:
         payload["system_metrics"] = system_metrics
     return payload
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "preparing",
+        "downloading",
+        "validating",
+        "building",
+        "starting",
+        "health_check",
+        "submitting",
+    ],
+)
+def test_v2_canonical_signing_matches_screener_contract(stage: str) -> None:
+    payload = _heartbeat_payload(
+        timestamp=456,
+        state="screening",
+        active_agent_id=UUID("550e8400-e29b-41d4-a716-446655440000"),
+        protocol_version=2,
+        progress={"stage": stage, "started_at": 400},
+    )
+    request = ScreenerHeartbeatRequest.model_validate(payload)
+    assert (
+        _heartbeat_signing_message(request)
+        == (
+            "ditto-screener-heartbeat:v2:"
+            f"{_SCREENER_HOTKEY}:0.4.2:2:{SCREENING_POLICY_VERSION}:screening:"
+            f"550e8400-e29b-41d4-a716-446655440000:{stage},400:-:456"
+        ).encode()
+    )
 
 
 # --- DB + dependency wiring ------------------------------------------------
@@ -283,6 +333,149 @@ def _authenticate_screener_client(client: httpx.AsyncClient) -> None:
 
 
 class TestHeartbeat:
+    async def test_v2_progress_is_public_and_clears_on_idle_and_terminal(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        started = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=2)
+        agent_id = await _seed_agent(
+            session_maker, status=AgentStatus.SCREENING, name="steady-agent"
+        )
+        attempt_id = uuid4()
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=attempt_id,
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="running",
+                    started_at=started,
+                    deadline=started + timedelta(minutes=30),
+                )
+            )
+
+        timestamp = int(datetime.now(UTC).timestamp())
+        progress = {"stage": "building", "started_at": int(started.timestamp())}
+        response = await client.post(
+            "/api/v1/screener/heartbeat",
+            json=_heartbeat_payload(
+                timestamp=timestamp,
+                state="screening",
+                active_agent_id=agent_id,
+                protocol_version=2,
+                progress=progress,
+            ),
+        )
+        assert response.status_code == 200, response.text
+        entry = (await client.get("/api/v1/public/screeners")).json()["screeners"][0]
+        assert entry["active_agent_id"] == str(agent_id)
+        assert entry["active_agent_name"] == "steady-agent"
+        assert entry["screening_progress"]["stage"] == "building"
+        assert entry["screening_progress"]["started_at"].startswith(
+            started.isoformat().replace("+00:00", "")
+        )
+
+        idle = await client.post(
+            "/api/v1/screener/heartbeat",
+            json=_heartbeat_payload(timestamp=timestamp + 1, protocol_version=2),
+        )
+        assert idle.status_code == 200
+        idle_entry = (await client.get("/api/v1/public/screeners")).json()["screeners"][
+            0
+        ]
+        assert idle_entry["active_agent_id"] is None
+        assert idle_entry["active_agent_name"] is None
+        assert idle_entry["screening_progress"] is None
+
+        legacy = await client.post(
+            "/api/v1/screener/heartbeat",
+            json=_heartbeat_payload(
+                timestamp=timestamp + 2,
+                state="screening",
+                active_agent_id=agent_id,
+                protocol_version=1,
+            ),
+        )
+        assert legacy.status_code == 200
+        legacy_entry = (await client.get("/api/v1/public/screeners")).json()[
+            "screeners"
+        ][0]
+        assert legacy_entry["active_agent_name"] == "steady-agent"
+        assert legacy_entry["screening_progress"] is None
+
+        active = await client.post(
+            "/api/v1/screener/heartbeat",
+            json=_heartbeat_payload(
+                timestamp=timestamp + 3,
+                state="screening",
+                active_agent_id=agent_id,
+                protocol_version=2,
+                progress=progress,
+            ),
+        )
+        assert active.status_code == 200
+        async with session_maker() as session, session.begin():
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            agent = await session.get(Agent, agent_id)
+            assert attempt is not None and agent is not None
+            attempt.status = "passed"
+            attempt.finished_at = datetime.now(UTC)
+            agent.status = AgentStatus.EVALUATING
+        terminal_entry = (await client.get("/api/v1/public/screeners")).json()[
+            "screeners"
+        ][0]
+        assert terminal_entry["active_agent_id"] is None
+        assert terminal_entry["screening_progress"] is None
+
+    async def test_stale_progress_is_offline_and_not_projected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        started = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=2)
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.SCREENING)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=uuid4(),
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="running",
+                    started_at=started,
+                    deadline=started + timedelta(minutes=30),
+                )
+            )
+        timestamp = int(datetime.now(UTC).timestamp())
+        response = await client.post(
+            "/api/v1/screener/heartbeat",
+            json=_heartbeat_payload(
+                timestamp=timestamp,
+                state="screening",
+                active_agent_id=agent_id,
+                protocol_version=2,
+                progress={
+                    "stage": "health_check",
+                    "started_at": int(started.timestamp()),
+                },
+            ),
+        )
+        assert response.status_code == 200
+        async with session_maker() as session, session.begin():
+            heartbeat = await session.get(ScreenerHeartbeat, _SCREENER_HOTKEY)
+            assert heartbeat is not None
+            heartbeat.seen_at = datetime.now(UTC) - timedelta(minutes=10)
+        entry = (await client.get("/api/v1/public/screeners")).json()["screeners"][0]
+        assert entry["online"] is False
+        assert entry["active_agent_id"] is None
+        assert entry["screening_progress"] is None
+
     async def test_records_signed_metrics_and_is_publicly_visible(
         self,
         app: FastAPI,
@@ -362,6 +555,42 @@ class TestHeartbeat:
             json=_heartbeat_payload(),
         )
         assert response.status_code == 401
+
+        now = int(datetime.now(UTC).timestamp())
+        progress = {"stage": "building", "started_at": now - 30}
+        tampered_progress = _heartbeat_payload(
+            timestamp=now,
+            state="screening",
+            active_agent_id=uuid4(),
+            protocol_version=2,
+            progress=progress,
+        )
+        tampered_progress["progress"]["stage"] = "submitting"  # type: ignore[index]
+        response = await client.post(
+            "/api/v1/screener/heartbeat", json=tampered_progress
+        )
+        assert response.status_code == 401
+
+        private_field = _heartbeat_payload(
+            timestamp=now,
+            state="screening",
+            active_agent_id=uuid4(),
+            protocol_version=2,
+            progress={"stage": "building", "started_at": now - 30},
+        )
+        private_field["progress"]["dependency"] = "private-package"  # type: ignore[index]
+        response = await client.post("/api/v1/screener/heartbeat", json=private_field)
+        assert response.status_code == 422
+
+        invalid_stage = _heartbeat_payload(
+            timestamp=now,
+            state="screening",
+            active_agent_id=uuid4(),
+            protocol_version=2,
+            progress={"stage": "docker_layer", "started_at": now - 30},
+        )
+        response = await client.post("/api/v1/screener/heartbeat", json=invalid_stage)
+        assert response.status_code == 422
 
     async def test_heartbeat_payload_size_is_bounded(
         self,

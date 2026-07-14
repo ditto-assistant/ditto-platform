@@ -178,6 +178,13 @@ class TestDashboard:
         assert "@media (max-width: 720px)" in body
         assert 'class="fleet-work-col"' in body
         assert "Current work" in body
+        assert "screenerStageLabel" in body
+        assert "screening_progress" in body
+        assert "Building image" in body
+        assert "elapsedDuration" in body
+        assert "data-started-at" in body
+        assert "active_agent_name" in body
+        assert "setInterval(updateScreenerElapsed, 1000)" in body
 
     async def test_includes_system_and_time_aware_theme_switcher(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))

@@ -16,7 +16,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
-from ditto.api_models.screener import ScreenerRuntimeState
+from ditto.api_models.screener import ScreenerProgressStage, ScreenerRuntimeState
 from ditto.api_models.validator import ValidatorRuntimeState
 
 _SS58_PATTERN = r"^[1-9A-HJ-NP-Za-km-z]{47,48}$"
@@ -948,6 +948,13 @@ class PublicValidatorHeartbeatsResponse(BaseModel):
     validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)
 
 
+class PublicScreenerProgress(BaseModel):
+    """Allowlisted stage and signed start time for one current job."""
+
+    stage: ScreenerProgressStage
+    started_at: datetime
+
+
 class PublicScreenerHeartbeat(BaseModel):
     """Latest public-safe report from one authenticated screener."""
 
@@ -959,6 +966,8 @@ class PublicScreenerHeartbeat(BaseModel):
     policy_version: Annotated[int, Field(ge=1)]
     state: ScreenerRuntimeState
     active_agent_id: UUID | None = None
+    active_agent_name: str | None = None
+    screening_progress: PublicScreenerProgress | None = None
     first_seen_at: datetime | None = None
     reported_at: datetime
     seen_at: datetime

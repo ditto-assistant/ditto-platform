@@ -307,6 +307,7 @@ async def upsert_screener_heartbeat(
     policy_version: int,
     state: str,
     active_agent_id: UUID | None,
+    screening_progress: dict | None,
     system_metrics: dict | None,
     reported_at: datetime,
     seen_at: datetime,
@@ -328,7 +329,17 @@ async def upsert_screener_heartbeat(
     row.policy_version = policy_version
     row.state = state
     row.active_agent_id = active_agent_id
-    row.system_metrics = system_metrics
+    # Reuse the existing JSON telemetry column. Legacy rows contain the raw
+    # metrics object; active v2 rows use this private envelope so no migration is
+    # needed and public projection still reconstructs fields from an allowlist.
+    row.system_metrics = (
+        {
+            "system_metrics": system_metrics,
+            "screening_progress": screening_progress,
+        }
+        if screening_progress is not None
+        else system_metrics
+    )
     row.reported_at = reported_at
     row.seen_at = seen_at
     row.signature = signature
