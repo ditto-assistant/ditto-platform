@@ -157,6 +157,56 @@ class TestIssueTicket:
 
         assert claimed == [zero_scores, one_score, two_scores]
 
+    async def test_defers_higher_score_agent_behind_screening_backlog(
+        self, session: AsyncSession
+    ) -> None:
+        two_scores = await _seed_evaluating(session, name="two-scores")
+        waiting_for_screening = uuid4()
+        async with session.begin():
+            session.add(
+                Agent(
+                    agent_id=waiting_for_screening,
+                    miner_hotkey="5PendingMiner",
+                    name="pending-screening",
+                    sha256="cd" * 32,
+                    status=AgentStatus.UPLOADED,
+                    screening_policy_version=0,
+                    created_at=_NOW + timedelta(minutes=1),
+                )
+            )
+            for validator in ("5A", "5B"):
+                session.add(
+                    ValidatorTicket(
+                        agent_id=two_scores,
+                        validator_hotkey=validator,
+                        status=TicketStatus.SCORED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                        bench_version=2,
+                        attempt_count=1,
+                    )
+                )
+
+        async with session.begin():
+            blocked = await issue_ticket(
+                session, validator_hotkey="5New", now=_NOW, ttl=_TTL
+            )
+        assert blocked is None
+
+        # A terminal screening rejection no longer participates in fairness,
+        # so the 2-of-3 artifact becomes eligible once no lower-score work can
+        # still advance through the pipeline.
+        async with session.begin():
+            pending = await session.get(Agent, waiting_for_screening)
+            assert pending is not None
+            pending.status = AgentStatus.REJECTED
+        async with session.begin():
+            released = await issue_ticket(
+                session, validator_hotkey="5New", now=_NOW, ttl=_TTL
+            )
+        assert released is not None
+        assert released.agent_id == two_scores
+
 
 class TestExpiry:
     async def test_deadline_instant_is_expired(self, session: AsyncSession) -> None:
