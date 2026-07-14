@@ -308,7 +308,7 @@
        scrollable on narrow viewports rather than truncated. */
     .sha-row { margin-top: 18px; }
     .sha-row .k { display: block; color: var(--text-dim); font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 6px; }
-    .sha-row code { display: block; font-family: var(--mono); font-size: 12.5px; color: var(--text); background: var(--bg-elev-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 11px; white-space: nowrap; overflow-x: auto; }
+    .sha-row code { display: block; flex: 1; min-width: 0; font-family: var(--mono); font-size: 12.5px; color: var(--text); background: var(--bg-elev-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 11px; white-space: nowrap; overflow-x: auto; }
 
     /* Labelled composite-trend chart. A grid keeps the plot in column 2 so the
        y-axis (column 1) and the x-axis caption (row 2, column 2) line up exactly
@@ -318,13 +318,17 @@
     .trend svg.spark { grid-column: 2; grid-row: 1; width: 100%; height: 58px; }
     .trend .xcap { grid-column: 2; grid-row: 2; display: flex; justify-content: space-between; margin-top: 6px; font-size: 11px; letter-spacing: 0.4px; text-transform: uppercase; color: var(--text-dim); }
     .stat-row .v.up { color: var(--good); } .stat-row .v.down { color: var(--danger); } .stat-row .v.flat { color: var(--text-dim); }
-    .copy { margin-left: 6px; color: var(--text-dim); cursor: pointer; font-size: 12px; line-height: 1; opacity: 0; transition: opacity .12s, color .12s; background: none; border: 0; padding: 2px; font-family: inherit; }
-    tr:hover .copy, .copy:focus-visible, .copy.copied { opacity: 1; }
+    .copyable { display: inline-flex; align-items: center; min-width: 0; }
+    .sha-row .copyable { display: flex; gap: 4px; }
+    .copy { flex: none; margin-left: 6px; color: var(--text-dim); cursor: pointer; font-size: 12px; line-height: 1; opacity: 0; transition: opacity .12s, color .12s; background: none; border: 0; padding: 4px; font-family: inherit; }
+    tr:hover .copy, .copyable:hover .copy, .copy:focus-visible, .copy.copied { opacity: 1; }
+    .modal .copy, .sha-row .copy { opacity: 1; }
     .copy:hover, .copy:focus-visible { color: var(--accent); }
     /* Copied confirmation: swap the glyph for a check without shifting layout. */
     .copy.copied { color: var(--good); }
     .copy.copied > span { display: none; }
     .copy.copied::after { content: "✓"; }
+    @media (hover: none) { .copy { opacity: 1; } }
 
     .metric { display: flex; align-items: center; gap: 10px; min-width: 150px; }
     .metric .barwrap { flex: 1; height: 7px; border-radius: 4px; background: var(--bg-elev-2); position: relative; }
@@ -1542,7 +1546,7 @@
       <h3 id="d-title">Miner</h3>
       <span id="d-bench"></span>
     </div>
-    <div class="dk"><span class="dk-label">Miner</span><span id="d-hotkey"></span></div>
+    <div class="dk"><span class="dk-label">Miner</span><span class="copyable"><span id="d-hotkey"></span><button type="button" class="copy" id="d-hotkey-copy" data-key="" aria-label="Copy miner hotkey" title="Copy miner hotkey"><span aria-hidden="true">⧉</span></button></span></div>
     <div class="split">
       <div class="seg">
         <div id="d-tool-seg" style="background:var(--tool)"></div>
@@ -1978,6 +1982,7 @@
       document.getElementById("d-title").textContent = "Rank #" + e.rank + (e.rank === 1 ? " · 👑 Leader" : "");
       benchChip(e);
       document.getElementById("d-hotkey").textContent = e.miner_hotkey;
+      document.getElementById("d-hotkey-copy").setAttribute("data-key", e.miner_hotkey || "");
 
       var tool = e.tool_mean, mem = e.memory_mean, sum = tool + mem || 1;
       var tw = (tool / sum) * 100, mw = 100 - tw;
@@ -2054,7 +2059,7 @@
         group("Benchmark integrity", ig) +
         trendBlock(e);
       var shaRow = e.dataset_sha256
-        ? '<div class="sha-row"><span class="k">Dataset SHA-256</span><code>' + esc(e.dataset_sha256) + '</code></div>'
+        ? '<div class="sha-row"><span class="k">Dataset SHA-256</span><span class="copyable"><code>' + esc(e.dataset_sha256) + '</code>' + copyButton(e.dataset_sha256, "dataset SHA-256") + '</span></div>'
         : "";
       document.getElementById("d-stats").innerHTML =
         '<div class="stat-cols">' + colStats + '</div>' +
@@ -2105,6 +2110,13 @@
     function shortKey(k) {
       return k && k.length > 16 ? k.slice(0, 8) + "…" + k.slice(-6) : (k || "");
     }
+    function copyButton(value, label) {
+      if (!value) return "";
+      var safeLabel = esc(label || "value");
+      return '<button type="button" class="copy" data-key="' + esc(String(value)) +
+        '" aria-label="Copy ' + safeLabel + '" title="Copy ' + safeLabel +
+        '"><span aria-hidden="true">⧉</span></button>';
+    }
     // The k=3 consensus record: which independent validators scored this agent,
     // each one's composite, and the median the platform finalized on. Fetched on
     // demand from the entry's agent_id (the leaderboard carries only the median).
@@ -2121,8 +2133,8 @@
         var rows = r.scores.slice()
           .sort(function (a, b) { return b.composite - a.composite; })
           .map(function (s) {
-            return '<div class="stat-row"><span class="k" title="' + esc(s.validator_hotkey) +
-              '">' + esc(shortKey(s.validator_hotkey)) + '</span><span class="v">' +
+            return '<div class="stat-row"><span class="k copyable" title="' + esc(s.validator_hotkey) +
+              '"><span>' + esc(shortKey(s.validator_hotkey)) + '</span>' + copyButton(s.validator_hotkey, "validator hotkey") + '</span><span class="v">' +
               fx(s.composite) + '</span></div>';
           }).join("");
         var med = r.median_composite != null
@@ -2389,15 +2401,58 @@
 
     // ── Events (delegated) ───────────────────────────────────
     var rowsEl = document.getElementById("rows");
-    function doCopy(btn) {
-      navigator.clipboard && navigator.clipboard.writeText(btn.getAttribute("data-key"));
-      btn.classList.add("copied");
-      var restore = function () { btn.classList.remove("copied"); };
-      setTimeout(restore, 900);
+    function legacyCopy(value) {
+      return new Promise(function (resolve, reject) {
+        var input = document.createElement("textarea");
+        input.value = value;
+        input.setAttribute("readonly", "");
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.select();
+        try {
+          if (!document.execCommand("copy")) throw new Error("Copy command failed");
+          resolve();
+        } catch (error) {
+          reject(error);
+        } finally {
+          input.remove();
+        }
+      });
     }
+    function copyText(value) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(value).catch(function () { return legacyCopy(value); });
+      }
+      return legacyCopy(value);
+    }
+    function doCopy(btn) {
+      var value = btn.getAttribute("data-key");
+      if (!value) return;
+      copyText(value).then(function () {
+        var originalLabel = btn.getAttribute("aria-label") || "Copy value";
+        btn.classList.add("copied");
+        btn.setAttribute("aria-label", "Copied");
+        var restore = function () {
+          btn.classList.remove("copied");
+          btn.setAttribute("aria-label", originalLabel);
+        };
+        setTimeout(restore, 1200);
+      }).catch(function () {
+        btn.setAttribute("title", "Copy failed");
+        setTimeout(function () { btn.setAttribute("title", btn.getAttribute("aria-label") || "Copy value"); }, 1200);
+      });
+    }
+    document.addEventListener("click", function (ev) {
+      var copy = ev.target.closest(".copy");
+      if (!copy) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      doCopy(copy);
+    });
     rowsEl.addEventListener("click", function (ev) {
       var copy = ev.target.closest(".copy");
-      if (copy) { ev.stopPropagation(); doCopy(copy); return; }
+      if (copy) return;
       var tr = ev.target.closest("tr[data-i]");
       if (tr) openModal(+tr.getAttribute("data-i"));
     });
@@ -2415,10 +2470,12 @@
     });
     var activityRowsEl = document.getElementById("activity-rows");
     activityRowsEl.addEventListener("click", function (ev) {
+      if (ev.target.closest(".copy")) return;
       var tr = ev.target.closest("tr[data-activity-i]");
       if (tr) openActivityModal(+tr.getAttribute("data-activity-i"));
     });
     activityRowsEl.addEventListener("keydown", function (ev) {
+      if (ev.target.closest(".copy")) return;
       var tr = ev.target.closest("tr[data-activity-i]");
       if (!tr) return;
       if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
@@ -2644,7 +2701,7 @@
           '<section class="pipeline-meta" aria-labelledby="pipeline-meta-title">' +
             '<h4 id="pipeline-meta-title">Submission details</h4>' +
             '<dl class="pipeline-meta-list">' +
-              '<div><dt>Agent ID</dt><dd><code>' + esc(String(e.agent_id || "")) + '</code></dd></div>' +
+              '<div><dt>Agent ID</dt><dd><span class="copyable"><code>' + esc(String(e.agent_id || "")) + '</code>' + copyButton(e.agent_id, "agent ID") + '</span></dd></div>' +
               '<div><dt>Evidence</dt><dd>' + esc(evidence) + '</dd></div>' +
             '</dl>' +
           '</section>' +
@@ -2668,6 +2725,7 @@
       chip.textContent = stage[0];
       chip.title = "Current submission stage";
       document.getElementById("d-hotkey").textContent = e.miner_hotkey;
+      document.getElementById("d-hotkey-copy").setAttribute("data-key", e.miner_hotkey || "");
       document.getElementById("d-stats").innerHTML = renderPipelineSummary(
         e, null, evidence, "Loading screening and validation history…", "loading"
       );
@@ -2786,8 +2844,8 @@
         return '<tr role="button" tabindex="0" data-activity-i="' + i + '" aria-label="' +
           esc("View details for " + (e.name || "unnamed agent") + ", " + stage[0] + ", " + progress) + '">' +
           '<td><span class="agent-name">' + esc(e.name || "Unnamed agent") + '</span>' +
-          '<span class="agent-id" title="' + esc(id) + '">' + esc(id.slice(0, 8)) + '</span></td>' +
-          '<td class="hide-sm"><span class="hotkey" title="' + esc(e.miner_hotkey) + '">' + esc(shortKey(e.miner_hotkey)) + '</span></td>' +
+          '<span class="agent-id copyable" title="' + esc(id) + '"><span>' + esc(id.slice(0, 8)) + '</span>' + copyButton(id, "agent ID") + '</span></td>' +
+          '<td class="hide-sm"><span class="hotkey copyable" title="' + esc(e.miner_hotkey) + '"><span>' + esc(shortKey(e.miner_hotkey)) + '</span>' + copyButton(e.miner_hotkey, "miner hotkey") + '</span></td>' +
           '<td class="stage-cell"><span class="stage ' + stage[1] + '">' + stage[0] + '</span>' + evidence + '</td>' +
           '<td><span class="validation-progress' + (progress === "Not started" ? " pending" : "") + '">' + esc(progress) + '</span></td>' +
           '<td class="num hide-sm" title="' + esc(e.submitted_at) + '">' + relTime(e.submitted_at) + '</td>' +
@@ -2984,7 +3042,7 @@
           : "Protocol " + entry.protocol_version;
         return '<tr>' +
           '<td><span class="fleet-node-wrap"><span class="fleet-type" aria-label="' + (singular === "screener" ? "Screener" : "Validator") + '">' + (singular === "screener" ? "S" : "V") + '</span><span>' +
-            '<span class="fleet-node" title="' + esc(hotkey) + '">' + esc(shortKey(hotkey)) + '</span></span></span></td>' +
+            '<span class="fleet-node copyable" title="' + esc(hotkey) + '"><span>' + esc(shortKey(hotkey)) + '</span>' + copyButton(hotkey, singular + " hotkey") + '</span></span></span></td>' +
           '<td><span class="stage ' + status[1] + '">' + status[0] + '</span></td>' +
           '<td><span class="fleet-time" title="' + esc(entry.first_seen_at || "") + '">' + esc(firstSeen) + '</span></td>' +
           '<td><span class="fleet-time" title="' + esc(reportedAt) + '">' + relTime(reportedAt) + '</span></td>' +
