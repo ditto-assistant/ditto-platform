@@ -135,7 +135,13 @@ class TestDashboard:
         assert "Screener result" in body
         assert "Lease expired" not in body
         assert "System failure" not in body
-        assert 'expired: ["Assignment expired", "warn"]' in body
+        assert 'role === "validator" ? "Retrying" : "Expired"' in body
+        assert "Validator took too long to post a score." in body
+        assert "Another validator will score you soon." in body
+        assert 'class="retry-info" role="img" tabindex="0"' in body
+        assert 'data-tooltip="' in body
+        assert "validatorRetryInfo(a.actively_running" in body
+        assert "Assignment expired" not in body
         assert 'failed: ["Could not complete", "warn"]' in body
         assert 'class="pipeline-summary"' in body
         assert 'class="pipeline-key-facts"' in body
