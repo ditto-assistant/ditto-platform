@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.db.models import Agent
 from ditto.db.queries.scores import SCORING_QUORUM
@@ -35,6 +36,7 @@ async def _seed_evaluating(
                 name=name,
                 sha256="ab" * 32,
                 status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
                 created_at=created_at,
             )
         )
@@ -42,6 +44,20 @@ async def _seed_evaluating(
 
 
 class TestIssueTicket:
+    async def test_skips_agent_that_needs_rescreening(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            agent = await session.get(Agent, aid)
+            assert agent is not None
+            agent.screening_policy_version = 0
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
+            )
+        assert ticket is None
+
     async def test_seats_ticket_for_evaluating_agent(
         self, session: AsyncSession
     ) -> None:

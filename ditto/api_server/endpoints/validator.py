@@ -60,6 +60,7 @@ from ditto.api_models import (
     ValidatorHeartbeatResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_server.bench import stamp_bench_version
 from ditto.api_server.dependencies import (
@@ -555,6 +556,11 @@ async def submit_score(
         if agent.status not in _SCOREABLE_STATUSES:
             raise AgentNotEvaluatableError(
                 f"agent {agent_id} is {agent.status}, not in {_SCOREABLE_STATUSES}"
+            )
+        if agent.screening_policy_version < SCREENING_POLICY_VERSION:
+            raise AgentNotEvaluatableError(
+                f"agent {agent_id} has not passed screening policy "
+                f"{SCREENING_POLICY_VERSION}"
             )
         if payload.ticket_deadline is None:
             raise HTTPException(

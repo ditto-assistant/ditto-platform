@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_server.datapipeline import DataPipelineError, NullGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -55,12 +56,18 @@ def _sign(message: str) -> str:
 
 
 def _result_payload(
-    agent_id: UUID, *, passed: bool = True, **overrides: object
+    agent_id: UUID,
+    *,
+    passed: bool = True,
+    policy_version: int = SCREENING_POLICY_VERSION,
+    **overrides: object,
 ) -> dict:
+    signed = f"{_SCREENER_HOTKEY}:{agent_id}:{passed}:{policy_version}"
     body = {
         "screener_hotkey": _SCREENER_HOTKEY,
-        "signature": _sign(f"{_SCREENER_HOTKEY}:{agent_id}:{passed}"),
+        "signature": _sign(signed),
         "passed": passed,
+        "policy_version": policy_version,
         "detail": "",
     }
     body.update(overrides)
@@ -182,6 +189,7 @@ async def _seed_agent(
     name: str = "alpha-agent",
     created_at: datetime | None = None,
     agent_id: UUID | None = None,
+    screening_policy_version: int | None = None,
 ) -> UUID:
     aid = agent_id or uuid4()
     async with maker() as s, s.begin():
@@ -192,6 +200,12 @@ async def _seed_agent(
                 name=name,
                 sha256=_SHA256,
                 status=status,
+                screening_policy_version=(
+                    SCREENING_POLICY_VERSION
+                    if screening_policy_version is None
+                    and status == AgentStatus.EVALUATING
+                    else (screening_policy_version or 0)
+                ),
                 created_at=created_at or datetime.now(UTC),
             )
         )
@@ -241,6 +255,23 @@ class TestQueue:
         assert body["count"] == 2
         assert [i["name"] for i in body["items"]] == ["older", "younger"]
         assert all(i["status"] == AgentStatus.UPLOADED for i in body["items"])
+        assert body["required_policy_version"] == SCREENING_POLICY_VERSION
+
+    async def test_requeues_legacy_evaluating_submission(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            screening_policy_version=0,
+        )
+        _install_db(app, session_maker)
+        response = await client.get("/api/v1/screener/queue")
+        assert response.status_code == 200
+        assert response.json()["count"] == 1
 
     async def test_limit_caps_results(
         self,
@@ -343,6 +374,7 @@ class TestArtifact:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
         _install_db(app, session_maker)
         _install_chain(app)
+        _install_chain(app)
         storage = _install_storage(app)
 
         response = await client.get(
@@ -378,6 +410,53 @@ class TestArtifact:
 
 
 class TestSubmitResult:
+    async def test_legacy_pass_cannot_promote(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        payload = _result_payload(agent_id, policy_version=1)
+        payload["signature"] = _sign(f"{_SCREENER_HOTKEY}:{agent_id}:True")
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=payload
+        )
+        assert response.status_code == 409
+
+    async def test_v2_pass_rescreens_in_place_and_preserves_dataset(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            screening_policy_version=0,
+        )
+        async with session_maker() as s, s.begin():
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            agent.dataset_seed = 42
+            agent.dataset_sha256 = "cd" * 32
+            agent.dataset_run_size = "full"
+        _install_db(app, session_maker)
+        _install_chain(app)
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id),
+        )
+        assert response.status_code == 200
+        async with session_maker() as s:
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.status == AgentStatus.EVALUATING
+            assert agent.screening_policy_version == SCREENING_POLICY_VERSION
+            assert agent.dataset_seed == 42
+
     async def test_pass_promotes_to_evaluating(
         self,
         app: FastAPI,

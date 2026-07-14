@@ -196,6 +196,15 @@ class Agent(Base):
     so the endpoint maps it to a fixed category before persisting it here.
     """
 
+    screening_policy_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    """Latest anti-cheat screening policy this submission passed.
+
+    Zero marks submissions screened before policy attestation was introduced.
+    Validators may score only submissions at the platform's required version.
+    """
+
     status: Mapped[AgentStatus] = mapped_column(
         Enum(
             AgentStatus,
@@ -224,6 +233,13 @@ class Agent(Base):
             "agents_status_evaluating_idx",
             "status",
             postgresql_where=text("status = 'evaluating'"),
+        ),
+        Index(
+            "agents_rescreen_idx",
+            "created_at",
+            postgresql_where=text(
+                "status = 'evaluating' AND screening_policy_version < 2"
+            ),
         ),
         # Screener polls for agents in the 'uploaded' state; a partial index
         # keeps that lookup cheap (mirrors the evaluating index).

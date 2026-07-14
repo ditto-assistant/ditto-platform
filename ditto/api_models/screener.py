@@ -34,6 +34,8 @@ from ditto.api_models.upload import (
     _SS58_PATTERN,
 )
 
+SCREENING_POLICY_VERSION = 2
+
 
 class ScreenerQueueItem(BaseModel):
     """One agent awaiting screening, returned by ``GET /screener/queue``.
@@ -68,6 +70,13 @@ class ScreenerQueueResponse(BaseModel):
         Field(description="Agents awaiting screening, oldest first."),
     ]
     count: Annotated[int, Field(ge=0, description="Number of items returned.")]
+    required_policy_version: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Minimum screening policy a passing verdict must attest.",
+        ),
+    ] = SCREENING_POLICY_VERSION
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -94,7 +103,8 @@ class ScreenResultRequest(BaseModel):
     """Body of ``POST /screener/agent/{agent_id}/result``.
 
     The screener authenticates by signing the verdict: the signature is over
-    the UTF-8 bytes of ``f"{screener_hotkey}:{agent_id}:{passed}"`` with the
+    the UTF-8 bytes of ``f"{screener_hotkey}:{agent_id}:{passed}:{policy_version}"``
+    with the
     screener's hotkey keypair. Binding ``passed`` means a captured result cannot
     be replayed with the boolean flipped to grief (or unfairly promote) a miner.
     ``passed`` is the gate: ``True`` promotes the agent to ``evaluating``,
@@ -112,14 +122,20 @@ class ScreenResultRequest(BaseModel):
         str,
         Field(
             pattern=_SIGNATURE_HEX_PATTERN,
-            description=(
-                "Hex sr25519 signature over ``{screener_hotkey}:{agent_id}:{passed}``."
-            ),
+            description=("Hex sr25519 signature over the versioned screening verdict."),
         ),
     ]
     passed: Annotated[
         bool,
         Field(description="True promotes to evaluating; False -> screening_failed."),
+    ]
+    policy_version: Annotated[
+        int,
+        Field(
+            default=1,
+            ge=1,
+            description="Screening policy version bound into new verdict signatures.",
+        ),
     ]
     detail: Annotated[
         str,
