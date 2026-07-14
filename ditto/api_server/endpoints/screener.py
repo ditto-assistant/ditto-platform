@@ -285,6 +285,8 @@ def _public_screening_reason(detail: str) -> str:
         return "Submission failed anti-cheat screening"
     if normalized.startswith("contract failed"):
         return "Submission does not satisfy the Rust harness contract"
+    if normalized.startswith("model canary"):
+        return "Harness did not use the validator model gateway"
     return "Screening failed"
 
 

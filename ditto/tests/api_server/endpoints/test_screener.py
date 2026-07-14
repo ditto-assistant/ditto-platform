@@ -508,6 +508,32 @@ class TestSubmitResult:
             assert agent.screening_reason == "Docker image build failed"
             assert "SECRET_FROM_BUILD" not in agent.screening_reason
 
+    async def test_model_canary_failure_has_public_safe_reason(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                detail="model canary observed no model call",
+            ),
+        )
+        assert response.status_code == 200
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            assert (
+                agent.screening_reason
+                == "Harness did not use the validator model gateway"
+            )
+
     async def test_pass_is_idempotent(
         self,
         app: FastAPI,
