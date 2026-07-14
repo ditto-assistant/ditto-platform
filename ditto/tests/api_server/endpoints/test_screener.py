@@ -1235,6 +1235,67 @@ class TestQuarantineAdmin:
             "expires_in": 300,
         }
 
+    async def test_rejected_rescreen_preserves_score_and_attempt_history(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.REJECTED,
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        await _seed_score(session_maker, agent_id=agent_id)
+        attempt_id = uuid4()
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=attempt_id,
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="rejected",
+                    started_at=now - timedelta(minutes=2),
+                    deadline=now + timedelta(minutes=28),
+                    finished_at=now,
+                    public_reason="Docker image build failed",
+                )
+            )
+        _install_db(app, session_maker)
+        response = await client.post(
+            f"/api/v1/admin/screening-submissions/{agent_id}/rescreen",
+            headers={
+                "Authorization": "Bearer test-admin-token-at-least-32-characters",
+                "X-Admin-Actor": "backroom:test-user",
+            },
+            json={"reason": "Build was interrupted by a worker deployment"},
+        )
+        assert response.status_code == 200
+        assert response.json()["agent_status"] == AgentStatus.SCREENING_FAILED
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            attempts = list(
+                await session.scalars(
+                    select(ScreeningAttempt).where(
+                        ScreeningAttempt.agent_id == agent_id
+                    )
+                )
+            )
+            scores = list(
+                await session.scalars(select(Score).where(Score.agent_id == agent_id))
+            )
+            assert agent is not None
+            assert agent.status == AgentStatus.SCREENING_FAILED
+            assert agent.screening_policy_version == SCREENING_POLICY_VERSION
+            assert [attempt.attempt_id for attempt in attempts] == [attempt_id]
+            assert len(scores) == 1
+
 
 # --- Artifact --------------------------------------------------------------
 
@@ -1383,6 +1444,49 @@ class TestSubmitResult:
             assert agent.screening_reason == "Docker image build failed"
             assert agent.screening_policy_version == SCREENING_POLICY_VERSION
             assert "SECRET_FROM_BUILD" not in agent.screening_reason
+
+    @pytest.mark.parametrize(
+        ("outcome", "detail", "expected"),
+        [
+            (
+                "retryable_infra",
+                "build failed: dependency fetch returned 503",
+                AgentStatus.SCREENING_FAILED,
+            ),
+            (
+                "deterministic_reject",
+                "screener error: deliberately misleading legacy detail",
+                AgentStatus.REJECTED,
+            ),
+        ],
+    )
+    async def test_typed_failure_outcome_is_authoritative(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        outcome: str,
+        detail: str,
+        expected: AgentStatus,
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            headers=_AUTH_HEADER,
+            json=_result_payload(
+                agent_id,
+                attempt_id=attempt_id,
+                passed=False,
+                outcome=outcome,
+                detail=detail,
+            ),
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == expected
 
     async def test_current_pass_recovers_stale_screening_failure(
         self,

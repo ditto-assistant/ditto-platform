@@ -19,6 +19,8 @@ from ditto.api_models.admin_quarantine import (
     AdminQuarantineResolveRequest,
     AdminQuarantineResolveResponse,
     AdminScreeningAttempt,
+    AdminScreeningRescreenRequest,
+    AdminScreeningRescreenResponse,
     AdminScreeningSubmission,
     AdminScreeningSubmissionList,
 )
@@ -280,6 +282,49 @@ async def list_screening_submissions(
             )
             for agent in agents
         ],
+    )
+
+
+@router.post(
+    "/screening-submissions/{agent_id}/rescreen",
+    response_model=AdminScreeningRescreenResponse,
+)
+async def rescreen_rejected_submission(
+    agent_id: UUID,
+    payload: AdminScreeningRescreenRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminScreeningRescreenResponse:
+    """Return one rejected submission to the queue without rewriting history."""
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    async with session.begin():
+        agent = await session.scalar(
+            select(Agent).where(Agent.agent_id == agent_id).with_for_update()
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        running_attempt = await session.scalar(
+            select(ScreeningAttempt.attempt_id).where(
+                ScreeningAttempt.agent_id == agent_id,
+                ScreeningAttempt.status == "running",
+            )
+        )
+        if running_attempt is not None:
+            raise HTTPException(status_code=409, detail="screening attempt is active")
+        if agent.status != AgentStatus.REJECTED:
+            raise HTTPException(status_code=409, detail="submission is not rejected")
+        agent.status = AgentStatus.SCREENING_FAILED
+        agent.screening_reason = "Operator requested a screening retry"
+    logger.info(
+        "admin_actor=%s requested rescreen agent_id=%s reason=%s",
+        x_admin_actor,
+        agent_id,
+        payload.reason,
+    )
+    return AdminScreeningRescreenResponse(
+        agent_id=agent_id, agent_status=AgentStatus.SCREENING_FAILED
     )
 
 

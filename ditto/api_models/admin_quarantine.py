@@ -75,6 +75,17 @@ class AdminScreeningSubmissionList(BaseModel):
     count: int
 
 
+class AdminScreeningRescreenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=3, max_length=500)]
+
+
+class AdminScreeningRescreenResponse(BaseModel):
+    agent_id: UUID
+    agent_status: str
+
+
 __all__ = [
     "AdminQuarantineItem",
     "AdminQuarantineList",
@@ -83,4 +94,6 @@ __all__ = [
     "AdminScreeningAttempt",
     "AdminScreeningSubmission",
     "AdminScreeningSubmissionList",
+    "AdminScreeningRescreenRequest",
+    "AdminScreeningRescreenResponse",
 ]
