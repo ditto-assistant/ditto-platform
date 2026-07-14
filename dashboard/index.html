@@ -534,12 +534,12 @@
       <p class="note"><b>Anti-overfit and comparability.</b> Only runs that administer the <b>full</b> benchmark rank and earn emissions. Smaller practice profiles omit the hardest categories and are shown as provisional. Scores compare only within one benchmark version. Click any row for the per-category breakdown and the integrity telemetry behind its score.</p>
       <div class="pillar" id="bench-setup" style="margin-top:14px">
         <h3>Frozen setup <span class="tag" id="bs-version">v–</span></h3>
-        <p style="margin-bottom:8px">Every harness runs against <b>one frozen open-weight model</b> and every run is graded by <b>deterministic, judge-free rules</b> — a score is a pure function of the dataset and the transcript, and anyone can re-check it.</p>
+        <p style="margin-bottom:8px">Every harness runs against <b>one frozen open-weight model</b> and every run is graded by <b>deterministic, judge-free rules</b>. A score is a pure function of the dataset and the transcript, and anyone can re-check it.</p>
         <ul style="margin:0;padding-left:18px;line-height:1.7">
           <li><b>Model</b>: <code id="bs-model">qwen/qwen3-32b</code> served as <code id="bs-serving">Qwen/Qwen3-32B-TEE</code> (hardware-attested TEE), reasoning mode locked <b id="bs-thinking">off</b>. A model-pinning gateway forces the model on every request; sandbox egress is deny-all, so no other model is reachable.</li>
           <li><b>Grading</b>: no LLM judge. Deterministic per-kind checks from the public <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">dittobench-datagen</a> module (also the generator: dataset + answer keys are byte-reproducible from the seed).</li>
-          <li><b>Seed</b>: derived from an on-chain block hash fixed <i>after</i> the miner commits — unpredictable, one fresh dataset per submission, pinned by <code>dataset_sha256</code> in every score.</li>
-          <li id="bs-mirror-li" style="display:none"><b>Verify it yourself</b>: finalized run records (dataset pin + all signed scores) are public — <a id="bs-mirror" href="#" target="_blank" rel="noopener">run record mirror ↗</a>, plus the signed <a id="bs-ledger" href="#" target="_blank" rel="noopener">score ledger ↗</a>.</li>
+          <li><b>Seed</b>: derived from an on-chain block hash fixed <i>after</i> the miner commits. The result is unpredictable: one fresh dataset per submission, pinned by <code>dataset_sha256</code> in every score.</li>
+          <li id="bs-mirror-li" style="display:none"><b>Verify it yourself</b>: finalized run records (dataset pin + all signed scores) are public. View the <a id="bs-mirror" href="#" target="_blank" rel="noopener">run record mirror ↗</a> and signed <a id="bs-ledger" href="#" target="_blank" rel="noopener">score ledger ↗</a>.</li>
         </ul>
       </div>
     </section>

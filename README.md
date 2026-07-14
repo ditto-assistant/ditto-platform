@@ -106,6 +106,7 @@ for the evaluation/scoring design.
 ### Prerequisites
 
 - [`uv`](https://docs.astral.sh/uv/) (Python toolchain + venv)
+- Node.js 22 and npm (copy lint only)
 - Docker + Docker Compose (Postgres, MinIO, Pylon)
 - Python 3.11 or 3.12
 
@@ -168,6 +169,7 @@ pm2 status                   # process state
 | Target | Description |
 | --- | --- |
 | `make lint` | `ruff format --check` + `ruff check` |
+| `make lint-copy` | lint public dashboard copy with Faircopy |
 | `make format` | `ruff format` + `ruff check --fix` |
 | `make typecheck` | `mypy ditto/` |
 | `make test` | unit test suite (`pytest`) |

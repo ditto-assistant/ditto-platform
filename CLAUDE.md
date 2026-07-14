@@ -59,12 +59,12 @@ make stack-up                # postgres + pylon + minio (docker)
 make migrate                 # alembic upgrade head
 make api-up                  # run the API on :8000 (foreground)
 make smoke-api               # curl /health
-make lint typecheck test     # ruff + mypy + pytest (run before every PR)
+make lint lint-copy typecheck test  # ruff + faircopy + mypy + pytest
 ```
 
-Run on a host under pm2 with `./scripts/start.sh` (see README). Always run
-`make lint`, `make typecheck`, and `make test` before opening a PR — CI enforces
-all three on Python 3.11 and 3.12.
+Run on a host under pm2 with `./scripts/start.sh` (see README). Before opening a
+PR, run `make lint`, `make lint-copy`, `make typecheck`, and `make test`. CI
+enforces all four; Python checks run on 3.11 and 3.12.
 
 ## Testing
 
