@@ -414,10 +414,20 @@ class TestSubmitResult:
 
         response = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=False, detail="cargo build failed"),
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                detail="build failed: cargo error SECRET_FROM_BUILD",
+            ),
         )
         assert response.status_code == 200
         assert response.json()["status"] == AgentStatus.SCREENING_FAILED
+
+        async with session_maker() as s:
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.screening_reason == "Docker image build failed"
+            assert "SECRET_FROM_BUILD" not in agent.screening_reason
 
     async def test_pass_is_idempotent(
         self,

@@ -189,6 +189,13 @@ class Agent(Base):
     review_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     """Human-readable reason a held agent was routed to review (audit trail)."""
 
+    screening_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Public-safe reason category for a failed build/serve screen.
+
+    The screener's raw ``detail`` may contain an untrusted Docker build-log tail,
+    so the endpoint maps it to a fixed category before persisting it here.
+    """
+
     status: Mapped[AgentStatus] = mapped_column(
         Enum(
             AgentStatus,

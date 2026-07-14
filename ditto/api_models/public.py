@@ -546,6 +546,56 @@ class PublicSubmissionsResponse(BaseModel):
     ]
 
 
+class PublicActivityEntry(BaseModel):
+    """One submission's safe, public lifecycle state."""
+
+    agent_id: Annotated[UUID, Field(description="The submitted agent's id.")]
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
+    ]
+    name: Annotated[str, Field(description="Miner-provided agent display name.")]
+    status: Annotated[
+        str,
+        Field(
+            description=(
+                "Public lifecycle stage. Internal review and enforcement states are "
+                "collapsed to under_review or rejected."
+            )
+        ),
+    ]
+    submitted_at: Annotated[
+        datetime, Field(description="When the platform accepted the upload (UTC).")
+    ]
+    screening_reason: Annotated[
+        str | None,
+        Field(default=None, description="Public-safe screening failure category."),
+    ]
+    duplicate_of: Annotated[
+        UUID | None,
+        Field(default=None, description="Earlier agent this submission may duplicate."),
+    ]
+    review_reason: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Anti-copy signals that routed this submission to review.",
+        ),
+    ]
+
+
+class PublicActivityResponse(BaseModel):
+    """Recent submission activity, newest first."""
+
+    generated_at: Annotated[
+        datetime, Field(description="When this snapshot was read (UTC).")
+    ]
+    count: Annotated[int, Field(ge=0, description="Number of submissions returned.")]
+    entries: Annotated[
+        list[PublicActivityEntry],
+        Field(default_factory=list, description="Recent submissions, newest first."),
+    ]
+
+
 class PublicDatasetReveal(BaseModel):
     """The full labeled dataset a finalized submission was scored against.
 
