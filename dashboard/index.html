@@ -420,8 +420,10 @@
     /* Title row: rank heading + the run's benchmark-version chip side by side. */
     .modal .dhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-right: 28px; }
     .modal h3 { margin: 0; font-size: 16px; }
-    .modal .dk { font-family: var(--mono); font-size: 12px; color: var(--text-dim); word-break: break-all; margin: 4px 0 20px; }
-    .modal .close { position: absolute; top: 16px; right: 16px; }
+    .modal .dk { display: flex; gap: 8px; align-items: baseline; min-width: 0; margin: 6px 0 20px; color: var(--text-dim); font-family: var(--mono); font-size: 12px; }
+    .modal .dk-label { flex: none; color: var(--text-faint); font-family: var(--sans); font-size: 11px; font-weight: 650; }
+    .modal #d-hotkey { min-width: 0; overflow-wrap: anywhere; }
+    .modal .close { position: absolute; top: 14px; right: 14px; width: 44px; height: 44px; justify-content: center; padding: 0; }
     /* Benchmark-version chip in the modal header (larger than the row chip). */
     #d-bench { font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; border-radius: 6px; padding: 2px 8px; color: var(--accent-2); border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent); background: color-mix(in oklab, var(--accent-2) 12%, transparent); }
     #d-bench.prev { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 48%, transparent); background: color-mix(in oklab, var(--warn) 14%, transparent); }
@@ -534,8 +536,80 @@
       .benchmark-stage-label, .benchmark-agent, .benchmark-progress-text,
       .benchmark-progress.unknown .benchmark-progress-text { color: CanvasText; }
     }
-    .attempt-list { margin-top: 18px; }
-    .attempt { display: grid; grid-template-columns: 110px 1fr auto; gap: 12px; align-items: start; padding: 11px 0; border-bottom: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
+    #d-stats.pipeline-mode,
+    .pipeline-detail {
+      --detail-space-xs: 4px;
+      --detail-space-sm: 8px;
+      --detail-space-md: 12px;
+      --detail-space-lg: 16px;
+      --detail-space-xl: 24px;
+      --detail-space-2xl: 32px;
+    }
+    #d-stats.pipeline-mode { margin-top: 16px; }
+    .pipeline-summary {
+      display: grid;
+      grid-template-columns: minmax(0, 1.25fr) minmax(260px, .75fr);
+      gap: var(--detail-space-2xl);
+      padding-bottom: var(--detail-space-xl);
+      border-bottom: 1px solid color-mix(in oklab, var(--border) 72%, transparent);
+    }
+    .pipeline-summary h4,
+    .pipeline-section-heading h4 {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 13px;
+      font-weight: 750;
+      letter-spacing: 0;
+    }
+    .pipeline-current-message {
+      max-width: 58ch;
+      margin: var(--detail-space-sm) 0 var(--detail-space-lg);
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 500;
+      line-height: 1.5;
+      text-wrap: pretty;
+    }
+    .pipeline-key-facts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--detail-space-md) var(--detail-space-2xl);
+      margin: 0;
+    }
+    .pipeline-key-facts > div { min-width: 132px; }
+    .pipeline-key-facts dt,
+    .pipeline-meta-list dt {
+      color: var(--text-faint);
+      font-size: 11px;
+      font-weight: 650;
+    }
+    .pipeline-key-facts dd {
+      margin: var(--detail-space-xs) 0 0;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 650;
+      font-variant-numeric: tabular-nums;
+    }
+    .pipeline-meta-list { display: grid; gap: var(--detail-space-lg); margin: var(--detail-space-md) 0 0; }
+    .pipeline-meta-list > div { min-width: 0; }
+    .pipeline-meta-list dd {
+      margin: var(--detail-space-xs) 0 0;
+      color: var(--text-dim);
+      font-size: 12px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+      text-wrap: pretty;
+    }
+    .pipeline-meta-list code { color: var(--text); font-family: var(--mono); font-size: 11.5px; }
+    .pipeline-history { display: grid; gap: var(--detail-space-xl); padding-top: var(--detail-space-xl); }
+    .pipeline-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: var(--detail-space-lg); margin-bottom: var(--detail-space-sm); }
+    .pipeline-section-count { color: var(--text-faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+    .pipeline-detail-state { margin: 0; padding: var(--detail-space-md) 0; color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
+    .pipeline-detail-state.loading { color: var(--text-faint); }
+    .pipeline-detail-state.error { color: var(--warn); }
+    .attempt-list { margin-top: 0; }
+    .attempt { display: grid; grid-template-columns: 88px minmax(0, 1fr) auto; gap: 16px; align-items: start; padding: 12px 0; border-bottom: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
     .attempt:last-child { border-bottom: 0; }
     .attempt-version { font-family: var(--mono); font-size: 12px; color: var(--text); }
     .attempt-main { min-width: 0; }
@@ -547,7 +621,19 @@
     .old-screeners summary:hover { color: var(--text); }
     .old-screeners summary:focus-visible { outline: 3px solid color-mix(in oklch, var(--focus) 30%, transparent); outline-offset: 3px; }
     .old-screeners[open] summary { color: var(--text); }
-    @media (max-width: 560px) { .attempt { grid-template-columns: 88px 1fr; } .attempt-time { grid-column: 2; } }
+    @media (max-width: 800px) {
+      .pipeline-summary { grid-template-columns: 1fr; gap: var(--detail-space-xl); }
+      .pipeline-meta { padding-top: var(--detail-space-xl); border-top: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
+    }
+    @media (max-width: 560px) {
+      .modal { padding-inline: 20px; }
+      .modal .dk { display: block; }
+      .modal .dk-label { display: block; margin-bottom: 2px; }
+      .pipeline-key-facts { display: grid; grid-template-columns: 1fr 1fr; gap: var(--detail-space-md); }
+      .pipeline-key-facts > div { min-width: 0; }
+      .attempt { grid-template-columns: 76px 1fr; gap: 12px; }
+      .attempt-time { grid-column: 2; }
+    }
 
     @media (max-width: 960px) {
       .hide-md { display: none; }
@@ -1367,7 +1453,7 @@
       <h3 id="d-title">Miner</h3>
       <span id="d-bench"></span>
     </div>
-    <div class="dk" id="d-hotkey"></div>
+    <div class="dk"><span class="dk-label">Miner</span><span id="d-hotkey"></span></div>
     <div class="split">
       <div class="seg">
         <div id="d-tool-seg" style="background:var(--tool)"></div>
@@ -1787,6 +1873,7 @@
     function openModal(i) {
       var e = lastEntries[i];
       if (!e) return;
+      document.getElementById("d-stats").classList.remove("pipeline-mode");
       document.querySelector("#modal .split").style.display = "";
       document.getElementById("d-title").textContent = "Rank #" + e.rank + (e.rank === 1 ? " · 👑 Leader" : "");
       benchChip(e);
@@ -2422,13 +2509,48 @@
           '<div class="attempt-meta">' + esc(meta) + '</div>' + benchmark + '</div>' +
           '<div class="attempt-time" title="' + esc(a.issued_at) + '">' + relTime(a.issued_at) + '</div></div>';
       }).join("");
-      return '<div class="attempt-list">' +
-        '<div class="stat-head">Screener result</div>' +
-        (screening || '<div class="muted" style="padding:10px 0">No versioned screening attempt recorded yet.</div>') +
-        (oldScreening ? '<details class="old-screeners"><summary>Old screener results</summary>' + oldScreening + '</details>' : '') +
-        '<div class="stat-head" style="margin-top:18px">Validator progress · ' + esc(pipeline.score_count) + ' of ' + esc(pipeline.quorum) + ' scores received</div>' +
-        (validation || '<div class="muted" style="padding:10px 0">No validator is assigned yet.</div>') +
-        '</div>';
+      return '<div class="pipeline-history">' +
+        '<section class="pipeline-section" aria-labelledby="pipeline-screening-history">' +
+          '<div class="pipeline-section-heading"><h4 id="pipeline-screening-history">Screener result</h4></div>' +
+          '<div class="attempt-list">' +
+            (screening || '<p class="pipeline-detail-state">No versioned screening attempt recorded yet.</p>') +
+            (oldScreening ? '<details class="old-screeners"><summary>Old screener results</summary>' + oldScreening + '</details>' : '') +
+          '</div>' +
+        '</section>' +
+        '<section class="pipeline-section" aria-labelledby="pipeline-validator-history">' +
+          '<div class="pipeline-section-heading"><h4 id="pipeline-validator-history">Validator progress</h4>' +
+            '<span class="pipeline-section-count">' + esc(pipeline.score_count) + ' of ' + esc(pipeline.quorum) + ' scores received</span></div>' +
+          '<div class="attempt-list">' +
+            (validation || '<p class="pipeline-detail-state">No validator is assigned yet.</p>') +
+          '</div>' +
+        '</section>' +
+      '</div>';
+    }
+
+    function renderPipelineSummary(e, pipeline, evidence, stateMessage, stateClass) {
+      var current = Object.assign({}, e, pipeline || {});
+      var scoreCount = current.score_count == null ? 0 : current.score_count;
+      var quorum = current.quorum == null ? 3 : current.quorum;
+      return '<div class="pipeline-detail">' +
+        '<div class="pipeline-summary">' +
+          '<section class="pipeline-current" aria-labelledby="pipeline-current-title">' +
+            '<h4 id="pipeline-current-title">Current progress</h4>' +
+            '<p class="pipeline-current-message">' + esc(validationDetail(current)) + '</p>' +
+            '<dl class="pipeline-key-facts">' +
+              '<div><dt>Validation</dt><dd>' + esc(scoreCount) + ' of ' + esc(quorum) + '</dd></div>' +
+              '<div><dt>Submitted</dt><dd>' + esc(new Date(e.submitted_at).toLocaleString()) + '</dd></div>' +
+            '</dl>' +
+          '</section>' +
+          '<section class="pipeline-meta" aria-labelledby="pipeline-meta-title">' +
+            '<h4 id="pipeline-meta-title">Submission details</h4>' +
+            '<dl class="pipeline-meta-list">' +
+              '<div><dt>Agent ID</dt><dd><code>' + esc(String(e.agent_id || "")) + '</code></dd></div>' +
+              '<div><dt>Evidence</dt><dd>' + esc(evidence) + '</dd></div>' +
+            '</dl>' +
+          '</section>' +
+        '</div>' +
+        (stateMessage ? '<p class="pipeline-detail-state ' + esc(stateClass || "") + '">' + esc(stateMessage) + '</p>' : '') +
+      '</div>';
     }
 
     function openActivityEntry(e) {
@@ -2438,6 +2560,7 @@
         ? "Copy review: " + e.review_reason
         : (e.screening_reason ? "Screening: " + e.screening_reason : "No additional evidence reported.");
       consensusToken = null;
+      document.getElementById("d-stats").classList.add("pipeline-mode");
       document.querySelector("#modal .split").style.display = "none";
       document.getElementById("d-title").textContent = e.name || "Unnamed agent";
       var chip = document.getElementById("d-bench");
@@ -2445,39 +2568,22 @@
       chip.textContent = stage[0];
       chip.title = "Current submission stage";
       document.getElementById("d-hotkey").textContent = e.miner_hotkey;
-      document.getElementById("d-stats").innerHTML =
-        '<div class="stat-cols">' +
-          '<div class="stat-group"><div class="stat-head">Pipeline state</div>' +
-            stat("Stage", stage[0]) +
-            stat("Validation", validationProgress(e)) +
-            stat("Submitted", new Date(e.submitted_at).toLocaleString()) +
-          '</div>' +
-          '<div class="stat-group"><div class="stat-head">Details</div>' +
-            stat("Agent ID", String(e.agent_id || "")) +
-            stat("Progress", validationDetail(e)) +
-            stat("Evidence", evidence) +
-          '</div>' +
-        '</div><div class="muted" style="margin-top:18px">Loading screening and validation history…</div>';
+      document.getElementById("d-stats").innerHTML = renderPipelineSummary(
+        e, null, evidence, "Loading screening and validation history…", "loading"
+      );
       showModal();
       getJSON("/public/agent/" + encodeURIComponent(e.agent_id) + "/pipeline")
         .then(function (pipeline) {
           document.getElementById("d-stats").innerHTML =
-            '<div class="stat-cols">' +
-              '<div class="stat-group"><div class="stat-head">Pipeline state</div>' +
-                stat("Stage", activityStage(pipeline.status)[0]) +
-                stat("Validation", pipeline.score_count + " of " + pipeline.quorum) +
-                stat("Submitted", new Date(e.submitted_at).toLocaleString()) +
-              '</div>' +
-              '<div class="stat-group"><div class="stat-head">Details</div>' +
-                stat("Agent ID", String(e.agent_id || "")) +
-                stat("Progress", validationDetail(Object.assign({}, e, pipeline))) +
-                stat("Evidence", evidence) +
-              '</div>' +
-            '</div>' + renderPipelineDetail(e, pipeline);
+            renderPipelineSummary(e, pipeline, evidence) + renderPipelineDetail(e, pipeline);
         })
         .catch(function () {
           var el = document.getElementById("d-stats");
-          el.insertAdjacentHTML("beforeend", '<div class="muted" style="margin-top:18px">Detailed history is temporarily unavailable.</div>');
+          var state = el.querySelector(".pipeline-detail-state");
+          if (state) {
+            state.className = "pipeline-detail-state error";
+            state.textContent = "Detailed history is temporarily unavailable.";
+          }
         });
     }
 

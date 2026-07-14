@@ -133,6 +133,12 @@ class TestDashboard:
         assert "System failure" not in body
         assert 'expired: ["Assignment expired", "warn"]' in body
         assert 'failed: ["Could not complete", "warn"]' in body
+        assert 'class="pipeline-summary"' in body
+        assert 'class="pipeline-key-facts"' in body
+        assert 'class="pipeline-meta-list"' in body
+        assert 'class="pipeline-history"' in body
+        assert 'class="pipeline-detail-state"' in body
+        assert 'style="margin-top:18px">Validator progress' not in body
 
     async def test_includes_accessible_fleet_status(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
