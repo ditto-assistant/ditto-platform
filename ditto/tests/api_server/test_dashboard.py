@@ -86,6 +86,12 @@ class TestDashboard:
         assert "Waiting for screening" in body
         assert "Waiting for validator" in body
         assert 'getJSON("/public/activity?page=1&limit=200")' in body
+        assert body.count('type="button" data-activity-page="prev"') == 2
+        assert body.count('type="button" data-activity-page="next"') == 2
+        assert 'aria-label="Submission pages, bottom"' in body
+        assert 'class="activity-table-frame"' in body
+        assert "lockActivityFrameHeight" in body
+        assert "anchor.getBoundingClientRect().top - anchorTop" in body
         assert "Validation" in body
         assert "openActivityModal" in body
         assert "validators scored this submission" in body
