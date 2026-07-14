@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
@@ -41,17 +41,6 @@ def _as_utc(dt: datetime) -> datetime:
 # Statuses that occupy a slot: an issued (live) or already-scored ticket. An
 # expired ticket does not count, so its slot re-opens.
 _LIVE_TICKET_STATUSES = (TicketStatus.ISSUED, TicketStatus.SCORED)
-
-# Fairness spans the whole active submission pipeline, not only artifacts that
-# have already cleared the current screener. Otherwise a 2-of-3 artifact can be
-# the sole scoreable candidate during a policy-wide rescreen and jump dozens of
-# 0-of-3 submissions that are still waiting for screening.
-_FAIRNESS_SCREENING_STATUSES = (
-    AgentStatus.UPLOADED,
-    AgentStatus.SCREENING,
-    AgentStatus.SCREENING_PASSED,
-    AgentStatus.SCREENING_FAILED,
-)
 
 # A timed-out artifact must not monopolize one validator. Give transient
 # failures one delayed retry, while allowing other validators to make an
@@ -99,12 +88,12 @@ async def issue_ticket(
 
     Sweeps overdue tickets first, then picks an ``evaluating`` agent that (a)
     has fewer than :data:`SCORING_QUORUM` live tickets and (b) this validator
-    does not already hold a live or scored ticket for. Candidates with fewer
-    accepted scores come first, then never-attempted work, then submission age.
-    A prior expired row is reissued only after its cooldown and only once for
-    the same benchmark version. Returns the ticket, or ``None`` when there is no
-    work for this validator ("no job for you"). Runs inside the caller's
-    transaction.
+    does not already hold a live or scored ticket for. Candidates with the
+    least total coverage (accepted scores plus live assignments) come first,
+    then never-attempted work, then submission age. A prior expired row is
+    reissued only after its cooldown and only once for the same benchmark
+    version. Returns the ticket, or ``None`` when there is no work for this
+    validator ("no job for you"). Runs inside the caller's transaction.
     """
     # No row exists to lock before a validator's first claim. Serialize that
     # gap explicitly on Postgres; the unique partial index remains the durable
@@ -170,30 +159,17 @@ async def issue_ticket(
         .correlate(Agent)
         .scalar_subquery()
     )
-    backlog_agents = (
-        select(Agent.agent_id)
-        .where(Agent.status.in_(_FAIRNESS_SCREENING_STATUSES))
-        .subquery()
-    )
-    backlog_score_counts = (
-        select(
-            ValidatorTicket.agent_id,
-            func.count().label("score_count"),
+    live_assignment_count = (
+        select(func.count())
+        .where(
+            ValidatorTicket.agent_id == Agent.agent_id,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
         )
-        .where(ValidatorTicket.status == TicketStatus.SCORED)
-        .group_by(ValidatorTicket.agent_id)
-        .subquery()
-    )
-    global_score_floor = (
-        select(func.min(func.coalesce(backlog_score_counts.c.score_count, 0)))
-        .select_from(
-            backlog_agents.outerjoin(
-                backlog_score_counts,
-                backlog_score_counts.c.agent_id == backlog_agents.c.agent_id,
-            )
-        )
+        .correlate(Agent)
         .scalar_subquery()
     )
+    total_coverage = accepted_score_count + live_assignment_count
     # Lock one candidate Agent row before counting its tickets. The recount is a
     # separate statement after the lock is acquired, so under Postgres READ
     # COMMITTED it sees any ticket committed by the previous lock holder.
@@ -204,25 +180,18 @@ async def issue_ticket(
             Agent.status == AgentStatus.EVALUATING,
             Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
             Agent.agent_id.not_in(already_mine),
-            # Do not let already-screened work jump a lower-score rescreen
-            # backlog. NULL means no artifact is currently moving through the
-            # screening stages, in which case normal score-count ordering
-            # applies among eligible candidates.
-            or_(
-                global_score_floor.is_(None),
-                accepted_score_count <= global_score_floor,
-            ),
         )
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
         candidate = (
-            # Spread validator coverage across the backlog before completing a
-            # submission's quorum. An agent with zero accepted scores precedes
-            # one with one, which precedes one with two. Within that fairness
-            # bucket, never-attempted work precedes this validator's cooled-down
+            # Round-robin the scoreable backlog. A live evaluator counts as one
+            # unit of coverage just like an accepted score, so an agent cannot
+            # jump from zero coverage to three concurrent validators while
+            # another eligible agent remains uncovered. Within one coverage
+            # round, never-attempted work precedes this validator's cooled-down
             # retry, then the oldest submission wins with a stable UUID tie-break.
             candidate.order_by(
-                accepted_score_count.asc(),
+                total_coverage.asc(),
                 had_prior_ticket.asc(),
                 Agent.created_at.asc(),
                 Agent.agent_id.asc(),
