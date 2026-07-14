@@ -1168,6 +1168,7 @@
     }
     .pipeline-item-name { font-size: 11px; }
     .pipeline-item-meta { font-size: 9px; }
+    .pipeline-item .screener-progress { margin-top: 6px; }
     .pipeline-empty,
     .pipeline-more { padding: 7px 4px; text-align: center; font-size: 10px; }
 
@@ -1624,6 +1625,8 @@
     var lastEntries = [];
     var lastActivityEntries = [];
     var pipelineEntries = [];
+    var pipelineLoaded = false;
+    var pipelineUnavailable = false;
     var activityPage = 1;
     var activityTotalPages = 1;
     var ACTIVITY_PAGE_SIZE = 10;
@@ -2697,6 +2700,8 @@
         { status: "evaluating", body: "pipeline-evaluating", count: "pipeline-evaluating-count", empty: "No active evaluation." },
         { status: "scored", body: "pipeline-scored", count: "pipeline-scored-count", empty: "No recent scores." }
       ];
+      pipelineLoaded = true;
+      pipelineUnavailable = unavailable;
       pipelineEntries = unavailable ? [] : entries;
       columns.forEach(function (column) {
         var body = document.getElementById(column.body);
@@ -2726,9 +2731,12 @@
           var benchmark = column.status === "evaluating"
             ? (entry.active_benchmarks || []).map(function (progress) { return renderBenchmarkProgress(progress, false); }).join("")
             : "";
-          return '<button type="button" class="pipeline-item" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(entry.name || "unnamed agent") + ' details">' +
+          var screening = column.status === "screening" ? renderPipelineScreenerProgress(entry) : "";
+          var screeningLabel = column.status === "screening" ? pipelineScreenerStage(entry) : "";
+          return '<button type="button" class="pipeline-item" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(entry.name || "unnamed agent") + ' details' + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
             '<span class="pipeline-item-name">' + esc(entry.name || "Unnamed agent") + '</span>' +
             '<span class="pipeline-item-meta"><span>' + esc(String(entry.agent_id || "").slice(0, 8)) + '</span><span>' + esc(meta) + '</span></span>' +
+            screening +
             benchmark +
             '</button>';
         }).join("");
@@ -2836,6 +2844,27 @@
       return '<span class="screener-progress">' +
         '<span class="screener-progress-stage">' + esc(label) + ' · <span class="screener-progress-time" data-started-at="' + esc(progress.started_at) + '">' + esc(elapsedDuration(progress.started_at)) + '</span></span>' +
         '<span class="current-agent" title="' + esc(agentId) + '">' + esc(agent) + (agentId ? " · " + esc(agentId.slice(0, 8)) : "") + '</span></span>';
+    }
+
+    function activeScreenerFor(agentId) {
+      var data = fleetReports.screeners;
+      var screeners = data && data.screeners ? data.screeners : [];
+      return screeners.find(function (entry) {
+        return entry.active_agent_id === agentId && entry.screening_progress;
+      }) || null;
+    }
+
+    function pipelineScreenerStage(entry) {
+      var screener = activeScreenerFor(entry.agent_id);
+      return screener ? screenerStageLabel(screener.screening_progress.stage) : "";
+    }
+
+    function renderPipelineScreenerProgress(entry) {
+      var screener = activeScreenerFor(entry.agent_id);
+      if (!screener) return "";
+      var progress = screener.screening_progress;
+      return '<span class="screener-progress">' +
+        '<span class="screener-progress-stage">' + esc(screenerStageLabel(progress.stage)) + ' · <span class="screener-progress-time" data-started-at="' + esc(progress.started_at) + '">' + esc(elapsedDuration(progress.started_at)) + '</span></span></span>';
     }
 
     function updateScreenerElapsed() {
@@ -3036,6 +3065,9 @@
           fleetReports.screeners = data;
           fleetUnavailable.screeners = false;
           renderFleet();
+          if (pipelineLoaded && !pipelineUnavailable) {
+            renderPipelineBoard({ entries: pipelineEntries }, false);
+          }
         })
         .catch(function () {
           fleetUnavailable.screeners = true;
