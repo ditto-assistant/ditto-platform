@@ -8,8 +8,9 @@ from uuid import UUID, uuid4
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
-from ditto.db.models import Agent
+from ditto.db.models import Agent, ValidatorTicket
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import (
     expire_overdue_tickets,
@@ -21,6 +22,7 @@ from ditto.db.queries.tickets import (
 _NOW = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
 _TTL = timedelta(minutes=30)
 _LATER = _NOW + timedelta(hours=1)
+_AFTER_COOLDOWN = _NOW + timedelta(hours=7)
 
 
 async def _seed_evaluating(
@@ -35,6 +37,7 @@ async def _seed_evaluating(
                 name=name,
                 sha256="ab" * 32,
                 status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
                 created_at=created_at,
             )
         )
@@ -42,6 +45,20 @@ async def _seed_evaluating(
 
 
 class TestIssueTicket:
+    async def test_skips_agent_that_needs_rescreening(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            agent = await session.get(Agent, aid)
+            assert agent is not None
+            agent.screening_policy_version = 0
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
+            )
+        assert ticket is None
+
     async def test_seats_ticket_for_evaluating_agent(
         self, session: AsyncSession
     ) -> None:
@@ -114,26 +131,134 @@ class TestExpiry:
             )
         assert t is not None and t.agent_id == aid
 
-    async def test_expired_ticket_is_reissued_to_same_validator(
+    async def test_expired_ticket_cools_down_and_next_agent_moves_ahead(
         self, session: AsyncSession
     ) -> None:
-        aid = await _seed_evaluating(session)
+        slow = await _seed_evaluating(session, name="slow")
+        next_agent = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="next",
+        )
         async with session.begin():
             first = await issue_ticket(
                 session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
             )
-        assert first is not None
+        assert first is not None and first.agent_id == slow
 
         async with session.begin():
-            retried = await issue_ticket(
+            claimed = await issue_ticket(
                 session, validator_hotkey="5V1", now=_LATER, ttl=_TTL
             )
 
-        assert retried is not None
-        assert retried.agent_id == aid
-        assert retried.status == TicketStatus.ISSUED
-        assert retried.issued_at == _LATER
-        assert retried.deadline == _LATER + _TTL
+        assert claimed is not None
+        assert claimed.agent_id == next_agent
+
+    async def test_expired_ticket_gets_one_retry_after_cooldown(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
+        async with session.begin():
+            retried = await issue_ticket(
+                session,
+                validator_hotkey="5V1",
+                now=_AFTER_COOLDOWN,
+                ttl=_TTL,
+            )
+
+        assert retried is not None and retried.agent_id == aid
+        assert retried.attempt_count == 2
+        assert retried.issued_at == _AFTER_COOLDOWN
+
+    async def test_never_attempted_agent_precedes_eligible_retry(
+        self, session: AsyncSession
+    ) -> None:
+        slow = await _seed_evaluating(session, name="slow")
+        untouched = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="untouched",
+        )
+        async with session.begin():
+            first = await issue_ticket(
+                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
+            )
+        assert first is not None and first.agent_id == slow
+
+        async with session.begin():
+            claimed = await issue_ticket(
+                session,
+                validator_hotkey="5V1",
+                now=_AFTER_COOLDOWN,
+                ttl=_TTL,
+            )
+
+        assert claimed is not None
+        assert claimed.agent_id == untouched
+
+    async def test_second_expiry_exhausts_same_version_retry_budget(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
+        async with session.begin():
+            await issue_ticket(
+                session,
+                validator_hotkey="5V1",
+                now=_AFTER_COOLDOWN,
+                ttl=_TTL,
+            )
+        after_second_expiry = _AFTER_COOLDOWN + timedelta(hours=7)
+        async with session.begin():
+            third = await issue_ticket(
+                session,
+                validator_hotkey="5V1",
+                now=after_second_expiry,
+                ttl=_TTL,
+            )
+
+        assert third is None
+        async with session.begin():
+            ticket = await session.get(ValidatorTicket, (aid, "5V1"))
+        assert ticket is not None
+        assert ticket.status == TicketStatus.EXPIRED
+        assert ticket.attempt_count == 2
+
+    async def test_benchmark_version_change_resets_retry_budget(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5V1",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=2,
+            )
+        assert ticket is not None
+        async with session.begin():
+            ticket = await session.get(ValidatorTicket, (aid, "5V1"))
+            assert ticket is not None
+            ticket.status = TicketStatus.EXPIRED
+            ticket.attempt_count = 2
+            ticket.retry_after = _NOW + timedelta(days=1)
+        async with session.begin():
+            reset = await issue_ticket(
+                session,
+                validator_hotkey="5V1",
+                now=_LATER,
+                ttl=_TTL,
+                bench_version=3,
+            )
+
+        assert reset is not None
+        assert reset.bench_version == 3
+        assert reset.attempt_count == 1
+        assert reset.retry_after is None
 
     async def test_expire_overdue_returns_count(self, session: AsyncSession) -> None:
         await _seed_evaluating(session)

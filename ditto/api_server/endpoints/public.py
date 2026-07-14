@@ -36,6 +36,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Response
+from sqlalchemy import func, select
 
 from ditto.api_models import (
     BenchDatasetConfig,
@@ -56,23 +57,35 @@ from ditto.api_models import (
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
     PublicRunModels,
+    PublicScreenerHeartbeat,
+    PublicScreenerHeartbeatsResponse,
+    PublicScreeningAttempt,
+    PublicSubmissionPipeline,
     PublicSubmissionScores,
     PublicSubmissionsResponse,
     PublicSubmissionSummary,
+    PublicSystemMetrics,
+    PublicValidationAttempt,
     PublicValidatorHeartbeat,
     PublicValidatorHeartbeatsResponse,
     PublicValidatorScore,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.public import FleetAvailability, FleetHealth
+from ditto.api_models.screener import SCREENING_POLICY_VERSION, ScreenerRuntimeState
+from ditto.api_models.system_health import SystemMetrics
 from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.validator import SessionDep
-from ditto.db.models import Score
+from ditto.db.models import Agent, Score, ValidatorTicket
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
-from ditto.db.queries.heartbeats import list_validator_heartbeats
+from ditto.db.queries.heartbeats import (
+    list_screener_heartbeats,
+    list_validator_heartbeats,
+)
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
@@ -84,6 +97,7 @@ from ditto.db.queries.scores import (
     list_public_submissions,
     list_scores_for_bench_version,
 )
+from ditto.db.queries.screening import list_screening_attempts
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +107,62 @@ router = APIRouter(prefix="/public", tags=["public"])
 # cache is safe and shields the DB from dashboard/CDN traffic.
 _CACHE_CONTROL = "public, max-age=30"
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=UTC)
+
+
+def _public_system_metrics(raw: dict | None) -> PublicSystemMetrics | None:
+    """Validate stored telemetry again and expose only the fixed public allowlist."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        metrics = SystemMetrics.model_validate(raw)
+    except Exception:  # noqa: BLE001 - malformed historical rows stay private
+        return None
+    return PublicSystemMetrics(
+        cpu_percent=metrics.cpu_percent,
+        memory_percent=metrics.memory_percent,
+        disk_percent=metrics.disk_percent,
+        docker_status=metrics.docker.status,
+        running_containers=metrics.docker.running_containers,
+        unhealthy_containers=metrics.docker.unhealthy_containers,
+    )
+
+
+def _fleet_classification(
+    *, state: str, seen_at: datetime, now: datetime, metrics: PublicSystemMetrics | None
+) -> tuple[bool, FleetAvailability, FleetHealth]:
+    """Return online, availability, and health without treating omission as outage."""
+    online = seen_at >= now - _VALIDATOR_ONLINE_WINDOW
+    availability: FleetAvailability
+    if not online:
+        availability = "offline"
+    elif state == "paused":
+        availability = "paused"
+    else:
+        availability = "available"
+
+    health: FleetHealth
+    if state == "error":
+        health = "warning"
+    elif metrics is None:
+        health = "unknown"
+    elif (
+        metrics.cpu_percent >= 95
+        or metrics.memory_percent >= 90
+        or metrics.disk_percent >= 85
+        or metrics.docker_status == "degraded"
+    ):
+        health = "warning"
+    elif metrics.docker_status == "unavailable":
+        health = "unknown"
+    else:
+        health = "healthy"
+    return online, availability, health
 
 
 def _safe_models(details: dict) -> PublicRunModels | None:
@@ -370,32 +440,78 @@ async def validators(
     """
     response.headers["Cache-Control"] = _CACHE_CONTROL
     now = datetime.now(UTC)
-    cutoff = now - _VALIDATOR_ONLINE_WINDOW
     rows = await list_validator_heartbeats(session)
-
-    def aware(value: datetime) -> datetime:
-        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-
-    entries = [
-        PublicValidatorHeartbeat(
-            validator_hotkey=row.validator_hotkey,
-            software_version=row.software_version,
-            protocol_version=row.protocol_version,
-            code_digest=row.code_digest,
-            state=cast(ValidatorRuntimeState, row.state),
-            reported_at=aware(row.reported_at),
-            seen_at=aware(row.seen_at),
-            signature=row.signature,
-            online=aware(row.seen_at) >= cutoff,
+    entries = []
+    for row in rows:
+        seen_at = cast(datetime, _aware(row.seen_at))
+        metrics = _public_system_metrics(row.system_metrics)
+        online, availability, health = _fleet_classification(
+            state=row.state, seen_at=seen_at, now=now, metrics=metrics
         )
-        for row in rows
-    ]
+        entries.append(
+            PublicValidatorHeartbeat(
+                validator_hotkey=row.validator_hotkey,
+                software_version=row.software_version,
+                protocol_version=row.protocol_version,
+                state=cast(ValidatorRuntimeState, row.state),
+                active_agent_id=row.active_agent_id,
+                first_seen_at=_aware(row.first_seen_at),
+                reported_at=cast(datetime, _aware(row.reported_at)),
+                seen_at=seen_at,
+                online=online,
+                availability=availability,
+                health=health,
+                system_metrics=metrics,
+            )
+        )
     return PublicValidatorHeartbeatsResponse(
         generated_at=now,
         online_window_seconds=int(_VALIDATOR_ONLINE_WINDOW.total_seconds()),
         reported_count=len(entries),
         online_count=sum(entry.online for entry in entries),
         validators=entries,
+    )
+
+
+@router.get("/screeners", response_model=PublicScreenerHeartbeatsResponse)
+async def screeners(
+    response: Response,
+    session: SessionDep,
+) -> PublicScreenerHeartbeatsResponse:
+    """Authenticated screener fleet reports with a strict public allowlist."""
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    now = datetime.now(UTC)
+    rows = await list_screener_heartbeats(session)
+    entries = []
+    for row in rows:
+        seen_at = cast(datetime, _aware(row.seen_at))
+        metrics = _public_system_metrics(row.system_metrics)
+        online, availability, health = _fleet_classification(
+            state=row.state, seen_at=seen_at, now=now, metrics=metrics
+        )
+        entries.append(
+            PublicScreenerHeartbeat(
+                screener_hotkey=row.screener_hotkey,
+                software_version=row.software_version,
+                protocol_version=row.protocol_version,
+                policy_version=row.policy_version,
+                state=cast(ScreenerRuntimeState, row.state),
+                active_agent_id=row.active_agent_id,
+                first_seen_at=_aware(row.first_seen_at),
+                reported_at=cast(datetime, _aware(row.reported_at)),
+                seen_at=seen_at,
+                online=online,
+                availability=availability,
+                health=health,
+                system_metrics=metrics,
+            )
+        )
+    return PublicScreenerHeartbeatsResponse(
+        generated_at=now,
+        online_window_seconds=int(_VALIDATOR_ONLINE_WINDOW.total_seconds()),
+        reported_count=len(entries),
+        online_count=sum(entry.online for entry in entries),
+        screeners=entries,
     )
 
 
@@ -470,8 +586,28 @@ def _submission_summary(row: SubmissionRow) -> PublicSubmissionSummary:
     )
 
 
-def _public_activity_status(status: AgentStatus) -> str:
+def _public_activity_status(
+    status: AgentStatus,
+    *,
+    screening_policy_version: int,
+    has_active_attempt: bool,
+    has_active_validation: bool,
+) -> str:
     """Collapse internal moderation detail into stable public lifecycle labels."""
+    needs_rescreen = (
+        status
+        in (
+            AgentStatus.EVALUATING,
+            AgentStatus.REJECTED,
+        )
+        and screening_policy_version < SCREENING_POLICY_VERSION
+    )
+    if has_active_attempt or status == AgentStatus.SCREENING:
+        return AgentStatus.SCREENING.value
+    if status in (AgentStatus.UPLOADED, AgentStatus.SCREENING_FAILED) or needs_rescreen:
+        return "waiting_screening"
+    if status in (AgentStatus.SCREENING_PASSED, AgentStatus.EVALUATING):
+        return "evaluating" if has_active_validation else "waiting_validator"
     if status == AgentStatus.ATH_PENDING_REVIEW:
         return "under_review"
     if status == AgentStatus.BANNED:
@@ -483,6 +619,7 @@ def _public_activity_status(status: AgentStatus) -> str:
 async def activity(
     response: Response,
     session: SessionDep,
+    page: int = Query(default=1, ge=1),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> PublicActivityResponse:
     """Recent submissions and their safe public pipeline stage, newest first.
@@ -493,22 +630,157 @@ async def activity(
     private.
     """
     response.headers["Cache-Control"] = "public, max-age=10"
-    rows = await list_public_activity(session, limit=limit)
+    rows, total = await list_public_activity(
+        session, limit=limit, offset=(page - 1) * limit
+    )
+    now = datetime.now(UTC)
+    cutoff = now - _VALIDATOR_ONLINE_WINDOW
+    active_agent_ids = {
+        heartbeat.active_agent_id
+        for heartbeat in await list_validator_heartbeats(session)
+        if heartbeat.active_agent_id is not None
+        and heartbeat.state == "running_benchmark"
+        and (
+            heartbeat.seen_at
+            if heartbeat.seen_at.tzinfo is not None
+            else heartbeat.seen_at.replace(tzinfo=UTC)
+        )
+        >= cutoff
+    }
+
+    def public_status(row: Any) -> str:
+        return _public_activity_status(
+            row.agent.status,
+            screening_policy_version=row.agent.screening_policy_version,
+            has_active_attempt=row.screening_attempt is not None,
+            has_active_validation=row.agent.agent_id in active_agent_ids,
+        )
+
     return PublicActivityResponse(
-        generated_at=datetime.now(UTC),
+        generated_at=now,
         count=len(rows),
+        total=total,
+        page=page,
+        page_size=limit,
+        total_pages=max(1, math.ceil(total / limit)),
         entries=[
             PublicActivityEntry(
-                agent_id=row.agent_id,
-                miner_hotkey=row.miner_hotkey,
-                name=row.name,
-                status=_public_activity_status(row.status),
-                submitted_at=row.created_at,
-                screening_reason=row.screening_reason,
-                duplicate_of=row.duplicate_of,
-                review_reason=row.review_reason,
+                agent_id=row.agent.agent_id,
+                miner_hotkey=row.agent.miner_hotkey,
+                name=row.agent.name,
+                status=public_status(row),
+                submitted_at=row.agent.created_at,
+                screening_reason=(
+                    None
+                    if public_status(row) in ("waiting_screening", "screening")
+                    else row.agent.screening_reason
+                ),
+                duplicate_of=row.agent.duplicate_of,
+                review_reason=row.agent.review_reason,
+                score_count=row.score_count,
+                quorum=SCORING_QUORUM,
+                screening_policy_version=row.agent.screening_policy_version,
+                required_screening_policy_version=SCREENING_POLICY_VERSION,
+                screening_attempt_id=(
+                    row.screening_attempt.attempt_id
+                    if row.screening_attempt is not None
+                    else None
+                ),
+                screening_started_at=(
+                    row.screening_attempt.started_at
+                    if row.screening_attempt is not None
+                    else None
+                ),
+                screening_deadline=(
+                    row.screening_attempt.deadline
+                    if row.screening_attempt is not None
+                    else None
+                ),
             )
             for row in rows
+        ],
+    )
+
+
+@router.get("/agent/{agent_id}/pipeline", response_model=PublicSubmissionPipeline)
+async def agent_pipeline(
+    response: Response,
+    session: SessionDep,
+    agent_id: UUID,
+) -> PublicSubmissionPipeline:
+    """Versioned screening history and validator progress for one submission."""
+    response.headers["Cache-Control"] = "public, max-age=10"
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="submission not found")
+
+    attempts = await list_screening_attempts(session, agent_id=agent_id)
+    tickets = list(
+        await session.scalars(
+            select(ValidatorTicket)
+            .where(ValidatorTicket.agent_id == agent_id)
+            .order_by(
+                ValidatorTicket.issued_at.desc(),
+                ValidatorTicket.validator_hotkey,
+            )
+        )
+    )
+    heartbeats = await list_validator_heartbeats(session)
+    now = datetime.now(UTC)
+    cutoff = now - _VALIDATOR_ONLINE_WINDOW
+
+    def aware(value: datetime) -> datetime:
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+    active_validators = {
+        heartbeat.validator_hotkey
+        for heartbeat in heartbeats
+        if heartbeat.active_agent_id == agent_id
+        and heartbeat.state == "running_benchmark"
+        and aware(heartbeat.seen_at) >= cutoff
+    }
+    score_count = int(
+        await session.scalar(
+            select(func.count(Score.validator_hotkey)).where(Score.agent_id == agent_id)
+        )
+        or 0
+    )
+    running_attempt = next(
+        (attempt for attempt in attempts if attempt.status == "running"), None
+    )
+    return PublicSubmissionPipeline(
+        generated_at=now,
+        agent_id=agent_id,
+        status=_public_activity_status(
+            agent.status,
+            screening_policy_version=agent.screening_policy_version,
+            has_active_attempt=running_attempt is not None,
+            has_active_validation=bool(active_validators),
+        ),
+        score_count=score_count,
+        quorum=SCORING_QUORUM,
+        screening_attempts=[
+            PublicScreeningAttempt(
+                attempt_id=attempt.attempt_id,
+                policy_version=attempt.policy_version,
+                status=attempt.status,
+                screener_hotkey=attempt.screener_hotkey,
+                started_at=attempt.started_at,
+                deadline=attempt.deadline,
+                finished_at=attempt.finished_at,
+                reason=attempt.public_reason,
+            )
+            for attempt in attempts
+        ],
+        validation_attempts=[
+            PublicValidationAttempt(
+                validator_hotkey=ticket.validator_hotkey,
+                status=ticket.status.value,
+                issued_at=ticket.issued_at,
+                deadline=ticket.deadline,
+                actively_running=ticket.validator_hotkey in active_validators,
+            )
+            for ticket in tickets
         ],
     )
 

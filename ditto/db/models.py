@@ -196,6 +196,15 @@ class Agent(Base):
     so the endpoint maps it to a fixed category before persisting it here.
     """
 
+    screening_policy_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    """Latest anti-cheat screening policy this submission passed.
+
+    Zero marks submissions screened before policy attestation was introduced.
+    Validators may score only submissions at the platform's required version.
+    """
+
     status: Mapped[AgentStatus] = mapped_column(
         Enum(
             AgentStatus,
@@ -245,6 +254,59 @@ class Agent(Base):
             ["agents.agent_id"],
             ondelete="SET NULL",
             name="agents_duplicate_of_fkey",
+        ),
+    )
+
+
+class ScreeningAttempt(Base):
+    """One claimed, versioned screening lease for a submission."""
+
+    __tablename__ = "screening_attempts"
+
+    attempt_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    screener_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    deadline: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    public_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="CASCADE",
+            name="screening_attempts_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "policy_version > 0",
+            name="screening_attempts_policy_version_check",
+        ),
+        CheckConstraint(
+            "status IN ('running', 'passed', 'rejected', 'failed', 'expired')",
+            name="screening_attempts_status_check",
+        ),
+        CheckConstraint(
+            "deadline >= started_at",
+            name="screening_attempts_deadline_check",
+        ),
+        CheckConstraint(
+            "finished_at IS NULL OR finished_at >= started_at",
+            name="screening_attempts_finished_check",
+        ),
+        Index("screening_attempts_agent_started_idx", "agent_id", "started_at"),
+        Index(
+            "screening_attempts_one_running_idx",
+            "agent_id",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+            sqlite_where=text("status = 'running'"),
         ),
     )
 
@@ -423,6 +485,13 @@ class ValidatorHeartbeat(Base):
     protocol_version: Mapped[int] = mapped_column(Integer, nullable=False)
     code_digest: Mapped[str] = mapped_column(Text, nullable=False)
     state: Mapped[str] = mapped_column(Text, nullable=False)
+    active_agent_id: Mapped[UUID | None] = mapped_column(
+        SaUUID(as_uuid=True), nullable=True
+    )
+    first_seen_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    system_metrics: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )
@@ -444,14 +513,84 @@ class ValidatorHeartbeat(Base):
         ),
         CheckConstraint(
             "state IN ('polling', 'running_benchmark', 'updating_weights', "
-            "'idle', 'error')",
+            "'idle', 'error', 'paused')",
             name="validator_heartbeats_state_check",
         ),
         CheckConstraint(
             "length(signature) = 128",
             name="validator_heartbeats_signature_length_check",
         ),
+        ForeignKeyConstraint(
+            ["active_agent_id"],
+            ["agents.agent_id"],
+            ondelete="SET NULL",
+            name="validator_heartbeats_active_agent_id_fkey",
+        ),
         Index("validator_heartbeats_seen_at_idx", "seen_at"),
+        Index(
+            "validator_heartbeats_active_agent_idx",
+            "active_agent_id",
+            postgresql_where=text("active_agent_id IS NOT NULL"),
+        ),
+    )
+
+
+class ScreenerHeartbeat(Base):
+    """Latest signed runtime and host-health report for one screener hotkey."""
+
+    __tablename__ = "screener_heartbeats"
+
+    screener_hotkey: Mapped[str] = mapped_column(Text, primary_key=True)
+    software_version: Mapped[str] = mapped_column(Text, nullable=False)
+    protocol_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    active_agent_id: Mapped[UUID | None] = mapped_column(
+        SaUUID(as_uuid=True), nullable=True
+    )
+    first_seen_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    system_metrics: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    reported_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    seen_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    signature: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "length(software_version) BETWEEN 1 AND 64",
+            name="screener_heartbeats_software_version_length_check",
+        ),
+        CheckConstraint(
+            "protocol_version > 0",
+            name="screener_heartbeats_protocol_version_check",
+        ),
+        CheckConstraint(
+            "policy_version > 0",
+            name="screener_heartbeats_policy_version_check",
+        ),
+        CheckConstraint(
+            "state IN ('polling', 'screening', 'error', 'paused')",
+            name="screener_heartbeats_state_check",
+        ),
+        CheckConstraint(
+            "length(signature) = 128",
+            name="screener_heartbeats_signature_length_check",
+        ),
+        ForeignKeyConstraint(
+            ["active_agent_id"],
+            ["agents.agent_id"],
+            ondelete="SET NULL",
+            name="screener_heartbeats_active_agent_id_fkey",
+        ),
+        Index("screener_heartbeats_seen_at_idx", "seen_at"),
+        Index(
+            "screener_heartbeats_active_agent_idx",
+            "active_agent_id",
+            postgresql_where=text("active_agent_id IS NOT NULL"),
+        ),
     )
 
 
@@ -507,6 +646,17 @@ class ValidatorTicket(Base):
     deadline: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     """When an unscored ticket expires and its slot re-opens (UTC)."""
 
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    """Benchmark version whose retry budget this ticket consumes."""
+
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    """Number of leases issued to this validator for this agent/version."""
+
+    retry_after: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    """Earliest time this validator may retry an expired ticket."""
+
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=False,
@@ -533,6 +683,14 @@ class ValidatorTicket(Base):
             name="validator_tickets_agent_id_fkey",
         ),
         Index("validator_tickets_agent_id_idx", "agent_id"),
+        CheckConstraint(
+            "bench_version > 0",
+            name="validator_tickets_bench_version_positive",
+        ),
+        CheckConstraint(
+            "attempt_count > 0",
+            name="validator_tickets_attempt_count_positive",
+        ),
         # The expiry sweep and the live-slot count both scan open tickets only;
         # a partial index keeps those hot paths off the full table.
         Index(

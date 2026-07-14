@@ -3,8 +3,8 @@
 The screener worker (in ``ditto-subnet``) drains freshly ``uploaded`` agents,
 does a lint + compile + build check on each tarball, and reports a verdict.
 A pass promotes the agent ``uploaded -> evaluating`` so the validator queue
-picks it up; a fail moves it ``uploaded -> screening_failed`` and it never costs
-a full DittoBench run. This is the promotion path that today is manual.
+picks it up. A deterministic submission failure becomes ``rejected``; a
+retryable infrastructure failure becomes ``screening_failed``.
 
 The platform stays thin: it owns the state machine + the queue only. The build
 check lives in the worker. These endpoints mirror ``/validator/*`` so the two
@@ -12,15 +12,15 @@ workers look identical to an operator.
 
 Lifecycle + scope decisions (documented so they're easy to revisit):
 
-- **Queue = agents in ``uploaded``.** Backed by the partial index
-  ``agents_status_uploaded_idx``. Oldest-first drains in arrival order.
+- **Queue = new uploads, retryable failures, and stale-policy results.**
+  Oldest-first drains in arrival order and re-screens in place.
 - **Verdict is a direct promotion.** A pass sets ``evaluating`` (not
-  ``screening_passed``) so nothing else has to promote it; a fail sets
-  ``screening_failed``. Re-reporting the same verdict is idempotent; a
-  conflicting or late verdict (agent already past screening) is a 409.
+  ``screening_passed``). A deterministic fail sets ``rejected``; an
+  infrastructure fail remains retryable as ``screening_failed``. Re-reporting
+  the same verdict is idempotent; a conflicting or late verdict is a 409.
 - **Dedicated auth.** Every request carries a bearer token and the configured
   screener hotkey. Result POSTs additionally verify the hotkey's sr25519
-  signature over ``f"{screener_hotkey}:{agent_id}:{passed}"``.
+  signature over the verdict and its policy version.
 """
 
 from __future__ import annotations
@@ -31,17 +31,22 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
     ArtifactResponse,
+    ScreenerHeartbeatRequest,
+    ScreenerHeartbeatResponse,
     ScreenerQueueItem,
     ScreenerQueueResponse,
     ScreenResultRequest,
     ScreenResultResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.system_health import system_metrics_signing_token
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_dataset_generator,
@@ -56,7 +61,14 @@ from ditto.api_server.endpoints.validator import (
 from ditto.api_server.onchain_seed import derive_seed
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
-from ditto.db.queries.agents import get_agent_by_id, list_agents_by_status
+from ditto.db.models import Agent, ScreeningAttempt
+from ditto.db.queries.agents import get_agent_by_id
+from ditto.db.queries.heartbeats import upsert_screener_heartbeat
+from ditto.db.queries.screening import (
+    claim_screening_attempts,
+    get_screening_attempt,
+)
+from ditto_screening_protocol import verdict_signing_message
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -67,14 +79,19 @@ router = APIRouter(prefix="/screener", tags=["screener"])
 
 # How long a pre-signed artifact URL stays valid (mirrors the validator's).
 _ARTIFACT_URL_TTL = timedelta(minutes=5)
+_SCREENING_LEASE_TTL = timedelta(minutes=30)
+_HEARTBEAT_MAX_SKEW_SECONDS = 300
+_HEARTBEAT_MAX_BYTES = 4096
+
+# Policy v1 used the legacy three-field signature. Every policy from v2 onward
+# binds its version, including an older worker reporting a failure during a
+# future rolling policy upgrade.
+_FIRST_VERSIONED_POLICY = 2
 
 
 def _artifact_key(agent_id: UUID) -> str:
     return f"{agent_id}/agent.tar.gz"
 
-
-# Agents the screener may pull as work. Backed by ``agents_status_uploaded_idx``.
-_QUEUE_STATUSES = (AgentStatus.UPLOADED,)
 
 # Agents a verdict may act on. ``screening`` is included for forward-compat with
 # a future claim step; the terminal targets are handled separately (idempotency).
@@ -167,11 +184,95 @@ async def require_screener(
 ScreenerDep = Annotated[str, Depends(require_screener)]
 
 
+def _heartbeat_signing_message(payload: ScreenerHeartbeatRequest) -> bytes:
+    """Canonical screener heartbeat bytes, mirrored by ``ditto-subnet``."""
+    return (
+        "ditto-screener-heartbeat:v1:"
+        f"{payload.screener_hotkey}:{payload.software_version}:"
+        f"{payload.protocol_version}:{payload.policy_version}:{payload.state}:"
+        f"{payload.active_agent_id or ''}:"
+        f"{system_metrics_signing_token(payload.system_metrics)}:{payload.timestamp}"
+    ).encode()
+
+
+@router.post(
+    "/heartbeat",
+    response_model=ScreenerHeartbeatResponse,
+    responses={
+        401: {"description": "Invalid screener credentials, signature, or timestamp."},
+        413: {"description": "Heartbeat payload exceeds the bounded contract."},
+    },
+)
+async def heartbeat(
+    request: Request,
+    request_body: ScreenerHeartbeatRequest,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+) -> ScreenerHeartbeatResponse:
+    """Record a fresh report signed by the dedicated screener identity."""
+    content_length = request.headers.get("content-length")
+    try:
+        claimed_bytes = int(content_length) if content_length is not None else 0
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="invalid Content-Length") from error
+    if (
+        claimed_bytes > _HEARTBEAT_MAX_BYTES
+        or len(await request.body()) > _HEARTBEAT_MAX_BYTES
+    ):
+        raise HTTPException(status_code=413, detail="heartbeat payload too large")
+    if request_body.screener_hotkey != screener_hotkey:
+        raise ScreenerAuthError("heartbeat body hotkey does not match header")
+    now = datetime.now(UTC)
+    if abs(int(now.timestamp()) - request_body.timestamp) > _HEARTBEAT_MAX_SKEW_SECONDS:
+        raise ScreenerAuthError("heartbeat timestamp is stale or too far in the future")
+    if (
+        request_body.system_metrics is not None
+        and abs(request_body.timestamp - request_body.system_metrics.collected_at)
+        > _HEARTBEAT_MAX_SKEW_SECONDS
+    ):
+        raise ScreenerAuthError(
+            "system metrics timestamp is outside the heartbeat window"
+        )
+    if request_body.active_agent_id is not None and request_body.state != "screening":
+        raise ScreenerAuthError("active agent requires screening state")
+    if not _verify_signature(
+        screener_hotkey,
+        _heartbeat_signing_message(request_body),
+        request_body.signature,
+    ):
+        raise ScreenerAuthError("heartbeat signature verification failed")
+
+    reported_at = datetime.fromtimestamp(request_body.timestamp, tz=UTC)
+    async with session.begin():
+        row, accepted = await upsert_screener_heartbeat(
+            session,
+            screener_hotkey=screener_hotkey,
+            software_version=request_body.software_version,
+            protocol_version=request_body.protocol_version,
+            policy_version=request_body.policy_version,
+            state=request_body.state,
+            active_agent_id=request_body.active_agent_id,
+            system_metrics=(
+                request_body.system_metrics.model_dump(mode="json")
+                if request_body.system_metrics is not None
+                else None
+            ),
+            reported_at=reported_at,
+            seen_at=now,
+            signature=request_body.signature,
+        )
+    seen_at = row.seen_at
+    if seen_at.tzinfo is None:
+        seen_at = seen_at.replace(tzinfo=UTC)
+    return ScreenerHeartbeatResponse(accepted=accepted, seen_at=seen_at)
+
+
 @router.get(
     "/queue",
     response_model=ScreenerQueueResponse,
     responses={
         401: {"description": "Missing/invalid screener auth."},
+        409: {"description": "Worker screening policy does not match platform."},
         422: {"description": "Malformed query parameter."},
     },
 )
@@ -181,9 +282,30 @@ async def queue(
     session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> ScreenerQueueResponse:
-    """List agents awaiting screening (status ``uploaded``), oldest first."""
+    """List new and stale-policy agents awaiting screening, oldest first."""
     response.headers["Cache-Control"] = "no-store"
-    agents = await list_agents_by_status(session, statuses=_QUEUE_STATUSES, limit=limit)
+    agents = (
+        await session.scalars(
+            select(Agent)
+            .where(
+                or_(
+                    Agent.status == AgentStatus.UPLOADED,
+                    Agent.status == AgentStatus.SCREENING_FAILED,
+                    (
+                        Agent.status.in_(
+                            (
+                                AgentStatus.EVALUATING,
+                                AgentStatus.REJECTED,
+                            )
+                        )
+                        & (Agent.screening_policy_version < SCREENING_POLICY_VERSION)
+                    ),
+                )
+            )
+            .order_by(Agent.created_at.asc())
+            .limit(limit)
+        )
+    ).all()
     items = [
         ScreenerQueueItem(
             agent_id=a.agent_id,
@@ -196,7 +318,63 @@ async def queue(
         for a in agents
     ]
     logger.info("screener=%s polled queue: %d item(s)", screener_hotkey, len(items))
-    return ScreenerQueueResponse(items=items, count=len(items))
+    return ScreenerQueueResponse(
+        items=items,
+        count=len(items),
+        required_policy_version=SCREENING_POLICY_VERSION,
+    )
+
+
+@router.post(
+    "/claim",
+    response_model=ScreenerQueueResponse,
+    responses={
+        401: {"description": "Missing/invalid screener auth."},
+        422: {"description": "Malformed query parameter."},
+    },
+)
+async def claim(
+    response: Response,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+    policy_version: Annotated[int, Query(ge=1)],
+    limit: Annotated[int, Query(ge=1, le=20)] = 1,
+) -> ScreenerQueueResponse:
+    """Lease pending work and make its active screening state public."""
+    response.headers["Cache-Control"] = "no-store"
+    if policy_version != SCREENING_POLICY_VERSION:
+        raise AgentNotScreenableError(
+            "screening policy mismatch before claim: platform requires "
+            f"{SCREENING_POLICY_VERSION}, worker declared {policy_version}"
+        )
+    now = datetime.now(UTC)
+    async with session.begin():
+        claimed = await claim_screening_attempts(
+            session,
+            screener_hotkey=screener_hotkey,
+            now=now,
+            ttl=_SCREENING_LEASE_TTL,
+            limit=limit,
+        )
+    items = [
+        ScreenerQueueItem(
+            agent_id=agent.agent_id,
+            miner_hotkey=agent.miner_hotkey,
+            name=agent.name,
+            sha256=agent.sha256,
+            status=AgentStatus.SCREENING,
+            created_at=agent.created_at,
+            attempt_id=attempt.attempt_id,
+            lease_deadline=attempt.deadline,
+        )
+        for agent, attempt in claimed
+    ]
+    logger.info("screener=%s claimed %d item(s)", screener_hotkey, len(items))
+    return ScreenerQueueResponse(
+        items=items,
+        count=len(items),
+        required_policy_version=SCREENING_POLICY_VERSION,
+    )
 
 
 @router.get(
@@ -257,7 +435,28 @@ def _public_screening_reason(detail: str) -> str:
         return "Submission artifact could not be downloaded"
     if normalized.startswith("screener error"):
         return "Screening infrastructure error"
+    if normalized.startswith("policy failed"):
+        return "Submission failed anti-cheat screening"
+    if normalized.startswith("contract failed"):
+        return "Submission does not satisfy the Rust harness contract"
+    if normalized.startswith("model canary"):
+        return "Harness did not use the validator model gateway"
     return "Screening failed"
+
+
+def _failed_screening_target(detail: str) -> AgentStatus:
+    """Separate submission rejection from retryable screening infrastructure."""
+    normalized = detail.strip().casefold()
+    infrastructure_markers = (
+        "artifact download",
+        "screener error",
+        "could not resolve published port",
+        "cannot connect to the docker daemon",
+        "docker daemon",
+    )
+    if any(marker in normalized for marker in infrastructure_markers):
+        return AgentStatus.SCREENING_FAILED
+    return AgentStatus.REJECTED
 
 
 @router.post(
@@ -283,7 +482,7 @@ async def submit_result(
 
     Ordering is cheap-before-expensive; no DB write happens until every check
     passes: (1) dedicated screener bearer authentication, (2) signature over
-    ``{screener_hotkey}:{agent_id}:{passed}``, (3) generate the per-submission
+    the versioned verdict, (3) generate the per-submission
     dataset (pass + generation enabled), (4) one transaction that promotes
     ``uploaded -> evaluating`` (pass, pinning the dataset) or ``uploaded ->
     screening_failed``.
@@ -302,13 +501,41 @@ async def submit_result(
     # Signature proves the screener owns the hotkey and binds THIS verdict:
     #    ``passed`` is signed, so a captured result can't be replayed with the
     #    boolean flipped to grief (or unfairly promote) a miner.
-    signed = f"{payload.screener_hotkey}:{agent_id}:{payload.passed}".encode()
+    if payload.attempt_id is not None:
+        signed = verdict_signing_message(
+            screener_hotkey=payload.screener_hotkey,
+            agent_id=agent_id,
+            attempt_id=payload.attempt_id,
+            passed=payload.passed,
+            policy_version=payload.policy_version,
+        )
+    elif payload.policy_version >= _FIRST_VERSIONED_POLICY:
+        signed = verdict_signing_message(
+            screener_hotkey=payload.screener_hotkey,
+            agent_id=agent_id,
+            passed=payload.passed,
+            policy_version=payload.policy_version,
+        )
+    else:
+        signed = f"{payload.screener_hotkey}:{agent_id}:{payload.passed}".encode()
     if not _verify_signature(payload.screener_hotkey, signed, payload.signature):
         raise ScreenerAuthError(
             f"verdict signature did not verify for hotkey {payload.screener_hotkey}"
         )
 
-    target = AgentStatus.EVALUATING if payload.passed else AgentStatus.SCREENING_FAILED
+    # A legacy worker may still report a failure during a rolling deploy, but it
+    # can never promote a submission without attesting the current policy.
+    if payload.passed and payload.policy_version != SCREENING_POLICY_VERSION:
+        raise AgentNotScreenableError(
+            f"passing verdict requires screening policy {SCREENING_POLICY_VERSION}"
+        )
+
+    target = (
+        AgentStatus.EVALUATING
+        if payload.passed
+        else _failed_screening_target(payload.detail)
+    )
+    public_reason = None if payload.passed else _public_screening_reason(payload.detail)
 
     # 3. Generate the per-submission dataset (outside the row lock). Only on a pass,
     #    when generation is enabled, and when the agent is not already pinned (a
@@ -339,7 +566,48 @@ async def submit_result(
         agent = await get_agent_by_id(session, agent_id=agent_id, for_update=True)
         if agent is None:
             raise AgentNotFoundError(f"no agent with id={agent_id}")
-        if agent.status in _SCREENABLE_STATUSES:
+        attempt: ScreeningAttempt | None = None
+        attempt_status = (
+            "passed"
+            if payload.passed
+            else ("rejected" if target == AgentStatus.REJECTED else "failed")
+        )
+        if payload.attempt_id is not None:
+            attempt = await get_screening_attempt(
+                session, attempt_id=payload.attempt_id, for_update=True
+            )
+            if (
+                attempt is None
+                or attempt.agent_id != agent_id
+                or attempt.screener_hotkey != screener_hotkey
+                or attempt.policy_version != payload.policy_version
+            ):
+                raise AgentNotScreenableError(
+                    "verdict does not match the claimed screening attempt"
+                )
+            deadline = attempt.deadline
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=UTC)
+            if attempt.status == attempt_status and agent.status == target:
+                result_status = agent.status
+                return ScreenResultResponse(
+                    agent_id=agent_id, status=result_status, accepted=True
+                )
+            if attempt.status != "running" or datetime.now(UTC) > deadline:
+                raise AgentNotScreenableError(
+                    "screening attempt is expired or already completed"
+                )
+        rescreening = (
+            agent.status
+            in (
+                AgentStatus.EVALUATING,
+                AgentStatus.SCREENING_FAILED,
+                AgentStatus.REJECTED,
+            )
+            and agent.screening_policy_version < SCREENING_POLICY_VERSION
+        )
+        idempotent = agent.status == target
+        if agent.status in _SCREENABLE_STATUSES or rescreening:
             agent.status = target
         elif agent.status == target:
             pass  # idempotent re-report of the same verdict
@@ -348,9 +616,30 @@ async def submit_result(
                 f"agent {agent_id} is {agent.status}, cannot apply verdict "
                 f"passed={payload.passed} (target {target})"
             )
-        agent.screening_reason = (
-            None if payload.passed else _public_screening_reason(payload.detail)
-        )
+        agent.screening_reason = public_reason
+        # Persist the policy that produced either terminal verdict. Rejected
+        # submissions retry only after a policy bump; infrastructure failures
+        # remain retryable under the same policy.
+        if payload.policy_version == SCREENING_POLICY_VERSION:
+            agent.screening_policy_version = payload.policy_version
+        if attempt is None and not idempotent:
+            now = datetime.now(UTC)
+            attempt = ScreeningAttempt(
+                attempt_id=payload.attempt_id or UUID(int=secrets.randbits(128)),
+                agent_id=agent_id,
+                screener_hotkey=screener_hotkey,
+                policy_version=payload.policy_version,
+                status=attempt_status,
+                started_at=now,
+                deadline=now,
+                finished_at=now,
+                public_reason=public_reason,
+            )
+            session.add(attempt)
+        elif attempt is not None:
+            attempt.status = attempt_status
+            attempt.finished_at = datetime.now(UTC)
+            attempt.public_reason = public_reason
         # Pin the generated dataset once, when evaluating and not yet set (the
         # `is None` guard keeps a concurrent/duplicate verdict from overwriting).
         if (

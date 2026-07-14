@@ -166,11 +166,30 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   existing Prometheus `/metrics`.
 - `GET /api/v1/public/validators` → the latest signed software heartbeat from
   each reporting permitted validator: public hotkey, package/protocol version,
-  deterministic source digest, current worker phase, report/receive times,
-  signature, and a five-minute online flag. Active benchmarks refresh
-  `running_benchmark` every two minutes. A missing hotkey means it has not proved
+  current worker phase/work id, reliable first-seen time when known,
+  report/receive times, availability, health, and coarse CPU/memory/disk/Docker
+  aggregates. Active benchmarks refresh `running_benchmark` every two minutes.
+  Protocol v1/v2 reporters remain valid and return `system_metrics: null`; this
+  is “not reported,” never an outage. A missing hotkey means it has not proved
   heartbeat-capable software; this endpoint does not pretend to enumerate every
   on-chain permit holder.
+- `GET /api/v1/public/screeners` → the equivalent public-safe view for
+  platform-operated screeners. Reports use the existing dedicated screener
+  bearer-token and hotkey-signature boundary, not a validator mnemonic or
+  validator permit. `policy_version` is included so operators can spot a stale
+  gate alongside its package/protocol version.
+
+  Fleet telemetry is an explicit allowlist. The signed ingestion contract
+  accepts only five-point CPU/memory/disk percentages, one aggregate Docker
+  state, bounded running/unhealthy counts, and a sample timestamp within the
+  heartbeat freshness window. Payloads are capped at 4 KiB, stored revalidation
+  drops malformed historical values, and the public projection omits the sample
+  timestamp to reduce temporal resolution. Hostnames, IPs, cloud instance ids,
+  filesystem paths, image digests, container names, secrets, env values, wallet
+  paths, key material, signatures, source digests, and arbitrary keys are never
+  returned. Five-minute freshness determines availability; missing optional
+  metrics determine only `health: unknown`. Values are sampled at most every two
+  minutes and rounded to five-point buckets.
 - Per-category means + run provenance: the scoring engine (dittobench-api) emits
   `models` + `per_category` (alongside `bench_version`, `dataset_sha256`,
   `lexical_gap`, `paraphrase`, `seeding_waves`, `tokens`) in `RunDetails`; the
@@ -192,8 +211,10 @@ for the deep dive. Sections:
 - **Miner drill-down** — composite history, category radar, ATH badge, best run
   (aggregate only).
 - **Weights** — current on-chain allocation (pie/bar), champion callout.
-- **Health** — validators online, sweep cadence, runs/day, success rate, avg
-  latency; "anti-overfit: seeds rotate every submission" assurance line.
+- **Fleet health** — validators by default, with a keyboard-accessible native
+  “Show screeners” checkbox. One dense responsive table shows availability,
+  heartbeat age, current work, version, first-seen time, and coarse system
+  metrics without turning each machine into a repetitive card.
 
 Hosting: static build → object storage + CDN (matches the earlier static-serve
 idea); no server needed since all data comes from the public API + wandb.

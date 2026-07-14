@@ -8,14 +8,15 @@ two surfaces share their dispatch on the ORM model.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
-from ditto.db.models import Agent
+from ditto.db.models import Agent, Score, ScreeningAttempt
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -193,16 +194,52 @@ async def list_agents_by_status(
     return list(result.scalars().all())
 
 
+@dataclass(frozen=True)
+class PublicActivityRow:
+    """One public activity entry plus its safe aggregate score progress."""
+
+    agent: Agent
+    score_count: int
+    screening_attempt: ScreeningAttempt | None
+
+
 async def list_public_activity(
     session: AsyncSession,
     *,
     limit: int,
-) -> list[Agent]:
-    """Return recent submissions, newest first, for the public lifecycle feed."""
+    offset: int = 0,
+) -> tuple[list[PublicActivityRow], int]:
+    """Return a page of recent submissions and the total row count."""
+    total = int(await session.scalar(select(func.count(Agent.agent_id))) or 0)
+    score_counts = (
+        select(
+            Score.agent_id,
+            func.count(Score.validator_hotkey).label("score_count"),
+        )
+        .group_by(Score.agent_id)
+        .subquery()
+    )
     stmt = (
-        select(Agent)
+        select(Agent, func.coalesce(score_counts.c.score_count, 0), ScreeningAttempt)
+        .outerjoin(score_counts, score_counts.c.agent_id == Agent.agent_id)
+        .outerjoin(
+            ScreeningAttempt,
+            (ScreeningAttempt.agent_id == Agent.agent_id)
+            & (ScreeningAttempt.status == "running"),
+        )
         .order_by(Agent.created_at.desc(), Agent.agent_id.desc())
+        .offset(offset)
         .limit(limit)
     )
     result = await session.execute(stmt)
-    return list(result.scalars().all())
+    return (
+        [
+            PublicActivityRow(
+                agent=agent,
+                score_count=int(score_count),
+                screening_attempt=screening_attempt,
+            )
+            for agent, score_count, screening_attempt in result.all()
+        ],
+        total,
+    )

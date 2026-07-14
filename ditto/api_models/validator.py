@@ -28,6 +28,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.system_health import SystemMetrics
 from ditto.api_models.upload import (
     _SIGNATURE_HEX_PATTERN,
     _SS58_PATTERN,
@@ -42,6 +43,7 @@ ValidatorRuntimeState = Literal[
     "updating_weights",
     "idle",
     "error",
+    "paused",
 ]
 
 
@@ -199,6 +201,8 @@ class ValidatorHeartbeatRequest(BaseModel):
     Git label. ``timestamp`` is Unix time and is freshness-checked by the server.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     validator_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Reporting validator hotkey.")
     ]
@@ -223,6 +227,22 @@ class ValidatorHeartbeatRequest(BaseModel):
         ValidatorRuntimeState,
         Field(description="Current validator worker phase."),
     ]
+    active_agent_id: Annotated[
+        UUID | None,
+        Field(
+            default=None,
+            description=(
+                "Agent currently being benchmarked under heartbeat protocol v2."
+            ),
+        ),
+    ] = None
+    system_metrics: Annotated[
+        SystemMetrics | None,
+        Field(
+            default=None,
+            description="Optional coarse host telemetry under heartbeat protocol v3.",
+        ),
+    ] = None
     timestamp: Annotated[
         int, Field(ge=0, description="Validator-reported Unix timestamp (UTC).")
     ]

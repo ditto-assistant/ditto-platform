@@ -60,8 +60,13 @@ from ditto.api_models import (
     ValidatorHeartbeatResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.system_health import (
+    SystemMetrics,
+    system_metrics_signing_token,
+)
 from ditto.api_models.upload import _SS58_PATTERN
-from ditto.api_server.bench import stamp_bench_version
+from ditto.api_server.bench import CURRENT_BENCH_VERSION, stamp_bench_version
 from ditto.api_server.dependencies import (
     get_chain_client,
     get_session,
@@ -107,7 +112,9 @@ _ARTIFACT_URL_TTL = timedelta(minutes=5)
 
 # How long a validator has to redeem a ticket with a score before it lapses and
 # the slot re-opens for another validator.
-_TICKET_TTL = timedelta(minutes=30)
+# Keep the lease longer than the validator's locked 40-minute benchmark cap.
+# The five-minute margin leaves enough time to sign and submit a completed run.
+_TICKET_TTL = timedelta(minutes=45)
 
 # Signed job claims outside this window are stale. A consumed nonce remains in
 # the database for the same window, making replay rejection consistent across
@@ -117,6 +124,7 @@ _JOB_REQUEST_MAX_AGE = timedelta(minutes=2)
 # Reject captured heartbeats outside a short clock-skew/retry window. Workers
 # report every two minutes, so five minutes tolerates normal transient outages.
 _HEARTBEAT_MAX_SKEW_SECONDS = 300
+_HEARTBEAT_MAX_BYTES = 4096
 
 
 # Object-store key the upload pipeline writes the tarball under.
@@ -288,8 +296,25 @@ def _heartbeat_signing_message(
     code_digest: str,
     state: str,
     timestamp: int,
+    active_agent_id: UUID | None = None,
+    system_metrics: SystemMetrics | None = None,
 ) -> bytes:
-    """Canonical v1 heartbeat payload, mirrored by ``ditto-subnet``."""
+    """Canonical heartbeat payload, mirrored by ``ditto-subnet``."""
+    if protocol_version >= 3:
+        active = str(active_agent_id) if active_agent_id is not None else ""
+        return (
+            "ditto-validator-heartbeat:v3:"
+            f"{validator_hotkey}:{software_version}:{protocol_version}:"
+            f"{code_digest}:{state}:{active}:"
+            f"{system_metrics_signing_token(system_metrics)}:{timestamp}"
+        ).encode()
+    if protocol_version >= 2:
+        active = str(active_agent_id) if active_agent_id is not None else ""
+        return (
+            "ditto-validator-heartbeat:v2:"
+            f"{validator_hotkey}:{software_version}:{protocol_version}:"
+            f"{code_digest}:{state}:{active}:{timestamp}"
+        ).encode()
     return (
         "ditto-validator-heartbeat:v1:"
         f"{validator_hotkey}:{software_version}:{protocol_version}:"
@@ -320,11 +345,22 @@ def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:
     },
 )
 async def heartbeat(
+    request: Request,
     request_body: ValidatorHeartbeatRequest,
     validator_hotkey: ValidatorDep,
     session: SessionDep,
 ) -> ValidatorHeartbeatResponse:
     """Record a fresh, signed proof of the worker bytes serving this hotkey."""
+    content_length = request.headers.get("content-length")
+    try:
+        claimed_bytes = int(content_length) if content_length is not None else 0
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="invalid Content-Length") from error
+    if (
+        claimed_bytes > _HEARTBEAT_MAX_BYTES
+        or len(await request.body()) > _HEARTBEAT_MAX_BYTES
+    ):
+        raise HTTPException(status_code=413, detail="heartbeat payload too large")
     if request_body.validator_hotkey != validator_hotkey:
         raise ValidatorAuthError("heartbeat body hotkey does not match header")
 
@@ -333,6 +369,23 @@ async def heartbeat(
         raise ValidatorAuthError(
             "heartbeat timestamp is stale or too far in the future"
         )
+    if request_body.protocol_version < 2 and request_body.active_agent_id is not None:
+        raise ValidatorAuthError("heartbeat protocol v1 cannot report active work")
+    if request_body.protocol_version < 3 and request_body.system_metrics is not None:
+        raise ValidatorAuthError("system metrics require heartbeat protocol v3")
+    if (
+        request_body.system_metrics is not None
+        and abs(request_body.timestamp - request_body.system_metrics.collected_at)
+        > _HEARTBEAT_MAX_SKEW_SECONDS
+    ):
+        raise ValidatorAuthError(
+            "system metrics timestamp is outside the heartbeat window"
+        )
+    if (
+        request_body.active_agent_id is not None
+        and request_body.state != "running_benchmark"
+    ):
+        raise ValidatorAuthError("active agent requires running_benchmark state")
     payload = _heartbeat_signing_message(
         validator_hotkey=validator_hotkey,
         software_version=request_body.software_version,
@@ -340,6 +393,8 @@ async def heartbeat(
         code_digest=request_body.code_digest,
         state=request_body.state,
         timestamp=request_body.timestamp,
+        active_agent_id=request_body.active_agent_id,
+        system_metrics=request_body.system_metrics,
     )
     if not _verify_signature(validator_hotkey, payload, request_body.signature):
         raise ValidatorAuthError("heartbeat signature verification failed")
@@ -353,6 +408,12 @@ async def heartbeat(
             protocol_version=request_body.protocol_version,
             code_digest=request_body.code_digest,
             state=request_body.state,
+            active_agent_id=request_body.active_agent_id,
+            system_metrics=(
+                request_body.system_metrics.model_dump(mode="json")
+                if request_body.system_metrics is not None
+                else None
+            ),
             reported_at=reported_at,
             seen_at=now,
             signature=request_body.signature,
@@ -430,6 +491,7 @@ async def request_job(
             validator_hotkey=payload.validator_hotkey,
             now=now,
             ttl=_TICKET_TTL,
+            bench_version=CURRENT_BENCH_VERSION,
         )
         if ticket is None:
             return Response(status_code=204, headers={"Cache-Control": "no-store"})
@@ -555,6 +617,11 @@ async def submit_score(
         if agent.status not in _SCOREABLE_STATUSES:
             raise AgentNotEvaluatableError(
                 f"agent {agent_id} is {agent.status}, not in {_SCOREABLE_STATUSES}"
+            )
+        if agent.screening_policy_version < SCREENING_POLICY_VERSION:
+            raise AgentNotEvaluatableError(
+                f"agent {agent_id} has not passed screening policy "
+                f"{SCREENING_POLICY_VERSION}"
             )
         if payload.ticket_deadline is None:
             raise HTTPException(

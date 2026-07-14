@@ -10,11 +10,12 @@ hand a miner the benchmark's answer key (per-case ``expected``/``called``). See
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ditto.api_models.screener import ScreenerRuntimeState
 from ditto.api_models.validator import ValidatorRuntimeState
 
 _SS58_PATTERN = r"^[1-9A-HJ-NP-Za-km-z]{47,48}$"
@@ -597,6 +598,29 @@ class PublicActivityEntry(BaseModel):
             description="Anti-copy signals that routed this submission to review.",
         ),
     ]
+    score_count: Annotated[
+        int,
+        Field(ge=0, description="Independent validator scores recorded so far."),
+    ]
+    quorum: Annotated[
+        int,
+        Field(ge=1, description="Independent validator scores required to finalize."),
+    ]
+    screening_policy_version: Annotated[
+        int, Field(ge=0, description="Latest completed screening policy version.")
+    ]
+    required_screening_policy_version: Annotated[
+        int, Field(ge=1, description="Policy currently required by the platform.")
+    ]
+    screening_attempt_id: Annotated[
+        UUID | None, Field(default=None, description="Active screening lease, if any.")
+    ]
+    screening_started_at: Annotated[
+        datetime | None, Field(default=None, description="Active attempt start time.")
+    ]
+    screening_deadline: Annotated[
+        datetime | None, Field(default=None, description="Active attempt deadline.")
+    ]
 
 
 class PublicActivityResponse(BaseModel):
@@ -606,10 +630,51 @@ class PublicActivityResponse(BaseModel):
         datetime, Field(description="When this snapshot was read (UTC).")
     ]
     count: Annotated[int, Field(ge=0, description="Number of submissions returned.")]
+    total: Annotated[int, Field(ge=0, description="Total number of submissions.")]
+    page: Annotated[int, Field(ge=1, description="Current one-based page number.")]
+    page_size: Annotated[int, Field(ge=1, description="Maximum entries per page.")]
+    total_pages: Annotated[
+        int, Field(ge=1, description="Total pages, or one when there are no entries.")
+    ]
     entries: Annotated[
         list[PublicActivityEntry],
         Field(default_factory=list, description="Recent submissions, newest first."),
     ]
+
+
+class PublicScreeningAttempt(BaseModel):
+    """One append-only screening attempt shown in submission details."""
+
+    attempt_id: UUID
+    policy_version: Annotated[int, Field(ge=1)]
+    status: Annotated[str, Field(pattern=r"^(running|passed|rejected|failed|expired)$")]
+    screener_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    started_at: datetime
+    deadline: datetime
+    finished_at: datetime | None = None
+    reason: str | None = None
+
+
+class PublicValidationAttempt(BaseModel):
+    """One validator ticket contributing toward the three-score quorum."""
+
+    validator_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    status: Annotated[str, Field(pattern=r"^(issued|scored|expired)$")]
+    issued_at: datetime
+    deadline: datetime
+    actively_running: bool = False
+
+
+class PublicSubmissionPipeline(BaseModel):
+    """Full public execution history for one submitted agent."""
+
+    generated_at: datetime
+    agent_id: UUID
+    status: str
+    score_count: Annotated[int, Field(ge=0)]
+    quorum: Annotated[int, Field(ge=1)]
+    screening_attempts: list[PublicScreeningAttempt] = Field(default_factory=list)
+    validation_attempts: list[PublicValidationAttempt] = Field(default_factory=list)
 
 
 class PublicDatasetReveal(BaseModel):
@@ -822,6 +887,21 @@ class PublicHealthResponse(BaseModel):
     )
 
 
+FleetAvailability = Literal["available", "offline", "paused", "unknown"]
+FleetHealth = Literal["healthy", "warning", "unknown"]
+
+
+class PublicSystemMetrics(BaseModel):
+    """Coarse allowlisted metrics; collector timestamps stay private."""
+
+    cpu_percent: Annotated[int, Field(ge=0, le=100, multiple_of=5)]
+    memory_percent: Annotated[int, Field(ge=0, le=100, multiple_of=5)]
+    disk_percent: Annotated[int, Field(ge=0, le=100, multiple_of=5)]
+    docker_status: Literal["healthy", "degraded", "unavailable"]
+    running_containers: Annotated[int, Field(ge=0, le=1000)]
+    unhealthy_containers: Annotated[int, Field(ge=0, le=1000)]
+
+
 class PublicValidatorHeartbeat(BaseModel):
     """Latest signed software report from one permitted validator."""
 
@@ -830,14 +910,15 @@ class PublicValidatorHeartbeat(BaseModel):
     ]
     software_version: str
     protocol_version: Annotated[int, Field(ge=1)]
-    code_digest: Annotated[
-        str, Field(pattern=r"^[0-9a-f]{64}$", description="Installed source digest.")
-    ]
     state: ValidatorRuntimeState
+    active_agent_id: UUID | None = None
+    first_seen_at: datetime | None = None
     reported_at: datetime
     seen_at: datetime
-    signature: Annotated[str, Field(pattern=r"^[0-9a-fA-F]{128}$")]
     online: bool
+    availability: FleetAvailability
+    health: FleetHealth
+    system_metrics: PublicSystemMetrics | None = None
 
 
 class PublicValidatorHeartbeatsResponse(BaseModel):
@@ -848,6 +929,36 @@ class PublicValidatorHeartbeatsResponse(BaseModel):
     reported_count: Annotated[int, Field(ge=0)]
     online_count: Annotated[int, Field(ge=0)]
     validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)
+
+
+class PublicScreenerHeartbeat(BaseModel):
+    """Latest public-safe report from one authenticated screener."""
+
+    screener_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Screener's public hotkey.")
+    ]
+    software_version: str
+    protocol_version: Annotated[int, Field(ge=1)]
+    policy_version: Annotated[int, Field(ge=1)]
+    state: ScreenerRuntimeState
+    active_agent_id: UUID | None = None
+    first_seen_at: datetime | None = None
+    reported_at: datetime
+    seen_at: datetime
+    online: bool
+    availability: FleetAvailability
+    health: FleetHealth
+    system_metrics: PublicSystemMetrics | None = None
+
+
+class PublicScreenerHeartbeatsResponse(BaseModel):
+    """Public view of authenticated platform-operated screeners."""
+
+    generated_at: datetime
+    online_window_seconds: Annotated[int, Field(ge=1)]
+    reported_count: Annotated[int, Field(ge=0)]
+    online_count: Annotated[int, Field(ge=0)]
+    screeners: list[PublicScreenerHeartbeat] = Field(default_factory=list)
 
 
 class BenchHarnessConfig(BaseModel):

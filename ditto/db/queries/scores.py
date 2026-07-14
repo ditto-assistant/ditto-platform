@@ -157,7 +157,7 @@ class HealthRollup:
     scored_agents: int
     """``scored`` agents that actually carry a score row (eligible submissions)."""
     last_scored_at: datetime | None
-    """Newest score ``generated_at`` — when a validator last scored anything."""
+    """Newest platform score-write time — when a validator last scored anything."""
     scores_24h: int
     """Scores generated in the last 24h — scoring throughput."""
     avg_latency_ms: int | None
@@ -181,11 +181,13 @@ async def get_public_health(session: AsyncSession, *, now: datetime) -> HealthRo
     """Compute the public subnet-health rollup as of ``now`` (aware UTC).
 
     Two cheap reads: a conditional-aggregate over ``agents`` for the miner/agent
-    counts, and a scan of ``(generated_at, median_ms)`` over ``scores`` reduced
-    in Python. The Python reduction (rather than a SQL time filter + window)
-    keeps the 24h cutoff and the naive/aware timestamp handling identical across
-    Postgres and the SQLite test fallback; the ``scores`` table is small at
-    subnet scale (one row per agent per validator).
+    counts, and a scan of ``(updated_at, median_ms)`` over ``scores`` reduced in
+    Python. Public activity uses the platform-controlled write timestamp rather
+    than the validator-supplied report ``generated_at`` provenance field. The
+    Python reduction (rather than a SQL time filter + window) keeps the 24h
+    cutoff and the naive/aware timestamp handling identical across Postgres and
+    the SQLite test fallback; the ``scores`` table is small at subnet scale (one
+    row per agent per validator).
     """
     total_miners = (
         await session.execute(select(func.count(func.distinct(Agent.miner_hotkey))))
@@ -207,7 +209,7 @@ async def get_public_health(session: AsyncSession, *, now: datetime) -> HealthRo
         )
     ).one()
 
-    rows = (await session.execute(select(Score.generated_at, Score.median_ms))).all()
+    rows = (await session.execute(select(Score.updated_at, Score.median_ms))).all()
     cutoff = now - _HEALTH_WINDOW
     generated = [_as_utc(r[0]) for r in rows]
     return HealthRollup(

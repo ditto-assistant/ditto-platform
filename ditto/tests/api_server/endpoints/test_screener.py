@@ -7,6 +7,7 @@ sr25519 dev keypair so the verification path runs for real.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -16,7 +17,7 @@ import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -25,6 +26,11 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.system_health import (
+    SystemMetrics,
+    system_metrics_signing_token,
+)
 from ditto.api_server.datapipeline import DataPipelineError, NullGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -40,7 +46,8 @@ from ditto.api_server.middleware.error_envelope import (
 )
 from ditto.chain import ChainError
 from ditto.chain.models import BlockInfo, NeuronInfo
-from ditto.db.models import Agent, Base
+from ditto.db.models import Agent, Base, ScreenerHeartbeat, ScreeningAttempt
+from ditto_screening_protocol import verdict_signing_message
 
 _KEYPAIR = bittensor.Keypair.create_from_uri("//Alice")
 _SCREENER_HOTKEY = _KEYPAIR.ss58_address
@@ -50,21 +57,76 @@ _SHA256 = "ab" * 32
 _BLOCK = BlockInfo(number=4321, hash="0x" + "9f" * 32, timestamp=0)
 
 
-def _sign(message: str) -> str:
-    return _KEYPAIR.sign(message.encode()).hex()
+def _sign(message: str | bytes) -> str:
+    return _KEYPAIR.sign(
+        message.encode() if isinstance(message, str) else message
+    ).hex()
 
 
 def _result_payload(
-    agent_id: UUID, *, passed: bool = True, **overrides: object
+    agent_id: UUID,
+    *,
+    passed: bool = True,
+    policy_version: int = SCREENING_POLICY_VERSION,
+    **overrides: object,
 ) -> dict:
+    attempt_id = overrides.get("attempt_id")
+    signed = (
+        verdict_signing_message(
+            screener_hotkey=_SCREENER_HOTKEY,
+            agent_id=agent_id,
+            attempt_id=attempt_id,
+            passed=passed,
+            policy_version=policy_version,
+        )
+        if isinstance(attempt_id, UUID)
+        else f"{_SCREENER_HOTKEY}:{agent_id}:{passed}:{policy_version}"
+    )
     body = {
         "screener_hotkey": _SCREENER_HOTKEY,
-        "signature": _sign(f"{_SCREENER_HOTKEY}:{agent_id}:{passed}"),
+        "signature": _sign(signed),
         "passed": passed,
+        "policy_version": policy_version,
         "detail": "",
     }
     body.update(overrides)
+    if isinstance(body.get("attempt_id"), UUID):
+        body["attempt_id"] = str(body["attempt_id"])
     return body
+
+
+def _heartbeat_payload(
+    *,
+    timestamp: int | None = None,
+    state: str = "polling",
+    active_agent_id: UUID | None = None,
+    system_metrics: dict[str, object] | None = None,
+) -> dict[str, object]:
+    ts = timestamp if timestamp is not None else int(datetime.now(UTC).timestamp())
+    metrics = (
+        SystemMetrics.model_validate(system_metrics)
+        if system_metrics is not None
+        else None
+    )
+    message = (
+        "ditto-screener-heartbeat:v1:"
+        f"{_SCREENER_HOTKEY}:0.4.2:1:{SCREENING_POLICY_VERSION}:{state}:"
+        f"{active_agent_id or ''}:{system_metrics_signing_token(metrics)}:{ts}"
+    ).encode()
+    payload: dict[str, object] = {
+        "screener_hotkey": _SCREENER_HOTKEY,
+        "software_version": "0.4.2",
+        "protocol_version": 1,
+        "policy_version": SCREENING_POLICY_VERSION,
+        "state": state,
+        "timestamp": ts,
+        "signature": _sign(message),
+    }
+    if active_agent_id is not None:
+        payload["active_agent_id"] = str(active_agent_id)
+    if system_metrics is not None:
+        payload["system_metrics"] = system_metrics
+    return payload
 
 
 # --- DB + dependency wiring ------------------------------------------------
@@ -182,6 +244,7 @@ async def _seed_agent(
     name: str = "alpha-agent",
     created_at: datetime | None = None,
     agent_id: UUID | None = None,
+    screening_policy_version: int | None = None,
 ) -> UUID:
     aid = agent_id or uuid4()
     async with maker() as s, s.begin():
@@ -192,6 +255,12 @@ async def _seed_agent(
                 name=name,
                 sha256=_SHA256,
                 status=status,
+                screening_policy_version=(
+                    SCREENING_POLICY_VERSION
+                    if screening_policy_version is None
+                    and status == AgentStatus.EVALUATING
+                    else (screening_policy_version or 0)
+                ),
                 created_at=created_at or datetime.now(UTC),
             )
         )
@@ -202,6 +271,7 @@ _AUTH_HEADER = {
     "Authorization": "Bearer test-screener-token-at-least-32-characters",
     "X-Screener-Hotkey": _SCREENER_HOTKEY,
 }
+_CLAIM_URL = f"/api/v1/screener/claim?policy_version={SCREENING_POLICY_VERSION}"
 
 
 @pytest.fixture(autouse=True)
@@ -210,6 +280,110 @@ def _authenticate_screener_client(client: httpx.AsyncClient) -> None:
 
 
 # --- Queue -----------------------------------------------------------------
+
+
+class TestHeartbeat:
+    async def test_records_signed_metrics_and_is_publicly_visible(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        timestamp = int(datetime.now(UTC).timestamp())
+        metrics = {
+            "collected_at": timestamp,
+            "cpu_percent": 20,
+            "memory_percent": 35,
+            "disk_percent": 50,
+            "docker": {
+                "status": "healthy",
+                "running_containers": 3,
+                "unhealthy_containers": 0,
+            },
+        }
+        payload = _heartbeat_payload(timestamp=timestamp, system_metrics=metrics)
+        response = await client.post("/api/v1/screener/heartbeat", json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["accepted"] is True
+
+        async with session_maker() as session:
+            stored = await session.get(ScreenerHeartbeat, _SCREENER_HOTKEY)
+            assert stored is not None
+            assert stored.first_seen_at is not None
+            assert stored.system_metrics is not None
+            assert stored.system_metrics["docker"]["running_containers"] == 3
+
+        public = (await client.get("/api/v1/public/screeners")).json()
+        assert public["reported_count"] == 1
+        entry = public["screeners"][0]
+        assert entry["screener_hotkey"] == _SCREENER_HOTKEY
+        assert entry["availability"] == "available"
+        assert entry["health"] == "healthy"
+        assert entry["system_metrics"]["docker_status"] == "healthy"
+        assert "signature" not in entry
+
+        replay = await client.post("/api/v1/screener/heartbeat", json=payload)
+        assert replay.status_code == 200
+        assert replay.json()["accepted"] is False
+
+    async def test_rejects_tampering_arbitrary_metrics_and_wrong_auth(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        timestamp = int(datetime.now(UTC).timestamp())
+        metrics = {
+            "collected_at": timestamp,
+            "cpu_percent": 20,
+            "memory_percent": 35,
+            "disk_percent": 50,
+            "docker": {
+                "status": "healthy",
+                "running_containers": 3,
+                "unhealthy_containers": 0,
+            },
+        }
+        tampered = _heartbeat_payload(timestamp=timestamp, system_metrics=metrics)
+        tampered["system_metrics"]["disk_percent"] = 90  # type: ignore[index]
+        response = await client.post("/api/v1/screener/heartbeat", json=tampered)
+        assert response.status_code == 401
+
+        malformed = _heartbeat_payload(timestamp=timestamp, system_metrics=metrics)
+        malformed["system_metrics"]["container_names"] = ["secret"]  # type: ignore[index]
+        response = await client.post("/api/v1/screener/heartbeat", json=malformed)
+        assert response.status_code == 422
+
+        response = await client.post(
+            "/api/v1/screener/heartbeat",
+            headers={**_AUTH_HEADER, "Authorization": "Bearer wrong-token"},
+            json=_heartbeat_payload(),
+        )
+        assert response.status_code == 401
+
+    async def test_heartbeat_payload_size_is_bounded(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        response = await client.post(
+            "/api/v1/screener/heartbeat",
+            headers={"Content-Length": "4097"},
+            json=_heartbeat_payload(),
+        )
+        assert response.status_code == 413
+
+        payload = json.dumps(_heartbeat_payload())
+        response = await client.post(
+            "/api/v1/screener/heartbeat",
+            headers={"Content-Type": "application/json"},
+            content=(" " * 4097) + payload,
+        )
+        assert response.status_code == 413
 
 
 class TestQueue:
@@ -241,6 +415,49 @@ class TestQueue:
         assert body["count"] == 2
         assert [i["name"] for i in body["items"]] == ["older", "younger"]
         assert all(i["status"] == AgentStatus.UPLOADED for i in body["items"])
+        assert body["required_policy_version"] == SCREENING_POLICY_VERSION
+
+    async def test_requeues_legacy_evaluating_submission(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            screening_policy_version=0,
+        )
+        _install_db(app, session_maker)
+        response = await client.get("/api/v1/screener/queue")
+        assert response.status_code == 200
+        assert response.json()["count"] == 1
+
+    async def test_requeues_retryable_failures_regardless_of_policy(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        stale_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCREENING_FAILED,
+            screening_policy_version=SCREENING_POLICY_VERSION - 1,
+        )
+        current_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCREENING_FAILED,
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/screener/queue")
+
+        assert response.status_code == 200
+        assert {item["agent_id"] for item in response.json()["items"]} == {
+            str(stale_id),
+            str(current_id),
+        }
 
     async def test_limit_caps_results(
         self,
@@ -330,6 +547,75 @@ class TestQueue:
         assert response.json()["error_code"] == ERROR_CODE_VALIDATION
 
 
+# --- Leased claims ---------------------------------------------------------
+
+
+class TestClaim:
+    async def test_claim_is_exclusive_and_lease_bound_verdict_is_idempotent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        claimed = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        assert claimed.status_code == 200
+        item = claimed.json()["items"][0]
+        assert item["agent_id"] == str(agent_id)
+        assert item["status"] == AgentStatus.SCREENING
+        assert item["attempt_id"]
+        assert item["lease_deadline"]
+
+        duplicate = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        assert duplicate.status_code == 200
+        assert duplicate.json()["count"] == 0
+
+        payload = _result_payload(
+            agent_id,
+            passed=True,
+            attempt_id=UUID(item["attempt_id"]),
+        )
+        first = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            headers=_AUTH_HEADER,
+            json=payload,
+        )
+        replay = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            headers=_AUTH_HEADER,
+            json=payload,
+        )
+        assert first.status_code == 200
+        assert replay.status_code == 200
+        assert replay.json()["status"] == AgentStatus.EVALUATING
+
+    async def test_policy_mismatch_does_not_create_lease(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+
+        mismatch = await client.post(
+            f"/api/v1/screener/claim?policy_version={SCREENING_POLICY_VERSION - 1}",
+            headers=_AUTH_HEADER,
+        )
+
+        assert mismatch.status_code == 409
+        assert mismatch.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.status == AgentStatus.UPLOADED
+            attempts = (await session.scalars(select(ScreeningAttempt))).all()
+            assert attempts == []
+
+
 # --- Artifact --------------------------------------------------------------
 
 
@@ -342,6 +628,7 @@ class TestArtifact:
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
         _install_db(app, session_maker)
+        _install_chain(app)
         _install_chain(app)
         storage = _install_storage(app)
 
@@ -378,6 +665,53 @@ class TestArtifact:
 
 
 class TestSubmitResult:
+    async def test_legacy_pass_cannot_promote(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        payload = _result_payload(agent_id, policy_version=1)
+        payload["signature"] = _sign(f"{_SCREENER_HOTKEY}:{agent_id}:True")
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=payload
+        )
+        assert response.status_code == 409
+
+    async def test_v2_pass_rescreens_in_place_and_preserves_dataset(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            screening_policy_version=0,
+        )
+        async with session_maker() as s, s.begin():
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            agent.dataset_seed = 42
+            agent.dataset_sha256 = "cd" * 32
+            agent.dataset_run_size = "full"
+        _install_db(app, session_maker)
+        _install_chain(app)
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id),
+        )
+        assert response.status_code == 200
+        async with session_maker() as s:
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.status == AgentStatus.EVALUATING
+            assert agent.screening_policy_version == SCREENING_POLICY_VERSION
+            assert agent.dataset_seed == 42
+
     async def test_pass_promotes_to_evaluating(
         self,
         app: FastAPI,
@@ -402,7 +736,7 @@ class TestSubmitResult:
             assert agent is not None
             assert agent.status == AgentStatus.EVALUATING
 
-    async def test_fail_moves_to_screening_failed(
+    async def test_deterministic_fail_moves_to_rejected(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -421,13 +755,91 @@ class TestSubmitResult:
             ),
         )
         assert response.status_code == 200
-        assert response.json()["status"] == AgentStatus.SCREENING_FAILED
+        assert response.json()["status"] == AgentStatus.REJECTED
 
         async with session_maker() as s:
             agent = await s.get(Agent, agent_id)
             assert agent is not None
             assert agent.screening_reason == "Docker image build failed"
+            assert agent.screening_policy_version == SCREENING_POLICY_VERSION
             assert "SECRET_FROM_BUILD" not in agent.screening_reason
+
+    async def test_current_pass_recovers_stale_screening_failure(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCREENING_FAILED,
+            screening_policy_version=SCREENING_POLICY_VERSION - 1,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, passed=True),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == AgentStatus.EVALUATING
+        async with session_maker() as s:
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.screening_policy_version == SCREENING_POLICY_VERSION
+
+    async def test_infrastructure_failure_is_retryable_not_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                detail="screener error: Docker daemon unavailable SECRET",
+            ),
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == AgentStatus.SCREENING_FAILED
+
+        retry = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        assert retry.status_code == 200
+        assert retry.json()["items"][0]["agent_id"] == str(agent_id)
+
+    async def test_model_canary_failure_has_public_safe_reason(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                detail="model canary observed no model call",
+            ),
+        )
+        assert response.status_code == 200
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            assert (
+                agent.screening_reason
+                == "Harness did not use the validator model gateway"
+            )
 
     async def test_pass_is_idempotent(
         self,

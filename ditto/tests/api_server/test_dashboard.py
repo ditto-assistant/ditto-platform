@@ -41,6 +41,29 @@ class TestDashboard:
         # api-base stays empty so the SPA uses its same-origin /api/v1 default.
         assert 'name="ditto:api-base" content=""' in body
 
+    async def test_includes_social_preview_metadata(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        image_url = "https://platform-api.heyditto.ai/assets/paperditto-512.png"
+        assert '<meta property="og:type" content="website"' in body
+        assert (
+            '<meta property="og:title" content="Ditto SN118 · Subnet Leaderboard"'
+            in body
+        )
+        assert f'<meta property="og:image" content="{image_url}"' in body
+        assert '<meta property="og:image:width" content="512"' in body
+        assert '<meta name="twitter:card" content="summary"' in body
+        assert f'<meta name="twitter:image" content="{image_url}"' in body
+        assert '<link rel="canonical" href="https://platform-api.heyditto.ai/"' in body
+
+    async def test_serves_social_preview_image(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        resp = await _get(app, "/assets/paperditto-512.png")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "image/png"
+        assert resp.headers["Cache-Control"] == "public, max-age=86400"
+        assert resp.content.startswith(b"\x89PNG\r\n\x1a\n")
+
     async def test_wandb_url_is_html_escaped(self) -> None:
         # A stray quote in the configured URL must not break out of the attribute.
         app = create_api_server(
@@ -59,7 +82,13 @@ class TestDashboard:
         assert resp.status_code == 404
 
     @pytest.mark.parametrize(
-        "path", ["/api/v1/public/leaderboard", "/api/v1/public/activity"]
+        "path",
+        [
+            "/api/v1/public/leaderboard",
+            "/api/v1/public/activity",
+            "/api/v1/public/validators",
+            "/api/v1/public/screeners",
+        ],
     )
     async def test_api_still_mounted_alongside_dashboard(self, path: str) -> None:
         # Serving HTML at / must not shadow the API routes.
@@ -71,17 +100,96 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert "Submission pipeline" in body
-        # The pipeline is its own hash-routed page, reachable from the sidebar.
-        assert 'data-page="pipeline"' in body
-        assert 'href="#/pipeline"' in body
-        assert 'getJSON("/public/activity?limit=200")' in body
+        assert body.index("<h2>Leaderboard</h2>") < body.index('class="operations"')
+        assert 'getJSON("/public/activity?page="' in body
         assert 'id="activity-rows"' in body
+        assert 'id="activity-pager"' in body
+        assert 'id="pipeline-overview"' in body
+        assert "Network operations" in body
+        assert "Waiting for screening" in body
+        assert "Waiting for validator" in body
+        assert "Evaluating" in body
+        assert 'id="pipeline-scored"' in body
+        assert 'data-pipeline-stage="scored"' in body
+        assert 'getJSON("/public/activity?page=1&limit=200")' in body
+        assert body.count('type="button" data-activity-page="prev"') == 2
+        assert body.count('type="button" data-activity-page="next"') == 2
+        assert 'aria-label="Submission pages, bottom"' in body
+        assert 'class="activity-table-frame"' in body
+        assert "lockActivityFrameHeight" in body
+        assert "anchor.getBoundingClientRect().top - anchorTop" in body
+        assert "Validation" in body
+        assert "openActivityModal" in body
+        assert "validators scored this submission" in body
         assert "Copy review:" in body
         assert "screening_reason" in body
+        assert '<details class="old-screeners">' in body
+        assert "Old screener results" in body
+        assert "Screener result" in body
+        assert "Lease expired" not in body
+        assert "System failure" not in body
+        assert 'expired: ["Timed out", "warn"]' in body
+        assert 'failed: ["Could not complete", "warn"]' in body
 
-    async def test_sidebar_routes_every_section(self) -> None:
+    async def test_includes_accessible_fleet_status(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
-        for page in ("overview", "leaderboard", "pipeline", "health", "benchmark"):
+        assert "Fleet health" in body
+        assert 'id="fleet-summary"' in body
+        assert 'id="fleet-rows"' in body
+        assert 'id="show-screeners"' in body
+        assert 'type="checkbox"' in body
+        assert '<label class="fleet-toggle" for="show-screeners">' in body
+        assert '<table class="fleet-table"' in body
+        assert '<th scope="col" style="width:105px">First seen</th>' in body
+        assert '<th scope="col" style="width:110px">Last heartbeat</th>' in body
+        assert '<th scope="col" style="width:118px">Status</th>' in body
+        assert '<th scope="col" style="width:108px">CPU</th>' in body
+        assert '<th scope="col" style="width:120px">Containers</th>' in body
+        assert "Missing optional telemetry is not an outage." in body
+        assert "allowlisted" not in body
+        assert 'id="fleet-count-unknown"' in body
+        assert 'getJSON("/public/validators")' in body
+        assert 'getJSON("/public/screeners")' in body
+        assert 'getElementById("show-screeners").addEventListener' in body
+        assert 'showScreeners ? "Screener" : "Validator"' in body
+        assert "running_benchmark" in body
+        assert "privacy-note" not in body
+        assert "fleet-health-note" not in body
+        assert '" reporting " + kind' not in body
+
+    async def test_includes_time_aware_theme_switcher(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert 'data-theme-choice="light"' in body
+        assert 'data-theme-choice="dark"' in body
+        assert 'data-theme-choice="time"' in body
+        assert 'var STORAGE_KEY = "ditto:dashboard-theme"' in body
+        assert 'return MODES[saved] ? saved : "time"' in body
+        assert "root.dataset.timePhase = fromHour(new Date().getHours())" in body
+        assert 'if (hour >= 5 && hour < 8) return "dawn"' in body
+
+    async def test_sidebar_routes_every_section(self) -> None:
+        # The dashboard is a sidebar shell with hash-routed pages; each nav item
+        # and its page share the same data-page id and #/<page> deep link.
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert '<aside class="sidebar"' in body
+        assert 'id="nav-toggle"' in body  # mobile hamburger
+        for page in (
+            "overview",
+            "leaderboard",
+            "operations",
+            "submissions",
+            "benchmark",
+        ):
             assert f'href="#/{page}"' in body
             assert f'data-page="{page}"' in body
+        # The time-aware theme switcher moved into the sidebar but stays wired.
+        assert 'data-theme-choice="light"' in body
+
+    async def test_benchmark_badge_omits_latest_suffix(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert 'badge.textContent = "DittoBench v" + currentBench +' in body
+        assert 'currentBench + " · latest"' not in body
