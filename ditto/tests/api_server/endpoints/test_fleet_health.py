@@ -60,6 +60,20 @@ def test_classifies_availability_without_turning_missing_metrics_into_outage(
     )
 
 
+def test_saturated_cpu_is_healthy_workload(
+    healthy_metrics: PublicSystemMetrics,
+) -> None:
+    now = datetime.now(UTC)
+    busy_metrics = healthy_metrics.model_copy(update={"cpu_percent": 100})
+
+    assert _fleet_classification(
+        state="running_benchmark",
+        seen_at=now - timedelta(seconds=30),
+        now=now,
+        metrics=busy_metrics,
+    ) == (True, "available", "healthy")
+
+
 def test_malformed_stored_metrics_are_not_partially_exposed() -> None:
     raw = {
         "collected_at": int(datetime.now(UTC).timestamp()),

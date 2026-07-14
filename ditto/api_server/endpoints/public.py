@@ -219,8 +219,7 @@ def _fleet_classification(
     elif metrics is None:
         health = "unknown"
     elif (
-        metrics.cpu_percent >= 95
-        or metrics.memory_percent >= 90
+        metrics.memory_percent >= 90
         or metrics.disk_percent >= 85
         or metrics.docker_status == "degraded"
     ):

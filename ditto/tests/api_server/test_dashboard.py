@@ -163,6 +163,8 @@ class TestDashboard:
         assert 'getElementById("show-screeners").addEventListener' in body
         assert 'showScreeners ? "Screener" : "Validator"' in body
         assert "running_benchmark" in body
+        assert "metrics.cpu_percent >= 95" not in body
+        assert 'fleetMeter(metrics.cpu_percent, "")' in body
         assert "privacy-note" not in body
         assert "fleet-health-note" not in body
         assert '" reporting " + kind' not in body
