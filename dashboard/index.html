@@ -28,6 +28,48 @@
 
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%B7%3C/text%3E%3C/svg%3E" />
 
+  <script>
+    // Apply the saved theme before CSS paints to avoid a light/dark flash.
+    (function () {
+      "use strict";
+      var STORAGE_KEY = "ditto:dashboard-theme";
+      var MODES = { light: true, dark: true, time: true };
+
+      function fromHour(hour) {
+        if (hour >= 5 && hour < 8) return "dawn";
+        if (hour >= 8 && hour < 12) return "morning";
+        if (hour >= 12 && hour < 17) return "afternoon";
+        if (hour >= 17 && hour < 20) return "dusk";
+        return "night";
+      }
+
+      function readMode() {
+        try {
+          var saved = localStorage.getItem(STORAGE_KEY);
+          return MODES[saved] ? saved : "time";
+        } catch (e) {
+          return "time";
+        }
+      }
+
+      function apply(mode) {
+        var next = MODES[mode] ? mode : "time";
+        var root = document.documentElement;
+        root.dataset.theme = next;
+        root.dataset.timePhase = fromHour(new Date().getHours());
+        return next;
+      }
+
+      window.__dittoDashboardTheme = {
+        storageKey: STORAGE_KEY,
+        fromHour: fromHour,
+        readMode: readMode,
+        apply: apply
+      };
+      apply(readMode());
+    })();
+  </script>
+
   <style>
     /* Palette aligned to the Ditto app's dark "night" theme (ditto-app
        src/styles/variables.css): a deep blue-purple ground (hue 260) with a
@@ -491,6 +533,11 @@
       --danger: #a33d36;
       --on-accent: #fdfbf7;
       --focus: #5c4d3c;
+      --accent-hover: #433529;
+      --banner-text: #684215;
+      --banner-strong: #4d3010;
+      --rank-one-text: #754b18;
+      --rank-three-text: #814626;
       --radius: 8px;
       --shadow: 0 4px 12px color-mix(in oklch, var(--text) 10%, transparent);
       --display: Georgia, "Times New Roman", serif;
@@ -498,7 +545,65 @@
       --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
     }
 
+    :root[data-theme="time"][data-time-phase="dawn"] {
+      --bg: oklch(96% .015 45);
+      --bg-elev: oklch(98% .01 45);
+      --bg-elev-2: oklch(93% .02 42);
+      --border: oklch(84% .035 45);
+      --border-strong: oklch(67% .045 45);
+      --accent: oklch(43% .055 45);
+      --accent-hover: oklch(34% .05 45);
+      --focus: oklch(43% .055 45);
+    }
+    :root[data-theme="time"][data-time-phase="morning"] {
+      --bg: oklch(98% .006 90);
+      --bg-elev: oklch(99% .004 90);
+      --bg-elev-2: oklch(95% .01 85);
+      --border: oklch(87% .018 85);
+      --border-strong: oklch(69% .028 80);
+    }
+    :root[data-theme="time"][data-time-phase="dusk"] {
+      --bg: oklch(94% .022 45);
+      --bg-elev: oklch(97% .016 42);
+      --bg-elev-2: oklch(91% .028 40);
+      --border: oklch(80% .045 42);
+      --border-strong: oklch(62% .055 40);
+      --accent: oklch(42% .07 50);
+      --accent-hover: oklch(33% .06 48);
+      --gold: oklch(55% .12 65);
+      --tool: var(--gold);
+      --focus: oklch(42% .07 50);
+    }
+    :root[data-theme="dark"],
+    :root[data-theme="time"][data-time-phase="night"] {
+      --bg: oklch(19% .025 255);
+      --bg-elev: oklch(23% .028 255);
+      --bg-elev-2: oklch(27% .03 255);
+      --border: oklch(36% .02 255);
+      --border-strong: oklch(48% .025 255);
+      --text: oklch(92% .006 85);
+      --text-dim: oklch(79% .008 85);
+      --text-faint: oklch(72% .01 85);
+      --accent: oklch(74% .12 75);
+      --accent-hover: oklch(80% .115 75);
+      --accent-2: oklch(75% .1 340);
+      --gold: oklch(78% .12 75);
+      --tool: var(--accent);
+      --memory: var(--accent-2);
+      --good: oklch(75% .11 145);
+      --warn: oklch(78% .12 75);
+      --danger: oklch(72% .13 28);
+      --on-accent: oklch(19% .025 255);
+      --focus: oklch(80% .115 75);
+      --banner-text: oklch(86% .08 75);
+      --banner-strong: oklch(92% .08 75);
+      --rank-one-text: oklch(84% .1 75);
+      --rank-three-text: oklch(78% .08 45);
+    }
+
     html { color-scheme: light; background: var(--bg); }
+    html[data-theme="dark"],
+    html[data-theme="time"][data-time-phase="night"] { color-scheme: dark; }
     body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 15px; }
     .wrap { max-width: 1440px; padding: 24px 28px 72px; }
 
@@ -563,7 +668,7 @@
       font-size: 12px;
       transition: background 140ms ease, border-color 140ms ease, color 140ms ease, transform 80ms ease;
     }
-    .btn:hover { border-color: var(--accent); background: #433529; }
+    .btn:hover { border-color: var(--accent); background: var(--accent-hover); }
     .btn.ghost { background: transparent; color: var(--text); border-color: var(--border); }
     .btn.ghost:hover { border-color: var(--border-strong); background: var(--bg-elev-2); }
 
@@ -572,9 +677,9 @@
       border-radius: 4px;
       border-color: color-mix(in oklch, var(--warn) 45%, var(--border));
       background: color-mix(in oklch, var(--warn) 9%, var(--bg-elev));
-      color: #684215;
+      color: var(--banner-text);
     }
-    .banner b { color: #4d3010; }
+    .banner b { color: var(--banner-strong); }
 
     .cards {
       grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -607,9 +712,39 @@
     tbody tr.champion:hover { background: color-mix(in oklch, var(--gold) 13%, var(--bg-elev)); }
     .tip { border-color: color-mix(in oklch, var(--text-dim) 55%, transparent); }
     .rank { min-width: 25px; height: 25px; border-radius: 3px; background: var(--bg-elev-2); color: var(--text-dim); }
-    .rank.r1 { background: color-mix(in oklch, var(--gold) 14%, var(--bg-elev)); color: #754b18; }
+    .rank.r1 { background: color-mix(in oklch, var(--gold) 14%, var(--bg-elev)); color: var(--rank-one-text); }
     .rank.r2 { background: var(--bg-elev-2); color: var(--text-dim); }
-    .rank.r3 { background: color-mix(in oklch, #a85d35 11%, var(--bg-elev)); color: #814626; }
+    .rank.r3 { background: color-mix(in oklch, #a85d35 11%, var(--bg-elev)); color: var(--rank-three-text); }
+
+    .theme-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      padding: 2px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg-elev);
+    }
+    .theme-option {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-height: 29px;
+      padding: 5px 8px;
+      border: 0;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--text-dim);
+      font: 600 10px/1 var(--mono);
+      cursor: pointer;
+    }
+    .theme-option:hover { background: var(--bg-elev-2); color: var(--text); }
+    .theme-option[aria-pressed="true"] {
+      background: var(--bg-elev-2);
+      color: var(--text);
+      box-shadow: inset 0 0 0 1px var(--border);
+    }
+    .theme-option svg { width: 13px; height: 13px; flex: none; }
     .hotkey .badge,
     .bv,
     .prov,
@@ -666,6 +801,10 @@
       header.top .brand { flex: 1 0 100%; }
       header.top .brand .sub { max-width: 28ch; }
       header.top .bench-badge.show { display: block; width: fit-content; margin: 6px 0 0; }
+      .theme-switch { order: 1; }
+      header.top #status { order: 2; }
+      header.top #wandb-link { order: 3; }
+      header.top #refresh { order: 4; }
       .cards { grid-template-columns: repeat(2, 1fr); }
       .card:nth-child(3) { border-right: 1px solid var(--border); }
       .card:nth-child(even) { border-right: 0; }
@@ -695,6 +834,20 @@
         </div>
       </div>
       <div class="spacer"></div>
+      <div class="theme-switch" role="group" aria-label="Color theme">
+        <button class="theme-option" type="button" data-theme-choice="light" aria-pressed="false" title="Always use the light paper theme">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42"/></svg>
+          <span>Light</span>
+        </button>
+        <button class="theme-option" type="button" data-theme-choice="dark" aria-pressed="false" title="Always use the dark ink-blue theme">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20.5 15.4A8.5 8.5 0 0 1 8.6 3.5 8.5 8.5 0 1 0 20.5 15.4Z"/></svg>
+          <span>Dark</span>
+        </button>
+        <button class="theme-option" type="button" data-theme-choice="time" aria-pressed="false" title="Follow the landing page theme for the current time of day">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+          <span id="theme-time-label">Time</span>
+        </button>
+      </div>
       <span id="status" class="pill" role="status" aria-live="polite"><span class="dot" aria-hidden="true"></span><span id="status-text">Connecting…</span></span>
       <a id="wandb-link" class="btn ghost" href="#" target="_blank" rel="noopener"><span aria-hidden="true">📈</span> Full telemetry <span aria-hidden="true">↗</span></a>
       <button id="refresh" class="btn" title="Refresh now"><span aria-hidden="true">↻</span> Refresh</button>
@@ -878,6 +1031,40 @@
   <script>
   (function () {
     "use strict";
+
+    // Theme control: fixed light/dark, or the landing page's five time phases.
+    (function () {
+      var theme = window.__dittoDashboardTheme;
+      if (!theme) return;
+      var controls = document.querySelectorAll("[data-theme-choice]");
+      var timeLabel = document.getElementById("theme-time-label");
+
+      function sync() {
+        var mode = document.documentElement.dataset.theme || "time";
+        var phase = document.documentElement.dataset.timePhase || "afternoon";
+        controls.forEach(function (control) {
+          control.setAttribute("aria-pressed", String(control.dataset.themeChoice === mode));
+        });
+        if (timeLabel) timeLabel.textContent = mode === "time"
+          ? "Time · " + phase.charAt(0).toUpperCase() + phase.slice(1)
+          : "Time";
+      }
+
+      controls.forEach(function (control) {
+        control.addEventListener("click", function () {
+          var mode = theme.apply(control.dataset.themeChoice);
+          try { localStorage.setItem(theme.storageKey, mode); } catch (e) { /* optional */ }
+          sync();
+        });
+      });
+      sync();
+      setInterval(function () {
+        if (document.documentElement.dataset.theme === "time") {
+          theme.apply("time");
+          sync();
+        }
+      }, 60000);
+    })();
 
     // Reuse the inlined brand logo as the favicon (one embedded copy).
     (function () {
