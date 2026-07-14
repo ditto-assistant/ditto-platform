@@ -71,10 +71,17 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert "Submission pipeline" in body
-        assert body.index("<h2>Leaderboard</h2>") < body.index(
-            "<h2>Submission pipeline</h2>"
-        )
-        assert 'getJSON("/public/activity")' in body
+        # The pipeline is its own hash-routed page, reachable from the sidebar.
+        assert 'data-page="pipeline"' in body
+        assert 'href="#/pipeline"' in body
+        assert 'getJSON("/public/activity?limit=200")' in body
         assert 'id="activity-rows"' in body
         assert "Copy review:" in body
         assert "screening_reason" in body
+
+    async def test_sidebar_routes_every_section(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        for page in ("overview", "leaderboard", "pipeline", "health", "benchmark"):
+            assert f'href="#/{page}"' in body
+            assert f'data-page="{page}"' in body
