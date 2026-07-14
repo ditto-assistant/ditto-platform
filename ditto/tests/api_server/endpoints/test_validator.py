@@ -1156,13 +1156,17 @@ class TestRequestJob:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         _install_db(app, session_maker)
         _install_chain(app)
+        before = datetime.now(UTC)
         resp = await client.post(
             "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
         )
+        after = datetime.now(UTC)
         assert resp.status_code == 200
         body = resp.json()
         assert body["agent_id"] == str(agent_id)
-        assert "deadline" in body
+        deadline = datetime.fromisoformat(body["deadline"].replace("Z", "+00:00"))
+        assert before + timedelta(minutes=90) <= deadline
+        assert deadline <= after + timedelta(minutes=90)
 
     async def test_no_work_returns_204(
         self,
