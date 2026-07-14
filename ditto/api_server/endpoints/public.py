@@ -32,7 +32,7 @@ import math
 import os
 import statistics
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Response
@@ -64,6 +64,7 @@ from ditto.api_models import (
     PublicValidatorScore,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.endpoints.screener import GeneratorDep
@@ -381,6 +382,7 @@ async def validators(
             software_version=row.software_version,
             protocol_version=row.protocol_version,
             code_digest=row.code_digest,
+            state=cast(ValidatorRuntimeState, row.state),
             reported_at=aware(row.reported_at),
             seen_at=aware(row.seen_at),
             signature=row.signature,

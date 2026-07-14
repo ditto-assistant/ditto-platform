@@ -20,6 +20,7 @@ async def upsert_validator_heartbeat(
     software_version: str,
     protocol_version: int,
     code_digest: str,
+    state: str,
     reported_at: datetime,
     seen_at: datetime,
     signature: str,
@@ -38,6 +39,7 @@ async def upsert_validator_heartbeat(
     row.software_version = software_version
     row.protocol_version = protocol_version
     row.code_digest = code_digest
+    row.state = state
     row.reported_at = reported_at
     row.seen_at = seen_at
     row.signature = signature

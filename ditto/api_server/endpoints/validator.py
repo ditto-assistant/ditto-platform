@@ -286,13 +286,14 @@ def _heartbeat_signing_message(
     software_version: str,
     protocol_version: int,
     code_digest: str,
+    state: str,
     timestamp: int,
 ) -> bytes:
     """Canonical v1 heartbeat payload, mirrored by ``ditto-subnet``."""
     return (
         "ditto-validator-heartbeat:v1:"
         f"{validator_hotkey}:{software_version}:{protocol_version}:"
-        f"{code_digest}:{timestamp}"
+        f"{code_digest}:{state}:{timestamp}"
     ).encode()
 
 
@@ -337,6 +338,7 @@ async def heartbeat(
         software_version=request_body.software_version,
         protocol_version=request_body.protocol_version,
         code_digest=request_body.code_digest,
+        state=request_body.state,
         timestamp=request_body.timestamp,
     )
     if not _verify_signature(validator_hotkey, payload, request_body.signature):
@@ -350,6 +352,7 @@ async def heartbeat(
             software_version=request_body.software_version,
             protocol_version=request_body.protocol_version,
             code_digest=request_body.code_digest,
+            state=request_body.state,
             reported_at=reported_at,
             seen_at=now,
             signature=request_body.signature,

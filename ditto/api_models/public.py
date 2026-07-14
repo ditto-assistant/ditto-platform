@@ -15,6 +15,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ditto.api_models.validator import ValidatorRuntimeState
+
 _SS58_PATTERN = r"^[1-9A-HJ-NP-Za-km-z]{47,48}$"
 
 
@@ -831,6 +833,7 @@ class PublicValidatorHeartbeat(BaseModel):
     code_digest: Annotated[
         str, Field(pattern=r"^[0-9a-f]{64}$", description="Installed source digest.")
     ]
+    state: ValidatorRuntimeState
     reported_at: datetime
     seen_at: datetime
     signature: Annotated[str, Field(pattern=r"^[0-9a-fA-F]{128}$")]

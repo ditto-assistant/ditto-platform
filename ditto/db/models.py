@@ -414,7 +414,7 @@ class Score(Base):
 
 
 class ValidatorHeartbeat(Base):
-    """Latest signed software heartbeat for one permitted validator hotkey."""
+    """Latest signed build and runtime heartbeat for one validator hotkey."""
 
     __tablename__ = "validator_heartbeats"
 
@@ -422,6 +422,7 @@ class ValidatorHeartbeat(Base):
     software_version: Mapped[str] = mapped_column(Text, nullable=False)
     protocol_version: Mapped[int] = mapped_column(Integer, nullable=False)
     code_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )
@@ -440,6 +441,11 @@ class ValidatorHeartbeat(Base):
         CheckConstraint(
             "length(code_digest) = 64",
             name="validator_heartbeats_code_digest_length_check",
+        ),
+        CheckConstraint(
+            "state IN ('polling', 'running_benchmark', 'updating_weights', "
+            "'idle', 'error')",
+            name="validator_heartbeats_state_check",
         ),
         CheckConstraint(
             "length(signature) = 128",

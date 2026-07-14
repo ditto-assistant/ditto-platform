@@ -166,9 +166,11 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   existing Prometheus `/metrics`.
 - `GET /api/v1/public/validators` → the latest signed software heartbeat from
   each reporting permitted validator: public hotkey, package/protocol version,
-  deterministic source digest, report/receive times, signature, and a five-minute
-  online flag. A missing hotkey means it has not proved heartbeat-capable software;
-  this endpoint does not pretend to enumerate every on-chain permit holder.
+  deterministic source digest, current worker phase, report/receive times,
+  signature, and a five-minute online flag. Active benchmarks refresh
+  `running_benchmark` every two minutes. A missing hotkey means it has not proved
+  heartbeat-capable software; this endpoint does not pretend to enumerate every
+  on-chain permit holder.
 - Per-category means + run provenance: the scoring engine (dittobench-api) emits
   `models` + `per_category` (alongside `bench_version`, `dataset_sha256`,
   `lexical_gap`, `paraphrase`, `seeding_waves`, `tokens`) in `RunDetails`; the
