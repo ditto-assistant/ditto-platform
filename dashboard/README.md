@@ -6,6 +6,18 @@ platform's public, aggregate-only API (`GET /api/v1/public/leaderboard` and
 `GET /api/v1/public/health`) and links out to wandb for the per-epoch deep dive.
 This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 
+## Layout
+
+Desktop/widescreen chrome: a sticky left sidebar lists every section of the
+site; each section is a deep-linkable, hash-routed page (`#/overview`,
+`#/leaderboard`, `#/operations`, `#/submissions`, `#/benchmark`). On narrow
+viewports the sidebar becomes a top bar with a hamburger menu. The
+light/dark/time theme switcher and the telemetry/refresh actions live in the
+sidebar; the status pill and page title sit in a slim main header. Overview is
+the snapshot cards; Network operations holds the live submission pipeline and
+the validator/screener fleet-health table; Submissions is the paginated recent
+uploads; Benchmark explains what DittoBench v2 measures.
+
 ## What it shows
 
 - **Subnet snapshot** — total miners are the primary signal, with scored-miner,
