@@ -234,13 +234,6 @@ class Agent(Base):
             "status",
             postgresql_where=text("status = 'evaluating'"),
         ),
-        Index(
-            "agents_rescreen_idx",
-            "created_at",
-            postgresql_where=text(
-                "status = 'evaluating' AND screening_policy_version < 2"
-            ),
-        ),
         # Screener polls for agents in the 'uploaded' state; a partial index
         # keeps that lookup cheap (mirrors the evaluating index).
         Index(

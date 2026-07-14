@@ -71,6 +71,11 @@ router = APIRouter(prefix="/screener", tags=["screener"])
 # How long a pre-signed artifact URL stays valid (mirrors the validator's).
 _ARTIFACT_URL_TTL = timedelta(minutes=5)
 
+# Policy v1 used the legacy three-field signature. Every policy from v2 onward
+# binds its version, including an older worker reporting a failure during a
+# future rolling policy upgrade.
+_FIRST_VERSIONED_POLICY = 2
+
 
 def _artifact_key(agent_id: UUID) -> str:
     return f"{agent_id}/agent.tar.gz"
@@ -325,7 +330,7 @@ async def submit_result(
     # Signature proves the screener owns the hotkey and binds THIS verdict:
     #    ``passed`` is signed, so a captured result can't be replayed with the
     #    boolean flipped to grief (or unfairly promote) a miner.
-    if payload.policy_version >= SCREENING_POLICY_VERSION:
+    if payload.policy_version >= _FIRST_VERSIONED_POLICY:
         signed = (
             f"{payload.screener_hotkey}:{agent_id}:{payload.passed}:"
             f"{payload.policy_version}"

@@ -21,12 +21,7 @@ def upgrade() -> None:
         "ALTER TABLE agents ADD COLUMN screening_policy_version "
         "INTEGER NOT NULL DEFAULT 0"
     )
-    op.execute(
-        "CREATE INDEX agents_rescreen_idx ON agents "
-        "(created_at) WHERE status = 'evaluating' AND screening_policy_version < 2"
-    )
 
 
 def downgrade() -> None:
-    op.execute("DROP INDEX IF EXISTS agents_rescreen_idx")
     op.execute("ALTER TABLE agents DROP COLUMN IF EXISTS screening_policy_version")

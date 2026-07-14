@@ -76,7 +76,7 @@ class ScreenerQueueResponse(BaseModel):
             ge=1,
             description="Minimum screening policy a passing verdict must attest.",
         ),
-    ] = SCREENING_POLICY_VERSION
+    ]
 
     model_config = ConfigDict(
         json_schema_extra={
