@@ -96,3 +96,14 @@ class TestDashboard:
         assert 'id="validator-rows"' in body
         assert 'getJSON("/public/validators")' in body
         assert "running_benchmark" in body
+
+    async def test_includes_time_aware_theme_switcher(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert 'data-theme-choice="light"' in body
+        assert 'data-theme-choice="dark"' in body
+        assert 'data-theme-choice="time"' in body
+        assert 'var STORAGE_KEY = "ditto:dashboard-theme"' in body
+        assert 'return MODES[saved] ? saved : "time"' in body
+        assert "root.dataset.timePhase = fromHour(new Date().getHours())" in body
+        assert 'if (hour >= 5 && hour < 8) return "dawn"' in body
