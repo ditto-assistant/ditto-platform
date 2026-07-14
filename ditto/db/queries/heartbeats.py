@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
+from uuid import UUID
 
 from sqlalchemy import select
 
@@ -21,6 +22,7 @@ async def upsert_validator_heartbeat(
     protocol_version: int,
     code_digest: str,
     state: str,
+    active_agent_id: UUID | None,
     reported_at: datetime,
     seen_at: datetime,
     signature: str,
@@ -40,6 +42,7 @@ async def upsert_validator_heartbeat(
     row.protocol_version = protocol_version
     row.code_digest = code_digest
     row.state = state
+    row.active_agent_id = active_agent_id
     row.reported_at = reported_at
     row.seen_at = seen_at
     row.signature = signature

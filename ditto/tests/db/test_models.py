@@ -67,6 +67,7 @@ class TestAgentStatusEnum:
             "live",
             "ath_pending_review",
             "banned",
+            "rejected",
         }
         assert {s.value for s in AgentStatus} == expected
 

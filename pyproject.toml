@@ -22,12 +22,12 @@ dependencies = [
     "prometheus-client>=0.20",
     "tenacity>=8.0",
     "aioboto3>=13.0",
-    "ditto-screening-protocol==0.3.0",
+    "ditto-screening-protocol==0.4.0",
 ]
 
 [tool.uv.sources]
 bittensor-pylon-client = { git = "https://github.com/bittensor-church/bittensor-pylon", subdirectory = "pylon_client" }
-ditto-screening-protocol = { git = "https://github.com/ditto-assistant/ditto-subnet", rev = "8487fbdfc8a8137552d50646f4e8388be8f3de25", subdirectory = "packages/ditto-screening-protocol" }
+ditto-screening-protocol = { git = "https://github.com/ditto-assistant/ditto-subnet", rev = "bc8642d49b7d2fd3a8861053b1fa5b6e4f3fa640", subdirectory = "packages/ditto-screening-protocol" }
 
 [dependency-groups]
 dev = [

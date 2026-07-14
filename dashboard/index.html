@@ -399,6 +399,20 @@
 
     /* ── Submission pipeline ───────────────────────────────── */
     .activity tbody tr { cursor: pointer; }
+    .pipeline-overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 14px; overflow: hidden; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); }
+    .pipeline-column { min-width: 0; padding: 14px; }
+    .pipeline-column + .pipeline-column { border-left: 1px solid var(--border); }
+    .pipeline-column-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+    .pipeline-column h3 { margin: 0; font-size: 12px; font-weight: 700; color: var(--text); }
+    .pipeline-count { min-width: 24px; padding: 2px 7px; border-radius: 999px; background: var(--bg-elev-2); color: var(--text-dim); font-size: 11px; font-weight: 750; text-align: center; font-variant-numeric: tabular-nums; }
+    .pipeline-items { display: flex; flex-direction: column; gap: 5px; }
+    .pipeline-item { width: 100%; min-width: 0; padding: 8px 9px; border: 0; border-radius: 7px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; transition: background .16s ease-out; }
+    .pipeline-item:hover { background: var(--bg-elev-2); }
+    .pipeline-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .pipeline-item-name { display: block; overflow: hidden; color: var(--text); font-size: 12.5px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+    .pipeline-item-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 3px; color: var(--text-faint); font-family: var(--mono); font-size: 10.5px; }
+    .pipeline-empty, .pipeline-more { padding: 8px 9px; color: var(--text-faint); font-size: 11.5px; line-height: 1.4; }
+    .pipeline-more { color: var(--text-dim); font-weight: 650; }
     .agent-name { display: block; font-weight: 650; color: var(--text); }
     .agent-id { display: block; margin-top: 3px; font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
     .stage { display: inline-flex; align-items: center; gap: 7px; border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 750; letter-spacing: .2px; white-space: nowrap; border: 1px solid var(--border); color: var(--text-dim); background: var(--bg-elev-2); }
@@ -420,6 +434,16 @@
     .validators tbody tr { cursor: default; }
     .validator-version { display: block; font-family: var(--mono); font-size: 12px; color: var(--text); }
     .validator-protocol { display: block; margin-top: 3px; font-size: 11px; color: var(--text-faint); }
+    .current-agent { display: block; margin-top: 4px; font-family: var(--mono); font-size: 11px; color: var(--accent-2); }
+    .attempt-list { margin-top: 18px; }
+    .attempt { display: grid; grid-template-columns: 110px 1fr auto; gap: 12px; align-items: start; padding: 11px 0; border-bottom: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
+    .attempt:last-child { border-bottom: 0; }
+    .attempt-version { font-family: var(--mono); font-size: 12px; color: var(--text); }
+    .attempt-main { min-width: 0; }
+    .attempt-main b { display: block; font-size: 13px; }
+    .attempt-meta { margin-top: 3px; color: var(--text-dim); font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere; }
+    .attempt-time { color: var(--text-faint); font-size: 11.5px; white-space: nowrap; }
+    @media (max-width: 560px) { .attempt { grid-template-columns: 88px 1fr; } .attempt-time { grid-column: 2; } }
 
     /* ── Health strip ───────────────────────────────────────── */
     .health { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
@@ -431,6 +455,9 @@
     @media (max-width: 960px) {
       .hide-md { display: none; }
       .cards { grid-template-columns: repeat(3, 1fr); }
+      .pipeline-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .pipeline-column:nth-child(3) { border-left: 0; border-top: 1px solid var(--border); }
+      .pipeline-column:nth-child(4) { border-top: 1px solid var(--border); }
     }
     @media (max-width: 720px) {
       .cards { grid-template-columns: repeat(2, 1fr); }
@@ -438,6 +465,8 @@
       .hide-sm { display: none; }
       .stage-cell { min-width: 0; }
       .brand h1 { font-size: 18px; }
+      .pipeline-overview { grid-template-columns: 1fr; }
+      .pipeline-column + .pipeline-column { border-left: 0; border-top: 1px solid var(--border); }
     }
 
     /* ── Ditto paper product system ───────────────────────────
@@ -711,7 +740,25 @@
 
     <div class="section-head">
       <h2>Submission pipeline</h2>
-      <span class="hint">recent uploads · screening and evaluation progress</span>
+      <span class="hint">live work queues · click any submission for its history</span>
+    </div>
+    <div class="pipeline-overview" id="pipeline-overview" aria-label="Live submission queues">
+      <section class="pipeline-column" aria-labelledby="pipeline-wait-screen-title">
+        <div class="pipeline-column-head"><h3 id="pipeline-wait-screen-title">Waiting for screening</h3><span class="pipeline-count" id="pipeline-wait-screen-count">–</span></div>
+        <div class="pipeline-items" id="pipeline-wait-screen"><div class="pipeline-empty">Loading…</div></div>
+      </section>
+      <section class="pipeline-column" aria-labelledby="pipeline-screening-title">
+        <div class="pipeline-column-head"><h3 id="pipeline-screening-title">Screening</h3><span class="pipeline-count" id="pipeline-screening-count">–</span></div>
+        <div class="pipeline-items" id="pipeline-screening"><div class="pipeline-empty">Loading…</div></div>
+      </section>
+      <section class="pipeline-column" aria-labelledby="pipeline-wait-validator-title">
+        <div class="pipeline-column-head"><h3 id="pipeline-wait-validator-title">Waiting for validator</h3><span class="pipeline-count" id="pipeline-wait-validator-count">–</span></div>
+        <div class="pipeline-items" id="pipeline-wait-validator"><div class="pipeline-empty">Loading…</div></div>
+      </section>
+      <section class="pipeline-column" aria-labelledby="pipeline-evaluating-title">
+        <div class="pipeline-column-head"><h3 id="pipeline-evaluating-title">Evaluating</h3><span class="pipeline-count" id="pipeline-evaluating-count">–</span></div>
+        <div class="pipeline-items" id="pipeline-evaluating"><div class="pipeline-empty">Loading…</div></div>
+      </section>
     </div>
     <div class="board activity">
       <table aria-label="Recent agent submission pipeline">
@@ -853,6 +900,7 @@
     var REFRESH_MS = 30000; // matches the API's Cache-Control max-age
     var lastEntries = [];
     var lastActivityEntries = [];
+    var pipelineEntries = [];
     var activityPage = 1;
     var activityTotalPages = 1;
     var ACTIVITY_PAGE_SIZE = 10;
@@ -1633,6 +1681,10 @@
         openActivityModal(+tr.getAttribute("data-activity-i"));
       }
     });
+    document.getElementById("pipeline-overview").addEventListener("click", function (ev) {
+      var item = ev.target.closest("[data-pipeline-i]");
+      if (item) openActivityEntry(pipelineEntries[+item.getAttribute("data-pipeline-i")]);
+    });
     document.getElementById("activity-prev").addEventListener("click", function () {
       if (activityPage > 1) loadActivity(activityPage - 1);
     });
@@ -1660,10 +1712,12 @@
 
     function activityStage(status) {
       var stages = {
-        uploaded: ["Queued", "progress"],
+        uploaded: ["Waiting for screening", "progress"],
+        waiting_screening: ["Waiting for screening", "progress"],
         screening: ["Screening", "progress"],
         screening_passed: ["Screening passed", "good"],
-        screening_failed: ["Screening failed", "bad"],
+        screening_failed: ["Screening interrupted", "warn"],
+        waiting_validator: ["Waiting for validator", "progress"],
         evaluating: ["Evaluating", "progress"],
         scored: ["Scored", "good"],
         live: ["Live", "good"],
@@ -1676,7 +1730,7 @@
     function validationProgress(e) {
       var count = Math.max(0, Number(e.score_count) || 0);
       var quorum = Math.max(1, Number(e.quorum) || 3);
-      var hasStarted = count > 0 || ["evaluating", "scored", "live", "under_review"].indexOf(e.status) >= 0;
+      var hasStarted = count > 0 || ["waiting_validator", "evaluating", "scored", "live", "under_review"].indexOf(e.status) >= 0;
       return hasStarted ? count + " of " + quorum : "Not started";
     }
 
@@ -1684,16 +1738,60 @@
       var count = Math.max(0, Number(e.score_count) || 0);
       var quorum = Math.max(1, Number(e.quorum) || 3);
       if (count >= quorum) return "Validation complete. The canonical result uses the median of " + quorum + " independent scores.";
+      if (e.status === "waiting_screening") return "Queued for a screener to claim under the current policy.";
+      if (e.status === "screening") return "A screener is currently checking this submission.";
+      if (e.status === "waiting_validator") {
+        var waiting = quorum - count;
+        return count + " of " + quorum + " validators scored this submission. Waiting for " + waiting + " validator " + (waiting === 1 ? "score" : "scores") + ".";
+      }
       if (e.status === "evaluating" || count > 0) {
         var remaining = quorum - count;
         return count + " of " + quorum + " validators scored this submission. Waiting for " + remaining + " more independent " + (remaining === 1 ? "score" : "scores") + ".";
       }
-      if (e.status === "screening_failed" || e.status === "rejected") return "Validation did not start because this submission did not advance to evaluation.";
+      if (e.status === "rejected") return "Screening completed and rejected this submission. Open the screening history for the policy version and reason.";
+      if (e.status === "screening_failed") return "Screening could not complete reliably. This is retryable and is distinct from a submission rejection.";
       return "Validation starts after the submission passes screening.";
     }
 
-    function openActivityModal(i) {
-      var e = lastActivityEntries[i];
+    function attemptLabel(status) {
+      var labels = {
+        running: ["Running", "progress"], passed: ["Passed", "good"],
+        rejected: ["Rejected", "bad"], failed: ["System failure", "warn"],
+        expired: ["Lease expired", "warn"], issued: ["Claimed", "progress"],
+        scored: ["Score submitted", "good"]
+      };
+      return labels[status] || [String(status || "Unknown").replace(/_/g, " "), ""];
+    }
+
+    function renderPipelineDetail(e, pipeline) {
+      var screening = (pipeline.screening_attempts || []).map(function (a) {
+        var label = attemptLabel(a.status);
+        var when = a.finished_at || a.started_at;
+        var meta = "Screener " + shortKey(a.screener_hotkey);
+        if (a.reason) meta += " · " + a.reason;
+        if (a.status === "running") meta += " · lease ends " + new Date(a.deadline).toLocaleString();
+        return '<div class="attempt"><div><span class="attempt-version">Policy v' + esc(a.policy_version) + '</span></div>' +
+          '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(label[0]) + '</span></b>' +
+          '<div class="attempt-meta">' + esc(meta) + '</div></div>' +
+          '<div class="attempt-time" title="' + esc(when) + '">' + relTime(when) + '</div></div>';
+      }).join("");
+      var validation = (pipeline.validation_attempts || []).map(function (a) {
+        var label = attemptLabel(a.actively_running ? "running" : a.status);
+        var meta = "Validator " + shortKey(a.validator_hotkey) + " · deadline " + new Date(a.deadline).toLocaleString();
+        return '<div class="attempt"><div><span class="attempt-version">Validator</span></div>' +
+          '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(a.actively_running ? "Evaluating now" : label[0]) + '</span></b>' +
+          '<div class="attempt-meta">' + esc(meta) + '</div></div>' +
+          '<div class="attempt-time" title="' + esc(a.issued_at) + '">' + relTime(a.issued_at) + '</div></div>';
+      }).join("");
+      return '<div class="attempt-list">' +
+        '<div class="stat-head">Screening history</div>' +
+        (screening || '<div class="muted" style="padding:10px 0">No versioned screening attempt recorded yet.</div>') +
+        '<div class="stat-head" style="margin-top:18px">Validator progress · ' + esc(pipeline.score_count) + ' of ' + esc(pipeline.quorum) + ' scored</div>' +
+        (validation || '<div class="muted" style="padding:10px 0">No validator has claimed this submission yet.</div>') +
+        '</div>';
+    }
+
+    function openActivityEntry(e) {
       if (!e) return;
       var stage = activityStage(e.status);
       var evidence = e.review_reason
@@ -1719,8 +1817,73 @@
             stat("Progress", validationDetail(e)) +
             stat("Evidence", evidence) +
           '</div>' +
-        '</div>';
+        '</div><div class="muted" style="margin-top:18px">Loading screening and validation history…</div>';
       showModal();
+      getJSON("/public/agent/" + encodeURIComponent(e.agent_id) + "/pipeline")
+        .then(function (pipeline) {
+          document.getElementById("d-stats").innerHTML =
+            '<div class="stat-cols">' +
+              '<div class="stat-group"><div class="stat-head">Pipeline state</div>' +
+                stat("Stage", activityStage(pipeline.status)[0]) +
+                stat("Validation", pipeline.score_count + " of " + pipeline.quorum) +
+                stat("Submitted", new Date(e.submitted_at).toLocaleString()) +
+              '</div>' +
+              '<div class="stat-group"><div class="stat-head">Details</div>' +
+                stat("Agent ID", String(e.agent_id || "")) +
+                stat("Progress", validationDetail(Object.assign({}, e, pipeline))) +
+                stat("Evidence", evidence) +
+              '</div>' +
+            '</div>' + renderPipelineDetail(e, pipeline);
+        })
+        .catch(function () {
+          var el = document.getElementById("d-stats");
+          el.insertAdjacentHTML("beforeend", '<div class="muted" style="margin-top:18px">Detailed history is temporarily unavailable.</div>');
+        });
+    }
+
+    function openActivityModal(i) {
+      openActivityEntry(lastActivityEntries[i]);
+    }
+
+    function renderPipelineBoard(data, unavailable) {
+      var entries = data && data.entries ? data.entries : [];
+      var columns = [
+        { status: "waiting_screening", body: "pipeline-wait-screen", count: "pipeline-wait-screen-count", empty: "No submissions waiting." },
+        { status: "screening", body: "pipeline-screening", count: "pipeline-screening-count", empty: "No active screening job." },
+        { status: "waiting_validator", body: "pipeline-wait-validator", count: "pipeline-wait-validator-count", empty: "No submissions waiting." },
+        { status: "evaluating", body: "pipeline-evaluating", count: "pipeline-evaluating-count", empty: "No active evaluation." }
+      ];
+      pipelineEntries = unavailable ? [] : entries;
+      columns.forEach(function (column) {
+        var body = document.getElementById(column.body);
+        var count = document.getElementById(column.count);
+        if (unavailable) {
+          count.textContent = "–";
+          body.innerHTML = '<div class="pipeline-empty">Queue unavailable.</div>';
+          return;
+        }
+        var indexed = [];
+        pipelineEntries.forEach(function (entry, index) {
+          if (entry.status === column.status) indexed.push({ entry: entry, index: index });
+        });
+        count.textContent = indexed.length;
+        if (!indexed.length) {
+          body.innerHTML = '<div class="pipeline-empty">' + esc(column.empty) + '</div>';
+          return;
+        }
+        var visible = indexed.slice(0, 5).map(function (item) {
+          var entry = item.entry;
+          var meta = column.status === "waiting_validator" || column.status === "evaluating"
+            ? validationProgress(entry)
+            : relTime(entry.submitted_at);
+          return '<button type="button" class="pipeline-item" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(entry.name || "unnamed agent") + ' details">' +
+            '<span class="pipeline-item-name">' + esc(entry.name || "Unnamed agent") + '</span>' +
+            '<span class="pipeline-item-meta"><span>' + esc(String(entry.agent_id || "").slice(0, 8)) + '</span><span>' + esc(meta) + '</span></span>' +
+            '</button>';
+        }).join("");
+        if (indexed.length > 5) visible += '<div class="pipeline-more">+' + (indexed.length - 5) + ' more</div>';
+        body.innerHTML = visible;
+      });
     }
 
     function renderActivity(data, unavailable) {
@@ -1805,10 +1968,11 @@
         var version = String(v.software_version || "Unknown");
         if (version !== "Unknown" && version.charAt(0).toLowerCase() !== "v") version = "v" + version;
         var reportedAt = v.seen_at || v.reported_at;
+        var active = v.active_agent_id ? '<span class="current-agent" title="' + esc(v.active_agent_id) + '">Agent ' + esc(String(v.active_agent_id).slice(0, 8)) + '</span>' : '';
         return '<tr>' +
           '<td><span class="hotkey" title="' + esc(v.validator_hotkey) + '">' + esc(shortKey(v.validator_hotkey)) + '</span></td>' +
           '<td><span class="stage ' + (v.online ? "good" : "bad") + '">' + (v.online ? "Online" : "Offline") + '</span></td>' +
-          '<td class="hide-sm"><span class="stage ' + work[1] + '">' + esc(work[0]) + '</span></td>' +
+          '<td class="hide-sm"><span class="stage ' + work[1] + '">' + esc(work[0]) + '</span>' + active + '</td>' +
           '<td class="hide-sm"><span class="validator-version">' + esc(version) + '</span>' +
             '<span class="validator-protocol">Protocol ' + esc(v.protocol_version) + '</span></td>' +
           '<td class="num" title="' + esc(reportedAt) + '">' + relTime(reportedAt) + '</td>' +
@@ -1837,6 +2001,12 @@
         .catch(function () { renderActivity(null, true); });
     }
 
+    function loadPipelineBoard() {
+      getJSON("/public/activity?page=1&limit=200")
+        .then(function (data) { renderPipelineBoard(data, false); })
+        .catch(function () { renderPipelineBoard(null, true); });
+    }
+
     function load(manual) {
       if (manual) setStatus("", "Refreshing…");
       getJSON("/public/leaderboard")
@@ -1848,6 +2018,7 @@
         .then(function (h) { renderHealth(h); })
         .catch(function () { renderHealth(SAMPLE_HEALTH); });
       loadActivity(activityPage);
+      loadPipelineBoard();
       getJSON("/public/validators")
         .then(function (data) { renderValidators(data, false); })
         .catch(function () { renderValidators(null, true); });
