@@ -483,6 +483,7 @@ def _public_activity_status(status: AgentStatus) -> str:
 async def activity(
     response: Response,
     session: SessionDep,
+    page: int = Query(default=1, ge=1),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> PublicActivityResponse:
     """Recent submissions and their safe public pipeline stage, newest first.
@@ -493,20 +494,28 @@ async def activity(
     private.
     """
     response.headers["Cache-Control"] = "public, max-age=10"
-    rows = await list_public_activity(session, limit=limit)
+    rows, total = await list_public_activity(
+        session, limit=limit, offset=(page - 1) * limit
+    )
     return PublicActivityResponse(
         generated_at=datetime.now(UTC),
         count=len(rows),
+        total=total,
+        page=page,
+        page_size=limit,
+        total_pages=max(1, math.ceil(total / limit)),
         entries=[
             PublicActivityEntry(
-                agent_id=row.agent_id,
-                miner_hotkey=row.miner_hotkey,
-                name=row.name,
-                status=_public_activity_status(row.status),
-                submitted_at=row.created_at,
-                screening_reason=row.screening_reason,
-                duplicate_of=row.duplicate_of,
-                review_reason=row.review_reason,
+                agent_id=row.agent.agent_id,
+                miner_hotkey=row.agent.miner_hotkey,
+                name=row.agent.name,
+                status=_public_activity_status(row.agent.status),
+                submitted_at=row.agent.created_at,
+                screening_reason=row.agent.screening_reason,
+                duplicate_of=row.agent.duplicate_of,
+                review_reason=row.agent.review_reason,
+                score_count=row.score_count,
+                quorum=SCORING_QUORUM,
             )
             for row in rows
         ],
