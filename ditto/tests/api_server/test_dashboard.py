@@ -190,13 +190,15 @@ class TestDashboard:
         assert "screening_progress" in body
         assert "Building image" in body
         assert "elapsedDuration" in body
+        assert "benchmark-progress-time" in body
+        assert "progress.started_at" in body
         assert "renderPipelineScreenerProgress" in body
         assert "activeScreenerFor" in body
         assert "pipelineScreenerStage" in body
         assert "renderPipelineBoard({ entries: pipelineEntries }, false)" in body
         assert "data-started-at" in body
         assert "active_agent_name" in body
-        assert "setInterval(updateScreenerElapsed, 1000)" in body
+        assert "setInterval(updateElapsedTimes, 1000)" in body
 
     async def test_includes_copy_controls_for_operational_identifiers(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))

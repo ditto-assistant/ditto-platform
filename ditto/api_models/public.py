@@ -569,6 +569,9 @@ class PublicBenchmarkProgress(BaseModel):
 
     agent_id: UUID
     agent_name: str
+    started_at: Annotated[
+        datetime, Field(description="When the validator ticket was issued (UTC).")
+    ]
     stage: BenchmarkProgressStage | None = None
     completed_checks: Annotated[int | None, Field(default=None, ge=0)] = None
     total_checks: Annotated[int | None, Field(default=None, ge=1)] = None
