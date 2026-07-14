@@ -79,6 +79,8 @@ class AdminScreeningRescreenRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: Annotated[str, Field(min_length=3, max_length=500)]
+    expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_score_count: Annotated[int, Field(ge=0)]
 
 
 class AdminScreeningRescreenResponse(BaseModel):

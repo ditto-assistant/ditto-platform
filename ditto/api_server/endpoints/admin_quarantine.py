@@ -35,7 +35,7 @@ from ditto.api_server.dependencies import (
 from ditto.api_server.endpoints.screener import _derive_dataset_seed
 from ditto.api_server.endpoints.validator import ChainDep
 from ditto.api_server.storage import S3StorageClient
-from ditto.db.models import Agent, ScreeningAttempt, ScreeningQuarantine
+from ditto.db.models import Agent, Score, ScreeningAttempt, ScreeningQuarantine
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +305,18 @@ async def rescreen_rejected_submission(
         )
         if agent is None:
             raise HTTPException(status_code=404, detail="agent not found")
+        if agent.sha256 != payload.expected_sha256:
+            raise HTTPException(status_code=409, detail="artifact identity changed")
+        score_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(Score)
+                .where(Score.agent_id == agent_id)
+            )
+            or 0
+        )
+        if score_count != payload.expected_score_count:
+            raise HTTPException(status_code=409, detail="score count changed")
         running_attempt = await session.scalar(
             select(ScreeningAttempt.attempt_id).where(
                 ScreeningAttempt.agent_id == agent_id,
