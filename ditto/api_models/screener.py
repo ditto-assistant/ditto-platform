@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ditto.api_models.system_health import SystemMetrics
 from ditto_screening_protocol import (
@@ -22,6 +22,24 @@ _SIGNATURE_HEX_PATTERN = r"^[0-9a-fA-F]{128}$"
 _SOFTWARE_VERSION_PATTERN = r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$"
 
 ScreenerRuntimeState = Literal["polling", "screening", "error", "paused"]
+ScreenerProgressStage = Literal[
+    "preparing",
+    "downloading",
+    "validating",
+    "building",
+    "starting",
+    "health_check",
+    "submitting",
+]
+
+
+class ScreenerProgress(BaseModel):
+    """Signed, public-safe progress for one active screening job."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    stage: ScreenerProgressStage
+    started_at: Annotated[int, Field(ge=0)]
 
 
 class ScreenerHeartbeatRequest(BaseModel):
@@ -35,9 +53,24 @@ class ScreenerHeartbeatRequest(BaseModel):
     policy_version: Annotated[int, Field(ge=1, le=2**31 - 1)]
     state: ScreenerRuntimeState
     active_agent_id: UUID | None = None
+    progress: ScreenerProgress | None = None
     system_metrics: SystemMetrics | None = None
     timestamp: Annotated[int, Field(ge=0)]
     signature: Annotated[str, Field(pattern=_SIGNATURE_HEX_PATTERN)]
+
+    @model_validator(mode="after")
+    def validate_progress(self) -> ScreenerHeartbeatRequest:
+        if self.progress is None:
+            return self
+        if self.protocol_version < 2:
+            raise ValueError("progress requires heartbeat protocol v2")
+        if self.state != "screening" or self.active_agent_id is None:
+            raise ValueError("progress requires active screening work")
+        if self.progress.started_at > self.timestamp:
+            raise ValueError("progress start cannot be after the heartbeat")
+        if self.timestamp - self.progress.started_at > 6 * 60 * 60:
+            raise ValueError("progress start is outside the bounded job window")
+        return self
 
 
 class ScreenerHeartbeatResponse(BaseModel):
@@ -53,6 +86,8 @@ __all__ = [
     "ScreenerQueueResponse",
     "ScreenerHeartbeatRequest",
     "ScreenerHeartbeatResponse",
+    "ScreenerProgress",
+    "ScreenerProgressStage",
     "ScreenerRuntimeState",
     "ScreenResultRequest",
     "ScreenResultResponse",

@@ -185,12 +185,26 @@ ScreenerDep = Annotated[str, Depends(require_screener)]
 
 
 def _heartbeat_signing_message(payload: ScreenerHeartbeatRequest) -> bytes:
-    """Canonical screener heartbeat bytes, mirrored by ``ditto-subnet``."""
+    """Canonical versioned heartbeat bytes mirrored by ``ditto-screener``."""
+    if payload.protocol_version == 1:
+        return (
+            "ditto-screener-heartbeat:v1:"
+            f"{payload.screener_hotkey}:{payload.software_version}:"
+            f"{payload.protocol_version}:{payload.policy_version}:{payload.state}:"
+            f"{payload.active_agent_id or ''}:"
+            f"{system_metrics_signing_token(payload.system_metrics)}:{payload.timestamp}"
+        ).encode()
+    progress = (
+        f"{payload.progress.stage},{payload.progress.started_at}"
+        if payload.progress is not None
+        else "-"
+    )
     return (
-        "ditto-screener-heartbeat:v1:"
+        "ditto-screener-heartbeat:v2:"
         f"{payload.screener_hotkey}:{payload.software_version}:"
         f"{payload.protocol_version}:{payload.policy_version}:{payload.state}:"
         f"{payload.active_agent_id or ''}:"
+        f"{progress}:"
         f"{system_metrics_signing_token(payload.system_metrics)}:{payload.timestamp}"
     ).encode()
 
@@ -252,6 +266,11 @@ async def heartbeat(
             policy_version=request_body.policy_version,
             state=request_body.state,
             active_agent_id=request_body.active_agent_id,
+            screening_progress=(
+                request_body.progress.model_dump(mode="json")
+                if request_body.progress is not None
+                else None
+            ),
             system_metrics=(
                 request_body.system_metrics.model_dump(mode="json")
                 if request_body.system_metrics is not None

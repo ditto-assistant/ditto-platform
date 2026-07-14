@@ -60,6 +60,7 @@ from ditto.api_models import (
     PublicRunModels,
     PublicScreenerHeartbeat,
     PublicScreenerHeartbeatsResponse,
+    PublicScreenerProgress,
     PublicScreeningAttempt,
     PublicSubmissionPipeline,
     PublicSubmissionScores,
@@ -73,7 +74,11 @@ from ditto.api_models import (
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.public import FleetAvailability, FleetHealth
-from ditto.api_models.screener import SCREENING_POLICY_VERSION, ScreenerRuntimeState
+from ditto.api_models.screener import (
+    SCREENING_POLICY_VERSION,
+    ScreenerProgress,
+    ScreenerRuntimeState,
+)
 from ditto.api_models.system_health import SystemMetrics
 from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
@@ -100,7 +105,10 @@ from ditto.db.queries.scores import (
     list_public_submissions,
     list_scores_for_bench_version,
 )
-from ditto.db.queries.screening import list_screening_attempts
+from ditto.db.queries.screening import (
+    get_running_screening_attempts,
+    list_screening_attempts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +142,27 @@ def _public_system_metrics(raw: dict | None) -> PublicSystemMetrics | None:
         running_containers=metrics.docker.running_containers,
         unhealthy_containers=metrics.docker.unhealthy_containers,
     )
+
+
+def _screener_system_metrics(raw: dict | None) -> PublicSystemMetrics | None:
+    """Read legacy raw metrics or the private v2 telemetry envelope."""
+    if isinstance(raw, dict) and "screening_progress" in raw:
+        nested = raw.get("system_metrics")
+        return _public_system_metrics(nested if isinstance(nested, dict) else None)
+    return _public_system_metrics(raw)
+
+
+def _stored_screener_progress(raw: dict | None) -> ScreenerProgress | None:
+    """Revalidate only the signed progress pair from a v2 storage envelope."""
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("screening_progress")
+    if not isinstance(value, dict):
+        return None
+    try:
+        return ScreenerProgress.model_validate(value)
+    except Exception:  # noqa: BLE001 - malformed historical rows stay private
+        return None
 
 
 def _public_benchmark_progress(work: ActiveValidatorWork) -> PublicBenchmarkProgress:
@@ -534,13 +563,57 @@ async def screeners(
     response.headers["Cache-Control"] = _CACHE_CONTROL
     now = datetime.now(UTC)
     rows = await list_screener_heartbeats(session)
+    active_ids = [
+        row.active_agent_id
+        for row in rows
+        if row.state == "screening" and row.active_agent_id is not None
+    ]
+    attempts = await get_running_screening_attempts(session, agent_ids=active_ids)
+    agents = {
+        agent.agent_id: agent
+        for agent in await session.scalars(
+            select(Agent).where(Agent.agent_id.in_(active_ids))
+        )
+    }
     entries = []
     for row in rows:
         seen_at = cast(datetime, _aware(row.seen_at))
-        metrics = _public_system_metrics(row.system_metrics)
+        metrics = _screener_system_metrics(row.system_metrics)
         online, availability, health = _fleet_classification(
             state=row.state, seen_at=seen_at, now=now, metrics=metrics
         )
+        active_agent_id = row.active_agent_id
+        active_agent = (
+            agents.get(active_agent_id) if active_agent_id is not None else None
+        )
+        active_attempt = (
+            attempts.get(active_agent_id) if active_agent_id is not None else None
+        )
+        active_work = bool(
+            online
+            and row.state == "screening"
+            and active_agent is not None
+            and active_agent.status == AgentStatus.SCREENING
+            and active_attempt is not None
+            and active_attempt.screener_hotkey == row.screener_hotkey
+            and cast(datetime, _aware(active_attempt.deadline)) >= now
+        )
+        progress = (
+            _stored_screener_progress(row.system_metrics) if active_work else None
+        )
+        public_progress = None
+        if progress is not None and active_attempt is not None:
+            progress_started = datetime.fromtimestamp(progress.started_at, tz=UTC)
+            attempt_started = cast(datetime, _aware(active_attempt.started_at))
+            if (
+                attempt_started - _VALIDATOR_ONLINE_WINDOW
+                <= progress_started
+                <= seen_at + _VALIDATOR_ONLINE_WINDOW
+            ):
+                public_progress = PublicScreenerProgress(
+                    stage=progress.stage,
+                    started_at=progress_started,
+                )
         entries.append(
             PublicScreenerHeartbeat(
                 screener_hotkey=row.screener_hotkey,
@@ -548,7 +621,13 @@ async def screeners(
                 protocol_version=row.protocol_version,
                 policy_version=row.policy_version,
                 state=cast(ScreenerRuntimeState, row.state),
-                active_agent_id=row.active_agent_id,
+                active_agent_id=active_agent_id if active_work else None,
+                active_agent_name=(
+                    active_agent.name
+                    if active_work and active_agent is not None
+                    else None
+                ),
+                screening_progress=public_progress,
                 first_seen_at=_aware(row.first_seen_at),
                 reported_at=cast(datetime, _aware(row.reported_at)),
                 seen_at=seen_at,
