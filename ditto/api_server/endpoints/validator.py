@@ -66,7 +66,7 @@ from ditto.api_models.system_health import (
     system_metrics_signing_token,
 )
 from ditto.api_models.upload import _SS58_PATTERN
-from ditto.api_server.bench import stamp_bench_version
+from ditto.api_server.bench import CURRENT_BENCH_VERSION, stamp_bench_version
 from ditto.api_server.dependencies import (
     get_chain_client,
     get_session,
@@ -112,7 +112,9 @@ _ARTIFACT_URL_TTL = timedelta(minutes=5)
 
 # How long a validator has to redeem a ticket with a score before it lapses and
 # the slot re-opens for another validator.
-_TICKET_TTL = timedelta(minutes=30)
+# Keep the lease longer than the validator's locked 40-minute benchmark cap.
+# The five-minute margin leaves enough time to sign and submit a completed run.
+_TICKET_TTL = timedelta(minutes=45)
 
 # Signed job claims outside this window are stale. A consumed nonce remains in
 # the database for the same window, making replay rejection consistent across
@@ -489,6 +491,7 @@ async def request_job(
             validator_hotkey=payload.validator_hotkey,
             now=now,
             ttl=_TICKET_TTL,
+            bench_version=CURRENT_BENCH_VERSION,
         )
         if ticket is None:
             return Response(status_code=204, headers={"Cache-Control": "no-store"})

@@ -1505,7 +1505,7 @@ class TestMultiValidatorConsensus:
         assert reopened.status_code == 200, reopened.text
         assert reopened.json()["agent_id"] == str(agent_id)
 
-    async def test_expired_ticket_reopens_for_same_validator(
+    async def test_expired_ticket_cools_down_before_same_validator_retry(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -1526,6 +1526,16 @@ class TestMultiValidatorConsensus:
             lapsed = await s.get(ValidatorTicket, (agent_id, keypair.ss58_address))
             assert lapsed is not None
             lapsed.deadline = datetime.now(UTC) - timedelta(minutes=1)
+
+        cooling_down = await client.post(
+            "/api/v1/validator/job", headers=headers, json=_job_payload(keypair)
+        )
+        assert cooling_down.status_code == 204
+
+        async with session_maker() as s, s.begin():
+            lapsed = await s.get(ValidatorTicket, (agent_id, keypair.ss58_address))
+            assert lapsed is not None
+            lapsed.retry_after = datetime.now(UTC) - timedelta(seconds=1)
 
         retried = await client.post(
             "/api/v1/validator/job", headers=headers, json=_job_payload(keypair)
