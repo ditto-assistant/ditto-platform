@@ -1254,12 +1254,19 @@
       .board { overflow-x: auto; }
       .sidebar { position: sticky; top: 0; z-index: 60; height: auto; flex: none; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 12px; border-right: none; border-bottom: 1px solid var(--border); }
       .sidebar .brand { flex: 1 1 auto; min-width: 0; order: 0; }
-      .side-theme { order: 1; margin-top: 0; }
+      .side-theme { order: 1; min-width: 0; margin-top: 0; }
       .side-theme .theme-switch { display: inline-flex; width: auto; }
       .nav { order: 2; flex-basis: 100%; width: 100%; flex-direction: row; flex-wrap: nowrap; overflow-x: auto; gap: 4px; margin-top: 2px; }
       .nav-item { flex: 0 0 auto; padding: 7px 11px; border-radius: 8px; }
       .nav-item .ni-desc { display: none; }
       .side-foot { display: none; }
+    }
+    @media (max-width: 720px) {
+      /* Give every choice a full touch target without letting the four labels
+         compete for one narrow row. */
+      .side-theme { flex: 1 0 100%; width: 100%; }
+      .side-theme .theme-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
+      .side-theme .theme-option { min-height: 44px; padding: 8px; }
     }
   </style>
 </head>

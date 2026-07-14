@@ -207,6 +207,9 @@ class TestDashboard:
         assert "root.dataset.systemTheme" in body
         assert "root.dataset.timePhase = fromHour(new Date().getHours())" in body
         assert 'if (hour >= 5 && hour < 8) return "dawn"' in body
+        assert ".side-theme { flex: 1 0 100%; width: 100%; }" in body
+        assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in body
+        assert ".side-theme .theme-option { min-height: 44px;" in body
 
     async def test_sidebar_shell_routes_every_section(self) -> None:
         # The dashboard is a sidebar shell with hash-routed pages; the theme
