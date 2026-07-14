@@ -114,6 +114,27 @@ class TestExpiry:
             )
         assert t is not None and t.agent_id == aid
 
+    async def test_expired_ticket_is_reissued_to_same_validator(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            first = await issue_ticket(
+                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
+            )
+        assert first is not None
+
+        async with session.begin():
+            retried = await issue_ticket(
+                session, validator_hotkey="5V1", now=_LATER, ttl=_TTL
+            )
+
+        assert retried is not None
+        assert retried.agent_id == aid
+        assert retried.status == TicketStatus.ISSUED
+        assert retried.issued_at == _LATER
+        assert retried.deadline == _LATER + _TTL
+
     async def test_expire_overdue_returns_count(self, session: AsyncSession) -> None:
         await _seed_evaluating(session)
         async with session.begin():

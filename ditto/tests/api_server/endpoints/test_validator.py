@@ -960,6 +960,30 @@ class TestMultiValidatorConsensus:
         assert reopened.status_code == 200, reopened.text
         assert reopened.json()["agent_id"] == str(agent_id)
 
+    async def test_expired_ticket_reopens_for_same_validator(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        keypair = _KEYPAIRS[0]
+        headers = {"X-Validator-Hotkey": keypair.ss58_address}
+
+        claimed = await client.post("/api/v1/validator/job", headers=headers)
+        assert claimed.status_code == 200, claimed.text
+
+        async with session_maker() as s, s.begin():
+            lapsed = await s.get(ValidatorTicket, (agent_id, keypair.ss58_address))
+            assert lapsed is not None
+            lapsed.deadline = datetime.now(UTC) - timedelta(minutes=1)
+
+        retried = await client.post("/api/v1/validator/job", headers=headers)
+        assert retried.status_code == 200, retried.text
+        assert retried.json()["agent_id"] == str(agent_id)
+
 
 def test_dev_bypass_permit_refused_on_mainnet(monkeypatch) -> None:
     """The dev permit-bypass flag is honored off mainnet but refused on finney,

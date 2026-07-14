@@ -80,9 +80,9 @@ async def issue_ticket(
 
     Sweeps overdue tickets first, then picks the oldest ``evaluating`` agent
     that (a) has fewer than :data:`SCORING_QUORUM` live tickets and (b) this
-    validator does not already hold any ticket for, and seats a fresh ``issued``
-    ticket with a ``now + ttl`` deadline. Returns the ticket, or ``None`` when
-    there is no work for this validator ("no job for you"). Runs inside the
+    validator does not already hold a live or scored ticket for. A prior expired
+    row is reissued with a ``now + ttl`` deadline. Returns the ticket, or ``None``
+    when there is no work for this validator ("no job for you"). Runs inside the
     caller's transaction.
     """
     await expire_overdue_tickets(session, now=now)
@@ -97,9 +97,12 @@ async def issue_ticket(
         .group_by(ValidatorTicket.agent_id)
         .subquery()
     )
-    # Agents this validator already has any ticket for (never re-seat it).
+    # Agents this validator already has a live or scored ticket for. Expired
+    # tickets are intentionally excluded: validators are stateless workers, so
+    # a repaired/restarted validator must be able to retry unfinished work.
     already_mine = select(ValidatorTicket.agent_id).where(
-        ValidatorTicket.validator_hotkey == validator_hotkey
+        ValidatorTicket.validator_hotkey == validator_hotkey,
+        ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES),
     )
     candidate = (
         select(Agent.agent_id)
@@ -116,14 +119,22 @@ async def issue_ticket(
     if agent_id is None:
         return None
 
-    ticket = ValidatorTicket(
-        agent_id=agent_id,
-        validator_hotkey=validator_hotkey,
-        status=TicketStatus.ISSUED,
-        issued_at=now,
-        deadline=now + ttl,
-    )
-    session.add(ticket)
+    ticket = await session.get(ValidatorTicket, (agent_id, validator_hotkey))
+    if ticket is None:
+        ticket = ValidatorTicket(
+            agent_id=agent_id,
+            validator_hotkey=validator_hotkey,
+            status=TicketStatus.ISSUED,
+            issued_at=now,
+            deadline=now + ttl,
+        )
+        session.add(ticket)
+    else:
+        # The composite PK preserves one validator slot per agent. Reuse the
+        # expired row with a fresh lease rather than inserting a duplicate.
+        ticket.status = TicketStatus.ISSUED
+        ticket.issued_at = now
+        ticket.deadline = now + ttl
     await session.flush()
     return ticket
 
