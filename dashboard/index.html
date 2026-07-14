@@ -52,7 +52,7 @@
     (function () {
       "use strict";
       var STORAGE_KEY = "ditto:dashboard-theme";
-      var MODES = { light: true, dark: true, time: true };
+      var MODES = { system: true, light: true, dark: true, time: true };
 
       function fromHour(hour) {
         if (hour >= 5 && hour < 8) return "dawn";
@@ -65,16 +65,19 @@
       function readMode() {
         try {
           var saved = localStorage.getItem(STORAGE_KEY);
-          return MODES[saved] ? saved : "time";
+          return MODES[saved] ? saved : "system";
         } catch (e) {
-          return "time";
+          return "system";
         }
       }
 
       function apply(mode) {
-        var next = MODES[mode] ? mode : "time";
+        var next = MODES[mode] ? mode : "system";
         var root = document.documentElement;
         root.dataset.theme = next;
+        root.dataset.systemTheme = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+          ? "dark"
+          : "light";
         root.dataset.timePhase = fromHour(new Date().getHours());
         return next;
       }
@@ -631,6 +634,7 @@
       --focus: oklch(42% .07 50);
     }
     :root[data-theme="dark"],
+    :root[data-theme="system"][data-system-theme="dark"],
     :root[data-theme="time"][data-time-phase="night"] {
       --bg: oklch(19% .025 255);
       --bg-elev: oklch(23% .028 255);
@@ -659,6 +663,7 @@
 
     html { color-scheme: light; background: var(--bg); }
     html[data-theme="dark"],
+    html[data-theme="system"][data-system-theme="dark"],
     html[data-theme="time"][data-time-phase="night"] { color-scheme: dark; }
     body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 15px; }
     .wrap { max-width: 1440px; padding: 24px 28px 72px; }
@@ -1137,6 +1142,10 @@
       </div>
       <div class="spacer"></div>
       <div class="theme-switch" role="group" aria-label="Color theme">
+        <button class="theme-option" type="button" data-theme-choice="system" aria-pressed="false" title="Follow your system light or dark appearance">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          <span>System</span>
+        </button>
         <button class="theme-option" type="button" data-theme-choice="light" aria-pressed="false" title="Always use the light paper theme">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42"/></svg>
           <span>Light</span>
@@ -1385,7 +1394,7 @@
   (function () {
     "use strict";
 
-    // Theme control: fixed light/dark, or the landing page's five time phases.
+    // Theme control: system, fixed light/dark, or the landing page's five time phases.
     (function () {
       var theme = window.__dittoDashboardTheme;
       if (!theme) return;
@@ -1393,7 +1402,7 @@
       var timeLabel = document.getElementById("theme-time-label");
 
       function sync() {
-        var mode = document.documentElement.dataset.theme || "time";
+        var mode = document.documentElement.dataset.theme || "system";
         var phase = document.documentElement.dataset.timePhase || "afternoon";
         controls.forEach(function (control) {
           control.setAttribute("aria-pressed", String(control.dataset.themeChoice === mode));
@@ -1411,6 +1420,15 @@
         });
       });
       sync();
+      if (window.matchMedia) {
+        var systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
+        systemTheme.addEventListener("change", function () {
+          if (document.documentElement.dataset.theme === "system") {
+            theme.apply("system");
+            sync();
+          }
+        });
+      }
       setInterval(function () {
         if (document.documentElement.dataset.theme === "time") {
           theme.apply("time");
