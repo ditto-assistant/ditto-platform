@@ -30,6 +30,11 @@ def upgrade() -> None:
         "ALTER TABLE validator_tickets ADD CONSTRAINT "
         "validator_tickets_attempt_count_positive CHECK (attempt_count > 0)"
     )
+    op.execute(
+        "UPDATE validator_tickets "
+        "SET retry_after = deadline + INTERVAL '6 hours' "
+        "WHERE status = 'expired'"
+    )
 
 
 def downgrade() -> None:
