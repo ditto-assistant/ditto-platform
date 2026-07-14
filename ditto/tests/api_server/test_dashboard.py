@@ -82,6 +82,10 @@ class TestDashboard:
         assert 'getJSON("/public/activity?page="' in body
         assert 'id="activity-rows"' in body
         assert 'id="activity-pager"' in body
+        assert 'id="pipeline-overview"' in body
+        assert "Waiting for screening" in body
+        assert "Waiting for validator" in body
+        assert 'getJSON("/public/activity?page=1&limit=200")' in body
         assert "Validation" in body
         assert "openActivityModal" in body
         assert "validators scored this submission" in body

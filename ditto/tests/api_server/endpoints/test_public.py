@@ -27,7 +27,7 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import get_dataset_generator, get_session
-from ditto.db.models import Agent, Base, Score, ScreeningAttempt
+from ditto.db.models import Agent, Base, Score, ScreeningAttempt, ValidatorHeartbeat
 from ditto.db.queries.audit import (
     EVENT_SCORE,
     GENESIS_HASH,
@@ -547,7 +547,7 @@ class TestPublicActivity:
         assert [entry["status"] for entry in body["entries"]] == [
             "rejected",
             "under_review",
-            "uploaded",
+            "waiting_screening",
         ]
         assert body["entries"][2]["agent_id"] == older_id
         assert body["entries"][0]["screening_reason"] == "Docker image build failed"
@@ -645,6 +645,63 @@ class TestPublicActivity:
             "running",
             "rejected",
         ]
+
+    async def test_stale_rejection_projects_as_waiting_for_rescreen(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.REJECTED,
+            screening_reason="Container failed the health check",
+            screening_policy_version=SCREENING_POLICY_VERSION - 1,
+        )
+        _install_db(app, session_maker)
+
+        entry = (await client.get("/api/v1/public/activity")).json()["entries"][0]
+        assert entry["status"] == "waiting_screening"
+        assert entry["screening_reason"] is None
+
+    async def test_evaluation_projects_live_work_from_validator_heartbeat(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        _install_db(app, session_maker)
+
+        waiting = (await client.get("/api/v1/public/activity")).json()["entries"][0]
+        assert waiting["status"] == "waiting_validator"
+
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_MINER_B,
+                    software_version="1.2.3",
+                    protocol_version=2,
+                    code_digest="ab" * 32,
+                    state="running_benchmark",
+                    active_agent_id=agent_id,
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                )
+            )
+
+        evaluating = (await client.get("/api/v1/public/activity")).json()["entries"][0]
+        assert evaluating["status"] == "evaluating"
 
     async def test_respects_limit(
         self,

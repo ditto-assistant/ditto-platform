@@ -482,18 +482,23 @@ def _public_activity_status(
     *,
     screening_policy_version: int,
     has_active_attempt: bool,
+    has_active_validation: bool,
 ) -> str:
     """Collapse internal moderation detail into stable public lifecycle labels."""
-    if has_active_attempt or (
+    needs_rescreen = (
         status
         in (
             AgentStatus.EVALUATING,
-            AgentStatus.SCREENING_FAILED,
             AgentStatus.REJECTED,
         )
         and screening_policy_version < SCREENING_POLICY_VERSION
-    ):
+    )
+    if has_active_attempt or status == AgentStatus.SCREENING:
         return AgentStatus.SCREENING.value
+    if status in (AgentStatus.UPLOADED, AgentStatus.SCREENING_FAILED) or needs_rescreen:
+        return "waiting_screening"
+    if status in (AgentStatus.SCREENING_PASSED, AgentStatus.EVALUATING):
+        return "evaluating" if has_active_validation else "waiting_validator"
     if status == AgentStatus.ATH_PENDING_REVIEW:
         return "under_review"
     if status == AgentStatus.BANNED:
@@ -519,8 +524,31 @@ async def activity(
     rows, total = await list_public_activity(
         session, limit=limit, offset=(page - 1) * limit
     )
+    now = datetime.now(UTC)
+    cutoff = now - _VALIDATOR_ONLINE_WINDOW
+    active_agent_ids = {
+        heartbeat.active_agent_id
+        for heartbeat in await list_validator_heartbeats(session)
+        if heartbeat.active_agent_id is not None
+        and heartbeat.state == "running_benchmark"
+        and (
+            heartbeat.seen_at
+            if heartbeat.seen_at.tzinfo is not None
+            else heartbeat.seen_at.replace(tzinfo=UTC)
+        )
+        >= cutoff
+    }
+
+    def public_status(row: Any) -> str:
+        return _public_activity_status(
+            row.agent.status,
+            screening_policy_version=row.agent.screening_policy_version,
+            has_active_attempt=row.screening_attempt is not None,
+            has_active_validation=row.agent.agent_id in active_agent_ids,
+        )
+
     return PublicActivityResponse(
-        generated_at=datetime.now(UTC),
+        generated_at=now,
         count=len(rows),
         total=total,
         page=page,
@@ -531,25 +559,11 @@ async def activity(
                 agent_id=row.agent.agent_id,
                 miner_hotkey=row.agent.miner_hotkey,
                 name=row.agent.name,
-                status=_public_activity_status(
-                    row.agent.status,
-                    screening_policy_version=row.agent.screening_policy_version,
-                    has_active_attempt=row.screening_attempt is not None,
-                ),
+                status=public_status(row),
                 submitted_at=row.agent.created_at,
                 screening_reason=(
                     None
-                    if row.screening_attempt is not None
-                    or (
-                        row.agent.status
-                        in (
-                            AgentStatus.EVALUATING,
-                            AgentStatus.SCREENING_FAILED,
-                            AgentStatus.REJECTED,
-                        )
-                        and row.agent.screening_policy_version
-                        < SCREENING_POLICY_VERSION
-                    )
+                    if public_status(row) in ("waiting_screening", "screening")
                     else row.agent.screening_reason
                 ),
                 duplicate_of=row.agent.duplicate_of,
@@ -632,6 +646,7 @@ async def agent_pipeline(
             agent.status,
             screening_policy_version=agent.screening_policy_version,
             has_active_attempt=running_attempt is not None,
+            has_active_validation=bool(active_validators),
         ),
         score_count=score_count,
         quorum=SCORING_QUORUM,
