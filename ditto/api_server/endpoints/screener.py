@@ -12,8 +12,8 @@ workers look identical to an operator.
 
 Lifecycle + scope decisions (documented so they're easy to revisit):
 
-- **Queue = new uploads plus stale-policy evaluations.** Oldest-first drains in
-  arrival order and re-screens existing submissions in place.
+- **Queue = new uploads plus stale-policy results.** Oldest-first drains in
+  arrival order and re-screens existing evaluations and failures in place.
 - **Verdict is a direct promotion.** A pass sets ``evaluating`` (not
   ``screening_passed``) so nothing else has to promote it; a fail sets
   ``screening_failed``. Re-reporting the same verdict is idempotent; a
@@ -187,7 +187,7 @@ async def queue(
     session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> ScreenerQueueResponse:
-    """List agents awaiting screening (status ``uploaded``), oldest first."""
+    """List new and stale-policy agents awaiting screening, oldest first."""
     response.headers["Cache-Control"] = "no-store"
     agents = (
         await session.scalars(
@@ -196,7 +196,12 @@ async def queue(
                 or_(
                     Agent.status == AgentStatus.UPLOADED,
                     (
-                        (Agent.status == AgentStatus.EVALUATING)
+                        Agent.status.in_(
+                            (
+                                AgentStatus.EVALUATING,
+                                AgentStatus.SCREENING_FAILED,
+                            )
+                        )
                         & (Agent.screening_policy_version < SCREENING_POLICY_VERSION)
                     ),
                 )
@@ -386,7 +391,8 @@ async def submit_result(
         if agent is None:
             raise AgentNotFoundError(f"no agent with id={agent_id}")
         rescreening = (
-            agent.status == AgentStatus.EVALUATING
+            agent.status
+            in (AgentStatus.EVALUATING, AgentStatus.SCREENING_FAILED)
             and agent.screening_policy_version < SCREENING_POLICY_VERSION
         )
         if agent.status in _SCREENABLE_STATUSES or rescreening:
@@ -401,7 +407,10 @@ async def submit_result(
         agent.screening_reason = (
             None if payload.passed else _public_screening_reason(payload.detail)
         )
-        if payload.passed:
+        # Persist the policy that produced either terminal verdict. A stale
+        # failure remains eligible until a current worker replaces it; a
+        # current failure is then excluded so it cannot loop forever.
+        if payload.policy_version == SCREENING_POLICY_VERSION:
             agent.screening_policy_version = payload.policy_version
         # Pin the generated dataset once, when evaluating and not yet set (the
         # `is None` guard keeps a concurrent/duplicate verdict from overwriting).
