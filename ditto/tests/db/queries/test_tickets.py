@@ -151,7 +151,11 @@ class TestTicketLifecycle:
             await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         async with session.begin():
             t = await get_open_ticket(
-                session, agent_id=aid, validator_hotkey="5V1", now=_NOW
+                session,
+                agent_id=aid,
+                validator_hotkey="5V1",
+                now=_NOW,
+                deadline=_NOW + _TTL,
             )
         assert t is not None
 
@@ -161,7 +165,11 @@ class TestTicketLifecycle:
             await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         async with session.begin():
             t = await get_open_ticket(
-                session, agent_id=aid, validator_hotkey="5V1", now=_LATER
+                session,
+                agent_id=aid,
+                validator_hotkey="5V1",
+                now=_LATER,
+                deadline=_NOW + _TTL,
             )
         assert t is None
 
@@ -169,7 +177,11 @@ class TestTicketLifecycle:
         aid = await _seed_evaluating(session)
         async with session.begin():
             t = await get_open_ticket(
-                session, agent_id=aid, validator_hotkey="5Vx", now=_NOW
+                session,
+                agent_id=aid,
+                validator_hotkey="5Vx",
+                now=_NOW,
+                deadline=_NOW + _TTL,
             )
         assert t is None
 
@@ -183,6 +195,10 @@ class TestTicketLifecycle:
             await mark_ticket_scored(session, agent_id=aid, validator_hotkey="5V1")
         async with session.begin():
             t = await get_open_ticket(
-                session, agent_id=aid, validator_hotkey="5V1", now=_NOW
+                session,
+                agent_id=aid,
+                validator_hotkey="5V1",
+                now=_NOW,
+                deadline=_NOW + _TTL,
             )
         assert t is None  # spent, no longer open

@@ -54,6 +54,7 @@ _VALIDATOR_HOTKEY = _KEYPAIR.ss58_address
 _DAVE = bittensor.Keypair.create_from_uri("//Dave")
 _MINER_HOTKEY = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _SHA256 = "ab" * 32
+_TICKET_DEADLINE = datetime(2030, 1, 1, tzinfo=UTC)
 
 
 def _sign(message: str) -> str:
@@ -67,6 +68,8 @@ def _score_payload(
     keypair: bittensor.Keypair = _KEYPAIR,
     **overrides: object,
 ) -> dict:
+    ticket_deadline = overrides.pop("ticket_deadline", _TICKET_DEADLINE)
+    assert isinstance(ticket_deadline, datetime)
     report = {
         "run_id": run_id,
         "seed": 8675309,
@@ -80,9 +83,13 @@ def _score_payload(
     }
     report.update(overrides)
     hotkey = keypair.ss58_address
-    signed = f"{hotkey}:{agent_id}:{run_id}:{report['composite']!r}:{report['seed']}"
+    lease = ticket_deadline.astimezone(UTC).isoformat(timespec="microseconds")
+    signed = (
+        f"{hotkey}:{agent_id}:{lease}:{run_id}:{report['composite']!r}:{report['seed']}"
+    )
     return {
         "validator_hotkey": hotkey,
+        "ticket_deadline": ticket_deadline.isoformat(),
         "signature": keypair.sign(signed.encode()).hex(),
         "report": report,
     }
@@ -225,7 +232,7 @@ async def _seed_ticket(
     agent_id: UUID,
     *,
     keypair: bittensor.Keypair = _KEYPAIR,
-    ttl: timedelta = timedelta(hours=1),
+    deadline: datetime = _TICKET_DEADLINE,
 ) -> None:
     """Seat (or re-open) an issued ticket for a specific (agent, validator) so a
     score against that agent is accepted by the k=3 gate. Upserts so a test can
@@ -239,12 +246,12 @@ async def _seed_ticket(
                     validator_hotkey=keypair.ss58_address,
                     status=TicketStatus.ISSUED,
                     issued_at=datetime.now(UTC),
-                    deadline=datetime.now(UTC) + ttl,
+                    deadline=deadline,
                 )
             )
         else:
             existing.status = TicketStatus.ISSUED
-            existing.deadline = datetime.now(UTC) + ttl
+            existing.deadline = deadline
 
 
 _AUTH_HEADER = {"X-Validator-Hotkey": _VALIDATOR_HOTKEY}
@@ -527,6 +534,27 @@ class TestSubmitScore:
             assert len(scores) == 1
             assert scores[0].run_id == "run_a"  # the first (only) score stands
             assert scores[0].composite == pytest.approx(0.5)
+
+    async def test_superseded_ticket_lease_rejects_late_score(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        old_deadline = _TICKET_DEADLINE
+        new_deadline = old_deadline + timedelta(hours=1)
+        await _seed_ticket(session_maker, agent_id, deadline=new_deadline)
+
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id, ticket_deadline=old_deadline),
+        )
+
+        assert response.status_code == 409
+        assert "no open scoring ticket" in response.json()["message"]
 
     async def test_bad_signature_returns_401(
         self,

@@ -228,20 +228,27 @@ async def require_validator(
 ValidatorDep = Annotated[str, Depends(require_validator)]
 
 
+def _lease_token(deadline: datetime) -> str:
+    """Canonical UTC token that binds a score to one ticket lease."""
+    return deadline.astimezone(UTC).isoformat(timespec="microseconds")
+
+
 def _score_signing_message(
-    validator_hotkey: str, agent_id: UUID, report: ScoreReport
+    validator_hotkey: str,
+    agent_id: UUID,
+    ticket_deadline: datetime | None,
+    report: ScoreReport,
 ) -> bytes:
     """Canonical bytes a score signature is verified against.
 
     Must match the validator's ``sign_score`` byte-for-byte:
-    ``{validator_hotkey}:{agent_id}:{run_id}:{composite!r}:{seed}``. Binding the
-    agent id + composite + seed (not just ``run_id``) means a captured signature
-    cannot be replayed for a different agent, and the recorded composite cannot
-    be altered without invalidating it. ``composite`` uses Python's shortest
-    round-trip float repr, which the JSON transport preserves exactly.
+    ``{validator_hotkey}:{agent_id}:{ticket_deadline}:{run_id}:``
+    ``{composite!r}:{seed}``. Binding the exact lease means a response from an
+    expired attempt cannot be replayed after the ticket is reissued.
     """
+    lease = _lease_token(ticket_deadline) if ticket_deadline is not None else ""
     return (
-        f"{validator_hotkey}:{agent_id}:{report.run_id}:"
+        f"{validator_hotkey}:{agent_id}:{lease}:{report.run_id}:"
         f"{report.composite!r}:{report.seed}"
     ).encode()
 
@@ -386,7 +393,9 @@ async def submit_score(
 
     # 1. Signature proves the reporting validator owns the hotkey and binds the
     #    agent + score contents (anti-replay / anti-tamper). CPU-only, no I/O.
-    signed = _score_signing_message(payload.validator_hotkey, agent_id, report)
+    signed = _score_signing_message(
+        payload.validator_hotkey, agent_id, payload.ticket_deadline, report
+    )
     if not _verify_signature(payload.validator_hotkey, signed, payload.signature):
         raise ValidatorAuthError(
             f"score signature did not verify for hotkey {payload.validator_hotkey}"
@@ -410,6 +419,11 @@ async def submit_score(
             raise AgentNotEvaluatableError(
                 f"agent {agent_id} is {agent.status}, not in {_SCOREABLE_STATUSES}"
             )
+        if payload.ticket_deadline is None:
+            raise HTTPException(
+                status_code=409,
+                detail="score submission is missing its ticket lease deadline",
+            )
         # k=3 gate: a score is only accepted against a live ticket this validator
         # holds for the agent. No ticket (never issued, expired, or already
         # spent) means the score is unsolicited or late, so it is rejected and
@@ -420,6 +434,7 @@ async def submit_score(
             agent_id=agent_id,
             validator_hotkey=payload.validator_hotkey,
             now=datetime.now(UTC),
+            deadline=payload.ticket_deadline,
         )
         if ticket is None:
             raise HTTPException(

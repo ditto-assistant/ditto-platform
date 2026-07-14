@@ -145,6 +145,7 @@ async def get_open_ticket(
     agent_id: UUID,
     validator_hotkey: str,
     now: datetime,
+    deadline: datetime,
 ) -> ValidatorTicket | None:
     """Return the validator's live (``issued``, not-yet-past-deadline) ticket for
     the agent, or ``None`` if it has none, it is already spent, or it expired."""
@@ -153,6 +154,7 @@ async def get_open_ticket(
         ticket is None
         or ticket.status != TicketStatus.ISSUED
         or _as_utc(ticket.deadline) < now
+        or _as_utc(ticket.deadline) != _as_utc(deadline)
     ):
         return None
     return ticket
