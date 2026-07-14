@@ -193,9 +193,7 @@ async def resolve_quarantine(
             "reject": AgentStatus.REJECTED,
         }[payload.resolution]
         agent.status = target
-        agent.screening_reason = (
-            None if payload.resolution == "release" else payload.reason
-        )
+        agent.screening_reason = payload.reason
         if new_dataset is not None and agent.dataset_seed is None:
             (
                 agent.dataset_seed,

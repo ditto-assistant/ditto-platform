@@ -1086,7 +1086,11 @@ class TestQuarantineAdmin:
     @pytest.mark.parametrize(
         ("resolution", "expected_status", "expected_reason"),
         [
-            ("release", AgentStatus.EVALUATING, None),
+            (
+                "release",
+                AgentStatus.EVALUATING,
+                "Remove the bundled credential and resubmit",
+            ),
             (
                 "rescreen",
                 AgentStatus.SCREENING_FAILED,
