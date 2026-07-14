@@ -568,6 +568,7 @@ class TestPublicActivity:
             "name",
             "status",
             "submitted_at",
+            "last_scored_at",
             "screening_reason",
             "duplicate_of",
             "review_reason",
@@ -588,6 +589,28 @@ class TestPublicActivity:
             "SECRET_FROM_BUILD",
         ):
             assert private_field not in serialized
+
+    async def test_exposes_latest_score_time_for_finalized_agents(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        scored_at = datetime(2026, 7, 14, 9, 30, 0, tzinfo=UTC)
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.61, 0.64, 0.67],
+            status=AgentStatus.LIVE,
+            base_time=scored_at - timedelta(minutes=2),
+        )
+        _install_db(app, session_maker)
+
+        entry = (await client.get("/api/v1/public/activity")).json()["entries"][0]
+
+        assert entry["status"] == "live"
+        assert entry["score_count"] == 3
+        assert datetime.fromisoformat(entry["last_scored_at"]) == scored_at
 
     async def test_active_rescreen_projects_yellow_and_exposes_version_history(
         self,

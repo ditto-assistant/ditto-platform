@@ -115,7 +115,12 @@ class TestDashboard:
         assert "Evaluating" in body
         assert 'id="pipeline-scored"' in body
         assert 'data-pipeline-stage="scored"' in body
+        assert "Recent scores" in body
+        assert 'statuses: ["scored", "live"]' in body
         assert 'getJSON("/public/activity?page=1&limit=200")' in body
+        assert 'getJSON("/public/activity?page=" + page + "&limit=200")' in body
+        assert "max-height: 390px" in body
+        assert "indexed.slice(0, 5)" not in body
         assert body.count('type="button" data-activity-page="prev"') == 2
         assert body.count('type="button" data-activity-page="next"') == 2
         assert 'aria-label="Submission pages, bottom"' in body

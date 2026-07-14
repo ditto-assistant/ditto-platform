@@ -797,6 +797,7 @@ async def activity(
                 name=row.agent.name,
                 status=public_status(row),
                 submitted_at=row.agent.created_at,
+                last_scored_at=_aware(row.last_scored_at),
                 screening_reason=(
                     None
                     if public_status(row) in ("waiting_screening", "screening")

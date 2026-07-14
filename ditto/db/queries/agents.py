@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
@@ -200,6 +201,7 @@ class PublicActivityRow:
 
     agent: Agent
     score_count: int
+    last_scored_at: datetime | None
     screening_attempt: ScreeningAttempt | None
 
 
@@ -215,12 +217,18 @@ async def list_public_activity(
         select(
             Score.agent_id,
             func.count(Score.validator_hotkey).label("score_count"),
+            func.max(Score.generated_at).label("last_scored_at"),
         )
         .group_by(Score.agent_id)
         .subquery()
     )
     stmt = (
-        select(Agent, func.coalesce(score_counts.c.score_count, 0), ScreeningAttempt)
+        select(
+            Agent,
+            func.coalesce(score_counts.c.score_count, 0),
+            score_counts.c.last_scored_at,
+            ScreeningAttempt,
+        )
         .outerjoin(score_counts, score_counts.c.agent_id == Agent.agent_id)
         .outerjoin(
             ScreeningAttempt,
@@ -237,9 +245,10 @@ async def list_public_activity(
             PublicActivityRow(
                 agent=agent,
                 score_count=int(score_count),
+                last_scored_at=last_scored_at,
                 screening_attempt=screening_attempt,
             )
-            for agent, score_count, screening_attempt in result.all()
+            for agent, score_count, last_scored_at, screening_attempt in result.all()
         ],
         total,
     )

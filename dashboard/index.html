@@ -1338,7 +1338,13 @@
       color: var(--text);
       font: 400 18px/1 var(--display);
     }
-    .pipeline-items { gap: 3px; }
+    .pipeline-items {
+      gap: 3px;
+      max-height: 390px;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+    }
     .pipeline-item {
       padding: 6px 7px;
       border-top: 1px solid color-mix(in oklch, var(--border) 58%, transparent);
@@ -1348,8 +1354,7 @@
     .pipeline-item-name { font-size: 11px; }
     .pipeline-item-meta { font-size: 9px; }
     .pipeline-item .screener-progress { margin-top: 6px; }
-    .pipeline-empty,
-    .pipeline-more { padding: 7px 4px; text-align: center; font-size: 10px; }
+    .pipeline-empty { padding: 7px 4px; text-align: center; font-size: 10px; }
 
     .fleet-ledger {
       padding: 48px 20px 20px;
@@ -1621,7 +1626,7 @@
             </section>
             <section class="pipeline-column" data-pipeline-stage="scored" aria-labelledby="pipeline-scored-title">
               <div class="pipeline-node" aria-hidden="true">5</div>
-              <div class="pipeline-column-head"><h3 id="pipeline-scored-title">Scored</h3><span class="pipeline-count" id="pipeline-scored-count">–</span></div>
+              <div class="pipeline-column-head"><h3 id="pipeline-scored-title">Recent scores</h3><span class="pipeline-count" id="pipeline-scored-count">–</span></div>
               <div class="pipeline-items" id="pipeline-scored"><div class="pipeline-empty">Loading…</div></div>
             </section>
           </div>
@@ -3157,11 +3162,11 @@
     function renderPipelineBoard(data, unavailable) {
       var entries = data && data.entries ? data.entries : [];
       var columns = [
-        { status: "waiting_screening", body: "pipeline-wait-screen", count: "pipeline-wait-screen-count", empty: "No submissions waiting." },
-        { status: "screening", body: "pipeline-screening", count: "pipeline-screening-count", empty: "No active screening job." },
-        { status: "waiting_validator", body: "pipeline-wait-validator", count: "pipeline-wait-validator-count", empty: "No submissions waiting." },
-        { status: "evaluating", body: "pipeline-evaluating", count: "pipeline-evaluating-count", empty: "No active evaluation." },
-        { status: "scored", body: "pipeline-scored", count: "pipeline-scored-count", empty: "No recent scores." }
+        { status: "waiting_screening", statuses: ["waiting_screening"], body: "pipeline-wait-screen", count: "pipeline-wait-screen-count", empty: "No submissions waiting." },
+        { status: "screening", statuses: ["screening"], body: "pipeline-screening", count: "pipeline-screening-count", empty: "No active screening job." },
+        { status: "waiting_validator", statuses: ["waiting_validator"], body: "pipeline-wait-validator", count: "pipeline-wait-validator-count", empty: "No submissions waiting." },
+        { status: "evaluating", statuses: ["evaluating"], body: "pipeline-evaluating", count: "pipeline-evaluating-count", empty: "No active evaluation." },
+        { status: "scored", statuses: ["scored", "live"], body: "pipeline-scored", count: "pipeline-scored-count", empty: "No scores yet. Finalized agents will appear here." }
       ];
       pipelineLoaded = true;
       pipelineUnavailable = unavailable;
@@ -3179,19 +3184,25 @@
         }
         var indexed = [];
         pipelineEntries.forEach(function (entry, index) {
-          if (entry.status === column.status) indexed.push({ entry: entry, index: index });
+          if (column.statuses.indexOf(entry.status) >= 0) indexed.push({ entry: entry, index: index });
         });
+        if (column.status === "scored") {
+          indexed.sort(function (a, b) {
+            return new Date(b.entry.last_scored_at || b.entry.submitted_at) -
+              new Date(a.entry.last_scored_at || a.entry.submitted_at);
+          });
+        }
         count.textContent = indexed.length;
         stage.setAttribute("data-active", indexed.length ? "true" : "false");
         if (!indexed.length) {
           body.innerHTML = '<div class="pipeline-empty">' + esc(column.empty) + '</div>';
           return;
         }
-        var visible = indexed.slice(0, 5).map(function (item) {
+        var visible = indexed.map(function (item) {
           var entry = item.entry;
           var meta = column.status === "waiting_validator" || column.status === "evaluating"
             ? validationProgress(entry)
-            : relTime(entry.submitted_at);
+            : relTime(column.status === "scored" && entry.last_scored_at ? entry.last_scored_at : entry.submitted_at);
           var benchmark = column.status === "evaluating"
             ? (entry.active_benchmarks || []).map(function (progress) { return renderBenchmarkProgress(progress, false); }).join("")
             : "";
@@ -3208,7 +3219,6 @@
             benchmark +
             '</button>';
         }).join("");
-        if (indexed.length > 5) visible += '<div class="pipeline-more">+' + (indexed.length - 5) + ' more</div>';
         body.innerHTML = visible;
       });
       updateSearch();
@@ -3505,6 +3515,20 @@
 
     function loadPipelineBoard() {
       getJSON("/public/activity?page=1&limit=200")
+        .then(function (first) {
+          if (first.total_pages <= 1) return first;
+          var pages = [];
+          for (var page = 2; page <= first.total_pages; page += 1) {
+            pages.push(getJSON("/public/activity?page=" + page + "&limit=200"));
+          }
+          return Promise.all(pages).then(function (rest) {
+            first.entries = rest.reduce(function (entries, data) {
+              return entries.concat(data.entries || []);
+            }, first.entries || []);
+            first.count = first.entries.length;
+            return first;
+          });
+        })
         .then(function (data) { renderPipelineBoard(data, false); })
         .catch(function () { renderPipelineBoard(null, true); });
     }
