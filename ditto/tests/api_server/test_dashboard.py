@@ -276,6 +276,14 @@ class TestDashboard:
         assert "<h2>Leaderboard</h2>" in body  # folded into Overview
         assert 'data-theme-choice="system"' in body  # switcher still wired
 
+    async def test_mobile_sidebar_stays_below_modal(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert ".modal-back { position: fixed;" in body
+        assert "z-index: 40;" in body
+        assert "position: fixed; top: 50%; left: 50%; z-index: 50;" in body
+        assert ".sidebar { position: sticky; top: 0; z-index: 30;" in body
+
     async def test_includes_accessible_global_search(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
