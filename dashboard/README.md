@@ -13,6 +13,13 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 - **Leaderboard** — best eligible score per miner, ranked by composite, with
   composite / tool / memory bars; the leader is highlighted. Click a row for a
   drill-down (tool-vs-memory split, first-seen, rank).
+- **Submission pipeline** — screening and validator-ticket history, including a
+  compact accessible benchmark progress bar for each validator currently
+  evaluating the submission. Multiple validators remain separate rather than
+  being averaged together.
+- **Validator fleet** — signed worker availability, coarse system health, and
+  the public active agent with the same stage/progress shown in the pipeline.
+  Old clients render as progress not reported; expired or stale work disappears.
 - **Anti-overfit assurance** — states plainly that only aggregates are published
   and that dataset seeds rotate every submission.
 

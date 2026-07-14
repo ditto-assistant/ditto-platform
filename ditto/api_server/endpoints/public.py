@@ -50,6 +50,7 @@ from ditto.api_models import (
     PublicBenchCorpusEntry,
     PublicBenchCorpusResponse,
     PublicBenchIntegrity,
+    PublicBenchmarkProgress,
     PublicCaseResult,
     PublicCategoryStat,
     PublicDatasetReveal,
@@ -83,6 +84,8 @@ from ditto.db.models import Agent, Score, ValidatorTicket
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.heartbeats import (
+    ActiveValidatorWork,
+    list_active_validator_work,
     list_screener_heartbeats,
     list_validator_heartbeats,
 )
@@ -130,6 +133,41 @@ def _public_system_metrics(raw: dict | None) -> PublicSystemMetrics | None:
         docker_status=metrics.docker.status,
         running_containers=metrics.docker.running_containers,
         unhealthy_containers=metrics.docker.unhealthy_containers,
+    )
+
+
+def _public_benchmark_progress(work: ActiveValidatorWork) -> PublicBenchmarkProgress:
+    """Coarsen private signed counts into the six-field public allowlist."""
+    progress = work.progress
+    if progress is None:
+        return PublicBenchmarkProgress(
+            agent_id=work.agent.agent_id,
+            agent_name=work.agent.name,
+        )
+    percent: int | None = None
+    completed_checks: int | None = None
+    total_checks: int | None = None
+    if progress.completed is not None and progress.total is not None:
+        # Nearest 5% is useful without exposing high-resolution timing. Even
+        # 114/114 remains 95% while finalization/signing is still in progress.
+        percent = min(
+            95,
+            ((progress.completed * 200 + progress.total * 5) // (progress.total * 10))
+            * 5,
+        )
+        total_checks = progress.total
+        completed_checks = (
+            progress.total
+            if progress.stage in {"finalizing", "submitting_result"}
+            else progress.completed
+        )
+    return PublicBenchmarkProgress(
+        agent_id=work.agent.agent_id,
+        agent_name=work.agent.name,
+        stage=progress.stage,
+        completed_checks=completed_checks,
+        total_checks=total_checks,
+        percent=percent,
     )
 
 
@@ -441,6 +479,12 @@ async def validators(
     response.headers["Cache-Control"] = _CACHE_CONTROL
     now = datetime.now(UTC)
     rows = await list_validator_heartbeats(session)
+    active_by_hotkey = {
+        work.heartbeat.validator_hotkey: work
+        for work in await list_active_validator_work(
+            session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
+        )
+    }
     entries = []
     for row in rows:
         seen_at = cast(datetime, _aware(row.seen_at))
@@ -448,13 +492,21 @@ async def validators(
         online, availability, health = _fleet_classification(
             state=row.state, seen_at=seen_at, now=now, metrics=metrics
         )
+        active_work = active_by_hotkey.get(row.validator_hotkey)
         entries.append(
             PublicValidatorHeartbeat(
                 validator_hotkey=row.validator_hotkey,
                 software_version=row.software_version,
                 protocol_version=row.protocol_version,
                 state=cast(ValidatorRuntimeState, row.state),
-                active_agent_id=row.active_agent_id,
+                active_agent_id=(
+                    active_work.agent.agent_id if active_work is not None else None
+                ),
+                active_benchmark=(
+                    _public_benchmark_progress(active_work)
+                    if active_work is not None
+                    else None
+                ),
                 first_seen_at=_aware(row.first_seen_at),
                 reported_at=cast(datetime, _aware(row.reported_at)),
                 seen_at=seen_at,
@@ -634,19 +686,14 @@ async def activity(
         session, limit=limit, offset=(page - 1) * limit
     )
     now = datetime.now(UTC)
-    cutoff = now - _VALIDATOR_ONLINE_WINDOW
-    active_agent_ids = {
-        heartbeat.active_agent_id
-        for heartbeat in await list_validator_heartbeats(session)
-        if heartbeat.active_agent_id is not None
-        and heartbeat.state == "running_benchmark"
-        and (
-            heartbeat.seen_at
-            if heartbeat.seen_at.tzinfo is not None
-            else heartbeat.seen_at.replace(tzinfo=UTC)
+    active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
+    for work in await list_active_validator_work(
+        session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
+    ):
+        active_by_agent.setdefault(work.agent.agent_id, []).append(
+            _public_benchmark_progress(work)
         )
-        >= cutoff
-    }
+    active_agent_ids = set(active_by_agent)
 
     def public_status(row: Any) -> str:
         return _public_activity_status(
@@ -696,6 +743,7 @@ async def activity(
                     if row.screening_attempt is not None
                     else None
                 ),
+                active_benchmarks=active_by_agent.get(row.agent.agent_id, []),
             )
             for row in rows
         ],
@@ -725,20 +773,15 @@ async def agent_pipeline(
             )
         )
     )
-    heartbeats = await list_validator_heartbeats(session)
     now = datetime.now(UTC)
-    cutoff = now - _VALIDATOR_ONLINE_WINDOW
-
-    def aware(value: datetime) -> datetime:
-        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-
-    active_validators = {
-        heartbeat.validator_hotkey
-        for heartbeat in heartbeats
-        if heartbeat.active_agent_id == agent_id
-        and heartbeat.state == "running_benchmark"
-        and aware(heartbeat.seen_at) >= cutoff
-    }
+    active_work = [
+        work
+        for work in await list_active_validator_work(
+            session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
+        )
+        if work.agent.agent_id == agent_id
+    ]
+    active_by_hotkey = {work.heartbeat.validator_hotkey: work for work in active_work}
     score_count = int(
         await session.scalar(
             select(func.count(Score.validator_hotkey)).where(Score.agent_id == agent_id)
@@ -755,7 +798,7 @@ async def agent_pipeline(
             agent.status,
             screening_policy_version=agent.screening_policy_version,
             has_active_attempt=running_attempt is not None,
-            has_active_validation=bool(active_validators),
+            has_active_validation=bool(active_work),
         ),
         score_count=score_count,
         quorum=SCORING_QUORUM,
@@ -778,7 +821,14 @@ async def agent_pipeline(
                 status=ticket.status.value,
                 issued_at=ticket.issued_at,
                 deadline=ticket.deadline,
-                actively_running=ticket.validator_hotkey in active_validators,
+                actively_running=ticket.validator_hotkey in active_by_hotkey,
+                benchmark_progress=(
+                    _public_benchmark_progress(
+                        active_by_hotkey[ticket.validator_hotkey]
+                    )
+                    if ticket.validator_hotkey in active_by_hotkey
+                    else None
+                ),
             )
             for ticket in tickets
         ],

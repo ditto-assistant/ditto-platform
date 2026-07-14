@@ -27,6 +27,10 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_progress import (
+    BenchmarkProgress,
+    benchmark_progress_signing_token,
+)
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.system_health import (
     SystemMetrics,
@@ -38,6 +42,7 @@ from ditto.api_server.dependencies import (
     get_session,
     get_storage_client,
 )
+from ditto.api_server.endpoints.validator import _heartbeat_signing_message
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_AGENT_NOT_EVALUATABLE,
     ERROR_CODE_AGENT_NOT_FOUND,
@@ -67,6 +72,37 @@ _DAVE = bittensor.Keypair.create_from_uri("//Dave")
 _MINER_HOTKEY = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _SHA256 = "ab" * 32
 _TICKET_DEADLINE = datetime(2030, 1, 1, tzinfo=UTC)
+
+
+def test_v4_heartbeat_canonical_vector() -> None:
+    """Freeze the cross-repository v4 bytes independently of test helpers."""
+    agent_id = UUID("11111111-2222-4333-8444-555555555555")
+    progress = BenchmarkProgress(
+        stage="running_benchmark",
+        completed=51,
+        total=114,
+        ticket_deadline=_TICKET_DEADLINE,
+    )
+    actual = _heartbeat_signing_message(
+        validator_hotkey="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        software_version="1.2.3",
+        protocol_version=4,
+        code_digest="ab" * 32,
+        state="running_benchmark",
+        active_agent_id=agent_id,
+        system_metrics=None,
+        benchmark_progress=progress,
+        timestamp=1784020800,
+    )
+    assert actual == (
+        b"ditto-validator-heartbeat:v4:"
+        b"5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY:"
+        b"1.2.3:4:"
+        b"abababababababababababababababababababababababababababababababab:"
+        b"running_benchmark:11111111-2222-4333-8444-555555555555:-:"
+        b"running_benchmark,51,114,2030-01-01T00:00:00.000000+00:00:"
+        b"1784020800"
+    )
 
 
 def _sign(message: str) -> str:
@@ -134,10 +170,28 @@ def _heartbeat_payload(
     protocol_version: int = 1,
     active_agent_id: UUID | None = None,
     system_metrics: dict[str, object] | None = None,
+    benchmark_progress: dict[str, object] | None = None,
 ) -> dict[str, object]:
     ts = timestamp if timestamp is not None else int(datetime.now(UTC).timestamp())
     hotkey = keypair.ss58_address
-    if protocol_version >= 3:
+    if protocol_version >= 4:
+        metrics = (
+            SystemMetrics.model_validate(system_metrics)
+            if system_metrics is not None
+            else None
+        )
+        progress = (
+            BenchmarkProgress.model_validate_json(json.dumps(benchmark_progress))
+            if benchmark_progress is not None
+            else None
+        )
+        message = (
+            f"ditto-validator-heartbeat:v4:{hotkey}:0.1.0:{protocol_version}:"
+            f"{code_digest}:{state}:{active_agent_id or ''}:"
+            f"{system_metrics_signing_token(metrics)}:"
+            f"{benchmark_progress_signing_token(progress)}:{ts}"
+        )
+    elif protocol_version >= 3:
         metrics = (
             SystemMetrics.model_validate(system_metrics)
             if system_metrics is not None
@@ -170,7 +224,25 @@ def _heartbeat_payload(
         payload["active_agent_id"] = str(active_agent_id)
     if system_metrics is not None:
         payload["system_metrics"] = system_metrics
+    if benchmark_progress is not None:
+        payload["benchmark_progress"] = benchmark_progress
     return payload
+
+
+def _progress(
+    stage: str,
+    *,
+    completed: int | None = None,
+    total: int | None = None,
+    ticket_deadline: datetime = _TICKET_DEADLINE,
+) -> dict[str, object]:
+    """Build the exact privacy-safe progress shape accepted by protocol v4."""
+    return {
+        "stage": stage,
+        "completed": completed,
+        "total": total,
+        "ticket_deadline": ticket_deadline.isoformat(),
+    }
 
 
 async def _score_to_quorum(
@@ -325,7 +397,7 @@ async def _seed_ticket(
                     agent_id=agent_id,
                     validator_hotkey=keypair.ss58_address,
                     status=TicketStatus.ISSUED,
-                    issued_at=datetime.now(UTC),
+                    issued_at=datetime.now(UTC) - timedelta(seconds=1),
                     deadline=deadline,
                 )
             )
@@ -420,6 +492,7 @@ class TestHeartbeat:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
         _install_db(app, session_maker)
         _install_chain(app)
         payload = _heartbeat_payload(
@@ -434,6 +507,351 @@ class TestHeartbeat:
         assert response.status_code == 200, response.text
         public = (await client.get("/api/v1/public/validators")).json()
         assert public["validators"][0]["active_agent_id"] == str(agent_id)
+        assert public["validators"][0]["active_benchmark"] == {
+            "agent_id": str(agent_id),
+            "agent_name": "alpha-agent",
+            "stage": None,
+            "completed_checks": None,
+            "total_checks": None,
+            "percent": None,
+        }
+
+    @pytest.mark.e2e
+    async def test_v4_progresses_public_lifecycle_and_terminal_score_clears_it(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Fake build -> run -> finalize -> submit against one real ticket."""
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        timestamp = int(datetime.now(UTC).timestamp())
+        stages = [
+            _progress("preparing"),
+            _progress("building_harness"),
+            _progress("starting_harness"),
+            _progress("running_benchmark", completed=0, total=114),
+            _progress("running_benchmark", completed=51, total=114),
+            _progress("finalizing", completed=114, total=114),
+            _progress("submitting_result", completed=114, total=114),
+        ]
+
+        for offset, progress in enumerate(stages):
+            response = await client.post(
+                "/api/v1/validator/heartbeat",
+                headers=_AUTH_HEADER,
+                json=_heartbeat_payload(
+                    protocol_version=4,
+                    timestamp=timestamp + offset,
+                    state="running_benchmark",
+                    active_agent_id=agent_id,
+                    benchmark_progress=progress,
+                ),
+            )
+            assert response.status_code == 200, response.text
+            public = (await client.get("/api/v1/public/validators")).json()
+            shown = public["validators"][0]["active_benchmark"]
+            assert shown["stage"] == progress["stage"]
+            assert shown["agent_id"] == str(agent_id)
+
+            if progress["stage"] == "running_benchmark" and progress["completed"] == 51:
+                assert shown == {
+                    "agent_id": str(agent_id),
+                    "agent_name": "alpha-agent",
+                    "stage": "running_benchmark",
+                    "completed_checks": 51,
+                    "total_checks": 114,
+                    "percent": 45,
+                }
+            if progress["stage"] in {"finalizing", "submitting_result"}:
+                assert shown["percent"] == 95
+                assert shown["completed_checks"] == shown["total_checks"] == 114
+
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()
+        attempt = pipeline["validation_attempts"][0]
+        assert attempt["deadline"] is not None
+        assert attempt["actively_running"] is True
+        assert attempt["benchmark_progress"]["stage"] == "submitting_result"
+
+        scored = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id),
+        )
+        assert scored.status_code == 200, scored.text
+        fleet = (await client.get("/api/v1/public/validators")).json()
+        assert fleet["validators"][0]["active_agent_id"] is None
+        assert fleet["validators"][0]["active_benchmark"] is None
+        activity = (await client.get("/api/v1/public/activity")).json()
+        assert activity["entries"][0]["active_benchmarks"] == []
+
+    async def test_v4_rejects_regression_omission_and_signature_tampering(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        timestamp = int(datetime.now(UTC).timestamp())
+
+        initial = _heartbeat_payload(
+            protocol_version=4,
+            timestamp=timestamp,
+            state="running_benchmark",
+            active_agent_id=agent_id,
+            benchmark_progress=_progress("running_benchmark", completed=51, total=114),
+        )
+        assert (
+            await client.post(
+                "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=initial
+            )
+        ).status_code == 200
+
+        regressions = [
+            _progress("starting_harness"),
+            _progress("running_benchmark", completed=40, total=114),
+            _progress("running_benchmark", completed=52, total=120),
+        ]
+        for offset, progress in enumerate(regressions, start=1):
+            rejected = await client.post(
+                "/api/v1/validator/heartbeat",
+                headers=_AUTH_HEADER,
+                json=_heartbeat_payload(
+                    protocol_version=4,
+                    timestamp=timestamp + offset,
+                    state="running_benchmark",
+                    active_agent_id=agent_id,
+                    benchmark_progress=progress,
+                ),
+            )
+            assert rejected.status_code == 409, rejected.text
+
+        omitted = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                timestamp=timestamp + 4,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+            ),
+        )
+        assert omitted.status_code == 200, omitted.text
+        public_unknown = (await client.get("/api/v1/public/validators")).json()
+        assert public_unknown["validators"][0]["active_benchmark"] == {
+            "agent_id": str(agent_id),
+            "agent_name": "alpha-agent",
+            "stage": None,
+            "completed_checks": None,
+            "total_checks": None,
+            "percent": None,
+        }
+
+        downgraded = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=3,
+                timestamp=timestamp + 5,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+            ),
+        )
+        assert downgraded.status_code == 200, downgraded.text
+        public_unknown = (await client.get("/api/v1/public/validators")).json()
+        assert public_unknown["validators"][0]["active_benchmark"]["stage"] is None
+
+        lower_after_downgrade = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                timestamp=timestamp + 6,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+                benchmark_progress=_progress(
+                    "running_benchmark", completed=50, total=114
+                ),
+            ),
+        )
+        assert lower_after_downgrade.status_code == 409
+
+        tampered = _heartbeat_payload(
+            protocol_version=4,
+            timestamp=timestamp + 7,
+            state="running_benchmark",
+            active_agent_id=agent_id,
+            benchmark_progress=_progress("running_benchmark", completed=52, total=114),
+        )
+        assert isinstance(tampered["benchmark_progress"], dict)
+        tampered["benchmark_progress"]["completed"] = 53
+        rejected = await client.post(
+            "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=tampered
+        )
+        assert rejected.status_code == 401
+
+        cleared = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(protocol_version=4, timestamp=timestamp + 8),
+        )
+        assert cleared.status_code == 200, cleared.text
+        fleet = (await client.get("/api/v1/public/validators")).json()
+        assert fleet["validators"][0]["active_benchmark"] is None
+
+        lower_after_idle = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                timestamp=timestamp + 9,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+                benchmark_progress=_progress(
+                    "running_benchmark", completed=1, total=114
+                ),
+            ),
+        )
+        assert lower_after_idle.status_code == 409
+
+        other_agent_id = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, name="new-agent"
+        )
+        await _seed_ticket(session_maker, other_agent_id)
+        different_agent = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                timestamp=timestamp + 10,
+                state="running_benchmark",
+                active_agent_id=other_agent_id,
+                benchmark_progress=_progress(
+                    "running_benchmark", completed=1, total=114
+                ),
+            ),
+        )
+        assert different_agent.status_code == 200, different_agent.text
+
+    async def test_v4_failed_retrying_explicitly_restarts_at_preparing(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        timestamp = int(datetime.now(UTC).timestamp())
+
+        sequence = [
+            _progress("running_benchmark", completed=51, total=114),
+            _progress("failed_retrying", completed=51, total=114),
+        ]
+        for offset, progress in enumerate(sequence):
+            response = await client.post(
+                "/api/v1/validator/heartbeat",
+                headers=_AUTH_HEADER,
+                json=_heartbeat_payload(
+                    protocol_version=4,
+                    timestamp=timestamp + offset,
+                    state="running_benchmark",
+                    active_agent_id=agent_id,
+                    benchmark_progress=progress,
+                ),
+            )
+            assert response.status_code == 200, response.text
+
+        same_lease_restart = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                timestamp=timestamp + 2,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+                benchmark_progress=_progress("preparing"),
+            ),
+        )
+        assert same_lease_restart.status_code == 200, same_lease_restart.text
+
+        resumed = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                timestamp=timestamp + 3,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+                benchmark_progress=_progress(
+                    "running_benchmark", completed=1, total=114
+                ),
+            ),
+        )
+        assert resumed.status_code == 200, resumed.text
+
+        new_deadline = _TICKET_DEADLINE + timedelta(hours=1)
+        await _seed_ticket(session_maker, agent_id, deadline=new_deadline)
+        restarted = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                timestamp=timestamp + 4,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+                benchmark_progress=_progress("preparing", ticket_deadline=new_deadline),
+            ),
+        )
+        assert restarted.status_code == 200, restarted.text
+
+    async def test_v4_rejects_progress_without_matching_live_ticket(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        timestamp = int(datetime.now(UTC).timestamp())
+
+        missing = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                timestamp=timestamp,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+                benchmark_progress=_progress("preparing"),
+            ),
+        )
+        assert missing.status_code == 409
+
+        await _seed_ticket(session_maker, agent_id)
+        wrong_deadline = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                timestamp=timestamp + 1,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+                benchmark_progress=_progress(
+                    "preparing", ticket_deadline=_TICKET_DEADLINE + timedelta(days=1)
+                ),
+            ),
+        )
+        assert wrong_deadline.status_code == 409
 
     async def test_v3_binds_coarse_metrics_and_public_response_is_redacted(
         self,

@@ -13,6 +13,7 @@ from uuid import UUID
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     CheckConstraint,
     Enum,
     Float,
@@ -492,6 +493,15 @@ class ValidatorHeartbeat(Base):
         TIMESTAMP(timezone=True), nullable=True
     )
     system_metrics: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    benchmark_progress: Mapped[dict | None] = mapped_column(
+        _JSON_VARIANT, nullable=True
+    )
+    benchmark_progress_reported: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    benchmark_progress_agent_id: Mapped[UUID | None] = mapped_column(
+        SaUUID(as_uuid=True), nullable=True
+    )
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )
@@ -525,6 +535,12 @@ class ValidatorHeartbeat(Base):
             ["agents.agent_id"],
             ondelete="SET NULL",
             name="validator_heartbeats_active_agent_id_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["benchmark_progress_agent_id"],
+            ["agents.agent_id"],
+            ondelete="SET NULL",
+            name="validator_heartbeats_benchmark_progress_agent_id_fkey",
         ),
         Index("validator_heartbeats_seen_at_idx", "seen_at"),
         Index(

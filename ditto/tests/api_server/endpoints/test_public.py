@@ -25,9 +25,17 @@ from sqlalchemy.ext.asyncio import (
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import get_dataset_generator, get_session
-from ditto.db.models import Agent, Base, Score, ScreeningAttempt, ValidatorHeartbeat
+from ditto.db.models import (
+    Agent,
+    Base,
+    Score,
+    ScreeningAttempt,
+    ValidatorHeartbeat,
+    ValidatorTicket,
+)
 from ditto.db.queries.audit import (
     EVENT_SCORE,
     GENESIS_HASH,
@@ -37,6 +45,7 @@ from ditto.db.queries.scores import upsert_score
 
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+_VALIDATOR_C = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
 
 @pytest.fixture
@@ -569,6 +578,7 @@ class TestPublicActivity:
             "screening_attempt_id",
             "screening_started_at",
             "screening_deadline",
+            "active_benchmarks",
         }
         serialized = resp.text
         for private_field in (
@@ -699,9 +709,202 @@ class TestPublicActivity:
                     signature="cd" * 64,
                 )
             )
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=_MINER_B,
+                    status=TicketStatus.ISSUED,
+                    issued_at=now - timedelta(seconds=1),
+                    deadline=now + timedelta(minutes=30),
+                )
+            )
 
         evaluating = (await client.get("/api/v1/public/activity")).json()["entries"][0]
         assert evaluating["status"] == "evaluating"
+
+    async def test_progress_is_multi_validator_allowlisted_and_recursively_redacted(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                name="privacy-safe-agent",
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        now = datetime.now(UTC)
+        deadline = now + timedelta(minutes=30)
+        safe_progress = {
+            "stage": "running_benchmark",
+            "completed": 51,
+            "total": 114,
+            "ticket_deadline": deadline.isoformat(),
+        }
+        sentinel = "PRIVATE_PROMPT_CANARY_DO_NOT_PUBLISH"
+        async with session_maker() as session, session.begin():
+            for hotkey, progress in (
+                (_MINER_A, safe_progress),
+                (_MINER_B, {**safe_progress, "completed": 3, "total": 8}),
+                (_VALIDATOR_C, {**safe_progress, "prompt": sentinel}),
+            ):
+                session.add(
+                    ValidatorHeartbeat(
+                        validator_hotkey=hotkey,
+                        software_version="1.2.3",
+                        protocol_version=4,
+                        code_digest="ab" * 32,
+                        state="running_benchmark",
+                        active_agent_id=agent_id,
+                        benchmark_progress=progress,
+                        benchmark_progress_reported=True,
+                        reported_at=now,
+                        seen_at=now,
+                        signature="cd" * 64,
+                    )
+                )
+                session.add(
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        validator_hotkey=hotkey,
+                        status=TicketStatus.ISSUED,
+                        issued_at=now - timedelta(seconds=1),
+                        deadline=deadline,
+                    )
+                )
+        _install_db(app, session_maker)
+
+        responses = [
+            await client.get("/api/v1/public/validators"),
+            await client.get("/api/v1/public/activity"),
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline"),
+        ]
+        assert all(response.status_code == 200 for response in responses)
+        public_progress_keys = {
+            "agent_id",
+            "agent_name",
+            "stage",
+            "completed_checks",
+            "total_checks",
+            "percent",
+        }
+        fleet = responses[0].json()
+        shown = [
+            row["active_benchmark"]
+            for row in fleet["validators"]
+            if row["active_benchmark"] is not None
+        ]
+        assert len(shown) == 2
+        assert all(set(progress) == public_progress_keys for progress in shown)
+        first = next(
+            progress for progress in shown if progress["completed_checks"] == 51
+        )
+        assert first["percent"] == 45
+        assert first["total_checks"] == 114
+        threshold = next(
+            progress for progress in shown if progress["completed_checks"] == 3
+        )
+        assert threshold["percent"] == 40  # 3/8 = 37.5%, rounded half-up.
+        activity = responses[1].json()["entries"][0]
+        assert len(activity["active_benchmarks"]) == 2
+        pipeline = responses[2].json()
+        assert sum(a["actively_running"] for a in pipeline["validation_attempts"]) == 2
+
+        forbidden_keys = {
+            "case_id",
+            "case_category",
+            "prompt",
+            "expected",
+            "called",
+            "tool_names",
+            "memory_contents",
+            "dataset",
+            "dataset_sha256",
+            "seed",
+            "canary",
+            "partial_score",
+            "latency_ms",
+            "model_output",
+            "harness_logs",
+            "tarball_logs",
+            "run_id",
+            "container_id",
+            "filesystem_path",
+            "ip_address",
+            "error_body",
+            "ticket_deadline",
+        }
+
+        def assert_redacted(value: object) -> None:
+            if isinstance(value, dict):
+                assert forbidden_keys.isdisjoint(value)
+                for nested in value.values():
+                    assert_redacted(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    assert_redacted(nested)
+            elif isinstance(value, str):
+                assert sentinel not in value
+
+        for response in responses:
+            assert_redacted(response.json())
+
+    async def test_delayed_legacy_or_omitted_progress_cannot_revive_reissued_work(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        now = datetime.now(UTC)
+        issued_at = now - timedelta(seconds=5)
+        old_signed_at = now - timedelta(seconds=10)
+        deadline = now + timedelta(minutes=30)
+        async with session_maker() as session, session.begin():
+            for hotkey, protocol_version in ((_MINER_A, 3), (_MINER_B, 4)):
+                session.add(
+                    ValidatorHeartbeat(
+                        validator_hotkey=hotkey,
+                        software_version="1.2.3",
+                        protocol_version=protocol_version,
+                        code_digest="ab" * 32,
+                        state="running_benchmark",
+                        active_agent_id=agent_id,
+                        benchmark_progress=None,
+                        benchmark_progress_reported=False,
+                        reported_at=old_signed_at,
+                        # Receipt after reissue must not make the old signature fresh.
+                        seen_at=now,
+                        signature="cd" * 64,
+                    )
+                )
+                session.add(
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        validator_hotkey=hotkey,
+                        status=TicketStatus.ISSUED,
+                        issued_at=issued_at,
+                        deadline=deadline,
+                    )
+                )
+        _install_db(app, session_maker)
+
+        fleet = (await client.get("/api/v1/public/validators")).json()
+        assert all(row["active_agent_id"] is None for row in fleet["validators"])
+        activity = (await client.get("/api/v1/public/activity")).json()
+        assert activity["entries"][0]["status"] == "waiting_validator"
+        assert activity["entries"][0]["active_benchmarks"] == []
 
     async def test_respects_limit(
         self,

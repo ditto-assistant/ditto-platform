@@ -51,6 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
     ArtifactResponse,
+    BenchmarkProgress,
     JobRequest,
     JobResponse,
     ScoreReport,
@@ -60,6 +61,7 @@ from ditto.api_models import (
     ValidatorHeartbeatResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_progress import benchmark_progress_signing_token
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.system_health import (
     SystemMetrics,
@@ -83,7 +85,10 @@ from ditto.db.queries.audit import (
     EVENT_SCORE,
     append_audit_entry,
 )
-from ditto.db.queries.heartbeats import upsert_validator_heartbeat
+from ditto.db.queries.heartbeats import (
+    HeartbeatProgressRegressionError,
+    upsert_validator_heartbeat,
+)
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     list_eligible_ledger,
@@ -298,8 +303,18 @@ def _heartbeat_signing_message(
     timestamp: int,
     active_agent_id: UUID | None = None,
     system_metrics: SystemMetrics | None = None,
+    benchmark_progress: BenchmarkProgress | None = None,
 ) -> bytes:
     """Canonical heartbeat payload, mirrored by ``ditto-subnet``."""
+    if protocol_version >= 4:
+        active = str(active_agent_id) if active_agent_id is not None else ""
+        return (
+            "ditto-validator-heartbeat:v4:"
+            f"{validator_hotkey}:{software_version}:{protocol_version}:"
+            f"{code_digest}:{state}:{active}:"
+            f"{system_metrics_signing_token(system_metrics)}:"
+            f"{benchmark_progress_signing_token(benchmark_progress)}:{timestamp}"
+        ).encode()
     if protocol_version >= 3:
         active = str(active_agent_id) if active_agent_id is not None else ""
         return (
@@ -374,6 +389,18 @@ async def heartbeat(
     if request_body.protocol_version < 3 and request_body.system_metrics is not None:
         raise ValidatorAuthError("system metrics require heartbeat protocol v3")
     if (
+        request_body.protocol_version < 4
+        and request_body.benchmark_progress is not None
+    ):
+        raise ValidatorAuthError("benchmark progress requires heartbeat protocol v4")
+    if request_body.benchmark_progress is not None and (
+        request_body.active_agent_id is None
+        or request_body.state != "running_benchmark"
+    ):
+        raise ValidatorAuthError(
+            "benchmark progress requires active running_benchmark work"
+        )
+    if (
         request_body.system_metrics is not None
         and abs(request_body.timestamp - request_body.system_metrics.collected_at)
         > _HEARTBEAT_MAX_SKEW_SECONDS
@@ -395,29 +422,63 @@ async def heartbeat(
         timestamp=request_body.timestamp,
         active_agent_id=request_body.active_agent_id,
         system_metrics=request_body.system_metrics,
+        benchmark_progress=request_body.benchmark_progress,
     )
     if not _verify_signature(validator_hotkey, payload, request_body.signature):
         raise ValidatorAuthError("heartbeat signature verification failed")
 
     reported_at = datetime.fromtimestamp(request_body.timestamp, tz=UTC)
     async with session.begin():
-        row, accepted = await upsert_validator_heartbeat(
-            session,
-            validator_hotkey=validator_hotkey,
-            software_version=request_body.software_version,
-            protocol_version=request_body.protocol_version,
-            code_digest=request_body.code_digest,
-            state=request_body.state,
-            active_agent_id=request_body.active_agent_id,
-            system_metrics=(
-                request_body.system_metrics.model_dump(mode="json")
-                if request_body.system_metrics is not None
-                else None
-            ),
-            reported_at=reported_at,
-            seen_at=now,
-            signature=request_body.signature,
-        )
+        if request_body.benchmark_progress is not None:
+            assert request_body.active_agent_id is not None
+            agent = await get_agent_by_id(
+                session, agent_id=request_body.active_agent_id, for_update=True
+            )
+            ticket = await get_open_ticket(
+                session,
+                agent_id=request_body.active_agent_id,
+                validator_hotkey=validator_hotkey,
+                now=now,
+                deadline=request_body.benchmark_progress.ticket_deadline,
+                for_update=True,
+            )
+            if (
+                ticket is None
+                or agent is None
+                or agent.status != AgentStatus.EVALUATING
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "benchmark progress does not match a live issued ticket "
+                        "for an evaluating agent"
+                    ),
+                )
+        try:
+            row, accepted = await upsert_validator_heartbeat(
+                session,
+                validator_hotkey=validator_hotkey,
+                software_version=request_body.software_version,
+                protocol_version=request_body.protocol_version,
+                code_digest=request_body.code_digest,
+                state=request_body.state,
+                active_agent_id=request_body.active_agent_id,
+                system_metrics=(
+                    request_body.system_metrics.model_dump(mode="json")
+                    if request_body.system_metrics is not None
+                    else None
+                ),
+                benchmark_progress=(
+                    request_body.benchmark_progress.model_dump(mode="json")
+                    if request_body.benchmark_progress is not None
+                    else None
+                ),
+                reported_at=reported_at,
+                seen_at=now,
+                signature=request_body.signature,
+            )
+        except HeartbeatProgressRegressionError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
     seen_at = row.seen_at
     if seen_at.tzinfo is None:
         seen_at = seen_at.replace(tzinfo=UTC)
@@ -639,6 +700,7 @@ async def submit_score(
             validator_hotkey=payload.validator_hotkey,
             now=datetime.now(UTC),
             deadline=payload.ticket_deadline,
+            for_update=True,
         )
         if ticket is None:
             raise HTTPException(

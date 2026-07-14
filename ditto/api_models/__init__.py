@@ -17,6 +17,7 @@ Usage:
 
 from __future__ import annotations
 
+from ditto.api_models.benchmark_progress import BenchmarkProgress
 from ditto.api_models.health import HealthResponse
 from ditto.api_models.public import (
     BenchDatasetConfig,
@@ -30,6 +31,7 @@ from ditto.api_models.public import (
     PublicBenchCorpusEntry,
     PublicBenchCorpusResponse,
     PublicBenchIntegrity,
+    PublicBenchmarkProgress,
     PublicCaseResult,
     PublicCategoryStat,
     PublicDatasetReveal,
@@ -83,6 +85,7 @@ __all__ = [
     "AgentResponse",
     "AgentStatusResponse",
     "ArtifactResponse",
+    "BenchmarkProgress",
     "CaseScore",
     "EvalPricingResponse",
     "HealthResponse",
@@ -101,6 +104,7 @@ __all__ = [
     "PublicBenchConfigResponse",
     "PublicBenchCorpusResponse",
     "PublicBenchIntegrity",
+    "PublicBenchmarkProgress",
     "PublicCaseResult",
     "PublicCategoryStat",
     "PublicDatasetReveal",
