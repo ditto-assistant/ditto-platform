@@ -36,6 +36,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Response
+from sqlalchemy import func, select
 
 from ditto.api_models import (
     BenchDatasetConfig,
@@ -56,20 +57,24 @@ from ditto.api_models import (
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
     PublicRunModels,
+    PublicScreeningAttempt,
+    PublicSubmissionPipeline,
     PublicSubmissionScores,
     PublicSubmissionsResponse,
     PublicSubmissionSummary,
+    PublicValidationAttempt,
     PublicValidatorHeartbeat,
     PublicValidatorHeartbeatsResponse,
     PublicValidatorScore,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.validator import SessionDep
-from ditto.db.models import Score
+from ditto.db.models import Agent, Score, ValidatorTicket
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.heartbeats import list_validator_heartbeats
@@ -84,6 +89,7 @@ from ditto.db.queries.scores import (
     list_public_submissions,
     list_scores_for_bench_version,
 )
+from ditto.db.queries.screening import list_screening_attempts
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +389,7 @@ async def validators(
             protocol_version=row.protocol_version,
             code_digest=row.code_digest,
             state=cast(ValidatorRuntimeState, row.state),
+            active_agent_id=row.active_agent_id,
             reported_at=aware(row.reported_at),
             seen_at=aware(row.seen_at),
             signature=row.signature,
@@ -470,8 +477,23 @@ def _submission_summary(row: SubmissionRow) -> PublicSubmissionSummary:
     )
 
 
-def _public_activity_status(status: AgentStatus) -> str:
+def _public_activity_status(
+    status: AgentStatus,
+    *,
+    screening_policy_version: int,
+    has_active_attempt: bool,
+) -> str:
     """Collapse internal moderation detail into stable public lifecycle labels."""
+    if has_active_attempt or (
+        status
+        in (
+            AgentStatus.EVALUATING,
+            AgentStatus.SCREENING_FAILED,
+            AgentStatus.REJECTED,
+        )
+        and screening_policy_version < SCREENING_POLICY_VERSION
+    ):
+        return AgentStatus.SCREENING.value
     if status == AgentStatus.ATH_PENDING_REVIEW:
         return "under_review"
     if status == AgentStatus.BANNED:
@@ -509,15 +531,132 @@ async def activity(
                 agent_id=row.agent.agent_id,
                 miner_hotkey=row.agent.miner_hotkey,
                 name=row.agent.name,
-                status=_public_activity_status(row.agent.status),
+                status=_public_activity_status(
+                    row.agent.status,
+                    screening_policy_version=row.agent.screening_policy_version,
+                    has_active_attempt=row.screening_attempt is not None,
+                ),
                 submitted_at=row.agent.created_at,
-                screening_reason=row.agent.screening_reason,
+                screening_reason=(
+                    None
+                    if row.screening_attempt is not None
+                    or (
+                        row.agent.status
+                        in (
+                            AgentStatus.EVALUATING,
+                            AgentStatus.SCREENING_FAILED,
+                            AgentStatus.REJECTED,
+                        )
+                        and row.agent.screening_policy_version
+                        < SCREENING_POLICY_VERSION
+                    )
+                    else row.agent.screening_reason
+                ),
                 duplicate_of=row.agent.duplicate_of,
                 review_reason=row.agent.review_reason,
                 score_count=row.score_count,
                 quorum=SCORING_QUORUM,
+                screening_policy_version=row.agent.screening_policy_version,
+                required_screening_policy_version=SCREENING_POLICY_VERSION,
+                screening_attempt_id=(
+                    row.screening_attempt.attempt_id
+                    if row.screening_attempt is not None
+                    else None
+                ),
+                screening_started_at=(
+                    row.screening_attempt.started_at
+                    if row.screening_attempt is not None
+                    else None
+                ),
+                screening_deadline=(
+                    row.screening_attempt.deadline
+                    if row.screening_attempt is not None
+                    else None
+                ),
             )
             for row in rows
+        ],
+    )
+
+
+@router.get("/agent/{agent_id}/pipeline", response_model=PublicSubmissionPipeline)
+async def agent_pipeline(
+    response: Response,
+    session: SessionDep,
+    agent_id: UUID,
+) -> PublicSubmissionPipeline:
+    """Versioned screening history and validator progress for one submission."""
+    response.headers["Cache-Control"] = "public, max-age=10"
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="submission not found")
+
+    attempts = await list_screening_attempts(session, agent_id=agent_id)
+    tickets = list(
+        await session.scalars(
+            select(ValidatorTicket)
+            .where(ValidatorTicket.agent_id == agent_id)
+            .order_by(
+                ValidatorTicket.issued_at.desc(),
+                ValidatorTicket.validator_hotkey,
+            )
+        )
+    )
+    heartbeats = await list_validator_heartbeats(session)
+    now = datetime.now(UTC)
+    cutoff = now - _VALIDATOR_ONLINE_WINDOW
+
+    def aware(value: datetime) -> datetime:
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+    active_validators = {
+        heartbeat.validator_hotkey
+        for heartbeat in heartbeats
+        if heartbeat.active_agent_id == agent_id
+        and heartbeat.state == "running_benchmark"
+        and aware(heartbeat.seen_at) >= cutoff
+    }
+    score_count = int(
+        await session.scalar(
+            select(func.count(Score.validator_hotkey)).where(Score.agent_id == agent_id)
+        )
+        or 0
+    )
+    running_attempt = next(
+        (attempt for attempt in attempts if attempt.status == "running"), None
+    )
+    return PublicSubmissionPipeline(
+        generated_at=now,
+        agent_id=agent_id,
+        status=_public_activity_status(
+            agent.status,
+            screening_policy_version=agent.screening_policy_version,
+            has_active_attempt=running_attempt is not None,
+        ),
+        score_count=score_count,
+        quorum=SCORING_QUORUM,
+        screening_attempts=[
+            PublicScreeningAttempt(
+                attempt_id=attempt.attempt_id,
+                policy_version=attempt.policy_version,
+                status=attempt.status,
+                screener_hotkey=attempt.screener_hotkey,
+                started_at=attempt.started_at,
+                deadline=attempt.deadline,
+                finished_at=attempt.finished_at,
+                reason=attempt.public_reason,
+            )
+            for attempt in attempts
+        ],
+        validation_attempts=[
+            PublicValidationAttempt(
+                validator_hotkey=ticket.validator_hotkey,
+                status=ticket.status.value,
+                issued_at=ticket.issued_at,
+                deadline=ticket.deadline,
+                actively_running=ticket.validator_hotkey in active_validators,
+            )
+            for ticket in tickets
         ],
     )
 

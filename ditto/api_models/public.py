@@ -605,6 +605,21 @@ class PublicActivityEntry(BaseModel):
         int,
         Field(ge=1, description="Independent validator scores required to finalize."),
     ]
+    screening_policy_version: Annotated[
+        int, Field(ge=0, description="Latest completed screening policy version.")
+    ]
+    required_screening_policy_version: Annotated[
+        int, Field(ge=1, description="Policy currently required by the platform.")
+    ]
+    screening_attempt_id: Annotated[
+        UUID | None, Field(default=None, description="Active screening lease, if any.")
+    ]
+    screening_started_at: Annotated[
+        datetime | None, Field(default=None, description="Active attempt start time.")
+    ]
+    screening_deadline: Annotated[
+        datetime | None, Field(default=None, description="Active attempt deadline.")
+    ]
 
 
 class PublicActivityResponse(BaseModel):
@@ -624,6 +639,41 @@ class PublicActivityResponse(BaseModel):
         list[PublicActivityEntry],
         Field(default_factory=list, description="Recent submissions, newest first."),
     ]
+
+
+class PublicScreeningAttempt(BaseModel):
+    """One append-only screening attempt shown in submission details."""
+
+    attempt_id: UUID
+    policy_version: Annotated[int, Field(ge=1)]
+    status: Annotated[str, Field(pattern=r"^(running|passed|rejected|failed|expired)$")]
+    screener_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    started_at: datetime
+    deadline: datetime
+    finished_at: datetime | None = None
+    reason: str | None = None
+
+
+class PublicValidationAttempt(BaseModel):
+    """One validator ticket contributing toward the three-score quorum."""
+
+    validator_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    status: Annotated[str, Field(pattern=r"^(issued|scored|expired)$")]
+    issued_at: datetime
+    deadline: datetime
+    actively_running: bool = False
+
+
+class PublicSubmissionPipeline(BaseModel):
+    """Full public execution history for one submitted agent."""
+
+    generated_at: datetime
+    agent_id: UUID
+    status: str
+    score_count: Annotated[int, Field(ge=0)]
+    quorum: Annotated[int, Field(ge=1)]
+    screening_attempts: list[PublicScreeningAttempt] = Field(default_factory=list)
+    validation_attempts: list[PublicValidationAttempt] = Field(default_factory=list)
 
 
 class PublicDatasetReveal(BaseModel):
@@ -848,6 +898,7 @@ class PublicValidatorHeartbeat(BaseModel):
         str, Field(pattern=r"^[0-9a-f]{64}$", description="Installed source digest.")
     ]
     state: ValidatorRuntimeState
+    active_agent_id: UUID | None = None
     reported_at: datetime
     seen_at: datetime
     signature: Annotated[str, Field(pattern=r"^[0-9a-fA-F]{128}$")]

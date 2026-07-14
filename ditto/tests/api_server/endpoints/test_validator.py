@@ -120,21 +120,29 @@ def _heartbeat_payload(
     timestamp: int | None = None,
     code_digest: str = "ab" * 32,
     state: str = "idle",
+    protocol_version: int = 1,
+    active_agent_id: UUID | None = None,
 ) -> dict[str, object]:
     ts = timestamp if timestamp is not None else int(datetime.now(UTC).timestamp())
     hotkey = keypair.ss58_address
     message = (
-        f"ditto-validator-heartbeat:v1:{hotkey}:0.1.0:1:{code_digest}:{state}:{ts}"
+        f"ditto-validator-heartbeat:v2:{hotkey}:0.1.0:{protocol_version}:"
+        f"{code_digest}:{state}:{active_agent_id or ''}:{ts}"
+        if protocol_version >= 2
+        else f"ditto-validator-heartbeat:v1:{hotkey}:0.1.0:1:{code_digest}:{state}:{ts}"
     )
-    return {
+    payload: dict[str, object] = {
         "validator_hotkey": hotkey,
         "software_version": "0.1.0",
-        "protocol_version": 1,
+        "protocol_version": protocol_version,
         "code_digest": code_digest,
         "state": state,
         "timestamp": ts,
         "signature": keypair.sign(message.encode()).hex(),
     }
+    if active_agent_id is not None:
+        payload["active_agent_id"] = str(active_agent_id)
+    return payload
 
 
 async def _score_to_quorum(
@@ -344,6 +352,28 @@ class TestHeartbeat:
         assert replay.status_code == 200
         assert replay.json()["accepted"] is False
         assert replay.json()["seen_at"] == response.json()["seen_at"]
+
+    async def test_v2_reports_current_agent_publicly(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        payload = _heartbeat_payload(
+            protocol_version=2,
+            state="running_benchmark",
+            active_agent_id=agent_id,
+        )
+
+        response = await client.post(
+            "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=payload
+        )
+        assert response.status_code == 200, response.text
+        public = (await client.get("/api/v1/public/validators")).json()
+        assert public["validators"][0]["active_agent_id"] == str(agent_id)
 
     async def test_rejects_stale_heartbeat(
         self,

@@ -289,8 +289,16 @@ def _heartbeat_signing_message(
     code_digest: str,
     state: str,
     timestamp: int,
+    active_agent_id: UUID | None = None,
 ) -> bytes:
-    """Canonical v1 heartbeat payload, mirrored by ``ditto-subnet``."""
+    """Canonical heartbeat payload, mirrored by ``ditto-subnet``."""
+    if protocol_version >= 2:
+        active = str(active_agent_id) if active_agent_id is not None else ""
+        return (
+            "ditto-validator-heartbeat:v2:"
+            f"{validator_hotkey}:{software_version}:{protocol_version}:"
+            f"{code_digest}:{state}:{active}:{timestamp}"
+        ).encode()
     return (
         "ditto-validator-heartbeat:v1:"
         f"{validator_hotkey}:{software_version}:{protocol_version}:"
@@ -334,6 +342,13 @@ async def heartbeat(
         raise ValidatorAuthError(
             "heartbeat timestamp is stale or too far in the future"
         )
+    if request_body.protocol_version < 2 and request_body.active_agent_id is not None:
+        raise ValidatorAuthError("heartbeat protocol v1 cannot report active work")
+    if (
+        request_body.active_agent_id is not None
+        and request_body.state != "running_benchmark"
+    ):
+        raise ValidatorAuthError("active agent requires running_benchmark state")
     payload = _heartbeat_signing_message(
         validator_hotkey=validator_hotkey,
         software_version=request_body.software_version,
@@ -341,6 +356,7 @@ async def heartbeat(
         code_digest=request_body.code_digest,
         state=request_body.state,
         timestamp=request_body.timestamp,
+        active_agent_id=request_body.active_agent_id,
     )
     if not _verify_signature(validator_hotkey, payload, request_body.signature):
         raise ValidatorAuthError("heartbeat signature verification failed")
@@ -354,6 +370,7 @@ async def heartbeat(
             protocol_version=request_body.protocol_version,
             code_digest=request_body.code_digest,
             state=request_body.state,
+            active_agent_id=request_body.active_agent_id,
             reported_at=reported_at,
             seen_at=now,
             signature=request_body.signature,

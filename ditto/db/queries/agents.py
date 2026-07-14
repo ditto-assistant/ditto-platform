@@ -16,7 +16,7 @@ from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
-from ditto.db.models import Agent, Score
+from ditto.db.models import Agent, Score, ScreeningAttempt
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -200,6 +200,7 @@ class PublicActivityRow:
 
     agent: Agent
     score_count: int
+    screening_attempt: ScreeningAttempt | None
 
 
 async def list_public_activity(
@@ -219,8 +220,13 @@ async def list_public_activity(
         .subquery()
     )
     stmt = (
-        select(Agent, func.coalesce(score_counts.c.score_count, 0))
+        select(Agent, func.coalesce(score_counts.c.score_count, 0), ScreeningAttempt)
         .outerjoin(score_counts, score_counts.c.agent_id == Agent.agent_id)
+        .outerjoin(
+            ScreeningAttempt,
+            (ScreeningAttempt.agent_id == Agent.agent_id)
+            & (ScreeningAttempt.status == "running"),
+        )
         .order_by(Agent.created_at.desc(), Agent.agent_id.desc())
         .offset(offset)
         .limit(limit)
@@ -228,8 +234,12 @@ async def list_public_activity(
     result = await session.execute(stmt)
     return (
         [
-            PublicActivityRow(agent=agent, score_count=int(score_count))
-            for agent, score_count in result.all()
+            PublicActivityRow(
+                agent=agent,
+                score_count=int(score_count),
+                screening_attempt=screening_attempt,
+            )
+            for agent, score_count, screening_attempt in result.all()
         ],
         total,
     )

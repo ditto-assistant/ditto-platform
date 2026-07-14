@@ -258,6 +258,59 @@ class Agent(Base):
     )
 
 
+class ScreeningAttempt(Base):
+    """One claimed, versioned screening lease for a submission."""
+
+    __tablename__ = "screening_attempts"
+
+    attempt_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    screener_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    deadline: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    public_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="CASCADE",
+            name="screening_attempts_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "policy_version > 0",
+            name="screening_attempts_policy_version_check",
+        ),
+        CheckConstraint(
+            "status IN ('running', 'passed', 'rejected', 'failed', 'expired')",
+            name="screening_attempts_status_check",
+        ),
+        CheckConstraint(
+            "deadline >= started_at",
+            name="screening_attempts_deadline_check",
+        ),
+        CheckConstraint(
+            "finished_at IS NULL OR finished_at >= started_at",
+            name="screening_attempts_finished_check",
+        ),
+        Index("screening_attempts_agent_started_idx", "agent_id", "started_at"),
+        Index(
+            "screening_attempts_one_running_idx",
+            "agent_id",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+            sqlite_where=text("status = 'running'"),
+        ),
+    )
+
+
 class EvaluationPayment(Base):
     """One row of the ``evaluation_payments`` table.
 
@@ -432,6 +485,9 @@ class ValidatorHeartbeat(Base):
     protocol_version: Mapped[int] = mapped_column(Integer, nullable=False)
     code_digest: Mapped[str] = mapped_column(Text, nullable=False)
     state: Mapped[str] = mapped_column(Text, nullable=False)
+    active_agent_id: Mapped[UUID | None] = mapped_column(
+        SaUUID(as_uuid=True), nullable=True
+    )
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )
@@ -460,7 +516,18 @@ class ValidatorHeartbeat(Base):
             "length(signature) = 128",
             name="validator_heartbeats_signature_length_check",
         ),
+        ForeignKeyConstraint(
+            ["active_agent_id"],
+            ["agents.agent_id"],
+            ondelete="SET NULL",
+            name="validator_heartbeats_active_agent_id_fkey",
+        ),
         Index("validator_heartbeats_seen_at_idx", "seen_at"),
+        Index(
+            "validator_heartbeats_active_agent_idx",
+            "active_agent_id",
+            postgresql_where=text("active_agent_id IS NOT NULL"),
+        ),
     )
 
 
