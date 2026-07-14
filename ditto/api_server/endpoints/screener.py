@@ -235,6 +235,31 @@ async def agent_artifact(
     )
 
 
+def _public_screening_reason(detail: str) -> str:
+    """Map untrusted screener detail to a stable, public-safe failure category.
+
+    ``detail`` can include a Docker build-log tail produced by miner-controlled
+    code. Never persist or return it verbatim: a malicious Dockerfile could print
+    the BuildKit secret mounted for private dependency access.
+    """
+    normalized = detail.strip().casefold()
+    if "no dockerfile at tarball root" in normalized:
+        return "Dockerfile missing from archive root"
+    if normalized.startswith("build failed"):
+        return "Docker image build failed"
+    if normalized.startswith("serve check failed"):
+        return "Container failed the health check"
+    if "tarball exceeds" in normalized:
+        return "Submission archive exceeded the size limit"
+    if "sha256 mismatch" in normalized:
+        return "Submission artifact failed integrity verification"
+    if normalized.startswith("artifact download"):
+        return "Submission artifact could not be downloaded"
+    if normalized.startswith("screener error"):
+        return "Screening infrastructure error"
+    return "Screening failed"
+
+
 @router.post(
     "/agent/{agent_id}/result",
     response_model=ScreenResultResponse,
@@ -323,6 +348,9 @@ async def submit_result(
                 f"agent {agent_id} is {agent.status}, cannot apply verdict "
                 f"passed={payload.passed} (target {target})"
             )
+        agent.screening_reason = (
+            None if payload.passed else _public_screening_reason(payload.detail)
+        )
         # Pin the generated dataset once, when evaluating and not yet set (the
         # `is None` guard keeps a concurrent/duplicate verdict from overwriting).
         if (
@@ -340,12 +368,13 @@ async def submit_result(
         result_status = agent.status
 
     logger.info(
-        "screen verdict agent_id=%s screener=%s passed=%s status=%s dataset=%s%s",
+        "screen verdict agent_id=%s screener=%s passed=%s status=%s dataset=%s "
+        "reason=%r",
         agent_id,
         payload.screener_hotkey,
         payload.passed,
         result_status,
         "pinned" if new_dataset is not None else "none",
-        f" detail={payload.detail!r}" if payload.detail else "",
+        agent.screening_reason,
     )
     return ScreenResultResponse(agent_id=agent_id, status=result_status, accepted=True)

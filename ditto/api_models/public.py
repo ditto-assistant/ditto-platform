@@ -566,6 +566,21 @@ class PublicActivityEntry(BaseModel):
     submitted_at: Annotated[
         datetime, Field(description="When the platform accepted the upload (UTC).")
     ]
+    screening_reason: Annotated[
+        str | None,
+        Field(default=None, description="Public-safe screening failure category."),
+    ]
+    duplicate_of: Annotated[
+        UUID | None,
+        Field(default=None, description="Earlier agent this submission may duplicate."),
+    ]
+    review_reason: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Anti-copy signals that routed this submission to review.",
+        ),
+    ]
 
 
 class PublicActivityResponse(BaseModel):

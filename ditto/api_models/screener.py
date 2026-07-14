@@ -99,7 +99,9 @@ class ScreenResultRequest(BaseModel):
     be replayed with the boolean flipped to grief (or unfairly promote) a miner.
     ``passed`` is the gate: ``True`` promotes the agent to ``evaluating``,
     ``False`` moves it to ``screening_failed``. ``detail`` is an optional
-    human-readable reason (e.g. a build-log tail) for logs/audit.
+    human-readable reason (e.g. a build-log tail). Because the detail is produced
+    by miner-controlled build output, the platform maps it to a fixed public-safe
+    category and never logs or persists it verbatim.
     """
 
     screener_hotkey: Annotated[
@@ -124,7 +126,10 @@ class ScreenResultRequest(BaseModel):
         Field(
             default="",
             max_length=4000,
-            description="Optional reason / build-log tail (logged, not persisted).",
+            description=(
+                "Optional reason / build-log tail; mapped to a fixed public-safe "
+                "category and never logged or persisted verbatim."
+            ),
         ),
     ]
 

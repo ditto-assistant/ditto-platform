@@ -407,6 +407,9 @@
     .stage.good { color: var(--good); border-color: color-mix(in oklab, var(--good) 38%, transparent); background: color-mix(in oklab, var(--good) 10%, transparent); }
     .stage.warn { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 40%, transparent); background: color-mix(in oklab, var(--warn) 10%, transparent); }
     .stage.bad { color: var(--danger); border-color: color-mix(in oklab, var(--danger) 40%, transparent); background: color-mix(in oklab, var(--danger) 10%, transparent); }
+    .stage-cell { min-width: 230px; }
+    .stage-note { display: block; margin-top: 6px; max-width: 54ch; color: var(--text-dim); font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere; }
+    .stage-note b { color: var(--text); font-weight: 650; }
 
     /* ── Health strip ───────────────────────────────────────── */
     .health { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
@@ -423,6 +426,7 @@
       .cards { grid-template-columns: repeat(2, 1fr); }
       .health { grid-template-columns: repeat(2, 1fr); }
       .hide-sm { display: none; }
+      .stage-cell { min-width: 0; }
       .brand h1 { font-size: 18px; }
     }
   </style>
@@ -467,8 +471,8 @@
         <thead>
           <tr>
             <th scope="col">Agent</th>
-            <th scope="col">Miner</th>
-            <th scope="col" style="width:160px">Stage</th>
+            <th scope="col" class="hide-sm">Miner</th>
+            <th scope="col" style="width:390px">Stage &amp; evidence</th>
             <th scope="col" class="num hide-sm" style="width:110px">Submitted</th>
           </tr>
         </thead>
@@ -1405,11 +1409,20 @@
       rows.innerHTML = entries.map(function (e) {
         var stage = activityStage(e.status);
         var id = String(e.agent_id || "");
+        var evidence = "";
+        if (e.review_reason) {
+          evidence = '<span class="stage-note"><b>Copy review:</b> ' + esc(e.review_reason) + '</span>';
+        } else if (e.screening_reason) {
+          evidence = '<span class="stage-note"><b>Screening:</b> ' + esc(e.screening_reason) + '</span>';
+        }
+        if (e.duplicate_of && (!e.review_reason || e.review_reason.indexOf(e.duplicate_of) < 0)) {
+          evidence += '<span class="stage-note"><b>Compared with:</b> ' + esc(String(e.duplicate_of).slice(0, 8)) + '</span>';
+        }
         return '<tr>' +
           '<td><span class="agent-name">' + esc(e.name || "Unnamed agent") + '</span>' +
           '<span class="agent-id" title="' + esc(id) + '">' + esc(id.slice(0, 8)) + '</span></td>' +
-          '<td><span class="hotkey" title="' + esc(e.miner_hotkey) + '">' + esc(shortKey(e.miner_hotkey)) + '</span></td>' +
-          '<td><span class="stage ' + stage[1] + '">' + stage[0] + '</span></td>' +
+          '<td class="hide-sm"><span class="hotkey" title="' + esc(e.miner_hotkey) + '">' + esc(shortKey(e.miner_hotkey)) + '</span></td>' +
+          '<td class="stage-cell"><span class="stage ' + stage[1] + '">' + stage[0] + '</span>' + evidence + '</td>' +
           '<td class="num hide-sm" title="' + esc(e.submitted_at) + '">' + relTime(e.submitted_at) + '</td>' +
           '</tr>';
       }).join("");

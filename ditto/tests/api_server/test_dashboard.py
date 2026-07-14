@@ -73,3 +73,5 @@ class TestDashboard:
         assert "Submission pipeline" in body
         assert 'getJSON("/public/activity")' in body
         assert 'id="activity-rows"' in body
+        assert "Copy review:" in body
+        assert "screening_reason" in body

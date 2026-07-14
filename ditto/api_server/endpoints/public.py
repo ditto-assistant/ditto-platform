@@ -7,7 +7,8 @@ validator-gated ``/scoring/scores`` reads:
   per miner, composite plus tool/memory means and rank, never exposing per-case
   answer-key detail. This half stays aggregate-only.
 * **Submission lifecycle** (``/activity``): recent uploads and their public
-  pipeline stage, without artifacts, hashes, payment data, or moderation detail.
+  pipeline stage, safe screening reason, and anti-copy review evidence, without
+  artifacts, hashes, payment data, or raw build logs.
 * **Per-submission transparency** (``/submissions``, ``/agent/{id}/scores``): the
   k=3 record for a finalized agent — *which* validators scored it, each one's
   exact numbers + signature, the median the platform finalized on, and the pinned
@@ -425,9 +426,10 @@ async def activity(
 ) -> PublicActivityResponse:
     """Recent submissions and their safe public pipeline stage, newest first.
 
-    This intentionally exposes only identity, display name, lifecycle stage, and
-    submission time. Artifact locations, hashes, payments, screening reasons,
-    duplicate signals, and review metadata remain private.
+    This exposes the evidence a miner needs to understand a failure or review:
+    a safe screening category plus the duplicate reference and anti-copy signal
+    summary. Artifact locations, hashes, payments, and raw build logs remain
+    private.
     """
     response.headers["Cache-Control"] = "public, max-age=10"
     rows = await list_public_activity(session, limit=limit)
@@ -441,6 +443,9 @@ async def activity(
                 name=row.name,
                 status=_public_activity_status(row.status),
                 submitted_at=row.created_at,
+                screening_reason=row.screening_reason,
+                duplicate_of=row.duplicate_of,
+                review_reason=row.review_reason,
             )
             for row in rows
         ],
