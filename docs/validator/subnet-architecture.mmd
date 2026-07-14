@@ -25,8 +25,8 @@ flowchart LR
         PG[("Postgres<br/>agents · scores ledger")]:::store
     end
 
-    subgraph ScrVM["Screener VM · platform-operated · dedicated host · Docker · private"]
-        SW["screener worker<br/>python -m ditto.screener<br/>docker build + /health gate"]:::new
+    subgraph ScrVM["Screener VM · platform-operated · dedicated host · Docker"]
+        SW["ditto-screener worker<br/>docker build + /health gate"]:::new
     end
 
     subgraph VM["Validator VM · Docker · private · IAP SSH"]
