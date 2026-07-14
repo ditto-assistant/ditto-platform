@@ -600,6 +600,10 @@ class PublicActivityEntry(BaseModel):
     submitted_at: Annotated[
         datetime, Field(description="When the platform accepted the upload (UTC).")
     ]
+    last_scored_at: Annotated[
+        datetime | None,
+        Field(default=None, description="Most recent score time for this agent (UTC)."),
+    ]
     screening_reason: Annotated[
         str | None,
         Field(default=None, description="Public-safe screening failure category."),
