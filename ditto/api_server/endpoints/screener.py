@@ -391,8 +391,7 @@ async def submit_result(
         if agent is None:
             raise AgentNotFoundError(f"no agent with id={agent_id}")
         rescreening = (
-            agent.status
-            in (AgentStatus.EVALUATING, AgentStatus.SCREENING_FAILED)
+            agent.status in (AgentStatus.EVALUATING, AgentStatus.SCREENING_FAILED)
             and agent.screening_policy_version < SCREENING_POLICY_VERSION
         )
         if agent.status in _SCREENABLE_STATUSES or rescreening:
