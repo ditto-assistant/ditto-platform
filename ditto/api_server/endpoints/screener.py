@@ -60,6 +60,7 @@ from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.models import Agent
 from ditto.db.queries.agents import get_agent_by_id
+from ditto_screening_protocol import verdict_signing_message
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -333,10 +334,12 @@ async def submit_result(
     #    ``passed`` is signed, so a captured result can't be replayed with the
     #    boolean flipped to grief (or unfairly promote) a miner.
     if payload.policy_version >= _FIRST_VERSIONED_POLICY:
-        signed = (
-            f"{payload.screener_hotkey}:{agent_id}:{payload.passed}:"
-            f"{payload.policy_version}"
-        ).encode()
+        signed = verdict_signing_message(
+            screener_hotkey=payload.screener_hotkey,
+            agent_id=agent_id,
+            passed=payload.passed,
+            policy_version=payload.policy_version,
+        )
     else:
         signed = f"{payload.screener_hotkey}:{agent_id}:{payload.passed}".encode()
     if not _verify_signature(payload.screener_hotkey, signed, payload.signature):
