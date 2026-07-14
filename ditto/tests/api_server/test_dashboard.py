@@ -179,14 +179,17 @@ class TestDashboard:
         assert 'class="fleet-work-col"' in body
         assert "Current work" in body
 
-    async def test_includes_time_aware_theme_switcher(self) -> None:
+    async def test_includes_system_and_time_aware_theme_switcher(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
+        assert 'data-theme-choice="system"' in body
         assert 'data-theme-choice="light"' in body
         assert 'data-theme-choice="dark"' in body
         assert 'data-theme-choice="time"' in body
         assert 'var STORAGE_KEY = "ditto:dashboard-theme"' in body
-        assert 'return MODES[saved] ? saved : "time"' in body
+        assert 'return MODES[saved] ? saved : "system"' in body
+        assert 'window.matchMedia("(prefers-color-scheme: dark)")' in body
+        assert "root.dataset.systemTheme" in body
         assert "root.dataset.timePhase = fromHour(new Date().getHours())" in body
         assert 'if (hour >= 5 && hour < 8) return "dawn"' in body
 
