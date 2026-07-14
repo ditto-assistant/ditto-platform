@@ -14,7 +14,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 import ditto
 from ditto.api_server.config import (
@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 # The dashboard SPA lives at the repo root (source checkout on the deployed VM);
 # it is not packaged into the wheel, so a missing file just disables the route.
 _DASHBOARD_FILE = Path(__file__).resolve().parents[2] / "dashboard" / "index.html"
+_DASHBOARD_IMAGE = (
+    Path(__file__).resolve().parents[2] / "dashboard" / "assets" / "paperditto-512.png"
+)
 _WANDB_META_RE = re.compile(r'(<meta name="ditto:wandb-url" content=")[^"]*(")')
 
 
@@ -181,5 +184,19 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
                     content=dashboard_html,
                     headers={"Cache-Control": "public, max-age=300"},
                 )
+
+            if _DASHBOARD_IMAGE.is_file():
+
+                @app.get(
+                    "/assets/paperditto-512.png",
+                    include_in_schema=False,
+                    response_class=FileResponse,
+                )
+                async def dashboard_image() -> FileResponse:
+                    return FileResponse(
+                        _DASHBOARD_IMAGE,
+                        media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=86400"},
+                    )
 
     return app

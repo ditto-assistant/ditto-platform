@@ -41,6 +41,29 @@ class TestDashboard:
         # api-base stays empty so the SPA uses its same-origin /api/v1 default.
         assert 'name="ditto:api-base" content=""' in body
 
+    async def test_includes_social_preview_metadata(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        image_url = "https://platform-api.heyditto.ai/assets/paperditto-512.png"
+        assert '<meta property="og:type" content="website"' in body
+        assert (
+            '<meta property="og:title" content="Ditto SN118 · Subnet Leaderboard"'
+            in body
+        )
+        assert f'<meta property="og:image" content="{image_url}"' in body
+        assert '<meta property="og:image:width" content="512"' in body
+        assert '<meta name="twitter:card" content="summary"' in body
+        assert f'<meta name="twitter:image" content="{image_url}"' in body
+        assert '<link rel="canonical" href="https://platform-api.heyditto.ai/"' in body
+
+    async def test_serves_social_preview_image(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        resp = await _get(app, "/assets/paperditto-512.png")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "image/png"
+        assert resp.headers["Cache-Control"] == "public, max-age=86400"
+        assert resp.content.startswith(b"\x89PNG\r\n\x1a\n")
+
     async def test_wandb_url_is_html_escaped(self) -> None:
         # A stray quote in the configured URL must not break out of the attribute.
         app = create_api_server(
