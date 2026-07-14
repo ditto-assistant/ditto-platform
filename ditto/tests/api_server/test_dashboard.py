@@ -59,7 +59,12 @@ class TestDashboard:
         assert resp.status_code == 404
 
     @pytest.mark.parametrize(
-        "path", ["/api/v1/public/leaderboard", "/api/v1/public/activity"]
+        "path",
+        [
+            "/api/v1/public/leaderboard",
+            "/api/v1/public/activity",
+            "/api/v1/public/validators",
+        ],
     )
     async def test_api_still_mounted_alongside_dashboard(self, path: str) -> None:
         # Serving HTML at / must not shadow the API routes.
@@ -82,3 +87,12 @@ class TestDashboard:
         assert "validators scored this submission" in body
         assert "Copy review:" in body
         assert "screening_reason" in body
+
+    async def test_includes_validator_fleet_status(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert "Validator fleet" in body
+        assert 'id="validator-summary"' in body
+        assert 'id="validator-rows"' in body
+        assert 'getJSON("/public/validators")' in body
+        assert "running_benchmark" in body
