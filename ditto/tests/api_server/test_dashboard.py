@@ -100,6 +100,13 @@ class TestDashboard:
         assert "validators scored this submission" in body
         assert "Copy review:" in body
         assert "screening_reason" in body
+        assert '<details class="old-screeners">' in body
+        assert "Old screener results" in body
+        assert "Screener result" in body
+        assert "Lease expired" not in body
+        assert "System failure" not in body
+        assert 'expired: ["Timed out", "warn"]' in body
+        assert 'failed: ["Could not complete", "warn"]' in body
 
     async def test_includes_accessible_fleet_status(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))

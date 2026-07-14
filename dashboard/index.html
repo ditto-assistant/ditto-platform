@@ -505,6 +505,11 @@
     .attempt-main b { display: block; font-size: 13px; }
     .attempt-meta { margin-top: 3px; color: var(--text-dim); font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere; }
     .attempt-time { color: var(--text-faint); font-size: 11.5px; white-space: nowrap; }
+    .old-screeners { margin-top: 10px; border-top: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
+    .old-screeners summary { padding: 12px 0; color: var(--text-dim); font-size: 12.5px; font-weight: 700; cursor: pointer; }
+    .old-screeners summary:hover { color: var(--text); }
+    .old-screeners summary:focus-visible { outline: 3px solid color-mix(in oklch, var(--focus) 30%, transparent); outline-offset: 3px; }
+    .old-screeners[open] summary { color: var(--text); }
     @media (max-width: 560px) { .attempt { grid-template-columns: 88px 1fr; } .attempt-time { grid-column: 2; } }
 
     /* ── Health strip ───────────────────────────────────────── */
@@ -2282,7 +2287,7 @@
         var remaining = quorum - count;
         return count + " of " + quorum + " validators scored this submission. Waiting for " + remaining + " more independent " + (remaining === 1 ? "score" : "scores") + ".";
       }
-      if (e.status === "rejected") return "Screening completed and rejected this submission. Open the screening history for the policy version and reason.";
+      if (e.status === "rejected") return "Screening completed and rejected this submission. See the screener result for the policy version and reason.";
       if (e.status === "screening_failed") return "Screening could not complete reliably. This is retryable and is distinct from a submission rejection.";
       return "Validation starts after the submission passes screening.";
     }
@@ -2290,25 +2295,42 @@
     function attemptLabel(status) {
       var labels = {
         running: ["Running", "progress"], passed: ["Passed", "good"],
-        rejected: ["Rejected", "bad"], failed: ["System failure", "warn"],
-        expired: ["Lease expired", "warn"], issued: ["Claimed", "progress"],
+        rejected: ["Rejected", "bad"], failed: ["Could not complete", "warn"],
+        expired: ["Timed out", "warn"], issued: ["Assigned", "progress"],
         scored: ["Score submitted", "good"]
       };
       return labels[status] || [String(status || "Unknown").replace(/_/g, " "), ""];
     }
 
     function renderPipelineDetail(e, pipeline) {
-      var screening = (pipeline.screening_attempts || []).map(function (a) {
+      var screeningAttempts = pipeline.screening_attempts || [];
+      var currentPolicy = screeningAttempts.reduce(function (latest, attempt) {
+        return Math.max(latest, Number(attempt.policy_version) || 0);
+      }, 0);
+      function renderScreeningAttempt(a, isOld) {
         var label = attemptLabel(a.status);
         var when = a.finished_at || a.started_at;
         var meta = "Screener " + shortKey(a.screener_hotkey);
-        if (a.reason) meta += " · " + a.reason;
-        if (a.status === "running") meta += " · lease ends " + new Date(a.deadline).toLocaleString();
+        if (isOld && a.status === "expired") {
+          meta += " · This attempt did not finish before its deadline.";
+        } else if (isOld && a.status === "failed") {
+          meta += " · The screener could not complete this attempt.";
+          if (a.reason) meta += " Recorded detail: " + a.reason;
+        } else if (a.reason) {
+          meta += " · " + a.reason;
+        }
+        if (a.status === "running") meta += " · deadline " + new Date(a.deadline).toLocaleString();
         return '<div class="attempt"><div><span class="attempt-version">Policy v' + esc(a.policy_version) + '</span></div>' +
           '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(label[0]) + '</span></b>' +
           '<div class="attempt-meta">' + esc(meta) + '</div></div>' +
           '<div class="attempt-time" title="' + esc(when) + '">' + relTime(when) + '</div></div>';
-      }).join("");
+      }
+      var screening = screeningAttempts.filter(function (a) {
+        return (Number(a.policy_version) || 0) === currentPolicy;
+      }).map(function (a) { return renderScreeningAttempt(a, false); }).join("");
+      var oldScreening = screeningAttempts.filter(function (a) {
+        return (Number(a.policy_version) || 0) !== currentPolicy;
+      }).map(function (a) { return renderScreeningAttempt(a, true); }).join("");
       var validation = (pipeline.validation_attempts || []).map(function (a) {
         var label = attemptLabel(a.actively_running ? "running" : a.status);
         var meta = "Validator " + shortKey(a.validator_hotkey) + " · deadline " + new Date(a.deadline).toLocaleString();
@@ -2318,8 +2340,9 @@
           '<div class="attempt-time" title="' + esc(a.issued_at) + '">' + relTime(a.issued_at) + '</div></div>';
       }).join("");
       return '<div class="attempt-list">' +
-        '<div class="stat-head">Screening history</div>' +
+        '<div class="stat-head">Screener result</div>' +
         (screening || '<div class="muted" style="padding:10px 0">No versioned screening attempt recorded yet.</div>') +
+        (oldScreening ? '<details class="old-screeners"><summary>Old screener results</summary>' + oldScreening + '</details>' : '') +
         '<div class="stat-head" style="margin-top:18px">Validator progress · ' + esc(pipeline.score_count) + ' of ' + esc(pipeline.quorum) + ' scored</div>' +
         (validation || '<div class="muted" style="padding:10px 0">No validator has claimed this submission yet.</div>') +
         '</div>';
