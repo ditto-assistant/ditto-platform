@@ -57,18 +57,23 @@ from ditto.api_models import (
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
     PublicRunModels,
+    PublicScreenerHeartbeat,
+    PublicScreenerHeartbeatsResponse,
     PublicScreeningAttempt,
     PublicSubmissionPipeline,
     PublicSubmissionScores,
     PublicSubmissionsResponse,
     PublicSubmissionSummary,
+    PublicSystemMetrics,
     PublicValidationAttempt,
     PublicValidatorHeartbeat,
     PublicValidatorHeartbeatsResponse,
     PublicValidatorScore,
 )
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.public import FleetAvailability, FleetHealth
+from ditto.api_models.screener import SCREENING_POLICY_VERSION, ScreenerRuntimeState
+from ditto.api_models.system_health import SystemMetrics
 from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.datapipeline import DataPipelineError
@@ -77,7 +82,10 @@ from ditto.api_server.endpoints.validator import SessionDep
 from ditto.db.models import Agent, Score, ValidatorTicket
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
-from ditto.db.queries.heartbeats import list_validator_heartbeats
+from ditto.db.queries.heartbeats import (
+    list_screener_heartbeats,
+    list_validator_heartbeats,
+)
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
@@ -99,6 +107,62 @@ router = APIRouter(prefix="/public", tags=["public"])
 # cache is safe and shields the DB from dashboard/CDN traffic.
 _CACHE_CONTROL = "public, max-age=30"
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=UTC)
+
+
+def _public_system_metrics(raw: dict | None) -> PublicSystemMetrics | None:
+    """Validate stored telemetry again and expose only the fixed public allowlist."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        metrics = SystemMetrics.model_validate(raw)
+    except Exception:  # noqa: BLE001 - malformed historical rows stay private
+        return None
+    return PublicSystemMetrics(
+        cpu_percent=metrics.cpu_percent,
+        memory_percent=metrics.memory_percent,
+        disk_percent=metrics.disk_percent,
+        docker_status=metrics.docker.status,
+        running_containers=metrics.docker.running_containers,
+        unhealthy_containers=metrics.docker.unhealthy_containers,
+    )
+
+
+def _fleet_classification(
+    *, state: str, seen_at: datetime, now: datetime, metrics: PublicSystemMetrics | None
+) -> tuple[bool, FleetAvailability, FleetHealth]:
+    """Return online, availability, and health without treating omission as outage."""
+    online = seen_at >= now - _VALIDATOR_ONLINE_WINDOW
+    availability: FleetAvailability
+    if not online:
+        availability = "offline"
+    elif state == "paused":
+        availability = "paused"
+    else:
+        availability = "available"
+
+    health: FleetHealth
+    if state == "error":
+        health = "warning"
+    elif metrics is None:
+        health = "unknown"
+    elif (
+        metrics.cpu_percent >= 95
+        or metrics.memory_percent >= 90
+        or metrics.disk_percent >= 85
+        or metrics.docker_status == "degraded"
+    ):
+        health = "warning"
+    elif metrics.docker_status == "unavailable":
+        health = "unknown"
+    else:
+        health = "healthy"
+    return online, availability, health
 
 
 def _safe_models(details: dict) -> PublicRunModels | None:
@@ -376,33 +440,78 @@ async def validators(
     """
     response.headers["Cache-Control"] = _CACHE_CONTROL
     now = datetime.now(UTC)
-    cutoff = now - _VALIDATOR_ONLINE_WINDOW
     rows = await list_validator_heartbeats(session)
-
-    def aware(value: datetime) -> datetime:
-        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-
-    entries = [
-        PublicValidatorHeartbeat(
-            validator_hotkey=row.validator_hotkey,
-            software_version=row.software_version,
-            protocol_version=row.protocol_version,
-            code_digest=row.code_digest,
-            state=cast(ValidatorRuntimeState, row.state),
-            active_agent_id=row.active_agent_id,
-            reported_at=aware(row.reported_at),
-            seen_at=aware(row.seen_at),
-            signature=row.signature,
-            online=aware(row.seen_at) >= cutoff,
+    entries = []
+    for row in rows:
+        seen_at = cast(datetime, _aware(row.seen_at))
+        metrics = _public_system_metrics(row.system_metrics)
+        online, availability, health = _fleet_classification(
+            state=row.state, seen_at=seen_at, now=now, metrics=metrics
         )
-        for row in rows
-    ]
+        entries.append(
+            PublicValidatorHeartbeat(
+                validator_hotkey=row.validator_hotkey,
+                software_version=row.software_version,
+                protocol_version=row.protocol_version,
+                state=cast(ValidatorRuntimeState, row.state),
+                active_agent_id=row.active_agent_id,
+                first_seen_at=_aware(row.first_seen_at),
+                reported_at=cast(datetime, _aware(row.reported_at)),
+                seen_at=seen_at,
+                online=online,
+                availability=availability,
+                health=health,
+                system_metrics=metrics,
+            )
+        )
     return PublicValidatorHeartbeatsResponse(
         generated_at=now,
         online_window_seconds=int(_VALIDATOR_ONLINE_WINDOW.total_seconds()),
         reported_count=len(entries),
         online_count=sum(entry.online for entry in entries),
         validators=entries,
+    )
+
+
+@router.get("/screeners", response_model=PublicScreenerHeartbeatsResponse)
+async def screeners(
+    response: Response,
+    session: SessionDep,
+) -> PublicScreenerHeartbeatsResponse:
+    """Authenticated screener fleet reports with a strict public allowlist."""
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    now = datetime.now(UTC)
+    rows = await list_screener_heartbeats(session)
+    entries = []
+    for row in rows:
+        seen_at = cast(datetime, _aware(row.seen_at))
+        metrics = _public_system_metrics(row.system_metrics)
+        online, availability, health = _fleet_classification(
+            state=row.state, seen_at=seen_at, now=now, metrics=metrics
+        )
+        entries.append(
+            PublicScreenerHeartbeat(
+                screener_hotkey=row.screener_hotkey,
+                software_version=row.software_version,
+                protocol_version=row.protocol_version,
+                policy_version=row.policy_version,
+                state=cast(ScreenerRuntimeState, row.state),
+                active_agent_id=row.active_agent_id,
+                first_seen_at=_aware(row.first_seen_at),
+                reported_at=cast(datetime, _aware(row.reported_at)),
+                seen_at=seen_at,
+                online=online,
+                availability=availability,
+                health=health,
+                system_metrics=metrics,
+            )
+        )
+    return PublicScreenerHeartbeatsResponse(
+        generated_at=now,
+        online_window_seconds=int(_VALIDATOR_ONLINE_WINDOW.total_seconds()),
+        reported_count=len(entries),
+        online_count=sum(entry.online for entry in entries),
+        screeners=entries,
     )
 
 

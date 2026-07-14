@@ -28,6 +28,10 @@ from sqlalchemy.ext.asyncio import (
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.system_health import (
+    SystemMetrics,
+    system_metrics_signing_token,
+)
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -41,7 +45,14 @@ from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_VALIDATOR_AUTH,
 )
 from ditto.chain.models import NeuronInfo
-from ditto.db.models import Agent, Base, Score, ValidatorHeartbeat, ValidatorTicket
+from ditto.db.models import (
+    Agent,
+    Base,
+    Score,
+    ScreenerHeartbeat,
+    ValidatorHeartbeat,
+    ValidatorTicket,
+)
 
 # Real dev keypairs: sign for real so _verify_signature runs end to end. The k=3
 # quorum needs three distinct permitted validators before an agent finalizes.
@@ -122,15 +133,30 @@ def _heartbeat_payload(
     state: str = "idle",
     protocol_version: int = 1,
     active_agent_id: UUID | None = None,
+    system_metrics: dict[str, object] | None = None,
 ) -> dict[str, object]:
     ts = timestamp if timestamp is not None else int(datetime.now(UTC).timestamp())
     hotkey = keypair.ss58_address
-    message = (
-        f"ditto-validator-heartbeat:v2:{hotkey}:0.1.0:{protocol_version}:"
-        f"{code_digest}:{state}:{active_agent_id or ''}:{ts}"
-        if protocol_version >= 2
-        else f"ditto-validator-heartbeat:v1:{hotkey}:0.1.0:1:{code_digest}:{state}:{ts}"
-    )
+    if protocol_version >= 3:
+        metrics = (
+            SystemMetrics.model_validate(system_metrics)
+            if system_metrics is not None
+            else None
+        )
+        message = (
+            f"ditto-validator-heartbeat:v3:{hotkey}:0.1.0:{protocol_version}:"
+            f"{code_digest}:{state}:{active_agent_id or ''}:"
+            f"{system_metrics_signing_token(metrics)}:{ts}"
+        )
+    elif protocol_version >= 2:
+        message = (
+            f"ditto-validator-heartbeat:v2:{hotkey}:0.1.0:{protocol_version}:"
+            f"{code_digest}:{state}:{active_agent_id or ''}:{ts}"
+        )
+    else:
+        message = (
+            f"ditto-validator-heartbeat:v1:{hotkey}:0.1.0:1:{code_digest}:{state}:{ts}"
+        )
     payload: dict[str, object] = {
         "validator_hotkey": hotkey,
         "software_version": "0.1.0",
@@ -142,6 +168,8 @@ def _heartbeat_payload(
     }
     if active_agent_id is not None:
         payload["active_agent_id"] = str(active_agent_id)
+    if system_metrics is not None:
+        payload["system_metrics"] = system_metrics
     return payload
 
 
@@ -307,6 +335,38 @@ async def _seed_ticket(
 
 
 _AUTH_HEADER = {"X-Validator-Hotkey": _VALIDATOR_HOTKEY}
+_SYSTEM_METRICS = {
+    "collected_at": 0,
+    "cpu_percent": 15,
+    "memory_percent": 40,
+    "disk_percent": 55,
+    "docker": {
+        "status": "healthy",
+        "running_containers": 4,
+        "unhealthy_containers": 0,
+    },
+}
+
+
+def _screener_heartbeat_payload(
+    *, timestamp: int, system_metrics: dict[str, object]
+) -> dict[str, object]:
+    metrics = SystemMetrics.model_validate(system_metrics)
+    message = (
+        "ditto-screener-heartbeat:v1:"
+        f"{_KEYPAIR.ss58_address}:0.4.2:1:{SCREENING_POLICY_VERSION}:polling::"
+        f"{system_metrics_signing_token(metrics)}:{timestamp}"
+    )
+    return {
+        "screener_hotkey": _KEYPAIR.ss58_address,
+        "software_version": "0.4.2",
+        "protocol_version": 1,
+        "policy_version": SCREENING_POLICY_VERSION,
+        "state": "polling",
+        "timestamp": timestamp,
+        "signature": _KEYPAIR.sign(message.encode()).hex(),
+        "system_metrics": system_metrics,
+    }
 
 
 # --- Queue -----------------------------------------------------------------
@@ -375,6 +435,100 @@ class TestHeartbeat:
         public = (await client.get("/api/v1/public/validators")).json()
         assert public["validators"][0]["active_agent_id"] == str(agent_id)
 
+    async def test_v3_binds_coarse_metrics_and_public_response_is_redacted(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        timestamp = int(datetime.now(UTC).timestamp())
+        metrics = {**_SYSTEM_METRICS, "collected_at": timestamp}
+        payload = _heartbeat_payload(
+            protocol_version=3, timestamp=timestamp, system_metrics=metrics
+        )
+        response = await client.post(
+            "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=payload
+        )
+        assert response.status_code == 200, response.text
+
+        public = (await client.get("/api/v1/public/validators")).json()
+        entry = public["validators"][0]
+        assert entry["availability"] == "available"
+        assert entry["health"] == "healthy"
+        assert entry["first_seen_at"] is not None
+        assert entry["system_metrics"] == {
+            "cpu_percent": 15,
+            "memory_percent": 40,
+            "disk_percent": 55,
+            "docker_status": "healthy",
+            "running_containers": 4,
+            "unhealthy_containers": 0,
+        }
+        assert "signature" not in entry
+        assert "code_digest" not in entry
+        for forbidden in (
+            "hostname",
+            "ip",
+            "instance_id",
+            "path",
+            "container_name",
+            "image_digest",
+        ):
+            assert forbidden not in str(entry).lower()
+
+    async def test_v3_rejects_tampered_or_malformed_metrics(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        timestamp = int(datetime.now(UTC).timestamp())
+        metrics = {**_SYSTEM_METRICS, "collected_at": timestamp}
+        payload = _heartbeat_payload(
+            protocol_version=3, timestamp=timestamp, system_metrics=metrics
+        )
+        payload["system_metrics"]["memory_percent"] = 90  # type: ignore[index]
+        tampered = await client.post(
+            "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=payload
+        )
+        assert tampered.status_code == 401
+
+        malformed = _heartbeat_payload(
+            protocol_version=3, timestamp=timestamp, system_metrics=metrics
+        )
+        malformed["system_metrics"]["hostname"] = "private"  # type: ignore[index]
+        rejected = await client.post(
+            "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=malformed
+        )
+        assert rejected.status_code == 422
+
+    async def test_heartbeat_payload_size_is_bounded(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers={**_AUTH_HEADER, "Content-Length": "4097"},
+            json=_heartbeat_payload(),
+        )
+        assert response.status_code == 413
+
+        payload = json.dumps(_heartbeat_payload())
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers={**_AUTH_HEADER, "Content-Type": "application/json"},
+            content=(" " * 4097) + payload,
+        )
+        assert response.status_code == 413
+
     async def test_rejects_stale_heartbeat(
         self,
         app: FastAPI,
@@ -391,6 +545,106 @@ class TestHeartbeat:
         )
         assert response.status_code == 401
         assert response.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
+
+    @pytest.mark.e2e
+    async def test_mixed_fleet_and_malformed_telemetry(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Exercise reporter ingestion through both public fleet views."""
+        _install_db(app, session_maker)
+        _install_chain(app)
+        now = datetime.now(UTC)
+        timestamp = int(now.timestamp())
+        metrics = {**_SYSTEM_METRICS, "collected_at": timestamp}
+
+        old_validator = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers={"X-Validator-Hotkey": _KEYPAIRS[1].ss58_address},
+            json=_heartbeat_payload(keypair=_KEYPAIRS[1], protocol_version=2),
+        )
+        assert old_validator.status_code == 200, old_validator.text
+
+        metric_validator = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers={"X-Validator-Hotkey": _KEYPAIRS[2].ss58_address},
+            json=_heartbeat_payload(
+                keypair=_KEYPAIRS[2],
+                protocol_version=3,
+                timestamp=timestamp,
+                system_metrics=metrics,
+            ),
+        )
+        assert metric_validator.status_code == 200, metric_validator.text
+
+        screener_headers = {
+            "Authorization": "Bearer test-screener-token-at-least-32-characters",
+            "X-Screener-Hotkey": _KEYPAIR.ss58_address,
+        }
+        healthy_screener = await client.post(
+            "/api/v1/screener/heartbeat",
+            headers=screener_headers,
+            json=_screener_heartbeat_payload(
+                timestamp=timestamp, system_metrics=metrics
+            ),
+        )
+        assert healthy_screener.status_code == 200, healthy_screener.text
+
+        stale_at = now - timedelta(minutes=10)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreenerHeartbeat(
+                    screener_hotkey=_DAVE.ss58_address,
+                    software_version="0.4.1",
+                    protocol_version=1,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    state="polling",
+                    active_agent_id=None,
+                    first_seen_at=stale_at - timedelta(hours=2),
+                    system_metrics=metrics,
+                    reported_at=stale_at,
+                    seen_at=stale_at,
+                    signature="ab" * 64,
+                )
+            )
+
+        malformed = _heartbeat_payload(
+            keypair=_KEYPAIRS[2],
+            protocol_version=3,
+            timestamp=timestamp,
+            system_metrics=metrics,
+        )
+        malformed_metrics = malformed["system_metrics"]
+        assert isinstance(malformed_metrics, dict)
+        malformed_metrics["hostname"] = "must-never-be-accepted"
+        rejected = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers={"X-Validator-Hotkey": _KEYPAIRS[2].ss58_address},
+            json=malformed,
+        )
+        assert rejected.status_code == 422
+
+        validators = (await client.get("/api/v1/public/validators")).json()
+        assert validators["reported_count"] == 2
+        old = next(v for v in validators["validators"] if v["protocol_version"] == 2)
+        current = next(
+            v for v in validators["validators"] if v["protocol_version"] == 3
+        )
+        assert old["availability"] == "available"
+        assert old["health"] == "unknown"
+        assert old["system_metrics"] is None
+        assert current["availability"] == "available"
+        assert current["health"] == "healthy"
+
+        screeners = (await client.get("/api/v1/public/screeners")).json()
+        assert screeners["reported_count"] == 2
+        available = next(s for s in screeners["screeners"] if s["online"])
+        stale = next(s for s in screeners["screeners"] if not s["online"])
+        assert available["availability"] == "available"
+        assert available["health"] == "healthy"
+        assert stale["availability"] == "offline"
 
     async def test_rejects_tampered_digest(
         self,

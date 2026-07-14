@@ -64,6 +64,7 @@ class TestDashboard:
             "/api/v1/public/leaderboard",
             "/api/v1/public/activity",
             "/api/v1/public/validators",
+            "/api/v1/public/screeners",
         ],
     )
     async def test_api_still_mounted_alongside_dashboard(self, path: str) -> None:
@@ -76,15 +77,17 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert "Submission pipeline" in body
-        assert body.index("<h2>Leaderboard</h2>") < body.index(
-            "<h2>Submission pipeline</h2>"
-        )
+        assert body.index('class="operations"') < body.index("<h2>Leaderboard</h2>")
         assert 'getJSON("/public/activity?page="' in body
         assert 'id="activity-rows"' in body
         assert 'id="activity-pager"' in body
         assert 'id="pipeline-overview"' in body
+        assert "The machines behind the work." in body
         assert "Waiting for screening" in body
         assert "Waiting for validator" in body
+        assert "Evaluating" in body
+        assert 'id="pipeline-scored"' in body
+        assert 'data-pipeline-stage="scored"' in body
         assert 'getJSON("/public/activity?page=1&limit=200")' in body
         assert body.count('type="button" data-activity-page="prev"') == 2
         assert body.count('type="button" data-activity-page="next"') == 2
@@ -98,14 +101,28 @@ class TestDashboard:
         assert "Copy review:" in body
         assert "screening_reason" in body
 
-    async def test_includes_validator_fleet_status(self) -> None:
+    async def test_includes_accessible_fleet_status(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
-        assert "Validator fleet" in body
-        assert 'id="validator-summary"' in body
-        assert 'id="validator-rows"' in body
+        assert "Fleet health" in body
+        assert 'id="fleet-summary"' in body
+        assert 'id="fleet-rows"' in body
+        assert 'id="show-screeners"' in body
+        assert 'type="checkbox"' in body
+        assert '<label class="fleet-toggle" for="show-screeners">' in body
+        assert '<table class="fleet-table"' in body
+        assert '<th scope="col" style="width:105px">First seen</th>' in body
+        assert '<th scope="col" style="width:110px">Last heartbeat</th>' in body
+        assert '<th scope="col" style="width:108px">CPU</th>' in body
+        assert '<th scope="col" style="width:120px">Containers</th>' in body
+        assert "Missing optional telemetry is not an outage." in body
+        assert 'id="fleet-count-unknown"' in body
         assert 'getJSON("/public/validators")' in body
+        assert 'getJSON("/public/screeners")' in body
+        assert 'getElementById("show-screeners").addEventListener' in body
+        assert 'showScreeners ? "Screener" : "Validator"' in body
         assert "running_benchmark" in body
+        assert "system health not reported" in body
 
     async def test_includes_time_aware_theme_switcher(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))

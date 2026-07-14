@@ -58,6 +58,9 @@ clients are validated against that schema.
 | Method & path | Purpose |
 | --- | --- |
 | `POST /api/v1/validator/job` | Lease a scoring ticket (seed, dataset_sha256, run_size, deadline) |
+| `POST /api/v1/validator/heartbeat` | Submit a signed runtime heartbeat with optional coarse system health |
+| `GET /api/v1/public/validators` | Read the public-safe validator fleet view |
+| `GET /api/v1/public/screeners` | Read the public-safe platform screener fleet view |
 | `GET /api/v1/public/bench/config` | The frozen benchmark setup: locked model, judge-free grading, seed derivation, mirror |
 | `GET /api/v1/validator/agent/{id}/artifact` | Presigned download URL for an agent tarball |
 | `POST /api/v1/validator/agent/{id}/score` | Submit a signed DittoBench score (→ `scores` table) |
@@ -76,6 +79,7 @@ gate is the one the platform hosts.
 | Method & path | Purpose |
 | --- | --- |
 | `GET /api/v1/screener/queue` | List agents awaiting screening (status `uploaded`), oldest first |
+| `POST /api/v1/screener/heartbeat` | Submit a dedicated-auth signed screener health report |
 | `GET /api/v1/screener/agent/{id}/artifact` | Presigned download URL for the crate tarball |
 | `POST /api/v1/screener/agent/{id}/result` | Signed pass/fail verdict that promotes the agent |
 

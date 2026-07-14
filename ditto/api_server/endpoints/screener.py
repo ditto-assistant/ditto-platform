@@ -31,12 +31,14 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
     ArtifactResponse,
+    ScreenerHeartbeatRequest,
+    ScreenerHeartbeatResponse,
     ScreenerQueueItem,
     ScreenerQueueResponse,
     ScreenResultRequest,
@@ -44,6 +46,7 @@ from ditto.api_models import (
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.system_health import system_metrics_signing_token
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_dataset_generator,
@@ -60,6 +63,7 @@ from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.models import Agent, ScreeningAttempt
 from ditto.db.queries.agents import get_agent_by_id
+from ditto.db.queries.heartbeats import upsert_screener_heartbeat
 from ditto.db.queries.screening import (
     claim_screening_attempts,
     get_screening_attempt,
@@ -76,6 +80,8 @@ router = APIRouter(prefix="/screener", tags=["screener"])
 # How long a pre-signed artifact URL stays valid (mirrors the validator's).
 _ARTIFACT_URL_TTL = timedelta(minutes=5)
 _SCREENING_LEASE_TTL = timedelta(minutes=30)
+_HEARTBEAT_MAX_SKEW_SECONDS = 300
+_HEARTBEAT_MAX_BYTES = 4096
 
 # Policy v1 used the legacy three-field signature. Every policy from v2 onward
 # binds its version, including an older worker reporting a failure during a
@@ -176,6 +182,89 @@ async def require_screener(
 
 
 ScreenerDep = Annotated[str, Depends(require_screener)]
+
+
+def _heartbeat_signing_message(payload: ScreenerHeartbeatRequest) -> bytes:
+    """Canonical screener heartbeat bytes, mirrored by ``ditto-subnet``."""
+    return (
+        "ditto-screener-heartbeat:v1:"
+        f"{payload.screener_hotkey}:{payload.software_version}:"
+        f"{payload.protocol_version}:{payload.policy_version}:{payload.state}:"
+        f"{payload.active_agent_id or ''}:"
+        f"{system_metrics_signing_token(payload.system_metrics)}:{payload.timestamp}"
+    ).encode()
+
+
+@router.post(
+    "/heartbeat",
+    response_model=ScreenerHeartbeatResponse,
+    responses={
+        401: {"description": "Invalid screener credentials, signature, or timestamp."},
+        413: {"description": "Heartbeat payload exceeds the bounded contract."},
+    },
+)
+async def heartbeat(
+    request: Request,
+    request_body: ScreenerHeartbeatRequest,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+) -> ScreenerHeartbeatResponse:
+    """Record a fresh report signed by the dedicated screener identity."""
+    content_length = request.headers.get("content-length")
+    try:
+        claimed_bytes = int(content_length) if content_length is not None else 0
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="invalid Content-Length") from error
+    if (
+        claimed_bytes > _HEARTBEAT_MAX_BYTES
+        or len(await request.body()) > _HEARTBEAT_MAX_BYTES
+    ):
+        raise HTTPException(status_code=413, detail="heartbeat payload too large")
+    if request_body.screener_hotkey != screener_hotkey:
+        raise ScreenerAuthError("heartbeat body hotkey does not match header")
+    now = datetime.now(UTC)
+    if abs(int(now.timestamp()) - request_body.timestamp) > _HEARTBEAT_MAX_SKEW_SECONDS:
+        raise ScreenerAuthError("heartbeat timestamp is stale or too far in the future")
+    if (
+        request_body.system_metrics is not None
+        and abs(request_body.timestamp - request_body.system_metrics.collected_at)
+        > _HEARTBEAT_MAX_SKEW_SECONDS
+    ):
+        raise ScreenerAuthError(
+            "system metrics timestamp is outside the heartbeat window"
+        )
+    if request_body.active_agent_id is not None and request_body.state != "screening":
+        raise ScreenerAuthError("active agent requires screening state")
+    if not _verify_signature(
+        screener_hotkey,
+        _heartbeat_signing_message(request_body),
+        request_body.signature,
+    ):
+        raise ScreenerAuthError("heartbeat signature verification failed")
+
+    reported_at = datetime.fromtimestamp(request_body.timestamp, tz=UTC)
+    async with session.begin():
+        row, accepted = await upsert_screener_heartbeat(
+            session,
+            screener_hotkey=screener_hotkey,
+            software_version=request_body.software_version,
+            protocol_version=request_body.protocol_version,
+            policy_version=request_body.policy_version,
+            state=request_body.state,
+            active_agent_id=request_body.active_agent_id,
+            system_metrics=(
+                request_body.system_metrics.model_dump(mode="json")
+                if request_body.system_metrics is not None
+                else None
+            ),
+            reported_at=reported_at,
+            seen_at=now,
+            signature=request_body.signature,
+        )
+    seen_at = row.seen_at
+    if seen_at.tzinfo is None:
+        seen_at = seen_at.replace(tzinfo=UTC)
+    return ScreenerHeartbeatResponse(accepted=accepted, seen_at=seen_at)
 
 
 @router.get(

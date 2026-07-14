@@ -7,6 +7,7 @@ sr25519 dev keypair so the verification path runs for real.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -26,6 +27,10 @@ from sqlalchemy.ext.asyncio import (
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.system_health import (
+    SystemMetrics,
+    system_metrics_signing_token,
+)
 from ditto.api_server.datapipeline import DataPipelineError, NullGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -41,7 +46,7 @@ from ditto.api_server.middleware.error_envelope import (
 )
 from ditto.chain import ChainError
 from ditto.chain.models import BlockInfo, NeuronInfo
-from ditto.db.models import Agent, Base, ScreeningAttempt
+from ditto.db.models import Agent, Base, ScreenerHeartbeat, ScreeningAttempt
 from ditto_screening_protocol import verdict_signing_message
 
 _KEYPAIR = bittensor.Keypair.create_from_uri("//Alice")
@@ -88,6 +93,40 @@ def _result_payload(
     if isinstance(body.get("attempt_id"), UUID):
         body["attempt_id"] = str(body["attempt_id"])
     return body
+
+
+def _heartbeat_payload(
+    *,
+    timestamp: int | None = None,
+    state: str = "polling",
+    active_agent_id: UUID | None = None,
+    system_metrics: dict[str, object] | None = None,
+) -> dict[str, object]:
+    ts = timestamp if timestamp is not None else int(datetime.now(UTC).timestamp())
+    metrics = (
+        SystemMetrics.model_validate(system_metrics)
+        if system_metrics is not None
+        else None
+    )
+    message = (
+        "ditto-screener-heartbeat:v1:"
+        f"{_SCREENER_HOTKEY}:0.4.2:1:{SCREENING_POLICY_VERSION}:{state}:"
+        f"{active_agent_id or ''}:{system_metrics_signing_token(metrics)}:{ts}"
+    ).encode()
+    payload: dict[str, object] = {
+        "screener_hotkey": _SCREENER_HOTKEY,
+        "software_version": "0.4.2",
+        "protocol_version": 1,
+        "policy_version": SCREENING_POLICY_VERSION,
+        "state": state,
+        "timestamp": ts,
+        "signature": _sign(message),
+    }
+    if active_agent_id is not None:
+        payload["active_agent_id"] = str(active_agent_id)
+    if system_metrics is not None:
+        payload["system_metrics"] = system_metrics
+    return payload
 
 
 # --- DB + dependency wiring ------------------------------------------------
@@ -241,6 +280,110 @@ def _authenticate_screener_client(client: httpx.AsyncClient) -> None:
 
 
 # --- Queue -----------------------------------------------------------------
+
+
+class TestHeartbeat:
+    async def test_records_signed_metrics_and_is_publicly_visible(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        timestamp = int(datetime.now(UTC).timestamp())
+        metrics = {
+            "collected_at": timestamp,
+            "cpu_percent": 20,
+            "memory_percent": 35,
+            "disk_percent": 50,
+            "docker": {
+                "status": "healthy",
+                "running_containers": 3,
+                "unhealthy_containers": 0,
+            },
+        }
+        payload = _heartbeat_payload(timestamp=timestamp, system_metrics=metrics)
+        response = await client.post("/api/v1/screener/heartbeat", json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["accepted"] is True
+
+        async with session_maker() as session:
+            stored = await session.get(ScreenerHeartbeat, _SCREENER_HOTKEY)
+            assert stored is not None
+            assert stored.first_seen_at is not None
+            assert stored.system_metrics is not None
+            assert stored.system_metrics["docker"]["running_containers"] == 3
+
+        public = (await client.get("/api/v1/public/screeners")).json()
+        assert public["reported_count"] == 1
+        entry = public["screeners"][0]
+        assert entry["screener_hotkey"] == _SCREENER_HOTKEY
+        assert entry["availability"] == "available"
+        assert entry["health"] == "healthy"
+        assert entry["system_metrics"]["docker_status"] == "healthy"
+        assert "signature" not in entry
+
+        replay = await client.post("/api/v1/screener/heartbeat", json=payload)
+        assert replay.status_code == 200
+        assert replay.json()["accepted"] is False
+
+    async def test_rejects_tampering_arbitrary_metrics_and_wrong_auth(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        timestamp = int(datetime.now(UTC).timestamp())
+        metrics = {
+            "collected_at": timestamp,
+            "cpu_percent": 20,
+            "memory_percent": 35,
+            "disk_percent": 50,
+            "docker": {
+                "status": "healthy",
+                "running_containers": 3,
+                "unhealthy_containers": 0,
+            },
+        }
+        tampered = _heartbeat_payload(timestamp=timestamp, system_metrics=metrics)
+        tampered["system_metrics"]["disk_percent"] = 90  # type: ignore[index]
+        response = await client.post("/api/v1/screener/heartbeat", json=tampered)
+        assert response.status_code == 401
+
+        malformed = _heartbeat_payload(timestamp=timestamp, system_metrics=metrics)
+        malformed["system_metrics"]["container_names"] = ["secret"]  # type: ignore[index]
+        response = await client.post("/api/v1/screener/heartbeat", json=malformed)
+        assert response.status_code == 422
+
+        response = await client.post(
+            "/api/v1/screener/heartbeat",
+            headers={**_AUTH_HEADER, "Authorization": "Bearer wrong-token"},
+            json=_heartbeat_payload(),
+        )
+        assert response.status_code == 401
+
+    async def test_heartbeat_payload_size_is_bounded(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        response = await client.post(
+            "/api/v1/screener/heartbeat",
+            headers={"Content-Length": "4097"},
+            json=_heartbeat_payload(),
+        )
+        assert response.status_code == 413
+
+        payload = json.dumps(_heartbeat_payload())
+        response = await client.post(
+            "/api/v1/screener/heartbeat",
+            headers={"Content-Type": "application/json"},
+            content=(" " * 4097) + payload,
+        )
+        assert response.status_code == 413
 
 
 class TestQueue:

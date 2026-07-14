@@ -488,6 +488,10 @@ class ValidatorHeartbeat(Base):
     active_agent_id: Mapped[UUID | None] = mapped_column(
         SaUUID(as_uuid=True), nullable=True
     )
+    first_seen_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    system_metrics: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )
@@ -509,7 +513,7 @@ class ValidatorHeartbeat(Base):
         ),
         CheckConstraint(
             "state IN ('polling', 'running_benchmark', 'updating_weights', "
-            "'idle', 'error')",
+            "'idle', 'error', 'paused')",
             name="validator_heartbeats_state_check",
         ),
         CheckConstraint(
@@ -525,6 +529,65 @@ class ValidatorHeartbeat(Base):
         Index("validator_heartbeats_seen_at_idx", "seen_at"),
         Index(
             "validator_heartbeats_active_agent_idx",
+            "active_agent_id",
+            postgresql_where=text("active_agent_id IS NOT NULL"),
+        ),
+    )
+
+
+class ScreenerHeartbeat(Base):
+    """Latest signed runtime and host-health report for one screener hotkey."""
+
+    __tablename__ = "screener_heartbeats"
+
+    screener_hotkey: Mapped[str] = mapped_column(Text, primary_key=True)
+    software_version: Mapped[str] = mapped_column(Text, nullable=False)
+    protocol_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    active_agent_id: Mapped[UUID | None] = mapped_column(
+        SaUUID(as_uuid=True), nullable=True
+    )
+    first_seen_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    system_metrics: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    reported_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    seen_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    signature: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "length(software_version) BETWEEN 1 AND 64",
+            name="screener_heartbeats_software_version_length_check",
+        ),
+        CheckConstraint(
+            "protocol_version > 0",
+            name="screener_heartbeats_protocol_version_check",
+        ),
+        CheckConstraint(
+            "policy_version > 0",
+            name="screener_heartbeats_policy_version_check",
+        ),
+        CheckConstraint(
+            "state IN ('polling', 'screening', 'error', 'paused')",
+            name="screener_heartbeats_state_check",
+        ),
+        CheckConstraint(
+            "length(signature) = 128",
+            name="screener_heartbeats_signature_length_check",
+        ),
+        ForeignKeyConstraint(
+            ["active_agent_id"],
+            ["agents.agent_id"],
+            ondelete="SET NULL",
+            name="screener_heartbeats_active_agent_id_fkey",
+        ),
+        Index("screener_heartbeats_seen_at_idx", "seen_at"),
+        Index(
+            "screener_heartbeats_active_agent_idx",
             "active_agent_id",
             postgresql_where=text("active_agent_id IS NOT NULL"),
         ),
