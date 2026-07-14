@@ -13,7 +13,7 @@ workers look identical to an operator.
 Lifecycle + scope decisions (documented so they're easy to revisit):
 
 - **Queue = new uploads, retryable failures, and stale-policy results.**
-  Oldest-first drains in arrival order and re-screens in place.
+  Submissions with fewer accepted scores drain first; arrival order breaks ties.
 - **Verdict is a direct promotion.** A pass sets ``evaluating`` (not
   ``screening_passed``). A deterministic fail sets ``rejected``; an
   infrastructure fail remains retryable as ``screening_failed``. Re-reporting
@@ -67,6 +67,7 @@ from ditto.db.queries.heartbeats import upsert_screener_heartbeat
 from ditto.db.queries.screening import (
     claim_screening_attempts,
     get_screening_attempt,
+    screening_score_count,
 )
 from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
 
@@ -301,7 +302,7 @@ async def queue(
     session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> ScreenerQueueResponse:
-    """List new and stale-policy agents awaiting screening, oldest first."""
+    """List least-scored pending agents, oldest first within each score bucket."""
     response.headers["Cache-Control"] = "no-store"
     agents = (
         await session.scalars(
@@ -321,7 +322,11 @@ async def queue(
                     ),
                 )
             )
-            .order_by(Agent.created_at.asc())
+            .order_by(
+                screening_score_count().asc(),
+                Agent.created_at.asc(),
+                Agent.agent_id.asc(),
+            )
             .limit(limit)
         )
     ).all()

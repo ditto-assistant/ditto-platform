@@ -6,14 +6,25 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import exists, or_, select
+from sqlalchemy import exists, func, or_, select
+from sqlalchemy.sql.selectable import ScalarSelect
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
-from ditto.db.models import Agent, ScreeningAttempt
+from ditto.db.models import Agent, Score, ScreeningAttempt
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+
+def screening_score_count() -> ScalarSelect[int]:
+    """Return the accepted-score count correlated to the current agent."""
+    return (
+        select(func.count())
+        .where(Score.agent_id == Agent.agent_id)
+        .correlate(Agent)
+        .scalar_subquery()
+    )
 
 
 async def expire_screening_attempts(session: AsyncSession, *, now: datetime) -> int:
@@ -47,7 +58,7 @@ async def claim_screening_attempts(
     ttl: timedelta,
     limit: int,
 ) -> list[tuple[Agent, ScreeningAttempt]]:
-    """Atomically claim oldest eligible submissions for one screener."""
+    """Claim least-scored eligible submissions, then oldest within that bucket."""
     await expire_screening_attempts(session, now=now)
     has_running = exists(
         select(ScreeningAttempt.attempt_id).where(
@@ -72,7 +83,11 @@ async def claim_screening_attempts(
         await session.scalars(
             select(Agent)
             .where(eligible, ~has_running)
-            .order_by(Agent.created_at.asc(), Agent.agent_id.asc())
+            .order_by(
+                screening_score_count().asc(),
+                Agent.created_at.asc(),
+                Agent.agent_id.asc(),
+            )
             .limit(limit)
             .with_for_update(of=Agent, skip_locked=True)
         )
