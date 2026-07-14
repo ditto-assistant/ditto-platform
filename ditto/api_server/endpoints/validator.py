@@ -22,13 +22,15 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
   gate holds it). No single validator is decisive; the transition lives in one
   place (:data:`_SCOREABLE_STATUSES` + the handler).
 - **Auth.** Only chain-registered hotkeys holding a ``validator_permit`` may
-  call these. The score POST additionally verifies an sr25519 signature over a
+  call these. Job claims additionally carry a fresh, one-time signed nonce so a
+  caller cannot reserve work by merely naming somebody else's permitted
+  hotkey. The score POST verifies an sr25519 signature over a
   **canonical payload** binding the agent id and the reported
   ``run_id`` / ``composite`` / ``seed`` (see :func:`_score_signing_message`), so
   a captured signature can neither be replayed against a different agent nor
-  cover an altered composite. The GET endpoints authenticate via the
-  ``X-Validator-Hotkey`` header + the on-chain permit check; binding those
-  reads to a per-request signature (nonce/timestamp) is a known gap.
+  cover an altered composite. The remaining GET endpoints are read-only and
+  authenticate via the ``X-Validator-Hotkey`` header + on-chain permit check;
+  they cannot allocate a quorum slot or submit a score.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
     ArtifactResponse,
+    JobRequest,
     JobResponse,
     ScoreReport,
     SubmitScoreRequest,
@@ -84,6 +87,10 @@ from ditto.db.queries.tickets import (
     issue_ticket,
     mark_ticket_scored,
 )
+from ditto.db.queries.validator_auth import (
+    ValidatorRequestReplayError,
+    consume_validator_nonce,
+)
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -98,6 +105,11 @@ _ARTIFACT_URL_TTL = timedelta(minutes=5)
 # How long a validator has to redeem a ticket with a score before it lapses and
 # the slot re-opens for another validator.
 _TICKET_TTL = timedelta(minutes=30)
+
+# Signed job claims outside this window are stale. A consumed nonce remains in
+# the database for the same window, making replay rejection consistent across
+# every API replica without introducing another secret.
+_JOB_REQUEST_MAX_AGE = timedelta(minutes=2)
 
 
 # Object-store key the upload pipeline writes the tarball under.
@@ -228,22 +240,37 @@ async def require_validator(
 ValidatorDep = Annotated[str, Depends(require_validator)]
 
 
+def _lease_token(deadline: datetime) -> str:
+    """Canonical UTC token that binds a score to one ticket lease."""
+    return deadline.astimezone(UTC).isoformat(timespec="microseconds")
+
+
 def _score_signing_message(
-    validator_hotkey: str, agent_id: UUID, report: ScoreReport
+    validator_hotkey: str,
+    agent_id: UUID,
+    ticket_deadline: datetime | None,
+    report: ScoreReport,
 ) -> bytes:
     """Canonical bytes a score signature is verified against.
 
     Must match the validator's ``sign_score`` byte-for-byte:
-    ``{validator_hotkey}:{agent_id}:{run_id}:{composite!r}:{seed}``. Binding the
-    agent id + composite + seed (not just ``run_id``) means a captured signature
-    cannot be replayed for a different agent, and the recorded composite cannot
-    be altered without invalidating it. ``composite`` uses Python's shortest
-    round-trip float repr, which the JSON transport preserves exactly.
+    ``{validator_hotkey}:{agent_id}:{ticket_deadline}:{run_id}:``
+    ``{composite!r}:{seed}``. Binding the exact lease means a response from an
+    expired attempt cannot be replayed after the ticket is reissued.
     """
+    lease = _lease_token(ticket_deadline) if ticket_deadline is not None else ""
     return (
-        f"{validator_hotkey}:{agent_id}:{report.run_id}:"
+        f"{validator_hotkey}:{agent_id}:{lease}:{report.run_id}:"
         f"{report.composite!r}:{report.seed}"
     ).encode()
+
+
+def _job_signing_message(
+    validator_hotkey: str, nonce: UUID, requested_at: datetime
+) -> bytes:
+    """Canonical bytes proving possession of a hotkey for one job claim."""
+    requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
+    return f"validator-job:{validator_hotkey}:{nonce}:{requested}".encode()
 
 
 def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:
@@ -266,13 +293,17 @@ def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:
     responses={
         204: {"description": "No agent needs this validator right now."},
         401: {"description": "Missing/invalid validator auth."},
+        409: {"description": "Stale or replayed signed job claim."},
         503: {"description": "Chain unavailable for the permit check."},
     },
 )
 async def request_job(
+    payload: JobRequest,
+    request: Request,
     response: Response,
-    validator_hotkey: ValidatorDep,
+    chain: ChainDep,
     session: SessionDep,
+    x_validator_hotkey: Annotated[str | None, Header()] = None,
 ) -> JobResponse | Response:
     """Issue this validator a scoring ticket for the next eligible agent.
 
@@ -282,10 +313,47 @@ async def request_job(
     deadline, or it lapses and the slot re-opens for another validator. The
     ticket write (and the overdue-ticket sweep it runs) commit together.
     """
+    # Prove the caller owns the hotkey before it can reserve a scarce quorum
+    # slot. The header remains for consistent routing/audit but must match the
+    # signed body exactly.
+    if x_validator_hotkey != payload.validator_hotkey:
+        raise ValidatorAuthError("job claim header does not match signed hotkey")
+    signed = _job_signing_message(
+        payload.validator_hotkey, payload.nonce, payload.requested_at
+    )
+    if not _verify_signature(payload.validator_hotkey, signed, payload.signature):
+        raise ValidatorAuthError(
+            f"job claim signature did not verify for hotkey {payload.validator_hotkey}"
+        )
     now = datetime.now(UTC)
+    requested_at = payload.requested_at.astimezone(UTC)
+    if abs(now - requested_at) > _JOB_REQUEST_MAX_AGE:
+        raise HTTPException(status_code=409, detail="job claim timestamp is stale")
+
+    netuid = request.app.state.config.chain.netuid
+    network = request.app.state.config.chain.subtensor_network
+    await _assert_validator_permitted(
+        chain, netuid, payload.validator_hotkey, network=network
+    )
+
     async with session.begin():
+        try:
+            await consume_validator_nonce(
+                session,
+                nonce=payload.nonce,
+                validator_hotkey=payload.validator_hotkey,
+                now=now,
+                expires_at=now + _JOB_REQUEST_MAX_AGE,
+            )
+        except ValidatorRequestReplayError as exc:
+            raise HTTPException(
+                status_code=409, detail="job claim nonce has already been used"
+            ) from exc
         ticket = await issue_ticket(
-            session, validator_hotkey=validator_hotkey, now=now, ttl=_TICKET_TTL
+            session,
+            validator_hotkey=payload.validator_hotkey,
+            now=now,
+            ttl=_TICKET_TTL,
         )
         if ticket is None:
             return Response(status_code=204, headers={"Cache-Control": "no-store"})
@@ -307,7 +375,7 @@ async def request_job(
     logger.info(
         "issued job agent=%s validator=%s deadline=%s",
         job.agent_id,
-        validator_hotkey,
+        payload.validator_hotkey,
         job.deadline.isoformat(),
     )
     return job
@@ -386,7 +454,9 @@ async def submit_score(
 
     # 1. Signature proves the reporting validator owns the hotkey and binds the
     #    agent + score contents (anti-replay / anti-tamper). CPU-only, no I/O.
-    signed = _score_signing_message(payload.validator_hotkey, agent_id, report)
+    signed = _score_signing_message(
+        payload.validator_hotkey, agent_id, payload.ticket_deadline, report
+    )
     if not _verify_signature(payload.validator_hotkey, signed, payload.signature):
         raise ValidatorAuthError(
             f"score signature did not verify for hotkey {payload.validator_hotkey}"
@@ -410,6 +480,11 @@ async def submit_score(
             raise AgentNotEvaluatableError(
                 f"agent {agent_id} is {agent.status}, not in {_SCOREABLE_STATUSES}"
             )
+        if payload.ticket_deadline is None:
+            raise HTTPException(
+                status_code=409,
+                detail="score submission is missing its ticket lease deadline",
+            )
         # k=3 gate: a score is only accepted against a live ticket this validator
         # holds for the agent. No ticket (never issued, expired, or already
         # spent) means the score is unsolicited or late, so it is rejected and
@@ -420,6 +495,7 @@ async def submit_score(
             agent_id=agent_id,
             validator_hotkey=payload.validator_hotkey,
             now=datetime.now(UTC),
+            deadline=payload.ticket_deadline,
         )
         if ticket is None:
             raise HTTPException(
@@ -435,6 +511,10 @@ async def submit_score(
         # surfaces a safe subset of this; the full blob (incl. per_case answer-key
         # fields) is only ever read back through validator-gated endpoints.
         score_details: dict[str, Any] = dict(report.details or {})
+        # Persist the exact lease identity alongside the signature so public
+        # records remain independently verifiable. Existing scores have no such
+        # key and intentionally remain valid legacy records.
+        score_details["ticket_deadline"] = _lease_token(payload.ticket_deadline)
         # Stamp the current benchmark version when the scorer omitted it, so no
         # run scored from now on is ever recorded as "legacy" (null version).
         # An explicit version in the report is left as-is (honest provenance).
@@ -486,6 +566,7 @@ async def submit_score(
                 "memory_mean": report.memory_mean,
                 "median_ms": report.median_ms,
                 "n": report.n,
+                "ticket_deadline": _lease_token(payload.ticket_deadline),
                 "signature": payload.signature,
                 "generated_at": report.generated_at.isoformat(),
             },
@@ -596,8 +677,11 @@ async def _publish_finalized_run(
     The record carries everything an offline verifier needs: the dataset pin
     (seed, sha256, seed block), the k=3 signed scores with their full details
     (per-case breakdown included), and the median the platform finalized on.
-    Signatures cover ``{hotkey}:{agent_id}:{run_id}:{composite!r}:{seed}``, so
-    the record is self-verifying against the validators' on-chain hotkeys.
+    Current signatures cover
+    ``{hotkey}:{agent_id}:{ticket_deadline}:{run_id}:{composite!r}:{seed}``;
+    legacy scores have no ``ticket_deadline`` detail and retain the previous
+    payload format. The record therefore carries the lease identity needed to
+    verify either generation against the validator's on-chain hotkey.
     No-op when ``STORAGE_PUBLIC_BUCKET`` is unset; failures log only.
     """
     if storage.public_bucket is None:
@@ -616,6 +700,11 @@ async def _publish_finalized_run(
             {
                 "validator_hotkey": sc.validator_hotkey,
                 "run_id": sc.run_id,
+                "ticket_deadline": (
+                    sc.details.get("ticket_deadline")
+                    if isinstance(sc.details, dict)
+                    else None
+                ),
                 "seed": sc.seed,
                 "composite": sc.composite,
                 "tool_mean": sc.tool_mean,
