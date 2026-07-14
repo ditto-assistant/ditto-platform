@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
@@ -41,6 +41,12 @@ def _as_utc(dt: datetime) -> datetime:
 # expired ticket does not count, so its slot re-opens.
 _LIVE_TICKET_STATUSES = (TicketStatus.ISSUED, TicketStatus.SCORED)
 
+# A timed-out artifact must not monopolize one validator. Give transient
+# failures one delayed retry, while allowing other validators to make an
+# independent attempt immediately.
+RETRY_COOLDOWN = timedelta(hours=6)
+MAX_ATTEMPTS_PER_VERSION = 2
+
 
 async def expire_overdue_tickets(session: AsyncSession, *, now: datetime) -> int:
     """Flip every overdue ``issued`` ticket to ``expired``; return the count.
@@ -50,22 +56,22 @@ async def expire_overdue_tickets(session: AsyncSession, *, now: datetime) -> int
     transaction. Idempotent: a second call over the same window flips nothing.
     """
     overdue = (
-        await session.execute(
-            select(ValidatorTicket.agent_id, ValidatorTicket.validator_hotkey).where(
-                ValidatorTicket.status == TicketStatus.ISSUED,
-                ValidatorTicket.deadline < now,
+        (
+            await session.execute(
+                select(ValidatorTicket).where(
+                    ValidatorTicket.status == TicketStatus.ISSUED,
+                    ValidatorTicket.deadline < now,
+                )
             )
         )
-    ).all()
-    if overdue:
-        await session.execute(
-            update(ValidatorTicket)
-            .where(
-                ValidatorTicket.status == TicketStatus.ISSUED,
-                ValidatorTicket.deadline < now,
-            )
-            .values(status=TicketStatus.EXPIRED)
-        )
+        .scalars()
+        .all()
+    )
+    for ticket in overdue:
+        ticket.status = TicketStatus.EXPIRED
+        # Cooldown begins at the lease deadline, not whenever a later sweep
+        # happens to notice it.
+        ticket.retry_after = _as_utc(ticket.deadline) + RETRY_COOLDOWN
     return len(overdue)
 
 
@@ -75,24 +81,46 @@ async def issue_ticket(
     validator_hotkey: str,
     now: datetime,
     ttl: timedelta,
+    bench_version: int = 2,
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
     Sweeps overdue tickets first, then picks the oldest ``evaluating`` agent
     that (a) has fewer than :data:`SCORING_QUORUM` live tickets and (b) this
     validator does not already hold a live or scored ticket for. A prior expired
-    row is reissued with a ``now + ttl`` deadline. Returns the ticket, or ``None``
-    when there is no work for this validator ("no job for you"). Runs inside the
-    caller's transaction.
+    row is reissued only after its cooldown and only once for the same benchmark
+    version, so never-attempted agents move ahead of a slow retry. Returns the
+    ticket, or ``None`` when there is no work for this validator ("no job for
+    you"). Runs inside the caller's transaction.
     """
     await expire_overdue_tickets(session, now=now)
 
-    # Agents this validator already has a live or scored ticket for. Expired
-    # tickets are intentionally excluded: validators are stateless workers, so
-    # a repaired/restarted validator must be able to retry unfinished work.
+    # Agents this validator must not receive right now: live/scored tickets,
+    # same-version tickets cooling down after expiry, and same-version tickets
+    # that already consumed the two-attempt budget. A benchmark-version bump
+    # resets the budget so repaired scoring software can revisit the artifact.
     already_mine = select(ValidatorTicket.agent_id).where(
         ValidatorTicket.validator_hotkey == validator_hotkey,
-        ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES),
+        (
+            ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES)
+            | (
+                (ValidatorTicket.status == TicketStatus.EXPIRED)
+                & (ValidatorTicket.bench_version == bench_version)
+                & (
+                    (ValidatorTicket.retry_after > now)
+                    | (ValidatorTicket.attempt_count >= MAX_ATTEMPTS_PER_VERSION)
+                )
+            )
+        ),
+    )
+    had_prior_ticket = (
+        select(ValidatorTicket.agent_id)
+        .where(
+            ValidatorTicket.agent_id == Agent.agent_id,
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+        )
+        .correlate(Agent)
+        .exists()
     )
     # Lock one candidate Agent row before counting its tickets. The recount is a
     # separate statement after the lock is acquired, so under Postgres READ
@@ -108,7 +136,9 @@ async def issue_ticket(
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
         candidate = (
-            candidate.order_by(Agent.created_at.asc())
+            # Never-attempted work always precedes a cooled-down retry, even
+            # when the retrying submission is older.
+            candidate.order_by(had_prior_ticket.asc(), Agent.created_at.asc())
             .limit(1)
             .with_for_update(of=Agent, skip_locked=True)
         )
@@ -133,14 +163,21 @@ async def issue_ticket(
             status=TicketStatus.ISSUED,
             issued_at=now,
             deadline=now + ttl,
+            bench_version=bench_version,
+            attempt_count=1,
+            retry_after=None,
         )
         session.add(ticket)
     else:
         # The composite PK preserves one validator slot per agent. Reuse the
         # expired row with a fresh lease rather than inserting a duplicate.
+        same_version = ticket.bench_version == bench_version
         ticket.status = TicketStatus.ISSUED
         ticket.issued_at = now
         ticket.deadline = now + ttl
+        ticket.bench_version = bench_version
+        ticket.attempt_count = ticket.attempt_count + 1 if same_version else 1
+        ticket.retry_after = None
     await session.flush()
     return ticket
 

@@ -646,6 +646,17 @@ class ValidatorTicket(Base):
     deadline: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     """When an unscored ticket expires and its slot re-opens (UTC)."""
 
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    """Benchmark version whose retry budget this ticket consumes."""
+
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    """Number of leases issued to this validator for this agent/version."""
+
+    retry_after: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    """Earliest time this validator may retry an expired ticket."""
+
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=False,
@@ -672,6 +683,14 @@ class ValidatorTicket(Base):
             name="validator_tickets_agent_id_fkey",
         ),
         Index("validator_tickets_agent_id_idx", "agent_id"),
+        CheckConstraint(
+            "bench_version > 0",
+            name="validator_tickets_bench_version_positive",
+        ),
+        CheckConstraint(
+            "attempt_count > 0",
+            name="validator_tickets_attempt_count_positive",
+        ),
         # The expiry sweep and the live-slot count both scan open tickets only;
         # a partial index keeps those hot paths off the full table.
         Index(
