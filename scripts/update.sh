@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Zero-downtime update for the Ditto Platform API:
-#   fetch -> reset -> uv sync -> set payment addr -> ensure Pylon -> migrate -> pm2 start/reload.
+#   fetch -> reset -> uv sync -> set deploy config -> ensure Pylon -> migrate -> pm2 start/reload.
 # Invoked on the host by the ditto-platform deploy workflow (push dev|main ->
 # IAP SSH). DITTO_DEPLOY_BRANCH defaults to the current branch; CI passes the
 # branch that was pushed so the checkout is deterministic.
@@ -43,6 +43,25 @@ upsert_env() {
 # wandb project URL injected into the served dashboard's telemetry link.
 upsert_env DITTO_UPLOAD_PAYMENT_ADDRESS "${DITTO_UPLOAD_PAYMENT_ADDRESS:-}"
 upsert_env DITTO_DASHBOARD_WANDB_URL "${DITTO_DASHBOARD_WANDB_URL:-}"
+
+# Validator-name enrichment is optional decoration. Read its API key directly
+# on the VM via the attached runtime service account so the value never crosses
+# GitHub Actions or SSH. A failed/slow Secret Manager lookup keeps any existing
+# .env value and must not block a platform deploy.
+taostats_secret_project="${DITTO_TAOSTATS_SECRET_PROJECT:-ditto-app-dev}"
+taostats_secret_id="${DITTO_TAOSTATS_SECRET_ID:-platform-taostats-api-key}"
+taostats_api_key=""
+if command -v gcloud >/dev/null 2>&1 && \
+  taostats_api_key="$(timeout 15s gcloud secrets versions access latest \
+    --project="$taostats_secret_project" \
+    --secret="$taostats_secret_id" 2>/dev/null)"; then
+  upsert_env DITTO_TAOSTATS_API_KEY "$taostats_api_key"
+  upsert_env DITTO_TAOSTATS_VALIDATOR_NAMES_URL \
+    "https://api.taostats.io/api/dtao/validator/available/v1?netuid=118"
+else
+  echo "==> Taostats key unavailable; keeping validator-name enrichment unchanged" >&2
+fi
+unset taostats_api_key taostats_secret_id taostats_secret_project
 
 set -a; . ./.env; set +a
 

@@ -28,7 +28,8 @@ def healthy_metrics() -> PublicSystemMetrics:
     [
         ("idle", timedelta(seconds=30), "healthy", (True, "available", "healthy")),
         ("idle", timedelta(seconds=30), "warning", (True, "available", "warning")),
-        ("idle", timedelta(minutes=6), "healthy", (False, "offline", "healthy")),
+        ("idle", timedelta(minutes=6), "healthy", (False, "stale", "healthy")),
+        ("idle", timedelta(minutes=16), "healthy", (False, "offline", "healthy")),
         ("paused", timedelta(seconds=30), "healthy", (True, "paused", "healthy")),
         ("idle", timedelta(seconds=30), "missing", (True, "available", "unknown")),
         ("idle", timedelta(seconds=30), "partial", (True, "available", "unknown")),

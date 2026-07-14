@@ -563,6 +563,10 @@ class TestHeartbeat:
             assert shown["agent_id"] == str(agent_id)
 
             if progress["stage"] == "running_benchmark" and progress["completed"] == 51:
+                started_at = datetime.fromisoformat(
+                    shown.pop("started_at").replace("Z", "+00:00")
+                )
+                assert started_at.tzinfo == UTC
                 assert shown == {
                     "agent_id": str(agent_id),
                     "agent_name": "alpha-agent",
@@ -827,7 +831,7 @@ class TestHeartbeat:
         )
         assert restarted.status_code == 200, restarted.text
 
-    async def test_v4_rejects_progress_without_matching_live_ticket(
+    async def test_v4_drops_progress_without_matching_live_ticket_but_stays_live(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -849,7 +853,15 @@ class TestHeartbeat:
                 benchmark_progress=_progress("preparing"),
             ),
         )
-        assert missing.status_code == 409
+        assert missing.status_code == 200, missing.text
+        assert missing.json()["accepted"] is True
+
+        async with session_maker() as session:
+            heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert heartbeat is not None
+            assert heartbeat.state == "running_benchmark"
+            assert heartbeat.active_agent_id is None
+            assert heartbeat.benchmark_progress_reported is False
 
         await _seed_ticket(session_maker, agent_id)
         wrong_deadline = await client.post(
@@ -865,7 +877,69 @@ class TestHeartbeat:
                 ),
             ),
         )
-        assert wrong_deadline.status_code == 409
+        assert wrong_deadline.status_code == 200, wrong_deadline.text
+        assert wrong_deadline.json()["accepted"] is True
+
+        async with session_maker() as session:
+            heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert heartbeat is not None
+            assert heartbeat.active_agent_id is None
+            assert heartbeat.benchmark_progress_reported is False
+            ticket = await session.get(ValidatorTicket, (agent_id, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.status == TicketStatus.ISSUED
+            assert ticket.deadline.replace(tzinfo=UTC) == _TICKET_DEADLINE
+
+    async def test_v4_expired_ticket_progress_cannot_block_heartbeat_recovery(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        deadline = datetime.now(UTC) - timedelta(minutes=1)
+        await _seed_ticket(session_maker, agent_id, deadline=deadline)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        timestamp = int(datetime.now(UTC).timestamp())
+
+        recovered = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                timestamp=timestamp,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+                benchmark_progress=_progress(
+                    "running_benchmark",
+                    completed=51,
+                    total=114,
+                    ticket_deadline=deadline,
+                ),
+            ),
+        )
+
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["accepted"] is True
+        fleet = (await client.get("/api/v1/public/validators")).json()
+        validator = fleet["validators"][0]
+        assert validator["availability"] == "available"
+        assert validator["online"] is True
+        assert validator["active_agent_id"] is None
+        assert validator["active_benchmark"] is None
+
+        async with session_maker() as session:
+            ticket = await session.get(ValidatorTicket, (agent_id, _VALIDATOR_HOTKEY))
+            heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert ticket is not None
+            assert ticket.status == TicketStatus.ISSUED
+            assert ticket.deadline.replace(tzinfo=UTC) == deadline
+            assert heartbeat is not None
+            assert heartbeat.seen_at is not None
+            assert heartbeat.active_agent_id is None
+            assert heartbeat.benchmark_progress is None
+            assert heartbeat.benchmark_progress_reported is False
 
     async def test_v3_binds_coarse_metrics_and_public_response_is_redacted(
         self,
@@ -1076,7 +1150,7 @@ class TestHeartbeat:
         stale = next(s for s in screeners["screeners"] if not s["online"])
         assert available["availability"] == "available"
         assert available["health"] == "healthy"
-        assert stale["availability"] == "offline"
+        assert stale["availability"] == "stale"
 
     async def test_rejects_tampered_digest(
         self,

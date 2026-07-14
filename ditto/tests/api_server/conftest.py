@@ -18,7 +18,12 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from ditto.api_server import ApiServerConfig, ScreenerAuthConfig, create_api_server
+from ditto.api_server import (
+    ApiServerConfig,
+    ScreenerAuthConfig,
+    ValidatorNamesConfig,
+    create_api_server,
+)
 from ditto.api_server.datapipeline import DataPipelineConfig, NullGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -90,6 +95,7 @@ def make_api_server_config(**overrides: Any) -> ApiServerConfig:
             hotkey="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
             api_token="test-screener-token-at-least-32-characters",
         ),
+        validator_names=ValidatorNamesConfig(),
     )
     if overrides:
         from dataclasses import replace

@@ -43,6 +43,7 @@ from ditto.api_server.middleware import (
 from ditto.api_server.payment_verifier import create_payment_verifier
 from ditto.api_server.pricing import create_price_oracle
 from ditto.api_server.storage import create_storage_client
+from ditto.api_server.validator_names import create_validator_names
 from ditto.chain import create_chain_client
 from ditto.db import create_db_engine, create_session_maker
 
@@ -113,6 +114,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             generator = create_generator(config.data_pipeline)
             stack.push_async_callback(generator.aclose)
             app.state.dataset_generator = generator
+
+            validator_names = app.state.validator_names
+            stack.push_async_callback(validator_names.aclose)
+            await validator_names.start()
         except Exception as e:
             raise ApiServerLifespanError(
                 f"failed to open dependencies during startup: {e}"
@@ -147,6 +152,10 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     )
     app.state.config = config
     app.state.commit_hash = config.commit_hash
+    # The object exists even when lifespan is skipped in unit tests. Its
+    # snapshot path is synchronous and disabled by default; production lifespan
+    # starts the optional background refresher without blocking API startup.
+    app.state.validator_names = create_validator_names(config.validator_names)
 
     # Starlette inserts each middleware at position 0, so the LAST
     # add_middleware call ends up outermost on the wire. RequestIDMiddleware

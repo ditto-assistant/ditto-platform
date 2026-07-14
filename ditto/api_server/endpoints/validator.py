@@ -430,6 +430,12 @@ async def heartbeat(
 
     reported_at = datetime.fromtimestamp(request_body.timestamp, tz=UTC)
     async with session.begin():
+        stored_active_agent_id = request_body.active_agent_id
+        stored_benchmark_progress = (
+            request_body.benchmark_progress.model_dump(mode="json")
+            if request_body.benchmark_progress is not None
+            else None
+        )
         if request_body.benchmark_progress is not None:
             assert request_body.active_agent_id is not None
             agent = await get_agent_by_id(
@@ -448,12 +454,17 @@ async def heartbeat(
                 or agent is None
                 or agent.status != AgentStatus.EVALUATING
             ):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "benchmark progress does not match a live issued ticket "
-                        "for an evaluating agent"
-                    ),
+                # Ticket-bound progress is optional decoration. A benchmark can
+                # outlive or lose its lease, but that must not discard an
+                # otherwise valid signed liveness/health report. Persist the
+                # authenticated fail-open projection without stale work context;
+                # tickets, submissions, benchmarks, and scores are untouched.
+                stored_active_agent_id = None
+                stored_benchmark_progress = None
+                logger.info(
+                    "validator heartbeat dropped stale ticket-bound progress "
+                    "validator=%s",
+                    validator_hotkey,
                 )
         try:
             row, accepted = await upsert_validator_heartbeat(
@@ -463,17 +474,13 @@ async def heartbeat(
                 protocol_version=request_body.protocol_version,
                 code_digest=request_body.code_digest,
                 state=request_body.state,
-                active_agent_id=request_body.active_agent_id,
+                active_agent_id=stored_active_agent_id,
                 system_metrics=(
                     request_body.system_metrics.model_dump(mode="json")
                     if request_body.system_metrics is not None
                     else None
                 ),
-                benchmark_progress=(
-                    request_body.benchmark_progress.model_dump(mode="json")
-                    if request_body.benchmark_progress is not None
-                    else None
-                ),
+                benchmark_progress=stored_benchmark_progress,
                 reported_at=reported_at,
                 seen_at=now,
                 signature=request_body.signature,

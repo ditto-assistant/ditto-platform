@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from urllib.parse import parse_qs, urlparse
 
 from ditto.api_server.datapipeline import (
     DataPipelineConfig,
@@ -17,6 +18,10 @@ from ditto.api_server.embedding import (
 from ditto.api_server.errors import ApiServerConfigError
 from ditto.api_server.pricing import PricingConfig, parse_pricing_config_from_env
 from ditto.api_server.storage import StorageConfig, parse_storage_config_from_env
+from ditto.api_server.validator_names import (
+    ValidatorNamesConfig,
+    parse_validator_names_config_from_env,
+)
 from ditto.chain import ChainConfig, parse_chain_config_from_env
 from ditto.db import PostgresConfig, parse_postgres_config_from_env
 
@@ -98,6 +103,9 @@ class ApiServerConfig:
     screener_auth: ScreenerAuthConfig
     """Dedicated signer and bearer token for the platform-operated screener."""
 
+    validator_names: ValidatorNamesConfig
+    """Optional, background-only Taostats display-name decoration."""
+
     admin_api_token: str | None = None
     """Bearer token for private Backroom/operator administration endpoints."""
 
@@ -177,6 +185,7 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
             hotkey=screener_hotkey,
             api_token=screener_api_token,
         ),
+        validator_names=parse_validator_names_config_from_env(),
         admin_api_token=os.environ.get("DITTO_ADMIN_API_TOKEN") or None,
         dashboard_enabled=dashboard_enabled,
         dashboard_wandb_url=dashboard_wandb_url,
@@ -209,4 +218,41 @@ def check_config(config: ApiServerConfig) -> None:
     if config.admin_api_token is not None and len(config.admin_api_token) < 32:
         raise ApiServerConfigError(
             "DITTO_ADMIN_API_TOKEN must be at least 32 characters"
+        )
+    names = config.validator_names
+    if (names.url is None) != (names.api_key is None):
+        raise ApiServerConfigError(
+            "DITTO_TAOSTATS_VALIDATOR_NAMES_URL and DITTO_TAOSTATS_API_KEY "
+            "must be set together"
+        )
+    if names.url is not None:
+        parsed = urlparse(names.url)
+        query = parse_qs(parsed.query)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "api.taostats.io"
+            or parsed.port not in {None, 443}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != "/api/dtao/validator/available/v1"
+            or query.get("netuid") != ["118"]
+        ):
+            raise ApiServerConfigError(
+                "DITTO_TAOSTATS_VALIDATOR_NAMES_URL must use the documented "
+                "https://api.taostats.io/api/dtao/validator/available/v1"
+                "?netuid=118 endpoint"
+            )
+    if not 0.1 <= names.timeout_seconds <= 5.0:
+        raise ApiServerConfigError(
+            "DITTO_TAOSTATS_TIMEOUT_SECONDS must be between 0.1 and 5"
+        )
+    if names.retry_seconds < 60:
+        raise ApiServerConfigError("DITTO_TAOSTATS_RETRY_SECONDS must be at least 60")
+    if names.refresh_seconds < names.retry_seconds:
+        raise ApiServerConfigError(
+            "DITTO_TAOSTATS_REFRESH_SECONDS must be at least the retry interval"
+        )
+    if names.max_stale_seconds < names.refresh_seconds:
+        raise ApiServerConfigError(
+            "DITTO_TAOSTATS_MAX_STALE_SECONDS must be at least the refresh interval"
         )

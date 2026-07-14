@@ -194,6 +194,7 @@ class TestDashboard:
         assert "allowlisted" not in body
         assert 'id="fleet-count-unknown"' in body
         assert 'getJSON("/public/validators")' in body
+        assert 'getJSON("/public/validator-names")' in body
         assert 'getJSON("/public/screeners")' in body
         assert 'getElementById("show-screeners").addEventListener' in body
         assert 'showScreeners ? "Screener" : "Validator"' in body
@@ -245,10 +246,39 @@ class TestDashboard:
         assert 'copyButton(e.agent_id, "agent ID")' in body
         assert 'copyButton(e.miner_hotkey, "miner hotkey")' in body
         assert 'copyButton(hotkey, singular + " hotkey")' in body
+        assert 'copyButton(hotkey, "validator hotkey")' in body
         assert 'copyButton(s.validator_hotkey, "validator hotkey")' in body
+        assert 'id="copy-status"' in body
+        assert 'role="status"' in body
+        assert 'aria-live="polite"' in body
+        assert 'aria-describedby="copy-status"' in body
+        assert 'type="button" class="copy"' in body
         assert 'document.addEventListener("click"' in body
+        assert 'document.addEventListener("keydown"' in body
+        assert 'ev.key !== "Enter" && ev.key !== " "' in body
         assert 'document.execCommand("copy")' in body
         assert "navigator.clipboard.writeText(value).catch" in body
+        assert 'btn.classList.add("failed")' in body
+        assert "Could not copy " in body
+        assert "Select the full value and copy it manually." in body
+
+    async def test_validator_names_remain_optional_untrusted_decoration(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert "var validatorNames = {};" in body
+        assert "validatorNames = {};" in body
+        assert "(data.validators || []).forEach" in body
+        assert "validatorNames[entry.validator_hotkey] = entry.display_name" in body
+        assert (
+            'var displayName = singular === "validator" ? validatorNames[hotkey]'
+            in body
+        )
+        assert "esc(displayName)" in body
+        assert "esc(shortKey(hotkey))" in body
+        assert "fleet-node-key copyable" in body
+        assert "title=\"' + esc(hotkey)" in body
+        assert 'copyButton(hotkey, "validator hotkey")' in body
+        assert "fleetUnavailable.validators = true" in body
 
     async def test_includes_system_and_time_aware_theme_switcher(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
