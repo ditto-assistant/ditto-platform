@@ -175,16 +175,12 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert '<aside class="sidebar"' in body
-        assert 'id="nav-toggle"' in body  # mobile hamburger
-        for page in (
-            "overview",
-            "leaderboard",
-            "operations",
-            "submissions",
-            "benchmark",
-        ):
+        # The leaderboard is consolidated into the Overview page (no own tab).
+        for page in ("overview", "operations", "submissions", "benchmark"):
             assert f'href="#/{page}"' in body
             assert f'data-page="{page}"' in body
+        assert 'href="#/leaderboard"' not in body
+        assert "<h2>Leaderboard</h2>" in body  # still present, inside Overview
         # The time-aware theme switcher moved into the sidebar but stays wired.
         assert 'data-theme-choice="light"' in body
 
