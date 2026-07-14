@@ -787,6 +787,7 @@ class TestPublicActivity:
         public_progress_keys = {
             "agent_id",
             "agent_name",
+            "started_at",
             "stage",
             "completed_checks",
             "total_checks",
@@ -805,6 +806,9 @@ class TestPublicActivity:
         )
         assert first["percent"] == 45
         assert first["total_checks"] == 114
+        assert datetime.fromisoformat(first["started_at"].replace("Z", "+00:00")) == (
+            now - timedelta(seconds=1)
+        )
         threshold = next(
             progress for progress in shown if progress["completed_checks"] == 3
         )

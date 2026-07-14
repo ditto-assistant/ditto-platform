@@ -507,7 +507,12 @@ class TestHeartbeat:
         assert response.status_code == 200, response.text
         public = (await client.get("/api/v1/public/validators")).json()
         assert public["validators"][0]["active_agent_id"] == str(agent_id)
-        assert public["validators"][0]["active_benchmark"] == {
+        active_benchmark = public["validators"][0]["active_benchmark"]
+        started_at = datetime.fromisoformat(
+            active_benchmark.pop("started_at").replace("Z", "+00:00")
+        )
+        assert started_at.tzinfo == UTC
+        assert active_benchmark == {
             "agent_id": str(agent_id),
             "agent_name": "alpha-agent",
             "stage": None,
@@ -645,7 +650,12 @@ class TestHeartbeat:
         )
         assert omitted.status_code == 200, omitted.text
         public_unknown = (await client.get("/api/v1/public/validators")).json()
-        assert public_unknown["validators"][0]["active_benchmark"] == {
+        active_benchmark = public_unknown["validators"][0]["active_benchmark"]
+        started_at = datetime.fromisoformat(
+            active_benchmark.pop("started_at").replace("Z", "+00:00")
+        )
+        assert started_at.tzinfo == UTC
+        assert active_benchmark == {
             "agent_id": str(agent_id),
             "agent_name": "alpha-agent",
             "stage": None,

@@ -166,12 +166,13 @@ def _stored_screener_progress(raw: dict | None) -> ScreenerProgress | None:
 
 
 def _public_benchmark_progress(work: ActiveValidatorWork) -> PublicBenchmarkProgress:
-    """Coarsen private signed counts into the six-field public allowlist."""
+    """Coarsen private signed counts into the fixed public allowlist."""
     progress = work.progress
     if progress is None:
         return PublicBenchmarkProgress(
             agent_id=work.agent.agent_id,
             agent_name=work.agent.name,
+            started_at=cast(datetime, _aware(work.ticket.issued_at)),
         )
     percent: int | None = None
     completed_checks: int | None = None
@@ -193,6 +194,7 @@ def _public_benchmark_progress(work: ActiveValidatorWork) -> PublicBenchmarkProg
     return PublicBenchmarkProgress(
         agent_id=work.agent.agent_id,
         agent_name=work.agent.name,
+        started_at=cast(datetime, _aware(work.ticket.issued_at)),
         stage=progress.stage,
         completed_checks=completed_checks,
         total_checks=total_checks,
