@@ -670,9 +670,6 @@
     .side-foot .btn { justify-content: center; }
     .page { display: none; }
     .page.active { display: block; }
-    .nav-toggle { display: none; align-items: center; justify-content: center; width: 40px; height: 40px; flex: 0 0 auto; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elev); color: var(--text); cursor: pointer; }
-    .nav-toggle .ic { width: 20px; height: 20px; }
-    .nav-toggle .menu-close { display: none; }
 
     .sidebar {
       flex-basis: 248px;
@@ -1133,20 +1130,19 @@
     @media (prefers-reduced-motion: reduce) {
       .fleet-option { transition: none; }
     }
+    /* Narrow viewports: the rail becomes a top bar. Brand + theme switch sit on
+       the first row; the sections are a horizontal, scrollable navbar strip
+       (no hamburger). Telemetry/refresh drop off to keep the bar compact. */
     @media (max-width: 960px) {
       .layout { display: block; overflow-x: clip; }
       .board { overflow-x: auto; }
-      .sidebar { position: sticky; top: 0; z-index: 60; height: auto; flex: none; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px; border-right: none; border-bottom: 1px solid var(--border); }
-      .sidebar .brand { flex: 1 1 auto; min-width: 0; }
-      .nav-toggle { display: inline-flex; }
-      .sidebar.open .nav-toggle .menu-open { display: none; }
-      .sidebar.open .nav-toggle .menu-close { display: block; }
-      .nav { flex-basis: 100%; width: 100%; flex-direction: column; gap: 4px; margin-top: 4px; display: none; }
-      .sidebar.open .nav { display: flex; }
-      .side-theme, .side-foot { display: none; flex-basis: 100%; width: 100%; margin-top: 4px; }
-      .sidebar.open .side-theme, .sidebar.open .side-foot { display: flex; }
-      .side-foot { flex-direction: row; gap: 8px; }
-      .side-foot .btn { flex: 1 1 0; }
+      .sidebar { position: sticky; top: 0; z-index: 60; height: auto; flex: none; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 12px; border-right: none; border-bottom: 1px solid var(--border); }
+      .sidebar .brand { flex: 1 1 auto; min-width: 0; order: 0; }
+      .side-theme { order: 1; margin-top: 0; }
+      .nav { order: 2; flex-basis: 100%; width: 100%; flex-direction: row; flex-wrap: nowrap; overflow-x: auto; gap: 4px; margin-top: 2px; }
+      .nav-item { flex: 0 0 auto; padding: 7px 11px; border-radius: 8px; }
+      .nav-item .ni-desc { display: none; }
+      .side-foot { display: none; }
     }
   </style>
 </head>
@@ -1161,13 +1157,8 @@
           <div class="sub">Public agent-memory scoring leaderboard<span id="bench-badge" class="bench-badge"></span></div>
         </div>
       </div>
-      <button class="nav-toggle" id="nav-toggle" aria-label="Open menu" aria-expanded="false" aria-controls="site-nav">
-        <svg class="ic menu-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h16"/></svg>
-        <svg class="ic menu-close" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-      </button>
       <nav class="nav" id="site-nav" aria-label="Sections">
-        <a class="nav-item" href="#/overview" data-page="overview"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg></span><span class="ni-text"><span class="ni-label">Overview</span><span class="ni-desc">Snapshot numbers</span></span></a>
-        <a class="nav-item" href="#/leaderboard" data-page="leaderboard"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"/><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"/><path d="M4 22h16"/><path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"/><path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"/><path d="M18 2H6v7a6 6 0 0 0 12 0V2Z"/></svg></span><span class="ni-text"><span class="ni-label">Leaderboard</span><span class="ni-desc">Every scored miner</span></span></a>
+        <a class="nav-item" href="#/overview" data-page="overview"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg></span><span class="ni-text"><span class="ni-label">Overview</span><span class="ni-desc">Snapshot &amp; leaderboard</span></span></a>
         <a class="nav-item" href="#/operations" data-page="operations"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/></svg></span><span class="ni-text"><span class="ni-label">Network ops</span><span class="ni-desc">Pipeline &amp; fleet health</span></span></a>
         <a class="nav-item" href="#/submissions" data-page="submissions"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg></span><span class="ni-text"><span class="ni-label">Submissions</span><span class="ni-desc">Recent uploads</span></span></a>
         <a class="nav-item" href="#/benchmark" data-page="benchmark"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M21.3 15.3a2.4 2.4 0 0 1 0 3.4l-2.6 2.6a2.4 2.4 0 0 1-3.4 0L2.7 8.7a2.41 2.41 0 0 1 0-3.4l2.6-2.6a2.41 2.41 0 0 1 3.4 0Z"/><path d="m14.5 12.5 2-2"/><path d="m11.5 9.5 2-2"/><path d="m8.5 6.5 2-2"/><path d="m17.5 15.5 2-2"/></svg></span><span class="ni-text"><span class="ni-label">Benchmark</span><span class="ni-desc">What v2 measures</span></span></a>
@@ -1225,9 +1216,6 @@
       <div class="card"><div class="label">Last scored</div><div class="value" id="h-last">–</div></div>
     </section>
 
-    </section>
-
-    <section class="page" data-page="leaderboard">
     <div class="section-head">
       <h2>Leaderboard</h2>
       <span class="hint">best eligible score per miner · ranked by composite · click a row for detail</span>
@@ -2841,20 +2829,11 @@
     // ── Go ───────────────────────────────────────────────────
     // ── Hash router: each sidebar section is a deep-linkable page ──
     var PAGES = {
-      overview:    ["Overview", "Public agent-memory scoring · aggregate-only API"],
-      leaderboard: ["Leaderboard", "Best eligible score per miner · ranked by composite"],
+      overview:    ["Overview", "Subnet snapshot and the full leaderboard · ranked by composite"],
       operations:  ["Network operations", "Live submission pipeline and validator / screener fleet health"],
       submissions: ["Recent submissions", "Every recent upload with its stage · newest first"],
       benchmark:   ["Benchmark", "What DittoBench v2 measures and the frozen scoring setup"]
     };
-    var sidebarEl = document.querySelector(".sidebar");
-    var navToggle = document.getElementById("nav-toggle");
-    function closeNav() {
-      if (!sidebarEl || !sidebarEl.classList.contains("open")) return;
-      sidebarEl.classList.remove("open");
-      navToggle.setAttribute("aria-expanded", "false");
-      navToggle.setAttribute("aria-label", "Open menu");
-    }
     function route(initial) {
       var m = /^#\/([a-z]+)/.exec(location.hash || "");
       if (!m && location.hash && !initial) return; // non-route hash: leave page
@@ -2870,24 +2849,9 @@
       document.getElementById("page-title").textContent = PAGES[page][0];
       document.getElementById("page-sub").textContent = PAGES[page][1];
       document.title = "Ditto SN118 · " + PAGES[page][0];
-      closeNav();
       window.scrollTo(0, 0);
     }
     window.addEventListener("hashchange", function () { route(false); });
-    if (navToggle) {
-      navToggle.addEventListener("click", function () {
-        var open = sidebarEl.classList.toggle("open");
-        navToggle.setAttribute("aria-expanded", open ? "true" : "false");
-        navToggle.setAttribute("aria-label", open ? "Close menu" : "Open menu");
-      });
-      document.getElementById("site-nav").addEventListener("click", function (ev) {
-        if (ev.target.closest(".nav-item")) closeNav();
-      });
-      document.addEventListener("click", function (ev) {
-        if (sidebarEl.classList.contains("open") && !sidebarEl.contains(ev.target)) closeNav();
-      });
-      document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") closeNav(); });
-    }
     route(true);
 
     load(false);
