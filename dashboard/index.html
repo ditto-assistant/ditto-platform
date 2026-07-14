@@ -504,6 +504,48 @@
     .pager .btn:active:not(:disabled) { transform: translateY(1px); }
     .pager .btn:disabled { cursor: not-allowed; opacity: .45; }
     .page-status { min-width: 104px; text-align: center; color: var(--text-dim); font-family: var(--mono); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .activity-filters {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px 16px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      background: color-mix(in oklab, var(--bg-elev-2) 38%, var(--bg-elev));
+    }
+    .activity-filter-list { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+    .activity-filter {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 34px;
+      padding: 6px 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--bg-elev);
+      color: var(--text-dim);
+      font: 650 11px/1.2 var(--sans);
+      cursor: pointer;
+      transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+    }
+    .activity-filter:hover { border-color: var(--border-strong); color: var(--text); }
+    .activity-filter[aria-pressed="true"] { border-color: var(--accent); background: var(--accent); color: var(--on-accent); }
+    .activity-filter-count {
+      min-width: 18px;
+      padding: 2px 5px;
+      border-radius: 999px;
+      background: color-mix(in oklab, currentColor 12%, transparent);
+      font: 700 10px/1 var(--mono);
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }
+    .activity-filter[aria-pressed="true"] .activity-filter-count { background: color-mix(in oklab, var(--on-accent) 18%, transparent); }
+    .activity-filter-meta { display: flex; flex: 0 0 auto; align-items: center; gap: 10px; }
+    .activity-filter-summary { color: var(--text-dim); font: 10.5px/1.4 var(--mono); white-space: nowrap; }
+    .activity-clear { min-height: 34px; padding: 5px 8px; border: 0; background: transparent; color: var(--accent); font: 650 11px/1.2 var(--sans); cursor: pointer; }
+    .activity-clear[hidden] { display: none; }
+    .activity-clear:hover { text-decoration: underline; text-underline-offset: 3px; }
+    .activity[aria-busy="true"] .activity-filter-summary { color: var(--text-faint); }
 
     /* ── Operational fleet ─────────────────────────────────── */
     .fleet-head { align-items: flex-end; justify-content: space-between; }
@@ -1156,6 +1198,12 @@
       .pager { gap: 6px; padding-inline: 8px; }
       .pager .btn { min-width: 84px; padding-inline: 9px; }
       .page-status { min-width: 94px; }
+      .activity-filters { align-items: flex-start; flex-direction: column; padding: 12px; }
+      .activity-filter-list { width: 100%; }
+      .activity-filter { min-height: 44px; }
+      .activity-filter-meta { width: 100%; justify-content: space-between; }
+      .activity-filter-summary { white-space: normal; }
+      .activity-table-frame { min-width: 680px; }
       .about .pillars { grid-template-columns: 1fr; }
       .about .pillar { border-right: 0; border-bottom: 1px solid var(--border); }
       .about .pillar:last-child { border-bottom: 0; }
@@ -1679,7 +1727,21 @@
     </section>
 
     <section class="page" data-page="submissions">
-    <div class="board activity">
+    <div class="board activity" aria-busy="true">
+      <div class="activity-filters" aria-labelledby="activity-filter-label">
+        <span class="visually-hidden" id="activity-filter-label">Filter recent submissions by public pipeline state</span>
+        <div class="activity-filter-list" role="group" aria-label="Quick submission filters">
+          <button class="activity-filter" type="button" data-activity-filter="all" aria-pressed="true">All <span class="activity-filter-count" data-activity-count="all">–</span></button>
+          <button class="activity-filter" type="button" data-activity-filter="rejected" aria-pressed="false">Rejected <span class="activity-filter-count" data-activity-count="rejected">–</span></button>
+          <button class="activity-filter" type="button" data-activity-filter="under_review" aria-pressed="false">Under review <span class="activity-filter-count" data-activity-count="under_review">–</span></button>
+          <button class="activity-filter" type="button" data-activity-filter="waiting_validator" aria-pressed="false">Waiting for scores <span class="activity-filter-count" data-activity-count="waiting_validator">–</span></button>
+          <button class="activity-filter" type="button" data-activity-filter="queued" aria-pressed="false">Queued work <span class="activity-filter-count" data-activity-count="queued">–</span></button>
+        </div>
+        <div class="activity-filter-meta">
+          <span class="activity-filter-summary" id="activity-filter-summary" role="status" aria-live="polite">Loading submissions…</span>
+          <button class="activity-clear" id="activity-clear" type="button" hidden>Clear filters</button>
+        </div>
+      </div>
       <nav class="pager top" id="activity-pager" aria-label="Submission pages">
         <button class="btn ghost" type="button" data-activity-page="prev"><span aria-hidden="true">←</span> Previous</button>
         <span class="page-status" aria-live="polite">Page 1 of 1</span>
@@ -1848,8 +1910,102 @@
     var activityTotalPages = 1;
     var ACTIVITY_PAGE_SIZE = 10;
     var activityFrame = document.querySelector(".activity-table-frame");
+    var activityRequestId = 0;
+    var activitySearchTimer = null;
+    var activityStatusCounts = {};
+    var ACTIVITY_FILTERS = {
+      rejected: ["rejected"],
+      under_review: ["under_review"],
+      waiting_validator: ["waiting_validator"],
+      queued: ["waiting_screening", "screening", "waiting_validator"]
+    };
+    var ACTIVITY_STATUSES = [
+      "waiting_screening", "screening", "waiting_validator", "evaluating",
+      "under_review", "rejected", "scored", "live"
+    ];
+    var activityStatuses = [];
+    var activityQuery = "";
     var searchMatches = [];
     var searchActiveIndex = -1;
+
+    function restoreActivityUrl() {
+      var url = new URL(location.href);
+      var values = [];
+      url.searchParams.getAll("status").forEach(function (value) {
+        value.split(",").forEach(function (part) { values.push(part.trim()); });
+      });
+      var requested = values.filter(Boolean);
+      var valid = requested.filter(function (value, index) {
+        return ACTIVITY_STATUSES.indexOf(value) >= 0 && requested.indexOf(value) === index;
+      });
+      activityStatuses = ACTIVITY_STATUSES.filter(function (value) { return valid.indexOf(value) >= 0; });
+      activityQuery = (url.searchParams.get("q") || "").trim().slice(0, 200);
+      return valid.length !== values.length || activityQuery !== (url.searchParams.get("q") || "");
+    }
+
+    function writeActivityUrl(push) {
+      var url = new URL(location.href);
+      url.searchParams.delete("status");
+      activityStatuses.forEach(function (status) { url.searchParams.append("status", status); });
+      if (activityQuery) url.searchParams.set("q", activityQuery); else url.searchParams.delete("q");
+      history[push ? "pushState" : "replaceState"]({}, "", url.pathname + url.search + url.hash);
+    }
+
+    function filterCount(name) {
+      var statuses = name === "all" ? ACTIVITY_STATUSES : (ACTIVITY_FILTERS[name] || []);
+      return statuses.reduce(function (total, status) { return total + Number(activityStatusCounts[status] || 0); }, 0);
+    }
+
+    function renderActivityFilterControls() {
+      document.querySelectorAll("[data-activity-filter]").forEach(function (button) {
+        var name = button.getAttribute("data-activity-filter");
+        var statuses = ACTIVITY_FILTERS[name] || [];
+        var selected = name === "all"
+          ? activityStatuses.length === 0
+          : statuses.length > 0 && statuses.every(function (status) { return activityStatuses.indexOf(status) >= 0; });
+        button.setAttribute("aria-pressed", selected ? "true" : "false");
+      });
+      document.querySelectorAll("[data-activity-count]").forEach(function (count) {
+        count.textContent = String(filterCount(count.getAttribute("data-activity-count")));
+      });
+      document.getElementById("activity-clear").hidden = activityStatuses.length === 0 && !activityQuery;
+    }
+
+    function setActivityLoading() {
+      document.querySelector(".activity").setAttribute("aria-busy", "true");
+      document.getElementById("activity-filter-summary").textContent = "Updating submissions…";
+    }
+
+    function activityRequestPath(page) {
+      var query = new URLSearchParams();
+      query.set("page", String(page));
+      query.set("limit", String(ACTIVITY_PAGE_SIZE));
+      activityStatuses.forEach(function (status) { query.append("status", status); });
+      if (activityQuery) query.set("q", activityQuery);
+      return "/public/activity?" + query.toString();
+    }
+
+    function applyActivityFilter(name) {
+      if (name === "all") {
+        activityStatuses = [];
+      } else {
+        var statuses = ACTIVITY_FILTERS[name] || [];
+        var removing = statuses.every(function (status) { return activityStatuses.indexOf(status) >= 0; });
+        statuses.forEach(function (status) {
+          var index = activityStatuses.indexOf(status);
+          if (removing && index >= 0) activityStatuses.splice(index, 1);
+          if (!removing && index < 0) activityStatuses.push(status);
+        });
+        activityStatuses = ACTIVITY_STATUSES.filter(function (status) { return activityStatuses.indexOf(status) >= 0; });
+      }
+      activityPage = 1;
+      writeActivityUrl(true);
+      renderActivityFilterControls();
+      loadActivity(1);
+    }
+
+    var activityUrlWasSanitized = restoreActivityUrl();
+    if (activityUrlWasSanitized) writeActivityUrl(false);
 
     function lockActivityFrameHeight() {
       if (!activityFrame) return;
@@ -2721,11 +2877,26 @@
       if (item) openActivityEntry(pipelineEntries[+item.getAttribute("data-pipeline-i")]);
     });
     document.querySelector(".activity").addEventListener("click", function (ev) {
+      var filter = ev.target.closest("[data-activity-filter]");
+      if (filter) {
+        applyActivityFilter(filter.getAttribute("data-activity-filter"));
+        return;
+      }
       var control = ev.target.closest("[data-activity-page]");
       if (!control) return;
       var direction = control.getAttribute("data-activity-page");
       if (direction === "prev" && activityPage > 1) loadActivity(activityPage - 1, control);
       if (direction === "next" && activityPage < activityTotalPages) loadActivity(activityPage + 1, control);
+    });
+    document.getElementById("activity-clear").addEventListener("click", function () {
+      activityStatuses = [];
+      activityQuery = "";
+      searchInput.value = "";
+      updateSearch();
+      activityPage = 1;
+      writeActivityUrl(true);
+      renderActivityFilterControls();
+      loadActivity(1, this);
     });
     document.getElementById("modal-close").addEventListener("click", closeModal);
     document.getElementById("modal-back").addEventListener("click", closeModal);
@@ -2850,8 +3021,22 @@
       }
     }
 
+    searchInput.value = activityQuery;
     searchInput.addEventListener("focus", function () { updateSearch(); openSearch(); });
-    searchInput.addEventListener("input", function () { updateSearch(); openSearch(); });
+    searchInput.addEventListener("input", function () {
+      updateSearch();
+      openSearch();
+      if (!/^#\/submissions/.test(location.hash || "")) return;
+      clearTimeout(activitySearchTimer);
+      activitySearchTimer = setTimeout(function () {
+        if (!/^#\/submissions/.test(location.hash || "")) return;
+        activityQuery = searchInput.value.trim().slice(0, 200);
+        activityPage = 1;
+        writeActivityUrl(false);
+        renderActivityFilterControls();
+        loadActivity(1);
+      }, 250);
+    });
     searchInput.addEventListener("keydown", function (event) {
       if (event.key === "ArrowDown") { event.preventDefault(); setSearchActive(searchActiveIndex + 1); }
       if (event.key === "ArrowUp") { event.preventDefault(); setSearchActive(searchActiveIndex - 1); }
@@ -2874,6 +3059,14 @@
       updateSearch();
       openSearch();
       searchInput.focus();
+      if (/^#\/submissions/.test(location.hash || "")) {
+        clearTimeout(activitySearchTimer);
+        activityQuery = "";
+        activityPage = 1;
+        writeActivityUrl(false);
+        renderActivityFilterControls();
+        loadActivity(1);
+      }
     });
     document.addEventListener("pointerdown", function (event) {
       if (!searchRoot.contains(event.target)) closeSearch();
@@ -3251,23 +3444,32 @@
       var prev = document.querySelectorAll('[data-activity-page="prev"]');
       var next = document.querySelectorAll('[data-activity-page="next"]');
       var statuses = document.querySelectorAll(".activity .page-status");
+      document.querySelector(".activity").setAttribute("aria-busy", "false");
       if (unavailable) {
         lastActivityEntries = [];
         rows.innerHTML = '<tr><td colspan="5" class="empty">Submission activity is temporarily unavailable.</td></tr>';
+        document.getElementById("activity-filter-summary").textContent = "Could not load submissions. Try again.";
         prev.forEach(function (button) { button.disabled = true; });
         next.forEach(function (button) { button.disabled = true; });
         return;
       }
+      activityStatusCounts = data.status_counts || {};
       lastActivityEntries = entries;
       activityPage = data.page || 1;
       activityTotalPages = data.total_pages || 1;
+      document.getElementById("activity-filter-summary").textContent =
+        data.total + (data.total === 1 ? " submission" : " submissions") +
+        (activityStatuses.length || activityQuery ? " match" : " total");
+      renderActivityFilterControls();
       statuses.forEach(function (status) {
         status.textContent = "Page " + activityPage + " of " + activityTotalPages;
       });
       prev.forEach(function (button) { button.disabled = activityPage <= 1; });
       next.forEach(function (button) { button.disabled = activityPage >= activityTotalPages; });
       if (!entries.length) {
-        rows.innerHTML = '<tr><td colspan="5" class="empty">No submissions yet. New uploads will appear here before screening begins.</td></tr>';
+        rows.innerHTML = activityStatuses.length || activityQuery
+          ? '<tr><td colspan="5" class="empty">No submissions match these filters. Clear filters or try a different search.</td></tr>'
+          : '<tr><td colspan="5" class="empty">No submissions yet. New uploads will appear here before screening begins.</td></tr>';
         return;
       }
       rows.innerHTML = entries.map(function (e, i) {
@@ -3522,9 +3724,12 @@
       // have variable-height evidence, so replacing a page would otherwise move
       // the bottom pager out from under the pointer.
       var anchorTop = anchor ? anchor.getBoundingClientRect().top : null;
+      var requestId = ++activityRequestId;
       lockActivityFrameHeight();
-      getJSON("/public/activity?page=" + page + "&limit=" + ACTIVITY_PAGE_SIZE)
+      setActivityLoading();
+      getJSON(activityRequestPath(page))
         .then(function (data) {
+          if (requestId !== activityRequestId) return;
           if (!data.entries.length && page > 1 && data.total_pages < page) {
             loadActivity(data.total_pages, anchor);
             return;
@@ -3539,7 +3744,9 @@
             }
           });
         })
-        .catch(function () { renderActivity(null, true); });
+        .catch(function () {
+          if (requestId === activityRequestId) renderActivity(null, true);
+        });
     }
 
     function loadPipelineBoard() {
@@ -3688,8 +3895,18 @@
       window.scrollTo(0, 0);
     }
     window.addEventListener("hashchange", function () { route(false); });
+    window.addEventListener("popstate", function () {
+      var sanitized = restoreActivityUrl();
+      if (sanitized) writeActivityUrl(false);
+      searchInput.value = activityQuery;
+      updateSearch();
+      renderActivityFilterControls();
+      activityPage = 1;
+      if (/^#\/submissions/.test(location.hash || "")) loadActivity(1);
+    });
     route(true);
 
+    renderActivityFilterControls();
     load(false);
     setInterval(function () { load(false); }, REFRESH_MS);
   })();

@@ -208,10 +208,14 @@ class PublicActivityRow:
 async def list_public_activity(
     session: AsyncSession,
     *,
-    limit: int,
+    limit: int | None = None,
     offset: int = 0,
 ) -> tuple[list[PublicActivityRow], int]:
-    """Return a page of recent submissions and the total row count."""
+    """Return recent submissions and the total row count.
+
+    ``limit=None`` lets callers that must filter on the derived public status
+    inspect the complete dataset before applying their own pagination.
+    """
     total = int(await session.scalar(select(func.count(Agent.agent_id))) or 0)
     score_counts = (
         select(
@@ -236,9 +240,11 @@ async def list_public_activity(
             & (ScreeningAttempt.status == "running"),
         )
         .order_by(Agent.created_at.desc(), Agent.agent_id.desc())
-        .offset(offset)
-        .limit(limit)
     )
+    if offset:
+        stmt = stmt.offset(offset)
+    if limit is not None:
+        stmt = stmt.limit(limit)
     result = await session.execute(stmt)
     return (
         [

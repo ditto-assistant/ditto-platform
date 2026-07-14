@@ -698,6 +698,106 @@ class TestPublicActivity:
         ):
             assert private_field not in serialized
 
+    async def test_filters_complete_dataset_before_paginating_with_counts(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        for index in range(12):
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.UPLOADED,
+                name=f"queued-{index}",
+                created_at=datetime(2026, 7, 13, 10, index, tzinfo=UTC),
+            )
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_B,
+            status=AgentStatus.BANNED,
+            name="rejected-late",
+            created_at=datetime(2026, 7, 13, 9, 0, tzinfo=UTC),
+        )
+        _install_db(app, session_maker)
+
+        body = (
+            await client.get("/api/v1/public/activity?status=rejected&page=1&limit=10")
+        ).json()
+
+        assert body["total"] == 1
+        assert body["count"] == 1
+        assert body["entries"][0]["name"] == "rejected-late"
+        assert body["status_counts"]["waiting_screening"] == 12
+        assert body["status_counts"]["rejected"] == 1
+
+    async def test_combines_states_and_composes_with_search(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.UPLOADED,
+            name="alpha queued",
+        )
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_B,
+            status=AgentStatus.SCREENING,
+            name="alpha screening",
+        )
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.BANNED,
+            name="alpha rejected",
+        )
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_B,
+            status=AgentStatus.UPLOADED,
+            name="beta queued",
+        )
+        _install_db(app, session_maker)
+
+        response = await client.get(
+            "/api/v1/public/activity",
+            params=[
+                ("status", "waiting_screening"),
+                ("status", "screening"),
+                ("q", "alpha"),
+            ],
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert {entry["name"] for entry in body["entries"]} == {
+            "alpha queued",
+            "alpha screening",
+        }
+        assert body["total"] == 2
+        assert body["status_counts"] == {
+            "waiting_screening": 1,
+            "screening": 1,
+            "rejected": 1,
+        }
+
+    async def test_rejects_unknown_public_status_filter(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/activity?status=obsolete")
+
+        assert response.status_code == 422
+        assert "unknown public activity status: obsolete" in response.text
+
     async def test_exposes_latest_score_time_for_finalized_agents(
         self,
         app: FastAPI,

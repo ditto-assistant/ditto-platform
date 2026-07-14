@@ -32,7 +32,7 @@ import math
 import os
 import statistics
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Annotated, Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -121,6 +121,18 @@ router = APIRouter(prefix="/public", tags=["public"])
 _CACHE_CONTROL = "public, max-age=30"
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 _VALIDATOR_STALE_WINDOW = timedelta(minutes=15)
+_PUBLIC_ACTIVITY_STATUSES = frozenset(
+    {
+        "waiting_screening",
+        "screening",
+        "waiting_validator",
+        "evaluating",
+        "under_review",
+        "rejected",
+        "scored",
+        "live",
+    }
+)
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -786,6 +798,8 @@ async def activity(
     session: SessionDep,
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=50, ge=1, le=200),
+    status: Annotated[list[str] | None, Query()] = None,
+    q: str | None = Query(default=None, min_length=1, max_length=200),
 ) -> PublicActivityResponse:
     """Recent submissions and their safe public pipeline stage, newest first.
 
@@ -795,9 +809,16 @@ async def activity(
     private.
     """
     response.headers["Cache-Control"] = "public, max-age=10"
-    rows, total = await list_public_activity(
-        session, limit=limit, offset=(page - 1) * limit
-    )
+    requested_statuses = set(status or [])
+    unknown_statuses = requested_statuses - _PUBLIC_ACTIVITY_STATUSES
+    if unknown_statuses:
+        raise HTTPException(
+            status_code=422,
+            detail="unknown public activity status: "
+            + ", ".join(sorted(unknown_statuses)),
+        )
+
+    rows, _ = await list_public_activity(session)
     now = datetime.now(UTC)
     active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
     for work in await list_active_validator_work(
@@ -816,10 +837,41 @@ async def activity(
             has_active_validation=row.agent.agent_id in active_agent_ids,
         )
 
+    projected = [(row, public_status(row)) for row in rows]
+    normalized_query = q.strip().casefold() if q else ""
+    if normalized_query:
+        projected = [
+            (row, row_status)
+            for row, row_status in projected
+            if normalized_query
+            in " ".join(
+                (
+                    row.agent.name,
+                    str(row.agent.agent_id),
+                    row.agent.miner_hotkey,
+                    row_status,
+                )
+            ).casefold()
+        ]
+
+    status_counts: dict[str, int] = {}
+    for _, row_status in projected:
+        status_counts[row_status] = status_counts.get(row_status, 0) + 1
+    if requested_statuses:
+        projected = [
+            (row, row_status)
+            for row, row_status in projected
+            if row_status in requested_statuses
+        ]
+
+    total = len(projected)
+    page_rows = projected[(page - 1) * limit : page * limit]
+
     return PublicActivityResponse(
         generated_at=now,
-        count=len(rows),
+        count=len(page_rows),
         total=total,
+        status_counts=status_counts,
         page=page,
         page_size=limit,
         total_pages=max(1, math.ceil(total / limit)),
@@ -828,12 +880,12 @@ async def activity(
                 agent_id=row.agent.agent_id,
                 miner_hotkey=row.agent.miner_hotkey,
                 name=row.agent.name,
-                status=public_status(row),
+                status=row_status,
                 submitted_at=row.agent.created_at,
                 last_scored_at=_aware(row.last_scored_at),
                 screening_reason=(
                     None
-                    if public_status(row) in ("waiting_screening", "screening")
+                    if row_status in ("waiting_screening", "screening")
                     else row.agent.screening_reason
                 ),
                 duplicate_of=row.agent.duplicate_of,
@@ -859,7 +911,7 @@ async def activity(
                 ),
                 active_benchmarks=active_by_agent.get(row.agent.agent_id, []),
             )
-            for row in rows
+            for row, row_status in page_rows
         ],
     )
 
