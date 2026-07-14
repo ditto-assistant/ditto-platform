@@ -226,6 +226,23 @@ class TestDashboard:
         assert "<h2>Leaderboard</h2>" in body  # folded into Overview
         assert 'data-theme-choice="system"' in body  # switcher still wired
 
+    async def test_includes_accessible_global_search(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert 'id="global-search"' in body
+        assert 'id="search-input" type="search" role="combobox"' in body
+        assert 'aria-controls="search-results"' in body
+        assert 'id="search-results" role="listbox"' in body
+        assert 'role="option" aria-selected="false"' in body
+        assert "function searchCorpus()" in body
+        assert "pipelineEntries.forEach" in body
+        assert 'location.hash = "#/overview"' in body
+        assert 'location.hash = "#/submissions"' in body
+        assert 'event.key === "/"' in body
+        assert 'event.key.toLowerCase() === "k"' in body
+        assert 'event.key === "ArrowDown"' in body
+        assert 'event.key === "Escape"' in body
+
     async def test_benchmark_badge_omits_latest_suffix(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
