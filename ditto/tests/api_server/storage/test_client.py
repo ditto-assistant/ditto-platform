@@ -8,6 +8,7 @@ methods are :class:`AsyncMock` instances.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from contextlib import asynccontextmanager
 from typing import Any
@@ -68,6 +69,15 @@ def _install_mock_session(
 
 
 class TestPutObject:
+    async def test_disables_optional_botocore_checksums_for_s3_compatibility(self):
+        client = S3StorageClient(_make_config())
+        session = _install_mock_session(client)
+
+        await client.put_object(key="abc/agent.tar.gz", body=b"x")
+
+        client_config = session.client.call_args.kwargs["config"]
+        assert client_config.request_checksum_calculation == "when_required"
+
     async def test_happy_path_returns_stored_object(self):
         client = S3StorageClient(_make_config())
         _install_mock_session(client)
@@ -102,6 +112,9 @@ class TestPutObject:
         assert kwargs["Key"] == "abc/agent.tar.gz"
         assert kwargs["ContentType"] == "application/gzip"
         assert kwargs["Body"] == b"x"
+        assert kwargs["ContentMD5"] == base64.b64encode(
+            hashlib.md5(b"x", usedforsecurity=False).digest()
+        ).decode("ascii")
 
     async def test_default_content_type_octet_stream(self):
         client = S3StorageClient(_make_config())

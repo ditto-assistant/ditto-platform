@@ -5,11 +5,10 @@ ticket is issued on demand to a validator that does not already hold one for the
 agent, expires if unscored by its deadline (freeing the slot), and is marked
 ``scored`` when the validator posts a valid score in time.
 
-The per-agent cap is enforced by a count-then-insert, which is best-effort under
-concurrency: a rare race could seat a fourth validator, but that is harmless
-because finalization triggers at exactly the quorum (the extra score simply
-joins the median pool and is never decisive). The ``(agent_id,
-validator_hotkey)`` primary key still hard-guarantees a validator can hold only
+Issuance locks the candidate agent row and then recounts its occupied slots in a
+fresh statement. Concurrent platform replicas therefore serialize allocation
+for a given agent and cannot over-issue a fourth slot. The ``(agent_id,
+validator_hotkey)`` primary key separately guarantees a validator can hold only
 one ticket per agent, so no single validator can take two slots.
 """
 
@@ -80,50 +79,66 @@ async def issue_ticket(
 
     Sweeps overdue tickets first, then picks the oldest ``evaluating`` agent
     that (a) has fewer than :data:`SCORING_QUORUM` live tickets and (b) this
-    validator does not already hold any ticket for, and seats a fresh ``issued``
-    ticket with a ``now + ttl`` deadline. Returns the ticket, or ``None`` when
-    there is no work for this validator ("no job for you"). Runs inside the
+    validator does not already hold a live or scored ticket for. A prior expired
+    row is reissued with a ``now + ttl`` deadline. Returns the ticket, or ``None``
+    when there is no work for this validator ("no job for you"). Runs inside the
     caller's transaction.
     """
     await expire_overdue_tickets(session, now=now)
 
-    # Live ticket count per agent (issued + scored; expired freed their slot).
-    live_counts = (
-        select(
-            ValidatorTicket.agent_id.label("agent_id"),
-            func.count().label("n"),
-        )
-        .where(ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES))
-        .group_by(ValidatorTicket.agent_id)
-        .subquery()
-    )
-    # Agents this validator already has any ticket for (never re-seat it).
+    # Agents this validator already has a live or scored ticket for. Expired
+    # tickets are intentionally excluded: validators are stateless workers, so
+    # a repaired/restarted validator must be able to retry unfinished work.
     already_mine = select(ValidatorTicket.agent_id).where(
-        ValidatorTicket.validator_hotkey == validator_hotkey
+        ValidatorTicket.validator_hotkey == validator_hotkey,
+        ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES),
     )
-    candidate = (
-        select(Agent.agent_id)
-        .outerjoin(live_counts, live_counts.c.agent_id == Agent.agent_id)
-        .where(
+    # Lock one candidate Agent row before counting its tickets. The recount is a
+    # separate statement after the lock is acquired, so under Postgres READ
+    # COMMITTED it sees any ticket committed by the previous lock holder.
+    # SKIP LOCKED lets unrelated agents continue allocating concurrently.
+    skipped: list[UUID] = []
+    while True:
+        candidate = select(Agent.agent_id).where(
             Agent.status == AgentStatus.EVALUATING,
-            func.coalesce(live_counts.c.n, 0) < SCORING_QUORUM,
             Agent.agent_id.not_in(already_mine),
         )
-        .order_by(Agent.created_at.asc())
-        .limit(1)
-    )
-    agent_id = (await session.execute(candidate)).scalar_one_or_none()
-    if agent_id is None:
-        return None
+        if skipped:
+            candidate = candidate.where(Agent.agent_id.not_in(skipped))
+        candidate = (
+            candidate.order_by(Agent.created_at.asc())
+            .limit(1)
+            .with_for_update(of=Agent, skip_locked=True)
+        )
+        agent_id = (await session.execute(candidate)).scalar_one_or_none()
+        if agent_id is None:
+            return None
+        occupied = await session.scalar(
+            select(func.count()).where(
+                ValidatorTicket.agent_id == agent_id,
+                ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES),
+            )
+        )
+        if (occupied or 0) < SCORING_QUORUM:
+            break
+        skipped.append(agent_id)
 
-    ticket = ValidatorTicket(
-        agent_id=agent_id,
-        validator_hotkey=validator_hotkey,
-        status=TicketStatus.ISSUED,
-        issued_at=now,
-        deadline=now + ttl,
-    )
-    session.add(ticket)
+    ticket = await session.get(ValidatorTicket, (agent_id, validator_hotkey))
+    if ticket is None:
+        ticket = ValidatorTicket(
+            agent_id=agent_id,
+            validator_hotkey=validator_hotkey,
+            status=TicketStatus.ISSUED,
+            issued_at=now,
+            deadline=now + ttl,
+        )
+        session.add(ticket)
+    else:
+        # The composite PK preserves one validator slot per agent. Reuse the
+        # expired row with a fresh lease rather than inserting a duplicate.
+        ticket.status = TicketStatus.ISSUED
+        ticket.issued_at = now
+        ticket.deadline = now + ttl
     await session.flush()
     return ticket
 
@@ -134,6 +149,7 @@ async def get_open_ticket(
     agent_id: UUID,
     validator_hotkey: str,
     now: datetime,
+    deadline: datetime,
 ) -> ValidatorTicket | None:
     """Return the validator's live (``issued``, not-yet-past-deadline) ticket for
     the agent, or ``None`` if it has none, it is already spent, or it expired."""
@@ -142,6 +158,7 @@ async def get_open_ticket(
         ticket is None
         or ticket.status != TicketStatus.ISSUED
         or _as_utc(ticket.deadline) < now
+        or _as_utc(ticket.deadline) != _as_utc(deadline)
     ):
         return None
     return ticket

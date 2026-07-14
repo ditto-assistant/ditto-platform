@@ -32,10 +32,11 @@ services:
     restart: unless-stopped
     environment:
       PYLON_OPEN_ACCESS_TOKEN: ${PYLON_OPEN_ACCESS_TOKEN:-dev-open-access}
-      PYLON_RECENT_OBJECTS_NETUIDS: ${PYLON_RECENT_OBJECTS_NETUIDS:-[3]}
-      # Point Pylon at the dev local chain (env-overridable), not finney.
-      PYLON_BITTENSOR_NETWORK: ${PYLON_BITTENSOR_NETWORK:-ws://68.183.141.180:80}
-      PYLON_BITTENSOR_ARCHIVE_NETWORK: ${PYLON_BITTENSOR_ARCHIVE_NETWORK:-ws://68.183.141.180:80}
+      # Ditto is SN118 consensus infrastructure; this is not operator-tunable.
+      PYLON_RECENT_OBJECTS_NETUIDS: "[118]"
+      # Pylon's neuron cache must read the same chain the API authorizes against.
+      PYLON_BITTENSOR_NETWORK: ${SUBTENSOR_NETWORK:?set SUBTENSOR_NETWORK in .env}
+      PYLON_BITTENSOR_ARCHIVE_NETWORK: ${SUBTENSOR_NETWORK:?set SUBTENSOR_NETWORK in .env}
       # --- Write identity (put_weights) ---
       # Open-access (above) stays for reads; identities add the write path.
       # Pylon loads the hotkey from the mounted wallet and signs set_weights
@@ -43,7 +44,7 @@ services:
       # (openssl rand -base64 32) shared with the validator's PYLON_IDENTITY_TOKEN.
       # Leave PYLON_IDENTITIES empty ([]) to keep this Pylon read-only.
       PYLON_IDENTITIES: ${PYLON_IDENTITIES:-["validator"]}
-      PYLON_ID_VALIDATOR_NETUID: ${PYLON_ID_VALIDATOR_NETUID:-3}
+      PYLON_ID_VALIDATOR_NETUID: "118"
       PYLON_ID_VALIDATOR_WALLET_NAME: ${PYLON_ID_VALIDATOR_WALLET_NAME:-validator}
       PYLON_ID_VALIDATOR_HOTKEY_NAME: ${PYLON_ID_VALIDATOR_HOTKEY_NAME:-default}
       PYLON_ID_VALIDATOR_TOKEN: ${PYLON_TOKEN:-}

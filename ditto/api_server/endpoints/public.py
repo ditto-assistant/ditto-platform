@@ -1,11 +1,14 @@
 """Public, unauthenticated read endpoints for the subnet dashboard.
 
-Two surfaces, both open (no credentials) and both fronting the same DB the
+Three surfaces, all open (no credentials) and fronting the same DB the
 validator-gated ``/scoring/scores`` reads:
 
 * **Aggregate leaderboard / health** (``/leaderboard``, ``/health``): best score
   per miner, composite plus tool/memory means and rank, never exposing per-case
   answer-key detail. This half stays aggregate-only.
+* **Submission lifecycle** (``/activity``): recent uploads and their public
+  pipeline stage, safe screening reason, and anti-copy review evidence, without
+  artifacts, hashes, payment data, or raw build logs.
 * **Per-submission transparency** (``/submissions``, ``/agent/{id}/scores``): the
   k=3 record for a finalized agent — *which* validators scored it, each one's
   exact numbers + signature, the median the platform finalized on, and the pinned
@@ -28,8 +31,8 @@ import logging
 import math
 import os
 import statistics
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Response
@@ -38,6 +41,8 @@ from ditto.api_models import (
     BenchDatasetConfig,
     BenchGradingConfig,
     BenchHarnessConfig,
+    PublicActivityEntry,
+    PublicActivityResponse,
     PublicAuditEntry,
     PublicAuditResponse,
     PublicBenchConfigResponse,
@@ -54,13 +59,20 @@ from ditto.api_models import (
     PublicSubmissionScores,
     PublicSubmissionsResponse,
     PublicSubmissionSummary,
+    PublicValidatorHeartbeat,
+    PublicValidatorHeartbeatsResponse,
     PublicValidatorScore,
 )
+from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.validator import SessionDep
+from ditto.db.models import Score
+from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
+from ditto.db.queries.heartbeats import list_validator_heartbeats
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
@@ -80,6 +92,7 @@ router = APIRouter(prefix="/public", tags=["public"])
 # The ledger only moves when a sweep records a new best score, so a short shared
 # cache is safe and shields the DB from dashboard/CDN traffic.
 _CACHE_CONTROL = "public, max-age=30"
+_VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 
 
 def _safe_models(details: dict) -> PublicRunModels | None:
@@ -345,11 +358,65 @@ async def health(
     )
 
 
+@router.get("/validators", response_model=PublicValidatorHeartbeatsResponse)
+async def validators(
+    response: Response,
+    session: SessionDep,
+) -> PublicValidatorHeartbeatsResponse:
+    """Signed software versions reported by heartbeat-capable validators.
+
+    This intentionally lists reporters, not every on-chain permit holder: a
+    missing hotkey means its software has not proved its version to the platform.
+    """
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    now = datetime.now(UTC)
+    cutoff = now - _VALIDATOR_ONLINE_WINDOW
+    rows = await list_validator_heartbeats(session)
+
+    def aware(value: datetime) -> datetime:
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+    entries = [
+        PublicValidatorHeartbeat(
+            validator_hotkey=row.validator_hotkey,
+            software_version=row.software_version,
+            protocol_version=row.protocol_version,
+            code_digest=row.code_digest,
+            state=cast(ValidatorRuntimeState, row.state),
+            reported_at=aware(row.reported_at),
+            seen_at=aware(row.seen_at),
+            signature=row.signature,
+            online=aware(row.seen_at) >= cutoff,
+        )
+        for row in rows
+    ]
+    return PublicValidatorHeartbeatsResponse(
+        generated_at=now,
+        online_window_seconds=int(_VALIDATOR_ONLINE_WINDOW.total_seconds()),
+        reported_count=len(entries),
+        online_count=sum(entry.online for entry in entries),
+        validators=entries,
+    )
+
+
 def _median_composite(row: SubmissionRow) -> float | None:
     """Median of the reported composites — the canonical score, or None if unscored."""
     if not row.scores:
         return None
     return statistics.median(s.composite for s in row.scores)
+
+
+def _ticket_deadline(score: Score) -> datetime | None:
+    """Read the signed lease identity from score details; null means legacy."""
+    if not isinstance(score.details, dict):
+        return None
+    value = score.details.get("ticket_deadline")
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
@@ -376,6 +443,7 @@ def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
                 n=s.n,
                 seed=s.seed,
                 run_id=s.run_id,
+                ticket_deadline=_ticket_deadline(s),
                 signature=s.signature,
                 generated_at=s.generated_at,
                 case_results=_safe_case_results(
@@ -399,6 +467,49 @@ def _submission_summary(row: SubmissionRow) -> PublicSubmissionSummary:
         dataset_seed=row.dataset_seed,
         dataset_sha256=row.dataset_sha256,
         last_scored_at=row.last_scored_at,
+    )
+
+
+def _public_activity_status(status: AgentStatus) -> str:
+    """Collapse internal moderation detail into stable public lifecycle labels."""
+    if status == AgentStatus.ATH_PENDING_REVIEW:
+        return "under_review"
+    if status == AgentStatus.BANNED:
+        return "rejected"
+    return status.value
+
+
+@router.get("/activity", response_model=PublicActivityResponse)
+async def activity(
+    response: Response,
+    session: SessionDep,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> PublicActivityResponse:
+    """Recent submissions and their safe public pipeline stage, newest first.
+
+    This exposes the evidence a miner needs to understand a failure or review:
+    a safe screening category plus the duplicate reference and anti-copy signal
+    summary. Artifact locations, hashes, payments, and raw build logs remain
+    private.
+    """
+    response.headers["Cache-Control"] = "public, max-age=10"
+    rows = await list_public_activity(session, limit=limit)
+    return PublicActivityResponse(
+        generated_at=datetime.now(UTC),
+        count=len(rows),
+        entries=[
+            PublicActivityEntry(
+                agent_id=row.agent_id,
+                miner_hotkey=row.miner_hotkey,
+                name=row.name,
+                status=_public_activity_status(row.status),
+                submitted_at=row.created_at,
+                screening_reason=row.screening_reason,
+                duplicate_of=row.duplicate_of,
+                review_reason=row.review_reason,
+            )
+            for row in rows
+        ],
     )
 
 

@@ -15,6 +15,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ditto.api_models.validator import ValidatorRuntimeState
+
 _SS58_PATTERN = r"^[1-9A-HJ-NP-Za-km-z]{47,48}$"
 
 
@@ -152,7 +154,13 @@ class PublicLeaderboardEntry(BaseModel):
     rank: Annotated[int, Field(ge=1, description="1-based rank by composite.")]
     agent_id: Annotated[
         UUID,
-        Field(description="The scored agent's id, to drill into its k=3 record at /public/agent/{id}/scores. Already public via /public/submissions."),
+        Field(
+            description=(
+                "The scored agent's id, to drill into its k=3 record at "
+                "/public/agent/{id}/scores. Already public via "
+                "/public/submissions."
+            )
+        ),
     ]
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Miner's SS58 hotkey.")
@@ -401,11 +409,25 @@ class PublicValidatorScore(BaseModel):
     run_id: Annotated[
         str, Field(description="Scoring-engine run id the signature is bound to.")
     ]
+    ticket_deadline: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description=(
+                "Exact ticket lease bound into current score signatures. Null "
+                "identifies a legacy score recorded before lease-bound signing."
+            ),
+        ),
+    ]
     signature: Annotated[
         str | None,
         Field(
             default=None,
-            description="sr25519 signature over the payload, hex (self-verifying).",
+            description=(
+                "sr25519 signature over the score payload, hex. Current signatures "
+                "include ticket_deadline; legacy rows with a null deadline use the "
+                "pre-lease payload and remain valid."
+            ),
         ),
     ]
     generated_at: Annotated[
@@ -537,6 +559,56 @@ class PublicSubmissionsResponse(BaseModel):
     submissions: Annotated[
         list[PublicSubmissionSummary],
         Field(default_factory=list, description="Recent finalized submissions."),
+    ]
+
+
+class PublicActivityEntry(BaseModel):
+    """One submission's safe, public lifecycle state."""
+
+    agent_id: Annotated[UUID, Field(description="The submitted agent's id.")]
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
+    ]
+    name: Annotated[str, Field(description="Miner-provided agent display name.")]
+    status: Annotated[
+        str,
+        Field(
+            description=(
+                "Public lifecycle stage. Internal review and enforcement states are "
+                "collapsed to under_review or rejected."
+            )
+        ),
+    ]
+    submitted_at: Annotated[
+        datetime, Field(description="When the platform accepted the upload (UTC).")
+    ]
+    screening_reason: Annotated[
+        str | None,
+        Field(default=None, description="Public-safe screening failure category."),
+    ]
+    duplicate_of: Annotated[
+        UUID | None,
+        Field(default=None, description="Earlier agent this submission may duplicate."),
+    ]
+    review_reason: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Anti-copy signals that routed this submission to review.",
+        ),
+    ]
+
+
+class PublicActivityResponse(BaseModel):
+    """Recent submission activity, newest first."""
+
+    generated_at: Annotated[
+        datetime, Field(description="When this snapshot was read (UTC).")
+    ]
+    count: Annotated[int, Field(ge=0, description="Number of submissions returned.")]
+    entries: Annotated[
+        list[PublicActivityEntry],
+        Field(default_factory=list, description="Recent submissions, newest first."),
     ]
 
 
@@ -748,6 +820,34 @@ class PublicHealthResponse(BaseModel):
             }
         }
     )
+
+
+class PublicValidatorHeartbeat(BaseModel):
+    """Latest signed software report from one permitted validator."""
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Validator's public hotkey.")
+    ]
+    software_version: str
+    protocol_version: Annotated[int, Field(ge=1)]
+    code_digest: Annotated[
+        str, Field(pattern=r"^[0-9a-f]{64}$", description="Installed source digest.")
+    ]
+    state: ValidatorRuntimeState
+    reported_at: datetime
+    seen_at: datetime
+    signature: Annotated[str, Field(pattern=r"^[0-9a-fA-F]{128}$")]
+    online: bool
+
+
+class PublicValidatorHeartbeatsResponse(BaseModel):
+    """Public view of validators that run heartbeat-capable software."""
+
+    generated_at: datetime
+    online_window_seconds: Annotated[int, Field(ge=1)]
+    reported_count: Annotated[int, Field(ge=0)]
+    online_count: Annotated[int, Field(ge=0)]
+    validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)
 
 
 class BenchHarnessConfig(BaseModel):

@@ -86,6 +86,15 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   **Never** included: `seed` (anti-overfit), `per_case` `expected`/`called` (the
   answer key), agent_id/sha256/signature/validator_hotkey (integrity-internal).
   `is_champion`/weights stay validator-side (KOTH fold), not served here.
+- `GET /api/v1/public/activity?limit=` → `{ generated_at, count, entries: [
+  { agent_id, miner_hotkey, name, status, submitted_at, screening_reason,
+    duplicate_of, review_reason } ] }`.
+  Recent uploads, newest first, including screening and evaluation stages so a
+  miner can confirm progress before a score exists. Screening failures expose a
+  stable failure category; anti-copy holds expose the matched agent and signal
+  summary. Internal review and ban states are collapsed to `under_review` /
+  `rejected`. Artifact locations, hashes, payments, and raw screener/build logs
+  are never included.
 - `GET /api/v1/public/submissions?limit=` → `{ generated_at, count, quorum,
   submissions: [ { agent_id, miner_hotkey, status, score_count,
   median_composite, dataset_seed, dataset_sha256, last_scored_at } ] }`.
@@ -155,6 +164,13 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   *successful* score, so run started/failed counts and set-weights latency are
   validator-side telemetry (wandb), not fabricated here. Detailed ops stay on the
   existing Prometheus `/metrics`.
+- `GET /api/v1/public/validators` → the latest signed software heartbeat from
+  each reporting permitted validator: public hotkey, package/protocol version,
+  deterministic source digest, current worker phase, report/receive times,
+  signature, and a five-minute online flag. Active benchmarks refresh
+  `running_benchmark` every two minutes. A missing hotkey means it has not proved
+  heartbeat-capable software; this endpoint does not pretend to enumerate every
+  on-chain permit holder.
 - Per-category means + run provenance: the scoring engine (dittobench-api) emits
   `models` + `per_category` (alongside `bench_version`, `dataset_sha256`,
   `lexical_gap`, `paraphrase`, `seeding_waves`, `tokens`) in `RunDetails`; the
@@ -168,6 +184,9 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
 
 Static SPA (no server-side secrets) pulling the public API above; wandb linked
 for the deep dive. Sections:
+- **Submission pipeline** — recent agent uploads, miner hotkey, public lifecycle
+  stage, screening/review evidence, and submission time, visible before scoring
+  completes.
 - **Leaderboard** — rank, miner, composite, category radar sparkline, weight %,
   trend arrow; champion highlighted.
 - **Miner drill-down** — composite history, category radar, ATH badge, best run

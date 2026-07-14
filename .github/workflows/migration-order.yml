@@ -1,0 +1,26 @@
+name: Migration Order
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migration-order-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  migration-order:
+    name: Migration order
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check Alembic migration order
+        run: python scripts/check_migration_order.py origin/main

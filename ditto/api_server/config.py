@@ -27,6 +27,21 @@ _SS58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$")
 
 
 @dataclass(frozen=True)
+class ScreenerAuthConfig:
+    """Credentials accepted by the platform-operated screener endpoints."""
+
+    hotkey: str | None
+    """Dedicated screener SS58 hotkey. It does not need an on-chain permit."""
+
+    api_token: str | None
+    """Bearer token required on every screener request."""
+
+    @property
+    def enabled(self) -> bool:
+        return self.hotkey is not None and self.api_token is not None
+
+
+@dataclass(frozen=True)
 class ApiServerConfig:
     """Resolved configuration for the API server process.
 
@@ -79,6 +94,9 @@ class ApiServerConfig:
     ``DATA_PIPELINE_URL``); when set, the platform generates one dataset per
     submission at job-ready and pins (seed, dataset_sha256, run_size) on the
     agent."""
+
+    screener_auth: ScreenerAuthConfig
+    """Dedicated signer and bearer token for the platform-operated screener."""
 
     dashboard_enabled: bool = True
     """Serve the public dashboard SPA (``dashboard/index.html``) at ``/``.
@@ -137,6 +155,8 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
     dashboard_wandb_url = os.environ.get(
         "DITTO_DASHBOARD_WANDB_URL", "https://wandb.ai/"
     )
+    screener_hotkey = os.environ.get("SCREENER_HOTKEY") or None
+    screener_api_token = os.environ.get("SCREENER_API_TOKEN") or None
 
     return ApiServerConfig(
         host=host,
@@ -150,6 +170,10 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
         storage=parse_storage_config_from_env(),
         embedding=parse_embedding_config_from_env(),
         data_pipeline=parse_data_pipeline_config_from_env(),
+        screener_auth=ScreenerAuthConfig(
+            hotkey=screener_hotkey,
+            api_token=screener_api_token,
+        ),
         dashboard_enabled=dashboard_enabled,
         dashboard_wandb_url=dashboard_wandb_url,
     )
@@ -169,3 +193,12 @@ def check_config(config: ApiServerConfig) -> None:
             f"log_level must be one of {sorted(_VALID_LOG_LEVELS)}; "
             f"got {config.log_level!r}"
         )
+    auth = config.screener_auth
+    if (auth.hotkey is None) != (auth.api_token is None):
+        raise ApiServerConfigError(
+            "SCREENER_HOTKEY and SCREENER_API_TOKEN must be set together"
+        )
+    if auth.hotkey is not None and not _SS58_RE.fullmatch(auth.hotkey):
+        raise ApiServerConfigError("SCREENER_HOTKEY is not a valid SS58 address")
+    if auth.api_token is not None and len(auth.api_token) < 32:
+        raise ApiServerConfigError("SCREENER_API_TOKEN must be at least 32 characters")

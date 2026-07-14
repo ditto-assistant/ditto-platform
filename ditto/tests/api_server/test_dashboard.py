@@ -58,9 +58,30 @@ class TestDashboard:
         resp = await _get(app, "/")
         assert resp.status_code == 404
 
-    @pytest.mark.parametrize("path", ["/api/v1/public/leaderboard"])
+    @pytest.mark.parametrize(
+        "path", ["/api/v1/public/leaderboard", "/api/v1/public/activity"]
+    )
     async def test_api_still_mounted_alongside_dashboard(self, path: str) -> None:
         # Serving HTML at / must not shadow the API routes.
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         # 200 requires a DB; here we only assert the route exists (not 404).
         assert any(getattr(r, "path", None) == path for r in app.routes)
+
+    async def test_includes_submission_pipeline(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert "Submission pipeline" in body
+        # The pipeline is its own hash-routed page, reachable from the sidebar.
+        assert 'data-page="pipeline"' in body
+        assert 'href="#/pipeline"' in body
+        assert 'getJSON("/public/activity?limit=200")' in body
+        assert 'id="activity-rows"' in body
+        assert "Copy review:" in body
+        assert "screening_reason" in body
+
+    async def test_sidebar_routes_every_section(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        for page in ("overview", "leaderboard", "pipeline", "health", "benchmark"):
+            assert f'href="#/{page}"' in body
+            assert f'data-page="{page}"' in body

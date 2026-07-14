@@ -22,7 +22,7 @@ through this endpoint unchanged.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -32,6 +32,17 @@ from ditto.api_models.upload import (
     _SIGNATURE_HEX_PATTERN,
     _SS58_PATTERN,
 )
+
+_CODE_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
+_SOFTWARE_VERSION_PATTERN = r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$"
+
+ValidatorRuntimeState = Literal[
+    "polling",
+    "running_benchmark",
+    "updating_weights",
+    "idle",
+    "error",
+]
 
 
 class ArtifactResponse(BaseModel):
@@ -66,6 +77,38 @@ class ArtifactResponse(BaseModel):
             }
         }
     )
+
+
+class JobRequest(BaseModel):
+    """Signed request to claim one validator scoring ticket.
+
+    The signature proves possession of ``validator_hotkey`` before the platform
+    allocates scarce quorum work. ``nonce`` is consumed exactly once and
+    ``requested_at`` is freshness-bounded, preventing a captured request from
+    claiming another ticket later.
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Claiming validator hotkey.")
+    ]
+    nonce: Annotated[UUID, Field(description="One-time claim nonce.")]
+    requested_at: Annotated[
+        datetime, Field(description="UTC time at which the claim was signed.")
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            pattern=_SIGNATURE_HEX_PATTERN,
+            description="sr25519 signature over the canonical claim payload.",
+        ),
+    ]
+
+    @field_validator("requested_at")
+    @classmethod
+    def requested_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("requested_at must include a timezone")
+        return value
 
 
 class JobResponse(BaseModel):
@@ -146,6 +189,57 @@ class JobResponse(BaseModel):
             }
         }
     )
+
+
+class ValidatorHeartbeatRequest(BaseModel):
+    """Signed proof of the validator build currently serving a hotkey.
+
+    ``code_digest`` is a deterministic SHA-256 over the installed Python source,
+    so it identifies the actual worker bytes without trusting an operator-supplied
+    Git label. ``timestamp`` is Unix time and is freshness-checked by the server.
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Reporting validator hotkey.")
+    ]
+    software_version: Annotated[
+        str,
+        Field(
+            pattern=_SOFTWARE_VERSION_PATTERN,
+            description="Ditto package version.",
+        ),
+    ]
+    protocol_version: Annotated[
+        int, Field(ge=1, le=2**31 - 1, description="Heartbeat protocol version.")
+    ]
+    code_digest: Annotated[
+        str,
+        Field(
+            pattern=_CODE_DIGEST_PATTERN,
+            description="SHA-256 of the installed validator Python source.",
+        ),
+    ]
+    state: Annotated[
+        ValidatorRuntimeState,
+        Field(description="Current validator worker phase."),
+    ]
+    timestamp: Annotated[
+        int, Field(ge=0, description="Validator-reported Unix timestamp (UTC).")
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            pattern=_SIGNATURE_HEX_PATTERN,
+            description=("sr25519 signature over the canonical v1 heartbeat payload."),
+        ),
+    ]
+
+
+class ValidatorHeartbeatResponse(BaseModel):
+    """Acknowledgement that a signed heartbeat was persisted."""
+
+    accepted: bool
+    seen_at: datetime
 
 
 class CaseScore(BaseModel):
@@ -321,24 +415,32 @@ class SubmitScoreRequest(BaseModel):
     """Body of ``POST /validator/agent/{agent_id}/score``.
 
     The validator authenticates by signing a canonical payload binding the
-    agent id and the report contents — the UTF-8 bytes of
-    ``f"{validator_hotkey}:{agent_id}:{run_id}:{composite!r}:{seed}"`` — with
-    the validator's hotkey keypair. The platform reconstructs and verifies the
-    same bytes, so a captured signature cannot be replayed against a different
-    agent nor cover an altered composite.
+    agent id, exact ticket lease, and report contents — the UTF-8 bytes of
+    ``f"{validator_hotkey}:{agent_id}:{ticket_deadline}:{run_id}:"`` +
+    ``f"{composite!r}:{seed}"`` — with the validator's hotkey keypair. The
+    platform reconstructs and verifies the same bytes, so a captured signature
+    cannot be replayed against a different agent or a reissued ticket.
     """
 
     validator_hotkey: Annotated[
         str,
         Field(pattern=_SS58_PATTERN, description="Reporting validator's SS58 hotkey."),
     ]
+    ticket_deadline: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description="Exact deadline from the JobResponse ticket lease.",
+        ),
+    ] = None
     signature: Annotated[
         str,
         Field(
             pattern=_SIGNATURE_HEX_PATTERN,
             description=(
                 "Hex sr25519 signature over "
-                "``{validator_hotkey}:{agent_id}:{run_id}:{composite!r}:{seed}``."
+                "``{validator_hotkey}:{agent_id}:{ticket_deadline}:"
+                "{run_id}:{composite!r}:{seed}``."
             ),
         ),
     ]
@@ -350,6 +452,7 @@ class SubmitScoreRequest(BaseModel):
                 "validator_hotkey": (
                     "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
                 ),
+                "ticket_deadline": "2026-07-09T12:30:00Z",
                 "signature": "ab" * 64,
                 "report": {
                     "run_id": "run_2026-06-08_abc123",

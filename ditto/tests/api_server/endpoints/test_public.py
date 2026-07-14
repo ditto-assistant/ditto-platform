@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -176,20 +176,30 @@ async def _seed_agent(
     *,
     miner: str,
     status: AgentStatus = AgentStatus.UPLOADED,
-) -> None:
+    name: str = "agent",
+    created_at: datetime | None = None,
+    screening_reason: str | None = None,
+    duplicate_of: UUID | None = None,
+    review_reason: str | None = None,
+) -> str:
     """Seed a submission with no score (e.g. still uploaded/evaluating)."""
+    agent_id = uuid4()
     async with maker() as s, s.begin():
         s.add(
             Agent(
-                agent_id=uuid4(),
+                agent_id=agent_id,
                 miner_hotkey=miner,
-                name="agent",
+                name=name,
                 sha256="cd" * 32,
                 size_bytes=524288,
                 status=status,
-                created_at=datetime.now(UTC),
+                created_at=created_at or datetime.now(UTC),
+                screening_reason=screening_reason,
+                duplicate_of=duplicate_of,
+                review_reason=review_reason,
             )
         )
+    return str(agent_id)
 
 
 class TestPublicLeaderboard:
@@ -468,6 +478,93 @@ class TestPublicHealth:
         }
 
 
+class TestPublicActivity:
+    async def test_lists_all_stages_newest_first_without_sensitive_fields(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        older_id = await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.UPLOADED,
+            name="memory-v1",
+            created_at=datetime(2026, 7, 13, 10, 0, 0, tzinfo=UTC),
+        )
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_B,
+            status=AgentStatus.ATH_PENDING_REVIEW,
+            name="memory-v2",
+            created_at=datetime(2026, 7, 13, 11, 0, 0, tzinfo=UTC),
+            duplicate_of=UUID(older_id),
+            review_reason=(
+                f"content near-duplicate of agent {older_id}: "
+                "composite delta 0.0010, jaccard 0.950"
+            ),
+        )
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.BANNED,
+            name="memory-v3",
+            created_at=datetime(2026, 7, 13, 12, 0, 0, tzinfo=UTC),
+            screening_reason="Docker image build failed",
+        )
+        _install_db(app, session_maker)
+
+        resp = await client.get("/api/v1/public/activity")
+        assert resp.status_code == 200
+        assert resp.headers["Cache-Control"] == "public, max-age=10"
+        body = resp.json()
+        assert body["count"] == 3
+        assert [entry["name"] for entry in body["entries"]] == [
+            "memory-v3",
+            "memory-v2",
+            "memory-v1",
+        ]
+        assert [entry["status"] for entry in body["entries"]] == [
+            "rejected",
+            "under_review",
+            "uploaded",
+        ]
+        assert body["entries"][2]["agent_id"] == older_id
+        assert body["entries"][0]["screening_reason"] == "Docker image build failed"
+        assert body["entries"][1]["duplicate_of"] == older_id
+        assert "jaccard 0.950" in body["entries"][1]["review_reason"]
+        assert set(body["entries"][0]) == {
+            "agent_id",
+            "miner_hotkey",
+            "name",
+            "status",
+            "submitted_at",
+            "screening_reason",
+            "duplicate_of",
+            "review_reason",
+        }
+        serialized = resp.text
+        for private_field in (
+            "sha256",
+            "artifact",
+            "payment",
+            "SECRET_FROM_BUILD",
+        ):
+            assert private_field not in serialized
+
+    async def test_respects_limit(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(session_maker, miner=_MINER_A)
+        await _seed_agent(session_maker, miner=_MINER_B)
+        _install_db(app, session_maker)
+        body = (await client.get("/api/v1/public/activity?limit=1")).json()
+        assert body["count"] == 1
+
+
 class TestPublicSubmissionScores:
     async def test_detail_exposes_k3_breakdown_and_median(
         self,
@@ -507,6 +604,9 @@ class TestPublicSubmissionScores:
             assert s["signature"] == "ab" * 64
             assert s["seed"] == 987654321
             assert "run_id" in s
+            # Scores recorded before lease-bound signing remain public and
+            # continue counting; null identifies their legacy signature format.
+            assert s["ticket_deadline"] is None
 
     async def test_detail_exposes_redacted_per_case_breakdown(
         self,

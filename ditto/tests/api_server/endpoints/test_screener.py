@@ -198,7 +198,15 @@ async def _seed_agent(
     return aid
 
 
-_AUTH_HEADER = {"X-Screener-Hotkey": _SCREENER_HOTKEY}
+_AUTH_HEADER = {
+    "Authorization": "Bearer test-screener-token-at-least-32-characters",
+    "X-Screener-Hotkey": _SCREENER_HOTKEY,
+}
+
+
+@pytest.fixture(autouse=True)
+def _authenticate_screener_client(client: httpx.AsyncClient) -> None:
+    client.headers.update(_AUTH_HEADER)
 
 
 # --- Queue -----------------------------------------------------------------
@@ -259,21 +267,53 @@ class TestQueue:
     ) -> None:
         _install_db(app, session_maker)
         _install_chain(app)
+        client.headers.clear()
         response = await client.get("/api/v1/screener/queue")
         assert response.status_code == 401
         assert response.json()["error_code"] == ERROR_CODE_SCREENER_AUTH
 
-    async def test_unpermitted_returns_401(
+    async def test_invalid_bearer_token_returns_401(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         _install_db(app, session_maker)
-        _install_chain(app, permitted=False)
-        response = await client.get("/api/v1/screener/queue", headers=_AUTH_HEADER)
+        response = await client.get(
+            "/api/v1/screener/queue",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
         assert response.status_code == 401
         assert response.json()["error_code"] == ERROR_CODE_SCREENER_AUTH
+
+    async def test_unapproved_hotkey_returns_401(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        response = await client.get(
+            "/api/v1/screener/queue",
+            headers={
+                "X-Screener-Hotkey": (
+                    "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
+                )
+            },
+        )
+        assert response.status_code == 401
+        assert response.json()["error_code"] == ERROR_CODE_SCREENER_AUTH
+
+    async def test_dedicated_screener_needs_no_validator_permit(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app, permitted=False, registered=False)
+        response = await client.get("/api/v1/screener/queue")
+        assert response.status_code == 200
 
     async def test_limit_out_of_range_returns_422(
         self,
@@ -374,10 +414,20 @@ class TestSubmitResult:
 
         response = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=False, detail="cargo build failed"),
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                detail="build failed: cargo error SECRET_FROM_BUILD",
+            ),
         )
         assert response.status_code == 200
         assert response.json()["status"] == AgentStatus.SCREENING_FAILED
+
+        async with session_maker() as s:
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.screening_reason == "Docker image build failed"
+            assert "SECRET_FROM_BUILD" not in agent.screening_reason
 
     async def test_pass_is_idempotent(
         self,
@@ -602,7 +652,7 @@ class TestSubmitResult:
         assert response.status_code == 401
         assert response.json()["error_code"] == ERROR_CODE_SCREENER_AUTH
 
-    async def test_unpermitted_returns_401(
+    async def test_payload_hotkey_must_match_authenticated_hotkey(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -610,10 +660,11 @@ class TestSubmitResult:
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
         _install_db(app, session_maker)
-        _install_chain(app, permitted=False)
+        _install_chain(app)
+        other = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
         response = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id),
+            json=_result_payload(agent_id, screener_hotkey=other),
         )
         assert response.status_code == 401
         assert response.json()["error_code"] == ERROR_CODE_SCREENER_AUTH

@@ -189,6 +189,13 @@ class Agent(Base):
     review_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     """Human-readable reason a held agent was routed to review (audit trail)."""
 
+    screening_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Public-safe reason category for a failed build/serve screen.
+
+    The screener's raw ``detail`` may contain an untrusted Docker build-log tail,
+    so the endpoint maps it to a fixed category before persisting it here.
+    """
+
     status: Mapped[AgentStatus] = mapped_column(
         Enum(
             AgentStatus,
@@ -406,6 +413,48 @@ class Score(Base):
     )
 
 
+class ValidatorHeartbeat(Base):
+    """Latest signed build and runtime heartbeat for one validator hotkey."""
+
+    __tablename__ = "validator_heartbeats"
+
+    validator_hotkey: Mapped[str] = mapped_column(Text, primary_key=True)
+    software_version: Mapped[str] = mapped_column(Text, nullable=False)
+    protocol_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    code_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    reported_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    seen_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    signature: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "length(software_version) BETWEEN 1 AND 64",
+            name="validator_heartbeats_software_version_length_check",
+        ),
+        CheckConstraint(
+            "protocol_version > 0",
+            name="validator_heartbeats_protocol_version_check",
+        ),
+        CheckConstraint(
+            "length(code_digest) = 64",
+            name="validator_heartbeats_code_digest_length_check",
+        ),
+        CheckConstraint(
+            "state IN ('polling', 'running_benchmark', 'updating_weights', "
+            "'idle', 'error')",
+            name="validator_heartbeats_state_check",
+        ),
+        CheckConstraint(
+            "length(signature) = 128",
+            name="validator_heartbeats_signature_length_check",
+        ),
+        Index("validator_heartbeats_seen_at_idx", "seen_at"),
+    )
+
+
 class ValidatorTicket(Base):
     """One validator's evaluation ticket for one agent (a k=3 scoring grant).
 
@@ -492,6 +541,26 @@ class ValidatorTicket(Base):
             postgresql_where=text("status = 'issued'"),
         ),
     )
+
+
+class ValidatorRequestNonce(Base):
+    """A recently consumed signed validator request nonce.
+
+    Rows are short-lived replay guards. The UUID primary key makes consuming a
+    nonce atomic across every platform replica; expired rows are pruned during
+    subsequent claims.
+    """
+
+    __tablename__ = "validator_request_nonces"
+
+    nonce: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    used_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+
+    __table_args__ = (Index("validator_request_nonces_expires_at_idx", "expires_at"),)
 
 
 class BannedHotkey(Base):

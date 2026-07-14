@@ -18,16 +18,14 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
   ``screening_passed``) so nothing else has to promote it; a fail sets
   ``screening_failed``. Re-reporting the same verdict is idempotent; a
   conflicting or late verdict (agent already past screening) is a 409.
-- **Auth mirrors the validator.** Only a chain-registered hotkey holding a
-  ``validator_permit`` may call these (a distinct ``screener_permit`` is a
-  future refinement); the result POST additionally verifies an sr25519
-  signature over ``f"{screener_hotkey}:{agent_id}"``.
+- **Dedicated auth.** Every request carries a bearer token and the configured
+  screener hotkey. Result POSTs additionally verify the hotkey's sr25519
+  signature over ``f"{screener_hotkey}:{agent_id}:{passed}"``.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated
@@ -44,7 +42,6 @@ from ditto.api_models import (
     ScreenResultResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_dataset_generator,
@@ -52,13 +49,8 @@ from ditto.api_server.dependencies import (
     get_storage_client,
 )
 from ditto.api_server.endpoints.retrieval import AgentNotFoundError
-
-# Reuse the validator's proven chain-auth + signature helpers so the screener
-# and validator share one implementation (same permit set, same sr25519 check).
 from ditto.api_server.endpoints.validator import (
     ChainDep,
-    ValidatorAuthError,
-    _assert_validator_permitted,
     _verify_signature,
 )
 from ditto.api_server.onchain_seed import derive_seed
@@ -129,10 +121,9 @@ async def _derive_dataset_seed(
 class ScreenerAuthError(Exception):
     """Raised when a screener request fails authentication/authorization.
 
-    Covers a missing/malformed ``X-Screener-Hotkey`` header, a hotkey not
-    registered on the netuid, a hotkey without a ``validator_permit``, and a
-    verdict whose signature does not verify. The envelope handler maps all of
-    these to HTTP 401 + code 5000.
+    Covers a missing/invalid bearer token, a hotkey other than the configured
+    dedicated screener, and a verdict whose signature does not verify. The
+    envelope handler maps these to HTTP 401 + code 5000.
     """
 
 
@@ -152,39 +143,25 @@ StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
 GeneratorDep = Annotated[DatasetGenerator, Depends(get_dataset_generator)]
 
 
-async def _assert_screener_permitted(
-    chain: ChainDep, netuid: int, hotkey: str, *, network: str
-) -> None:
-    """Permit check reusing the validator's, re-flavoured as a screener error.
-
-    A chain outage still surfaces as the validator helper's 503; a
-    registered-but-unpermitted / unregistered hotkey becomes a
-    :class:`ScreenerAuthError` (code 5000) rather than a validator one.
-    """
-    try:
-        await _assert_validator_permitted(chain, netuid, hotkey, network=network)
-    except ValidatorAuthError as e:
-        raise ScreenerAuthError(str(e)) from e
-
-
 async def require_screener(
     request: Request,
-    chain: ChainDep,
     x_screener_hotkey: Annotated[str | None, Header()] = None,
+    authorization: Annotated[str | None, Header()] = None,
 ) -> str:
-    """Authenticate a screener request via the ``X-Screener-Hotkey`` header.
-
-    Verifies the header is a well-formed SS58 hotkey and a permitted validator
-    on the configured netuid. Returns the hotkey for logging/audit.
-    """
-    if x_screener_hotkey is None or not re.fullmatch(_SS58_PATTERN, x_screener_hotkey):
-        raise ScreenerAuthError("missing or malformed X-Screener-Hotkey header")
-    netuid = request.app.state.config.chain.netuid
-    network = request.app.state.config.chain.subtensor_network
-    await _assert_screener_permitted(
-        chain, netuid, x_screener_hotkey, network=network
-    )
-    return x_screener_hotkey
+    """Authenticate the dedicated screener by hotkey and bearer token."""
+    auth = request.app.state.config.screener_auth
+    expected_hotkey = auth.hotkey
+    expected_token = auth.api_token
+    if expected_hotkey is None or expected_token is None:
+        raise ScreenerAuthError("screener authentication is not configured")
+    if x_screener_hotkey != expected_hotkey:
+        raise ScreenerAuthError("X-Screener-Hotkey is not authorized")
+    prefix = "Bearer "
+    if authorization is None or not authorization.startswith(prefix):
+        raise ScreenerAuthError("missing screener bearer token")
+    if not secrets.compare_digest(authorization[len(prefix) :], expected_token):
+        raise ScreenerAuthError("invalid screener bearer token")
+    return expected_hotkey
 
 
 ScreenerDep = Annotated[str, Depends(require_screener)]
@@ -196,7 +173,6 @@ ScreenerDep = Annotated[str, Depends(require_screener)]
     responses={
         401: {"description": "Missing/invalid screener auth."},
         422: {"description": "Malformed query parameter."},
-        503: {"description": "Chain unavailable for the permit check."},
     },
 )
 async def queue(
@@ -230,7 +206,6 @@ async def queue(
         401: {"description": "Missing/invalid screener auth."},
         404: {"description": "No agent with the given id."},
         422: {"description": "Malformed UUID path parameter."},
-        503: {"description": "Chain unavailable for the permit check."},
     },
 )
 async def agent_artifact(
@@ -260,21 +235,45 @@ async def agent_artifact(
     )
 
 
+def _public_screening_reason(detail: str) -> str:
+    """Map untrusted screener detail to a stable, public-safe failure category.
+
+    ``detail`` can include a Docker build-log tail produced by miner-controlled
+    code. Never persist or return it verbatim: a malicious Dockerfile could print
+    the BuildKit secret mounted for private dependency access.
+    """
+    normalized = detail.strip().casefold()
+    if "no dockerfile at tarball root" in normalized:
+        return "Dockerfile missing from archive root"
+    if normalized.startswith("build failed"):
+        return "Docker image build failed"
+    if normalized.startswith("serve check failed"):
+        return "Container failed the health check"
+    if "tarball exceeds" in normalized:
+        return "Submission archive exceeded the size limit"
+    if "sha256 mismatch" in normalized:
+        return "Submission artifact failed integrity verification"
+    if normalized.startswith("artifact download"):
+        return "Submission artifact could not be downloaded"
+    if normalized.startswith("screener error"):
+        return "Screening infrastructure error"
+    return "Screening failed"
+
+
 @router.post(
     "/agent/{agent_id}/result",
     response_model=ScreenResultResponse,
     responses={
-        401: {"description": "Signature did not verify / not a permitted screener."},
+        401: {"description": "Invalid screener credentials or signature."},
         404: {"description": "No agent with the given id."},
         409: {"description": "Agent is past the screening stage."},
         422: {"description": "Malformed request body or UUID path parameter."},
-        503: {"description": "Chain unavailable for the permit check."},
     },
 )
 async def submit_result(
     agent_id: UUID,
     payload: ScreenResultRequest,
-    request: Request,
+    screener_hotkey: ScreenerDep,
     response: Response,
     chain: ChainDep,
     session: SessionDep,
@@ -283,10 +282,11 @@ async def submit_result(
     """Record the screener's verdict and advance the agent's lifecycle.
 
     Ordering is cheap-before-expensive; no DB write happens until every check
-    passes: (1) signature over ``{screener_hotkey}:{agent_id}:{passed}``, (2)
-    on-chain permit check, (3) generate the per-submission dataset (pass +
-    generation enabled), (4) one transaction that promotes ``uploaded ->
-    evaluating`` (pass, pinning the dataset) or ``uploaded -> screening_failed``.
+    passes: (1) dedicated screener bearer authentication, (2) signature over
+    ``{screener_hotkey}:{agent_id}:{passed}``, (3) generate the per-submission
+    dataset (pass + generation enabled), (4) one transaction that promotes
+    ``uploaded -> evaluating`` (pass, pinning the dataset) or ``uploaded ->
+    screening_failed``.
 
     The dataset generation (3) is a network call to the private generate service;
     it runs BEFORE the row-lock transaction (never hold a lock across I/O) and
@@ -296,7 +296,10 @@ async def submit_result(
     """
     response.headers["Cache-Control"] = "no-store"
 
-    # 1. Signature proves the screener owns the hotkey and binds THIS verdict:
+    if payload.screener_hotkey != screener_hotkey:
+        raise ScreenerAuthError("payload hotkey does not match authenticated screener")
+
+    # Signature proves the screener owns the hotkey and binds THIS verdict:
     #    ``passed`` is signed, so a captured result can't be replayed with the
     #    boolean flipped to grief (or unfairly promote) a miner.
     signed = f"{payload.screener_hotkey}:{agent_id}:{payload.passed}".encode()
@@ -304,13 +307,6 @@ async def submit_result(
         raise ScreenerAuthError(
             f"verdict signature did not verify for hotkey {payload.screener_hotkey}"
         )
-
-    # 2. The hotkey must be a permitted validator on this subnet.
-    netuid = request.app.state.config.chain.netuid
-    network = request.app.state.config.chain.subtensor_network
-    await _assert_screener_permitted(
-        chain, netuid, payload.screener_hotkey, network=network
-    )
 
     target = AgentStatus.EVALUATING if payload.passed else AgentStatus.SCREENING_FAILED
 
@@ -352,6 +348,9 @@ async def submit_result(
                 f"agent {agent_id} is {agent.status}, cannot apply verdict "
                 f"passed={payload.passed} (target {target})"
             )
+        agent.screening_reason = (
+            None if payload.passed else _public_screening_reason(payload.detail)
+        )
         # Pin the generated dataset once, when evaluating and not yet set (the
         # `is None` guard keeps a concurrent/duplicate verdict from overwriting).
         if (
@@ -369,12 +368,13 @@ async def submit_result(
         result_status = agent.status
 
     logger.info(
-        "screen verdict agent_id=%s screener=%s passed=%s status=%s dataset=%s%s",
+        "screen verdict agent_id=%s screener=%s passed=%s status=%s dataset=%s "
+        "reason=%r",
         agent_id,
         payload.screener_hotkey,
         payload.passed,
         result_status,
         "pinned" if new_dataset is not None else "none",
-        f" detail={payload.detail!r}" if payload.detail else "",
+        agent.screening_reason,
     )
     return ScreenResultResponse(agent_id=agent_id, status=result_status, accepted=True)
