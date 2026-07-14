@@ -22,10 +22,12 @@ dependencies = [
     "prometheus-client>=0.20",
     "tenacity>=8.0",
     "aioboto3>=13.0",
+    "ditto-screening-protocol==0.1.0",
 ]
 
 [tool.uv.sources]
 bittensor-pylon-client = { git = "https://github.com/bittensor-church/bittensor-pylon", subdirectory = "pylon_client" }
+ditto-screening-protocol = { git = "https://github.com/ditto-assistant/ditto-subnet", rev = "bc2630d3c1a6edf63a587d202d75d5cd23908023", subdirectory = "packages/ditto-screening-protocol" }
 
 [dependency-groups]
 dev = [
@@ -56,7 +58,7 @@ extend-select = ["I"]
 quote-style = "double"
 
 [tool.ruff.lint.isort]
-known-first-party = ["ditto"]
+known-first-party = ["ditto", "ditto_screening_protocol"]
 
 # ─── Mypy ────────────────────────────────────────────────────────────────────
 
