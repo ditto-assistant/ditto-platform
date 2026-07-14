@@ -1083,11 +1083,34 @@ class TestClaim:
 
 
 class TestQuarantineAdmin:
-    async def test_list_release_and_conflicting_second_resolution(
+    @pytest.mark.parametrize(
+        ("resolution", "expected_status", "expected_reason"),
+        [
+            (
+                "release",
+                AgentStatus.EVALUATING,
+                "Remove the bundled credential and resubmit",
+            ),
+            (
+                "rescreen",
+                AgentStatus.SCREENING_FAILED,
+                "Remove the bundled credential and resubmit",
+            ),
+            (
+                "reject",
+                AgentStatus.REJECTED,
+                "Remove the bundled credential and resubmit",
+            ),
+        ],
+    )
+    async def test_list_resolution_reason_and_conflicting_second_resolution(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
+        resolution: str,
+        expected_status: AgentStatus,
+        expected_reason: str | None,
     ) -> None:
         app.state.config = replace(
             app.state.config,
@@ -1128,7 +1151,10 @@ class TestQuarantineAdmin:
         resolved = await client.post(
             f"/api/v1/admin/screening-quarantines/{item['quarantine_id']}/resolve",
             headers=admin_headers,
-            json={"resolution": "release", "reason": "Reviewed and approved"},
+            json={
+                "resolution": resolution,
+                "reason": "Remove the bundled credential and resubmit",
+            },
         )
         conflict = await client.post(
             f"/api/v1/admin/screening-quarantines/{item['quarantine_id']}/resolve",
@@ -1136,8 +1162,12 @@ class TestQuarantineAdmin:
             json={"resolution": "reject", "reason": "Conflicting action"},
         )
         assert resolved.status_code == 200
-        assert resolved.json()["agent_status"] == AgentStatus.EVALUATING
+        assert resolved.json()["agent_status"] == expected_status
         assert conflict.status_code == 409
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.screening_reason == expected_reason
 
     async def test_admin_auth_is_required(
         self, app: FastAPI, client: httpx.AsyncClient
