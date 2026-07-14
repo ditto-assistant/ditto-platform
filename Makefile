@@ -1,8 +1,11 @@
-.PHONY: lint format typecheck test test-integration smoke-pylon smoke-api stack-up stack-down migrate migrate-down migrate-history migrate-current api-up embedder-up embedder-down smoke-embedder
+.PHONY: lint lint-copy format typecheck test test-integration smoke-pylon smoke-api stack-up stack-down migrate migrate-down migrate-history migrate-current api-up embedder-up embedder-down smoke-embedder
 
 lint:
 	uv run ruff format --check .
 	uv run ruff check .
+
+lint-copy:
+	npm run lint:copy
 
 format:
 	uv run ruff format .
