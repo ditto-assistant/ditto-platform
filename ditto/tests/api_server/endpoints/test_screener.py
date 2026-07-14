@@ -16,7 +16,7 @@ import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -41,7 +41,7 @@ from ditto.api_server.middleware.error_envelope import (
 )
 from ditto.chain import ChainError
 from ditto.chain.models import BlockInfo, NeuronInfo
-from ditto.db.models import Agent, Base
+from ditto.db.models import Agent, Base, ScreeningAttempt
 from ditto_screening_protocol import verdict_signing_message
 
 _KEYPAIR = bittensor.Keypair.create_from_uri("//Alice")
@@ -232,6 +232,7 @@ _AUTH_HEADER = {
     "Authorization": "Bearer test-screener-token-at-least-32-characters",
     "X-Screener-Hotkey": _SCREENER_HOTKEY,
 }
+_CLAIM_URL = f"/api/v1/screener/claim?policy_version={SCREENING_POLICY_VERSION}"
 
 
 @pytest.fixture(autouse=True)
@@ -417,7 +418,7 @@ class TestClaim:
         _install_db(app, session_maker)
         _install_chain(app)
 
-        claimed = await client.post("/api/v1/screener/claim", headers=_AUTH_HEADER)
+        claimed = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
         assert claimed.status_code == 200
         item = claimed.json()["items"][0]
         assert item["agent_id"] == str(agent_id)
@@ -425,7 +426,7 @@ class TestClaim:
         assert item["attempt_id"]
         assert item["lease_deadline"]
 
-        duplicate = await client.post("/api/v1/screener/claim", headers=_AUTH_HEADER)
+        duplicate = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
         assert duplicate.status_code == 200
         assert duplicate.json()["count"] == 0
 
@@ -447,6 +448,29 @@ class TestClaim:
         assert first.status_code == 200
         assert replay.status_code == 200
         assert replay.json()["status"] == AgentStatus.EVALUATING
+
+    async def test_policy_mismatch_does_not_create_lease(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+
+        mismatch = await client.post(
+            f"/api/v1/screener/claim?policy_version={SCREENING_POLICY_VERSION - 1}",
+            headers=_AUTH_HEADER,
+        )
+
+        assert mismatch.status_code == 409
+        assert mismatch.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.status == AgentStatus.UPLOADED
+            attempts = (await session.scalars(select(ScreeningAttempt))).all()
+            assert attempts == []
 
 
 # --- Artifact --------------------------------------------------------------
@@ -644,7 +668,7 @@ class TestSubmitResult:
         assert response.status_code == 200
         assert response.json()["status"] == AgentStatus.SCREENING_FAILED
 
-        retry = await client.post("/api/v1/screener/claim", headers=_AUTH_HEADER)
+        retry = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
         assert retry.status_code == 200
         assert retry.json()["items"][0]["agent_id"] == str(agent_id)
 

@@ -183,6 +183,7 @@ ScreenerDep = Annotated[str, Depends(require_screener)]
     response_model=ScreenerQueueResponse,
     responses={
         401: {"description": "Missing/invalid screener auth."},
+        409: {"description": "Worker screening policy does not match platform."},
         422: {"description": "Malformed query parameter."},
     },
 )
@@ -247,10 +248,16 @@ async def claim(
     response: Response,
     screener_hotkey: ScreenerDep,
     session: SessionDep,
+    policy_version: Annotated[int, Query(ge=1)],
     limit: Annotated[int, Query(ge=1, le=20)] = 1,
 ) -> ScreenerQueueResponse:
     """Lease pending work and make its active screening state public."""
     response.headers["Cache-Control"] = "no-store"
+    if policy_version != SCREENING_POLICY_VERSION:
+        raise AgentNotScreenableError(
+            "screening policy mismatch before claim: platform requires "
+            f"{SCREENING_POLICY_VERSION}, worker declared {policy_version}"
+        )
     now = datetime.now(UTC)
     async with session.begin():
         claimed = await claim_screening_attempts(
