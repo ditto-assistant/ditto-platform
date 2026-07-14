@@ -71,6 +71,9 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert "Submission pipeline" in body
+        assert body.index("<h2>Leaderboard</h2>") < body.index(
+            "<h2>Submission pipeline</h2>"
+        )
         assert 'getJSON("/public/activity")' in body
         assert 'id="activity-rows"' in body
         assert "Copy review:" in body
