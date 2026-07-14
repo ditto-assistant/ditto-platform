@@ -136,6 +136,7 @@ which repos are public and what is left to open.
 | `ditto-harness` | miner agent/memory library | PUBLIC | none; fetched during the miner's Docker build inside the sandbox |
 | `dittobench-starter-kit` | miner harness kit | PUBLIC | none; miner-side |
 | `ditto-subnet` | the validator worker | PUBLIC | a validator runs this process |
+| `ditto-screener` | platform-operated build and model-call gate | PRIVATE | the team runs this process on the isolated screener VM |
 | `dittobench-api` | the scoring engine (build/run miner, model+egress lock, composite + gates) | PRIVATE | OPEN: flip visibility (pre-launch step 3) |
 | `ditto-platform` | central coordinator (dataset issuance, ticket lease, ledger, median) | PRIVATE | STAYS private: the validator talks to it but verifies everything it returns (seed re-derivation, tarball sha256, signed scores, public audit log) |
 | `ditto-data-pipeline` | upstream corpus extraction | PRIVATE | STAYS private: off the scoring path |

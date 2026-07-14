@@ -26,7 +26,7 @@ flowchart LR
     end
 
     subgraph ScrVM["Screener VM · platform-operated · dedicated host · Docker · private"]
-        SW["screener worker<br/>python -m ditto.screener<br/>docker build + /health gate"]:::new
+        SW["ditto-screener worker<br/>private repository<br/>docker build + /health gate"]:::new
     end
 
     subgraph VM["Validator VM · Docker · private · IAP SSH"]

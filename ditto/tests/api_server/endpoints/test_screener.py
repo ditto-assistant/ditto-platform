@@ -472,6 +472,89 @@ class TestClaim:
             attempts = (await session.scalars(select(ScreeningAttempt))).all()
             assert attempts == []
 
+    async def test_expired_lease_rejects_late_verdict(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        async with session_maker() as session, session.begin():
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            assert attempt is not None
+            attempt.started_at = datetime.now(UTC) - timedelta(minutes=2)
+            attempt.deadline = datetime.now(UTC) - timedelta(minutes=1)
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            headers=_AUTH_HEADER,
+            json=_result_payload(agent_id, attempt_id=attempt_id),
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+
+    async def test_attempt_cannot_be_replayed_for_another_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        claimed_agent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.UPLOADED,
+            created_at=datetime.now(UTC) - timedelta(minutes=1),
+        )
+        other_agent = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        item = next(
+            row
+            for row in claimed.json()["items"]
+            if row["agent_id"] == str(claimed_agent)
+        )
+        attempt_id = UUID(item["attempt_id"])
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{other_agent}/result",
+            headers=_AUTH_HEADER,
+            json=_result_payload(other_agent, attempt_id=attempt_id),
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+
+    async def test_attempt_rejects_wrong_policy_even_for_signed_failure(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            headers=_AUTH_HEADER,
+            json=_result_payload(
+                agent_id,
+                attempt_id=attempt_id,
+                passed=False,
+                policy_version=SCREENING_POLICY_VERSION - 1,
+            ),
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+
 
 # --- Artifact --------------------------------------------------------------
 

@@ -1,6 +1,6 @@
 """Screener-facing endpoints — the cheap pre-evaluation gate.
 
-The screener worker (in ``ditto-subnet``) drains freshly ``uploaded`` agents,
+The worker in the private ``ditto-screener`` repository drains freshly uploaded agents,
 does a lint + compile + build check on each tarball, and reports a verdict.
 A pass promotes the agent ``uploaded -> evaluating`` so the validator queue
 picks it up. A deterministic submission failure becomes ``rejected``; a

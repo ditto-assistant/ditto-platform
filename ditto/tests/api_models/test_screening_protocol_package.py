@@ -29,3 +29,22 @@ def test_canonical_versioned_verdict_message_is_wire_compatible() -> None:
         )
         == f"{hotkey}:{agent_id}:True:{SCREENING_POLICY_VERSION}".encode()
     )
+
+
+def test_canonical_lease_bound_verdict_message_is_exact() -> None:
+    hotkey = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+    agent_id = UUID("550e8400-e29b-41d4-a716-446655440000")
+    attempt_id = UUID("550e8400-e29b-41d4-a716-446655440001")
+    assert (
+        verdict_signing_message(
+            screener_hotkey=hotkey,
+            agent_id=agent_id,
+            attempt_id=attempt_id,
+            passed=False,
+            policy_version=SCREENING_POLICY_VERSION,
+        )
+        == (
+            "ditto-screen-verdict:v2:"
+            f"{hotkey}:{agent_id}:{attempt_id}:False:{SCREENING_POLICY_VERSION}"
+        ).encode()
+    )
