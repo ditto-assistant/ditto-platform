@@ -188,6 +188,10 @@ class TestDashboard:
         assert "screening_progress" in body
         assert "Building image" in body
         assert "elapsedDuration" in body
+        assert "renderPipelineScreenerProgress" in body
+        assert "activeScreenerFor" in body
+        assert "pipelineScreenerStage" in body
+        assert 'renderPipelineBoard({ entries: pipelineEntries }, false)' in body
         assert "data-started-at" in body
         assert "active_agent_name" in body
         assert "setInterval(updateScreenerElapsed, 1000)" in body
