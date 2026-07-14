@@ -665,7 +665,10 @@ class PublicScreeningAttempt(BaseModel):
 
     attempt_id: UUID
     policy_version: Annotated[int, Field(ge=1)]
-    status: Annotated[str, Field(pattern=r"^(running|passed|rejected|failed|expired)$")]
+    status: Annotated[
+        str,
+        Field(pattern=r"^(running|passed|rejected|failed|expired|quarantined)$"),
+    ]
     screener_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
     started_at: datetime
     deadline: datetime

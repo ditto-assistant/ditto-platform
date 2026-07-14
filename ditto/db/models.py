@@ -769,6 +769,13 @@ class ValidatorTicket(Base):
             "deadline",
             postgresql_where=text("status = 'issued'"),
         ),
+        Index(
+            "validator_tickets_one_issued_per_validator_idx",
+            "validator_hotkey",
+            unique=True,
+            postgresql_where=text("status = 'issued'"),
+            sqlite_where=text("status = 'issued'"),
+        ),
     )
 
 

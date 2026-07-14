@@ -91,7 +91,7 @@ class TestIssueTicket:
             )
         assert extra is None
 
-    async def test_same_validator_not_seated_twice_on_one_agent(
+    async def test_same_validator_resumes_its_live_ticket(
         self, session: AsyncSession
     ) -> None:
         await _seed_evaluating(session)
@@ -99,9 +99,11 @@ class TestIssueTicket:
             t1 = await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
             t2 = await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         assert t1 is not None
-        assert t2 is None  # only one agent, and this validator already holds it
+        assert t2 is not None
+        assert t2.agent_id == t1.agent_id
+        assert t2.deadline == t1.deadline
 
-    async def test_validator_can_hold_tickets_for_distinct_agents(
+    async def test_validator_cannot_hold_live_tickets_for_distinct_agents(
         self, session: AsyncSession
     ) -> None:
         a1 = await _seed_evaluating(session, created_at=_NOW, name="old")
@@ -113,7 +115,8 @@ class TestIssueTicket:
             t2 = await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
         assert t1 is not None and t2 is not None
         assert t1.agent_id == a1  # oldest first
-        assert {t1.agent_id, t2.agent_id} == {a1, a2}
+        assert t2.agent_id == a1
+        assert t2.agent_id != a2
 
     async def test_prioritizes_fewest_accepted_scores_before_age(
         self, session: AsyncSession
