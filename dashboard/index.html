@@ -200,8 +200,8 @@
     .banner.show { display: flex; }
     .banner b { color: #fde68a; }
 
-    /* ── Summary cards ──────────────────────────────────────── */
-    .cards { display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px; margin: 22px 0; }
+    /* ── Network snapshot ───────────────────────────────────── */
+    .cards { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 1px; margin: 22px 0; }
     .card {
       background: var(--bg-elev); border: 1px solid var(--border);
       border-radius: var(--radius); padding: 16px 18px; position: relative; overflow: hidden;
@@ -507,23 +507,15 @@
     .attempt-time { color: var(--text-faint); font-size: 11.5px; white-space: nowrap; }
     @media (max-width: 560px) { .attempt { grid-template-columns: 88px 1fr; } .attempt-time { grid-column: 2; } }
 
-    /* ── Health strip ───────────────────────────────────────── */
-    .health { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
-    .htile { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
-    .htile .hl { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
-    .htile .hv { font-size: 21px; font-weight: 700; margin-top: 5px; font-variant-numeric: tabular-nums; }
-    .htile .hv small { font-size: 12px; color: var(--text-dim); font-weight: 500; }
-
     @media (max-width: 960px) {
       .hide-md { display: none; }
-      .cards { grid-template-columns: repeat(3, 1fr); }
+      .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .pipeline-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .pipeline-column:nth-child(3) { border-left: 0; border-top: 1px solid var(--border); }
       .pipeline-column:nth-child(4) { border-top: 1px solid var(--border); }
     }
     @media (max-width: 720px) {
       .cards { grid-template-columns: repeat(2, 1fr); }
-      .health { grid-template-columns: repeat(2, 1fr); }
       .hide-sm { display: none; }
       .stage-cell { min-width: 0; }
       .brand h1 { font-size: 18px; }
@@ -704,18 +696,27 @@
     .banner b { color: var(--banner-strong); }
 
     .cards {
-      grid-template-columns: repeat(6, minmax(0, 1fr));
-      gap: 0;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
       margin: 0 0 36px;
       border: 1px solid var(--border);
-      background: var(--bg-elev);
+      background: var(--border);
     }
-    .card { min-width: 0; padding: 18px; border: 0; border-right: 1px solid var(--border); border-radius: 0; background: transparent; overflow: visible; }
-    .card:last-child { border-right: 0; }
+    .card { min-width: 0; padding: 18px; border: 0; border-radius: 0; background: var(--bg-elev); overflow: visible; }
+    .card.primary {
+      grid-column: span 2;
+      grid-row: span 2;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 24px;
+      background: color-mix(in oklch, var(--accent) 8%, var(--bg-elev));
+    }
     .card .glow { display: none; }
-    .card .label,
-    .htile .hl { color: var(--text-dim); font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: .06em; }
+    .card .label { color: var(--text-dim); font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: .06em; }
     .card .value { margin-top: 8px; font-family: var(--display); font-size: 29px; font-weight: 400; line-height: 1; letter-spacing: -0.02em; }
+    .card.primary .label { color: var(--accent); font-size: 10px; }
+    .card.primary .value { margin-top: 12px; font-size: 52px; }
+    .card.primary .context { max-width: 20ch; margin-top: 12px; color: var(--text-dim); font-size: 12px; line-height: 1.45; }
 
     .section-head { align-items: flex-end; margin: 34px 0 10px; }
     .section-head h2,
@@ -781,11 +782,6 @@
     .chip.on .n { color: var(--on-accent); }
     .stage { background: var(--bg-elev-2); }
 
-    .health { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; border: 1px solid var(--border); background: var(--bg-elev); }
-    .htile { padding: 18px; border: 0; border-right: 1px solid var(--border); border-radius: 0; background: transparent; }
-    .htile:last-child { border-right: 0; }
-    .htile .hv { margin-top: 8px; font-family: var(--display); font-size: 25px; font-weight: 400; }
-
     .about { margin-top: 46px; padding-top: 30px; border-top: 1px solid var(--border); }
     .about > p.lead { margin-top: 10px; color: var(--text-dim); font-size: 14px; }
     .about .pillars { gap: 0; border: 1px solid var(--border); }
@@ -805,10 +801,8 @@
     .stat-head { color: var(--text); font-size: 17px; }
     .split .seg { border-radius: 3px; }
 
-    @media (max-width: 1250px) {
-      .cards { grid-template-columns: repeat(3, 1fr); }
-      .card:nth-child(3) { border-right: 0; }
-      .card:nth-child(-n + 3) { border-bottom: 1px solid var(--border); }
+    @media (max-width: 900px) {
+      .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     }
     @media (max-width: 960px) {
       .sidebar { padding: 14px 16px 10px; background: var(--bg-elev); }
@@ -828,19 +822,14 @@
       header.top #wandb-link { order: 3; }
       header.top #refresh { order: 4; }
       .cards { grid-template-columns: repeat(2, 1fr); }
-      .card:nth-child(3) { border-right: 1px solid var(--border); }
-      .card:nth-child(even) { border-right: 0; }
-      .card:nth-child(-n + 4) { border-bottom: 1px solid var(--border); }
+      .card.primary { grid-column: 1 / -1; grid-row: auto; min-height: 152px; }
+      .card.primary .value { font-size: 44px; }
       .section-head { display: block; }
       .section-head .hint { display: block; margin-top: 6px; line-height: 1.5; }
       .view-all { display: inline-block; margin: 8px 0 0; }
       .pager { gap: 6px; padding-inline: 8px; }
       .pager .btn { min-width: 84px; padding-inline: 9px; }
       .page-status { min-width: 94px; }
-      .health { grid-template-columns: repeat(2, 1fr); }
-      .htile:nth-child(even) { border-right: 0; }
-      .htile:nth-child(-n + 4) { border-bottom: 1px solid var(--border); }
-      .htile:last-child { grid-column: 1 / -1; }
       .about .pillars { grid-template-columns: 1fr; }
       .about .pillar { border-right: 0; border-bottom: 1px solid var(--border); }
       .about .pillar:last-child { border-bottom: 0; }
@@ -1129,13 +1118,19 @@
       <span><b>Sample data.</b> The live API couldn't be reached, so the layout is shown with example numbers. Configure the API base with <code>?api=</code> or the <code>ditto:api-base</code> meta tag.</span>
     </div>
 
-    <section class="cards" id="cards">
+    <section class="cards" id="cards" aria-labelledby="snapshot-title">
+      <h2 class="visually-hidden" id="snapshot-title">Subnet snapshot</h2>
+      <div class="card primary"><div class="label">Miners total</div><div class="value" id="h-miners">–</div><div class="context">Distinct miners who have submitted to Subnet 118.</div></div>
       <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label"><span class="tip" title="Distinct miners with at least one scored run on the board (provisional runs included).">Miners Scored</span></div><div class="value" id="c-miners">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="The highest composite among ranked (full-benchmark) runs. Composite = (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates (efficiency, consistency, and canary integrity: a canary leak ×0.5, an honest miss ×0.85). Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
       <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" title="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 24 seeds at run_size=full. The score a submission must beat. Source: dittobench-api docs/BASELINES.md (bench_version 2).">Reference Baseline</span></div><div class="value" id="c-baseline">–</div></div>
+      <div class="card"><div class="label">Scores · 24h</div><div class="value" id="h-24h">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
       <div class="card"><div class="glow" style="background:var(--memory)"></div><div class="label"><span class="tip" title="Total LLM tokens the runs on the board spent (the harnesses' own calls to the locked model). Generation and grading are non-LLM, so scoring itself spends nothing.">Scoring Spend</span></div><div class="value" id="c-cost">–</div></div>
+      <div class="card"><div class="label">Scored agents</div><div class="value" id="h-agents">–</div></div>
+      <div class="card"><div class="label">Avg latency</div><div class="value" id="h-lat">–</div></div>
+      <div class="card"><div class="label">Last scored</div><div class="value" id="h-last">–</div></div>
     </section>
 
     <div class="section-head">
@@ -1282,18 +1277,6 @@
         <span class="page-status">Page 1 of 1</span>
         <button class="btn ghost" type="button" data-activity-page="next">Next <span aria-hidden="true">→</span></button>
       </nav>
-    </div>
-
-    <div class="section-head">
-      <h2>Subnet health</h2>
-      <span class="hint">what the platform records · run failures &amp; weight-setting live in wandb</span>
-    </div>
-    <div class="health" id="health">
-      <div class="htile"><div class="hl">Miners total</div><div class="hv" id="h-miners">–</div></div>
-      <div class="htile"><div class="hl">Scored agents</div><div class="hv" id="h-agents">–</div></div>
-      <div class="htile"><div class="hl">Scores · 24h</div><div class="hv" id="h-24h">–</div></div>
-      <div class="htile"><div class="hl">Avg latency</div><div class="hv" id="h-lat">–</div></div>
-      <div class="htile"><div class="hl">Last scored</div><div class="hv" id="h-last">–</div></div>
     </div>
 
     <section class="about">
@@ -2233,7 +2216,7 @@
     });
     document.getElementById("refresh").addEventListener("click", function () { load(true); });
 
-    // ── Health strip ─────────────────────────────────────────
+    // ── Operational snapshot metrics ─────────────────────────
     function renderHealth(h) {
       document.getElementById("h-miners").textContent = h.miners;
       document.getElementById("h-agents").textContent = h.scored_agents == null ? "–" : h.scored_agents;
