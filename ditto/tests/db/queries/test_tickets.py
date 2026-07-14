@@ -115,6 +115,48 @@ class TestIssueTicket:
         assert t1.agent_id == a1  # oldest first
         assert {t1.agent_id, t2.agent_id} == {a1, a2}
 
+    async def test_prioritizes_fewest_accepted_scores_before_age(
+        self, session: AsyncSession
+    ) -> None:
+        two_scores = await _seed_evaluating(
+            session, created_at=_NOW - timedelta(hours=2), name="two-scores"
+        )
+        one_score = await _seed_evaluating(
+            session, created_at=_NOW - timedelta(hours=1), name="one-score"
+        )
+        zero_scores = await _seed_evaluating(
+            session, created_at=_NOW, name="zero-scores"
+        )
+        async with session.begin():
+            for agent_id, validators in (
+                (two_scores, ("5A", "5B")),
+                (one_score, ("5C",)),
+            ):
+                for validator in validators:
+                    session.add(
+                        ValidatorTicket(
+                            agent_id=agent_id,
+                            validator_hotkey=validator,
+                            status=TicketStatus.SCORED,
+                            issued_at=_NOW,
+                            deadline=_NOW + _TTL,
+                            bench_version=2,
+                            attempt_count=1,
+                        )
+                    )
+
+        claimed: list[UUID] = []
+        async with session.begin():
+            for _ in range(3):
+                ticket = await issue_ticket(
+                    session, validator_hotkey="5New", now=_NOW, ttl=_TTL
+                )
+                assert ticket is not None
+                ticket.status = TicketStatus.SCORED
+                claimed.append(ticket.agent_id)
+
+        assert claimed == [zero_scores, one_score, two_scores]
+
 
 class TestExpiry:
     async def test_deadline_instant_is_expired(self, session: AsyncSession) -> None:

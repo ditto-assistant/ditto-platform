@@ -85,13 +85,14 @@ async def issue_ticket(
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
-    Sweeps overdue tickets first, then picks the oldest ``evaluating`` agent
-    that (a) has fewer than :data:`SCORING_QUORUM` live tickets and (b) this
-    validator does not already hold a live or scored ticket for. A prior expired
-    row is reissued only after its cooldown and only once for the same benchmark
-    version, so never-attempted agents move ahead of a slow retry. Returns the
-    ticket, or ``None`` when there is no work for this validator ("no job for
-    you"). Runs inside the caller's transaction.
+    Sweeps overdue tickets first, then picks an ``evaluating`` agent that (a)
+    has fewer than :data:`SCORING_QUORUM` live tickets and (b) this validator
+    does not already hold a live or scored ticket for. Candidates with fewer
+    accepted scores come first, then never-attempted work, then submission age.
+    A prior expired row is reissued only after its cooldown and only once for
+    the same benchmark version. Returns the ticket, or ``None`` when there is no
+    work for this validator ("no job for you"). Runs inside the caller's
+    transaction.
     """
     await expire_overdue_tickets(session, now=now)
 
@@ -122,6 +123,15 @@ async def issue_ticket(
         .correlate(Agent)
         .exists()
     )
+    accepted_score_count = (
+        select(func.count())
+        .where(
+            ValidatorTicket.agent_id == Agent.agent_id,
+            ValidatorTicket.status == TicketStatus.SCORED,
+        )
+        .correlate(Agent)
+        .scalar_subquery()
+    )
     # Lock one candidate Agent row before counting its tickets. The recount is a
     # separate statement after the lock is acquired, so under Postgres READ
     # COMMITTED it sees any ticket committed by the previous lock holder.
@@ -136,9 +146,17 @@ async def issue_ticket(
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
         candidate = (
-            # Never-attempted work always precedes a cooled-down retry, even
-            # when the retrying submission is older.
-            candidate.order_by(had_prior_ticket.asc(), Agent.created_at.asc())
+            # Spread validator coverage across the backlog before completing a
+            # submission's quorum. An agent with zero accepted scores precedes
+            # one with one, which precedes one with two. Within that fairness
+            # bucket, never-attempted work precedes this validator's cooled-down
+            # retry, then the oldest submission wins with a stable UUID tie-break.
+            candidate.order_by(
+                accepted_score_count.asc(),
+                had_prior_ticket.asc(),
+                Agent.created_at.asc(),
+                Agent.agent_id.asc(),
+            )
             .limit(1)
             .with_for_update(of=Agent, skip_locked=True)
         )
