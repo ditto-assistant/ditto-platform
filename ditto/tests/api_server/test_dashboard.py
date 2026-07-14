@@ -206,6 +206,20 @@ class TestDashboard:
         assert "root.dataset.timePhase = fromHour(new Date().getHours())" in body
         assert 'if (hour >= 5 && hour < 8) return "dawn"' in body
 
+    async def test_sidebar_shell_routes_every_section(self) -> None:
+        # The dashboard is a sidebar shell with hash-routed pages; the theme
+        # switcher moved into the sidebar and the leaderboard is consolidated
+        # onto the Overview page (no separate Leaderboard tab).
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert '<aside class="sidebar"' in body
+        for page in ("overview", "operations", "submissions", "benchmark"):
+            assert f'href="#/{page}"' in body
+            assert f'data-page="{page}"' in body
+        assert 'href="#/leaderboard"' not in body
+        assert "<h2>Leaderboard</h2>" in body  # folded into Overview
+        assert 'data-theme-choice="system"' in body  # switcher still wired
+
     async def test_benchmark_badge_omits_latest_suffix(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
