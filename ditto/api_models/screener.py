@@ -29,6 +29,17 @@ ScreenerProgressStage = Literal[
     "building",
     "starting",
     "health_check",
+    "source_review_0",
+    "source_review_10",
+    "source_review_20",
+    "source_review_30",
+    "source_review_40",
+    "source_review_50",
+    "source_review_60",
+    "source_review_70",
+    "source_review_80",
+    "source_review_90",
+    "source_review_100",
     "submitting",
 ]
 

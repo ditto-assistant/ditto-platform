@@ -29,7 +29,7 @@ import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from sqlalchemy import or_, select
@@ -61,14 +61,14 @@ from ditto.api_server.endpoints.validator import (
 from ditto.api_server.onchain_seed import derive_seed
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
-from ditto.db.models import Agent, ScreeningAttempt
+from ditto.db.models import Agent, ScreeningAttempt, ScreeningQuarantine
 from ditto.db.queries.agents import get_agent_by_id
 from ditto.db.queries.heartbeats import upsert_screener_heartbeat
 from ditto.db.queries.screening import (
     claim_screening_attempts,
     get_screening_attempt,
 )
-from ditto_screening_protocol import verdict_signing_message
+from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -520,7 +520,19 @@ async def submit_result(
     # Signature proves the screener owns the hotkey and binds THIS verdict:
     #    ``passed`` is signed, so a captured result can't be replayed with the
     #    boolean flipped to grief (or unfairly promote) a miner.
-    if payload.attempt_id is not None:
+    if payload.outcome is not None:
+        signed = verdict_signing_message(
+            screener_hotkey=payload.screener_hotkey,
+            agent_id=agent_id,
+            attempt_id=payload.attempt_id,
+            passed=payload.passed,
+            policy_version=payload.policy_version,
+            outcome=payload.outcome,
+            manifest_digest=payload.manifest_digest,
+            finding_digest=payload.finding_digest,
+            reason_code=payload.reason_code,
+        )
+    elif payload.attempt_id is not None:
         signed = verdict_signing_message(
             screener_hotkey=payload.screener_hotkey,
             agent_id=agent_id,
@@ -549,12 +561,19 @@ async def submit_result(
             f"passing verdict requires screening policy {SCREENING_POLICY_VERSION}"
         )
 
-    target = (
-        AgentStatus.EVALUATING
-        if payload.passed
-        else _failed_screening_target(payload.detail)
-    )
-    public_reason = None if payload.passed else _public_screening_reason(payload.detail)
+    public_reason: str | None
+    if payload.outcome == ScreenResultOutcome.QUARANTINE:
+        target = AgentStatus.QUARANTINED
+        public_reason = "Submission held for anti-cheat review"
+    else:
+        target = (
+            AgentStatus.EVALUATING
+            if payload.passed
+            else _failed_screening_target(payload.detail)
+        )
+        public_reason = (
+            None if payload.passed else _public_screening_reason(payload.detail)
+        )
 
     # 3. Generate the per-submission dataset (outside the row lock). Only on a pass,
     #    when generation is enabled, and when the agent is not already pinned (a
@@ -587,7 +606,9 @@ async def submit_result(
             raise AgentNotFoundError(f"no agent with id={agent_id}")
         attempt: ScreeningAttempt | None = None
         attempt_status = (
-            "passed"
+            "quarantined"
+            if target == AgentStatus.QUARANTINED
+            else "passed"
             if payload.passed
             else ("rejected" if target == AgentStatus.REJECTED else "failed")
         )
@@ -659,6 +680,34 @@ async def submit_result(
             attempt.status = attempt_status
             attempt.finished_at = datetime.now(UTC)
             attempt.public_reason = public_reason
+        if target == AgentStatus.QUARANTINED:
+            if attempt is None:
+                raise AgentNotScreenableError(
+                    "quarantine requires a claimed screening attempt"
+                )
+            if payload.manifest_digest is None or payload.reason_code is None:
+                raise AgentNotScreenableError(
+                    "quarantine result is missing bounded evidence"
+                )
+            existing_quarantine = await session.scalar(
+                select(ScreeningQuarantine).where(
+                    ScreeningQuarantine.attempt_id == attempt.attempt_id
+                )
+            )
+            if existing_quarantine is None:
+                session.add(
+                    ScreeningQuarantine(
+                        quarantine_id=uuid4(),
+                        agent_id=agent_id,
+                        attempt_id=attempt.attempt_id,
+                        screener_hotkey=screener_hotkey,
+                        policy_version=payload.policy_version,
+                        manifest_digest=payload.manifest_digest,
+                        finding_digest=payload.finding_digest,
+                        reason_code=payload.reason_code,
+                        status="active",
+                    )
+                )
         # Pin the generated dataset once, when evaluating and not yet set (the
         # `is None` guard keeps a concurrent/duplicate verdict from overwriting).
         if (

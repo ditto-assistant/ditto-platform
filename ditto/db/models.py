@@ -290,7 +290,8 @@ class ScreeningAttempt(Base):
             name="screening_attempts_policy_version_check",
         ),
         CheckConstraint(
-            "status IN ('running', 'passed', 'rejected', 'failed', 'expired')",
+            "status IN ('running', 'passed', 'rejected', 'failed', 'expired', "
+            "'quarantined')",
             name="screening_attempts_status_check",
         ),
         CheckConstraint(
@@ -309,6 +310,60 @@ class ScreeningAttempt(Base):
             postgresql_where=text("status = 'running'"),
             sqlite_where=text("status = 'running'"),
         ),
+    )
+
+
+class ScreeningQuarantine(Base):
+    """Append-only quarantine decision plus its operator resolution."""
+
+    __tablename__ = "screening_quarantines"
+
+    quarantine_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    attempt_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    screener_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    manifest_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    finding_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reason_code: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    resolved_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolution: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolution_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(
+            ["attempt_id"],
+            ["screening_attempts.attempt_id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("attempt_id", name="screening_quarantines_attempt_id_key"),
+        CheckConstraint(
+            "policy_version > 0", name="screening_quarantines_policy_check"
+        ),
+        CheckConstraint(
+            "status IN ('active', 'resolved')",
+            name="screening_quarantines_status_check",
+        ),
+        CheckConstraint(
+            "resolution IS NULL OR resolution IN ('release', 'rescreen', 'reject')",
+            name="screening_quarantines_resolution_check",
+        ),
+        Index(
+            "screening_quarantines_one_active_agent_idx",
+            "agent_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
+        Index("screening_quarantines_created_idx", "created_at"),
     )
 
 

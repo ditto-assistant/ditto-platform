@@ -189,6 +189,8 @@ class TestDashboard:
         assert "screenerStageLabel" in body
         assert "screening_progress" in body
         assert "Building image" in body
+        assert "LLM review" in body
+        assert "source_review_" in body
         assert "elapsedDuration" in body
         assert "data-started-at" in body
         assert "active_agent_name" in body

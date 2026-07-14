@@ -2800,6 +2800,8 @@
     }
 
     function screenerStageLabel(stage) {
+      var sourceReview = /^source_review_(\d+)$/.exec(stage || "");
+      if (sourceReview) return "LLM review · " + sourceReview[1] + "%";
       var labels = {
         preparing: "Preparing",
         downloading: "Downloading submission",

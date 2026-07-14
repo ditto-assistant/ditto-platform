@@ -62,6 +62,7 @@ class TestAgentStatusEnum:
             "screening",
             "screening_passed",
             "screening_failed",
+            "quarantined",
             "evaluating",
             "scored",
             "live",

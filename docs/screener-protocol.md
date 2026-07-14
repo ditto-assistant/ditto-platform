@@ -22,3 +22,22 @@ v6 worker, then merge/deploy this pin. Stop the old worker only after equivalent
 signed pass/reject/retry behavior is observed. Merge the subnet runtime-removal
 PR last. This order requires no migration and preserves screening history,
 active leases, waiting-validator submissions, evaluations, and score receipts.
+## Quarantine management
+
+A current worker can return a signed, attempt-bound `quarantine` outcome with
+only bounded reason and evidence digests. The platform completes that exact
+lease, moves the submission to the non-scoreable `quarantined` state, and
+appends a `screening_quarantines` row. Raw source, model transcripts, private
+prompts, and challenge contents are never stored in the platform database.
+
+Backroom and other operator clients use the bearer-protected endpoints below:
+
+- `GET /api/v1/admin/screening-quarantines`
+- `GET /api/v1/admin/screening-quarantines/{quarantine_id}`
+- `POST /api/v1/admin/screening-quarantines/{quarantine_id}/resolve`
+
+Resolution requires `X-Admin-Actor` and one of `release`, `rescreen`, or
+`reject`. A row lock makes resolution single-writer. Release pins a dataset if
+needed and promotes to evaluation; rescreen returns the preserved submission to
+the screener queue; reject retains the submission and prior scores but prevents
+evaluation until a future policy-version rescreen.
