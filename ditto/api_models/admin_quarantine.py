@@ -47,9 +47,40 @@ class AdminQuarantineResolveResponse(BaseModel):
     agent_status: str
 
 
+class AdminScreeningAttempt(BaseModel):
+    attempt_id: UUID
+    policy_version: int
+    status: Literal["running", "passed", "rejected", "failed", "expired", "quarantined"]
+    screener_hotkey: str
+    started_at: datetime
+    deadline: datetime
+    finished_at: datetime | None
+    reason: str | None
+
+
+class AdminScreeningSubmission(BaseModel):
+    agent_id: UUID
+    miner_hotkey: str
+    agent_name: str
+    artifact_sha256: str
+    agent_status: str
+    screening_policy_version: int
+    screening_reason: str | None
+    submitted_at: datetime
+    attempts: list[AdminScreeningAttempt]
+
+
+class AdminScreeningSubmissionList(BaseModel):
+    items: list[AdminScreeningSubmission]
+    count: int
+
+
 __all__ = [
     "AdminQuarantineItem",
     "AdminQuarantineList",
     "AdminQuarantineResolveRequest",
     "AdminQuarantineResolveResponse",
+    "AdminScreeningAttempt",
+    "AdminScreeningSubmission",
+    "AdminScreeningSubmissionList",
 ]

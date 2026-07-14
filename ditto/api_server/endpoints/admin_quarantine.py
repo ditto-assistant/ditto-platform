@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
-from datetime import UTC, datetime
+from collections import defaultdict
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -16,18 +18,30 @@ from ditto.api_models.admin_quarantine import (
     AdminQuarantineList,
     AdminQuarantineResolveRequest,
     AdminQuarantineResolveResponse,
+    AdminScreeningAttempt,
+    AdminScreeningSubmission,
+    AdminScreeningSubmissionList,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.validator import ArtifactResponse
 from ditto.api_server.datapipeline import DatasetGenerator
-from ditto.api_server.dependencies import get_dataset_generator, get_session
+from ditto.api_server.dependencies import (
+    get_dataset_generator,
+    get_session,
+    get_storage_client,
+)
 from ditto.api_server.endpoints.screener import _derive_dataset_seed
 from ditto.api_server.endpoints.validator import ChainDep
-from ditto.db.models import Agent, ScreeningQuarantine
+from ditto.api_server.storage import S3StorageClient
+from ditto.db.models import Agent, ScreeningAttempt, ScreeningQuarantine
 
-router = APIRouter(prefix="/admin/screening-quarantines", tags=["admin"])
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/admin", tags=["admin"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 GeneratorDep = Annotated[DatasetGenerator, Depends(get_dataset_generator)]
+StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
 
 
 async def require_admin(
@@ -68,7 +82,7 @@ def _item(row: ScreeningQuarantine, agent: Agent) -> AdminQuarantineItem:
     )
 
 
-@router.get("", response_model=AdminQuarantineList)
+@router.get("/screening-quarantines", response_model=AdminQuarantineList)
 async def list_quarantines(
     _admin: AdminDep,
     session: SessionDep,
@@ -97,7 +111,9 @@ async def list_quarantines(
     return AdminQuarantineList(items=items, count=total)
 
 
-@router.get("/{quarantine_id}", response_model=AdminQuarantineItem)
+@router.get(
+    "/screening-quarantines/{quarantine_id}", response_model=AdminQuarantineItem
+)
 async def get_quarantine(
     quarantine_id: UUID, _admin: AdminDep, session: SessionDep
 ) -> AdminQuarantineItem:
@@ -113,7 +129,10 @@ async def get_quarantine(
     return _item(*result)
 
 
-@router.post("/{quarantine_id}/resolve", response_model=AdminQuarantineResolveResponse)
+@router.post(
+    "/screening-quarantines/{quarantine_id}/resolve",
+    response_model=AdminQuarantineResolveResponse,
+)
 async def resolve_quarantine(
     quarantine_id: UUID,
     payload: AdminQuarantineResolveRequest,
@@ -197,6 +216,110 @@ async def resolve_quarantine(
 
     return AdminQuarantineResolveResponse(
         quarantine=_item(quarantine, agent), agent_status=agent.status
+    )
+
+
+@router.get("/screening-submissions", response_model=AdminScreeningSubmissionList)
+async def list_screening_submissions(
+    _admin: AdminDep,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AdminScreeningSubmissionList:
+    """Return private screening history without source or artifact URLs."""
+    total = int((await session.scalar(select(func.count()).select_from(Agent))) or 0)
+    agents = (
+        (
+            await session.execute(
+                select(Agent)
+                .order_by(Agent.created_at.desc(), Agent.agent_id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    agent_ids = [agent.agent_id for agent in agents]
+    attempts_by_agent: dict[UUID, list[AdminScreeningAttempt]] = defaultdict(list)
+    if agent_ids:
+        attempts = (
+            (
+                await session.execute(
+                    select(ScreeningAttempt)
+                    .where(ScreeningAttempt.agent_id.in_(agent_ids))
+                    .order_by(
+                        ScreeningAttempt.started_at.desc(),
+                        ScreeningAttempt.attempt_id.desc(),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for attempt in attempts:
+            attempts_by_agent[attempt.agent_id].append(
+                AdminScreeningAttempt(
+                    attempt_id=attempt.attempt_id,
+                    policy_version=attempt.policy_version,
+                    status=attempt.status,  # type: ignore[arg-type]
+                    screener_hotkey=attempt.screener_hotkey,
+                    started_at=attempt.started_at,
+                    deadline=attempt.deadline,
+                    finished_at=attempt.finished_at,
+                    reason=attempt.public_reason,
+                )
+            )
+    return AdminScreeningSubmissionList(
+        count=total,
+        items=[
+            AdminScreeningSubmission(
+                agent_id=agent.agent_id,
+                miner_hotkey=agent.miner_hotkey,
+                agent_name=agent.name,
+                artifact_sha256=agent.sha256,
+                agent_status=agent.status,
+                screening_policy_version=agent.screening_policy_version,
+                screening_reason=agent.screening_reason,
+                submitted_at=agent.created_at,
+                attempts=attempts_by_agent[agent.agent_id],
+            )
+            for agent in agents
+        ],
+    )
+
+
+@router.get(
+    "/screening-submissions/{agent_id}/artifact",
+    response_model=ArtifactResponse,
+)
+async def get_screening_artifact(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+    storage: StorageDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> ArtifactResponse:
+    """Issue an audited five-minute artifact URL to an authenticated operator."""
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    expires_in = 300
+    url = await storage.presigned_get_url(
+        key=f"{agent_id}/agent.tar.gz", expires_in=expires_in
+    )
+    logger.info(
+        "admin_actor=%s issued screening artifact url for agent_id=%s",
+        x_admin_actor,
+        agent_id,
+    )
+    return ArtifactResponse(
+        agent_id=agent_id,
+        sha256=agent.sha256,
+        download_url=url,
+        expires_at=datetime.now(UTC) + timedelta(seconds=expires_in),
     )
 
 

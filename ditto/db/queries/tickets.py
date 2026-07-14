@@ -9,7 +9,8 @@ Issuance locks the candidate agent row and then recounts its occupied slots in a
 fresh statement. Concurrent platform replicas therefore serialize allocation
 for a given agent and cannot over-issue a fourth slot. The ``(agent_id,
 validator_hotkey)`` primary key separately guarantees a validator can hold only
-one ticket per agent, so no single validator can take two slots.
+one ticket per agent. A partial unique index plus a per-validator transaction
+lock guarantees one validator cannot hold two live assignments across agents.
 """
 
 from __future__ import annotations
@@ -105,7 +106,33 @@ async def issue_ticket(
     work for this validator ("no job for you"). Runs inside the caller's
     transaction.
     """
+    # No row exists to lock before a validator's first claim. Serialize that
+    # gap explicitly on Postgres; the unique partial index remains the durable
+    # backstop and SQLite test transactions are already single-writer.
+    if session.get_bind().dialect.name == "postgresql":
+        await session.execute(
+            select(
+                func.pg_advisory_xact_lock(func.hashtextextended(validator_hotkey, 0))
+            )
+        )
     await expire_overdue_tickets(session, now=now)
+
+    # A validator executes one benchmark at a time. Polling again (including
+    # after a process restart) must resume that still-live lease instead of
+    # allocating unrelated work and leaving the first ticket stranded.
+    existing = await session.scalar(
+        select(ValidatorTicket)
+        .where(
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
+        )
+        .order_by(ValidatorTicket.issued_at.asc(), ValidatorTicket.agent_id.asc())
+        .limit(1)
+        .with_for_update()
+    )
+    if existing is not None:
+        return existing
 
     # Agents this validator must not receive right now: live/scored tickets,
     # same-version tickets cooling down after expiry, and same-version tickets

@@ -1152,6 +1152,59 @@ class TestQuarantineAdmin:
         )
         assert response.status_code == 401
 
+    async def test_lists_all_screening_outcomes_and_issues_audited_artifact_url(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.REJECTED)
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=uuid4(),
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="rejected",
+                    started_at=now - timedelta(minutes=2),
+                    deadline=now + timedelta(minutes=28),
+                    finished_at=now,
+                    public_reason="Docker image build failed",
+                )
+            )
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+        headers = {
+            "Authorization": "Bearer test-admin-token-at-least-32-characters",
+            "X-Admin-Actor": "backroom:test-user",
+        }
+
+        listing = await client.get(
+            "/api/v1/admin/screening-submissions", headers=headers
+        )
+        artifact = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/artifact",
+            headers=headers,
+        )
+
+        assert listing.status_code == 200
+        item = listing.json()["items"][0]
+        assert item["agent_id"] == str(agent_id)
+        assert item["attempts"][0]["status"] == "rejected"
+        assert item["attempts"][0]["reason"] == "Docker image build failed"
+        assert artifact.status_code == 200
+        assert artifact.json()["sha256"] == _SHA256
+        assert storage.presigned_get_url.await_args.kwargs == {
+            "key": f"{agent_id}/agent.tar.gz",
+            "expires_in": 300,
+        }
+
 
 # --- Artifact --------------------------------------------------------------
 

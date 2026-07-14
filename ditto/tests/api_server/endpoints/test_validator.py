@@ -734,6 +734,10 @@ class TestHeartbeat:
         other_agent_id = await _seed_agent(
             session_maker, status=AgentStatus.EVALUATING, name="new-agent"
         )
+        async with session_maker() as session, session.begin():
+            previous = await session.get(ValidatorTicket, (agent_id, _VALIDATOR_HOTKEY))
+            assert previous is not None
+            previous.status = TicketStatus.SCORED
         await _seed_ticket(session_maker, other_agent_id)
         different_agent = await client.post(
             "/api/v1/validator/heartbeat",
@@ -1199,7 +1203,7 @@ class TestRequestJob:
     ) -> None:
         await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         _install_db(app, session_maker)
-        _install_chain(app)
+        _install_chain(app, extra_keypairs=(_DAVE,))
         # Three distinct validators each get the single agent (fills the pool).
         for kp in _KEYPAIRS:
             r = await client.post(
@@ -1210,7 +1214,9 @@ class TestRequestJob:
             assert r.status_code == 200
         # A further request finds no open slot -> no job.
         r = await client.post(
-            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+            "/api/v1/validator/job",
+            headers={"X-Validator-Hotkey": _DAVE.ss58_address},
+            json=_job_payload(_DAVE),
         )
         assert r.status_code == 204
 

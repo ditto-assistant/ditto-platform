@@ -675,6 +675,43 @@ class TestPublicActivity:
         assert entry["status"] == "waiting_screening"
         assert entry["screening_reason"] is None
 
+    async def test_quarantined_attempt_history_is_publicly_serializable(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.QUARANTINED,
+                screening_reason="Submission held for anti-cheat review",
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=uuid4(),
+                    agent_id=agent_id,
+                    screener_hotkey=_MINER_B,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="quarantined",
+                    started_at=now - timedelta(minutes=2),
+                    deadline=now + timedelta(minutes=28),
+                    finished_at=now,
+                    public_reason="Submission held for anti-cheat review",
+                )
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+
+        assert response.status_code == 200
+        assert response.json()["screening_attempts"][0]["status"] == "quarantined"
+
     async def test_evaluation_projects_live_work_from_validator_heartbeat(
         self,
         app: FastAPI,
