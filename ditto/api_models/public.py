@@ -407,11 +407,25 @@ class PublicValidatorScore(BaseModel):
     run_id: Annotated[
         str, Field(description="Scoring-engine run id the signature is bound to.")
     ]
+    ticket_deadline: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description=(
+                "Exact ticket lease bound into current score signatures. Null "
+                "identifies a legacy score recorded before lease-bound signing."
+            ),
+        ),
+    ]
     signature: Annotated[
         str | None,
         Field(
             default=None,
-            description="sr25519 signature over the payload, hex (self-verifying).",
+            description=(
+                "sr25519 signature over the score payload, hex. Current signatures "
+                "include ticket_deadline; legacy rows with a null deadline use the "
+                "pre-lease payload and remain valid."
+            ),
         ),
     ]
     generated_at: Annotated[

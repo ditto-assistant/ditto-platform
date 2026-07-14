@@ -66,6 +66,7 @@ from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retir
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.validator import SessionDep
+from ditto.db.models import Score
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.scores import (
@@ -359,6 +360,19 @@ def _median_composite(row: SubmissionRow) -> float | None:
     return statistics.median(s.composite for s in row.scores)
 
 
+def _ticket_deadline(score: Score) -> datetime | None:
+    """Read the signed lease identity from score details; null means legacy."""
+    if not isinstance(score.details, dict):
+        return None
+    value = score.details.get("ticket_deadline")
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
     """Map a submission row to the full public k=3 record."""
     return PublicSubmissionScores(
@@ -383,6 +397,7 @@ def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
                 n=s.n,
                 seed=s.seed,
                 run_id=s.run_id,
+                ticket_deadline=_ticket_deadline(s),
                 signature=s.signature,
                 generated_at=s.generated_at,
                 case_results=_safe_case_results(

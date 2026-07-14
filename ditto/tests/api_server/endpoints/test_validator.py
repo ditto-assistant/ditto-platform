@@ -95,6 +95,24 @@ def _score_payload(
     }
 
 
+def _job_payload(
+    keypair: bittensor.Keypair = _KEYPAIR,
+    *,
+    nonce: UUID | None = None,
+    requested_at: datetime | None = None,
+) -> dict:
+    nonce = nonce or uuid4()
+    requested_at = requested_at or datetime.now(UTC)
+    requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
+    signed = f"validator-job:{keypair.ss58_address}:{nonce}:{requested}".encode()
+    return {
+        "validator_hotkey": keypair.ss58_address,
+        "nonce": str(nonce),
+        "requested_at": requested_at.isoformat(),
+        "signature": keypair.sign(signed).hex(),
+    }
+
+
 async def _score_to_quorum(
     client: httpx.AsyncClient,
     agent_id: UUID,
@@ -315,7 +333,9 @@ class TestRequestJob:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         _install_db(app, session_maker)
         _install_chain(app)
-        resp = await client.post("/api/v1/validator/job", headers=_AUTH_HEADER)
+        resp = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["agent_id"] == str(agent_id)
@@ -329,7 +349,9 @@ class TestRequestJob:
     ) -> None:
         _install_db(app, session_maker)
         _install_chain(app)
-        resp = await client.post("/api/v1/validator/job", headers=_AUTH_HEADER)
+        resp = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
         assert resp.status_code == 204
 
     async def test_caps_at_quorum_across_validators(
@@ -346,10 +368,13 @@ class TestRequestJob:
             r = await client.post(
                 "/api/v1/validator/job",
                 headers={"X-Validator-Hotkey": kp.ss58_address},
+                json=_job_payload(kp),
             )
             assert r.status_code == 200
         # A further request finds no open slot -> no job.
-        r = await client.post("/api/v1/validator/job", headers=_AUTH_HEADER)
+        r = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
         assert r.status_code == 204
 
     async def test_unpermitted_validator_returns_401(
@@ -361,8 +386,60 @@ class TestRequestJob:
         await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         _install_db(app, session_maker)
         _install_chain(app, permitted=False)
-        resp = await client.post("/api/v1/validator/job", headers=_AUTH_HEADER)
+        resp = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
         assert resp.status_code == 401
+
+    async def test_cannot_claim_by_naming_another_permitted_hotkey(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        forged = _job_payload(_KEYPAIRS[1])
+        forged["validator_hotkey"] = _VALIDATOR_HOTKEY
+        resp = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=forged
+        )
+        assert resp.status_code == 401
+
+    async def test_replayed_job_claim_is_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claim = _job_payload()
+        first = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=claim
+        )
+        replay = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=claim
+        )
+        assert first.status_code == 200
+        assert replay.status_code == 409
+
+    async def test_stale_job_claim_is_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        stale = _job_payload(requested_at=datetime.now(UTC) - timedelta(minutes=3))
+        resp = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=stale
+        )
+        assert resp.status_code == 409
 
 
 class TestSubmitScore:
@@ -475,6 +552,9 @@ class TestSubmitScore:
             assert score is not None
             assert score.details is not None
             assert score.details["bench_version"] == CURRENT_BENCH_VERSION
+            assert score.details["ticket_deadline"] == (
+                _TICKET_DEADLINE.isoformat(timespec="microseconds")
+            )
 
     async def test_preserves_explicit_bench_version(
         self,
@@ -952,6 +1032,11 @@ class TestMultiValidatorConsensus:
             kp.ss58_address: pytest.approx(comp) for kp, comp in composites.items()
         }
         assert all(s["signature"] for s in body["scores"])
+        assert all(
+            datetime.fromisoformat(s["ticket_deadline"].replace("Z", "+00:00"))
+            == _TICKET_DEADLINE
+            for s in body["scores"]
+        )
 
     async def test_expired_ticket_reopens_slot_for_a_new_validator(
         self,
@@ -968,13 +1053,16 @@ class TestMultiValidatorConsensus:
             r = await client.post(
                 "/api/v1/validator/job",
                 headers={"X-Validator-Hotkey": kp.ss58_address},
+                json=_job_payload(kp),
             )
             assert r.status_code == 200, r.text
         # A fourth, never-assigned validator is shut out (pool full, not
         # already-mine): "no job for you".
         dave_hdr = {"X-Validator-Hotkey": _DAVE.ss58_address}
         assert (
-            await client.post("/api/v1/validator/job", headers=dave_hdr)
+            await client.post(
+                "/api/v1/validator/job", headers=dave_hdr, json=_job_payload(_DAVE)
+            )
         ).status_code == 204
 
         # One validator's ticket lapses past its deadline, re-opening its slot.
@@ -984,7 +1072,9 @@ class TestMultiValidatorConsensus:
             lapsed.deadline = datetime.now(UTC) - timedelta(minutes=1)
 
         # The fourth validator now picks up the re-opened slot.
-        reopened = await client.post("/api/v1/validator/job", headers=dave_hdr)
+        reopened = await client.post(
+            "/api/v1/validator/job", headers=dave_hdr, json=_job_payload(_DAVE)
+        )
         assert reopened.status_code == 200, reopened.text
         assert reopened.json()["agent_id"] == str(agent_id)
 
@@ -1000,7 +1090,9 @@ class TestMultiValidatorConsensus:
         keypair = _KEYPAIRS[0]
         headers = {"X-Validator-Hotkey": keypair.ss58_address}
 
-        claimed = await client.post("/api/v1/validator/job", headers=headers)
+        claimed = await client.post(
+            "/api/v1/validator/job", headers=headers, json=_job_payload(keypair)
+        )
         assert claimed.status_code == 200, claimed.text
 
         async with session_maker() as s, s.begin():
@@ -1008,7 +1100,9 @@ class TestMultiValidatorConsensus:
             assert lapsed is not None
             lapsed.deadline = datetime.now(UTC) - timedelta(minutes=1)
 
-        retried = await client.post("/api/v1/validator/job", headers=headers)
+        retried = await client.post(
+            "/api/v1/validator/job", headers=headers, json=_job_payload(keypair)
+        )
         assert retried.status_code == 200, retried.text
         assert retried.json()["agent_id"] == str(agent_id)
 

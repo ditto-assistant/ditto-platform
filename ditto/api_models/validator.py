@@ -68,6 +68,38 @@ class ArtifactResponse(BaseModel):
     )
 
 
+class JobRequest(BaseModel):
+    """Signed request to claim one validator scoring ticket.
+
+    The signature proves possession of ``validator_hotkey`` before the platform
+    allocates scarce quorum work. ``nonce`` is consumed exactly once and
+    ``requested_at`` is freshness-bounded, preventing a captured request from
+    claiming another ticket later.
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Claiming validator hotkey.")
+    ]
+    nonce: Annotated[UUID, Field(description="One-time claim nonce.")]
+    requested_at: Annotated[
+        datetime, Field(description="UTC time at which the claim was signed.")
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            pattern=_SIGNATURE_HEX_PATTERN,
+            description="sr25519 signature over the canonical claim payload.",
+        ),
+    ]
+
+    @field_validator("requested_at")
+    @classmethod
+    def requested_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("requested_at must include a timezone")
+        return value
+
+
 class JobResponse(BaseModel):
     """Returned by ``POST /validator/job`` when a ticket is issued.
 

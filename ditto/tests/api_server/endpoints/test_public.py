@@ -604,6 +604,9 @@ class TestPublicSubmissionScores:
             assert s["signature"] == "ab" * 64
             assert s["seed"] == 987654321
             assert "run_id" in s
+            # Scores recorded before lease-bound signing remain public and
+            # continue counting; null identifies their legacy signature format.
+            assert s["ticket_deadline"] is None
 
     async def test_detail_exposes_redacted_per_case_breakdown(
         self,

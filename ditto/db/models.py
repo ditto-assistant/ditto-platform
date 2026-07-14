@@ -501,6 +501,26 @@ class ValidatorTicket(Base):
     )
 
 
+class ValidatorRequestNonce(Base):
+    """A recently consumed signed validator request nonce.
+
+    Rows are short-lived replay guards. The UUID primary key makes consuming a
+    nonce atomic across every platform replica; expired rows are pruned during
+    subsequent claims.
+    """
+
+    __tablename__ = "validator_request_nonces"
+
+    nonce: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    used_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+
+    __table_args__ = (Index("validator_request_nonces_expires_at_idx", "expires_at"),)
+
+
 class BannedHotkey(Base):
     """One row of the ``banned_hotkeys`` table.
 

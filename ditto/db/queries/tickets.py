@@ -5,11 +5,10 @@ ticket is issued on demand to a validator that does not already hold one for the
 agent, expires if unscored by its deadline (freeing the slot), and is marked
 ``scored`` when the validator posts a valid score in time.
 
-The per-agent cap is enforced by a count-then-insert, which is best-effort under
-concurrency: a rare race could seat a fourth validator, but that is harmless
-because finalization triggers at exactly the quorum (the extra score simply
-joins the median pool and is never decisive). The ``(agent_id,
-validator_hotkey)`` primary key still hard-guarantees a validator can hold only
+Issuance locks the candidate agent row and then recounts its occupied slots in a
+fresh statement. Concurrent platform replicas therefore serialize allocation
+for a given agent and cannot over-issue a fourth slot. The ``(agent_id,
+validator_hotkey)`` primary key separately guarantees a validator can hold only
 one ticket per agent, so no single validator can take two slots.
 """
 
@@ -87,16 +86,6 @@ async def issue_ticket(
     """
     await expire_overdue_tickets(session, now=now)
 
-    # Live ticket count per agent (issued + scored; expired freed their slot).
-    live_counts = (
-        select(
-            ValidatorTicket.agent_id.label("agent_id"),
-            func.count().label("n"),
-        )
-        .where(ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES))
-        .group_by(ValidatorTicket.agent_id)
-        .subquery()
-    )
     # Agents this validator already has a live or scored ticket for. Expired
     # tickets are intentionally excluded: validators are stateless workers, so
     # a repaired/restarted validator must be able to retry unfinished work.
@@ -104,20 +93,35 @@ async def issue_ticket(
         ValidatorTicket.validator_hotkey == validator_hotkey,
         ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES),
     )
-    candidate = (
-        select(Agent.agent_id)
-        .outerjoin(live_counts, live_counts.c.agent_id == Agent.agent_id)
-        .where(
+    # Lock one candidate Agent row before counting its tickets. The recount is a
+    # separate statement after the lock is acquired, so under Postgres READ
+    # COMMITTED it sees any ticket committed by the previous lock holder.
+    # SKIP LOCKED lets unrelated agents continue allocating concurrently.
+    skipped: list[UUID] = []
+    while True:
+        candidate = select(Agent.agent_id).where(
             Agent.status == AgentStatus.EVALUATING,
-            func.coalesce(live_counts.c.n, 0) < SCORING_QUORUM,
             Agent.agent_id.not_in(already_mine),
         )
-        .order_by(Agent.created_at.asc())
-        .limit(1)
-    )
-    agent_id = (await session.execute(candidate)).scalar_one_or_none()
-    if agent_id is None:
-        return None
+        if skipped:
+            candidate = candidate.where(Agent.agent_id.not_in(skipped))
+        candidate = (
+            candidate.order_by(Agent.created_at.asc())
+            .limit(1)
+            .with_for_update(of=Agent, skip_locked=True)
+        )
+        agent_id = (await session.execute(candidate)).scalar_one_or_none()
+        if agent_id is None:
+            return None
+        occupied = await session.scalar(
+            select(func.count()).where(
+                ValidatorTicket.agent_id == agent_id,
+                ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES),
+            )
+        )
+        if (occupied or 0) < SCORING_QUORUM:
+            break
+        skipped.append(agent_id)
 
     ticket = await session.get(ValidatorTicket, (agent_id, validator_hotkey))
     if ticket is None:
