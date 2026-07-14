@@ -10,11 +10,12 @@ hand a miner the benchmark's answer key (per-case ``expected``/``called``). See
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ditto.api_models.screener import ScreenerRuntimeState
 from ditto.api_models.validator import ValidatorRuntimeState
 
 _SS58_PATTERN = r"^[1-9A-HJ-NP-Za-km-z]{47,48}$"
@@ -886,6 +887,21 @@ class PublicHealthResponse(BaseModel):
     )
 
 
+FleetAvailability = Literal["available", "offline", "paused", "unknown"]
+FleetHealth = Literal["healthy", "warning", "unknown"]
+
+
+class PublicSystemMetrics(BaseModel):
+    """Coarse allowlisted metrics; collector timestamps stay private."""
+
+    cpu_percent: Annotated[int, Field(ge=0, le=100, multiple_of=5)]
+    memory_percent: Annotated[int, Field(ge=0, le=100, multiple_of=5)]
+    disk_percent: Annotated[int, Field(ge=0, le=100, multiple_of=5)]
+    docker_status: Literal["healthy", "degraded", "unavailable"]
+    running_containers: Annotated[int, Field(ge=0, le=1000)]
+    unhealthy_containers: Annotated[int, Field(ge=0, le=1000)]
+
+
 class PublicValidatorHeartbeat(BaseModel):
     """Latest signed software report from one permitted validator."""
 
@@ -894,15 +910,15 @@ class PublicValidatorHeartbeat(BaseModel):
     ]
     software_version: str
     protocol_version: Annotated[int, Field(ge=1)]
-    code_digest: Annotated[
-        str, Field(pattern=r"^[0-9a-f]{64}$", description="Installed source digest.")
-    ]
     state: ValidatorRuntimeState
     active_agent_id: UUID | None = None
+    first_seen_at: datetime | None = None
     reported_at: datetime
     seen_at: datetime
-    signature: Annotated[str, Field(pattern=r"^[0-9a-fA-F]{128}$")]
     online: bool
+    availability: FleetAvailability
+    health: FleetHealth
+    system_metrics: PublicSystemMetrics | None = None
 
 
 class PublicValidatorHeartbeatsResponse(BaseModel):
@@ -913,6 +929,36 @@ class PublicValidatorHeartbeatsResponse(BaseModel):
     reported_count: Annotated[int, Field(ge=0)]
     online_count: Annotated[int, Field(ge=0)]
     validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)
+
+
+class PublicScreenerHeartbeat(BaseModel):
+    """Latest public-safe report from one authenticated screener."""
+
+    screener_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Screener's public hotkey.")
+    ]
+    software_version: str
+    protocol_version: Annotated[int, Field(ge=1)]
+    policy_version: Annotated[int, Field(ge=1)]
+    state: ScreenerRuntimeState
+    active_agent_id: UUID | None = None
+    first_seen_at: datetime | None = None
+    reported_at: datetime
+    seen_at: datetime
+    online: bool
+    availability: FleetAvailability
+    health: FleetHealth
+    system_metrics: PublicSystemMetrics | None = None
+
+
+class PublicScreenerHeartbeatsResponse(BaseModel):
+    """Public view of authenticated platform-operated screeners."""
+
+    generated_at: datetime
+    online_window_seconds: Annotated[int, Field(ge=1)]
+    reported_count: Annotated[int, Field(ge=0)]
+    online_count: Annotated[int, Field(ge=0)]
+    screeners: list[PublicScreenerHeartbeat] = Field(default_factory=list)
 
 
 class BenchHarnessConfig(BaseModel):

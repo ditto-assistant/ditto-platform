@@ -8,7 +8,7 @@ from uuid import UUID
 
 from sqlalchemy import select
 
-from ditto.db.models import ValidatorHeartbeat
+from ditto.db.models import ScreenerHeartbeat, ValidatorHeartbeat
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +23,7 @@ async def upsert_validator_heartbeat(
     code_digest: str,
     state: str,
     active_agent_id: UUID | None,
+    system_metrics: dict | None,
     reported_at: datetime,
     seen_at: datetime,
     signature: str,
@@ -30,7 +31,9 @@ async def upsert_validator_heartbeat(
     """Persist only a strictly newer heartbeat; return ``(row, accepted)``."""
     row = await session.get(ValidatorHeartbeat, validator_hotkey)
     if row is None:
-        row = ValidatorHeartbeat(validator_hotkey=validator_hotkey)
+        row = ValidatorHeartbeat(
+            validator_hotkey=validator_hotkey, first_seen_at=seen_at
+        )
         session.add(row)
     else:
         existing_reported_at = row.reported_at
@@ -43,6 +46,7 @@ async def upsert_validator_heartbeat(
     row.code_digest = code_digest
     row.state = state
     row.active_agent_id = active_agent_id
+    row.system_metrics = system_metrics
     row.reported_at = reported_at
     row.seen_at = seen_at
     row.signature = signature
@@ -57,6 +61,56 @@ async def list_validator_heartbeats(
     result = await session.scalars(
         select(ValidatorHeartbeat).order_by(
             ValidatorHeartbeat.seen_at.desc(), ValidatorHeartbeat.validator_hotkey
+        )
+    )
+    return list(result)
+
+
+async def upsert_screener_heartbeat(
+    session: AsyncSession,
+    *,
+    screener_hotkey: str,
+    software_version: str,
+    protocol_version: int,
+    policy_version: int,
+    state: str,
+    active_agent_id: UUID | None,
+    system_metrics: dict | None,
+    reported_at: datetime,
+    seen_at: datetime,
+    signature: str,
+) -> tuple[ScreenerHeartbeat, bool]:
+    """Persist only a strictly newer screener heartbeat."""
+    row = await session.get(ScreenerHeartbeat, screener_hotkey)
+    if row is None:
+        row = ScreenerHeartbeat(screener_hotkey=screener_hotkey, first_seen_at=seen_at)
+        session.add(row)
+    else:
+        existing_reported_at = row.reported_at
+        if existing_reported_at.tzinfo is None:
+            existing_reported_at = existing_reported_at.replace(tzinfo=UTC)
+        if reported_at <= existing_reported_at:
+            return row, False
+    row.software_version = software_version
+    row.protocol_version = protocol_version
+    row.policy_version = policy_version
+    row.state = state
+    row.active_agent_id = active_agent_id
+    row.system_metrics = system_metrics
+    row.reported_at = reported_at
+    row.seen_at = seen_at
+    row.signature = signature
+    await session.flush()
+    return row, True
+
+
+async def list_screener_heartbeats(
+    session: AsyncSession,
+) -> list[ScreenerHeartbeat]:
+    """Return every reporting screener, newest heartbeat first."""
+    result = await session.scalars(
+        select(ScreenerHeartbeat).order_by(
+            ScreenerHeartbeat.seen_at.desc(), ScreenerHeartbeat.screener_hotkey
         )
     )
     return list(result)
