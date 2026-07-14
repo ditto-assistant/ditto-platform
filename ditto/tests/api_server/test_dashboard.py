@@ -140,6 +140,26 @@ class TestDashboard:
         assert 'class="pipeline-detail-state"' in body
         assert 'style="margin-top:18px">Validator progress' not in body
 
+    async def test_explains_policy_rescreen_from_public_activity_state(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert 'id="rescreen-notice"' in body
+        assert 'id="rescreen-count"' in body
+        assert 'id="rescreen-scored"' in body
+        assert "function renderPolicyRescreenNotice(entries, unavailable)" in body
+        assert (
+            'entry.status === "waiting_screening" || entry.status === "screening"'
+            in body
+        )
+        assert "completed < required" in body
+        assert "Number(entry.screening_policy_version) > 0" in body
+        assert "Prior scores remain preserved" in body
+        assert "validators may intentionally idle" in body
+        assert "lower-score submissions clear screening" in body
+        assert "This is not data loss" in body
+        assert "policyScreeningLabel(entry)" in body
+        assert 'return "Rescreen · policy v" + completed + " → v" + required' in body
+
     async def test_includes_accessible_fleet_status(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
