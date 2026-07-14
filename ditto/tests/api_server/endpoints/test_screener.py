@@ -273,6 +273,31 @@ class TestQueue:
         assert response.status_code == 200
         assert response.json()["count"] == 1
 
+    async def test_requeues_stale_failure_but_not_current_failure(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        stale_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCREENING_FAILED,
+            screening_policy_version=SCREENING_POLICY_VERSION - 1,
+        )
+        await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCREENING_FAILED,
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/screener/queue")
+
+        assert response.status_code == 200
+        assert [item["agent_id"] for item in response.json()["items"]] == [
+            str(stale_id)
+        ]
+
     async def test_limit_caps_results(
         self,
         app: FastAPI,
@@ -506,7 +531,34 @@ class TestSubmitResult:
             agent = await s.get(Agent, agent_id)
             assert agent is not None
             assert agent.screening_reason == "Docker image build failed"
+            assert agent.screening_policy_version == SCREENING_POLICY_VERSION
             assert "SECRET_FROM_BUILD" not in agent.screening_reason
+
+    async def test_current_pass_recovers_stale_screening_failure(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCREENING_FAILED,
+            screening_policy_version=SCREENING_POLICY_VERSION - 1,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, passed=True),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == AgentStatus.EVALUATING
+        async with session_maker() as s:
+            agent = await s.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.screening_policy_version == SCREENING_POLICY_VERSION
 
     async def test_model_canary_failure_has_public_safe_reason(
         self,
