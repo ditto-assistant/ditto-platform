@@ -77,7 +77,7 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert "Submission pipeline" in body
-        assert body.index('class="operations"') < body.index("<h2>Leaderboard</h2>")
+        assert body.index("<h2>Leaderboard</h2>") < body.index('class="operations"')
         assert 'getJSON("/public/activity?page="' in body
         assert 'id="activity-rows"' in body
         assert 'id="activity-pager"' in body
