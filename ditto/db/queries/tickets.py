@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
@@ -40,6 +40,17 @@ def _as_utc(dt: datetime) -> datetime:
 # Statuses that occupy a slot: an issued (live) or already-scored ticket. An
 # expired ticket does not count, so its slot re-opens.
 _LIVE_TICKET_STATUSES = (TicketStatus.ISSUED, TicketStatus.SCORED)
+
+# Fairness spans the whole active submission pipeline, not only artifacts that
+# have already cleared the current screener. Otherwise a 2-of-3 artifact can be
+# the sole scoreable candidate during a policy-wide rescreen and jump dozens of
+# 0-of-3 submissions that are still waiting for screening.
+_FAIRNESS_SCREENING_STATUSES = (
+    AgentStatus.UPLOADED,
+    AgentStatus.SCREENING,
+    AgentStatus.SCREENING_PASSED,
+    AgentStatus.SCREENING_FAILED,
+)
 
 # A timed-out artifact must not monopolize one validator. Give transient
 # failures one delayed retry, while allowing other validators to make an
@@ -132,6 +143,30 @@ async def issue_ticket(
         .correlate(Agent)
         .scalar_subquery()
     )
+    backlog_agents = (
+        select(Agent.agent_id)
+        .where(Agent.status.in_(_FAIRNESS_SCREENING_STATUSES))
+        .subquery()
+    )
+    backlog_score_counts = (
+        select(
+            ValidatorTicket.agent_id,
+            func.count().label("score_count"),
+        )
+        .where(ValidatorTicket.status == TicketStatus.SCORED)
+        .group_by(ValidatorTicket.agent_id)
+        .subquery()
+    )
+    global_score_floor = (
+        select(func.min(func.coalesce(backlog_score_counts.c.score_count, 0)))
+        .select_from(
+            backlog_agents.outerjoin(
+                backlog_score_counts,
+                backlog_score_counts.c.agent_id == backlog_agents.c.agent_id,
+            )
+        )
+        .scalar_subquery()
+    )
     # Lock one candidate Agent row before counting its tickets. The recount is a
     # separate statement after the lock is acquired, so under Postgres READ
     # COMMITTED it sees any ticket committed by the previous lock holder.
@@ -142,6 +177,14 @@ async def issue_ticket(
             Agent.status == AgentStatus.EVALUATING,
             Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
             Agent.agent_id.not_in(already_mine),
+            # Do not let already-screened work jump a lower-score rescreen
+            # backlog. NULL means no artifact is currently moving through the
+            # screening stages, in which case normal score-count ordering
+            # applies among eligible candidates.
+            or_(
+                global_score_floor.is_(None),
+                accepted_score_count <= global_score_floor,
+            ),
         )
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
