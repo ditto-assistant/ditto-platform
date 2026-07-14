@@ -396,6 +396,18 @@
 
     .empty { padding: 40px; text-align: center; color: var(--text-dim); }
 
+    /* ── Submission pipeline ───────────────────────────────── */
+    .activity tbody tr { cursor: default; }
+    .activity tbody tr:hover { background: transparent; }
+    .agent-name { display: block; font-weight: 650; color: var(--text); }
+    .agent-id { display: block; margin-top: 3px; font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+    .stage { display: inline-flex; align-items: center; gap: 7px; border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 750; letter-spacing: .2px; white-space: nowrap; border: 1px solid var(--border); color: var(--text-dim); background: var(--bg-elev-2); }
+    .stage::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .stage.progress { color: var(--accent-2); border-color: color-mix(in oklab, var(--accent-2) 38%, transparent); background: color-mix(in oklab, var(--accent-2) 10%, transparent); }
+    .stage.good { color: var(--good); border-color: color-mix(in oklab, var(--good) 38%, transparent); background: color-mix(in oklab, var(--good) 10%, transparent); }
+    .stage.warn { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 40%, transparent); background: color-mix(in oklab, var(--warn) 10%, transparent); }
+    .stage.bad { color: var(--danger); border-color: color-mix(in oklab, var(--danger) 40%, transparent); background: color-mix(in oklab, var(--danger) 10%, transparent); }
+
     /* ── Health strip ───────────────────────────────────────── */
     .health { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
     .htile { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
@@ -445,6 +457,26 @@
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
       <div class="card"><div class="glow" style="background:var(--memory)"></div><div class="label"><span class="tip" title="Total LLM tokens the runs on the board spent (the harnesses' own calls to the locked model). Generation and grading are non-LLM, so scoring itself spends nothing.">Scoring Spend</span></div><div class="value" id="c-cost">–</div></div>
     </section>
+
+    <div class="section-head">
+      <h2>Submission pipeline</h2>
+      <span class="hint">recent uploads · screening and evaluation progress</span>
+    </div>
+    <div class="board activity">
+      <table aria-label="Recent agent submission pipeline">
+        <thead>
+          <tr>
+            <th scope="col">Agent</th>
+            <th scope="col">Miner</th>
+            <th scope="col" style="width:160px">Stage</th>
+            <th scope="col" class="num hide-sm" style="width:110px">Submitted</th>
+          </tr>
+        </thead>
+        <tbody id="activity-rows">
+          <tr><td colspan="4" class="empty">Loading submissions…</td></tr>
+        </tbody>
+      </table>
+    </div>
 
     <div class="section-head">
       <h2>Leaderboard</h2>
@@ -1344,6 +1376,45 @@
         h.last_scored_at ? relTime(h.last_scored_at) : "–";
     }
 
+    function activityStage(status) {
+      var stages = {
+        uploaded: ["Queued", "progress"],
+        screening: ["Screening", "progress"],
+        screening_passed: ["Screening passed", "good"],
+        screening_failed: ["Screening failed", "bad"],
+        evaluating: ["Evaluating", "progress"],
+        scored: ["Scored", "good"],
+        live: ["Live", "good"],
+        under_review: ["Under review", "warn"],
+        rejected: ["Rejected", "bad"]
+      };
+      return stages[status] || ["Pending", ""];
+    }
+
+    function renderActivity(data, unavailable) {
+      var rows = document.getElementById("activity-rows");
+      var entries = data && data.entries ? data.entries : [];
+      if (unavailable) {
+        rows.innerHTML = '<tr><td colspan="4" class="empty">Submission activity is temporarily unavailable.</td></tr>';
+        return;
+      }
+      if (!entries.length) {
+        rows.innerHTML = '<tr><td colspan="4" class="empty">No submissions yet. New uploads will appear here before screening begins.</td></tr>';
+        return;
+      }
+      rows.innerHTML = entries.map(function (e) {
+        var stage = activityStage(e.status);
+        var id = String(e.agent_id || "");
+        return '<tr>' +
+          '<td><span class="agent-name">' + esc(e.name || "Unnamed agent") + '</span>' +
+          '<span class="agent-id" title="' + esc(id) + '">' + esc(id.slice(0, 8)) + '</span></td>' +
+          '<td><span class="hotkey" title="' + esc(e.miner_hotkey) + '">' + esc(shortKey(e.miner_hotkey)) + '</span></td>' +
+          '<td><span class="stage ' + stage[1] + '">' + stage[0] + '</span></td>' +
+          '<td class="num hide-sm" title="' + esc(e.submitted_at) + '">' + relTime(e.submitted_at) + '</td>' +
+          '</tr>';
+      }).join("");
+    }
+
     // ── Data load ────────────────────────────────────────────
     function getJSON(path) {
       var ctrl = new AbortController();
@@ -1363,6 +1434,9 @@
       getJSON("/public/health")
         .then(function (h) { renderHealth(h); })
         .catch(function () { renderHealth(SAMPLE_HEALTH); });
+      getJSON("/public/activity")
+        .then(function (data) { renderActivity(data, false); })
+        .catch(function () { renderActivity(null, true); });
       // Frozen-setup panel; static markup doubles as the fallback.
       getJSON("/public/bench/config").then(function (c) {
         document.getElementById("bs-version").textContent = "v" + c.bench_version;

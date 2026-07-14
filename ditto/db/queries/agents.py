@@ -191,3 +191,18 @@ async def list_agents_by_status(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def list_public_activity(
+    session: AsyncSession,
+    *,
+    limit: int,
+) -> list[Agent]:
+    """Return recent submissions, newest first, for the public lifecycle feed."""
+    stmt = (
+        select(Agent)
+        .order_by(Agent.created_at.desc(), Agent.agent_id.desc())
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())

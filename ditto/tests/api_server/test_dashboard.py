@@ -58,9 +58,18 @@ class TestDashboard:
         resp = await _get(app, "/")
         assert resp.status_code == 404
 
-    @pytest.mark.parametrize("path", ["/api/v1/public/leaderboard"])
+    @pytest.mark.parametrize(
+        "path", ["/api/v1/public/leaderboard", "/api/v1/public/activity"]
+    )
     async def test_api_still_mounted_alongside_dashboard(self, path: str) -> None:
         # Serving HTML at / must not shadow the API routes.
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         # 200 requires a DB; here we only assert the route exists (not 404).
         assert any(getattr(r, "path", None) == path for r in app.routes)
+
+    async def test_includes_submission_pipeline(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert "Submission pipeline" in body
+        assert 'getJSON("/public/activity")' in body
+        assert 'id="activity-rows"' in body

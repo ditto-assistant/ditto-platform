@@ -176,20 +176,24 @@ async def _seed_agent(
     *,
     miner: str,
     status: AgentStatus = AgentStatus.UPLOADED,
-) -> None:
+    name: str = "agent",
+    created_at: datetime | None = None,
+) -> str:
     """Seed a submission with no score (e.g. still uploaded/evaluating)."""
+    agent_id = uuid4()
     async with maker() as s, s.begin():
         s.add(
             Agent(
-                agent_id=uuid4(),
+                agent_id=agent_id,
                 miner_hotkey=miner,
-                name="agent",
+                name=name,
                 sha256="cd" * 32,
                 size_bytes=524288,
                 status=status,
-                created_at=datetime.now(UTC),
+                created_at=created_at or datetime.now(UTC),
             )
         )
+    return str(agent_id)
 
 
 class TestPublicLeaderboard:
@@ -466,6 +470,82 @@ class TestPublicHealth:
             "scores_24h": 0,
             "avg_latency_ms": None,
         }
+
+
+class TestPublicActivity:
+    async def test_lists_all_stages_newest_first_without_sensitive_fields(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        older_id = await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.UPLOADED,
+            name="memory-v1",
+            created_at=datetime(2026, 7, 13, 10, 0, 0, tzinfo=UTC),
+        )
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_B,
+            status=AgentStatus.ATH_PENDING_REVIEW,
+            name="memory-v2",
+            created_at=datetime(2026, 7, 13, 11, 0, 0, tzinfo=UTC),
+        )
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.BANNED,
+            name="memory-v3",
+            created_at=datetime(2026, 7, 13, 12, 0, 0, tzinfo=UTC),
+        )
+        _install_db(app, session_maker)
+
+        resp = await client.get("/api/v1/public/activity")
+        assert resp.status_code == 200
+        assert resp.headers["Cache-Control"] == "public, max-age=10"
+        body = resp.json()
+        assert body["count"] == 3
+        assert [entry["name"] for entry in body["entries"]] == [
+            "memory-v3",
+            "memory-v2",
+            "memory-v1",
+        ]
+        assert [entry["status"] for entry in body["entries"]] == [
+            "rejected",
+            "under_review",
+            "uploaded",
+        ]
+        assert body["entries"][2]["agent_id"] == older_id
+        assert set(body["entries"][0]) == {
+            "agent_id",
+            "miner_hotkey",
+            "name",
+            "status",
+            "submitted_at",
+        }
+        serialized = resp.text
+        for private_field in (
+            "sha256",
+            "artifact",
+            "payment",
+            "review_reason",
+            "duplicate_of",
+        ):
+            assert private_field not in serialized
+
+    async def test_respects_limit(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(session_maker, miner=_MINER_A)
+        await _seed_agent(session_maker, miner=_MINER_B)
+        _install_db(app, session_maker)
+        body = (await client.get("/api/v1/public/activity?limit=1")).json()
+        assert body["count"] == 1
 
 
 class TestPublicSubmissionScores:

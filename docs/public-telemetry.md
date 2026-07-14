@@ -86,6 +86,13 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   **Never** included: `seed` (anti-overfit), `per_case` `expected`/`called` (the
   answer key), agent_id/sha256/signature/validator_hotkey (integrity-internal).
   `is_champion`/weights stay validator-side (KOTH fold), not served here.
+- `GET /api/v1/public/activity?limit=` → `{ generated_at, count, entries: [
+  { agent_id, miner_hotkey, name, status, submitted_at } ] }`.
+  Recent uploads, newest first, including screening and evaluation stages so a
+  miner can confirm progress before a score exists. Internal review and ban
+  states are collapsed to `under_review` / `rejected`. Artifact locations,
+  hashes, payments, screening reasons, duplicate signals, and moderation detail
+  are never included.
 - `GET /api/v1/public/submissions?limit=` → `{ generated_at, count, quorum,
   submissions: [ { agent_id, miner_hotkey, status, score_count,
   median_composite, dataset_seed, dataset_sha256, last_scored_at } ] }`.
@@ -168,6 +175,8 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
 
 Static SPA (no server-side secrets) pulling the public API above; wandb linked
 for the deep dive. Sections:
+- **Submission pipeline** — recent agent uploads, miner hotkey, public lifecycle
+  stage, and submission time, visible before scoring completes.
 - **Leaderboard** — rank, miner, composite, category radar sparkline, weight %,
   trend arrow; champion highlighted.
 - **Miner drill-down** — composite history, category radar, ATH badge, best run
