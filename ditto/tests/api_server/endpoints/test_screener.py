@@ -1274,7 +1274,11 @@ class TestQuarantineAdmin:
                 "Authorization": "Bearer test-admin-token-at-least-32-characters",
                 "X-Admin-Actor": "backroom:test-user",
             },
-            json={"reason": "Build was interrupted by a worker deployment"},
+            json={
+                "reason": "Build was interrupted by a worker deployment",
+                "expected_sha256": _SHA256,
+                "expected_score_count": 1,
+            },
         )
         assert response.status_code == 200
         assert response.json()["agent_status"] == AgentStatus.SCREENING_FAILED
