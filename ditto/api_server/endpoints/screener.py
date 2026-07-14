@@ -570,7 +570,15 @@ async def submit_result(
     if payload.outcome == ScreenResultOutcome.QUARANTINE:
         target = AgentStatus.QUARANTINED
         public_reason = "Submission held for anti-cheat review"
+    elif payload.outcome == ScreenResultOutcome.RETRYABLE_INFRA:
+        target = AgentStatus.SCREENING_FAILED
+        public_reason = "Screening infrastructure error"
+    elif payload.outcome == ScreenResultOutcome.DETERMINISTIC_REJECT:
+        target = AgentStatus.REJECTED
+        public_reason = _public_screening_reason(payload.detail)
     else:
+        # Legacy workers did not send typed pass/fail outcomes. Preserve their
+        # detail-based behavior during rolling upgrades.
         target = (
             AgentStatus.EVALUATING
             if payload.passed
