@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -251,6 +252,7 @@ async def _seed_agent(
     miner_hotkey: str = _MINER_HOTKEY,
     sha256: str = _SHA256,
     size_bytes: int = 524288,
+    screening_policy_version: int = SCREENING_POLICY_VERSION,
 ) -> UUID:
     aid = agent_id or uuid4()
     async with maker() as s, s.begin():
@@ -262,6 +264,7 @@ async def _seed_agent(
                 sha256=sha256,
                 size_bytes=size_bytes,
                 status=status,
+                screening_policy_version=screening_policy_version,
                 created_at=created_at or datetime.now(UTC),
             )
         )
@@ -561,6 +564,28 @@ class TestRequestJob:
 
 
 class TestSubmitScore:
+    async def test_rejects_score_until_current_screening_policy_passes(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            screening_policy_version=0,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        await _seed_ticket(session_maker, agent_id)
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id),
+        )
+        assert response.status_code == 409
+        async with session_maker() as session:
+            assert await session.get(Score, (agent_id, _VALIDATOR_HOTKEY)) is None
+
     async def test_records_score_and_finalizes(
         self,
         app: FastAPI,

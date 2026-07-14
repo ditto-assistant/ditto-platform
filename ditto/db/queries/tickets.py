@@ -21,6 +21,7 @@ from uuid import UUID
 from sqlalchemy import func, select, update
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.db.models import Agent, ValidatorTicket
 from ditto.db.queries.scores import SCORING_QUORUM
@@ -101,6 +102,7 @@ async def issue_ticket(
     while True:
         candidate = select(Agent.agent_id).where(
             Agent.status == AgentStatus.EVALUATING,
+            Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
             Agent.agent_id.not_in(already_mine),
         )
         if skipped:
