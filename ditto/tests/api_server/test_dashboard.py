@@ -111,3 +111,9 @@ class TestDashboard:
         assert 'return MODES[saved] ? saved : "time"' in body
         assert "root.dataset.timePhase = fromHour(new Date().getHours())" in body
         assert 'if (hour >= 5 && hour < 8) return "dawn"' in body
+
+    async def test_benchmark_badge_omits_latest_suffix(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert 'badge.textContent = "DittoBench v" + currentBench +' in body
+        assert 'currentBench + " · latest"' not in body
