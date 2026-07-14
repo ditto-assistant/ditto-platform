@@ -82,7 +82,7 @@ class TestDashboard:
         assert 'id="activity-rows"' in body
         assert 'id="activity-pager"' in body
         assert 'id="pipeline-overview"' in body
-        assert "The machines behind the work." in body
+        assert "Network operations" in body
         assert "Waiting for screening" in body
         assert "Waiting for validator" in body
         assert "Evaluating" in body
@@ -113,16 +113,20 @@ class TestDashboard:
         assert '<table class="fleet-table"' in body
         assert '<th scope="col" style="width:105px">First seen</th>' in body
         assert '<th scope="col" style="width:110px">Last heartbeat</th>' in body
+        assert '<th scope="col" style="width:118px">Status</th>' in body
         assert '<th scope="col" style="width:108px">CPU</th>' in body
         assert '<th scope="col" style="width:120px">Containers</th>' in body
         assert "Missing optional telemetry is not an outage." in body
+        assert "allowlisted" not in body
         assert 'id="fleet-count-unknown"' in body
         assert 'getJSON("/public/validators")' in body
         assert 'getJSON("/public/screeners")' in body
         assert 'getElementById("show-screeners").addEventListener' in body
         assert 'showScreeners ? "Screener" : "Validator"' in body
         assert "running_benchmark" in body
-        assert "system health not reported" in body
+        assert "privacy-note" not in body
+        assert "fleet-health-note" not in body
+        assert '" reporting " + kind' not in body
 
     async def test_includes_time_aware_theme_switcher(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
