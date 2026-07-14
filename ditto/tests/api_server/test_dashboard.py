@@ -101,8 +101,8 @@ class TestDashboard:
         body = (await _get(app, "/")).text
         assert '<h1 id="page-title">Overview</h1>' in body
         assert '<h2 id="operations-title">Network operations</h2>' not in body
-        assert '<h2>Recent submissions</h2>' not in body
-        assert '<h2>What DittoBench v2 measures</h2>' not in body
+        assert "<h2>Recent submissions</h2>" not in body
+        assert "<h2>What DittoBench v2 measures</h2>" not in body
         assert "Submission pipeline" in body
         assert body.index("<h2>Leaderboard</h2>") < body.index('class="operations"')
         assert 'getJSON("/public/activity?page="' in body
