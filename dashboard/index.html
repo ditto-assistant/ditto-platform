@@ -1203,7 +1203,7 @@
       var hasOld = entries.some(function (e) { return e.bench_version == null || e.bench_version < currentBench; });
       var badge = document.getElementById("bench-badge");
       badge.className = "bench-badge show";
-      badge.textContent = "DittoBench v" + currentBench + " · latest" +
+      badge.textContent = "DittoBench v" + currentBench +
         (hasOld ? " · older runs marked" : "");
       // Freshness lives on the status pill (no separate card), keeping the
       // headline cards to distinct leaderboard metrics.
