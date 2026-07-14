@@ -6,6 +6,18 @@ platform's public, aggregate-only API (`GET /api/v1/public/leaderboard` and
 `GET /api/v1/public/health`) and links out to wandb for the per-epoch deep dive.
 This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 
+## Layout
+
+Desktop/widescreen chrome: a sticky left sidebar lists every section of the
+site; each section is a deep-linkable, hash-routed page (`#/overview`,
+`#/leaderboard`, `#/pipeline`, `#/health`, `#/benchmark`). On narrow viewports
+the sidebar collapses into a horizontal tab strip. The Overview page shows the
+summary cards plus condensed previews of the leaderboard and pipeline with
+"view all" links into the full pages; the Leaderboard page adds a hotkey
+filter and a ranked/provisional toggle; the Submission pipeline page adds
+stage chips (with counts) and free-text filtering over up to 200 recent
+uploads.
+
 ## What it shows
 
 - **Summary cards** — scored miners, top composite, median composite, freshness.
