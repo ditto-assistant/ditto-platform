@@ -107,7 +107,7 @@ class TestDashboard:
         assert 'id="pipeline-overview"' in body
         assert "Network operations" in body
         assert "Waiting for screening" in body
-        assert "Waiting for validator" in body
+        assert "Waiting for scores" in body
         assert "Evaluating" in body
         assert 'id="pipeline-scored"' in body
         assert 'data-pipeline-stage="scored"' in body
@@ -120,7 +120,10 @@ class TestDashboard:
         assert "anchor.getBoundingClientRect().top - anchorTop" in body
         assert "Validation" in body
         assert "openActivityModal" in body
-        assert "validators scored this submission" in body
+        assert "scores received" in body
+        assert "validator is assigned; its score is pending" in body
+        assert "Score pending" in body
+        assert "has this assignment" in body
         assert "Copy review:" in body
         assert "screening_reason" in body
         assert '<details class="old-screeners">' in body
@@ -128,7 +131,7 @@ class TestDashboard:
         assert "Screener result" in body
         assert "Lease expired" not in body
         assert "System failure" not in body
-        assert 'expired: ["Timed out", "warn"]' in body
+        assert 'expired: ["Assignment expired", "warn"]' in body
         assert 'failed: ["Could not complete", "warn"]' in body
 
     async def test_includes_accessible_fleet_status(self) -> None:

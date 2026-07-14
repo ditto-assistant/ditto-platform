@@ -1233,7 +1233,7 @@
             </section>
             <section class="pipeline-column" data-pipeline-stage="waiting_validator" aria-labelledby="pipeline-wait-validator-title">
               <div class="pipeline-node" aria-hidden="true">3</div>
-              <div class="pipeline-column-head"><h3 id="pipeline-wait-validator-title">Waiting for validator</h3><span class="pipeline-count" id="pipeline-wait-validator-count">–</span></div>
+              <div class="pipeline-column-head"><h3 id="pipeline-wait-validator-title">Waiting for scores</h3><span class="pipeline-count" id="pipeline-wait-validator-count">–</span></div>
               <div class="pipeline-items" id="pipeline-wait-validator"><div class="pipeline-empty">Loading…</div></div>
             </section>
             <section class="pipeline-column" data-pipeline-stage="evaluating" aria-labelledby="pipeline-evaluating-title">
@@ -2276,7 +2276,7 @@
         screening: ["Screening", "progress"],
         screening_passed: ["Screening passed", "good"],
         screening_failed: ["Screening interrupted", "warn"],
-        waiting_validator: ["Waiting for validator", "progress"],
+        waiting_validator: ["Waiting for scores", "progress"],
         evaluating: ["Evaluating", "progress"],
         scored: ["Scored", "good"],
         live: ["Live", "good"],
@@ -2296,16 +2296,27 @@
     function validationDetail(e) {
       var count = Math.max(0, Number(e.score_count) || 0);
       var quorum = Math.max(1, Number(e.quorum) || 3);
+      var assignments = (e.validation_attempts || []).filter(function (attempt) {
+        return attempt.status === "issued";
+      }).length;
       if (count >= quorum) return "Validation complete. The canonical result uses the median of " + quorum + " independent scores.";
       if (e.status === "waiting_screening") return "Queued for a screener to claim under the current policy.";
       if (e.status === "screening") return "A screener is currently checking this submission.";
       if (e.status === "waiting_validator") {
-        var waiting = quorum - count;
-        return count + " of " + quorum + " validators scored this submission. Waiting for " + waiting + " validator " + (waiting === 1 ? "score" : "scores") + ".";
+        var waiting = Math.max(0, quorum - count - assignments);
+        var assignmentCopy = assignments === 0
+          ? "No validator is assigned yet."
+          : (assignments === 1
+            ? "1 validator is assigned; its score is pending."
+            : assignments + " validators are assigned; their scores are pending.");
+        var waitingCopy = waiting
+          ? " Waiting for " + waiting + (assignments ? " more " : " ") + (waiting === 1 ? "validator" : "validators") + "."
+          : "";
+        return count + " of " + quorum + " scores received. " + assignmentCopy + waitingCopy;
       }
       if (e.status === "evaluating" || count > 0) {
         var remaining = quorum - count;
-        return count + " of " + quorum + " validators scored this submission. Waiting for " + remaining + " more independent " + (remaining === 1 ? "score" : "scores") + ".";
+        return count + " of " + quorum + " scores received. Waiting for " + remaining + " more independent " + (remaining === 1 ? "score" : "scores") + ".";
       }
       if (e.status === "rejected") return "Screening completed and rejected this submission. See the screener result for the policy version and reason.";
       if (e.status === "screening_failed") return "Screening could not complete reliably. This is retryable and is distinct from a submission rejection.";
@@ -2358,7 +2369,7 @@
       var labels = {
         running: ["Running", "progress"], passed: ["Passed", "good"],
         rejected: ["Rejected", "bad"], failed: ["Could not complete", "warn"],
-        expired: ["Timed out", "warn"], issued: ["Assigned", "progress"],
+        expired: ["Assignment expired", "warn"], issued: ["Score pending", "progress"],
         scored: ["Score submitted", "good"]
       };
       return labels[status] || [String(status || "Unknown").replace(/_/g, " "), ""];
@@ -2396,10 +2407,18 @@
       var validation = (pipeline.validation_attempts || []).map(function (a) {
         var label = attemptLabel(a.actively_running ? "running" : a.status);
         var meta = "Validator " + shortKey(a.validator_hotkey);
-        if (a.deadline) meta += " · lease ends " + new Date(a.deadline).toLocaleString();
+        if (a.actively_running) meta += " is running the benchmark";
+        else if (a.status === "issued") meta += " has this assignment";
+        else if (a.status === "expired") meta += " did not submit a score";
+        else meta += " submitted a score";
+        if (a.deadline && (a.actively_running || a.status === "issued")) {
+          meta += " · score due " + new Date(a.deadline).toLocaleString();
+        } else if (a.deadline && a.status === "expired") {
+          meta += " before " + new Date(a.deadline).toLocaleString();
+        }
         var benchmark = a.benchmark_progress ? renderBenchmarkProgress(a.benchmark_progress, false) : "";
         return '<div class="attempt"><div><span class="attempt-version">Validator</span></div>' +
-          '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(a.actively_running ? "Evaluating now" : label[0]) + '</span></b>' +
+          '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(a.actively_running ? "Scoring now" : label[0]) + '</span></b>' +
           '<div class="attempt-meta">' + esc(meta) + '</div>' + benchmark + '</div>' +
           '<div class="attempt-time" title="' + esc(a.issued_at) + '">' + relTime(a.issued_at) + '</div></div>';
       }).join("");
@@ -2407,8 +2426,8 @@
         '<div class="stat-head">Screener result</div>' +
         (screening || '<div class="muted" style="padding:10px 0">No versioned screening attempt recorded yet.</div>') +
         (oldScreening ? '<details class="old-screeners"><summary>Old screener results</summary>' + oldScreening + '</details>' : '') +
-        '<div class="stat-head" style="margin-top:18px">Validator progress · ' + esc(pipeline.score_count) + ' of ' + esc(pipeline.quorum) + ' scored</div>' +
-        (validation || '<div class="muted" style="padding:10px 0">No validator has claimed this submission yet.</div>') +
+        '<div class="stat-head" style="margin-top:18px">Validator progress · ' + esc(pipeline.score_count) + ' of ' + esc(pipeline.quorum) + ' scores received</div>' +
+        (validation || '<div class="muted" style="padding:10px 0">No validator is assigned yet.</div>') +
         '</div>';
     }
 
