@@ -597,6 +597,14 @@ class PublicActivityEntry(BaseModel):
             description="Anti-copy signals that routed this submission to review.",
         ),
     ]
+    score_count: Annotated[
+        int,
+        Field(ge=0, description="Independent validator scores recorded so far."),
+    ]
+    quorum: Annotated[
+        int,
+        Field(ge=1, description="Independent validator scores required to finalize."),
+    ]
 
 
 class PublicActivityResponse(BaseModel):
@@ -606,6 +614,12 @@ class PublicActivityResponse(BaseModel):
         datetime, Field(description="When this snapshot was read (UTC).")
     ]
     count: Annotated[int, Field(ge=0, description="Number of submissions returned.")]
+    total: Annotated[int, Field(ge=0, description="Total number of submissions.")]
+    page: Annotated[int, Field(ge=1, description="Current one-based page number.")]
+    page_size: Annotated[int, Field(ge=1, description="Maximum entries per page.")]
+    total_pages: Annotated[
+        int, Field(ge=1, description="Total pages, or one when there are no entries.")
+    ]
     entries: Annotated[
         list[PublicActivityEntry],
         Field(default_factory=list, description="Recent submissions, newest first."),

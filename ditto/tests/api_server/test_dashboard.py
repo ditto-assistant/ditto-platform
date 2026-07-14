@@ -74,7 +74,11 @@ class TestDashboard:
         assert body.index("<h2>Leaderboard</h2>") < body.index(
             "<h2>Submission pipeline</h2>"
         )
-        assert 'getJSON("/public/activity")' in body
+        assert 'getJSON("/public/activity?page="' in body
         assert 'id="activity-rows"' in body
+        assert 'id="activity-pager"' in body
+        assert "Validation" in body
+        assert "openActivityModal" in body
+        assert "validators scored this submission" in body
         assert "Copy review:" in body
         assert "screening_reason" in body

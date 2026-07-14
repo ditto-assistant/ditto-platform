@@ -519,6 +519,10 @@ class TestPublicActivity:
         assert resp.headers["Cache-Control"] == "public, max-age=10"
         body = resp.json()
         assert body["count"] == 3
+        assert body["total"] == 3
+        assert body["page"] == 1
+        assert body["page_size"] == 50
+        assert body["total_pages"] == 1
         assert [entry["name"] for entry in body["entries"]] == [
             "memory-v3",
             "memory-v2",
@@ -542,6 +546,8 @@ class TestPublicActivity:
             "screening_reason",
             "duplicate_of",
             "review_reason",
+            "score_count",
+            "quorum",
         }
         serialized = resp.text
         for private_field in (
@@ -563,6 +569,54 @@ class TestPublicActivity:
         _install_db(app, session_maker)
         body = (await client.get("/api/v1/public/activity?limit=1")).json()
         assert body["count"] == 1
+        assert body["total"] == 2
+        assert body["total_pages"] == 2
+
+    async def test_paginates_newest_first_without_overlap(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        for hour, name in ((10, "oldest"), (11, "middle"), (12, "newest")):
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                name=name,
+                created_at=datetime(2026, 7, 13, hour, tzinfo=UTC),
+            )
+        _install_db(app, session_maker)
+
+        first = (await client.get("/api/v1/public/activity?limit=2&page=1")).json()
+        second = (await client.get("/api/v1/public/activity?limit=2&page=2")).json()
+
+        assert [entry["name"] for entry in first["entries"]] == ["newest", "middle"]
+        assert [entry["name"] for entry in second["entries"]] == ["oldest"]
+        assert first["total"] == second["total"] == 3
+        assert first["total_pages"] == second["total_pages"] == 2
+        assert first["page"] == 1
+        assert second["page"] == 2
+
+    async def test_exposes_progress_count_without_partial_scores(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.42],
+            status=AgentStatus.EVALUATING,
+        )
+        _install_db(app, session_maker)
+
+        resp = await client.get("/api/v1/public/activity")
+        entry = resp.json()["entries"][0]
+        assert entry["score_count"] == 1
+        assert entry["quorum"] == 3
+        assert "composite" not in resp.text
+        assert "signature" not in resp.text
 
 
 class TestPublicSubmissionScores:
