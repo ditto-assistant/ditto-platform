@@ -653,6 +653,16 @@ class PublicActivityResponse(BaseModel):
     ]
     count: Annotated[int, Field(ge=0, description="Number of submissions returned.")]
     total: Annotated[int, Field(ge=0, description="Total number of submissions.")]
+    status_counts: Annotated[
+        dict[str, int],
+        Field(
+            default_factory=dict,
+            description=(
+                "Counts by canonical public lifecycle stage before status filters "
+                "are applied. Search filtering is reflected when present."
+            ),
+        ),
+    ]
     page: Annotated[int, Field(ge=1, description="Current one-based page number.")]
     page_size: Annotated[int, Field(ge=1, description="Maximum entries per page.")]
     total_pages: Annotated[

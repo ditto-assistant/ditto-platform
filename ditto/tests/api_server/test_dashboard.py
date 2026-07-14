@@ -105,7 +105,7 @@ class TestDashboard:
         assert "<h2>What DittoBench v2 measures</h2>" not in body
         assert "Submission pipeline" in body
         assert body.index("<h2>Leaderboard</h2>") < body.index('class="operations"')
-        assert 'getJSON("/public/activity?page="' in body
+        assert "getJSON(activityRequestPath(page))" in body
         assert 'id="activity-rows"' in body
         assert 'id="activity-pager"' in body
         assert 'id="pipeline-overview"' in body
@@ -154,6 +154,52 @@ class TestDashboard:
         assert 'class="pipeline-history"' in body
         assert 'class="pipeline-detail-state"' in body
         assert 'style="margin-top:18px">Validator progress' not in body
+
+    async def test_includes_server_backed_submission_quick_filters(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert 'aria-label="Quick submission filters"' in body
+        assert 'data-activity-filter="all" aria-pressed="true"' in body
+        assert 'data-activity-filter="rejected" aria-pressed="false"' in body
+        assert 'data-activity-filter="under_review" aria-pressed="false"' in body
+        assert 'data-activity-filter="waiting_validator" aria-pressed="false"' in body
+        assert 'data-activity-filter="queued" aria-pressed="false"' in body
+        assert 'waiting_screening", "screening", "waiting_validator' in body
+        assert 'id="activity-clear" type="button" hidden' in body
+        assert 'id="activity-filter-summary" role="status" aria-live="polite"' in body
+        assert 'query.append("status", status)' in body
+        assert 'if (activityQuery) query.set("q", activityQuery)' in body
+        assert "getJSON(activityRequestPath(page))" in body
+        assert "activityPage = 1;" in body
+        assert "No submissions match these filters." in body
+        assert "Could not load submissions. Try again." in body
+
+    async def test_submission_filters_restore_and_sanitize_the_url(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert "function restoreActivityUrl()" in body
+        assert 'url.searchParams.getAll("status")' in body
+        assert "ACTIVITY_STATUSES.indexOf(value) >= 0" in body
+        assert "function writeActivityUrl(push)" in body
+        assert 'url.searchParams.append("status", status)' in body
+        assert 'url.searchParams.set("q", activityQuery)' in body
+        assert 'history[push ? "pushState" : "replaceState"]' in body
+        assert 'window.addEventListener("popstate"' in body
+        assert "if (activityUrlWasSanitized) writeActivityUrl(false)" in body
+        assert "searchInput.value = activityQuery" in body
+
+    async def test_submission_filters_are_mobile_and_keyboard_accessible(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert '.activity-filter[aria-pressed="true"]' in body
+        assert ".activity-filter { min-height: 44px; }" in body
+        assert ".activity-filter-list { width: 100%; }" in body
+        assert ".activity-table-frame { min-width: 680px; }" in body
+        assert (
+            'button.setAttribute("aria-pressed", selected ? "true" : "false")' in body
+        )
+        assert "[data-activity-filter]" in body
+        assert ":focus-visible { outline: 2px solid var(--focus)" in body
 
     async def test_explains_policy_rescreen_from_public_activity_state(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
