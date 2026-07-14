@@ -30,6 +30,7 @@ from ditto.api_server.errors import (
     ApiServerLifespanError,
 )
 from ditto.api_server.factory import create_api_server
+from ditto.api_server.validator_names import ValidatorNamesConfig
 
 __all__ = [
     # Main components
@@ -37,6 +38,7 @@ __all__ = [
     # Configuration
     "ApiServerConfig",
     "ScreenerAuthConfig",
+    "ValidatorNamesConfig",
     "parse_api_server_config_from_env",
     # Errors
     "ApiServerError",

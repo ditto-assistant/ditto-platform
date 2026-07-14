@@ -208,9 +208,19 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   timestamp to reduce temporal resolution. Hostnames, IPs, cloud instance ids,
   filesystem paths, image digests, container names, secrets, env values, wallet
   paths, key material, signatures, source digests, and arbitrary keys are never
-  returned. Five-minute freshness determines availability; missing optional
-  metrics determine only `health: unknown`. Values are sampled at most every two
-  minutes and rounded to five-point buckets.
+  returned. Five-minute freshness determines `available`; a separate 15-minute
+  grace window reports a delayed heartbeat as `stale`, and only older reports
+  become `offline`. A newly accepted heartbeat immediately recovers the row.
+  Missing optional metrics determine only `health: unknown`. Values are sampled
+  at most every two minutes and rounded to five-point buckets.
+
+  Ticket-bound benchmark progress is optional decoration on an otherwise valid
+  signed heartbeat. If the referenced lease has expired, disappeared, or no
+  longer belongs to an evaluating agent, ingestion drops only the active-work
+  context and still records liveness, version, state, and safe system metrics.
+  It does not update the ticket, submission, benchmark, or any accepted score.
+  Progress regression for a still-valid lease remains rejected. Telemetry
+  failure therefore cannot abort scoring or weights.
 
   Screener heartbeat protocol v2 may also sign a current-job start time and one
   coarse stage: `preparing`, `downloading`, `validating`, `building`, `starting`,
@@ -250,7 +260,37 @@ for the deep dive. Sections:
 - **Fleet health** — validators by default, with a keyboard-accessible native
   “Show screeners” checkbox. One dense responsive table shows availability,
   heartbeat age, current work, version, first-seen time, and coarse system
-  metrics without turning each machine into a repetitive card.
+  metrics without turning each machine into a repetitive card. Validator rows
+  always retain the shortened public hotkey, full-hotkey title, and an accessible
+  copy button with clipboard fallback and announced success/failure state.
+
+### Optional Taostats validator names
+
+`GET /api/v1/public/validator-names` exposes a cache snapshot containing only
+`validator_hotkey` and `display_name` for hotkeys already present in the
+platform's public validator fleet. The dashboard escapes names as untrusted text
+and continues to show each short hotkey, so duplicate names remain unambiguous.
+The name route is decoration only: validator availability, scheduling, scoring,
+and weights never read it.
+
+The cache refreshes in a background task with a 1.5-second default timeout, a
+one-hour refresh interval, a five-minute minimum retry interval, and a bounded
+24-hour stale-while-revalidate window. HTTP errors, timeouts, malformed JSON,
+rate limits, an unknown hotkey, or an expired cache produce an empty fallback;
+no public request performs Taostats I/O. The response parser accepts only the
+documented address/hotkey and name fields, bounds record and name counts, and
+drops control and bidirectional-spoofing characters. Configuration accepts only
+HTTPS URLs on `api.taostats.io`.
+
+As checked on 2026-07-14, Taostats documents
+`/api/dtao/validator/available/v1` for subnet validators, and its current welcome
+page says API keys are free. An unauthenticated SN118 request returns `401`, so
+enrichment requires the optional `DITTO_TAOSTATS_API_KEY` secret alongside
+`DITTO_TAOSTATS_VALIDATOR_NAMES_URL`; no paid plan is required. Its terms reserve
+rate-limit and access changes. The public metagraph page contains rendered data,
+but HTML scraping is deliberately unsupported. Both settings are disabled by
+default, so deployments without a key use hotkeys without changing core
+behavior or making failed anonymous calls.
 
 Hosting: static build → object storage + CDN (matches the earlier static-serve
 idea); no server needed since all data comes from the public API + wandb.

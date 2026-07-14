@@ -913,7 +913,7 @@ class PublicHealthResponse(BaseModel):
     )
 
 
-FleetAvailability = Literal["available", "offline", "paused", "unknown"]
+FleetAvailability = Literal["available", "stale", "offline", "paused", "unknown"]
 FleetHealth = Literal["healthy", "warning", "unknown"]
 
 
@@ -953,9 +953,29 @@ class PublicValidatorHeartbeatsResponse(BaseModel):
 
     generated_at: datetime
     online_window_seconds: Annotated[int, Field(ge=1)]
+    stale_window_seconds: Annotated[int, Field(ge=1)]
     reported_count: Annotated[int, Field(ge=0)]
     online_count: Annotated[int, Field(ge=0)]
     validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)
+
+
+class PublicValidatorName(BaseModel):
+    """One optional, untrusted display label paired with its full identity."""
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Validator's public hotkey.")
+    ]
+    display_name: Annotated[str, Field(min_length=1, max_length=80)]
+
+
+class PublicValidatorNamesResponse(BaseModel):
+    """Non-blocking snapshot of optional Taostats display-name decoration."""
+
+    generated_at: datetime
+    source: Literal["taostats"] = "taostats"
+    status: Literal["disabled", "fresh", "stale", "unavailable"]
+    refreshed_at: datetime | None = None
+    validators: list[PublicValidatorName] = Field(default_factory=list)
 
 
 class PublicScreenerProgress(BaseModel):
@@ -992,6 +1012,7 @@ class PublicScreenerHeartbeatsResponse(BaseModel):
 
     generated_at: datetime
     online_window_seconds: Annotated[int, Field(ge=1)]
+    stale_window_seconds: Annotated[int, Field(ge=1)]
     reported_count: Annotated[int, Field(ge=0)]
     online_count: Annotated[int, Field(ge=0)]
     screeners: list[PublicScreenerHeartbeat] = Field(default_factory=list)

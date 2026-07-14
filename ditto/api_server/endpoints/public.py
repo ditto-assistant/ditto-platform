@@ -35,7 +35,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from sqlalchemy import func, select
 
 from ditto.api_models import (
@@ -70,6 +70,8 @@ from ditto.api_models import (
     PublicValidationAttempt,
     PublicValidatorHeartbeat,
     PublicValidatorHeartbeatsResponse,
+    PublicValidatorName,
+    PublicValidatorNamesResponse,
     PublicValidatorScore,
 )
 from ditto.api_models.agent_status import AgentStatus
@@ -118,6 +120,7 @@ router = APIRouter(prefix="/public", tags=["public"])
 # cache is safe and shields the DB from dashboard/CDN traffic.
 _CACHE_CONTROL = "public, max-age=30"
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
+_VALIDATOR_STALE_WINDOW = timedelta(minutes=15)
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -208,12 +211,14 @@ def _fleet_classification(
     """Return online, availability, and health without treating omission as outage."""
     online = seen_at >= now - _VALIDATOR_ONLINE_WINDOW
     availability: FleetAvailability
-    if not online:
-        availability = "offline"
-    elif state == "paused":
+    if online and state == "paused":
         availability = "paused"
-    else:
+    elif online:
         availability = "available"
+    elif seen_at >= now - _VALIDATOR_STALE_WINDOW:
+        availability = "stale"
+    else:
+        availability = "offline"
 
     health: FleetHealth
     if state == "error":
@@ -549,9 +554,36 @@ async def validators(
     return PublicValidatorHeartbeatsResponse(
         generated_at=now,
         online_window_seconds=int(_VALIDATOR_ONLINE_WINDOW.total_seconds()),
+        stale_window_seconds=int(_VALIDATOR_STALE_WINDOW.total_seconds()),
         reported_count=len(entries),
         online_count=sum(entry.online for entry in entries),
         validators=entries,
+    )
+
+
+@router.get("/validator-names", response_model=PublicValidatorNamesResponse)
+async def validator_names(
+    request: Request,
+    response: Response,
+    session: SessionDep,
+) -> PublicValidatorNamesResponse:
+    """Cached optional Taostats labels; this route never performs external I/O."""
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    rows = await list_validator_heartbeats(session)
+    reporter_hotkeys = {row.validator_hotkey for row in rows}
+    snapshot = request.app.state.validator_names.snapshot(sorted(reporter_hotkeys))
+    return PublicValidatorNamesResponse(
+        generated_at=datetime.now(UTC),
+        status=snapshot.status,
+        refreshed_at=snapshot.refreshed_at,
+        validators=[
+            PublicValidatorName(
+                validator_hotkey=hotkey,
+                display_name=display_name,
+            )
+            for hotkey, display_name in sorted(snapshot.names.items())
+            if hotkey in reporter_hotkeys
+        ],
     )
 
 
@@ -641,6 +673,7 @@ async def screeners(
     return PublicScreenerHeartbeatsResponse(
         generated_at=now,
         online_window_seconds=int(_VALIDATOR_ONLINE_WINDOW.total_seconds()),
+        stale_window_seconds=int(_VALIDATOR_STALE_WINDOW.total_seconds()),
         reported_count=len(entries),
         online_count=sum(entry.online for entry in entries),
         screeners=entries,

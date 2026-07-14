@@ -166,6 +166,13 @@ def _config_to_log_dict(config: ApiServerConfig) -> dict[str, object]:
                 else "<unset>"
             ),
         },
+        "validator_names": {
+            "enabled": config.validator_names.enabled,
+            "timeout_seconds": config.validator_names.timeout_seconds,
+            "refresh_seconds": config.validator_names.refresh_seconds,
+            "retry_seconds": config.validator_names.retry_seconds,
+            "max_stale_seconds": config.validator_names.max_stale_seconds,
+        },
         "storage": {
             "endpoint_url": config.storage.endpoint_url,
             "bucket": config.storage.bucket,

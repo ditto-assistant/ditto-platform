@@ -28,6 +28,8 @@ from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import get_dataset_generator, get_session
+from ditto.api_server.endpoints.public import _fleet_classification
+from ditto.api_server.validator_names import ValidatorNamesSnapshot
 from ditto.db.models import (
     Agent,
     Base,
@@ -501,6 +503,112 @@ class TestPublicHealth:
             "scores_24h": 0,
             "avg_latency_ms": None,
         }
+
+
+class TestPublicFleet:
+    def test_stale_boundaries_and_recovery_after_delayed_heartbeat(self) -> None:
+        now = datetime(2026, 7, 14, 20, 0, tzinfo=UTC)
+
+        assert _fleet_classification(
+            state="idle",
+            seen_at=now - timedelta(minutes=5),
+            now=now,
+            metrics=None,
+        )[:2] == (True, "available")
+        assert _fleet_classification(
+            state="running_benchmark",
+            seen_at=now - timedelta(minutes=5, microseconds=1),
+            now=now,
+            metrics=None,
+        )[:2] == (False, "stale")
+        assert _fleet_classification(
+            state="running_benchmark",
+            seen_at=now - timedelta(minutes=15),
+            now=now,
+            metrics=None,
+        )[:2] == (False, "stale")
+        assert _fleet_classification(
+            state="running_benchmark",
+            seen_at=now - timedelta(minutes=15, microseconds=1),
+            now=now,
+            metrics=None,
+        )[:2] == (False, "offline")
+        assert _fleet_classification(
+            state="running_benchmark", seen_at=now, now=now, metrics=None
+        )[:2] == (True, "available")
+
+    async def test_validator_name_response_is_allowlisted_to_reporters(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_MINER_A,
+                    software_version="1.2.3",
+                    protocol_version=4,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                )
+            )
+        _install_db(app, session_maker)
+
+        class Names:
+            calls = 0
+
+            def snapshot(self, hotkeys: list[str]) -> ValidatorNamesSnapshot:
+                self.calls += 1
+                assert hotkeys == [_MINER_A]
+                return ValidatorNamesSnapshot(
+                    status="fresh",
+                    refreshed_at=now,
+                    names={_MINER_A: "Rizzo", _MINER_B: "Not a reporter"},
+                )
+
+        names = Names()
+        app.state.validator_names = names
+        response = await client.get("/api/v1/public/validator-names")
+
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "public, max-age=30"
+        body = response.json()
+        assert set(body) == {
+            "generated_at",
+            "source",
+            "status",
+            "refreshed_at",
+            "validators",
+        }
+        assert body["source"] == "taostats"
+        assert body["status"] == "fresh"
+        assert body["validators"] == [
+            {"validator_hotkey": _MINER_A, "display_name": "Rizzo"}
+        ]
+        assert names.calls == 1
+
+    async def test_core_fleet_endpoint_never_reads_external_name_cache(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+
+        class ExplodingNames:
+            def snapshot(self, hotkeys: list[str]) -> ValidatorNamesSnapshot:
+                raise AssertionError(f"unexpected name lookup for {hotkeys}")
+
+        app.state.validator_names = ExplodingNames()
+        response = await client.get("/api/v1/public/validators")
+
+        assert response.status_code == 200
+        assert response.json()["validators"] == []
 
 
 class TestPublicActivity:

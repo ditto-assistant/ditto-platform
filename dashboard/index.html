@@ -328,6 +328,7 @@
     .copy.copied { color: var(--good); }
     .copy.copied > span { display: none; }
     .copy.copied::after { content: "✓"; }
+    .copy.failed { color: var(--danger); opacity: 1; }
     @media (hover: none) { .copy { opacity: 1; } }
 
     .metric { display: flex; align-items: center; gap: 10px; min-width: 150px; }
@@ -513,6 +514,9 @@
     .fleet-table { min-width: 940px; }
     .fleet-table tbody tr { cursor: default; }
     .fleet-node { display: block; color: var(--text); font-family: var(--mono); font-size: 12px; }
+    .fleet-node-identity { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+    .fleet-node-name { overflow: hidden; color: var(--text); font: 650 12px/1.2 var(--sans); text-overflow: ellipsis; white-space: nowrap; }
+    .fleet-node-key { color: var(--text-dim); font-size: 11px; }
     .fleet-version { display: block; font-family: var(--mono); font-size: 12px; color: var(--text); }
     .fleet-protocol { display: block; margin-top: 3px; font-size: 11px; color: var(--text-faint); }
     .fleet-time { display: block; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -1460,6 +1464,7 @@
 </head>
 <body>
   <a class="skip-link" href="#main-content">Skip to content</a>
+  <div id="copy-status" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
   <div class="layout">
     <aside class="sidebar" aria-label="Site sections">
       <div class="brand">
@@ -2326,7 +2331,8 @@
       if (!value) return "";
       var safeLabel = esc(label || "value");
       return '<button type="button" class="copy" data-key="' + esc(String(value)) +
-        '" aria-label="Copy ' + safeLabel + '" title="Copy ' + safeLabel +
+        '" data-copy-label="' + safeLabel + '" aria-label="Copy ' + safeLabel +
+        '" aria-describedby="copy-status" title="Copy ' + safeLabel +
         '"><span aria-hidden="true">⧉</span></button>';
     }
     // The k=3 consensus record: which independent validators scored this agent,
@@ -2641,23 +2647,38 @@
     function doCopy(btn) {
       var value = btn.getAttribute("data-key");
       if (!value) return;
+      var copyLabel = btn.getAttribute("data-copy-label") || "value";
+      var status = document.getElementById("copy-status");
+      var originalLabel = "Copy " + copyLabel;
+      var reset = function () {
+        btn.classList.remove("copied", "failed");
+        btn.setAttribute("aria-label", originalLabel);
+        btn.setAttribute("title", originalLabel);
+      };
       copyText(value).then(function () {
-        var originalLabel = btn.getAttribute("aria-label") || "Copy value";
         btn.classList.add("copied");
-        btn.setAttribute("aria-label", "Copied");
-        var restore = function () {
-          btn.classList.remove("copied");
-          btn.setAttribute("aria-label", originalLabel);
-        };
-        setTimeout(restore, 1200);
+        btn.setAttribute("aria-label", "Copied " + copyLabel);
+        btn.setAttribute("title", "Copied " + copyLabel);
+        status.textContent = "Copied " + copyLabel + " to the clipboard.";
+        setTimeout(reset, 1600);
       }).catch(function () {
-        btn.setAttribute("title", "Copy failed");
-        setTimeout(function () { btn.setAttribute("title", btn.getAttribute("aria-label") || "Copy value"); }, 1200);
+        btn.classList.add("failed");
+        btn.setAttribute("aria-label", "Could not copy " + copyLabel);
+        btn.setAttribute("title", "Could not copy " + copyLabel);
+        status.textContent = "Could not copy " + copyLabel + ". Select the full value and copy it manually.";
+        setTimeout(reset, 2400);
       });
     }
     document.addEventListener("click", function (ev) {
       var copy = ev.target.closest(".copy");
       if (!copy) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      doCopy(copy);
+    });
+    document.addEventListener("keydown", function (ev) {
+      var copy = ev.target.closest(".copy");
+      if (!copy || (ev.key !== "Enter" && ev.key !== " ")) return;
       ev.preventDefault();
       ev.stopPropagation();
       doCopy(copy);
@@ -3276,6 +3297,7 @@
 
     var fleetReports = { validators: null, screeners: null };
     var fleetUnavailable = { validators: false, screeners: false };
+    var validatorNames = {};
 
     function fleetWork(state, role) {
       var states = {
@@ -3355,7 +3377,8 @@
     }
 
     function fleetStatus(entry) {
-      if (entry.availability === "offline" || entry.online === false) return ["Offline", "bad"];
+      if (entry.availability === "stale") return ["Stale", "warn"];
+      if (entry.availability === "offline") return ["Offline", "bad"];
       if (entry.availability === "paused") return ["Paused", "paused"];
       if (entry.health === "warning") return ["Warning", "warn"];
       if (entry.health === "healthy") return ["Healthy", "good"];
@@ -3388,7 +3411,8 @@
     function updateFleetLedger(entries) {
       var counts = { healthy: 0, warning: 0, offline: 0, paused: 0, unknown: 0 };
       entries.forEach(function (entry) {
-        if (entry.availability === "offline" || entry.online === false) counts.offline++;
+        if (entry.availability === "stale") counts.warning++;
+        else if (entry.availability === "offline") counts.offline++;
         else if (entry.availability === "paused") counts.paused++;
         else if (entry.health === "warning") counts.warning++;
         else if (entry.health === "healthy") counts.healthy++;
@@ -3444,6 +3468,7 @@
         var hotkey = entry[singular + "_hotkey"] || "Unknown";
         var status = fleetStatus(entry);
         var work = fleetWork(entry.state, singular);
+        if (entry.availability === "stale") work = ["Last reported · " + work[0], "warn"];
         var version = String(entry.software_version || "Unknown");
         if (version !== "Unknown" && version.charAt(0).toLowerCase() !== "v") version = "v" + version;
         var reportedAt = entry.seen_at || entry.reported_at;
@@ -3463,9 +3488,13 @@
         var protocol = singular === "screener"
           ? "Health " + entry.protocol_version + " · Policy " + entry.policy_version
           : "Protocol " + entry.protocol_version;
+        var displayName = singular === "validator" ? validatorNames[hotkey] : "";
+        var identity = displayName
+          ? '<span class="fleet-node-identity"><span class="fleet-node-name" title="' + esc(displayName) + '">' + esc(displayName) + '</span><span class="fleet-node fleet-node-key copyable" title="' + esc(hotkey) + '"><span>' + esc(shortKey(hotkey)) + '</span>' + copyButton(hotkey, "validator hotkey") + '</span></span>'
+          : '<span class="fleet-node copyable" title="' + esc(hotkey) + '"><span>' + esc(shortKey(hotkey)) + '</span>' + copyButton(hotkey, singular + " hotkey") + '</span>';
         return '<tr>' +
           '<td><span class="fleet-node-wrap"><span class="fleet-type" aria-label="' + (singular === "screener" ? "Screener" : "Validator") + '">' + (singular === "screener" ? "S" : "V") + '</span><span>' +
-            '<span class="fleet-node copyable" title="' + esc(hotkey) + '"><span>' + esc(shortKey(hotkey)) + '</span>' + copyButton(hotkey, singular + " hotkey") + '</span></span></span></td>' +
+            identity + '</span></span></td>' +
           '<td><span class="stage ' + status[1] + '">' + status[0] + '</span></td>' +
           '<td><span class="fleet-time" title="' + esc(entry.first_seen_at || "") + '">' + esc(firstSeen) + '</span></td>' +
           '<td><span class="fleet-time" title="' + esc(reportedAt) + '">' + relTime(reportedAt) + '</span></td>' +
@@ -3553,6 +3582,20 @@
         })
         .catch(function () {
           fleetUnavailable.validators = true;
+          renderFleet();
+        });
+      getJSON("/public/validator-names")
+        .then(function (data) {
+          validatorNames = {};
+          (data.validators || []).forEach(function (entry) {
+            if (entry && typeof entry.validator_hotkey === "string" && typeof entry.display_name === "string") {
+              validatorNames[entry.validator_hotkey] = entry.display_name;
+            }
+          });
+          renderFleet();
+        })
+        .catch(function () {
+          validatorNames = {};
           renderFleet();
         });
       getJSON("/public/screeners")
