@@ -198,6 +198,19 @@ class TestDashboard:
         assert "active_agent_name" in body
         assert "setInterval(updateScreenerElapsed, 1000)" in body
 
+    async def test_includes_copy_controls_for_operational_identifiers(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert 'id="d-hotkey-copy"' in body
+        assert 'copyButton(e.dataset_sha256, "dataset SHA-256")' in body
+        assert 'copyButton(e.agent_id, "agent ID")' in body
+        assert 'copyButton(e.miner_hotkey, "miner hotkey")' in body
+        assert 'copyButton(hotkey, singular + " hotkey")' in body
+        assert 'copyButton(s.validator_hotkey, "validator hotkey")' in body
+        assert 'document.addEventListener("click"' in body
+        assert 'document.execCommand("copy")' in body
+        assert "navigator.clipboard.writeText(value).catch" in body
+
     async def test_includes_system_and_time_aware_theme_switcher(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
