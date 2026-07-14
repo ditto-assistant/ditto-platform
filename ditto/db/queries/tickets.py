@@ -60,7 +60,7 @@ async def expire_overdue_tickets(session: AsyncSession, *, now: datetime) -> int
             await session.execute(
                 select(ValidatorTicket).where(
                     ValidatorTicket.status == TicketStatus.ISSUED,
-                    ValidatorTicket.deadline < now,
+                    ValidatorTicket.deadline <= now,
                 )
             )
         )
@@ -189,14 +189,21 @@ async def get_open_ticket(
     validator_hotkey: str,
     now: datetime,
     deadline: datetime,
+    for_update: bool = False,
 ) -> ValidatorTicket | None:
     """Return the validator's live (``issued``, not-yet-past-deadline) ticket for
     the agent, or ``None`` if it has none, it is already spent, or it expired."""
-    ticket = await session.get(ValidatorTicket, (agent_id, validator_hotkey))
+    statement = select(ValidatorTicket).where(
+        ValidatorTicket.agent_id == agent_id,
+        ValidatorTicket.validator_hotkey == validator_hotkey,
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    ticket = await session.scalar(statement)
     if (
         ticket is None
         or ticket.status != TicketStatus.ISSUED
-        or _as_utc(ticket.deadline) < now
+        or _as_utc(ticket.deadline) <= now
         or _as_utc(ticket.deadline) != _as_utc(deadline)
     ):
         return None

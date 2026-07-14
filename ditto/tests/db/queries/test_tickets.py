@@ -117,6 +117,14 @@ class TestIssueTicket:
 
 
 class TestExpiry:
+    async def test_deadline_instant_is_expired(self, session: AsyncSession) -> None:
+        await _seed_evaluating(session)
+        async with session.begin():
+            await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
+        deadline = _NOW + _TTL
+        async with session.begin():
+            assert await expire_overdue_tickets(session, now=deadline) == 1
+
     async def test_expired_ticket_frees_slot(self, session: AsyncSession) -> None:
         aid = await _seed_evaluating(session)
         async with session.begin():
@@ -297,6 +305,23 @@ class TestTicketLifecycle:
                 deadline=_NOW + _TTL,
             )
         assert t is None
+
+    async def test_get_open_ticket_at_exact_deadline_is_none(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        deadline = _NOW + _TTL
+        async with session.begin():
+            await issue_ticket(session, validator_hotkey="5V1", now=_NOW, ttl=_TTL)
+        async with session.begin():
+            ticket = await get_open_ticket(
+                session,
+                agent_id=aid,
+                validator_hotkey="5V1",
+                now=deadline,
+                deadline=deadline,
+            )
+        assert ticket is None
 
     async def test_get_open_ticket_absent_is_none(self, session: AsyncSession) -> None:
         aid = await _seed_evaluating(session)

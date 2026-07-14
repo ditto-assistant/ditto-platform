@@ -158,6 +158,24 @@ class TestDashboard:
         assert "fleet-health-note" not in body
         assert '" reporting " + kind' not in body
 
+    async def test_includes_accessible_benchmark_progress(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert "benchmarkStageLabel" in body
+        assert "active_benchmarks" in body
+        assert "active_benchmark" in body
+        assert '<progress max="100" value="' in body
+        assert "aria-label" in body
+        assert "Benchmark progress not reported" in body
+        assert "failed_retrying" in body
+        assert "Scoring and finalizing" in body
+        assert "Signing and submitting result" in body
+        assert "prefers-reduced-motion" in body
+        assert "@media (forced-colors: active)" in body
+        assert "@media (max-width: 720px)" in body
+        assert 'class="fleet-work-col"' in body
+        assert "Current work" in body
+
     async def test_includes_time_aware_theme_switcher(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text

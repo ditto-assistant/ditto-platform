@@ -28,6 +28,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_progress import BenchmarkProgress
 from ditto.api_models.system_health import SystemMetrics
 from ditto.api_models.upload import (
     _SIGNATURE_HEX_PATTERN,
@@ -241,6 +242,15 @@ class ValidatorHeartbeatRequest(BaseModel):
         Field(
             default=None,
             description="Optional coarse host telemetry under heartbeat protocol v3.",
+        ),
+    ] = None
+    benchmark_progress: Annotated[
+        BenchmarkProgress | None,
+        Field(
+            default=None,
+            description=(
+                "Optional ticket-bound benchmark progress under heartbeat protocol v4."
+            ),
         ),
     ] = None
     timestamp: Annotated[

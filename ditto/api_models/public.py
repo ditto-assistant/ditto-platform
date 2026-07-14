@@ -15,6 +15,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.screener import ScreenerRuntimeState
 from ditto.api_models.validator import ValidatorRuntimeState
 
@@ -563,6 +564,19 @@ class PublicSubmissionsResponse(BaseModel):
     ]
 
 
+class PublicBenchmarkProgress(BaseModel):
+    """Ticket-validated and coarsened public benchmark progress allowlist."""
+
+    agent_id: UUID
+    agent_name: str
+    stage: BenchmarkProgressStage | None = None
+    completed_checks: Annotated[int | None, Field(default=None, ge=0)] = None
+    total_checks: Annotated[int | None, Field(default=None, ge=1)] = None
+    percent: Annotated[int | None, Field(default=None, ge=0, le=95, multiple_of=5)] = (
+        None
+    )
+
+
 class PublicActivityEntry(BaseModel):
     """One submission's safe, public lifecycle state."""
 
@@ -621,6 +635,7 @@ class PublicActivityEntry(BaseModel):
     screening_deadline: Annotated[
         datetime | None, Field(default=None, description="Active attempt deadline.")
     ]
+    active_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
 
 
 class PublicActivityResponse(BaseModel):
@@ -663,6 +678,7 @@ class PublicValidationAttempt(BaseModel):
     issued_at: datetime
     deadline: datetime
     actively_running: bool = False
+    benchmark_progress: PublicBenchmarkProgress | None = None
 
 
 class PublicSubmissionPipeline(BaseModel):
@@ -912,6 +928,7 @@ class PublicValidatorHeartbeat(BaseModel):
     protocol_version: Annotated[int, Field(ge=1)]
     state: ValidatorRuntimeState
     active_agent_id: UUID | None = None
+    active_benchmark: PublicBenchmarkProgress | None = None
     first_seen_at: datetime | None = None
     reported_at: datetime
     seen_at: datetime

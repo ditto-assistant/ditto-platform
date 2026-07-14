@@ -173,6 +173,27 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   is “not reported,” never an outage. A missing hotkey means it has not proved
   heartbeat-capable software; this endpoint does not pretend to enumerate every
   on-chain permit holder.
+
+  Heartbeat protocol v4 optionally signs a ticket-bound benchmark stage and
+  aggregate `completed`/`total` check counts. The platform revalidates the live
+  ticket, evaluating agent, freshness, stage allowlist, bounds, and monotonic
+  high-water mark before projecting progress. Public responses derive only six
+  progress fields: `agent_id`, `agent_name`, `stage`, `completed_checks`,
+  `total_checks`, and `percent`. Percent is rounded to the nearest 5% and capped
+  at 95% until the score is submitted; finalizing/signing may therefore show
+  `95%` with all checks complete. Terminal, expired, stale, requeued, or
+  mismatched tickets clear public active work. Older clients and v4 heartbeats
+  that omit progress remain compatible and show an explicit unknown-progress
+  state. A private agent-bound high-water mark survives idle, polling, and
+  downgrade reports so a late same-ticket heartbeat cannot restart at a lower
+  count; it is never part of a public response.
+
+  Progress never publishes case ids, case categories or order, prompts, answer
+  keys, tool names, memory or generated-dataset contents, pre-disclosure dataset
+  hashes, seeds, canaries, partial scores, per-case outcomes or latency, model
+  output, harness/build logs, internal run/container ids, paths, IPs, or error
+  bodies. The API constructs the public shape from an allowlist rather than
+  forwarding validator JSON or a validator-supplied display string.
 - `GET /api/v1/public/screeners` → the equivalent public-safe view for
   platform-operated screeners. Reports use the existing dedicated screener
   bearer-token and hotkey-signature boundary, not a validator mnemonic or
