@@ -169,6 +169,19 @@ class TestDashboard:
         assert "root.dataset.timePhase = fromHour(new Date().getHours())" in body
         assert 'if (hour >= 5 && hour < 8) return "dawn"' in body
 
+    async def test_sidebar_routes_every_section(self) -> None:
+        # The dashboard is a sidebar shell with hash-routed pages; each nav item
+        # and its page share the same data-page id and #/<page> deep link.
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert '<aside class="sidebar"' in body
+        assert 'id="nav-toggle"' in body  # mobile hamburger
+        for page in ("overview", "leaderboard", "operations", "submissions", "benchmark"):
+            assert f'href="#/{page}"' in body
+            assert f'data-page="{page}"' in body
+        # The time-aware theme switcher moved into the sidebar but stays wired.
+        assert 'data-theme-choice="light"' in body
+
     async def test_benchmark_badge_omits_latest_suffix(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
