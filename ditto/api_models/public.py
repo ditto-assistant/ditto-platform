@@ -688,6 +688,8 @@ class PublicScreeningAttempt(BaseModel):
     deadline: datetime
     finished_at: datetime | None = None
     reason: str | None = None
+    quarantine_resolution: Literal["release", "rescreen", "reject"] | None = None
+    quarantine_resolved_at: datetime | None = None
 
 
 class PublicValidationAttempt(BaseModel):

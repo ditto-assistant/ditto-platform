@@ -35,6 +35,7 @@ from ditto.db.models import (
     Base,
     Score,
     ScreeningAttempt,
+    ScreeningQuarantine,
     ValidatorHeartbeat,
     ValidatorTicket,
 )
@@ -922,26 +923,104 @@ class TestPublicActivity:
             )
         )
         now = datetime.now(UTC)
+        attempt_id = uuid4()
         async with session_maker() as session, session.begin():
-            session.add(
-                ScreeningAttempt(
-                    attempt_id=uuid4(),
-                    agent_id=agent_id,
-                    screener_hotkey=_MINER_B,
-                    policy_version=SCREENING_POLICY_VERSION,
-                    status="quarantined",
-                    started_at=now - timedelta(minutes=2),
-                    deadline=now + timedelta(minutes=28),
-                    finished_at=now,
-                    public_reason="Submission held for anti-cheat review",
-                )
+            session.add_all(
+                [
+                    ScreeningAttempt(
+                        attempt_id=attempt_id,
+                        agent_id=agent_id,
+                        screener_hotkey=_MINER_B,
+                        policy_version=SCREENING_POLICY_VERSION,
+                        status="quarantined",
+                        started_at=now - timedelta(minutes=2),
+                        deadline=now + timedelta(minutes=28),
+                        finished_at=now,
+                        public_reason="Submission held for anti-cheat review",
+                    ),
+                    ScreeningQuarantine(
+                        quarantine_id=uuid4(),
+                        agent_id=agent_id,
+                        attempt_id=attempt_id,
+                        screener_hotkey=_MINER_B,
+                        policy_version=SCREENING_POLICY_VERSION,
+                        manifest_digest="ab" * 32,
+                        reason_code="suspicious_source",
+                        status="active",
+                    ),
+                ]
             )
         _install_db(app, session_maker)
 
         response = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
 
         assert response.status_code == 200
-        assert response.json()["screening_attempts"][0]["status"] == "quarantined"
+        attempt = response.json()["screening_attempts"][0]
+        assert attempt["status"] == "quarantined"
+        assert attempt["quarantine_resolution"] is None
+        assert attempt["quarantine_resolved_at"] is None
+
+    async def test_released_quarantine_resolution_is_public_in_attempt_history(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                screening_reason="Manual review found no prohibited behavior",
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        now = datetime.now(UTC)
+        attempt_id = uuid4()
+        async with session_maker() as session, session.begin():
+            session.add_all(
+                [
+                    ScreeningAttempt(
+                        attempt_id=attempt_id,
+                        agent_id=agent_id,
+                        screener_hotkey=_MINER_B,
+                        policy_version=SCREENING_POLICY_VERSION,
+                        status="quarantined",
+                        started_at=now - timedelta(minutes=12),
+                        deadline=now + timedelta(minutes=18),
+                        finished_at=now - timedelta(minutes=10),
+                        public_reason="Submission held for anti-cheat review",
+                    ),
+                    ScreeningQuarantine(
+                        quarantine_id=uuid4(),
+                        agent_id=agent_id,
+                        attempt_id=attempt_id,
+                        screener_hotkey=_MINER_B,
+                        policy_version=SCREENING_POLICY_VERSION,
+                        manifest_digest="ab" * 32,
+                        reason_code="suspicious_source",
+                        status="resolved",
+                        resolved_at=now,
+                        resolved_by="admin@example.com",
+                        resolution="release",
+                        resolution_reason=(
+                            "Manual review found no prohibited behavior"
+                        ),
+                    ),
+                ]
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+
+        assert response.status_code == 200
+        attempt = response.json()["screening_attempts"][0]
+        assert attempt["status"] == "quarantined"
+        assert attempt["quarantine_resolution"] == "release"
+        assert datetime.fromisoformat(attempt["quarantine_resolved_at"]) == now.replace(
+            tzinfo=None
+        )
+        assert "resolved_by" not in attempt
 
     async def test_evaluation_projects_live_work_from_validator_heartbeat(
         self,
