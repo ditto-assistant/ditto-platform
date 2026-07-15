@@ -352,7 +352,7 @@ async def upload_agent(
     # together. A replayed payment proof surfaces as PaymentReplayedError
     # (3207) and the envelope handler maps it to HTTP 402.
     async with session.begin():
-        await insert_agent(
+        version = await insert_agent(
             session,
             agent_id=agent_id,
             miner_hotkey=hotkey,
@@ -368,10 +368,12 @@ async def upload_agent(
         await insert_evaluation_payment(session, verified=verified, agent_id=agent_id)
 
     logger.info(
-        f"upload accepted hotkey={hotkey} agent_id={agent_id} "
+        f"upload accepted hotkey={hotkey} agent_id={agent_id} version={version} "
         f"amount_rao={verified.amount_rao} block_hash={verified.block_hash}"
     )
-    return UploadAgentResponse(agent_id=agent_id, status=AgentStatus.UPLOADED)
+    return UploadAgentResponse(
+        agent_id=agent_id, version=version, status=AgentStatus.UPLOADED
+    )
 
 
 def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:

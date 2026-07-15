@@ -190,6 +190,14 @@ class PublicLeaderboardEntry(BaseModel):
         str,
         Field(description="Human-friendly name of the miner's winning agent."),
     ]
+    agent_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description="Winning submission's version; null for legacy uploads.",
+        ),
+    ] = None
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Miner's SS58 hotkey.")
     ]
@@ -617,6 +625,16 @@ class PublicActivityEntry(BaseModel):
         str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
     ]
     name: Annotated[str, Field(description="Miner-provided agent display name.")]
+    version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description=(
+                "Submission version within this named agent; null for legacy uploads."
+            ),
+        ),
+    ] = None
     status: Annotated[
         str,
         Field(
@@ -643,6 +661,18 @@ class PublicActivityEntry(BaseModel):
     duplicate_of: Annotated[
         UUID | None,
         Field(default=None, description="Earlier agent this submission may duplicate."),
+    ]
+    duplicate_name: Annotated[
+        str | None,
+        Field(default=None, description="Name of the matched submission."),
+    ]
+    duplicate_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description="Version of the matched submission; null when it is legacy.",
+        ),
     ]
     review_reason: Annotated[
         str | None,

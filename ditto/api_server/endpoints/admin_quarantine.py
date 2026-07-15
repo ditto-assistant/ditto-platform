@@ -134,6 +134,7 @@ def _item(
         attempt_id=row.attempt_id,
         miner_hotkey=agent.miner_hotkey,
         agent_name=agent.name,
+        agent_version=agent.version,
         artifact_sha256=agent.sha256,
         policy_version=row.policy_version,
         manifest_digest=row.manifest_digest,
@@ -578,7 +579,23 @@ async def list_screening_submissions(
             .scalars()
             .all()
         )
+        duplicate_ids = {
+            attempt.duplicate_of
+            for attempt in attempts
+            if attempt.duplicate_of is not None
+        }
+        duplicate_agents = {
+            duplicate.agent_id: duplicate
+            for duplicate in await session.scalars(
+                select(Agent).where(Agent.agent_id.in_(duplicate_ids))
+            )
+        }
         for attempt in attempts:
+            duplicate = (
+                duplicate_agents.get(attempt.duplicate_of)
+                if attempt.duplicate_of is not None
+                else None
+            )
             attempts_by_agent[attempt.agent_id].append(
                 AdminScreeningAttempt(
                     attempt_id=attempt.attempt_id,
@@ -591,6 +608,10 @@ async def list_screening_submissions(
                     reason=attempt.public_reason,
                     reason_code=attempt.reason_code,
                     duplicate_of=attempt.duplicate_of,
+                    duplicate_name=duplicate.name if duplicate is not None else None,
+                    duplicate_version=(
+                        duplicate.version if duplicate is not None else None
+                    ),
                 )
             )
     return AdminScreeningSubmissionList(
@@ -600,6 +621,7 @@ async def list_screening_submissions(
                 agent_id=agent.agent_id,
                 miner_hotkey=agent.miner_hotkey,
                 agent_name=agent.name,
+                agent_version=agent.version,
                 artifact_sha256=agent.sha256,
                 agent_status=agent.status,
                 screening_policy_version=agent.screening_policy_version,

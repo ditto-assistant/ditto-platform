@@ -38,6 +38,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
     BenchDatasetConfig,
@@ -447,6 +448,7 @@ def _public_entry(
     rank: int,
     r: LedgerRow,
     agent_name: str,
+    agent_version: int | None,
     history: list[float] | None = None,
     *,
     finalized: bool = True,
@@ -474,6 +476,7 @@ def _public_entry(
         score_quorum=SCORING_QUORUM,
         agent_id=r.agent_id,
         agent_name=agent_name,
+        agent_version=agent_version,
         miner_hotkey=r.miner_hotkey,
         composite=r.composite,
         composite_stderr=_safe_stderr(details),
@@ -532,17 +535,18 @@ async def leaderboard(
             provisional_by_miner.setdefault(candidate[0].miner_hotkey, candidate)
     provisional_rows = list(provisional_by_miner.values())
     rows = finalized_rows + [row for row, _count in provisional_rows]
-    agent_names: dict[UUID, str] = dict(
-        (
+    agent_metadata = {
+        agent_id: (name, version)
+        for agent_id, name, version in (
             await session.execute(
-                select(Agent.agent_id, Agent.name).where(
+                select(Agent.agent_id, Agent.name, Agent.version).where(
                     Agent.agent_id.in_([row.agent_id for row in rows])
                 )
             )
         )
         .tuples()
         .all()
-    )
+    }
     histories = await list_miner_composite_history(
         session, [r.miner_hotkey for r in rows]
     )
@@ -552,7 +556,7 @@ async def leaderboard(
             _public_entry(
                 i,
                 row,
-                agent_names[row.agent_id],
+                *agent_metadata[row.agent_id],
                 histories.get(row.miner_hotkey),
                 finalized=True,
                 score_count=score_counts.get(row.agent_id, SCORING_QUORUM),
@@ -563,7 +567,7 @@ async def leaderboard(
             _public_entry(
                 len(entries) + 1,
                 row,
-                agent_names[row.agent_id],
+                *agent_metadata[row.agent_id],
                 histories.get(row.miner_hotkey),
                 finalized=False,
                 score_count=count,
@@ -964,6 +968,7 @@ def _public_activity_response(
     limit: int,
     requested_statuses: set[str],
     query: str | None,
+    duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
 ) -> PublicActivityResponse:
     """Project activity from the same validated work set used by fleet health."""
     active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
@@ -1069,6 +1074,7 @@ def _public_activity_response(
                 agent_id=row.agent.agent_id,
                 miner_hotkey=row.agent.miner_hotkey,
                 name=row.agent.name,
+                version=row.agent.version,
                 status=row_status,
                 submitted_at=row.agent.created_at,
                 last_scored_at=_aware(row.last_scored_at),
@@ -1078,6 +1084,12 @@ def _public_activity_response(
                     else row.agent.screening_reason
                 ),
                 duplicate_of=row.agent.duplicate_of,
+                duplicate_name=(duplicate_metadata or {}).get(
+                    row.agent.duplicate_of, (None, None)
+                )[0],
+                duplicate_version=(duplicate_metadata or {}).get(
+                    row.agent.duplicate_of, (None, None)
+                )[1],
                 review_reason=row.agent.review_reason,
                 score_count=row.score_count,
                 provisional_composite=row.provisional_composite,
@@ -1105,6 +1117,29 @@ def _public_activity_response(
             for row, row_status in page_rows
         ],
     )
+
+
+async def _duplicate_submission_metadata(
+    session: AsyncSession, rows: list[Any]
+) -> dict[UUID, tuple[str, int | None]]:
+    """Resolve safe display metadata for copy-review comparison targets."""
+    duplicate_ids = {
+        row.agent.duplicate_of for row in rows if row.agent.duplicate_of is not None
+    }
+    if not duplicate_ids:
+        return {}
+    return {
+        agent_id: (name, version)
+        for agent_id, name, version in (
+            await session.execute(
+                select(Agent.agent_id, Agent.name, Agent.version).where(
+                    Agent.agent_id.in_(duplicate_ids)
+                )
+            )
+        )
+        .tuples()
+        .all()
+    }
 
 
 @router.get("/activity", response_model=PublicActivityResponse)
@@ -1145,6 +1180,7 @@ async def activity(
         limit=limit,
         requested_statuses=requested_statuses,
         query=q,
+        duplicate_metadata=await _duplicate_submission_metadata(session, rows),
     )
 
 
@@ -1170,6 +1206,7 @@ async def operations(
         limit=max(1, len(activity_rows)),
         requested_statuses=set(),
         query=None,
+        duplicate_metadata=await _duplicate_submission_metadata(session, activity_rows),
     )
     validator_snapshot = _validator_heartbeats_response(
         rows=heartbeat_rows,

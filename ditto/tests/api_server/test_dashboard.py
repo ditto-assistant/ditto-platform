@@ -133,8 +133,10 @@ class TestDashboard:
         assert 'class="quorum-badge"' in body
         assert ">Winning agent</span>" in body
         assert 'class="winner-identity"' in body
-        assert 'entityAnchor("agent", e.agent_id, agentName)' in body
-        assert '", agent " + agentName + ", miner "' in body
+        assert 'entityAnchor("agent", e.agent_id, displayAgentName)' in body
+        assert "agentVersionBadge(e.agent_version)" in body
+        assert "Legacy submission" in body
+        assert "<b>Compared with:</b>" in body
         assert "function isFinalized(e)" in body
         assert '"Provisional leaderboard"' in body
         assert '"P" + e.rank' in body

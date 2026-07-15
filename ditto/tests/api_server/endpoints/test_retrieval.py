@@ -83,6 +83,7 @@ class TestAgentByHotkey:
             agent_id=uuid4(),
             miner_hotkey=_HOTKEY,
             name="alpha",
+            version=2,
             status=AgentStatus.SCORED,  # the agent itself is fine...
             sha256="ab" * 32,
             created_at=datetime.now(UTC),
@@ -109,6 +110,7 @@ class TestAgentByHotkey:
         assert response.status_code == 200
         # ...but the miner is banned, so the response says so.
         assert response.json()["status"] == AgentStatus.BANNED.value
+        assert response.json()["version"] == 2
         assert response.json()["screening_reason"] == agent.screening_reason
 
     async def test_malformed_hotkey_returns_422(

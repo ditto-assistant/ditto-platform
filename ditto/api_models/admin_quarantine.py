@@ -26,6 +26,7 @@ class AdminQuarantineItem(BaseModel):
     attempt_id: UUID
     miner_hotkey: str
     agent_name: str
+    agent_version: int | None = None
     artifact_sha256: str
     policy_version: int
     manifest_digest: str
@@ -76,12 +77,15 @@ class AdminScreeningAttempt(BaseModel):
     reason: str | None
     reason_code: str | None
     duplicate_of: UUID | None
+    duplicate_name: str | None = None
+    duplicate_version: int | None = None
 
 
 class AdminScreeningSubmission(BaseModel):
     agent_id: UUID
     miner_hotkey: str
     agent_name: str
+    agent_version: int | None = None
     artifact_sha256: str
     agent_status: str
     screening_policy_version: int

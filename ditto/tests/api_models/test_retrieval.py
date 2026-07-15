@@ -29,6 +29,7 @@ class TestAgentResponse:
         assert parsed.agent_id == UUID("550e8400-e29b-41d4-a716-446655440000")
         assert parsed.miner_hotkey == "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
         assert parsed.name == "alpha-agent"
+        assert parsed.version == 1
         assert parsed.status == AgentStatus.UPLOADED
         assert parsed.sha256 == "deadbeef" * 8
         assert parsed.created_at == datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
@@ -43,6 +44,11 @@ class TestAgentResponse:
         parsed = AgentResponse.model_validate(_load_fixture("agent_response_v1.json"))
         dumped = parsed.model_dump()
         assert "ip_address" not in dumped
+
+    def test_legacy_fixture_without_version_parses_as_unversioned(self) -> None:
+        payload = _load_fixture("agent_response_v1.json")
+        payload.pop("version")
+        assert AgentResponse.model_validate(payload).version is None
 
 
 class TestAgentStatusResponse:
