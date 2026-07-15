@@ -987,6 +987,7 @@ async def agent_pipeline(
                 status=ticket.status.value,
                 issued_at=ticket.issued_at,
                 deadline=ticket.deadline,
+                retry_after=ticket.retry_after,
                 actively_running=ticket.validator_hotkey in active_by_hotkey,
                 benchmark_progress=(
                     _public_benchmark_progress(

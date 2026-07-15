@@ -990,6 +990,47 @@ class TestPublicActivity:
         evaluating = (await client.get("/api/v1/public/activity")).json()["entries"][0]
         assert evaluating["status"] == "evaluating"
 
+    async def test_pipeline_exposes_expired_validator_retry_eligibility(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        deadline = datetime.now(UTC) - timedelta(minutes=5)
+        retry_after = deadline + timedelta(hours=6)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=_MINER_B,
+                    status=TicketStatus.EXPIRED,
+                    issued_at=deadline - timedelta(minutes=90),
+                    deadline=deadline,
+                    retry_after=retry_after,
+                )
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+
+        assert response.status_code == 200
+        attempt = response.json()["validation_attempts"][0]
+        assert attempt["status"] == "expired"
+        actual_retry_after = datetime.fromisoformat(
+            attempt["retry_after"].replace("Z", "+00:00")
+        )
+        if actual_retry_after.tzinfo is None:
+            actual_retry_after = actual_retry_after.replace(tzinfo=UTC)
+        assert actual_retry_after == retry_after
+
     async def test_progress_is_multi_validator_allowlisted_and_recursively_redacted(
         self,
         app: FastAPI,
