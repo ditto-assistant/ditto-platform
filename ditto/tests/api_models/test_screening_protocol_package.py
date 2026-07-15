@@ -14,12 +14,7 @@ from ditto_screening_protocol import (
 
 def test_compatibility_imports_are_shared_package_types() -> None:
     assert CompatibilityAgentStatus is AgentStatus
-    # The request is temporarily a platform-local extension of the shared type
-    # (quarantine review payloads shipped in protocol 0.9.0, while the pin is
-    # still 0.8.0). It must remain a subtype so the signing and validation
-    # semantics stay those of the shared package; restore the identity
-    # assertion when the pin reaches >= 0.9.0.
-    assert issubclass(CompatibilityRequest, ScreenResultRequest)
+    assert CompatibilityRequest is ScreenResultRequest
 
 
 def test_canonical_versioned_verdict_message_is_wire_compatible() -> None:
