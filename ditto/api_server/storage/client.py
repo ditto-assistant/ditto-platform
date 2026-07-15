@@ -20,6 +20,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Per-read chunk size when draining a download stream. The stream is read in a
+# loop (a single read does not return the whole object), so this only bounds how
+# much is pulled per await, not the total; the caller's ``max_bytes`` bounds that.
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+
 
 class S3StorageClient:
     """Async wrapper around aioboto3's S3 client.
@@ -198,18 +203,36 @@ class S3StorageClient:
                 config=self._client_config,
             ) as s3:
                 response = await s3.get_object(Bucket=self._config.bucket, Key=key)
-                body = await response["Body"].read(max_bytes + 1)
+                # aiobotocore's StreamingBody wraps an aiohttp reader whose
+                # read(n) returns only the NEXT buffered chunk (up to n), not
+                # the whole object. A single read(max_bytes + 1) therefore
+                # hands back a truncated prefix for any object large enough to
+                # span multiple chunks, whose sha256 never matches the stored
+                # digest (surfacing to operators as a 502 on every source
+                # inspection). Drain the stream so the returned bytes are the
+                # COMPLETE object, aborting as soon as the running total crosses
+                # the bound so a mis-sized object can't balloon the process.
+                stream = response["Body"]
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = await stream.read(_DOWNLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ObjectDownloadFailedError(
+                            f"get_object exceeded bound: "
+                            f"bucket={self._config.bucket!r} "
+                            f"key={key!r} max_bytes={max_bytes}"
+                        )
+                    chunks.append(chunk)
         except (ClientError, BotoCoreError) as e:
             raise ObjectDownloadFailedError(
                 f"get_object failed: bucket={self._config.bucket!r} "
                 f"key={key!r} cause={e}"
             ) from e
-        if len(body) > max_bytes:
-            raise ObjectDownloadFailedError(
-                f"get_object exceeded bound: bucket={self._config.bucket!r} "
-                f"key={key!r} max_bytes={max_bytes}"
-            )
-        return body
+        return b"".join(chunks)
 
     async def object_exists(self, *, key: str) -> bool:
         """Return ``True`` iff a HEAD against ``key`` succeeds.
