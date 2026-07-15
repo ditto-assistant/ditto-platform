@@ -7,7 +7,7 @@ import secrets
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from sqlalchemy import func, select
@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ditto.api_models.admin_quarantine import (
     AdminQuarantineItem,
     AdminQuarantineList,
+    AdminQuarantineResolutionEvent,
     AdminQuarantineResolveRequest,
     AdminQuarantineResolveResponse,
     AdminScreeningAttempt,
@@ -35,7 +36,13 @@ from ditto.api_server.dependencies import (
 from ditto.api_server.endpoints.screener import _derive_dataset_seed
 from ditto.api_server.endpoints.validator import ChainDep
 from ditto.api_server.storage import S3StorageClient
-from ditto.db.models import Agent, Score, ScreeningAttempt, ScreeningQuarantine
+from ditto.db.models import (
+    Agent,
+    Score,
+    ScreeningAttempt,
+    ScreeningQuarantine,
+    ScreeningQuarantineResolution,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +70,11 @@ async def require_admin(
 AdminDep = Annotated[None, Depends(require_admin)]
 
 
-def _item(row: ScreeningQuarantine, agent: Agent) -> AdminQuarantineItem:
+def _item(
+    row: ScreeningQuarantine,
+    agent: Agent,
+    history: list[ScreeningQuarantineResolution] | None = None,
+) -> AdminQuarantineItem:
     return AdminQuarantineItem(
         quarantine_id=row.quarantine_id,
         agent_id=row.agent_id,
@@ -81,7 +92,35 @@ def _item(row: ScreeningQuarantine, agent: Agent) -> AdminQuarantineItem:
         resolved_by=row.resolved_by,
         resolution=row.resolution,  # type: ignore[arg-type]
         resolution_reason=row.resolution_reason,
+        resolution_history=[
+            AdminQuarantineResolutionEvent(
+                resolution=event.resolution,  # type: ignore[arg-type]
+                reason=event.reason,
+                actor=event.actor,
+                created_at=event.created_at,
+            )
+            for event in history or []
+        ],
     )
+
+
+async def _resolution_history(
+    session: AsyncSession, quarantine_ids: list[UUID]
+) -> dict[UUID, list[ScreeningQuarantineResolution]]:
+    history: dict[UUID, list[ScreeningQuarantineResolution]] = defaultdict(list)
+    if not quarantine_ids:
+        return history
+    events = await session.scalars(
+        select(ScreeningQuarantineResolution)
+        .where(ScreeningQuarantineResolution.quarantine_id.in_(quarantine_ids))
+        .order_by(
+            ScreeningQuarantineResolution.created_at,
+            ScreeningQuarantineResolution.resolution_id,
+        )
+    )
+    for event in events:
+        history[event.quarantine_id].append(event)
+    return history
 
 
 @router.get("/screening-quarantines", response_model=AdminQuarantineList)
@@ -109,7 +148,13 @@ async def list_quarantines(
         count_stmt = count_stmt.where(ScreeningQuarantine.status == status)
     total = int((await session.scalar(count_stmt)) or 0)
     rows = (await session.execute(stmt)).all()
-    items = [_item(quarantine, agent) for quarantine, agent in rows]
+    history = await _resolution_history(
+        session, [quarantine.quarantine_id for quarantine, _agent in rows]
+    )
+    items = [
+        _item(quarantine, agent, history[quarantine.quarantine_id])
+        for quarantine, agent in rows
+    ]
     return AdminQuarantineList(items=items, count=total)
 
 
@@ -128,7 +173,9 @@ async def get_quarantine(
     ).one_or_none()
     if result is None:
         raise HTTPException(status_code=404, detail="quarantine not found")
-    return _item(*result)
+    quarantine, agent = result
+    history = await _resolution_history(session, [quarantine.quarantine_id])
+    return _item(quarantine, agent, history[quarantine.quarantine_id])
 
 
 @router.post(
@@ -186,8 +233,20 @@ async def resolve_quarantine(
         )
         if agent is None:
             raise HTTPException(status_code=404, detail="agent not found")
-        if quarantine.status != "active" or agent.status != AgentStatus.QUARANTINED:
-            raise HTTPException(status_code=409, detail="quarantine is not active")
+        is_initial_resolution = (
+            quarantine.status == "active" and agent.status == AgentStatus.QUARANTINED
+        )
+        is_rejection_correction = (
+            quarantine.status == "resolved"
+            and quarantine.resolution == "reject"
+            and agent.status == AgentStatus.REJECTED
+            and payload.resolution == "release"
+        )
+        if not is_initial_resolution and not is_rejection_correction:
+            raise HTTPException(
+                status_code=409,
+                detail="quarantine is not active or a correctable rejection",
+            )
 
         target = {
             "release": AgentStatus.EVALUATING,
@@ -209,9 +268,21 @@ async def resolve_quarantine(
         quarantine.resolved_by = x_admin_actor
         quarantine.resolution = payload.resolution
         quarantine.resolution_reason = payload.reason
+        session.add(
+            ScreeningQuarantineResolution(
+                resolution_id=uuid4(),
+                quarantine_id=quarantine.quarantine_id,
+                resolution=payload.resolution,
+                reason=payload.reason,
+                actor=x_admin_actor,
+                created_at=quarantine.resolved_at,
+            )
+        )
 
+    history = await _resolution_history(session, [quarantine.quarantine_id])
     return AdminQuarantineResolveResponse(
-        quarantine=_item(quarantine, agent), agent_status=agent.status
+        quarantine=_item(quarantine, agent, history[quarantine.quarantine_id]),
+        agent_status=agent.status,
     )
 
 

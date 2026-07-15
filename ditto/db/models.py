@@ -385,6 +385,38 @@ class ScreeningQuarantine(Base):
     )
 
 
+class ScreeningQuarantineResolution(Base):
+    """Append-only operator action history for a screening quarantine."""
+
+    __tablename__ = "screening_quarantine_resolutions"
+
+    resolution_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    quarantine_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    resolution: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["quarantine_id"],
+            ["screening_quarantines.quarantine_id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "resolution IN ('release', 'rescreen', 'reject')",
+            name="screening_quarantine_resolutions_resolution_check",
+        ),
+        Index(
+            "screening_quarantine_resolutions_quarantine_created_idx",
+            "quarantine_id",
+            "created_at",
+        ),
+    )
+
+
 class EvaluationPayment(Base):
     """One row of the ``evaluation_payments`` table.
 
