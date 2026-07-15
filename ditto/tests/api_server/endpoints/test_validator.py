@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
@@ -37,6 +38,7 @@ from ditto.api_models.system_health import (
     system_metrics_signing_token,
 )
 from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_server.config import ValidatorCompatibilityConfig
 from ditto.api_server.dependencies import (
     get_chain_client,
     get_session,
@@ -404,6 +406,36 @@ async def _seed_ticket(
         else:
             existing.status = TicketStatus.ISSUED
             existing.deadline = deadline
+
+
+async def _seed_validator_heartbeat(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    keypair: bittensor.Keypair = _KEYPAIR,
+    software_version: str = "0.7.0",
+    protocol_version: int = 4,
+    seen_at: datetime | None = None,
+) -> None:
+    now = seen_at or datetime.now(UTC)
+    async with maker() as s, s.begin():
+        s.add(
+            ValidatorHeartbeat(
+                validator_hotkey=keypair.ss58_address,
+                software_version=software_version,
+                protocol_version=protocol_version,
+                code_digest="ab" * 32,
+                state="polling",
+                active_agent_id=None,
+                first_seen_at=now,
+                system_metrics=None,
+                benchmark_progress=None,
+                benchmark_progress_reported=False,
+                benchmark_progress_agent_id=None,
+                reported_at=now,
+                seen_at=now,
+                signature="ab" * 64,
+            )
+        )
 
 
 _AUTH_HEADER = {"X-Validator-Hotkey": _VALIDATOR_HOTKEY}
@@ -1235,6 +1267,109 @@ class TestArtifact:
 
 
 class TestRequestJob:
+    @staticmethod
+    def _enable_compatibility_gate(app: FastAPI) -> None:
+        app.state.config = replace(
+            app.state.config,
+            validator_compatibility=ValidatorCompatibilityConfig(
+                minimum_software_version="0.7.0",
+                minimum_protocol_version=4,
+                heartbeat_max_age_seconds=300,
+            ),
+        )
+
+    async def test_requires_heartbeat_before_issuing_work(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        self._enable_compatibility_gate(app)
+
+        response = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert response.status_code == 428
+        assert "heartbeat required" in response.json()["message"]
+
+    @pytest.mark.parametrize(
+        ("software_version", "protocol_version", "expected_detail"),
+        [
+            ("0.6.9", 4, "software '0.6.9' is below required 0.7.0"),
+            ("0.7.0", 3, "protocol 3 is below required 4"),
+        ],
+    )
+    async def test_requires_supported_validator_release(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        software_version: str,
+        protocol_version: int,
+        expected_detail: str,
+    ) -> None:
+        await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_validator_heartbeat(
+            session_maker,
+            software_version=software_version,
+            protocol_version=protocol_version,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        self._enable_compatibility_gate(app)
+
+        response = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert response.status_code == 426
+        assert expected_detail in response.json()["message"]
+        assert "update ditto-subnet" in response.json()["message"]
+
+    async def test_supported_validator_receives_work(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_validator_heartbeat(session_maker)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        self._enable_compatibility_gate(app)
+
+        response = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert response.status_code == 200
+        assert response.json()["agent_id"] == str(agent_id)
+
+    async def test_stale_heartbeat_cannot_claim_work(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_validator_heartbeat(
+            session_maker, seen_at=datetime.now(UTC) - timedelta(minutes=6)
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        self._enable_compatibility_gate(app)
+
+        response = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert response.status_code == 428
+        assert "heartbeat is stale" in response.json()["message"]
+
     async def test_issues_ticket_for_evaluating_agent(
         self,
         app: FastAPI,

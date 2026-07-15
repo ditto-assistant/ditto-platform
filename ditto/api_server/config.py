@@ -47,6 +47,15 @@ class ScreenerAuthConfig:
 
 
 @dataclass(frozen=True)
+class ValidatorCompatibilityConfig:
+    """Minimum validator build accepted at the scoring-ticket boundary."""
+
+    minimum_software_version: str | None
+    minimum_protocol_version: int
+    heartbeat_max_age_seconds: int
+
+
+@dataclass(frozen=True)
 class ApiServerConfig:
     """Resolved configuration for the API server process.
 
@@ -105,6 +114,9 @@ class ApiServerConfig:
 
     validator_names: ValidatorNamesConfig
     """Optional, background-only Taostats display-name decoration."""
+
+    validator_compatibility: ValidatorCompatibilityConfig
+    """Validator release and heartbeat requirements for scoring tickets."""
 
     admin_api_token: str | None = None
     """Bearer token for private Backroom/operator administration endpoints."""
@@ -168,6 +180,20 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
     )
     screener_hotkey = os.environ.get("SCREENER_HOTKEY") or None
     screener_api_token = os.environ.get("SCREENER_API_TOKEN") or None
+    minimum_validator_version = (
+        os.environ.get("DITTO_MIN_VALIDATOR_SOFTWARE_VERSION", "0.7.0").strip() or None
+    )
+    try:
+        minimum_validator_protocol = int(
+            os.environ.get("DITTO_MIN_VALIDATOR_PROTOCOL_VERSION", "4")
+        )
+        validator_heartbeat_max_age = int(
+            os.environ.get("DITTO_VALIDATOR_HEARTBEAT_MAX_AGE_SECONDS", "300")
+        )
+    except ValueError as error:
+        raise ApiServerConfigError(
+            "validator compatibility protocol and heartbeat age must be integers"
+        ) from error
 
     return ApiServerConfig(
         host=host,
@@ -186,6 +212,11 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
             api_token=screener_api_token,
         ),
         validator_names=parse_validator_names_config_from_env(),
+        validator_compatibility=ValidatorCompatibilityConfig(
+            minimum_software_version=minimum_validator_version,
+            minimum_protocol_version=minimum_validator_protocol,
+            heartbeat_max_age_seconds=validator_heartbeat_max_age,
+        ),
         admin_api_token=os.environ.get("DITTO_ADMIN_API_TOKEN") or None,
         dashboard_enabled=dashboard_enabled,
         dashboard_wandb_url=dashboard_wandb_url,
@@ -255,4 +286,19 @@ def check_config(config: ApiServerConfig) -> None:
     if names.max_stale_seconds < names.refresh_seconds:
         raise ApiServerConfigError(
             "DITTO_TAOSTATS_MAX_STALE_SECONDS must be at least the refresh interval"
+        )
+    compatibility = config.validator_compatibility
+    if compatibility.minimum_protocol_version < 1:
+        raise ApiServerConfigError(
+            "DITTO_MIN_VALIDATOR_PROTOCOL_VERSION must be at least 1"
+        )
+    if compatibility.heartbeat_max_age_seconds < 30:
+        raise ApiServerConfigError(
+            "DITTO_VALIDATOR_HEARTBEAT_MAX_AGE_SECONDS must be at least 30"
+        )
+    if compatibility.minimum_software_version is not None and not re.fullmatch(
+        r"\d+\.\d+\.\d+", compatibility.minimum_software_version
+    ):
+        raise ApiServerConfigError(
+            "DITTO_MIN_VALIDATOR_SOFTWARE_VERSION must be a stable X.Y.Z release"
         )

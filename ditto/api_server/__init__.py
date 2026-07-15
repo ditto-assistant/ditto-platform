@@ -22,6 +22,7 @@ from __future__ import annotations
 from ditto.api_server.config import (
     ApiServerConfig,
     ScreenerAuthConfig,
+    ValidatorCompatibilityConfig,
     parse_api_server_config_from_env,
 )
 from ditto.api_server.errors import (
@@ -38,6 +39,7 @@ __all__ = [
     # Configuration
     "ApiServerConfig",
     "ScreenerAuthConfig",
+    "ValidatorCompatibilityConfig",
     "ValidatorNamesConfig",
     "parse_api_server_config_from_env",
     # Errors

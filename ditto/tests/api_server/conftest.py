@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from ditto.api_server import (
     ApiServerConfig,
     ScreenerAuthConfig,
+    ValidatorCompatibilityConfig,
     ValidatorNamesConfig,
     create_api_server,
 )
@@ -96,6 +97,11 @@ def make_api_server_config(**overrides: Any) -> ApiServerConfig:
             api_token="test-screener-token-at-least-32-characters",
         ),
         validator_names=ValidatorNamesConfig(),
+        validator_compatibility=ValidatorCompatibilityConfig(
+            minimum_software_version=None,
+            minimum_protocol_version=1,
+            heartbeat_max_age_seconds=300,
+        ),
     )
     if overrides:
         from dataclasses import replace
