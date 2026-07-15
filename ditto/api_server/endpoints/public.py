@@ -441,6 +441,7 @@ def _safe_stderr(details: dict) -> float | None:
 def _public_entry(
     rank: int,
     r: LedgerRow,
+    agent_name: str,
     history: list[float] | None = None,
     *,
     finalized: bool = True,
@@ -467,6 +468,7 @@ def _public_entry(
         score_count=score_count,
         score_quorum=SCORING_QUORUM,
         agent_id=r.agent_id,
+        agent_name=agent_name,
         miner_hotkey=r.miner_hotkey,
         composite=r.composite,
         composite_stderr=_safe_stderr(details),
@@ -525,6 +527,17 @@ async def leaderboard(
             provisional_by_miner.setdefault(candidate[0].miner_hotkey, candidate)
     provisional_rows = list(provisional_by_miner.values())
     rows = finalized_rows + [row for row, _count in provisional_rows]
+    agent_names: dict[UUID, str] = dict(
+        (
+            await session.execute(
+                select(Agent.agent_id, Agent.name).where(
+                    Agent.agent_id.in_([row.agent_id for row in rows])
+                )
+            )
+        )
+        .tuples()
+        .all()
+    )
     histories = await list_miner_composite_history(
         session, [r.miner_hotkey for r in rows]
     )
@@ -534,6 +547,7 @@ async def leaderboard(
             _public_entry(
                 i,
                 row,
+                agent_names[row.agent_id],
                 histories.get(row.miner_hotkey),
                 finalized=True,
                 score_count=score_counts.get(row.agent_id, SCORING_QUORUM),
@@ -544,6 +558,7 @@ async def leaderboard(
             _public_entry(
                 len(entries) + 1,
                 row,
+                agent_names[row.agent_id],
                 histories.get(row.miner_hotkey),
                 finalized=False,
                 score_count=count,
