@@ -320,6 +320,7 @@ class TestPublicLeaderboard:
         assert all(e["score_count"] == 1 for e in body["entries"])
         top = body["entries"][0]
         assert top["agent_name"] == "agent"
+        assert top["agent_version"] is None
         assert top["composite"] == pytest.approx(0.9)
         assert top["tool_mean"] == pytest.approx(0.95)
         assert top["memory_mean"] == pytest.approx(0.8)
@@ -728,16 +729,21 @@ class TestPublicActivity:
         assert body["entries"][2]["agent_id"] == older_id
         assert body["entries"][0]["screening_reason"] == "Docker image build failed"
         assert body["entries"][1]["duplicate_of"] == older_id
+        assert body["entries"][1]["duplicate_name"] == "memory-v1"
+        assert body["entries"][1]["duplicate_version"] is None
         assert "jaccard 0.950" in body["entries"][1]["review_reason"]
         assert set(body["entries"][0]) == {
             "agent_id",
             "miner_hotkey",
             "name",
+            "version",
             "status",
             "submitted_at",
             "last_scored_at",
             "screening_reason",
             "duplicate_of",
+            "duplicate_name",
+            "duplicate_version",
             "review_reason",
             "score_count",
             "provisional_composite",

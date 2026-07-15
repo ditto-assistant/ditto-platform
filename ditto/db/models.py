@@ -78,6 +78,9 @@ class Agent(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     """Human-friendly agent name supplied by the miner."""
 
+    version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """Immutable revision within ``(miner_hotkey, name)``; null for legacy rows."""
+
     sha256: Mapped[str] = mapped_column(Text, nullable=False)
     """SHA-256 of the uploaded tarball, hex encoded."""
 
@@ -231,6 +234,15 @@ class Agent(Base):
     __table_args__ = (
         UniqueConstraint(
             "agent_id", "miner_hotkey", name="agents_agent_id_miner_hotkey_key"
+        ),
+        UniqueConstraint(
+            "miner_hotkey",
+            "name",
+            "version",
+            name="agents_hotkey_name_version_key",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "version IS NULL OR version > 0", name="agents_version_positive_check"
         ),
         Index("agents_miner_hotkey_idx", "miner_hotkey"),
         Index("agents_sha256_idx", "sha256"),

@@ -321,6 +321,7 @@ async def _seed_agent(
     screening_policy_version: int | None = None,
     miner_hotkey: str = _MINER_HOTKEY,
     sha256: str = _SHA256,
+    version: int | None = None,
 ) -> UUID:
     aid = agent_id or uuid4()
     async with maker() as s, s.begin():
@@ -329,6 +330,7 @@ async def _seed_agent(
                 agent_id=aid,
                 miner_hotkey=miner_hotkey,
                 name=name,
+                version=version,
                 sha256=sha256,
                 status=status,
                 screening_policy_version=(
@@ -1436,7 +1438,16 @@ class TestQuarantineAdmin:
             app.state.config,
             admin_api_token="test-admin-token-at-least-32-characters",
         )
-        agent_id = await _seed_agent(session_maker, status=AgentStatus.REJECTED)
+        duplicate_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCORED,
+            name="Jackie",
+            miner_hotkey="5DuplicateMinerHotkeyXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            version=2,
+        )
+        agent_id = await _seed_agent(
+            session_maker, status=AgentStatus.REJECTED, version=3
+        )
         now = datetime.now(UTC)
         async with session_maker() as session, session.begin():
             session.add(
@@ -1450,6 +1461,8 @@ class TestQuarantineAdmin:
                     deadline=now + timedelta(minutes=28),
                     finished_at=now,
                     public_reason="Docker image build failed",
+                    reason_code="exact-cross-miner-duplicate",
+                    duplicate_of=duplicate_id,
                 )
             )
         _install_db(app, session_maker)
@@ -1470,8 +1483,11 @@ class TestQuarantineAdmin:
         assert listing.status_code == 200
         item = listing.json()["items"][0]
         assert item["agent_id"] == str(agent_id)
+        assert item["agent_version"] == 3
         assert item["attempts"][0]["status"] == "rejected"
         assert item["attempts"][0]["reason"] == "Docker image build failed"
+        assert item["attempts"][0]["duplicate_name"] == "Jackie"
+        assert item["attempts"][0]["duplicate_version"] == 2
         assert artifact.status_code == 200
         assert artifact.json()["sha256"] == _SHA256
         assert storage.presigned_get_url.await_args.kwargs == {

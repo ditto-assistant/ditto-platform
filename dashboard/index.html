@@ -275,6 +275,7 @@
     .winner-name { display: flex; min-width: 0; width: 100%; align-items: center; gap: 7px; color: var(--text); font-size: 13.5px; font-weight: 700; }
     .winner-name > .entity-link { min-width: 0; flex: 1 1 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .winner-name .badge, .winner-name .prov, .winner-name .quorum-badge { flex: none; margin-left: 0; }
+    .submission-version { display: inline-flex; align-items: center; width: fit-content; border: 1px solid var(--border); border-radius: 999px; padding: 1px 6px; color: var(--text-dim); background: var(--bg-elev-2); font: 650 9.5px/1.4 var(--mono); letter-spacing: .15px; white-space: nowrap; }
     .winner-miner { display: flex; min-width: 0; max-width: 100%; align-items: center; color: var(--text-faint); }
     .winner-miner::before { content: "Miner"; margin-right: 6px; color: var(--text-dim); font-family: var(--sans); font-size: 10px; font-weight: 650; }
     .hotkey { overflow: hidden; font-family: var(--mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
@@ -508,6 +509,7 @@
     .pipeline-empty, .pipeline-more { padding: 8px 9px; color: var(--text-faint); font-size: 11.5px; line-height: 1.4; }
     .pipeline-more { color: var(--text-dim); font-weight: 650; }
     .agent-name { display: block; font-weight: 650; color: var(--text); }
+    .agent-name + .submission-version { margin-top: 4px; }
     .agent-id { display: block; margin-top: 3px; font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
     .entity-link { color: inherit; text-decoration: underline; text-decoration-color: transparent; text-underline-offset: 3px; transition: color .16s ease-out, text-decoration-color .16s ease-out; }
     .entity-link:hover { color: var(--accent); text-decoration-color: currentColor; }
@@ -2160,6 +2162,22 @@
     function pct(x) { return (x * 100).toFixed(1) + "%"; }
     function fx(x) { return x.toFixed(3); }
     function shortKey(k) { return k.length > 14 ? k.slice(0, 6) + "…" + k.slice(-6) : k; }
+    function agentLabel(name, version) {
+      var label = name || "Unnamed agent";
+      return label + ", " + agentVersionLabel(version);
+    }
+    function agentName(name) { return name || "Unnamed agent"; }
+    function agentVersionLabel(version) {
+      return version == null ? "Legacy submission" : "Submission v" + version;
+    }
+    function agentVersionBadge(version) {
+      return '<span class="submission-version">' + esc(agentVersionLabel(version)) + '</span>';
+    }
+    function duplicateLabel(entry) {
+      if (!entry || !entry.duplicate_of) return "";
+      if (entry.duplicate_name) return agentLabel(entry.duplicate_name, entry.duplicate_version);
+      return "Submission " + String(entry.duplicate_of).slice(0, 8);
+    }
     function median(nums) {
       if (!nums.length) return 0;
       var s = nums.slice().sort(function (a, b) { return a - b; });
@@ -2299,16 +2317,18 @@
           ? '<span class="rank' + rankCls + '">' + (finalizedEntry ? e.rank : "P" + e.rank) + '</span>' +
             (finalizedEntry ? rankMove(e.miner_hotkey, e.rank) : "")
           : '<span class="rank prov-rank" title="Not ranked (' + (kind === "zero" ? "scored 0.000" : "provisional run") + ').">–</span>';
-        var agentName = e.agent_name || "Unnamed agent";
+        var displayAgentName = agentName(e.agent_name);
+        var accessibleAgentName = agentLabel(e.agent_name, e.agent_version);
         var rowLabel = (elig ? (finalizedEntry ? "Rank " : "Provisional rank ") + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
-          ", agent " + agentName + ", miner " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) + ". Activate for run detail.";
+          ", agent " + accessibleAgentName + ", miner " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) + ". Activate for run detail.";
         var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge" title="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
           esc(e.score_count || 0) + ' of ' + esc(e.score_quorum || 3) + ' · provisional</span>';
         return '' +
           '<tr data-i="' + i + '"' + (isChamp ? ' class="champion"' : '') +
             ' role="button" tabindex="0" aria-label="' + esc(rowLabel) + '">' +
             '<td>' + rankCell + '</td>' +
-            '<td><span class="winner-identity"><span class="winner-name">' + entityAnchor("agent", e.agent_id, agentName) + champ + prov + quorumBadge + '</span>' +
+            '<td><span class="winner-identity"><span class="winner-name">' + entityAnchor("agent", e.agent_id, displayAgentName) + champ + prov + quorumBadge + '</span>' +
+              agentVersionBadge(e.agent_version) +
               '<span class="winner-miner" title="' + esc(e.miner_hotkey) + '"><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' +
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></span></span></td>' +
             modelCell(e) +
@@ -2553,6 +2573,8 @@
       // table, glossaries) render full width below the columns.
       function group(head, body) { return body ? '<div class="stat-group"><div class="stat-head">' + head + '</div>' + body + '</div>' : ""; }
       var overview =
+        stat("Winning agent", agentName(e.agent_name)) +
+        stat("Submission", agentVersionLabel(e.agent_version)) +
         stat("Composite", fx(e.composite) +
           (e.composite_stderr != null ? "  ± " + fx(e.composite_stderr) + " SE" : "")) +
         stat("Tool mean", fx(e.tool_mean) + "  (" + pct(e.tool_mean) + ")") +
@@ -3098,9 +3120,9 @@
         corpus.push({
           type: "submission",
           entry: entry,
-          title: entry.name || "Unnamed agent",
+          title: agentLabel(entry.name, entry.version),
           detail: String(entry.agent_id || "").slice(0, 8) + " · " + stage[0] + " · " + relTime(entry.submitted_at),
-          text: [entry.name, entry.agent_id, entry.miner_hotkey, entry.status, stage[0], entry.review_reason, entry.screening_reason, entry.duplicate_of].map(searchText).join(" ")
+          text: [entry.name, agentVersionLabel(entry.version), entry.agent_id, entry.miner_hotkey, entry.status, stage[0], entry.review_reason, entry.screening_reason, entry.duplicate_of, entry.duplicate_name, agentVersionLabel(entry.duplicate_version)].map(searchText).join(" ")
         });
       });
       return corpus;
@@ -3562,6 +3584,8 @@
           '<section class="pipeline-meta" aria-labelledby="pipeline-meta-title">' +
             '<h4 id="pipeline-meta-title">Submission details</h4>' +
             '<dl class="pipeline-meta-list">' +
+              '<div><dt>Agent</dt><dd>' + esc(agentName(e.name)) + '</dd></div>' +
+              '<div><dt>Submission</dt><dd>' + esc(agentVersionLabel(e.version)) + '</dd></div>' +
               '<div><dt>Agent ID</dt><dd><span class="copyable"><code>' + entityAnchor("agent", e.agent_id, String(e.agent_id || "")) + '</code>' + copyButton(e.agent_id, "agent ID") + '</span></dd></div>' +
               '<div><dt>Evidence</dt><dd>' + esc(evidence) + '</dd></div>' +
             '</dl>' +
@@ -3579,10 +3603,11 @@
       var evidence = e.review_reason
         ? "Copy review: " + e.review_reason
         : (e.screening_reason ? "Screening: " + e.screening_reason : "No additional evidence reported.");
+      if (e.duplicate_of) evidence += " Compared with " + duplicateLabel(e) + ".";
       consensusToken = null;
       document.getElementById("d-stats").classList.add("pipeline-mode");
       document.querySelector("#modal .split").style.display = "none";
-      document.getElementById("d-title").textContent = e.name || "Unnamed agent";
+      document.getElementById("d-title").textContent = agentName(e.name);
       var chip = document.getElementById("d-bench");
       chip.className = stage[1];
       chip.textContent = stage[0];
@@ -3675,9 +3700,11 @@
           var provisionalScore = column.status === "waiting_validator" && entry.provisional_composite != null
             ? "Provisional " + fx(Number(entry.provisional_composite))
             : "";
-          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(entry.name || "unnamed agent") + ' details' + (isUpNext ? ', up next for validator assignment' : '') + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
-            '<span class="pipeline-item-heading"><span class="pipeline-item-name">' + esc(entry.name || "Unnamed agent") + '</span>' +
+          var accessibleName = agentLabel(entry.name, entry.version);
+          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(accessibleName) + ' details' + (isUpNext ? ', up next for validator assignment' : '') + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
+            '<span class="pipeline-item-heading"><span class="pipeline-item-name">' + esc(agentName(entry.name)) + '</span>' +
               (isUpNext ? '<span class="pipeline-next-badge" title="Highest current priority; validator eligibility can vary">Up next</span>' : '') + '</span>' +
+            agentVersionBadge(entry.version) +
             '<span class="pipeline-item-meta"><span>' + esc(String(entry.agent_id || "").slice(0, 8)) + '</span><span>' + esc(meta) + '</span></span>' +
             (provisionalScore ? '<span class="pipeline-item-priority-detail">' + esc(provisionalScore) + '</span>' : '') +
             (policyLabel ? '<span class="pipeline-item-policy">' + esc(policyLabel) + '</span>' : '') +
@@ -3734,12 +3761,14 @@
         } else if (e.screening_reason) {
           evidence = '<span class="stage-note"><b>Screening:</b> ' + esc(e.screening_reason) + '</span>';
         }
-        if (e.duplicate_of && (!e.review_reason || e.review_reason.indexOf(e.duplicate_of) < 0)) {
-          evidence += '<span class="stage-note"><b>Compared with:</b> ' + esc(String(e.duplicate_of).slice(0, 8)) + '</span>';
+        if (e.duplicate_of) {
+          evidence += '<span class="stage-note"><b>Compared with:</b> ' +
+            entityAnchor("agent", e.duplicate_of, duplicateLabel(e)) + '</span>';
         }
+        var accessibleName = agentLabel(e.name, e.version);
         return '<tr role="button" tabindex="0" data-activity-i="' + i + '" aria-label="' +
-          esc("View details for " + (e.name || "unnamed agent") + ", " + stage[0] + ", " + progress) + '">' +
-          '<td><span class="agent-name">' + esc(e.name || "Unnamed agent") + '</span>' +
+          esc("View details for " + accessibleName + ", " + stage[0] + ", " + progress) + '">' +
+          '<td><span class="agent-name">' + esc(agentName(e.name)) + '</span>' + agentVersionBadge(e.version) +
           '<span class="agent-id copyable" title="' + esc(id) + '"><span>' + esc(id.slice(0, 8)) + '</span>' + copyButton(id, "agent ID") + '</span></td>' +
           '<td class="hide-sm"><span class="hotkey copyable" title="' + esc(e.miner_hotkey) + '"><span>' + esc(shortKey(e.miner_hotkey)) + '</span>' + copyButton(e.miner_hotkey, "miner hotkey") + '</span></td>' +
           '<td class="stage-cell"><span class="stage ' + stage[1] + '">' + stage[0] + '</span>' + evidence + '</td>' +
@@ -4171,7 +4200,7 @@
       generated_at: new Date(Date.now() - 12000).toISOString(),
       count: 5,
       entries: [
-        { rank: 1, finalized: true, score_count: 3, score_quorum: 3, agent_id: "11111111-1111-4111-8111-111111111111", agent_name: "Atlas Memory", miner_hotkey: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", composite: 0.658, tool_mean: 0.867, memory_mean: 0.449, first_seen: new Date(Date.now() - 86400000 * 2).toISOString(),
+        { rank: 1, finalized: true, score_count: 3, score_quorum: 3, agent_id: "11111111-1111-4111-8111-111111111111", agent_name: "Atlas Memory", agent_version: 3, miner_hotkey: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", composite: 0.658, tool_mean: 0.867, memory_mean: 0.449, first_seen: new Date(Date.now() - 86400000 * 2).toISOString(),
           median_ms: 2410, n: 12, bench_version: 2, dataset_sha256: "9f2c1a77b4e35d0182ac4f6b0e2d9c3a5b7148ef22d0c6a9f1e8b3d47c05a6e1",
           models: { harness: "qwen/qwen3-32b" },
           per_category: [{ category: "memory_lookup", count: 3, mean: 0.83 }, { category: "web_search", count: 2, mean: 0.75 }, { category: "artifacts_create", count: 1, mean: 0.6 }],
@@ -4183,16 +4212,16 @@
             { category: "memory_lookup", kind: "memory", score: 1.0, correct: true, latency_ms: 1330, notes: ["deterministic answer match (no judge call)"] },
             { category: "contradiction", kind: "memory", score: 0.0, correct: false, latency_ms: 2210, notes: ["deterministic answer mismatch (no judge call)"] }
           ] },
-        { rank: 2, finalized: true, score_count: 3, score_quorum: 3, agent_id: "22222222-2222-4222-8222-222222222222", agent_name: "Recall Relay", miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.432, first_seen: new Date(Date.now() - 86400000 * 3).toISOString(),
+        { rank: 2, finalized: true, score_count: 3, score_quorum: 3, agent_id: "22222222-2222-4222-8222-222222222222", agent_name: "Recall Relay", agent_version: 2, miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.432, first_seen: new Date(Date.now() - 86400000 * 3).toISOString(),
           median_ms: 3120, n: 12, bench_version: 2, dataset_sha256: "1b8e07d4c9f6a2531e0c74ab9f3d61528ac40f7e6d1b9c8a2f5e340d7b16c9a0",
           models: { harness: "qwen/qwen3-32b" },
           per_category: [{ category: "memory_lookup", count: 3, mean: 0.72 }, { category: "image_create", count: 1, mean: 0.5 }],
           integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 1, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.22, capped_tool_cases: 4, seeding_waves: 1 }, tokens: 7620,
           composite_stderr: 0.021, history: [0.544, 0.578, 0.612] },
-        { rank: 3, finalized: true, score_count: 3, score_quorum: 3, agent_id: "33333333-3333-4333-8333-333333333333", agent_name: "Threadkeeper", miner_hotkey: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", composite: 0.587, tool_mean: 0.867, memory_mean: 0.307, first_seen: new Date(Date.now() - 86400000 * 1).toISOString(),
+        { rank: 3, finalized: true, score_count: 3, score_quorum: 3, agent_id: "33333333-3333-4333-8333-333333333333", agent_name: "Threadkeeper", agent_version: null, miner_hotkey: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", composite: 0.587, tool_mean: 0.867, memory_mean: 0.307, first_seen: new Date(Date.now() - 86400000 * 1).toISOString(),
           median_ms: 2880, n: 12, bench_version: 2, composite_stderr: 0.019 },
-        { rank: 4, finalized: false, score_count: 2, score_quorum: 3, agent_id: "44444444-4444-4444-8444-444444444444", agent_name: "Context Forge", miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.382, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
-        { rank: 5, finalized: false, score_count: 1, score_quorum: 3, agent_id: "55555555-5555-4555-8555-555555555555", agent_name: "Longview", miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.356, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
+        { rank: 4, finalized: false, score_count: 2, score_quorum: 3, agent_id: "44444444-4444-4444-8444-444444444444", agent_name: "Context Forge", agent_version: 2, miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.382, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
+        { rank: 5, finalized: false, score_count: 1, score_quorum: 3, agent_id: "55555555-5555-4555-8555-555555555555", agent_name: "Longview", agent_version: 1, miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.356, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
       ]
     };
     var SAMPLE_HEALTH = {

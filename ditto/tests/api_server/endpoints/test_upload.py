@@ -381,6 +381,7 @@ def _override_session_writes(app: FastAPI) -> MagicMock:
     session.add = MagicMock(return_value=None)
     session.flush = AsyncMock(return_value=None)
     session.execute = AsyncMock(return_value=None)
+    session.scalar = AsyncMock(return_value=0)
     begin = MagicMock()
     begin.__aenter__ = AsyncMock(return_value=session)
     begin.__aexit__ = AsyncMock(return_value=None)
@@ -455,6 +456,7 @@ class TestUploadAgentHappyPath:
         assert response.status_code == 200, response.text
         body = response.json()
         assert "agent_id" in body
+        assert body["version"] == 1
         assert body["status"] == "uploaded"
 
     async def test_stores_tar_under_agent_id_key(

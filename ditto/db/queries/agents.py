@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
@@ -38,7 +38,7 @@ async def insert_agent(
     prompt_fingerprint: dict | None = None,
     code_embedding: list | None = None,
     code_embed_model: str | None = None,
-) -> None:
+) -> int:
     """Insert one ``agents`` row inside the caller-owned transaction.
 
     Status is omitted so the schema default ``'uploaded'`` applies; the
@@ -69,11 +69,36 @@ async def insert_agent(
             invalid enum value, etc.). No agents-level constraint is a
             miner-facing action, so the envelope catch-all maps every
             case to HTTP 500.
+
+    Returns:
+        The immutable version assigned within this hotkey-and-name series.
     """
+    # Serialize one logical agent series on Postgres so concurrent uploads with
+    # the same hotkey + name cannot claim the same revision. SQLite tests run
+    # single-process; the UNIQUE constraint remains the final invariant on both.
+    if session.get_bind().dialect.name == "postgresql":
+        series_key = f"{miner_hotkey}:{len(name)}:{name}"
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:series_key, 0))"),
+            {"series_key": series_key},
+        )
+    version = int(
+        (
+            await session.scalar(
+                select(func.coalesce(func.max(Agent.version), 0) + 1).where(
+                    Agent.miner_hotkey == miner_hotkey,
+                    Agent.name == name,
+                )
+            )
+        )
+        or 1
+    )
+
     row = Agent(
         agent_id=agent_id,
         miner_hotkey=miner_hotkey,
         name=name,
+        version=version,
         sha256=sha256,
         size_bytes=size_bytes,
         content_fingerprint=content_fingerprint,
@@ -87,6 +112,7 @@ async def insert_agent(
         await session.flush()
     except SAIntegrityError as e:
         raise DbIntegrityError(f"agents insert violated constraint: {e.orig}") from e
+    return version
 
 
 async def resolve_review(

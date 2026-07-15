@@ -84,6 +84,7 @@ async def agent_by_hotkey(
         agent_id=agent.agent_id,
         miner_hotkey=agent.miner_hotkey,
         name=agent.name,
+        version=agent.version,
         status=status,
         sha256=agent.sha256,
         created_at=agent.created_at,
