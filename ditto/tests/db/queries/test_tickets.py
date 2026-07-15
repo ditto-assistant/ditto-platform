@@ -14,6 +14,8 @@ from ditto.db.models import Agent, Score, ValidatorTicket
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import (
     FIRST_SCORE_CONTINUATION_FLOOR,
+    MAX_ATTEMPTS_PER_VERSION,
+    PROVISIONAL_CONTENDER_LANE_SIZE,
     expire_overdue_tickets,
     get_open_ticket,
     issue_ticket,
@@ -326,6 +328,121 @@ class TestIssueTicket:
 
         assert ticket is not None
         assert ticket.agent_id == high
+
+    async def test_top_provisional_contender_precedes_uncovered_work(
+        self, session: AsyncSession
+    ) -> None:
+        uncovered = await _seed_evaluating(
+            session, created_at=_NOW - timedelta(hours=2), name="uncovered"
+        )
+        contender = await _seed_evaluating(session, created_at=_NOW, name="contender")
+        async with session.begin():
+            for index, composite in enumerate((0.80, 0.90)):
+                validator = f"5Contender-{index}"
+                session.add(
+                    ValidatorTicket(
+                        agent_id=contender,
+                        validator_hotkey=validator,
+                        status=TicketStatus.SCORED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                        bench_version=2,
+                        attempt_count=1,
+                    )
+                )
+                session.add(
+                    Score(
+                        agent_id=contender,
+                        validator_hotkey=validator,
+                        run_id=f"run-contender-{index}",
+                        signature=None,
+                        seed=123,
+                        composite=composite,
+                        tool_mean=composite,
+                        memory_mean=composite,
+                        median_ms=100,
+                        n=114,
+                        details=None,
+                        generated_at=_NOW,
+                    )
+                )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Completion", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == contender
+        assert ticket.agent_id != uncovered
+
+    async def test_contender_lane_is_bounded(self, session: AsyncSession) -> None:
+        uncovered = await _seed_evaluating(
+            session, created_at=_NOW - timedelta(hours=2), name="uncovered"
+        )
+        async with session.begin():
+            for rank in range(PROVISIONAL_CONTENDER_LANE_SIZE + 1):
+                contender = Agent(
+                    agent_id=uuid4(),
+                    miner_hotkey=f"5Miner-{rank}",
+                    name=f"contender-{rank}",
+                    sha256=f"{rank + 1:064x}",
+                    status=AgentStatus.EVALUATING,
+                    screening_policy_version=SCREENING_POLICY_VERSION,
+                    created_at=_NOW + timedelta(minutes=rank),
+                )
+                session.add(contender)
+                for index in range(2):
+                    validator = f"5Scored-{rank}-{index}"
+                    composite = 1.0 - rank / 100
+                    session.add(
+                        ValidatorTicket(
+                            agent_id=contender.agent_id,
+                            validator_hotkey=validator,
+                            status=TicketStatus.SCORED,
+                            issued_at=_NOW,
+                            deadline=_NOW + _TTL,
+                            bench_version=2,
+                            attempt_count=1,
+                        )
+                    )
+                    session.add(
+                        Score(
+                            agent_id=contender.agent_id,
+                            validator_hotkey=validator,
+                            run_id=f"run-{rank}-{index}",
+                            signature=None,
+                            seed=123,
+                            composite=composite,
+                            tool_mean=composite,
+                            memory_mean=composite,
+                            median_ms=100,
+                            n=114,
+                            details=None,
+                            generated_at=_NOW,
+                        )
+                    )
+                if rank < PROVISIONAL_CONTENDER_LANE_SIZE:
+                    session.add(
+                        ValidatorTicket(
+                            agent_id=contender.agent_id,
+                            validator_hotkey="5Completion",
+                            status=TicketStatus.EXPIRED,
+                            issued_at=_NOW - _TTL,
+                            deadline=_NOW,
+                            bench_version=2,
+                            attempt_count=MAX_ATTEMPTS_PER_VERSION,
+                            retry_after=_NOW + timedelta(days=1),
+                        )
+                    )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Completion", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == uncovered
 
     async def test_round_robins_live_assignments_across_zero_score_agents(
         self, session: AsyncSession
