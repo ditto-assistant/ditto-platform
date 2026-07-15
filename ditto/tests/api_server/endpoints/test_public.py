@@ -1238,6 +1238,147 @@ class TestPublicActivity:
         assert "composite" not in resp.text
         assert "signature" not in resp.text
 
+    @pytest.mark.parametrize("score_count", [0, 1, 2, 3])
+    async def test_pipeline_exposes_only_safe_accepted_scores_before_quorum(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        score_count: int,
+    ) -> None:
+        composites = [0.41, 0.58, 0.73][:score_count]
+        if score_count:
+            agent_id = await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=composites,
+                status=(
+                    AgentStatus.SCORED if score_count == 3 else AgentStatus.EVALUATING
+                ),
+                details={"bench_version": 2},
+            )
+        else:
+            agent_id = await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["score_count"] == score_count
+        assert body["quorum"] == 3
+        assert len(body["provisional_scores"]) == score_count
+        assert body["final_composite"] == (
+            pytest.approx(0.58) if score_count == 3 else None
+        )
+        assert sorted(score["composite"] for score in body["provisional_scores"]) == (
+            composites
+        )
+        for score in body["provisional_scores"]:
+            assert score["seed"] == "987654321"
+            assert score["run_size"] == "full"
+            assert score["bench_version"] == 2
+            assert score["datagen_version"] == "v0.7.0"
+            assert score["seed_source"] == "on_chain"
+            assert score["dataset_sha256"] == "cd" * 32
+            assert score["reproduction_command"] == (
+                "go run github.com/ditto-assistant/dittobench-datagen/cmd/"
+                "generate@v0.7.0 -seed 987654321 -run-size full -out dataset.json"
+            )
+            assert score["verification_command"].endswith(
+                "-seed 987654321 -run-size full -sha"
+            )
+            assert "validator_hotkey" not in score
+            assert "signature" not in score
+            assert "ticket_deadline" not in score
+            assert "run_id" not in score
+
+    async def test_pipeline_labels_random_seed_fallback_without_block_provenance(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.52],
+            status=AgentStatus.EVALUATING,
+            dataset_seed_block=None,
+            dataset_seed_block_hash=None,
+            details={"bench_version": 2},
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")).json()
+
+        assert body["provisional_scores"][0]["seed_source"] == "random_fallback"
+
+    async def test_pipeline_keeps_accepted_score_visible_during_retry(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.52],
+                status=AgentStatus.EVALUATING,
+                details={"bench_version": 2},
+            )
+        )
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=_MINER_B,
+                    status=TicketStatus.EXPIRED,
+                    issued_at=now - timedelta(hours=2),
+                    deadline=now - timedelta(hours=1),
+                )
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")).json()
+
+        assert body["score_count"] == 1
+        assert body["provisional_scores"][0]["composite"] == pytest.approx(0.52)
+        assert body["validation_attempts"][0]["status"] == "expired"
+
+    @pytest.mark.parametrize(
+        "status",
+        [AgentStatus.SCREENING, AgentStatus.QUARANTINED, AgentStatus.REJECTED],
+    )
+    async def test_pipeline_preserves_scores_without_finalizing_screening_states(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        status: AgentStatus,
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.41, 0.58, 0.73],
+            status=status,
+            details={"bench_version": 2},
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")).json()
+
+        assert body["score_count"] == 3
+        assert len(body["provisional_scores"]) == 3
+        assert body["final_composite"] is None
+
 
 class TestPublicSubmissionScores:
     async def test_detail_exposes_k3_breakdown_and_median(

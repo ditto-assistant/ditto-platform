@@ -701,6 +701,92 @@ class PublicValidationAttempt(BaseModel):
     benchmark_progress: PublicBenchmarkProgress | None = None
 
 
+class PublicProvisionalScore(BaseModel):
+    """One score the platform accepted toward a submission's quorum.
+
+    This deliberately exposes only the numeric composite and the deterministic
+    dataset inputs needed to reproduce it. Validator identity, signatures,
+    ticket leases, and scorer internals remain outside the public in-progress
+    surface.
+    """
+
+    composite: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Accepted composite in [0,1].")
+    ]
+    seed: Annotated[
+        str,
+        Field(
+            pattern=r"^\d+$",
+            description=(
+                "Exact decimal dataset seed fixed after the miner committed the "
+                "submission. Encoded as a string to avoid JavaScript integer rounding."
+            ),
+        ),
+    ]
+    run_size: Annotated[
+        str | None,
+        Field(
+            default=None,
+            pattern=r"^(small|medium|full)$",
+            description="Generator profile used for the score, when recorded.",
+        ),
+    ]
+    bench_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description="DittoBench version recorded with the score.",
+        ),
+    ]
+    datagen_version: Annotated[
+        str | None,
+        Field(
+            default=None,
+            pattern=r"^v\d+\.\d+\.\d+$",
+            description="Pinned dittobench-datagen module release for reproduction.",
+        ),
+    ]
+    seed_source: Annotated[
+        str,
+        Field(
+            pattern=r"^(on_chain|random_fallback)$",
+            description=(
+                "Whether the post-commit seed was derived from an on-chain block "
+                "or an unpredictable fallback."
+            ),
+        ),
+    ]
+    dataset_sha256: Annotated[
+        str | None,
+        Field(
+            default=None,
+            pattern=r"^[0-9a-f]{64}$",
+            description="Pinned hash of the exact generated dataset, when recorded.",
+        ),
+    ]
+    accepted_at: Annotated[
+        datetime, Field(description="When the platform accepted this score (UTC).")
+    ]
+    reproduction_command: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Copyable dittobench-datagen command pinned to the generator "
+                "release used by the current benchmark."
+            ),
+        ),
+    ]
+    verification_command: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Copyable command that prints the regenerated dataset hash.",
+        ),
+    ]
+
+
 class PublicSubmissionPipeline(BaseModel):
     """Full public execution history for one submitted agent."""
 
@@ -709,6 +795,19 @@ class PublicSubmissionPipeline(BaseModel):
     status: str
     score_count: Annotated[int, Field(ge=0)]
     quorum: Annotated[int, Field(ge=1)]
+    provisional_scores: list[PublicProvisionalScore] = Field(default_factory=list)
+    final_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Canonical median once quorum is reached; null while scores are "
+                "still provisional."
+            ),
+        ),
+    ]
     screening_attempts: list[PublicScreeningAttempt] = Field(default_factory=list)
     validation_attempts: list[PublicValidationAttempt] = Field(default_factory=list)
 

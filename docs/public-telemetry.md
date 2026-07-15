@@ -95,6 +95,20 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   summary. Internal review and ban states are collapsed to `under_review` /
   `rejected`. Artifact locations, hashes, payments, and raw screener/build logs
   are never included.
+- `GET /api/v1/public/agent/{agent_id}/pipeline` → versioned screening history,
+  validator assignment progress, and `provisional_scores` as soon as the
+  platform accepts them. Each score exposes only `composite`, the post-commit
+  exact decimal `seed` (encoded as a string to preserve 64-bit browser precision),
+  run size, benchmark/generator version, dataset hash, acceptance time,
+  seed provenance, and version-pinned reproduction / hash-verification commands.
+  It does **not** associate a provisional number with a validator identity and
+  never returns signatures, leases, run ids, secrets, or scorer internals.
+  `final_composite` remains null until three independent scores reach quorum and
+  the submission is in a finalized public state; the leaderboard and emission
+  eligibility rules are unchanged. On-chain provenance is claimed only when the
+  block fields exist; otherwise the response labels the unpredictable CSPRNG
+  fallback. Unknown historical generator pins fail closed with no command rather
+  than silently using `latest`.
 - `GET /api/v1/public/submissions?limit=` → `{ generated_at, count, quorum,
   submissions: [ { agent_id, miner_hotkey, status, score_count,
   median_composite, dataset_seed, dataset_sha256, last_scored_at } ] }`.
@@ -188,7 +202,7 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   downgrade reports so a late same-ticket heartbeat cannot restart at a lower
   count; it is never part of a public response.
 
-  Progress never publishes case ids, case categories or order, prompts, answer
+  Validator heartbeat progress never publishes case ids, case categories or order, prompts, answer
   keys, tool names, memory or generated-dataset contents, pre-disclosure dataset
   hashes, seeds, canaries, partial scores, per-case outcomes or latency, model
   output, harness/build logs, internal run/container ids, paths, IPs, or error
@@ -250,8 +264,8 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
 Static SPA (no server-side secrets) pulling the public API above; wandb linked
 for the deep dive. Sections:
 - **Submission pipeline** — recent agent uploads, miner hotkey, public lifecycle
-  stage, screening/review evidence, and submission time, visible before scoring
-  completes.
+  stage, screening/review evidence, submission time, and accepted provisional
+  composites with reproducibility commands, visible before scoring completes.
 - **Leaderboard** — rank, miner, composite, category radar sparkline, weight %,
   trend arrow; champion highlighted.
 - **Miner drill-down** — composite history, category radar, ATH badge, best run

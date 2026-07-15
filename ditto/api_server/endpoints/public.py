@@ -6,9 +6,10 @@ validator-gated ``/scoring/scores`` reads:
 * **Aggregate leaderboard / health** (``/leaderboard``, ``/health``): best score
   per miner, composite plus tool/memory means and rank, never exposing per-case
   answer-key detail. This half stays aggregate-only.
-* **Submission lifecycle** (``/activity``): recent uploads and their public
-  pipeline stage, safe screening reason, and anti-copy review evidence, without
-  artifacts, hashes, payment data, or raw build logs.
+* **Submission lifecycle** (``/activity``, ``/agent/{id}/pipeline``): recent
+  uploads, public pipeline stage, safe screening evidence, and accepted numeric
+  scores as they arrive. In-progress score rows carry reproducibility inputs but
+  omit validator identity, signatures, ticket leases, and scorer internals.
 * **Per-submission transparency** (``/submissions``, ``/agent/{id}/scores``): the
   k=3 record for a finalized agent — *which* validators scored it, each one's
   exact numbers + signature, the median the platform finalized on, and the pinned
@@ -36,7 +37,7 @@ from typing import Annotated, Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from ditto.api_models import (
     BenchDatasetConfig,
@@ -57,6 +58,7 @@ from ditto.api_models import (
     PublicHealthResponse,
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
+    PublicProvisionalScore,
     PublicRunModels,
     PublicScreenerHeartbeat,
     PublicScreenerHeartbeatsResponse,
@@ -119,6 +121,11 @@ router = APIRouter(prefix="/public", tags=["public"])
 # The ledger only moves when a sweep records a new best score, so a short shared
 # cache is safe and shields the DB from dashboard/CDN traffic.
 _CACHE_CONTROL = "public, max-age=30"
+# Historical reproduction must fail closed: only benchmark epochs whose exact
+# generator release is known get a copyable command. Add a mapping deliberately
+# when a future epoch pins its generator; never point an old score at ``latest``.
+_DATAGEN_VERSION_BY_BENCH_VERSION = {2: "v0.7.0"}
+_DATAGEN_RUN_SIZES = frozenset({"small", "medium", "full"})
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 _VALIDATOR_STALE_WINDOW = timedelta(minutes=15)
 _PUBLIC_ACTIVITY_STATUSES = frozenset(
@@ -712,6 +719,35 @@ def _ticket_deadline(score: Score) -> datetime | None:
         return None
 
 
+def _score_bench_version(score: Score) -> int | None:
+    """Read the persisted benchmark epoch without guessing for legacy rows."""
+    if not isinstance(score.details, dict):
+        return None
+    value = score.details.get("bench_version")
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _datagen_version(bench_version: int | None) -> str | None:
+    """Resolve a benchmark epoch only when its exact generator pin is known."""
+    if bench_version is None:
+        return None
+    return _DATAGEN_VERSION_BY_BENCH_VERSION.get(bench_version)
+
+
+def _dataset_command(
+    *, seed: int, run_size: str | None, bench_version: int | None, sha_only: bool
+) -> str | None:
+    """Return the documented deterministic generator command for a score."""
+    datagen_version = _datagen_version(bench_version)
+    if run_size not in _DATAGEN_RUN_SIZES or datagen_version is None:
+        return None
+    command = (
+        "go run github.com/ditto-assistant/dittobench-datagen/cmd/generate@"
+        f"{datagen_version} -seed {seed} -run-size {run_size}"
+    )
+    return f"{command} -sha" if sha_only else f"{command} -out dataset.json"
+
+
 def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
     """Map a submission row to the full public k=3 record."""
     return PublicSubmissionScores(
@@ -922,7 +958,12 @@ async def agent_pipeline(
     session: SessionDep,
     agent_id: UUID,
 ) -> PublicSubmissionPipeline:
-    """Versioned screening history and validator progress for one submission."""
+    """Screening history, validator progress, and accepted scores for a submission.
+
+    Accepted scores are visible before quorum with the seed and version-pinned
+    dataset command needed to reproduce them. The canonical aggregate remains
+    null until the independent-score quorum is reached.
+    """
     response.headers["Cache-Control"] = "public, max-age=10"
     agent = await session.get(Agent, agent_id)
     if agent is None:
@@ -948,11 +989,12 @@ async def agent_pipeline(
         if work.agent.agent_id == agent_id
     ]
     active_by_hotkey = {work.heartbeat.validator_hotkey: work for work in active_work}
-    score_count = int(
-        await session.scalar(
-            select(func.count(Score.validator_hotkey)).where(Score.agent_id == agent_id)
+    accepted_scores = list(
+        await session.scalars(
+            select(Score)
+            .where(Score.agent_id == agent_id)
+            .order_by(Score.created_at, Score.validator_hotkey)
         )
-        or 0
     )
     running_attempt = next(
         (attempt for attempt in attempts if attempt.status == "running"), None
@@ -966,8 +1008,44 @@ async def agent_pipeline(
             has_active_attempt=running_attempt is not None,
             has_active_validation=bool(active_work),
         ),
-        score_count=score_count,
+        score_count=len(accepted_scores),
         quorum=SCORING_QUORUM,
+        provisional_scores=[
+            PublicProvisionalScore(
+                composite=score.composite,
+                seed=str(score.seed),
+                run_size=agent.dataset_run_size,
+                bench_version=_score_bench_version(score),
+                datagen_version=_datagen_version(_score_bench_version(score)),
+                seed_source=(
+                    "on_chain"
+                    if agent.dataset_seed_block is not None
+                    and agent.dataset_seed_block_hash is not None
+                    else "random_fallback"
+                ),
+                dataset_sha256=agent.dataset_sha256,
+                accepted_at=score.created_at,
+                reproduction_command=_dataset_command(
+                    seed=score.seed,
+                    run_size=agent.dataset_run_size,
+                    bench_version=_score_bench_version(score),
+                    sha_only=False,
+                ),
+                verification_command=_dataset_command(
+                    seed=score.seed,
+                    run_size=agent.dataset_run_size,
+                    bench_version=_score_bench_version(score),
+                    sha_only=True,
+                ),
+            )
+            for score in accepted_scores
+        ],
+        final_composite=(
+            statistics.median(score.composite for score in accepted_scores)
+            if len(accepted_scores) >= SCORING_QUORUM
+            and agent.status in (AgentStatus.SCORED, AgentStatus.LIVE)
+            else None
+        ),
         screening_attempts=[
             PublicScreeningAttempt(
                 attempt_id=attempt.attempt_id,

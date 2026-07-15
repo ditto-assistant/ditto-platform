@@ -2,8 +2,7 @@
 
 A single self-contained `index.html` — the public "front door" for Subnet 118.
 No build step, no framework, no external requests, **no secrets**. It reads the
-platform's public, aggregate-only API (`GET /api/v1/public/leaderboard` and
-`GET /api/v1/public/health`) and links out to wandb for the per-epoch deep dive.
+platform's public API and links out to wandb for the per-epoch deep dive.
 This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 
 ## What it shows
@@ -15,8 +14,11 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
   drill-down (tool-vs-memory split, first-seen, rank).
 - **Submission pipeline** — screening and validator-ticket history, including a
   compact accessible benchmark progress bar for each validator currently
-  evaluating the submission. Multiple validators remain separate rather than
-  being averaged together.
+  evaluating the submission. Accepted numeric scores appear immediately as
+  provisional feedback; the final median remains authoritative only after the
+  three-validator quorum. Each score includes its post-commit seed and a
+  version-pinned `dittobench-datagen` reproduction command, without exposing
+  ticket signatures or associating the number with a validator identity.
 - **Validator fleet** — signed worker availability, coarse system health, and
   the public active agent with the same stage/progress shown in the pipeline.
   Old clients render as progress not reported; expired or stale work disappears.
@@ -26,13 +28,16 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
   the matching detail or fleet row, and browser back/forward navigation stays
   useful without leaving the dashboard's hash-routed shell. The original
   pathname routes remain backward-compatible entry points.
-- **Anti-overfit assurance** — states plainly that only aggregates are published
-  and that dataset seeds rotate every submission.
+- **Anti-overfit assurance** — explains that seeds are fixed only after the
+  submission is committed, rotate per submission, and can reproduce a completed
+  evaluation without changing the already-submitted artifact.
 
-It intentionally shows **only** what the public API exposes (aggregates). Weights
-and full per-epoch telemetry live in wandb (linked), matching the endpoint
-boundary in `docs/public-telemetry.md` — the platform does not serve the KOTH
-weight vector.
+It intentionally shows **only** what the public API exposes. In-progress score
+rows are a narrow safe projection (composite, deterministic dataset inputs, and
+acceptance time); identities, signatures, ticket leases, and scorer internals
+stay private. Weights and full per-epoch telemetry live in wandb (linked),
+matching the endpoint boundary in `docs/public-telemetry.md` — the platform does
+not serve the KOTH weight vector.
 
 ## Configure
 
