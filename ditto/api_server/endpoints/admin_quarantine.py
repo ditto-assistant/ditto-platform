@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import secrets
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.admin_quarantine import (
     AdminArtifactDuplicate,
+    AdminDuplicateSummary,
     AdminMinerContext,
     AdminMinerQuarantineSummary,
     AdminQuarantineAgentContext,
@@ -79,14 +81,16 @@ AdminDep = Annotated[None, Depends(require_admin)]
 
 
 def _review_payloads(
-    row: ScreeningQuarantine,
+    row: ScreeningQuarantine, agent: Agent
 ) -> tuple[list[ScreenEvidenceItem] | None, SourceReviewFinding | None, bool]:
     """Parse the stored review payloads, tolerating legacy/foreign shapes.
 
     Rows written before the payloads landed have nulls; a row whose JSON no
     longer parses (schema drift) degrades to null rather than breaking the
     whole listing. ``finding_verified`` re-derives the digest binding at read
-    time so the console never has to trust a stored boolean.
+    time — and requires the finding to name THIS agent's artifact digest — so
+    the console never has to trust a stored boolean and a finding copied from
+    another submission can never present as verified.
     """
     evidence: list[ScreenEvidenceItem] | None = None
     if isinstance(row.evidence, list):
@@ -106,12 +110,13 @@ def _review_payloads(
         finding is not None
         and row.finding_digest is not None
         and finding.canonical_digest() == row.finding_digest
+        and finding.artifact_sha256 == agent.sha256
     )
     return evidence, finding, verified
 
 
 def _item(row: ScreeningQuarantine, agent: Agent) -> AdminQuarantineItem:
-    evidence, finding, finding_verified = _review_payloads(row)
+    evidence, finding, finding_verified = _review_payloads(row, agent)
     return AdminQuarantineItem(
         quarantine_id=row.quarantine_id,
         agent_id=row.agent_id,
@@ -226,18 +231,35 @@ async def get_quarantine_context(
         )
         or 0
     )
+    # Aggregate in SQL: a prolific miner must not make the console
+    # materialize their entire quarantine history per request.
+    resolution_rows = (
+        await session.execute(
+            select(ScreeningQuarantine.resolution, func.count())
+            .join(Agent, Agent.agent_id == ScreeningQuarantine.agent_id)
+            .where(Agent.miner_hotkey == agent.miner_hotkey)
+            .group_by(ScreeningQuarantine.resolution)
+        )
+    ).all()
+    resolution_counts = {
+        resolution: int(count) for resolution, count in resolution_rows
+    }
+    quarantine_count = sum(resolution_counts.values())
     miner_rows = (
         await session.execute(
             select(ScreeningQuarantine, Agent)
             .join(Agent, Agent.agent_id == ScreeningQuarantine.agent_id)
-            .where(Agent.miner_hotkey == agent.miner_hotkey)
+            .where(
+                Agent.miner_hotkey == agent.miner_hotkey,
+                ScreeningQuarantine.quarantine_id != quarantine_id,
+            )
             .order_by(
                 ScreeningQuarantine.created_at.desc(),
                 ScreeningQuarantine.quarantine_id.desc(),
             )
+            .limit(10)
         )
     ).all()
-    resolutions = [row.resolution for row, _ in miner_rows]
     recent = [
         AdminMinerQuarantineSummary(
             quarantine_id=row.quarantine_id,
@@ -250,8 +272,7 @@ async def get_quarantine_context(
             created_at=row.created_at,
             resolved_at=row.resolved_at,
         )
-        for row, other in miner_rows[:10]
-        if row.quarantine_id != quarantine_id
+        for row, other in miner_rows
     ]
 
     # Exact-duplicate signals only: identical tarball bytes, or identical
@@ -262,14 +283,38 @@ async def get_quarantine_context(
         duplicate_conditions.append(
             Agent.normalized_source_hash == agent.normalized_source_hash
         )
+    duplicate_filter = (
+        Agent.agent_id != agent.agent_id,
+        or_(*duplicate_conditions),
+    )
+    # Authoritative aggregate counts, independent of the bounded sample below:
+    # attribution claims ("another miner submitted this exact code") must
+    # never be derived from whether a 20-row sample happened to include one.
+    cross_miner_count = int(
+        (
+            await session.scalar(
+                select(func.count())
+                .select_from(Agent)
+                .where(*duplicate_filter, Agent.miner_hotkey != agent.miner_hotkey)
+            )
+        )
+        or 0
+    )
+    same_miner_count = int(
+        (
+            await session.scalar(
+                select(func.count())
+                .select_from(Agent)
+                .where(*duplicate_filter, Agent.miner_hotkey == agent.miner_hotkey)
+            )
+        )
+        or 0
+    )
     duplicate_rows = (
         (
             await session.execute(
                 select(Agent)
-                .where(
-                    Agent.agent_id != agent.agent_id,
-                    or_(*duplicate_conditions),
-                )
+                .where(*duplicate_filter)
                 .order_by(Agent.created_at.desc(), Agent.agent_id.desc())
                 .limit(20)
             )
@@ -324,13 +369,19 @@ async def get_quarantine_context(
         miner=AdminMinerContext(
             miner_hotkey=agent.miner_hotkey,
             total_submissions=total_submissions,
-            quarantine_count=len(miner_rows),
-            released_count=resolutions.count("release"),
-            rescreened_count=resolutions.count("rescreen"),
-            rejected_count=resolutions.count("reject"),
+            quarantine_count=quarantine_count,
+            released_count=resolution_counts.get("release", 0),
+            rescreened_count=resolution_counts.get("rescreen", 0),
+            rejected_count=resolution_counts.get("reject", 0),
             recent_quarantines=recent,
         ),
         duplicates=duplicates,
+        duplicate_summary=AdminDuplicateSummary(
+            total=cross_miner_count + same_miner_count,
+            cross_miner=cross_miner_count,
+            same_miner=same_miner_count,
+            sample_truncated=cross_miner_count + same_miner_count > len(duplicate_rows),
+        ),
     )
 
 
@@ -595,12 +646,18 @@ async def _load_inspector(
         raise HTTPException(
             status_code=502, detail="artifact is unavailable in storage"
         ) from error
-    if hashlib.sha256(tar_bytes).hexdigest() != agent.sha256:
-        raise HTTPException(
-            status_code=502, detail="stored artifact does not match its digest"
-        )
+
+    def _verify_and_open() -> TarSourceInspector:
+        # Digest verification and archive characterization are CPU-bound over
+        # attacker-supplied bytes; keep them off the event loop.
+        if hashlib.sha256(tar_bytes).hexdigest() != agent.sha256:
+            raise HTTPException(
+                status_code=502, detail="stored artifact does not match its digest"
+            )
+        return TarSourceInspector(tar_bytes)
+
     try:
-        return agent, TarSourceInspector(tar_bytes)
+        return agent, await asyncio.to_thread(_verify_and_open)
     except SourceInspectError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -625,10 +682,11 @@ async def list_screening_source_files(
         x_admin_actor,
         agent_id,
     )
+    listing = await asyncio.to_thread(inspector.listing)
     return AdminSourceListing(
         agent_id=agent_id,
         artifact_sha256=agent.sha256,
-        **inspector.listing(),  # type: ignore[arg-type]
+        **listing,  # type: ignore[arg-type]
     )
 
 
@@ -655,7 +713,7 @@ async def read_screening_source_file(
         raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
     _agent, inspector = await _load_inspector(agent_id, session, storage)
     try:
-        excerpt = inspector.read(path, start_line, end_line)
+        excerpt = await asyncio.to_thread(inspector.read, path, start_line, end_line)
     except SourceInspectError as error:
         status = 404 if error.code == "file-not-found" else 422
         raise HTTPException(status_code=status, detail=str(error)) from error

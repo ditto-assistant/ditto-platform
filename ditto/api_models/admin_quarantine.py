@@ -150,6 +150,15 @@ class AdminArtifactDuplicate(BaseModel):
     match: Literal["identical_artifact", "identical_normalized_source"]
 
 
+class AdminDuplicateSummary(BaseModel):
+    """Authoritative duplicate counts, independent of the bounded sample."""
+
+    total: int
+    cross_miner: int
+    same_miner: int
+    sample_truncated: bool
+
+
 class AdminQuarantineContext(BaseModel):
     """Everything the review console shows for one quarantine decision."""
 
@@ -158,6 +167,9 @@ class AdminQuarantineContext(BaseModel):
     attempts: list[AdminScreeningAttempt]
     miner: AdminMinerContext
     duplicates: list[AdminArtifactDuplicate]
+    """A bounded sample (at most 20); use ``duplicate_summary`` for counts."""
+
+    duplicate_summary: AdminDuplicateSummary
 
 
 class AdminSourceFileEntry(BaseModel):
@@ -179,6 +191,9 @@ class AdminSourceListing(BaseModel):
     file_count: int
     files: list[AdminSourceFileEntry]
     opaque_blobs: list[AdminOpaqueBlobEntry]
+    opaque_total: int
+    """Total unreadable members found; ``opaque_blobs`` shows at most 128."""
+
     truncated: bool
 
 
@@ -198,6 +213,7 @@ class AdminSourceExcerpt(BaseModel):
 
 __all__ = [
     "AdminArtifactDuplicate",
+    "AdminDuplicateSummary",
     "AdminMinerContext",
     "AdminMinerQuarantineSummary",
     "AdminOpaqueBlobEntry",

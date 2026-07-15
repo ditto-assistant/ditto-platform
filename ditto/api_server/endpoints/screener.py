@@ -502,6 +502,52 @@ def _failed_screening_target(detail: str) -> AgentStatus:
     return AgentStatus.REJECTED
 
 
+def _quarantine_payload_json(
+    payload: ScreenResultRequest,
+) -> tuple[list[dict] | None, dict | None]:
+    """JSON-encode the bounded review payloads carried on a quarantine verdict."""
+    evidence_json = (
+        [item.model_dump(mode="json") for item in payload.evidence]
+        if payload.evidence
+        else None
+    )
+    finding_json = (
+        payload.finding.model_dump(mode="json") if payload.finding is not None else None
+    )
+    return evidence_json, finding_json
+
+
+async def _backfill_quarantine_payloads(
+    session: AsyncSession,
+    *,
+    attempt_id: UUID,
+    payload: ScreenResultRequest,
+) -> None:
+    """Backfill review payloads onto an existing quarantine, never rewriting.
+
+    A re-reported verdict may carry payloads an older worker, an earlier
+    retry, or an older platform build did not persist. Only null fields are
+    filled, and a finding is only accepted for the digest the original signed
+    verdict bound.
+    """
+    evidence_json, finding_json = _quarantine_payload_json(payload)
+    if evidence_json is None and finding_json is None:
+        return
+    quarantine = await session.scalar(
+        select(ScreeningQuarantine).where(ScreeningQuarantine.attempt_id == attempt_id)
+    )
+    if quarantine is None:
+        return
+    if quarantine.evidence is None and evidence_json:
+        quarantine.evidence = evidence_json
+    if (
+        quarantine.finding is None
+        and finding_json
+        and quarantine.finding_digest == payload.finding_digest
+    ):
+        quarantine.finding = finding_json
+
+
 @router.post(
     "/agent/{agent_id}/result",
     response_model=ScreenResultResponse,
@@ -593,6 +639,14 @@ async def submit_result(
         )
 
     public_reason: str | None
+    if payload.outcome == ScreenResultOutcome.INCONCLUSIVE:
+        # Inconclusive is explicitly a NON-verdict: the worker keeps it
+        # private (journal + lease expiry) and never posts it. Accepting one
+        # here would fall through to the legacy detail-based mapping and turn
+        # "we could not tell" into a rejection.
+        raise AgentNotScreenableError(
+            "inconclusive outcomes are not submittable verdicts"
+        )
     if payload.outcome == ScreenResultOutcome.QUARANTINE:
         target = AgentStatus.QUARANTINED
         public_reason = "Submission held for anti-cheat review"
@@ -676,6 +730,14 @@ async def submit_result(
             if deadline.tzinfo is None:
                 deadline = deadline.replace(tzinfo=UTC)
             if attempt.status == attempt_status and agent.status == target:
+                # Idempotent re-report: nothing transitions, but a retry may
+                # carry review payloads that an earlier report (or an older
+                # platform build) did not persist. Backfill them before
+                # returning or they would be unrecoverable for this attempt.
+                if target == AgentStatus.QUARANTINED:
+                    await _backfill_quarantine_payloads(
+                        session, attempt_id=attempt.attempt_id, payload=payload
+                    )
                 result_status = agent.status
                 return ScreenResultResponse(
                     agent_id=agent_id, status=result_status, accepted=True
@@ -748,16 +810,7 @@ async def submit_result(
                 )
             # The review payloads were digest/bounds-validated at parse time
             # (the finding must hash to the signed finding_digest).
-            evidence_json = (
-                [item.model_dump(mode="json") for item in payload.evidence]
-                if payload.evidence
-                else None
-            )
-            finding_json = (
-                payload.finding.model_dump(mode="json")
-                if payload.finding is not None
-                else None
-            )
+            evidence_json, finding_json = _quarantine_payload_json(payload)
             existing_quarantine = await session.scalar(
                 select(ScreeningQuarantine).where(
                     ScreeningQuarantine.attempt_id == attempt.attempt_id
@@ -780,16 +833,9 @@ async def submit_result(
                     )
                 )
             else:
-                # A re-reported verdict may carry payloads an older worker (or
-                # an earlier retry) omitted; backfill without rewriting history.
-                if existing_quarantine.evidence is None and evidence_json:
-                    existing_quarantine.evidence = evidence_json
-                if (
-                    existing_quarantine.finding is None
-                    and finding_json
-                    and existing_quarantine.finding_digest == payload.finding_digest
-                ):
-                    existing_quarantine.finding = finding_json
+                await _backfill_quarantine_payloads(
+                    session, attempt_id=attempt.attempt_id, payload=payload
+                )
         # Pin the generated dataset once, when evaluating and not yet set (the
         # `is None` guard keeps a concurrent/duplicate verdict from overwriting).
         if (

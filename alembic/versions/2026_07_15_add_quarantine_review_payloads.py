@@ -33,12 +33,23 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Add the nullable review payload JSONB columns."""
+    """Add the review payload columns and console lookup indexes."""
     op.execute("ALTER TABLE screening_quarantines ADD COLUMN evidence JSONB")
     op.execute("ALTER TABLE screening_quarantines ADD COLUMN finding JSONB")
+    # The review console's duplicate and miner-history lookups must not scan.
+    op.execute(
+        "CREATE INDEX agents_normalized_source_hash_idx "
+        "ON agents(normalized_source_hash)"
+    )
+    op.execute(
+        "CREATE INDEX screening_quarantines_agent_idx "
+        "ON screening_quarantines(agent_id)"
+    )
 
 
 def downgrade() -> None:
-    """Drop the review payload columns."""
+    """Drop the review payload columns and console lookup indexes."""
+    op.execute("DROP INDEX screening_quarantines_agent_idx")
+    op.execute("DROP INDEX agents_normalized_source_hash_idx")
     op.execute("ALTER TABLE screening_quarantines DROP COLUMN finding")
     op.execute("ALTER TABLE screening_quarantines DROP COLUMN evidence")

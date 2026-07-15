@@ -234,6 +234,8 @@ class Agent(Base):
         ),
         Index("agents_miner_hotkey_idx", "miner_hotkey"),
         Index("agents_sha256_idx", "sha256"),
+        # Exact-repack duplicate lookups for the quarantine review console.
+        Index("agents_normalized_source_hash_idx", "normalized_source_hash"),
         Index(
             "agents_status_evaluating_idx",
             "status",
@@ -395,6 +397,8 @@ class ScreeningQuarantine(Base):
             sqlite_where=text("status = 'active'"),
         ),
         Index("screening_quarantines_created_idx", "created_at"),
+        # Miner-history lookups (all quarantines for one agent, any status).
+        Index("screening_quarantines_agent_idx", "agent_id"),
     )
 
 

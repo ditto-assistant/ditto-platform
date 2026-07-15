@@ -2026,6 +2026,7 @@ class TestQuarantineReviewContext:
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
+        finding_model: SourceReviewFinding | None = None,
         **payload_overrides: object,
     ) -> tuple[UUID, dict]:
         app.state.config = replace(
@@ -2037,7 +2038,7 @@ class TestQuarantineReviewContext:
         _install_chain(app)
         claimed = await client.post(_CLAIM_URL)
         attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
-        finding = _review_finding()
+        finding = finding_model or _review_finding()
         digest = finding.canonical_digest()
         payload = _result_payload(
             agent_id,
@@ -2191,6 +2192,112 @@ class TestQuarantineReviewContext:
                 "match": "identical_artifact",
             }
         ]
+        # Attribution comes from authoritative SQL aggregates, not the sample.
+        assert body["duplicate_summary"] == {
+            "total": 1,
+            "cross_miner": 1,
+            "same_miner": 0,
+            "sample_truncated": False,
+        }
+
+    async def test_finding_for_a_different_artifact_is_not_verified(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A digest-consistent finding about ANOTHER artifact must not verify."""
+        foreign = _review_finding(artifact_sha256="ee" * 32)
+        agent_id, ctx = await self._quarantine(
+            app, client, session_maker, finding_model=foreign
+        )
+        assert ctx["response"].status_code == 200
+        listing = await client.get(
+            "/api/v1/admin/screening-quarantines", headers=_ADMIN_HEADERS
+        )
+        item = listing.json()["items"][0]
+        assert item["agent_id"] == str(agent_id)
+        assert item["finding_verified"] is False
+        assert item["finding"]["artifact_sha256"] == "ee" * 32
+
+    async def test_idempotent_replay_backfills_missing_review_payloads(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A retry can restore payloads the first report did not carry."""
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        finding = _review_finding()
+        digest = finding.canonical_digest()
+        bare = _result_payload(
+            agent_id,
+            passed=False,
+            attempt_id=attempt_id,
+            outcome="quarantine",
+            manifest_digest="56" * 32,
+            finding_digest=digest,
+            reason_code="agentic-source-review-tripwire",
+        )
+        first = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=bare
+        )
+        assert first.status_code == 200
+
+        enriched = dict(bare)
+        enriched["evidence"] = _review_evidence(digest)
+        enriched["finding"] = finding.model_dump(mode="json")
+        replay = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=enriched
+        )
+        assert replay.status_code == 200
+
+        listing = await client.get(
+            "/api/v1/admin/screening-quarantines", headers=_ADMIN_HEADERS
+        )
+        item = listing.json()["items"][0]
+        assert item["finding_verified"] is True
+        assert item["finding"]["summary"] == finding.summary
+        assert [entry["code"] for entry in item["evidence"]] == [
+            "agentic-source-review-tripwire"
+        ]
+
+    async def test_posted_inconclusive_outcome_is_rejected_not_a_rejection(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                attempt_id=attempt_id,
+                outcome="inconclusive",
+            ),
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+        async with session_maker() as session:
+            refreshed = await session.get(Agent, agent_id)
+            assert refreshed is not None
+            # The claim moved it to screening; the rejected non-verdict
+            # must not advance or reject it.
+            assert refreshed.status == AgentStatus.SCREENING
 
     async def test_missing_context_is_404(
         self,
