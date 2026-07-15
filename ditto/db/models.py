@@ -234,6 +234,8 @@ class Agent(Base):
         ),
         Index("agents_miner_hotkey_idx", "miner_hotkey"),
         Index("agents_sha256_idx", "sha256"),
+        # Exact-repack duplicate lookups for the quarantine review console.
+        Index("agents_normalized_source_hash_idx", "normalized_source_hash"),
         Index(
             "agents_status_evaluating_idx",
             "status",
@@ -344,6 +346,19 @@ class ScreeningQuarantine(Base):
     manifest_digest: Mapped[str] = mapped_column(Text, nullable=False)
     finding_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
     reason_code: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[list | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    """Bounded public-safe policy evidence trail (module, code, summary,
+    digest) shipped by the screener on quarantine. Display data for the
+    operator console; the signed verdict binds only the digests. Null for
+    rows written before the review payloads landed."""
+
+    finding: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    """Bounded source-review finding (risk, confidence, categories, flagged
+    path/line evidence, summary). Its canonical JSON hashes to
+    ``finding_digest``, which the verdict signature covers, so this payload is
+    verifiable end to end. Null before the review payloads landed and for
+    quarantines with no source-review finding."""
+
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -382,6 +397,8 @@ class ScreeningQuarantine(Base):
             sqlite_where=text("status = 'active'"),
         ),
         Index("screening_quarantines_created_idx", "created_at"),
+        # Miner-history lookups (all quarantines for one agent, any status).
+        Index("screening_quarantines_agent_idx", "agent_id"),
     )
 
 

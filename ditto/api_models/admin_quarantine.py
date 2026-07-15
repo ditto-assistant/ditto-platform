@@ -8,6 +8,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
+
 QuarantineResolution = Literal["release", "rescreen", "reject"]
 
 
@@ -29,6 +31,12 @@ class AdminQuarantineItem(BaseModel):
     manifest_digest: str
     finding_digest: str | None
     reason_code: str
+    evidence: list[ScreenEvidenceItem] | None
+    finding: SourceReviewFinding | None
+    finding_verified: bool
+    """True iff ``finding`` is present and its canonical digest equals the
+    ``finding_digest`` bound into the screener's signed verdict."""
+
     status: Literal["active", "resolved"]
     created_at: datetime
     resolved_at: datetime | None
@@ -101,7 +109,126 @@ class AdminScreeningRescreenResponse(BaseModel):
     agent_status: str
 
 
+class AdminQuarantineAgentContext(BaseModel):
+    """Submission metadata an operator needs while judging a quarantine."""
+
+    agent_id: UUID
+    miner_hotkey: str
+    agent_name: str
+    artifact_sha256: str
+    agent_status: str
+    size_bytes: int | None
+    submitted_at: datetime
+    screening_policy_version: int
+    screening_reason: str | None
+
+
+class AdminMinerQuarantineSummary(BaseModel):
+    """One prior quarantine from the same miner, with its resolution."""
+
+    quarantine_id: UUID
+    agent_id: UUID
+    agent_name: str
+    reason_code: str
+    status: Literal["active", "resolved"]
+    resolution: QuarantineResolution | None
+    resolution_reason: str | None
+    created_at: datetime
+    resolved_at: datetime | None
+
+
+class AdminMinerContext(BaseModel):
+    """The submitting miner's track record across all submissions."""
+
+    miner_hotkey: str
+    total_submissions: int
+    quarantine_count: int
+    released_count: int
+    rescreened_count: int
+    rejected_count: int
+    recent_quarantines: list[AdminMinerQuarantineSummary]
+
+
+class AdminArtifactDuplicate(BaseModel):
+    """Another submission whose artifact matches this one."""
+
+    agent_id: UUID
+    miner_hotkey: str
+    agent_name: str
+    agent_status: str
+    submitted_at: datetime
+    match: Literal["identical_artifact", "identical_normalized_source"]
+
+
+class AdminDuplicateSummary(BaseModel):
+    """Authoritative duplicate counts, independent of the bounded sample."""
+
+    total: int
+    cross_miner: int
+    same_miner: int
+    sample_truncated: bool
+
+
+class AdminQuarantineContext(BaseModel):
+    """Everything the review console shows for one quarantine decision."""
+
+    quarantine: AdminQuarantineItem
+    agent: AdminQuarantineAgentContext
+    attempts: list[AdminScreeningAttempt]
+    miner: AdminMinerContext
+    duplicates: list[AdminArtifactDuplicate]
+    """A bounded sample (at most 20); use ``duplicate_summary`` for counts."""
+
+    duplicate_summary: AdminDuplicateSummary
+
+
+class AdminSourceFileEntry(BaseModel):
+    path: str
+    bytes: int
+
+
+class AdminOpaqueBlobEntry(BaseModel):
+    """A member the text reader cannot show; a natural hiding place."""
+
+    path: str
+    bytes: int
+    reason: Literal["oversized", "non_utf8"]
+
+
+class AdminSourceListing(BaseModel):
+    agent_id: UUID
+    artifact_sha256: str
+    file_count: int
+    files: list[AdminSourceFileEntry]
+    opaque_blobs: list[AdminOpaqueBlobEntry]
+    opaque_total: int
+    """Total unreadable members found; ``opaque_blobs`` shows at most 128."""
+
+    truncated: bool
+
+
+class AdminSourceLine(BaseModel):
+    line: int
+    text: str
+
+
+class AdminSourceExcerpt(BaseModel):
+    agent_id: UUID
+    path: str
+    total_lines: int
+    start_line: int
+    end_line: int
+    lines: list[AdminSourceLine]
+
+
 __all__ = [
+    "AdminArtifactDuplicate",
+    "AdminDuplicateSummary",
+    "AdminMinerContext",
+    "AdminMinerQuarantineSummary",
+    "AdminOpaqueBlobEntry",
+    "AdminQuarantineAgentContext",
+    "AdminQuarantineContext",
     "AdminQuarantineItem",
     "AdminQuarantineList",
     "AdminQuarantineResolutionEvent",
@@ -112,4 +239,8 @@ __all__ = [
     "AdminScreeningSubmissionList",
     "AdminScreeningRescreenRequest",
     "AdminScreeningRescreenResponse",
+    "AdminSourceExcerpt",
+    "AdminSourceFileEntry",
+    "AdminSourceLine",
+    "AdminSourceListing",
 ]

@@ -35,3 +35,13 @@ class ObjectUploadFailedError(StorageError):
       that is not a routine 404 against a missing key.
     - The body exceeds the maximum object size configured upstream.
     """
+
+
+class ObjectDownloadFailedError(StorageError):
+    """Raised when a get_object call cannot complete within bounds.
+
+    This can happen when:
+    - The key does not exist in the bucket.
+    - The S3 endpoint is unreachable or rejects the request.
+    - The object body exceeds the caller's ``max_bytes`` bound.
+    """

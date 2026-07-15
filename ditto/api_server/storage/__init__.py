@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from ditto.api_server.storage.client import S3StorageClient
 from ditto.api_server.storage.errors import (
+    ObjectDownloadFailedError,
     ObjectUploadFailedError,
     StorageConfigurationError,
     StorageError,
@@ -45,6 +46,7 @@ __all__ = [
     # Result models
     "StoredObject",
     # Errors
+    "ObjectDownloadFailedError",
     "ObjectUploadFailedError",
     "StorageConfigurationError",
     "StorageError",

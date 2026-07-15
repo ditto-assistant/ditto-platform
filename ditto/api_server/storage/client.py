@@ -7,7 +7,10 @@ import hashlib
 import logging
 from typing import TYPE_CHECKING
 
-from ditto.api_server.storage.errors import ObjectUploadFailedError
+from ditto.api_server.storage.errors import (
+    ObjectDownloadFailedError,
+    ObjectUploadFailedError,
+)
 from ditto.api_server.storage.models import StoredObject
 
 if TYPE_CHECKING:
@@ -172,6 +175,41 @@ class S3StorageClient:
                 f"presigned_get_url failed: bucket={self._config.bucket!r} "
                 f"key={key!r} cause={e}"
             ) from e
+
+    async def get_object(self, *, key: str, max_bytes: int) -> bytes:
+        """Download ``key`` into memory, bounded to ``max_bytes``.
+
+        Serves the operator source-inspection endpoints, which extract
+        bounded excerpts from an uploaded tarball server-side. Upload already
+        caps tarballs (20 MiB by default), so an in-memory read is fine; the
+        explicit bound keeps a mis-sized object from ballooning the process.
+
+        Raises:
+            ObjectDownloadFailedError: When the object is missing, exceeds
+                ``max_bytes``, or the underlying S3 call fails.
+        """
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            async with self._session.client(
+                "s3",
+                endpoint_url=self._config.endpoint_url,
+                use_ssl=self._config.use_tls,
+                config=self._client_config,
+            ) as s3:
+                response = await s3.get_object(Bucket=self._config.bucket, Key=key)
+                body = await response["Body"].read(max_bytes + 1)
+        except (ClientError, BotoCoreError) as e:
+            raise ObjectDownloadFailedError(
+                f"get_object failed: bucket={self._config.bucket!r} "
+                f"key={key!r} cause={e}"
+            ) from e
+        if len(body) > max_bytes:
+            raise ObjectDownloadFailedError(
+                f"get_object exceeded bound: bucket={self._config.bucket!r} "
+                f"key={key!r} max_bytes={max_bytes}"
+            )
+        return body
 
     async def object_exists(self, *, key: str) -> bool:
         """Return ``True`` iff a HEAD against ``key`` succeeds.
