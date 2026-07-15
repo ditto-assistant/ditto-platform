@@ -316,3 +316,22 @@ def test_confirmation_composites_reads_details() -> None:
         _confirmation_composites({"confirmation_composites": [0.5, float("nan")]})
         is None
     )
+
+
+def test_confirmation_seeds_reads_details() -> None:
+    """The ledger surfaces the P4 confirmation CRN seeds (aligned 1:1 with the
+    composites) from the score details blob, and degrades to None for absent or
+    malformed values so the validator's fold falls back to the unpaired band."""
+    from ditto.api_server.endpoints.scoring import _confirmation_seeds
+
+    assert _confirmation_seeds({"confirmation_seeds": [10, 20, 30]}) == [10, 20, 30]
+    assert _confirmation_seeds({"confirmation_seeds": [0]}) == [0]
+    assert _confirmation_seeds({}) is None
+    assert _confirmation_seeds(None) is None
+    assert _confirmation_seeds({"confirmation_seeds": []}) is None
+    assert _confirmation_seeds({"confirmation_seeds": "x"}) is None
+    # Any negative, non-int, boolean, or float element voids the list.
+    assert _confirmation_seeds({"confirmation_seeds": [10, -1]}) is None
+    assert _confirmation_seeds({"confirmation_seeds": [10, 2.5]}) is None
+    assert _confirmation_seeds({"confirmation_seeds": [10, "20"]}) is None
+    assert _confirmation_seeds({"confirmation_seeds": [10, True]}) is None

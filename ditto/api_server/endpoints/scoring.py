@@ -89,6 +89,25 @@ def _confirmation_composites(details: dict | None) -> list[float] | None:
     return out
 
 
+def _confirmation_seeds(details: dict | None) -> list[int] | None:
+    """Read the P4 confirmation CRN seeds stashed in a score's details blob,
+    aligned 1:1 with :func:`_confirmation_composites`. Returns None unless the
+    value is a non-empty list of non-negative ints, so a malformed value degrades
+    to the unpaired dethrone band rather than corrupting the paired comparison.
+    Surfaced as-is (any length); the validator pairs only over shared seeds."""
+    if not isinstance(details, dict):
+        return None
+    v = details.get("confirmation_seeds")
+    if not isinstance(v, list) or not v:
+        return None
+    out: list[int] = []
+    for x in v:
+        if isinstance(x, bool) or not isinstance(x, int) or x < 0:
+            return None
+        out.append(x)
+    return out
+
+
 def _cached_snapshot(request: Request) -> _LedgerSnapshot | None:
     return getattr(request.app.state, "ledger_snapshot", None)
 
@@ -141,6 +160,7 @@ async def scores(
             signature=r.signature,
             composite_stderr=_composite_stderr(r.details),
             confirmation_composites=_confirmation_composites(r.details),
+            confirmation_seeds=_confirmation_seeds(r.details),
             status=r.status,
         )
         for r in rows
