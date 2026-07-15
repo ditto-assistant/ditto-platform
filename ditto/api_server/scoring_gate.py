@@ -3,7 +3,7 @@
 SN118 artifacts are downloadable, so the central threat is copying: download
 the current best harness and resubmit it (verbatim or lightly tweaked) to
 dethrone the original. The KOTH+ATH fold already defeats a *verbatim* copy — it
-ties the incumbent, never clears the 1% margin, and first-seen protects the
+ties the incumbent, never clears the 2% margin, and first-seen protects the
 original. This gate adds cheap signals against a *lightly-tweaked* copy that
 nudges its score just past the incumbent: such a submission scores within a hair
 of the agent it surpasses and matches on tarball size or on one of two fingerprint
@@ -38,9 +38,10 @@ if TYPE_CHECKING:
 # — the anti-copy tolerance must exceed the benchmark's between-seed composite
 # noise so a re-rolled verbatim copy cannot clear it on a lucky seed.
 # DittoBench v2 / bench_version 2 (BENCHMARK-V2 §6.2, B8) targets between-seed
-# σ ≤ 0.01 composite and matches the validator's 5% KOTH margin: 0.03 ≈ 3σ. Bump
-# alongside the subnet VALIDATOR_KOTH_MARGIN if the hosted 30-seed σ comes in
-# higher (was 0.02 for v1).
+# σ ≤ 0.01 composite. The 0.03 tolerance remains intentionally broader than
+# the validator's 2% KOTH margin so a near-copy that barely clears the crown gate
+# is still held for review. Bump this tolerance if the hosted 30-seed σ comes in
+# higher (it was 0.02 for v1).
 _DEFAULT_SCORE_TOL = 0.03
 # A tweaked copy differs from the original by at most a few edited lines, so its
 # gzipped tarball size barely moves. 8 KiB comfortably covers small edits.
