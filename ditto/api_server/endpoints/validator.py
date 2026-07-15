@@ -811,6 +811,11 @@ async def submit_score(
         # surfaces them so the KOTH fold dethrones on the median over seeds.
         if report.confirmation_composites is not None:
             score_details["confirmation_composites"] = report.confirmation_composites
+        # The K CRN seeds aligned 1:1 with those composites, so the fold can pair
+        # a challenger against the champion on shared seeds (paired-difference
+        # variance) instead of the wider independent-sum band.
+        if report.confirmation_seeds is not None:
+            score_details["confirmation_seeds"] = report.confirmation_seeds
         if report.per_case:
             score_details["per_case"] = [
                 c.model_dump(mode="json") for c in report.per_case
