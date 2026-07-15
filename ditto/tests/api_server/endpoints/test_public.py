@@ -629,6 +629,7 @@ class TestPublicFleet:
                     status="fresh",
                     refreshed_at=now,
                     names={_MINER_A: "Rizzo", _MINER_B: "Not a reporter"},
+                    stake_weights={_MINER_A: 123.5, _MINER_B: 456.0},
                 )
 
         names = Names()
@@ -648,7 +649,11 @@ class TestPublicFleet:
         assert body["source"] == "taostats"
         assert body["status"] == "fresh"
         assert body["validators"] == [
-            {"validator_hotkey": _MINER_A, "display_name": "Rizzo"}
+            {
+                "validator_hotkey": _MINER_A,
+                "display_name": "Rizzo",
+                "stake_weight": 123.5,
+            }
         ]
         assert names.calls == 1
 

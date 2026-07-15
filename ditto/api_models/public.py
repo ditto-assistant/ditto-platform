@@ -1179,12 +1179,13 @@ class PublicOperationsResponse(BaseModel):
 
 
 class PublicValidatorName(BaseModel):
-    """One optional, untrusted display label paired with its full identity."""
+    """Optional public chain metadata paired with a validator identity."""
 
     validator_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Validator's public hotkey.")
     ]
-    display_name: Annotated[str, Field(min_length=1, max_length=80)]
+    display_name: Annotated[str, Field(min_length=1, max_length=80)] | None = None
+    stake_weight: Annotated[float, Field(ge=0)] | None = None
 
 
 class PublicValidatorNamesResponse(BaseModel):

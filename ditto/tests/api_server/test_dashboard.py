@@ -403,9 +403,19 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert "var validatorNames = {};" in body
+        assert "var validatorStakeWeights = {};" in body
         assert "validatorNames = {};" in body
+        assert "validatorStakeWeights = {};" in body
         assert "(data.validators || []).forEach" in body
         assert "validatorNames[entry.validator_hotkey] = entry.display_name" in body
+        assert (
+            "validatorStakeWeights[entry.validator_hotkey] = entry.stake_weight" in body
+        )
+        assert "function sortFleetEntries(entries, singular)" in body
+        assert "return rightStake - leftStake" in body
+        assert "if (leftHotkey < rightHotkey) return -1" in body
+        assert "if (leftHotkey > rightHotkey) return 1" in body
+        assert "sortFleetEntries(data[kind] || [], singular)" in body
         assert (
             'var displayName = singular === "validator" ? validatorNames[hotkey]'
             in body
