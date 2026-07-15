@@ -122,7 +122,10 @@ from ditto.db.queries.screening import (
     get_running_screening_attempts,
     list_screening_attempts,
 )
-from ditto.db.queries.tickets import FIRST_SCORE_CONTINUATION_FLOOR
+from ditto.db.queries.tickets import (
+    FIRST_SCORE_CONTINUATION_FLOOR,
+    PROVISIONAL_CONTENDER_LANE_SIZE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -983,9 +986,35 @@ def _public_activity_response(
     projected = [(row, public_status(row)) for row in rows]
     # Mirror the validator ticket queue's global ordering. The ticket query adds
     # validator-specific retry and eligibility checks that can still skip a row.
-    waiting_rows = sorted(
-        (row for row, row_status in projected if row_status == "waiting_validator"),
+    waiting_candidates = [
+        row for row, row_status in projected if row_status == "waiting_validator"
+    ]
+    provisional_candidates = sorted(
+        (
+            row
+            for row in waiting_candidates
+            if row.score_count == SCORING_QUORUM - 1
+            and row.provisional_composite is not None
+        ),
         key=lambda row: (
+            -(row.provisional_composite or 0.0),
+            row.agent.created_at,
+            str(row.agent.agent_id),
+        ),
+    )
+    best_provisional_by_miner: dict[str, Any] = {}
+    for row in provisional_candidates:
+        best_provisional_by_miner.setdefault(row.agent.miner_hotkey, row)
+    provisional_contender_ids = {
+        row.agent.agent_id
+        for row in list(best_provisional_by_miner.values())[
+            :PROVISIONAL_CONTENDER_LANE_SIZE
+        ]
+    }
+    waiting_rows = sorted(
+        waiting_candidates,
+        key=lambda row: (
+            0 if row.agent.agent_id in provisional_contender_ids else 1,
             row.score_count,
             -(
                 row.provisional_composite or 0.0

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import case, func, select
+from sqlalchemy.orm import aliased
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
@@ -54,6 +55,12 @@ MAX_ATTEMPTS_PER_VERSION = 2
 # while every other finalized first score was at least 0.465. Keep this policy
 # platform-owned so every validator sees the same assignment boundary.
 FIRST_SCORE_CONTINUATION_FLOOR = 0.25
+
+# Finish a bounded set of likely leaderboard contenders before starting more
+# uncovered work. Keeping one best submission per miner in this small lane
+# makes strong 2-of-3 submissions emission-eligible quickly without allowing
+# the whole completion backlog to starve new miners.
+PROVISIONAL_CONTENDER_LANE_SIZE = 10
 
 
 async def expire_overdue_tickets(session: AsyncSession, *, now: datetime) -> int:
@@ -96,11 +103,13 @@ async def issue_ticket(
     Sweeps overdue tickets first, then picks an ``evaluating`` agent that (a)
     has fewer than :data:`SCORING_QUORUM` live tickets and (b) this validator
     does not already hold a live or scored ticket for. Candidates with the
-    least total coverage (accepted scores plus live assignments) come first,
-    then never-attempted work, then submission age. A prior expired row is
-    reissued only after its cooldown and only once for the same benchmark
-    version. Returns the ticket, or ``None`` when there is no work for this
-    validator ("no job for you"). Runs inside the caller's transaction.
+    strongest bounded set of 2-of-3 provisional contenders comes first. The
+    remaining candidates are ordered by least total coverage (accepted scores
+    plus live assignments), then never-attempted work, then submission age. A
+    prior expired row is reissued only after its cooldown and only once for the
+    same benchmark version. Returns the ticket, or ``None`` when there is no
+    work for this validator ("no job for you"). Runs inside the caller's
+    transaction.
     """
     # No row exists to lock before a validator's first claim. Serialize that
     # gap explicitly on Postgres; the unique partial index remains the durable
@@ -199,6 +208,66 @@ async def issue_ticket(
         ),
         else_=0.0,
     )
+    contender = aliased(Agent)
+    contender_accepted_score_count = (
+        select(func.count())
+        .where(
+            ValidatorTicket.agent_id == contender.agent_id,
+            ValidatorTicket.status == TicketStatus.SCORED,
+        )
+        .correlate(contender)
+        .scalar_subquery()
+    )
+    contender_recorded_score_count = (
+        select(func.count(Score.validator_hotkey))
+        .where(Score.agent_id == contender.agent_id)
+        .correlate(contender)
+        .scalar_subquery()
+    )
+    contender_provisional_composite = (
+        select(func.avg(Score.composite))
+        .where(Score.agent_id == contender.agent_id)
+        .correlate(contender)
+        .scalar_subquery()
+    )
+    contender_per_miner = (
+        select(
+            contender.agent_id.label("agent_id"),
+            contender.created_at.label("created_at"),
+            contender_provisional_composite.label("provisional_composite"),
+            func.row_number()
+            .over(
+                partition_by=contender.miner_hotkey,
+                order_by=(
+                    contender_provisional_composite.desc(),
+                    contender.created_at.asc(),
+                    contender.agent_id.asc(),
+                ),
+            )
+            .label("miner_rank"),
+        )
+        .where(
+            contender.status == AgentStatus.EVALUATING,
+            contender.screening_policy_version >= SCREENING_POLICY_VERSION,
+            contender_accepted_score_count == SCORING_QUORUM - 1,
+            contender_recorded_score_count >= SCORING_QUORUM - 1,
+        )
+        .subquery()
+    )
+    top_provisional_contenders = (
+        select(contender_per_miner.c.agent_id)
+        .where(contender_per_miner.c.miner_rank == 1)
+        .order_by(
+            contender_per_miner.c.provisional_composite.desc(),
+            contender_per_miner.c.created_at.asc(),
+            contender_per_miner.c.agent_id.asc(),
+        )
+        .limit(PROVISIONAL_CONTENDER_LANE_SIZE)
+    )
+    contender_lane = case(
+        (Agent.agent_id.in_(top_provisional_contenders), 0),
+        else_=1,
+    )
     # Lock one candidate Agent row before counting its tickets. The recount is a
     # separate statement after the lock is acquired, so under Postgres READ
     # COMMITTED it sees any ticket committed by the previous lock holder.
@@ -215,7 +284,10 @@ async def issue_ticket(
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
         candidate = (
-            # Round-robin the scoreable backlog. A live evaluator counts as one
+            # First finish the bounded set of strongest 2-of-3 provisional
+            # contenders, one best submission per miner. Then round-robin the
+            # rest of the scoreable backlog. A
+            # live evaluator counts as one
             # unit of coverage just like an accepted score, so an agent cannot
             # jump from zero coverage to three concurrent validators while
             # another eligible agent remains uncovered. Within one coverage
@@ -224,6 +296,7 @@ async def issue_ticket(
             # the highest provisional composite so the likely emission winner
             # reaches quorum first. Submission age and UUID remain stable ties.
             candidate.order_by(
+                contender_lane.asc(),
                 total_coverage.asc(),
                 had_prior_ticket.asc(),
                 completion_lane_score.desc(),

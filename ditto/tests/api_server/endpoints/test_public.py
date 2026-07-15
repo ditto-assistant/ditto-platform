@@ -800,10 +800,10 @@ class TestPublicActivity:
         response = await client.get("/api/v1/public/activity")
         by_id = {entry["agent_id"]: entry for entry in response.json()["entries"]}
 
-        assert by_id[zero_id]["validator_queue_rank"] == 1
-        assert by_id[one_id]["validator_queue_rank"] == 2
-        assert by_id[high_id]["validator_queue_rank"] == 3
-        assert by_id[low_id]["validator_queue_rank"] == 4
+        assert by_id[high_id]["validator_queue_rank"] == 1
+        assert by_id[low_id]["validator_queue_rank"] == 2
+        assert by_id[zero_id]["validator_queue_rank"] == 3
+        assert by_id[one_id]["validator_queue_rank"] == 4
         assert by_id[zero_id]["provisional_composite"] is None
         assert by_id[one_id]["provisional_composite"] == pytest.approx(0.5)
         assert by_id[high_id]["provisional_composite"] == pytest.approx(0.85)
