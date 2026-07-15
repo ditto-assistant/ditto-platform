@@ -58,6 +58,7 @@ from ditto.api_models import (
     PublicHealthResponse,
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
+    PublicOperationsResponse,
     PublicProvisionalScore,
     PublicRunModels,
     PublicScreenerHeartbeat,
@@ -77,7 +78,11 @@ from ditto.api_models import (
     PublicValidatorScore,
 )
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.public import FleetAvailability, FleetHealth
+from ditto.api_models.public import (
+    FleetAvailability,
+    FleetHealth,
+    ValidatorAssignmentState,
+)
 from ditto.api_models.screener import (
     SCREENING_POLICY_VERSION,
     ScreenerProgress,
@@ -93,7 +98,9 @@ from ditto.db.models import Agent, Score, ScreeningQuarantine, ValidatorTicket
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.heartbeats import (
+    ActiveValidatorAssignment,
     ActiveValidatorWork,
+    list_active_validator_assignments,
     list_active_validator_work,
     list_screener_heartbeats,
     list_validator_heartbeats,
@@ -575,25 +582,18 @@ async def health(
     )
 
 
-@router.get("/validators", response_model=PublicValidatorHeartbeatsResponse)
-async def validators(
-    response: Response,
-    session: SessionDep,
+def _validator_heartbeats_response(
+    *,
+    rows: list[Any],
+    assignments: list[ActiveValidatorAssignment],
+    active_work: list[ActiveValidatorWork],
+    now: datetime,
 ) -> PublicValidatorHeartbeatsResponse:
-    """Signed software versions reported by heartbeat-capable validators.
-
-    This intentionally lists reporters, not every on-chain permit holder: a
-    missing hotkey means its software has not proved its version to the platform.
-    """
-    response.headers["Cache-Control"] = _CACHE_CONTROL
-    now = datetime.now(UTC)
-    rows = await list_validator_heartbeats(session)
-    active_by_hotkey = {
-        work.heartbeat.validator_hotkey: work
-        for work in await list_active_validator_work(
-            session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
-        )
+    """Reconcile platform leases and signed heartbeat claims without conflating them."""
+    assignment_by_hotkey = {
+        assignment.ticket.validator_hotkey: assignment for assignment in assignments
     }
+    active_by_hotkey = {work.heartbeat.validator_hotkey: work for work in active_work}
     entries = []
     for row in rows:
         seen_at = cast(datetime, _aware(row.seen_at))
@@ -601,19 +601,43 @@ async def validators(
         online, availability, health = _fleet_classification(
             state=row.state, seen_at=seen_at, now=now, metrics=metrics
         )
-        active_work = active_by_hotkey.get(row.validator_hotkey)
+        assignment = assignment_by_hotkey.get(row.validator_hotkey)
+        synchronized_work = active_by_hotkey.get(row.validator_hotkey)
+        assignment_state: ValidatorAssignmentState
+        if assignment is None:
+            assignment_state = (
+                "heartbeat_mismatch"
+                if row.active_agent_id is not None
+                else "unassigned"
+            )
+        elif seen_at < now - _VALIDATOR_ONLINE_WINDOW:
+            assignment_state = "heartbeat_stale"
+        elif synchronized_work is not None:
+            assignment_state = "synchronized"
+        else:
+            assignment_state = "heartbeat_mismatch"
         entries.append(
             PublicValidatorHeartbeat(
                 validator_hotkey=row.validator_hotkey,
                 software_version=row.software_version,
                 protocol_version=row.protocol_version,
                 state=cast(ValidatorRuntimeState, row.state),
+                assigned_agent_id=(
+                    assignment.agent.agent_id if assignment is not None else None
+                ),
+                assigned_agent_name=(
+                    assignment.agent.name if assignment is not None else None
+                ),
+                reported_agent_id=row.active_agent_id,
+                assignment_state=assignment_state,
                 active_agent_id=(
-                    active_work.agent.agent_id if active_work is not None else None
+                    synchronized_work.agent.agent_id
+                    if synchronized_work is not None
+                    else None
                 ),
                 active_benchmark=(
-                    _public_benchmark_progress(active_work)
-                    if active_work is not None
+                    _public_benchmark_progress(synchronized_work)
+                    if synchronized_work is not None
                     else None
                 ),
                 first_seen_at=_aware(row.first_seen_at),
@@ -632,6 +656,24 @@ async def validators(
         reported_count=len(entries),
         online_count=sum(entry.online for entry in entries),
         validators=entries,
+    )
+
+
+@router.get("/validators", response_model=PublicValidatorHeartbeatsResponse)
+async def validators(
+    response: Response,
+    session: SessionDep,
+) -> PublicValidatorHeartbeatsResponse:
+    """Signed reports reconciled with the platform's current assignment truth."""
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    now = datetime.now(UTC)
+    return _validator_heartbeats_response(
+        rows=await list_validator_heartbeats(session),
+        assignments=await list_active_validator_assignments(session, now=now),
+        active_work=await list_active_validator_work(
+            session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
+        ),
+        now=now,
     )
 
 
@@ -883,38 +925,19 @@ def _public_activity_status(
     return status.value
 
 
-@router.get("/activity", response_model=PublicActivityResponse)
-async def activity(
-    response: Response,
-    session: SessionDep,
-    page: int = Query(default=1, ge=1),
-    limit: int = Query(default=50, ge=1, le=200),
-    status: Annotated[list[str] | None, Query()] = None,
-    q: str | None = Query(default=None, min_length=1, max_length=200),
+def _public_activity_response(
+    *,
+    rows: list[Any],
+    active_work: list[ActiveValidatorWork],
+    now: datetime,
+    page: int,
+    limit: int,
+    requested_statuses: set[str],
+    query: str | None,
 ) -> PublicActivityResponse:
-    """Recent submissions and their safe public pipeline stage, newest first.
-
-    This exposes the evidence a miner needs to understand a failure or review:
-    a safe screening category plus the duplicate reference and anti-copy signal
-    summary. Artifact locations, hashes, payments, and raw build logs remain
-    private.
-    """
-    response.headers["Cache-Control"] = "public, max-age=10"
-    requested_statuses = set(status or [])
-    unknown_statuses = requested_statuses - _PUBLIC_ACTIVITY_STATUSES
-    if unknown_statuses:
-        raise HTTPException(
-            status_code=422,
-            detail="unknown public activity status: "
-            + ", ".join(sorted(unknown_statuses)),
-        )
-
-    rows, _ = await list_public_activity(session)
-    now = datetime.now(UTC)
+    """Project activity from the same validated work set used by fleet health."""
     active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
-    for work in await list_active_validator_work(
-        session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
-    ):
+    for work in active_work:
         active_by_agent.setdefault(work.agent.agent_id, []).append(
             _public_benchmark_progress(work)
         )
@@ -929,7 +952,7 @@ async def activity(
         )
 
     projected = [(row, public_status(row)) for row in rows]
-    normalized_query = q.strip().casefold() if q else ""
+    normalized_query = query.strip().casefold() if query else ""
     if normalized_query:
         projected = [
             (row, row_status)
@@ -957,7 +980,6 @@ async def activity(
 
     total = len(projected)
     page_rows = projected[(page - 1) * limit : page * limit]
-
     return PublicActivityResponse(
         generated_at=now,
         count=len(page_rows),
@@ -1004,6 +1026,83 @@ async def activity(
             )
             for row, row_status in page_rows
         ],
+    )
+
+
+@router.get("/activity", response_model=PublicActivityResponse)
+async def activity(
+    response: Response,
+    session: SessionDep,
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    status: Annotated[list[str] | None, Query()] = None,
+    q: str | None = Query(default=None, min_length=1, max_length=200),
+) -> PublicActivityResponse:
+    """Recent submissions and their safe public pipeline stage, newest first.
+
+    This exposes the evidence a miner needs to understand a failure or review:
+    a safe screening category plus the duplicate reference and anti-copy signal
+    summary. Artifact locations, hashes, payments, and raw build logs remain
+    private.
+    """
+    response.headers["Cache-Control"] = "public, max-age=10"
+    requested_statuses = set(status or [])
+    unknown_statuses = requested_statuses - _PUBLIC_ACTIVITY_STATUSES
+    if unknown_statuses:
+        raise HTTPException(
+            status_code=422,
+            detail="unknown public activity status: "
+            + ", ".join(sorted(unknown_statuses)),
+        )
+
+    now = datetime.now(UTC)
+    rows, _ = await list_public_activity(session)
+    return _public_activity_response(
+        rows=rows,
+        active_work=await list_active_validator_work(
+            session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
+        ),
+        now=now,
+        page=page,
+        limit=limit,
+        requested_statuses=requested_statuses,
+        query=q,
+    )
+
+
+@router.get("/operations", response_model=PublicOperationsResponse)
+async def operations(
+    response: Response,
+    session: SessionDep,
+) -> PublicOperationsResponse:
+    """Atomic dashboard snapshot for submission pipeline and validator fleet health."""
+    response.headers["Cache-Control"] = "public, max-age=10"
+    now = datetime.now(UTC)
+    activity_rows, _ = await list_public_activity(session)
+    heartbeat_rows = await list_validator_heartbeats(session)
+    assignments = await list_active_validator_assignments(session, now=now)
+    active_work = await list_active_validator_work(
+        session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
+    )
+    activity_snapshot = _public_activity_response(
+        rows=activity_rows,
+        active_work=active_work,
+        now=now,
+        page=1,
+        limit=max(1, len(activity_rows)),
+        requested_statuses=set(),
+        query=None,
+    )
+    validator_snapshot = _validator_heartbeats_response(
+        rows=heartbeat_rows,
+        assignments=assignments,
+        active_work=active_work,
+        now=now,
+    )
+    return PublicOperationsResponse(
+        generated_at=now,
+        activity=activity_snapshot,
+        validators=validator_snapshot,
     )
 
 

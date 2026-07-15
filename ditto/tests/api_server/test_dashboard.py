@@ -103,6 +103,7 @@ class TestDashboard:
         [
             "/api/v1/public/leaderboard",
             "/api/v1/public/activity",
+            "/api/v1/public/operations",
             "/api/v1/public/validators",
             "/api/v1/public/screeners",
         ],
@@ -145,8 +146,7 @@ class TestDashboard:
         assert 'data-pipeline-stage="scored"' in body
         assert "Recent scores" in body
         assert 'statuses: ["scored", "live"]' in body
-        assert 'getJSON("/public/activity?page=1&limit=200")' in body
-        assert 'getJSON("/public/activity?page=" + page + "&limit=200")' in body
+        assert 'getJSON("/public/operations")' in body
         assert "max-height: 390px" in body
         assert "indexed.slice(0, 5)" not in body
         assert body.count('type="button" data-activity-page="prev"') == 2
@@ -297,7 +297,7 @@ class TestDashboard:
         assert "Missing optional telemetry is not an outage." in body
         assert "allowlisted" not in body
         assert 'id="fleet-count-unknown"' in body
-        assert 'getJSON("/public/validators")' in body
+        assert 'getJSON("/public/operations")' in body
         assert 'getJSON("/public/validator-names")' in body
         assert 'getJSON("/public/screeners")' in body
         assert 'getElementById("show-screeners").addEventListener' in body
@@ -308,6 +308,23 @@ class TestDashboard:
         assert "privacy-note" not in body
         assert "fleet-health-note" not in body
         assert '" reporting " + kind' not in body
+
+    async def test_operations_panels_share_one_snapshot_and_show_skew(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert body.count('getJSON("/public/operations")') == 1
+        assert 'getJSON("/public/validators")' not in body
+        assert 'getJSON("/public/activity?page=1&limit=200")' not in body
+        assert 'id="operations-snapshot" aria-live="polite"' in body
+        assert "Pipeline and fleet reconciled" in body
+        assert 'entry.assignment_state === "heartbeat_mismatch"' in body
+        assert 'entry.assignment_state === "heartbeat_stale"' in body
+        assert 'return ["Mismatch", "bad"]' in body
+        assert "counts.warning++" in body
+        assert "Assignment mismatch" in body
+        assert "Heartbeat stale" in body
+        assert "<b>Platform</b>" in body
+        assert "<b>Heartbeat</b>" in body
 
     async def test_includes_accessible_benchmark_progress(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))

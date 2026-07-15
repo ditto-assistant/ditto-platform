@@ -55,6 +55,14 @@ class ActiveValidatorWork:
     progress: BenchmarkProgress | None
 
 
+@dataclass(frozen=True)
+class ActiveValidatorAssignment:
+    """One live platform-issued validator assignment, independent of heartbeat."""
+
+    ticket: ValidatorTicket
+    agent: Agent
+
+
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
@@ -296,6 +304,28 @@ async def list_active_validator_work(
             )
         )
     return active
+
+
+async def list_active_validator_assignments(
+    session: AsyncSession,
+    *,
+    now: datetime,
+) -> list[ActiveValidatorAssignment]:
+    """Return platform assignment truth without inferring validator liveness."""
+    rows = (
+        await session.execute(
+            select(ValidatorTicket, Agent)
+            .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
+            .where(
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.deadline > now,
+            )
+            .order_by(ValidatorTicket.validator_hotkey)
+        )
+    ).all()
+    return [
+        ActiveValidatorAssignment(ticket=ticket, agent=agent) for ticket, agent in rows
+    ]
 
 
 async def upsert_screener_heartbeat(

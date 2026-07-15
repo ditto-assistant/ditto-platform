@@ -1483,6 +1483,8 @@
     .stage { border-radius: 3px; padding: 4px 7px; }
     .fleet-work-col > .stage { max-width: 100%; line-height: 1.25; white-space: normal; }
     .fleet-work-col > .stage::before { flex: none; }
+    .assignment-detail { display: block; margin-top: 6px; color: var(--text-dim); font: 10px/1.45 var(--mono); overflow-wrap: anywhere; }
+    .assignment-detail b { color: var(--text); font-weight: 650; }
     .stage.paused { color: var(--accent-2); border-color: color-mix(in oklch, var(--accent-2) 40%, var(--border)); background: color-mix(in oklch, var(--accent-2) 10%, var(--bg-elev)); }
     .stage.unknown { color: var(--text-dim); border-color: var(--border); background: var(--bg-elev-2); }
     .fleet-meter { display: grid; grid-template-columns: minmax(32px, 1fr) auto; align-items: center; gap: 6px; min-width: 0; }
@@ -1679,7 +1681,7 @@
           <div class="atlas-label">
             <div>
               <h2 class="atlas-title">Submission pipeline</h2>
-              <span class="atlas-note">Select a submission for history</span>
+              <span class="atlas-note" id="operations-snapshot" aria-live="polite">Loading one shared operations snapshot…</span>
             </div>
           </div>
           <div id="rescreen-notice" class="rescreen-notice" role="status" aria-live="polite" hidden>
@@ -3799,6 +3801,7 @@
     }
 
     function fleetStatus(entry) {
+      if (entry.assignment_state === "heartbeat_mismatch") return ["Mismatch", "bad"];
       if (entry.availability === "stale") return ["Stale", "warn"];
       if (entry.availability === "offline") return ["Offline", "bad"];
       if (entry.availability === "paused") return ["Paused", "paused"];
@@ -3830,10 +3833,32 @@
         '<td><span class="fleet-container-health' + (dockerTone ? " " + dockerTone : "") + '">' + esc(dockerValue) + '</span></td>';
     }
 
+    function renderValidatorAssignment(entry) {
+      if (entry.assignment_state === "heartbeat_mismatch") {
+        var assigned = entry.assigned_agent_id
+          ? entityAnchor("agent", entry.assigned_agent_id, (entry.assigned_agent_name || "Agent") + " · " + String(entry.assigned_agent_id).slice(0, 8))
+          : "No active assignment";
+        var reported = entry.reported_agent_id
+          ? entityAnchor("agent", entry.reported_agent_id, "Agent · " + String(entry.reported_agent_id).slice(0, 8))
+          : "No active agent";
+        return '<span class="stage bad">Assignment mismatch</span>' +
+          '<span class="assignment-detail"><b>Platform</b> ' + assigned + '<br><b>Heartbeat</b> ' + reported + '</span>';
+      }
+      if (entry.assignment_state === "heartbeat_stale") {
+        var staleAssignment = entry.assigned_agent_id
+          ? entityAnchor("agent", entry.assigned_agent_id, (entry.assigned_agent_name || "Agent") + " · " + String(entry.assigned_agent_id).slice(0, 8))
+          : "Unknown";
+        return '<span class="stage warn">Heartbeat stale</span>' +
+          '<span class="assignment-detail"><b>Platform assignment</b> ' + staleAssignment + '</span>';
+      }
+      return "";
+    }
+
     function updateFleetLedger(entries) {
       var counts = { healthy: 0, warning: 0, offline: 0, paused: 0, unknown: 0 };
       entries.forEach(function (entry) {
-        if (entry.availability === "stale") counts.warning++;
+        if (entry.assignment_state === "heartbeat_mismatch") counts.warning++;
+        else if (entry.availability === "stale") counts.warning++;
         else if (entry.availability === "offline") counts.offline++;
         else if (entry.availability === "paused") counts.paused++;
         else if (entry.health === "warning") counts.warning++;
@@ -3880,9 +3905,10 @@
       var available = entries.filter(function (entry) {
         return entry.availability === "available";
       }).length;
-      summary.textContent = entries.length
+      var snapshot = data.generated_at ? " · snapshot " + relTime(data.generated_at) : "";
+      summary.textContent = (entries.length
         ? available + " of " + reported + " " + kind + " available"
-        : "No " + kind + " reporting";
+        : "No " + kind + " reporting") + snapshot;
       if (!entries.length) {
         rows.innerHTML = '<tr><td colspan="10" class="empty">No ' + singular + ' software reports yet.</td></tr>';
         return;
@@ -3899,10 +3925,12 @@
         var active = entry.active_agent_id
           ? '<span class="current-agent" title="' + esc(entry.active_agent_id) + '">' + entityAnchor("agent", entry.active_agent_id, (entry.active_agent_name || "Agent") + ' · ' + String(entry.active_agent_id).slice(0, 8)) + '</span>'
           : '';
-        var currentWork = singular === "validator" && entry.active_benchmark
+        var assignmentState = singular === "validator" ? renderValidatorAssignment(entry) : "";
+        var currentWork = assignmentState || (singular === "validator" && entry.active_benchmark
           ? renderBenchmarkProgress(entry.active_benchmark, true)
-          : (singular === "screener" && entry.screening_progress ? renderScreenerProgress(entry) : active);
+          : (singular === "screener" && entry.screening_progress ? renderScreenerProgress(entry) : active));
         var hasGranularProgress =
+          assignmentState ||
           (singular === "validator" && entry.active_benchmark && entry.active_benchmark.stage) ||
           (singular === "screener" && entry.screening_progress);
         var workStatus = hasGranularProgress
@@ -4034,24 +4062,23 @@
         });
     }
 
-    function loadPipelineBoard() {
-      getJSON("/public/activity?page=1&limit=200")
-        .then(function (first) {
-          if (first.total_pages <= 1) return first;
-          var pages = [];
-          for (var page = 2; page <= first.total_pages; page += 1) {
-            pages.push(getJSON("/public/activity?page=" + page + "&limit=200"));
-          }
-          return Promise.all(pages).then(function (rest) {
-            first.entries = rest.reduce(function (entries, data) {
-              return entries.concat(data.entries || []);
-            }, first.entries || []);
-            first.count = first.entries.length;
-            return first;
-          });
+    function loadOperations() {
+      getJSON("/public/operations")
+        .then(function (data) {
+          fleetReports.validators = data.validators;
+          fleetUnavailable.validators = false;
+          renderPipelineBoard(data.activity, false);
+          renderFleet();
+          document.getElementById("operations-snapshot").textContent =
+            "Pipeline and fleet reconciled · " + relTime(data.generated_at);
         })
-        .then(function (data) { renderPipelineBoard(data, false); })
-        .catch(function () { renderPipelineBoard(null, true); });
+        .catch(function () {
+          fleetUnavailable.validators = true;
+          renderPipelineBoard(null, true);
+          renderFleet();
+          document.getElementById("operations-snapshot").textContent =
+            "Shared operations snapshot unavailable";
+        });
     }
 
     function load(manual) {
@@ -4065,17 +4092,7 @@
         .then(function (h) { renderHealth(h); })
         .catch(function () { renderHealth(SAMPLE_HEALTH); });
       loadActivity(activityPage);
-      loadPipelineBoard();
-      getJSON("/public/validators")
-        .then(function (data) {
-          fleetReports.validators = data;
-          fleetUnavailable.validators = false;
-          renderFleet();
-        })
-        .catch(function () {
-          fleetUnavailable.validators = true;
-          renderFleet();
-        });
+      loadOperations();
       getJSON("/public/validator-names")
         .then(function (data) {
           validatorNames = {};
