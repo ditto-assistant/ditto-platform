@@ -45,6 +45,7 @@ from ditto.api_server.dependencies import (
     get_session,
     get_storage_client,
 )
+from ditto.api_server.endpoints.public import screening_dispute_signing_message
 from ditto.api_server.endpoints.screener import _heartbeat_signing_message
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_AGENT_NOT_FOUND,
@@ -60,6 +61,7 @@ from ditto.db.models import (
     Score,
     ScreenerHeartbeat,
     ScreeningAttempt,
+    ScreeningDispute,
     ScreeningQuarantine,
     ScreeningQuarantineResolution,
 )
@@ -1557,6 +1559,207 @@ class TestQuarantineAdmin:
             headers={"Authorization": "Bearer wrong-token"},
         )
         assert response.status_code == 401
+
+    async def test_miner_can_submit_one_private_dispute_and_operator_can_release(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.UPLOADED,
+            miner_hotkey=_KEYPAIR.ss58_address,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        held = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                attempt_id=attempt_id,
+                outcome="quarantine",
+                manifest_digest="56" * 32,
+                finding_digest="78" * 32,
+                reason_code="agentic-source-review-tripwire",
+            ),
+        )
+        assert held.status_code == 200
+        admin_headers = {
+            "Authorization": "Bearer test-admin-token-at-least-32-characters",
+            "X-Admin-Actor": "backroom:first-reviewer",
+        }
+        quarantine = (
+            await client.get(
+                "/api/v1/admin/screening-quarantines", headers=admin_headers
+            )
+        ).json()["items"][0]
+        rejected = await client.post(
+            f"/api/v1/admin/screening-quarantines/{quarantine['quarantine_id']}/resolve",
+            headers=admin_headers,
+            json={
+                "resolution": "reject",
+                "reason": "Initial review found benchmark-specific behavior",
+            },
+        )
+        assert rejected.status_code == 200
+
+        message = (
+            "The implementation uses generic schema normalization and does not "
+            "contain benchmark-specific answer logic."
+        )
+        invalid = await client.post(
+            f"/api/v1/public/agent/{agent_id}/dispute",
+            json={"message": message, "signature": "00" * 64},
+        )
+        assert invalid.status_code == 401
+
+        signature = _sign(screening_dispute_signing_message(agent_id, message))
+        submitted = await client.post(
+            f"/api/v1/public/agent/{agent_id}/dispute",
+            json={"message": message, "signature": signature},
+        )
+        repeated = await client.post(
+            f"/api/v1/public/agent/{agent_id}/dispute",
+            json={"message": message, "signature": signature},
+        )
+        assert submitted.status_code == 201
+        assert submitted.json()["dispute"]["status"] == "pending"
+        assert message not in submitted.text
+        assert repeated.status_code == 409
+
+        pipeline = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        assert pipeline.json()["dispute"]["status"] == "pending"
+        assert message not in pipeline.text
+
+        listing = await client.get(
+            "/api/v1/admin/screening-disputes", headers=admin_headers
+        )
+        dispute = listing.json()["items"][0]
+        assert listing.json()["count"] == 1
+        assert dispute["message"] == message
+        assert dispute["original_reason"] == (
+            "Initial review found benchmark-specific behavior"
+        )
+
+        resolved = await client.post(
+            f"/api/v1/admin/screening-disputes/{dispute['dispute_id']}/resolve",
+            headers={**admin_headers, "X-Admin-Actor": "backroom:appeals-reviewer"},
+            json={
+                "resolution": "release",
+                "reason": "Second review confirmed the rejection was a false positive",
+            },
+        )
+        assert resolved.status_code == 200
+        assert resolved.json()["agent_status"] == AgentStatus.EVALUATING
+        assert resolved.json()["dispute"]["resolution"] == "release"
+        assert resolved.json()["dispute"]["original_reason"] == (
+            "Initial review found benchmark-specific behavior"
+        )
+
+        pipeline = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        assert pipeline.json()["status"] == "waiting_validator"
+        assert pipeline.json()["dispute"]["resolution"] == "release"
+        assert pipeline.json()["screening_attempts"][0]["quarantine_resolution"] == (
+            "release"
+        )
+        async with session_maker() as session:
+            disputes = (await session.scalars(select(ScreeningDispute))).all()
+            assert len(disputes) == 1
+
+    async def test_operator_can_uphold_dispute_without_changing_rejection(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.REJECTED,
+            miner_hotkey=_KEYPAIR.ss58_address,
+        )
+        attempt_id = uuid4()
+        quarantine_id = uuid4()
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=attempt_id,
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="quarantined",
+                    started_at=now,
+                    deadline=now + timedelta(minutes=10),
+                    finished_at=now,
+                )
+            )
+            session.add(
+                ScreeningQuarantine(
+                    quarantine_id=quarantine_id,
+                    agent_id=agent_id,
+                    attempt_id=attempt_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    manifest_digest="56" * 32,
+                    finding_digest="78" * 32,
+                    reason_code="agentic-source-review-tripwire",
+                    status="resolved",
+                    created_at=now,
+                    resolved_at=now,
+                    resolved_by="backroom:first-reviewer",
+                    resolution="reject",
+                    resolution_reason="Initial rejection remains supported",
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        message = (
+            "Please review the generic retrieval path and supporting source again."
+        )
+        submitted = await client.post(
+            f"/api/v1/public/agent/{agent_id}/dispute",
+            json={
+                "message": message,
+                "signature": _sign(
+                    screening_dispute_signing_message(agent_id, message)
+                ),
+            },
+        )
+        assert submitted.status_code == 201
+        listing = await client.get(
+            "/api/v1/admin/screening-disputes",
+            headers={"Authorization": "Bearer test-admin-token-at-least-32-characters"},
+        )
+        dispute_id = listing.json()["items"][0]["dispute_id"]
+        upheld = await client.post(
+            f"/api/v1/admin/screening-disputes/{dispute_id}/resolve",
+            headers={
+                "Authorization": "Bearer test-admin-token-at-least-32-characters",
+                "X-Admin-Actor": "backroom:appeals-reviewer",
+            },
+            json={
+                "resolution": "uphold",
+                "reason": (
+                    "Second review confirmed the original benchmark-specific finding"
+                ),
+            },
+        )
+        assert upheld.status_code == 200
+        assert upheld.json()["agent_status"] == AgentStatus.REJECTED
+        assert upheld.json()["dispute"]["resolution"] == "uphold"
 
     async def test_lists_all_screening_outcomes_and_issues_audited_artifact_url(
         self,

@@ -29,6 +29,7 @@ weights from wandb or the chain.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import os
@@ -37,16 +38,19 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
     BenchDatasetConfig,
     BenchGradingConfig,
     BenchHarnessConfig,
+    CreateScreeningDisputeRequest,
+    CreateScreeningDisputeResponse,
     PublicActivityEntry,
     PublicActivityResponse,
     PublicAuditEntry,
@@ -69,6 +73,7 @@ from ditto.api_models import (
     PublicScreenerHeartbeatsResponse,
     PublicScreenerProgress,
     PublicScreeningAttempt,
+    PublicScreeningDispute,
     PublicSubmissionPipeline,
     PublicSubmissionScores,
     PublicSubmissionsResponse,
@@ -98,9 +103,16 @@ from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.endpoints.screener import GeneratorDep
+from ditto.api_server.endpoints.upload import _verify_signature
 from ditto.api_server.endpoints.validator import SessionDep
 from ditto.chain import ChainError
-from ditto.db.models import Agent, Score, ScreeningQuarantine, ValidatorTicket
+from ditto.db.models import (
+    Agent,
+    Score,
+    ScreeningDispute,
+    ScreeningQuarantine,
+    ValidatorTicket,
+)
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.heartbeats import (
@@ -169,6 +181,22 @@ _PUBLIC_ACTIVITY_STATUSES = frozenset(
 class _RegistrationSnapshot:
     expires_at: float
     hotkeys: set[str] | None
+
+
+def screening_dispute_signing_message(agent_id: UUID, message: str) -> bytes:
+    """Return the stable payload a miner signs to authorize one dispute."""
+
+    digest = hashlib.sha256(message.encode()).hexdigest()
+    return f"ditto-dispute-v1:{agent_id}:{digest}".encode()
+
+
+def _public_dispute(dispute: ScreeningDispute) -> PublicScreeningDispute:
+    return PublicScreeningDispute(
+        status=dispute.status,  # type: ignore[arg-type]
+        submitted_at=dispute.created_at,
+        resolved_at=dispute.resolved_at,
+        resolution=dispute.resolution,  # type: ignore[arg-type]
+    )
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -1303,6 +1331,79 @@ async def operations(
     )
 
 
+@router.post(
+    "/agent/{agent_id}/dispute",
+    response_model=CreateScreeningDisputeResponse,
+    status_code=201,
+)
+async def create_screening_dispute(
+    response: Response,
+    session: SessionDep,
+    agent_id: UUID,
+    payload: CreateScreeningDisputeRequest,
+) -> CreateScreeningDisputeResponse:
+    """Record the submitting hotkey's single appeal of a quarantine rejection."""
+
+    response.headers["Cache-Control"] = "no-store"
+    dispute: ScreeningDispute | None = None
+    try:
+        async with session.begin():
+            agent = await session.scalar(
+                select(Agent).where(Agent.agent_id == agent_id).with_for_update()
+            )
+            if agent is None:
+                raise HTTPException(status_code=404, detail="submission not found")
+            if not _verify_signature(
+                agent.miner_hotkey,
+                screening_dispute_signing_message(agent_id, payload.message),
+                payload.signature,
+            ):
+                raise HTTPException(
+                    status_code=401,
+                    detail="signature did not verify against the submitting hotkey",
+                )
+            if await session.scalar(
+                select(ScreeningDispute).where(ScreeningDispute.agent_id == agent_id)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="this submission has already used its one dispute",
+                )
+            quarantine = await session.scalar(
+                select(ScreeningQuarantine)
+                .where(
+                    ScreeningQuarantine.agent_id == agent_id,
+                    ScreeningQuarantine.status == "resolved",
+                    ScreeningQuarantine.resolution == "reject",
+                )
+                .order_by(ScreeningQuarantine.resolved_at.desc())
+                .with_for_update()
+            )
+            if agent.status != AgentStatus.REJECTED or quarantine is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="only a rejected quarantine decision can be disputed",
+                )
+            dispute = ScreeningDispute(
+                dispute_id=uuid4(),
+                agent_id=agent.agent_id,
+                quarantine_id=quarantine.quarantine_id,
+                miner_hotkey=agent.miner_hotkey,
+                message=payload.message,
+                status="pending",
+                created_at=datetime.now(UTC),
+            )
+            session.add(dispute)
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="this submission has already used its one dispute",
+        ) from exc
+
+    assert dispute is not None
+    return CreateScreeningDisputeResponse(dispute=_public_dispute(dispute))
+
+
 @router.get("/agent/{agent_id}/pipeline", response_model=PublicSubmissionPipeline)
 async def agent_pipeline(
     response: Response,
@@ -1365,6 +1466,9 @@ async def agent_pipeline(
         (attempt for attempt in attempts if attempt.status == "running"), None
     )
     score_continuation_floor = await get_score_continuation_floor(session)
+    dispute = await session.scalar(
+        select(ScreeningDispute).where(ScreeningDispute.agent_id == agent_id)
+    )
     return PublicSubmissionPipeline(
         generated_at=now,
         agent_id=agent_id,
@@ -1461,6 +1565,7 @@ async def agent_pipeline(
             )
             for ticket in tickets
         ],
+        dispute=_public_dispute(dispute) if dispute is not None else None,
     )
 
 

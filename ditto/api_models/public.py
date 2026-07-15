@@ -20,6 +20,7 @@ from ditto.api_models.screener import ScreenerProgressStage, ScreenerRuntimeStat
 from ditto.api_models.validator import ValidatorRuntimeState
 
 _SS58_PATTERN = r"^[1-9A-HJ-NP-Za-km-z]{47,48}$"
+_SIGNATURE_HEX_PATTERN = r"^[0-9a-fA-F]{128}$"
 
 
 class PublicCategoryStat(BaseModel):
@@ -800,6 +801,28 @@ class PublicScreeningAttempt(BaseModel):
     quarantine_resolved_at: datetime | None = None
 
 
+class PublicScreeningDispute(BaseModel):
+    """Public-safe appeal state; the miner's private message is never exposed."""
+
+    status: Literal["pending", "resolved"]
+    submitted_at: datetime
+    resolved_at: datetime | None = None
+    resolution: Literal["release", "uphold"] | None = None
+
+
+class CreateScreeningDisputeRequest(BaseModel):
+    """One signed appeal of a rejected screening decision."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    message: Annotated[str, Field(min_length=20, max_length=1000)]
+    signature: Annotated[str, Field(pattern=_SIGNATURE_HEX_PATTERN)]
+
+
+class CreateScreeningDisputeResponse(BaseModel):
+    dispute: PublicScreeningDispute
+
+
 class PublicValidationAttempt(BaseModel):
     """One validator ticket contributing toward the three-score quorum."""
 
@@ -931,6 +954,7 @@ class PublicSubmissionPipeline(BaseModel):
     ]
     screening_attempts: list[PublicScreeningAttempt] = Field(default_factory=list)
     validation_attempts: list[PublicValidationAttempt] = Field(default_factory=list)
+    dispute: PublicScreeningDispute | None = None
 
 
 class PublicDatasetReveal(BaseModel):
