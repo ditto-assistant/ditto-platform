@@ -1051,6 +1051,12 @@ class PublicHealthResponse(BaseModel):
 
 FleetAvailability = Literal["available", "stale", "offline", "paused", "unknown"]
 FleetHealth = Literal["healthy", "warning", "unknown"]
+ValidatorAssignmentState = Literal[
+    "synchronized",
+    "heartbeat_stale",
+    "heartbeat_mismatch",
+    "unassigned",
+]
 
 
 class PublicSystemMetrics(BaseModel):
@@ -1073,6 +1079,10 @@ class PublicValidatorHeartbeat(BaseModel):
     software_version: str
     protocol_version: Annotated[int, Field(ge=1)]
     state: ValidatorRuntimeState
+    assigned_agent_id: UUID | None = None
+    assigned_agent_name: str | None = None
+    reported_agent_id: UUID | None = None
+    assignment_state: ValidatorAssignmentState
     active_agent_id: UUID | None = None
     active_benchmark: PublicBenchmarkProgress | None = None
     first_seen_at: datetime | None = None
@@ -1093,6 +1103,14 @@ class PublicValidatorHeartbeatsResponse(BaseModel):
     reported_count: Annotated[int, Field(ge=0)]
     online_count: Annotated[int, Field(ge=0)]
     validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)
+
+
+class PublicOperationsResponse(BaseModel):
+    """One cacheable operations snapshot shared by pipeline and fleet views."""
+
+    generated_at: datetime
+    activity: PublicActivityResponse
+    validators: PublicValidatorHeartbeatsResponse
 
 
 class PublicValidatorName(BaseModel):
