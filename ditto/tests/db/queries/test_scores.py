@@ -15,6 +15,7 @@ from ditto.db.queries.scores import (
     MIN_ELIGIBLE_CASES,
     list_eligible_ledger,
     list_scores_for_agent,
+    quorum_composites,
     upsert_score,
 )
 
@@ -465,3 +466,24 @@ class TestListScoresForBenchVersion:
         # The unredacted answer key rides along for the (retired) corpus.
         assert score.details is not None
         assert score.details["per_case"][0]["expected"] == ["x"]
+
+
+class TestQuorumComposites:
+    async def test_returns_every_composite_per_agent(
+        self, session: AsyncSession
+    ) -> None:
+        # Three validators score one agent on three different seeds; the query
+        # returns all three composites so the ledger can compute their SEM.
+        agent = await _seed_agent(session)
+        for vh, comp in (("5V1", 0.80), ("5V2", 0.85), ("5V3", 0.90)):
+            await _upsert(
+                session, agent.agent_id, validator_hotkey=vh, run_id=vh, composite=comp
+            )
+        out = await quorum_composites(session, [agent.agent_id])
+        assert sorted(out[agent.agent_id]) == pytest.approx([0.80, 0.85, 0.90])
+
+    async def test_empty_ids_returns_empty(self, session: AsyncSession) -> None:
+        assert await quorum_composites(session, []) == {}
+
+    async def test_unknown_agent_absent(self, session: AsyncSession) -> None:
+        assert await quorum_composites(session, [uuid4()]) == {}

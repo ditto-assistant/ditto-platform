@@ -335,3 +335,36 @@ def test_confirmation_seeds_reads_details() -> None:
     assert _confirmation_seeds({"confirmation_seeds": [10, 2.5]}) is None
     assert _confirmation_seeds({"confirmation_seeds": [10, "20"]}) is None
     assert _confirmation_seeds({"confirmation_seeds": [10, True]}) is None
+
+
+def test_quorum_stderr_is_between_validator_sem() -> None:
+    """The quorum SEM = stdev(composites) / sqrt(n); < 2 scores -> None; a
+    degenerate (identical) quorum -> 0.0 (band collapses to the flat margin)."""
+    from ditto.api_server.endpoints.scoring import _quorum_stderr
+
+    # stdev([0.80, 0.85, 0.90]) = 0.05, SEM = 0.05 / sqrt(3).
+    assert _quorum_stderr([0.80, 0.85, 0.90]) == pytest.approx(0.05 / 3**0.5)
+    assert _quorum_stderr([0.8, 0.8, 0.8]) == pytest.approx(0.0, abs=1e-12)
+    assert _quorum_stderr([0.8]) is None
+    assert _quorum_stderr([]) is None
+    # Non-finite scores are dropped before the SEM.
+    assert _quorum_stderr([0.8, float("nan")]) is None
+
+
+def test_ledger_stderr_prefers_stashed_then_quorum() -> None:
+    """The ledger SE prefers a run's own stashed composite_stderr (e.g. a
+    confirmation re-score's pooled SE); otherwise it falls back to the quorum
+    SEM; None only when neither is available."""
+    from ditto.api_server.endpoints.scoring import _ledger_stderr
+
+    # Stashed present -> used verbatim, quorum ignored.
+    assert _ledger_stderr({"composite_stderr": 0.012}, [0.7, 0.9]) == pytest.approx(
+        0.012
+    )
+    # No stash -> quorum SEM.
+    assert _ledger_stderr(None, [0.80, 0.85, 0.90]) == pytest.approx(0.05 / 3**0.5)
+    # stdev([0.80, 0.90]) = 0.1/sqrt(2); SEM divides by sqrt(2) again -> 0.05.
+    assert _ledger_stderr({}, [0.80, 0.90]) == pytest.approx(0.05)
+    # Neither -> None (band stays inert / flat margin).
+    assert _ledger_stderr(None, [0.8]) is None
+    assert _ledger_stderr(None, []) is None

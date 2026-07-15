@@ -21,6 +21,7 @@ validators is the v1 stance.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -29,7 +30,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ditto.api_models import LedgerEntry, LedgerResponse
 from ditto.api_server.endpoints.validator import SessionDep, ValidatorDep
-from ditto.db.queries.scores import list_eligible_ledger
+from ditto.db.queries.scores import list_eligible_ledger, quorum_composites
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,35 @@ def _confirmation_seeds(details: dict | None) -> list[int] | None:
     return out
 
 
+def _quorum_stderr(composites: list[float]) -> float | None:
+    """The standard error of an agent's composite from its k=3 quorum spread:
+    ``stdev(composites) / sqrt(n)`` over the validators' composites, or None with
+    fewer than two scores. This turns data the platform ALREADY collects (the
+    quorum) into the KOTH z-band's measurement-uncertainty estimate with no
+    re-score, so a plain quorum-scored champion still gets a noise-aware dethrone
+    band. Only finite composites contribute; a degenerate (identical) quorum
+    yields 0.0 (the band collapses to the flat margin, which is correct)."""
+    xs = [c for c in composites if isinstance(c, (int, float)) and c == c]
+    n = len(xs)
+    if n < 2:
+        return None
+    mean = sum(xs) / n
+    var = sum((c - mean) ** 2 for c in xs) / (n - 1)
+    return math.sqrt(var / n)
+
+
+def _ledger_stderr(details: dict | None, quorum: list[float]) -> float | None:
+    """The composite standard error to surface on a ledger entry. Prefer the
+    run's own stashed ``composite_stderr`` (e.g. a confirmation re-score's pooled
+    between-seed SE); else fall back to the between-validator SEM of the k=3
+    quorum (:func:`_quorum_stderr`), so the KOTH z-band has an uncertainty
+    estimate even for a plain quorum-scored agent, from data already collected."""
+    stashed = _composite_stderr(details)
+    if stashed is not None:
+        return stashed
+    return _quorum_stderr(quorum)
+
+
 def _cached_snapshot(request: Request) -> _LedgerSnapshot | None:
     return getattr(request.app.state, "ledger_snapshot", None)
 
@@ -141,6 +171,9 @@ async def scores(
     response.headers["Cache-Control"] = "no-store"
     try:
         rows = await list_eligible_ledger(session)
+        # The k=3 quorum spread per agent -> composite_stderr when the run itself
+        # did not stash one, so the KOTH z-band is noise-aware with no re-score.
+        quorum = await quorum_composites(session, [r.agent_id for r in rows])
     except SQLAlchemyError as e:
         return _serve_last_known(request, validator_hotkey, e)
 
@@ -158,7 +191,7 @@ async def scores(
             seed=r.seed,
             validator_hotkey=r.validator_hotkey,
             signature=r.signature,
-            composite_stderr=_composite_stderr(r.details),
+            composite_stderr=_ledger_stderr(r.details, quorum.get(r.agent_id, [])),
             confirmation_composites=_confirmation_composites(r.details),
             confirmation_seeds=_confirmation_seeds(r.details),
             status=r.status,

@@ -27,6 +27,8 @@ from ditto.db.models import Agent, Score
 from ditto.db.queries.agents import get_agent_by_id
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -649,6 +651,30 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         )
         for row in result
     ]
+
+
+async def quorum_composites(
+    session: AsyncSession, agent_ids: Sequence[UUID]
+) -> dict[UUID, list[float]]:
+    """Every accepted composite per agent for the given ids.
+
+    Lets the ledger report the between-validator spread — the k=3 quorum's
+    standard error — as the composite's ``composite_stderr`` from data already
+    collected, no re-score. One flat read (no aggregation): the SEM is computed
+    in Python (:func:`ditto.api_server.endpoints.scoring._quorum_stderr`), so this
+    stays portable across Postgres and the SQLite test path (no ``stddev``). The
+    row set matches :func:`list_eligible_ledger`'s median (all of the agent's
+    score rows), so the SE describes the same quorum the composite came from.
+    """
+    if not agent_ids:
+        return {}
+    result = await session.execute(
+        select(Score.agent_id, Score.composite).where(Score.agent_id.in_(agent_ids))
+    )
+    out: dict[UUID, list[float]] = {}
+    for agent_id, composite in result:
+        out.setdefault(agent_id, []).append(composite)
+    return out
 
 
 async def list_provisional_ledger(
