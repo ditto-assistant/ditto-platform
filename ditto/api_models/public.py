@@ -631,7 +631,10 @@ class PublicActivityEntry(BaseModel):
     ]
     last_scored_at: Annotated[
         datetime | None,
-        Field(default=None, description="Most recent score time for this agent (UTC)."),
+        Field(
+            default=None,
+            description="When the platform most recently recorded a score (UTC).",
+        ),
     ]
     screening_reason: Annotated[
         str | None,

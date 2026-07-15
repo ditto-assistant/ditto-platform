@@ -15,7 +15,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -856,27 +856,41 @@ class TestPublicActivity:
         assert response.status_code == 422
         assert "unknown public activity status: obsolete" in response.text
 
-    async def test_exposes_latest_score_time_for_finalized_agents(
+    async def test_exposes_latest_platform_score_time_for_finalized_agents(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        scored_at = datetime(2026, 7, 14, 9, 30, 0, tzinfo=UTC)
-        await _seed_k3(
-            session_maker,
-            miner=_MINER_A,
-            composites=[0.61, 0.64, 0.67],
-            status=AgentStatus.LIVE,
-            base_time=scored_at - timedelta(minutes=2),
+        recorded_at = datetime(2026, 7, 14, 9, 30, 0, tzinfo=UTC)
+        agent_id = UUID(
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.61, 0.64, 0.67],
+                status=AgentStatus.LIVE,
+                # Validator provenance may be stale or inaccurate and must not drive
+                # the public dashboard's relative score age.
+                base_time=datetime(2026, 1, 1, tzinfo=UTC),
+            )
         )
+        async with session_maker() as session, session.begin():
+            scores = (
+                (await session.execute(select(Score).where(Score.agent_id == agent_id)))
+                .scalars()
+                .all()
+            )
+            for index, score in enumerate(scores):
+                score.created_at = recorded_at - timedelta(minutes=index)
+                score.updated_at = recorded_at - timedelta(minutes=index)
+
         _install_db(app, session_maker)
 
         entry = (await client.get("/api/v1/public/activity")).json()["entries"][0]
 
         assert entry["status"] == "live"
         assert entry["score_count"] == 3
-        assert datetime.fromisoformat(entry["last_scored_at"]) == scored_at
+        assert datetime.fromisoformat(entry["last_scored_at"]) == recorded_at
 
     async def test_active_rescreen_projects_yellow_and_exposes_version_history(
         self,
