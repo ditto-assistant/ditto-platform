@@ -56,6 +56,9 @@ class TestParseApiServerConfigFromEnv:
         assert config.commit_hash == "abc"
         assert config.validator_names.url is None
         assert config.validator_names.api_key is None
+        assert config.validator_compatibility.minimum_software_version == "0.7.0"
+        assert config.validator_compatibility.minimum_protocol_version == 4
+        assert config.validator_compatibility.heartbeat_max_age_seconds == 300
 
     def test_free_taostats_key_config_is_optional(
         self, monkeypatch: pytest.MonkeyPatch
@@ -174,6 +177,21 @@ class TestCheckConfig:
     def test_unknown_log_level_raises(self):
         config = replace(make_api_server_config(), log_level="loud")
         with pytest.raises(ApiServerConfigError, match="log_level"):
+            check_config(config)
+
+    @pytest.mark.parametrize("version", ["latest", "v0.7.0", "0.7", ""])
+    def test_validator_minimum_requires_stable_version(self, version: str):
+        from ditto.api_server import ValidatorCompatibilityConfig
+
+        config = replace(
+            make_api_server_config(),
+            validator_compatibility=ValidatorCompatibilityConfig(
+                minimum_software_version=version,
+                minimum_protocol_version=4,
+                heartbeat_max_age_seconds=300,
+            ),
+        )
+        with pytest.raises(ApiServerConfigError, match="stable X.Y.Z"):
             check_config(config)
 
     def test_screener_auth_may_be_disabled(self):

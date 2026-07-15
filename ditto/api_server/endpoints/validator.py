@@ -69,6 +69,7 @@ from ditto.api_models.system_health import (
 )
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, stamp_bench_version
+from ditto.api_server.config import ValidatorCompatibilityConfig
 from ditto.api_server.dependencies import (
     get_chain_client,
     get_session,
@@ -78,7 +79,7 @@ from ditto.api_server.endpoints.retrieval import AgentNotFoundError
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
-from ditto.db.models import Agent, Score
+from ditto.db.models import Agent, Score, ValidatorHeartbeat
 from ditto.db.queries.agents import get_agent_by_id
 from ditto.db.queries.audit import (
     EVENT_FINALIZED,
@@ -499,6 +500,8 @@ async def heartbeat(
     responses={
         204: {"description": "No agent needs this validator right now."},
         401: {"description": "Missing/invalid validator auth."},
+        426: {"description": "Validator software or protocol must be upgraded."},
+        428: {"description": "A fresh signed validator heartbeat is required."},
         409: {"description": "Stale or replayed signed job claim."},
         503: {"description": "Chain unavailable for the permit check."},
     },
@@ -543,6 +546,12 @@ async def request_job(
     )
 
     async with session.begin():
+        await _assert_validator_compatible(
+            session,
+            validator_hotkey=payload.validator_hotkey,
+            now=now,
+            config=request.app.state.config.validator_compatibility,
+        )
         try:
             await consume_validator_nonce(
                 session,
@@ -586,6 +595,66 @@ async def request_job(
         job.deadline.isoformat(),
     )
     return job
+
+
+def _stable_version(value: str) -> tuple[int, int, int] | None:
+    """Parse the stable release format validators publish in heartbeats."""
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value.strip())
+    if match is None:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
+async def _assert_validator_compatible(
+    session: AsyncSession,
+    *,
+    validator_hotkey: str,
+    now: datetime,
+    config: ValidatorCompatibilityConfig,
+) -> None:
+    """Reject scoring work until a fresh, supported heartbeat is observed."""
+    if config.minimum_software_version is None:
+        return
+    heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
+    if heartbeat is None:
+        raise HTTPException(
+            status_code=428,
+            detail=(
+                "validator heartbeat required before requesting work; "
+                "update and restart ditto-subnet"
+            ),
+        )
+    seen_at = heartbeat.seen_at
+    if seen_at.tzinfo is None:
+        seen_at = seen_at.replace(tzinfo=UTC)
+    if now - seen_at > timedelta(seconds=config.heartbeat_max_age_seconds):
+        raise HTTPException(
+            status_code=428,
+            detail=(
+                "validator heartbeat is stale; confirm the current validator "
+                "release is running before requesting work"
+            ),
+        )
+    if heartbeat.protocol_version < config.minimum_protocol_version:
+        raise HTTPException(
+            status_code=426,
+            detail=(
+                f"validator protocol {heartbeat.protocol_version} is below required "
+                f"{config.minimum_protocol_version}; update ditto-subnet"
+            ),
+        )
+    current = _stable_version(heartbeat.software_version)
+    minimum = _stable_version(config.minimum_software_version)
+    assert minimum is not None  # validated at process boot
+    if current is None or current < minimum:
+        raise HTTPException(
+            status_code=426,
+            detail=(
+                f"validator software {heartbeat.software_version!r} is below required "
+                f"{config.minimum_software_version}; update ditto-subnet"
+            ),
+        )
 
 
 @router.get(
