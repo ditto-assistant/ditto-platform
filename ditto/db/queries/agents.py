@@ -221,7 +221,7 @@ async def list_public_activity(
         select(
             Score.agent_id,
             func.count(Score.validator_hotkey).label("score_count"),
-            func.max(Score.generated_at).label("last_scored_at"),
+            func.max(Score.updated_at).label("last_scored_at"),
         )
         .group_by(Score.agent_id)
         .subquery()
