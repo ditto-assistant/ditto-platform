@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import exists, func, or_, select
+from sqlalchemy import ColumnElement, case, exists, func, or_, select
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.selectable import ScalarSelect
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.db.models import Agent, Score, ScreeningAttempt
+from ditto.db.queries.scores import SCORING_QUORUM
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +26,38 @@ def screening_score_count() -> ScalarSelect[int]:
         .where(Score.agent_id == Agent.agent_id)
         .correlate(Agent)
         .scalar_subquery()
+    )
+
+
+def screening_priority_order() -> tuple[ColumnElement[Any], ...]:
+    """Prioritize likely finalists, then preserve least-scored fairness.
+
+    A policy bump can return the whole scored field to screening. Submissions
+    already one score from quorum should not lose their chance to finalize
+    behind the rescreen backlog, so that completion lane drains by provisional
+    score. Everything else keeps the existing least-scored, oldest-first order.
+    """
+    score_count = screening_score_count()
+    provisional_composite = (
+        select(func.avg(Score.composite))
+        .where(Score.agent_id == Agent.agent_id)
+        .correlate(Agent)
+        .scalar_subquery()
+    )
+    in_completion_lane = case(
+        (score_count >= SCORING_QUORUM - 1, 1),
+        else_=0,
+    )
+    completion_lane_score = case(
+        (score_count >= SCORING_QUORUM - 1, provisional_composite),
+        else_=0.0,
+    )
+    return (
+        in_completion_lane.desc(),
+        completion_lane_score.desc(),
+        score_count.asc(),
+        Agent.created_at.asc(),
+        Agent.agent_id.asc(),
     )
 
 
@@ -59,7 +92,7 @@ async def claim_screening_attempts(
     ttl: timedelta,
     limit: int,
 ) -> list[tuple[Agent, ScreeningAttempt, UUID | None]]:
-    """Claim least-scored eligible submissions, then oldest within that bucket."""
+    """Claim completion-lane contenders, then least-scored eligible work."""
     # Claiming is already a short transaction. Serialize it in Postgres so two
     # workers cannot skip-lock sibling rows with the same hash and admit both.
     # SQLite serializes writes itself and does not provide advisory locks.
@@ -109,11 +142,7 @@ async def claim_screening_attempts(
         await session.scalars(
             select(Agent)
             .where(eligible, ~has_running, ~earlier_pending)
-            .order_by(
-                screening_score_count().asc(),
-                Agent.created_at.asc(),
-                Agent.agent_id.asc(),
-            )
+            .order_by(*screening_priority_order())
             .limit(limit)
             .with_for_update(of=Agent, skip_locked=True)
         )

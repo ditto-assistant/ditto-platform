@@ -346,19 +346,23 @@ async def _seed_agent(
 
 
 async def _seed_score(
-    maker: async_sessionmaker[AsyncSession], *, agent_id: UUID
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    agent_id: UUID,
+    validator_hotkey: str = "5ScoreValidatorHotkeyXXXXXXXXXXXXXXXXXXXXXXXXXX",
+    composite: float = 0.5,
 ) -> None:
     async with maker() as session, session.begin():
         session.add(
             Score(
                 agent_id=agent_id,
-                validator_hotkey="5ScoreValidatorHotkeyXXXXXXXXXXXXXXXXXXXXXXXXXX",
+                validator_hotkey=validator_hotkey,
                 run_id=str(uuid4()),
                 signature=None,
                 seed=1,
-                composite=0.5,
-                tool_mean=0.5,
-                memory_mean=0.5,
+                composite=composite,
+                tool_mean=composite,
+                memory_mean=composite,
                 median_ms=100,
                 n=1,
                 details=None,
@@ -746,6 +750,60 @@ class TestQueue:
             "older-scored",
         ]
 
+    async def test_prioritizes_highest_two_score_contender_before_backlog(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        base = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        lower = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="older-lower-contender",
+            created_at=base,
+            screening_policy_version=SCREENING_POLICY_VERSION - 1,
+        )
+        higher = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="newer-higher-contender",
+            created_at=base + timedelta(minutes=5),
+            screening_policy_version=SCREENING_POLICY_VERSION - 1,
+        )
+        await _seed_agent(
+            session_maker,
+            status=AgentStatus.UPLOADED,
+            name="unscored-backlog",
+            created_at=base - timedelta(minutes=5),
+        )
+        for agent_id, prefix, composite in (
+            (lower, "5Lower", 0.60),
+            (higher, "5Higher", 0.80),
+        ):
+            await _seed_score(
+                session_maker,
+                agent_id=agent_id,
+                validator_hotkey=f"{prefix}OneXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+                composite=composite,
+            )
+            await _seed_score(
+                session_maker,
+                agent_id=agent_id,
+                validator_hotkey=f"{prefix}TwoXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+                composite=composite,
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/screener/queue")
+
+        assert response.status_code == 200
+        assert [item["name"] for item in response.json()["items"]] == [
+            "newer-higher-contender",
+            "older-lower-contender",
+            "unscored-backlog",
+        ]
+
     async def test_requeues_legacy_evaluating_submission(
         self,
         app: FastAPI,
@@ -907,6 +965,50 @@ class TestClaim:
 
         assert response.status_code == 200
         assert response.json()["items"][0]["agent_id"] == str(unscored)
+
+    async def test_claim_prioritizes_highest_two_score_contender(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        base = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        lower = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="lower-contender",
+            created_at=base,
+            screening_policy_version=SCREENING_POLICY_VERSION - 1,
+        )
+        higher = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="higher-contender",
+            created_at=base + timedelta(minutes=5),
+            screening_policy_version=SCREENING_POLICY_VERSION - 1,
+        )
+        for agent_id, prefix, composite in (
+            (lower, "5Lower", 0.60),
+            (higher, "5Higher", 0.80),
+        ):
+            await _seed_score(
+                session_maker,
+                agent_id=agent_id,
+                validator_hotkey=f"{prefix}OneXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+                composite=composite,
+            )
+            await _seed_score(
+                session_maker,
+                agent_id=agent_id,
+                validator_hotkey=f"{prefix}TwoXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+                composite=composite,
+            )
+        _install_db(app, session_maker)
+
+        response = await client.post(_CLAIM_URL)
+
+        assert response.status_code == 200
+        assert response.json()["items"][0]["agent_id"] == str(higher)
 
     async def test_claim_is_exclusive_and_lease_bound_verdict_is_idempotent(
         self,
