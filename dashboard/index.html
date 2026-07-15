@@ -238,6 +238,15 @@
     .section-head h2 { font-size: 16px; margin: 0; letter-spacing: 0.2px; }
     .section-head .hint { color: var(--text-faint); font-size: 12.5px; }
 
+    .leaderboard-notice {
+      display: none; margin: -4px 0 12px; padding: 10px 12px;
+      color: var(--text-dim); background: color-mix(in oklab, var(--warn) 9%, transparent);
+      border: 1px solid color-mix(in oklab, var(--warn) 34%, transparent);
+      border-radius: 9px; font-size: 12.5px; line-height: 1.5;
+    }
+    .leaderboard-notice.show { display: block; }
+    .leaderboard-notice strong { color: var(--warn); }
+
     /* ── Leaderboard ────────────────────────────────────────── */
     .board { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
     table { width: 100%; border-collapse: collapse; }
@@ -262,8 +271,14 @@
     .rank.r2 { background: rgba(203, 213, 225, 0.14); color: #cbd5e1; }
     .rank.r3 { background: rgba(217, 149, 92, 0.16); color: #d9955c; }
 
-    .hotkey { font-family: var(--mono); font-size: 13px; color: var(--text); }
-    .hotkey .badge { margin-left: 8px; font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--gold); border: 1px solid color-mix(in oklab, var(--gold) 42%, transparent); border-radius: 6px; padding: 1px 6px; vertical-align: middle; }
+    .winner-identity { display: flex; min-width: 190px; flex-direction: column; align-items: flex-start; gap: 4px; }
+    .winner-name { display: flex; min-width: 0; width: 100%; align-items: center; gap: 7px; color: var(--text); font-size: 13.5px; font-weight: 700; }
+    .winner-name > .entity-link { min-width: 0; flex: 1 1 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .winner-name .badge, .winner-name .prov, .winner-name .quorum-badge { flex: none; margin-left: 0; }
+    .winner-miner { display: flex; min-width: 0; max-width: 100%; align-items: center; color: var(--text-faint); }
+    .winner-miner::before { content: "Miner"; margin-right: 6px; color: var(--text-dim); font-family: var(--sans); font-size: 10px; font-weight: 650; }
+    .hotkey { overflow: hidden; font-family: var(--mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .winner-name .badge { font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--gold); border: 1px solid color-mix(in oklab, var(--gold) 42%, transparent); border-radius: 6px; padding: 1px 6px; vertical-align: middle; }
     /* Model column cell: harness model + bench-version chip. */
     .modelcell { display: flex; flex-direction: column; gap: 5px; align-items: flex-start; }
     .modelcell .mname { font-family: var(--mono); font-size: 12px; color: var(--text); display: inline-flex; align-items: center; gap: 6px; }
@@ -278,6 +293,7 @@
        amber like a previous-version run, and the rank cell is dimmed. */
     .prov { margin-left: 8px; font-family: var(--sans); font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn) 48%, transparent); background: color-mix(in oklab, var(--warn) 14%, transparent); border-radius: 5px; padding: 1px 6px; vertical-align: middle; }
     .rank.prov-rank { background: transparent; color: var(--text-faint); font-weight: 600; }
+    .quorum-badge { margin-left: 8px; font-family: var(--sans); font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn) 48%, transparent); background: color-mix(in oklab, var(--warn) 11%, transparent); border-radius: 5px; padding: 1px 6px; vertical-align: middle; white-space: nowrap; }
     /* Board-wide benchmark-version badge in the header subtitle. */
     .bench-badge { display: none; margin-left: 10px; font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--accent-2); background: color-mix(in oklab, var(--accent-2) 12%, transparent); border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent); border-radius: 6px; padding: 2px 8px; vertical-align: middle; text-transform: uppercase; }
     .bench-badge.show { display: inline-block; }
@@ -480,7 +496,15 @@
     .pipeline-item:hover { background: var(--bg-elev-2); }
     .pipeline-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
     .pipeline-item-name { display: block; overflow: hidden; color: var(--text); font-size: 12.5px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+    .pipeline-item-heading { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .pipeline-item-heading .pipeline-item-name { flex: 1 1 auto; min-width: 0; }
+    .pipeline-next-badge {
+      flex: 0 0 auto; padding: 1px 5px; border-radius: 999px;
+      color: var(--accent); background: color-mix(in oklab, var(--accent) 10%, transparent);
+      font: 700 8.5px/1.5 var(--mono); letter-spacing: .02em;
+    }
     .pipeline-item-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 3px; color: var(--text-faint); font-family: var(--mono); font-size: 10.5px; }
+    .pipeline-item-priority-detail { display: block; margin-top: 4px; color: var(--text-dim); font: 600 10px/1.35 var(--mono); }
     .pipeline-item-policy { display: block; margin-top: 5px; color: var(--accent-2); font: 650 10px/1.35 var(--mono); }
     .pipeline-empty, .pipeline-more { padding: 8px 9px; color: var(--text-faint); font-size: 11.5px; line-height: 1.4; }
     .pipeline-more { color: var(--text-dim); font-weight: 650; }
@@ -1158,7 +1182,7 @@
       box-shadow: inset 0 0 0 1px var(--border);
     }
     .theme-option svg { width: 13px; height: 13px; flex: none; }
-    .hotkey .badge,
+    .winner-name .badge,
     .bv,
     .prov,
     #d-bench { border-radius: 3px; }
@@ -1473,6 +1497,8 @@
     .stage { border-radius: 3px; padding: 4px 7px; }
     .fleet-work-col > .stage { max-width: 100%; line-height: 1.25; white-space: normal; }
     .fleet-work-col > .stage::before { flex: none; }
+    .assignment-detail { display: block; margin-top: 6px; color: var(--text-dim); font: 10px/1.45 var(--mono); overflow-wrap: anywhere; }
+    .assignment-detail b { color: var(--text); font-weight: 650; }
     .stage.paused { color: var(--accent-2); border-color: color-mix(in oklch, var(--accent-2) 40%, var(--border)); background: color-mix(in oklch, var(--accent-2) 10%, var(--bg-elev)); }
     .stage.unknown { color: var(--text-dim); border-color: var(--border); background: var(--bg-elev-2); }
     .fleet-meter { display: grid; grid-template-columns: minmax(32px, 1fr) auto; align-items: center; gap: 6px; min-width: 0; }
@@ -1627,15 +1653,16 @@
     </section>
 
     <div class="section-head">
-      <h2>Leaderboard</h2>
-      <span class="hint">best eligible score per miner · ranked by composite · click a row for detail</span>
+      <h2 id="leaderboard-title">Leaderboard</h2>
+      <span class="hint" id="leaderboard-hint">best final score per miner · ranked by composite · click a row for detail</span>
     </div>
+    <div class="leaderboard-notice" id="leaderboard-notice" role="status" aria-live="polite"></div>
     <div class="board">
       <table id="board" tabindex="-1" aria-label="Subnet 118 leaderboard: best score per miner">
         <thead>
           <tr>
             <th scope="col" style="width:52px"><span class="tip" title="Rank by composite among ranked (full-benchmark) runs. Provisional runs are shown but unranked (–).">#</span></th>
-            <th scope="col"><span class="tip" title="The miner's on-chain hotkey (SS58). Click a row for the full run detail, or ⧉ to copy the key.">Miner</span></th>
+            <th scope="col"><span class="tip" title="The miner's winning agent, with its on-chain hotkey below. Open either identity for details, or copy the hotkey.">Winning agent</span></th>
             <th scope="col" class="hide-md" style="width:180px"><span class="tip" title="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under.">Model</span></th>
             <th scope="col" style="width:190px"><span class="tip" title="Headline score in [0,1]: (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates. The band on the bar is ±1 standard error. The second line shows the score trend.">Composite</span></th>
             <th scope="col" class="hide-sm" style="width:140px"><span class="tip" title="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span></th>
@@ -1668,7 +1695,7 @@
           <div class="atlas-label">
             <div>
               <h2 class="atlas-title">Submission pipeline</h2>
-              <span class="atlas-note">Select a submission for history</span>
+              <span class="atlas-note" id="operations-snapshot" aria-live="polite">Loading one shared operations snapshot…</span>
             </div>
           </div>
           <div id="rescreen-notice" class="rescreen-notice" role="status" aria-live="polite" hidden>
@@ -1949,7 +1976,7 @@
     };
     var ACTIVITY_STATUSES = [
       "waiting_screening", "screening", "waiting_validator", "evaluating",
-      "under_review", "rejected", "scored", "live"
+      "below_score_floor", "under_review", "rejected", "scored", "live"
     ];
     var activityStatuses = [];
     var activityQuery = "";
@@ -2165,31 +2192,39 @@
 
     // ── Render ───────────────────────────────────────────────
     function render(data, isSample) {
-      // Eligible (full-benchmark) runs rank first; provisional smoke/practice
-      // runs (a smaller run-size profile that omits the hard memory categories)
-      // sink below them regardless of composite, so an inflated 6-case "100%
-      // memory" can never present as #1. Composite orders within each tier.
+      // Finalized submissions always rank ahead of pre-quorum feedback. Within
+      // each tier, full-benchmark runs rank ahead of smoke/practice runs and
+      // composite orders the field. Provisional values are useful feedback but
+      // never masquerade as the canonical three-validator result.
       var entries = (data.entries || []).slice().sort(function (a, b) {
+        var af = isFinalized(a), bf = isFinalized(b);
+        if (af !== bf) return af ? -1 : 1;
         var ae = isEligible(a), be = isEligible(b);
         if (ae !== be) return ae ? -1 : 1;
         return b.composite - a.composite;
       });
-      // Competitive rank is assigned only to eligible entries; provisional runs
-      // are shown for transparency but stay unranked (rank = null).
-      var rk = 0;
-      entries.forEach(function (e) { e.rank = isEligible(e) ? (++rk) : null; });
+      var finalRank = 0, provisionalRank = 0;
+      entries.forEach(function (e) {
+        e.rank = isEligible(e)
+          ? (isFinalized(e) ? (++finalRank) : (++provisionalRank))
+          : null;
+      });
       lastEntries = entries;
 
-      // Summary cards reflect the ranked (eligible) field only, a provisional
-      // run is not a real headline number.
-      var elig = entries.filter(isEligible);
-      var comps = elig.map(function (e) { return e.composite; });
+      var finalizedEntries = entries.filter(isFinalized);
+      var finalized = finalizedEntries.filter(isEligible);
+      var provisional = entries.filter(function (e) { return !isFinalized(e) && isEligible(e); });
+      var headline = finalized.length ? finalized : provisional;
+      var comps = headline.map(function (e) { return e.composite; });
+      var provisionalHeadline = !finalized.length && provisional.length;
       document.getElementById("c-miners").textContent = entries.length;
-      document.getElementById("c-top").innerHTML = comps.length ? fx(comps[0]) : "–";
-      document.getElementById("c-median").innerHTML = comps.length ? fx(median(comps)) : "–";
+      document.getElementById("c-top").innerHTML = comps.length
+        ? fx(comps[0]) + (provisionalHeadline ? ' <small>provisional</small>' : '') : "–";
+      document.getElementById("c-median").innerHTML = comps.length
+        ? fx(median(comps)) + (provisionalHeadline ? ' <small>provisional</small>' : '') : "–";
       // Top gap: how contested the #1 spot is (#1 minus #2 composite).
       document.getElementById("c-spread").innerHTML = comps.length >= 2
-        ? fx(comps[0] - comps[1]) + ' <small>#1 → #2</small>' : "–";
+        ? fx(comps[0] - comps[1]) + ' <small>' + (provisionalHeadline ? 'provisional · ' : '') + '#1 → #2</small>' : "–";
       // Scoring spend: total LLM tokens the harnesses' own calls burned (generation and grading are non-LLM).
       var toks = entries.map(function (e) { return e.tokens; }).filter(function (t) { return t != null; });
       document.getElementById("c-cost").innerHTML = toks.length
@@ -2210,7 +2245,9 @@
       // the board (which are individually marked in their rows).
       // "Older" = an explicit lower version OR a legacy run with no version recorded
       // (pre-versioning), both are marked in their rows and neither is the current bench.
-      var hasOld = entries.some(function (e) { return e.bench_version == null || e.bench_version < currentBench; });
+      var hasOld = entries.some(function (e) {
+        return isFinalized(e) && (e.bench_version == null || e.bench_version < currentBench);
+      });
       var badge = document.getElementById("bench-badge");
       badge.className = "bench-badge show";
       badge.textContent = "DittoBench v" + currentBench +
@@ -2219,6 +2256,23 @@
       // headline cards to distinct leaderboard metrics.
       var when = data.generated_at ? relTime(data.generated_at) : "–";
       if (!isSample) document.getElementById("status-text").textContent = "Live · " + when;
+
+      var title = document.getElementById("leaderboard-title");
+      var hint = document.getElementById("leaderboard-hint");
+      var notice = document.getElementById("leaderboard-notice");
+      title.textContent = finalizedEntries.length ? "Leaderboard" : (provisional.length ? "Provisional leaderboard" : "Leaderboard");
+      hint.textContent = finalizedEntries.length
+        ? "final three-validator results first · provisional feedback follows"
+        : "early accepted scores · ranked provisionally by composite";
+      if (provisional.length) {
+        notice.classList.add("show");
+        notice.innerHTML = '<strong>Provisional standings.</strong> ' + provisional.length +
+          ' miner' + (provisional.length === 1 ? ' has' : 's have') +
+          ' accepted validator feedback but not the required 3 of 3 scores. Rankings and composites can change until quorum; only final results drive emissions.';
+      } else {
+        notice.classList.remove("show");
+        notice.textContent = "";
+      }
 
       // Rows
       var tb = document.getElementById("rows");
@@ -2230,10 +2284,11 @@
       }
       tb.innerHTML = entries.map(function (e, i) {
         var elig = isEligible(e);
+        var finalizedEntry = isFinalized(e);
         // Crown + rank styling only for the top *eligible* run; provisional runs
         // are unranked and never champion.
-        var isChamp = elig && e.rank === 1;
-        var rankCls = (elig && e.rank <= 3) ? " r" + e.rank : "";
+        var isChamp = finalizedEntry && elig && e.rank === 1;
+        var rankCls = (finalizedEntry && elig && e.rank <= 3) ? " r" + e.rank : "";
         var champ = isChamp ? '<span class="badge"><span aria-hidden="true">👑</span> LEADER</span>' : "";
         var kind = unrankedKind(e);
         var prov = kind === "zero"
@@ -2242,16 +2297,21 @@
           ? '<span class="prov" title="Provisional. It ran a smaller profile that did not administer the full benchmark, so it is shown for transparency but is not ranked and not emission-eligible.">provisional</span>'
           : "";
         var rankCell = elig
-          ? '<span class="rank' + rankCls + '">' + e.rank + '</span>' + rankMove(e.miner_hotkey, e.rank)
+          ? '<span class="rank' + rankCls + '">' + (finalizedEntry ? e.rank : "P" + e.rank) + '</span>' +
+            (finalizedEntry ? rankMove(e.miner_hotkey, e.rank) : "")
           : '<span class="rank prov-rank" title="Not ranked (' + (kind === "zero" ? "scored 0.000" : "provisional run") + ').">–</span>';
-        var rowLabel = (elig ? "Rank " + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
-          ", miner " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) + ". Activate for run detail.";
+        var agentName = e.agent_name || "Unnamed agent";
+        var rowLabel = (elig ? (finalizedEntry ? "Rank " : "Provisional rank ") + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
+          ", agent " + agentName + ", miner " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) + ". Activate for run detail.";
+        var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge" title="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
+          esc(e.score_count || 0) + ' of ' + esc(e.score_quorum || 3) + ' · provisional</span>';
         return '' +
           '<tr data-i="' + i + '"' + (isChamp ? ' class="champion"' : '') +
             ' role="button" tabindex="0" aria-label="' + esc(rowLabel) + '">' +
             '<td>' + rankCell + '</td>' +
-            '<td><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' + champ + prov +
-              '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></td>' +
+            '<td><span class="winner-identity"><span class="winner-name">' + entityAnchor("agent", e.agent_id, agentName) + champ + prov + quorumBadge + '</span>' +
+              '<span class="winner-miner" title="' + esc(e.miner_hotkey) + '"><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' +
+              '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></span></span></td>' +
             modelCell(e) +
             compositeCell(e, entries[i - 1]) +
             '<td class="hide-sm">' + bar("tool", e.tool_mean) + '</td>' +
@@ -2272,6 +2332,7 @@
     // did not administer the full benchmark. Older APIs / sample data omit the
     // field and are treated as eligible.
     function isEligible(e) { return !e || e.eligible !== false; }
+    function isFinalized(e) { return !e || e.finalized !== false; }
     // Why an unranked run is unranked. A full run (n >= 100) that is not ranked
     // scored a non-positive composite ("no score"); otherwise it ran a smaller
     // practice profile ("provisional"). Mirrors the backend's two-gate rule so the
@@ -2387,9 +2448,13 @@
       var name = m.harness || "";
       var bv;
       if (e.bench_version == null) {
+        if (!isFinalized(e)) {
+          bv = '<span class="bv" title="Run provenance appears after the three-validator aggregate is final.">pending quorum</span>';
+        } else {
         // No version recorded → a run from before benchmark versioning. Flag it as
         // legacy so it reads as "not on the current benchmark", same as an older v.
-        bv = '<span class="bv prev" title="' + esc("Scored before benchmark versioning. A legacy run, not comparable to the current DittoBench v" + currentBench + ".") + '">legacy</span>';
+          bv = '<span class="bv prev" title="' + esc("Scored before benchmark versioning. A legacy run, not comparable to the current DittoBench v" + currentBench + ".") + '">legacy</span>';
+        }
       } else {
         var old = e.bench_version < currentBench;
         var cls = old ? "bv prev" : "bv";
@@ -2412,9 +2477,11 @@
     function benchChip(e) {
       var el = document.getElementById("d-bench");
       if (e.bench_version == null) {
-        el.className = "prev";
-        el.textContent = "legacy";
-        el.title = "Scored before benchmark versioning. A legacy run, not comparable to the current DittoBench v" + currentBench + ".";
+        el.className = isFinalized(e) ? "prev" : "";
+        el.textContent = isFinalized(e) ? "legacy" : "pending quorum";
+        el.title = isFinalized(e)
+          ? "Scored before benchmark versioning. A legacy run, not comparable to the current DittoBench v" + currentBench + "."
+          : "Run provenance appears after the three-validator aggregate is final.";
         return;
       }
       var old = e.bench_version < currentBench;
@@ -2432,7 +2499,9 @@
       activeEntityKey = "miners:" + e.miner_hotkey;
       document.getElementById("d-stats").classList.remove("pipeline-mode");
       document.querySelector("#modal .split").style.display = "";
-      document.getElementById("d-title").textContent = "Rank #" + e.rank + (e.rank === 1 ? " · 👑 Leader" : "");
+      document.getElementById("d-title").textContent = isFinalized(e)
+        ? "Rank #" + e.rank + (e.rank === 1 ? " · 👑 Leader" : "")
+        : "Provisional rank P" + e.rank + " · " + (e.score_count || 0) + " of " + (e.score_quorum || 3) + " scores";
       benchChip(e);
       document.getElementById("d-hotkey").innerHTML = entityAnchor("miner", e.miner_hotkey, e.miner_hotkey);
       document.getElementById("d-hotkey-copy").setAttribute("data-key", e.miner_hotkey || "");
@@ -2449,12 +2518,15 @@
       var m = e.models || {};
       var mKind = unrankedKind(e);
       var det = "";
+      if (!isFinalized(e)) det += stat("Validation", (e.score_count || 0) + " of " + (e.score_quorum || 3) + " accepted scores. Not final and not used for emissions.");
       if (e.n != null) det += stat("Cases scored", String(e.n) +
         (mKind === "provisional" ? " (provisional, partial benchmark)" : ""));
       if (mKind === "zero") det += stat("Ranking", "Not ranked. This full run scored a composite of 0.000, so it earns no rank and no emissions.");
       else if (mKind === "provisional") det += stat("Ranking", "Provisional. Not ranked and not emission-eligible. It ran a smaller profile that omits the hard memory categories.");
       if (e.median_ms != null) det += stat("Median latency", e.median_ms + " ms");
-      if (e.bench_version == null) {
+      if (e.bench_version == null && !isFinalized(e)) {
+        det += stat("Benchmark version", "Pending final quorum");
+      } else if (e.bench_version == null) {
         det += stat("Benchmark version", "legacy (pre-versioning, not comparable to v" + currentBench + ")");
       } else {
         det += stat("Benchmark version", "v" + e.bench_version +
@@ -3201,6 +3273,7 @@
         screening_failed: ["Screening interrupted", "warn"],
         waiting_validator: ["Waiting for scores", "progress"],
         evaluating: ["Evaluating", "progress"],
+        below_score_floor: ["Below score floor", "warn"],
         scored: ["Scored", "good"],
         live: ["Live", "good"],
         under_review: ["Under review", "warn"],
@@ -3212,6 +3285,7 @@
     function validationProgress(e) {
       var count = Math.max(0, Number(e.score_count) || 0);
       var quorum = Math.max(1, Number(e.quorum) || 3);
+      if (e.status === "below_score_floor") return "Stopped after " + count + " score";
       var hasStarted = count > 0 || ["waiting_validator", "evaluating", "scored", "live", "under_review"].indexOf(e.status) >= 0;
       return hasStarted ? count + " of " + quorum : "Not started";
     }
@@ -3257,6 +3331,14 @@
         return attempt.status === "issued";
       }).length;
       if (count >= quorum) return "Validation complete. The canonical result uses the median of " + quorum + " independent scores.";
+      if (e.status === "below_score_floor") {
+        var provisional = e.provisional_composite == null
+          ? ((e.provisional_scores || [])[0] || {}).composite
+          : e.provisional_composite;
+        return "Evaluation stopped after the first accepted score" +
+          (provisional == null ? "" : " of " + fx(provisional)) +
+          " was below the " + fx(e.score_floor) + " continuation floor. No further validator tickets will be issued.";
+      }
       if (e.status === "waiting_screening") return "Queued for a screener to claim under the current policy.";
       if (e.status === "screening") return "A screener is currently checking this submission.";
       if (e.status === "waiting_validator") {
@@ -3360,8 +3442,11 @@
       var quorum = Math.max(1, Number(pipeline.quorum) || 3);
       var complete = scores.length >= quorum && pipeline.final_composite != null &&
         (pipeline.status === "scored" || pipeline.status === "live");
+      var stopped = pipeline.status === "below_score_floor";
       var note = complete
         ? "Validation is complete. The final aggregate below is the authoritative median of the independent accepted scores."
+        : stopped
+        ? "Evaluation stopped because the first accepted score was below the continuation floor. This result is not eligible for emissions."
         : "Each value is an accepted platform score, but remains provisional until " + quorum + " independent scores arrive. Provisional scores may change; the final median is authoritative.";
       var rows = scores.map(function (score, index) {
         var label = complete ? "Accepted score " + (index + 1) : "Provisional score " + (index + 1);
@@ -3539,6 +3624,11 @@
       openActivityEntry(lastActivityEntries[i]);
     }
 
+    function validatorQueueCompare(a, b) {
+      return Number(a.entry.validator_queue_rank || Number.MAX_SAFE_INTEGER) -
+        Number(b.entry.validator_queue_rank || Number.MAX_SAFE_INTEGER);
+    }
+
     function renderPipelineBoard(data, unavailable) {
       var entries = data && data.entries ? data.entries : [];
       var columns = [
@@ -3546,7 +3636,7 @@
         { status: "screening", statuses: ["screening"], body: "pipeline-screening", count: "pipeline-screening-count", empty: "No active screening job." },
         { status: "waiting_validator", statuses: ["waiting_validator"], body: "pipeline-wait-validator", count: "pipeline-wait-validator-count", empty: "No submissions waiting." },
         { status: "evaluating", statuses: ["evaluating"], body: "pipeline-evaluating", count: "pipeline-evaluating-count", empty: "No active evaluation." },
-        { status: "scored", statuses: ["scored", "live"], body: "pipeline-scored", count: "pipeline-scored-count", empty: "No scores yet. Finalized agents will appear here." }
+        { status: "scored", statuses: ["scored", "live", "below_score_floor"], body: "pipeline-scored", count: "pipeline-scored-count", empty: "No scores yet. Finalized agents will appear here." }
       ];
       pipelineLoaded = true;
       pipelineUnavailable = unavailable;
@@ -3571,6 +3661,8 @@
             return new Date(b.entry.last_scored_at || b.entry.submitted_at) -
               new Date(a.entry.last_scored_at || a.entry.submitted_at);
           });
+        } else if (column.status === "waiting_validator") {
+          indexed.sort(validatorQueueCompare);
         }
         count.textContent = indexed.length;
         stage.setAttribute("data-active", indexed.length ? "true" : "false");
@@ -3580,7 +3672,8 @@
         }
         var visible = indexed.map(function (item) {
           var entry = item.entry;
-          var meta = column.status === "waiting_validator" || column.status === "evaluating"
+          var isUpNext = column.status === "waiting_validator" && Number(entry.validator_queue_rank) === 1;
+          var meta = column.status === "waiting_validator" || column.status === "evaluating" || entry.status === "below_score_floor"
             ? validationProgress(entry)
             : relTime(column.status === "scored" && entry.last_scored_at ? entry.last_scored_at : entry.submitted_at);
           var benchmark = column.status === "evaluating"
@@ -3591,9 +3684,14 @@
           var policyLabel = (column.status === "waiting_screening" || column.status === "screening")
             ? policyScreeningLabel(entry)
             : "";
-          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(entry.name || "unnamed agent") + ' details' + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
-            '<span class="pipeline-item-name">' + esc(entry.name || "Unnamed agent") + '</span>' +
+          var provisionalScore = column.status === "waiting_validator" && entry.provisional_composite != null
+            ? "Provisional " + fx(Number(entry.provisional_composite))
+            : "";
+          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(entry.name || "unnamed agent") + ' details' + (isUpNext ? ', up next for validator assignment' : '') + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
+            '<span class="pipeline-item-heading"><span class="pipeline-item-name">' + esc(entry.name || "Unnamed agent") + '</span>' +
+              (isUpNext ? '<span class="pipeline-next-badge" title="Highest current priority; validator eligibility can vary">Up next</span>' : '') + '</span>' +
             '<span class="pipeline-item-meta"><span>' + esc(String(entry.agent_id || "").slice(0, 8)) + '</span><span>' + esc(meta) + '</span></span>' +
+            (provisionalScore ? '<span class="pipeline-item-priority-detail">' + esc(provisionalScore) + '</span>' : '') +
             (policyLabel ? '<span class="pipeline-item-policy">' + esc(policyLabel) + '</span>' : '') +
             screening +
             benchmark +
@@ -3745,6 +3843,7 @@
     }
 
     function fleetStatus(entry) {
+      if (entry.assignment_state === "heartbeat_mismatch") return ["Mismatch", "bad"];
       if (entry.availability === "stale") return ["Stale", "warn"];
       if (entry.availability === "offline") return ["Offline", "bad"];
       if (entry.availability === "paused") return ["Paused", "paused"];
@@ -3776,10 +3875,32 @@
         '<td><span class="fleet-container-health' + (dockerTone ? " " + dockerTone : "") + '">' + esc(dockerValue) + '</span></td>';
     }
 
+    function renderValidatorAssignment(entry) {
+      if (entry.assignment_state === "heartbeat_mismatch") {
+        var assigned = entry.assigned_agent_id
+          ? entityAnchor("agent", entry.assigned_agent_id, (entry.assigned_agent_name || "Agent") + " · " + String(entry.assigned_agent_id).slice(0, 8))
+          : "No active assignment";
+        var reported = entry.reported_agent_id
+          ? entityAnchor("agent", entry.reported_agent_id, "Agent · " + String(entry.reported_agent_id).slice(0, 8))
+          : "No active agent";
+        return '<span class="stage bad">Assignment mismatch</span>' +
+          '<span class="assignment-detail"><b>Platform</b> ' + assigned + '<br><b>Heartbeat</b> ' + reported + '</span>';
+      }
+      if (entry.assignment_state === "heartbeat_stale") {
+        var staleAssignment = entry.assigned_agent_id
+          ? entityAnchor("agent", entry.assigned_agent_id, (entry.assigned_agent_name || "Agent") + " · " + String(entry.assigned_agent_id).slice(0, 8))
+          : "Unknown";
+        return '<span class="stage warn">Heartbeat stale</span>' +
+          '<span class="assignment-detail"><b>Platform assignment</b> ' + staleAssignment + '</span>';
+      }
+      return "";
+    }
+
     function updateFleetLedger(entries) {
       var counts = { healthy: 0, warning: 0, offline: 0, paused: 0, unknown: 0 };
       entries.forEach(function (entry) {
-        if (entry.availability === "stale") counts.warning++;
+        if (entry.assignment_state === "heartbeat_mismatch") counts.warning++;
+        else if (entry.availability === "stale") counts.warning++;
         else if (entry.availability === "offline") counts.offline++;
         else if (entry.availability === "paused") counts.paused++;
         else if (entry.health === "warning") counts.warning++;
@@ -3826,9 +3947,10 @@
       var available = entries.filter(function (entry) {
         return entry.availability === "available";
       }).length;
-      summary.textContent = entries.length
+      var snapshot = data.generated_at ? " · snapshot " + relTime(data.generated_at) : "";
+      summary.textContent = (entries.length
         ? available + " of " + reported + " " + kind + " available"
-        : "No " + kind + " reporting";
+        : "No " + kind + " reporting") + snapshot;
       if (!entries.length) {
         rows.innerHTML = '<tr><td colspan="10" class="empty">No ' + singular + ' software reports yet.</td></tr>';
         return;
@@ -3845,10 +3967,12 @@
         var active = entry.active_agent_id
           ? '<span class="current-agent" title="' + esc(entry.active_agent_id) + '">' + entityAnchor("agent", entry.active_agent_id, (entry.active_agent_name || "Agent") + ' · ' + String(entry.active_agent_id).slice(0, 8)) + '</span>'
           : '';
-        var currentWork = singular === "validator" && entry.active_benchmark
+        var assignmentState = singular === "validator" ? renderValidatorAssignment(entry) : "";
+        var currentWork = assignmentState || (singular === "validator" && entry.active_benchmark
           ? renderBenchmarkProgress(entry.active_benchmark, true)
-          : (singular === "screener" && entry.screening_progress ? renderScreenerProgress(entry) : active);
+          : (singular === "screener" && entry.screening_progress ? renderScreenerProgress(entry) : active));
         var hasGranularProgress =
+          assignmentState ||
           (singular === "validator" && entry.active_benchmark && entry.active_benchmark.stage) ||
           (singular === "screener" && entry.screening_progress);
         var workStatus = hasGranularProgress
@@ -3980,24 +4104,23 @@
         });
     }
 
-    function loadPipelineBoard() {
-      getJSON("/public/activity?page=1&limit=200")
-        .then(function (first) {
-          if (first.total_pages <= 1) return first;
-          var pages = [];
-          for (var page = 2; page <= first.total_pages; page += 1) {
-            pages.push(getJSON("/public/activity?page=" + page + "&limit=200"));
-          }
-          return Promise.all(pages).then(function (rest) {
-            first.entries = rest.reduce(function (entries, data) {
-              return entries.concat(data.entries || []);
-            }, first.entries || []);
-            first.count = first.entries.length;
-            return first;
-          });
+    function loadOperations() {
+      getJSON("/public/operations")
+        .then(function (data) {
+          fleetReports.validators = data.validators;
+          fleetUnavailable.validators = false;
+          renderPipelineBoard(data.activity, false);
+          renderFleet();
+          document.getElementById("operations-snapshot").textContent =
+            "Pipeline and fleet reconciled · " + relTime(data.generated_at);
         })
-        .then(function (data) { renderPipelineBoard(data, false); })
-        .catch(function () { renderPipelineBoard(null, true); });
+        .catch(function () {
+          fleetUnavailable.validators = true;
+          renderPipelineBoard(null, true);
+          renderFleet();
+          document.getElementById("operations-snapshot").textContent =
+            "Shared operations snapshot unavailable";
+        });
     }
 
     function load(manual) {
@@ -4011,17 +4134,7 @@
         .then(function (h) { renderHealth(h); })
         .catch(function () { renderHealth(SAMPLE_HEALTH); });
       loadActivity(activityPage);
-      loadPipelineBoard();
-      getJSON("/public/validators")
-        .then(function (data) {
-          fleetReports.validators = data;
-          fleetUnavailable.validators = false;
-          renderFleet();
-        })
-        .catch(function () {
-          fleetUnavailable.validators = true;
-          renderFleet();
-        });
+      loadOperations();
       getJSON("/public/validator-names")
         .then(function (data) {
           validatorNames = {};
@@ -4070,7 +4183,7 @@
       generated_at: new Date(Date.now() - 12000).toISOString(),
       count: 5,
       entries: [
-        { rank: 1, miner_hotkey: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", composite: 0.658, tool_mean: 0.867, memory_mean: 0.449, first_seen: new Date(Date.now() - 86400000 * 2).toISOString(),
+        { rank: 1, finalized: true, score_count: 3, score_quorum: 3, agent_id: "11111111-1111-4111-8111-111111111111", agent_name: "Atlas Memory", miner_hotkey: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", composite: 0.658, tool_mean: 0.867, memory_mean: 0.449, first_seen: new Date(Date.now() - 86400000 * 2).toISOString(),
           median_ms: 2410, n: 12, bench_version: 2, dataset_sha256: "9f2c1a77b4e35d0182ac4f6b0e2d9c3a5b7148ef22d0c6a9f1e8b3d47c05a6e1",
           models: { harness: "qwen/qwen3-32b" },
           per_category: [{ category: "memory_lookup", count: 3, mean: 0.83 }, { category: "web_search", count: 2, mean: 0.75 }, { category: "artifacts_create", count: 1, mean: 0.6 }],
@@ -4082,16 +4195,16 @@
             { category: "memory_lookup", kind: "memory", score: 1.0, correct: true, latency_ms: 1330, notes: ["deterministic answer match (no judge call)"] },
             { category: "contradiction", kind: "memory", score: 0.0, correct: false, latency_ms: 2210, notes: ["deterministic answer mismatch (no judge call)"] }
           ] },
-        { rank: 2, miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.432, first_seen: new Date(Date.now() - 86400000 * 3).toISOString(),
+        { rank: 2, finalized: true, score_count: 3, score_quorum: 3, agent_id: "22222222-2222-4222-8222-222222222222", agent_name: "Recall Relay", miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.432, first_seen: new Date(Date.now() - 86400000 * 3).toISOString(),
           median_ms: 3120, n: 12, bench_version: 2, dataset_sha256: "1b8e07d4c9f6a2531e0c74ab9f3d61528ac40f7e6d1b9c8a2f5e340d7b16c9a0",
           models: { harness: "qwen/qwen3-32b" },
           per_category: [{ category: "memory_lookup", count: 3, mean: 0.72 }, { category: "image_create", count: 1, mean: 0.5 }],
           integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 1, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.22, capped_tool_cases: 4, seeding_waves: 1 }, tokens: 7620,
           composite_stderr: 0.021, history: [0.544, 0.578, 0.612] },
-        { rank: 3, miner_hotkey: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", composite: 0.587, tool_mean: 0.867, memory_mean: 0.307, first_seen: new Date(Date.now() - 86400000 * 1).toISOString(),
+        { rank: 3, finalized: true, score_count: 3, score_quorum: 3, agent_id: "33333333-3333-4333-8333-333333333333", agent_name: "Threadkeeper", miner_hotkey: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", composite: 0.587, tool_mean: 0.867, memory_mean: 0.307, first_seen: new Date(Date.now() - 86400000 * 1).toISOString(),
           median_ms: 2880, n: 12, bench_version: 2, composite_stderr: 0.019 },
-        { rank: 4, miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.382, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
-        { rank: 5, miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.356, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
+        { rank: 4, finalized: false, score_count: 2, score_quorum: 3, agent_id: "44444444-4444-4444-8444-444444444444", agent_name: "Context Forge", miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.382, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
+        { rank: 5, finalized: false, score_count: 1, score_quorum: 3, agent_id: "55555555-5555-4555-8555-555555555555", agent_name: "Longview", miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.356, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
       ]
     };
     var SAMPLE_HEALTH = {

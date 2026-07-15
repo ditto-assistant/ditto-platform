@@ -15,7 +15,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -45,6 +45,7 @@ from ditto.db.queries.audit import (
     append_audit_entry,
 )
 from ditto.db.queries.scores import upsert_score
+from ditto.db.queries.tickets import FIRST_SCORE_CONTINUATION_FLOOR
 
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
@@ -227,6 +228,60 @@ async def _seed_agent(
 
 
 class TestPublicLeaderboard:
+    async def test_includes_pre_quorum_scores_as_provisional_feedback(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.6, 0.8],
+            status=AgentStatus.EVALUATING,
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        assert body["count"] == 1
+        entry = body["entries"][0]
+        assert entry["miner_hotkey"] == _MINER_A
+        assert entry["composite"] == pytest.approx(0.7)
+        assert entry["tool_mean"] == pytest.approx(0.7)
+        assert entry["memory_mean"] == pytest.approx(0.7)
+        assert entry["finalized"] is False
+        assert entry["score_count"] == 2
+        assert entry["score_quorum"] == 3
+        assert entry["bench_version"] is None
+
+    async def test_finalized_miner_supersedes_partial_submission(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+        )
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.99],
+            status=AgentStatus.EVALUATING,
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        assert body["count"] == 1
+        entry = body["entries"][0]
+        assert entry["composite"] == pytest.approx(0.5)
+        assert entry["finalized"] is True
+        assert entry["score_count"] == 3
+
     async def test_ranks_by_composite_and_exposes_aggregates(
         self,
         app: FastAPI,
@@ -261,7 +316,10 @@ class TestPublicLeaderboard:
         assert body["count"] == 2
         assert [e["rank"] for e in body["entries"]] == [1, 2]
         assert [e["miner_hotkey"] for e in body["entries"]] == [_MINER_B, _MINER_A]
+        assert all(e["finalized"] is False for e in body["entries"])
+        assert all(e["score_count"] == 1 for e in body["entries"])
         top = body["entries"][0]
+        assert top["agent_name"] == "agent"
         assert top["composite"] == pytest.approx(0.9)
         assert top["tool_mean"] == pytest.approx(0.95)
         assert top["memory_mean"] == pytest.approx(0.8)
@@ -682,6 +740,8 @@ class TestPublicActivity:
             "duplicate_of",
             "review_reason",
             "score_count",
+            "provisional_composite",
+            "validator_queue_rank",
             "quorum",
             "screening_policy_version",
             "required_screening_policy_version",
@@ -698,6 +758,56 @@ class TestPublicActivity:
             "SECRET_FROM_BUILD",
         ):
             assert private_field not in serialized
+
+    async def test_exposes_queue_priority_with_provisional_composites(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        zero_id = await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.EVALUATING,
+            name="zero",
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        one_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.5],
+            status=AgentStatus.EVALUATING,
+        )
+        low_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.2, 0.3],
+            status=AgentStatus.EVALUATING,
+        )
+        high_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.8, 0.9],
+            status=AgentStatus.EVALUATING,
+        )
+        async with session_maker() as session, session.begin():
+            for agent_id in (one_id, low_id, high_id):
+                agent = await session.get(Agent, UUID(agent_id))
+                assert agent is not None
+                agent.screening_policy_version = SCREENING_POLICY_VERSION
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/activity")
+        by_id = {entry["agent_id"]: entry for entry in response.json()["entries"]}
+
+        assert by_id[zero_id]["validator_queue_rank"] == 1
+        assert by_id[one_id]["validator_queue_rank"] == 2
+        assert by_id[high_id]["validator_queue_rank"] == 3
+        assert by_id[low_id]["validator_queue_rank"] == 4
+        assert by_id[zero_id]["provisional_composite"] is None
+        assert by_id[one_id]["provisional_composite"] == pytest.approx(0.5)
+        assert by_id[high_id]["provisional_composite"] == pytest.approx(0.85)
+        assert by_id[low_id]["provisional_composite"] == pytest.approx(0.25)
 
     async def test_filters_complete_dataset_before_paginating_with_counts(
         self,
@@ -799,27 +909,41 @@ class TestPublicActivity:
         assert response.status_code == 422
         assert "unknown public activity status: obsolete" in response.text
 
-    async def test_exposes_latest_score_time_for_finalized_agents(
+    async def test_exposes_latest_platform_score_time_for_finalized_agents(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        scored_at = datetime(2026, 7, 14, 9, 30, 0, tzinfo=UTC)
-        await _seed_k3(
-            session_maker,
-            miner=_MINER_A,
-            composites=[0.61, 0.64, 0.67],
-            status=AgentStatus.LIVE,
-            base_time=scored_at - timedelta(minutes=2),
+        recorded_at = datetime(2026, 7, 14, 9, 30, 0, tzinfo=UTC)
+        agent_id = UUID(
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.61, 0.64, 0.67],
+                status=AgentStatus.LIVE,
+                # Validator provenance may be stale or inaccurate and must not drive
+                # the public dashboard's relative score age.
+                base_time=datetime(2026, 1, 1, tzinfo=UTC),
+            )
         )
+        async with session_maker() as session, session.begin():
+            scores = (
+                (await session.execute(select(Score).where(Score.agent_id == agent_id)))
+                .scalars()
+                .all()
+            )
+            for index, score in enumerate(scores):
+                score.created_at = recorded_at - timedelta(minutes=index)
+                score.updated_at = recorded_at - timedelta(minutes=index)
+
         _install_db(app, session_maker)
 
         entry = (await client.get("/api/v1/public/activity")).json()["entries"][0]
 
         assert entry["status"] == "live"
         assert entry["score_count"] == 3
-        assert datetime.fromisoformat(entry["last_scored_at"]) == scored_at
+        assert datetime.fromisoformat(entry["last_scored_at"]) == recorded_at
 
     async def test_active_rescreen_projects_yellow_and_exposes_version_history(
         self,
@@ -1069,6 +1193,49 @@ class TestPublicActivity:
         evaluating = (await client.get("/api/v1/public/activity")).json()["entries"][0]
         assert evaluating["status"] == "evaluating"
 
+    async def test_below_floor_score_is_a_terminal_public_stage(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        async with session_maker() as session, session.begin():
+            await upsert_score(
+                session,
+                agent_id=agent_id,
+                validator_hotkey=_VALIDATOR_C,
+                run_id="below-floor",
+                seed=42,
+                composite=FIRST_SCORE_CONTINUATION_FLOOR - 0.01,
+                tool_mean=0.24,
+                memory_mean=0.24,
+                median_ms=500,
+                n=114,
+                generated_at=datetime.now(UTC),
+                signature="ab" * 64,
+                details=None,
+            )
+        _install_db(app, session_maker)
+
+        activity = (await client.get("/api/v1/public/activity")).json()["entries"][0]
+        assert activity["status"] == "below_score_floor"
+        assert activity["score_count"] == 1
+
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()
+        assert pipeline["status"] == "below_score_floor"
+        assert pipeline["score_count"] == 1
+        assert pipeline["score_floor"] == FIRST_SCORE_CONTINUATION_FLOOR
+
     async def test_progress_is_multi_validator_allowlisted_and_recursively_redacted(
         self,
         app: FastAPI,
@@ -1296,7 +1463,7 @@ class TestPublicActivity:
         assert first["page"] == 1
         assert second["page"] == 2
 
-    async def test_exposes_progress_count_without_partial_scores(
+    async def test_exposes_progress_count_with_partial_score(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -1314,7 +1481,7 @@ class TestPublicActivity:
         entry = resp.json()["entries"][0]
         assert entry["score_count"] == 1
         assert entry["quorum"] == 3
-        assert "composite" not in resp.text
+        assert entry["provisional_composite"] == pytest.approx(0.42)
         assert "signature" not in resp.text
 
     @pytest.mark.parametrize("score_count", [0, 1, 2, 3])

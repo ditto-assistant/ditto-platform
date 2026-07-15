@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from statistics import median
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -648,3 +649,102 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         )
         for row in result
     ]
+
+
+async def list_provisional_ledger(
+    session: AsyncSession,
+) -> list[tuple[LedgerRow, int]]:
+    """Return each unfinalized miner's best partially scored submission.
+
+    This is a public-feedback read only. It deliberately considers only agents
+    still in ``evaluating`` with at least one accepted score; validator weights
+    continue to use :func:`list_eligible_ledger` and therefore remain gated on
+    the finalized ``scored`` status. Numeric fields are medians of the accepted
+    reports available so far. Opaque run details are omitted because, before
+    quorum, no single validator row is the canonical result.
+    """
+    rows = (
+        await session.execute(
+            select(Agent, Score)
+            .join(Score, Score.agent_id == Agent.agent_id)
+            .where(Agent.status == AgentStatus.EVALUATING)
+            .order_by(
+                Agent.created_at.asc(),
+                Agent.agent_id.asc(),
+                Score.generated_at.asc(),
+                Score.validator_hotkey.asc(),
+            )
+        )
+    ).all()
+
+    by_agent: dict[UUID, tuple[Agent, list[Score]]] = {}
+    for agent, score in rows:
+        if agent.agent_id not in by_agent:
+            by_agent[agent.agent_id] = (agent, [])
+        by_agent[agent.agent_id][1].append(score)
+
+    candidates: list[tuple[LedgerRow, int]] = []
+    for agent, scores in by_agent.values():
+        if not scores:
+            continue
+        representative = sorted(
+            scores, key=lambda score: (score.composite, score.validator_hotkey)
+        )[(len(scores) - 1) // 2]
+        composite = float(median(score.composite for score in scores))
+        tool_mean = float(median(score.tool_mean for score in scores))
+        memory_mean = float(median(score.memory_mean for score in scores))
+        median_ms = int(median(score.median_ms for score in scores))
+        n = int(median(score.n for score in scores))
+        candidates.append(
+            (
+                LedgerRow(
+                    miner_hotkey=agent.miner_hotkey,
+                    agent_id=agent.agent_id,
+                    composite=composite,
+                    tool_mean=tool_mean,
+                    memory_mean=memory_mean,
+                    first_seen=agent.created_at,
+                    sha256=agent.sha256,
+                    size_bytes=agent.size_bytes,
+                    run_id=representative.run_id,
+                    seed=representative.seed,
+                    validator_hotkey=representative.validator_hotkey,
+                    signature=representative.signature,
+                    status=AgentStatus.EVALUATING,
+                    median_ms=median_ms,
+                    n=n,
+                    eligible=n >= MIN_ELIGIBLE_CASES and composite > 0.0,
+                    details=None,
+                ),
+                len(scores),
+            )
+        )
+
+    candidates.sort(
+        key=lambda candidate: (
+            not candidate[0].eligible,
+            -candidate[0].composite,
+            candidate[0].first_seen,
+            str(candidate[0].agent_id),
+        ),
+    )
+    best_by_miner: dict[str, tuple[LedgerRow, int]] = {}
+    for candidate in candidates:
+        best_by_miner.setdefault(candidate[0].miner_hotkey, candidate)
+    return list(best_by_miner.values())
+
+
+async def get_score_counts(
+    session: AsyncSession, agent_ids: list[UUID]
+) -> dict[UUID, int]:
+    """Return accepted validator-score counts for the requested agents."""
+    if not agent_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(Score.agent_id, func.count(Score.validator_hotkey))
+            .where(Score.agent_id.in_(agent_ids))
+            .group_by(Score.agent_id)
+        )
+    ).all()
+    return {agent_id: int(count) for agent_id, count in rows}

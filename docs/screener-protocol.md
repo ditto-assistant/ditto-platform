@@ -36,6 +36,11 @@ Backroom and other operator clients use the bearer-protected endpoints below:
 - `GET /api/v1/admin/screening-quarantines/{quarantine_id}`
 - `POST /api/v1/admin/screening-quarantines/{quarantine_id}/resolve`
 
+Resolution actions are append-only in `resolution_history`. A resolved rejection may
+be corrected to `release` while the agent is still rejected; other second resolutions
+remain conflicts. This narrow correction path preserves the original actor, reason,
+and timestamp while allowing a reviewed false positive to resume evaluation.
+
 Resolution requires `X-Admin-Actor` and one of `release`, `rescreen`, or
 `reject`. A row lock makes resolution single-writer. Release pins a dataset if
 needed and promotes to evaluation; rescreen returns the preserved submission to

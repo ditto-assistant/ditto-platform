@@ -61,6 +61,7 @@ from ditto.db.models import (
     ScreenerHeartbeat,
     ScreeningAttempt,
     ScreeningQuarantine,
+    ScreeningQuarantineResolution,
 )
 from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
 
@@ -1305,11 +1306,112 @@ class TestQuarantineAdmin:
         )
         assert resolved.status_code == 200
         assert resolved.json()["agent_status"] == expected_status
+        assert len(resolved.json()["quarantine"]["resolution_history"]) == 1
         assert conflict.status_code == 409
         async with session_maker() as session:
             agent = await session.get(Agent, agent_id)
             assert agent is not None
             assert agent.screening_reason == expected_reason
+
+    async def test_rejected_quarantine_can_be_corrected_to_release_with_history(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        held = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                attempt_id=attempt_id,
+                outcome="quarantine",
+                manifest_digest="56" * 32,
+                finding_digest="78" * 32,
+                reason_code="agentic-source-review-tripwire",
+            ),
+        )
+        assert held.status_code == 200
+
+        quarantine = (
+            await client.get(
+                "/api/v1/admin/screening-quarantines",
+                headers={
+                    "Authorization": "Bearer test-admin-token-at-least-32-characters"
+                },
+            )
+        ).json()["items"][0]
+        admin_headers = {
+            "Authorization": "Bearer test-admin-token-at-least-32-characters",
+            "X-Admin-Actor": "backroom:test-user",
+        }
+        rejected = await client.post(
+            f"/api/v1/admin/screening-quarantines/{quarantine['quarantine_id']}/resolve",
+            headers=admin_headers,
+            json={"resolution": "reject", "reason": "Initial manual rejection"},
+        )
+        corrected = await client.post(
+            f"/api/v1/admin/screening-quarantines/{quarantine['quarantine_id']}/resolve",
+            headers={**admin_headers, "X-Admin-Actor": "backroom:second-reviewer"},
+            json={
+                "resolution": "release",
+                "reason": "Second review confirmed a false positive",
+            },
+        )
+        repeated = await client.post(
+            f"/api/v1/admin/screening-quarantines/{quarantine['quarantine_id']}/resolve",
+            headers=admin_headers,
+            json={"resolution": "release", "reason": "Release it again"},
+        )
+
+        assert rejected.status_code == 200
+        assert corrected.status_code == 200
+        assert corrected.json()["agent_status"] == AgentStatus.EVALUATING
+        assert corrected.json()["quarantine"]["resolution"] == "release"
+        assert [
+            event["resolution"]
+            for event in corrected.json()["quarantine"]["resolution_history"]
+        ] == ["reject", "release"]
+        assert repeated.status_code == 409
+
+        detail = await client.get(
+            f"/api/v1/admin/screening-quarantines/{quarantine['quarantine_id']}",
+            headers=admin_headers,
+        )
+        assert [event["actor"] for event in detail.json()["resolution_history"]] == [
+            "backroom:test-user",
+            "backroom:second-reviewer",
+        ]
+
+        pipeline = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        assert pipeline.status_code == 200
+        assert pipeline.json()["status"] == "waiting_validator"
+        assert pipeline.json()["screening_attempts"][0]["quarantine_resolution"] == (
+            "release"
+        )
+
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            history = (
+                await session.scalars(
+                    select(ScreeningQuarantineResolution).order_by(
+                        ScreeningQuarantineResolution.created_at
+                    )
+                )
+            ).all()
+            assert agent is not None
+            assert agent.status == AgentStatus.EVALUATING
+            assert agent.screening_reason == "Second review confirmed a false positive"
+            assert [event.resolution for event in history] == ["reject", "release"]
 
     async def test_admin_auth_is_required(
         self, app: FastAPI, client: httpx.AsyncClient

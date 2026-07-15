@@ -13,6 +13,13 @@ from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
 QuarantineResolution = Literal["release", "rescreen", "reject"]
 
 
+class AdminQuarantineResolutionEvent(BaseModel):
+    resolution: QuarantineResolution
+    reason: str
+    actor: str
+    created_at: datetime
+
+
 class AdminQuarantineItem(BaseModel):
     quarantine_id: UUID
     agent_id: UUID
@@ -36,6 +43,9 @@ class AdminQuarantineItem(BaseModel):
     resolved_by: str | None
     resolution: QuarantineResolution | None
     resolution_reason: str | None
+    resolution_history: list[AdminQuarantineResolutionEvent] = Field(
+        default_factory=list
+    )
 
 
 class AdminQuarantineList(BaseModel):
@@ -221,6 +231,7 @@ __all__ = [
     "AdminQuarantineContext",
     "AdminQuarantineItem",
     "AdminQuarantineList",
+    "AdminQuarantineResolutionEvent",
     "AdminQuarantineResolveRequest",
     "AdminQuarantineResolveResponse",
     "AdminScreeningAttempt",

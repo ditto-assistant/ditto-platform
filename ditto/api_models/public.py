@@ -154,6 +154,28 @@ class PublicLeaderboardEntry(BaseModel):
     """
 
     rank: Annotated[int, Field(ge=1, description="1-based rank by composite.")]
+    finalized: Annotated[
+        bool,
+        Field(
+            default=True,
+            description=(
+                "Whether the submission reached the three-validator quorum. "
+                "False entries are provisional feedback and never drive weights."
+            ),
+        ),
+    ]
+    score_count: Annotated[
+        int,
+        Field(
+            default=3,
+            ge=1,
+            description="Accepted independent validator scores currently available.",
+        ),
+    ]
+    score_quorum: Annotated[
+        int,
+        Field(default=3, ge=1, description="Scores required for finalization."),
+    ]
     agent_id: Annotated[
         UUID,
         Field(
@@ -163,6 +185,10 @@ class PublicLeaderboardEntry(BaseModel):
                 "/public/submissions."
             )
         ),
+    ]
+    agent_name: Annotated[
+        str,
+        Field(description="Human-friendly name of the miner's winning agent."),
     ]
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Miner's SS58 hotkey.")
@@ -293,6 +319,9 @@ class PublicLeaderboardEntry(BaseModel):
         json_schema_extra={
             "example": {
                 "rank": 1,
+                "finalized": True,
+                "score_count": 3,
+                "score_quorum": 3,
                 "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
                 "composite": 0.587,
                 "composite_stderr": 0.014,
@@ -602,7 +631,10 @@ class PublicActivityEntry(BaseModel):
     ]
     last_scored_at: Annotated[
         datetime | None,
-        Field(default=None, description="Most recent score time for this agent (UTC)."),
+        Field(
+            default=None,
+            description="When the platform most recently recorded a score (UTC).",
+        ),
     ]
     screening_reason: Annotated[
         str | None,
@@ -622,6 +654,26 @@ class PublicActivityEntry(BaseModel):
     score_count: Annotated[
         int,
         Field(ge=0, description="Independent validator scores recorded so far."),
+    ]
+    provisional_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description="Mean composite across accepted validator scores so far.",
+        ),
+    ]
+    validator_queue_rank: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description=(
+                "Current global validator-assignment priority for a waiting "
+                "submission. Validator-specific eligibility may skip a row."
+            ),
+        ),
     ]
     quorum: Annotated[
         int,
@@ -797,6 +849,14 @@ class PublicSubmissionPipeline(BaseModel):
     status: str
     score_count: Annotated[int, Field(ge=0)]
     quorum: Annotated[int, Field(ge=1)]
+    score_floor: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Minimum provisional score required for another ticket.",
+        ),
+    ]
     provisional_scores: list[PublicProvisionalScore] = Field(default_factory=list)
     final_composite: Annotated[
         float | None,
@@ -1026,6 +1086,12 @@ class PublicHealthResponse(BaseModel):
 
 FleetAvailability = Literal["available", "stale", "offline", "paused", "unknown"]
 FleetHealth = Literal["healthy", "warning", "unknown"]
+ValidatorAssignmentState = Literal[
+    "synchronized",
+    "heartbeat_stale",
+    "heartbeat_mismatch",
+    "unassigned",
+]
 
 
 class PublicSystemMetrics(BaseModel):
@@ -1048,6 +1114,10 @@ class PublicValidatorHeartbeat(BaseModel):
     software_version: str
     protocol_version: Annotated[int, Field(ge=1)]
     state: ValidatorRuntimeState
+    assigned_agent_id: UUID | None = None
+    assigned_agent_name: str | None = None
+    reported_agent_id: UUID | None = None
+    assignment_state: ValidatorAssignmentState
     active_agent_id: UUID | None = None
     active_benchmark: PublicBenchmarkProgress | None = None
     first_seen_at: datetime | None = None
@@ -1068,6 +1138,14 @@ class PublicValidatorHeartbeatsResponse(BaseModel):
     reported_count: Annotated[int, Field(ge=0)]
     online_count: Annotated[int, Field(ge=0)]
     validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)
+
+
+class PublicOperationsResponse(BaseModel):
+    """One cacheable operations snapshot shared by pipeline and fleet views."""
+
+    generated_at: datetime
+    activity: PublicActivityResponse
+    validators: PublicValidatorHeartbeatsResponse
 
 
 class PublicValidatorName(BaseModel):

@@ -103,6 +103,7 @@ class TestDashboard:
         [
             "/api/v1/public/leaderboard",
             "/api/v1/public/activity",
+            "/api/v1/public/operations",
             "/api/v1/public/validators",
             "/api/v1/public/screeners",
         ],
@@ -121,7 +122,22 @@ class TestDashboard:
         assert "<h2>Recent submissions</h2>" not in body
         assert "<h2>What DittoBench v2 measures</h2>" not in body
         assert "Submission pipeline" in body
-        assert body.index("<h2>Leaderboard</h2>") < body.index('class="operations"')
+        assert body.index('id="leaderboard-title">Leaderboard</h2>') < body.index(
+            'class="operations"'
+        )
+        assert 'id="leaderboard-title">Leaderboard' in body
+        assert 'id="leaderboard-notice" role="status" aria-live="polite"' in body
+        assert "Provisional standings." in body
+        assert "not the required 3 of 3 scores" in body
+        assert "only final results drive emissions" in body
+        assert 'class="quorum-badge"' in body
+        assert ">Winning agent</span>" in body
+        assert 'class="winner-identity"' in body
+        assert 'entityAnchor("agent", e.agent_id, agentName)' in body
+        assert '", agent " + agentName + ", miner "' in body
+        assert "function isFinalized(e)" in body
+        assert '"Provisional leaderboard"' in body
+        assert '"P" + e.rank' in body
         assert "getJSON(activityRequestPath(page))" in body
         assert 'id="activity-rows"' in body
         assert 'id="activity-pager"' in body
@@ -129,13 +145,19 @@ class TestDashboard:
         assert "Network operations" in body
         assert "Waiting for screening" in body
         assert "Waiting for scores" in body
+        assert "function validatorQueueCompare(a, b)" in body
+        assert "indexed.sort(validatorQueueCompare)" in body
+        assert "validator_queue_rank" in body
+        assert "entry.provisional_composite" in body
+        assert '"Provisional " + fx(Number(entry.provisional_composite))' in body
+        assert "Highest current priority; validator eligibility can vary" in body
+        assert ">Up next</span>" in body
         assert "Evaluating" in body
         assert 'id="pipeline-scored"' in body
         assert 'data-pipeline-stage="scored"' in body
         assert "Recent scores" in body
-        assert 'statuses: ["scored", "live"]' in body
-        assert 'getJSON("/public/activity?page=1&limit=200")' in body
-        assert 'getJSON("/public/activity?page=" + page + "&limit=200")' in body
+        assert 'statuses: ["scored", "live", "below_score_floor"]' in body
+        assert 'getJSON("/public/operations")' in body
         assert "max-height: 390px" in body
         assert "indexed.slice(0, 5)" not in body
         assert body.count('type="button" data-activity-page="prev"') == 2
@@ -207,6 +229,9 @@ class TestDashboard:
         assert 'data-activity-filter="waiting_validator" aria-pressed="false"' in body
         assert 'data-activity-filter="queued" aria-pressed="false"' in body
         assert 'waiting_screening", "screening", "waiting_validator' in body
+        assert 'below_score_floor: ["Below score floor", "warn"]' in body
+        assert '"below_score_floor", "under_review"' in body
+        assert "No further validator tickets will be issued." in body
         assert 'id="activity-clear" type="button" hidden' in body
         assert 'id="activity-filter-summary" role="status" aria-live="polite"' in body
         assert 'query.append("status", status)' in body
@@ -286,7 +311,7 @@ class TestDashboard:
         assert "Missing optional telemetry is not an outage." in body
         assert "allowlisted" not in body
         assert 'id="fleet-count-unknown"' in body
-        assert 'getJSON("/public/validators")' in body
+        assert 'getJSON("/public/operations")' in body
         assert 'getJSON("/public/validator-names")' in body
         assert 'getJSON("/public/screeners")' in body
         assert 'getElementById("show-screeners").addEventListener' in body
@@ -297,6 +322,23 @@ class TestDashboard:
         assert "privacy-note" not in body
         assert "fleet-health-note" not in body
         assert '" reporting " + kind' not in body
+
+    async def test_operations_panels_share_one_snapshot_and_show_skew(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert body.count('getJSON("/public/operations")') == 1
+        assert 'getJSON("/public/validators")' not in body
+        assert 'getJSON("/public/activity?page=1&limit=200")' not in body
+        assert 'id="operations-snapshot" aria-live="polite"' in body
+        assert "Pipeline and fleet reconciled" in body
+        assert 'entry.assignment_state === "heartbeat_mismatch"' in body
+        assert 'entry.assignment_state === "heartbeat_stale"' in body
+        assert 'return ["Mismatch", "bad"]' in body
+        assert "counts.warning++" in body
+        assert "Assignment mismatch" in body
+        assert "Heartbeat stale" in body
+        assert "<b>Platform</b>" in body
+        assert "<b>Heartbeat</b>" in body
 
     async def test_includes_accessible_benchmark_progress(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
@@ -401,7 +443,7 @@ class TestDashboard:
             assert f'href="#/{page}"' in body
             assert f'data-page="{page}"' in body
         assert 'href="#/leaderboard"' not in body
-        assert "<h2>Leaderboard</h2>" in body  # folded into Overview
+        assert 'id="leaderboard-title">Leaderboard</h2>' in body  # folded into Overview
         assert 'data-theme-choice="system"' in body  # switcher still wired
 
     async def test_dashboard_entities_use_smooth_hash_routes(self) -> None:

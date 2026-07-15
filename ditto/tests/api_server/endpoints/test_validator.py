@@ -553,6 +553,107 @@ class TestHeartbeat:
             "percent": None,
         }
 
+    async def test_operations_snapshot_is_atomic_and_synchronized(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        heartbeat = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=2,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+            ),
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+
+        response = await client.get("/api/v1/public/operations")
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "public, max-age=10"
+        snapshot = response.json()
+        assert snapshot["generated_at"] == snapshot["activity"]["generated_at"]
+        assert snapshot["generated_at"] == snapshot["validators"]["generated_at"]
+        validator = snapshot["validators"]["validators"][0]
+        assert validator["assignment_state"] == "synchronized"
+        assert validator["assigned_agent_id"] == str(agent_id)
+        assert validator["reported_agent_id"] == str(agent_id)
+        assert validator["active_agent_id"] == str(agent_id)
+        activity = snapshot["activity"]["entries"][0]
+        assert activity["status"] == "evaluating"
+        assert activity["active_benchmarks"][0]["agent_id"] == str(agent_id)
+
+    async def test_operations_snapshot_surfaces_different_reported_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        assigned_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        reported_id = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, name="reported-agent"
+        )
+        await _seed_ticket(session_maker, assigned_id)
+        await _seed_validator_heartbeat(session_maker, protocol_version=2)
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert heartbeat is not None
+            heartbeat.state = "running_benchmark"
+            heartbeat.active_agent_id = reported_id
+            heartbeat.reported_at = now
+            heartbeat.seen_at = now
+        _install_db(app, session_maker)
+
+        snapshot = (await client.get("/api/v1/public/operations")).json()
+        validator = snapshot["validators"]["validators"][0]
+        assert validator["assignment_state"] == "heartbeat_mismatch"
+        assert validator["assigned_agent_id"] == str(assigned_id)
+        assert validator["assigned_agent_name"] == "alpha-agent"
+        assert validator["reported_agent_id"] == str(reported_id)
+        assert validator["active_agent_id"] is None
+        assigned = next(
+            entry
+            for entry in snapshot["activity"]["entries"]
+            if entry["agent_id"] == str(assigned_id)
+        )
+        assert assigned["status"] == "waiting_validator"
+        assert assigned["active_benchmarks"] == []
+
+    async def test_operations_snapshot_surfaces_stale_heartbeat_assignment(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        stale = datetime.now(UTC) - timedelta(minutes=10)
+        await _seed_validator_heartbeat(
+            session_maker, protocol_version=2, seen_at=stale
+        )
+        async with session_maker() as session, session.begin():
+            heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert heartbeat is not None
+            heartbeat.state = "running_benchmark"
+            heartbeat.active_agent_id = agent_id
+        _install_db(app, session_maker)
+
+        snapshot = (await client.get("/api/v1/public/operations")).json()
+        validator = snapshot["validators"]["validators"][0]
+        assert validator["assignment_state"] == "heartbeat_stale"
+        assert validator["availability"] == "stale"
+        assert validator["assigned_agent_id"] == str(agent_id)
+        assert validator["reported_agent_id"] == str(agent_id)
+        assert validator["active_agent_id"] is None
+        assert snapshot["activity"]["entries"][0]["status"] == "waiting_validator"
+
     @pytest.mark.e2e
     async def test_v4_progresses_public_lifecycle_and_terminal_score_clears_it(
         self,

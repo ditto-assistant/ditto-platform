@@ -68,7 +68,7 @@ New router `endpoints/public.py`, mounted at `/api/v1/public`, **no auth**,
 rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
 
 - `GET /api/v1/public/leaderboard` → `{ generated_at, count, entries: [
-  { rank, miner_hotkey, composite, tool_mean, memory_mean, first_seen, n,
+  { rank, agent_id, agent_name, miner_hotkey, composite, tool_mean, memory_mean, first_seen, n,
     median_ms, bench_version, dataset_sha256, models, per_category,
     integrity, tokens } ] }`.
   Best-per-miner, ranked by composite. The provenance block (`models` =

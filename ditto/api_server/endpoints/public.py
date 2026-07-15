@@ -58,6 +58,7 @@ from ditto.api_models import (
     PublicHealthResponse,
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
+    PublicOperationsResponse,
     PublicProvisionalScore,
     PublicRunModels,
     PublicScreenerHeartbeat,
@@ -77,7 +78,11 @@ from ditto.api_models import (
     PublicValidatorScore,
 )
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.public import FleetAvailability, FleetHealth
+from ditto.api_models.public import (
+    FleetAvailability,
+    FleetHealth,
+    ValidatorAssignmentState,
+)
 from ditto.api_models.screener import (
     SCREENING_POLICY_VERSION,
     ScreenerProgress,
@@ -93,7 +98,9 @@ from ditto.db.models import Agent, Score, ScreeningQuarantine, ValidatorTicket
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.heartbeats import (
+    ActiveValidatorAssignment,
     ActiveValidatorWork,
+    list_active_validator_assignments,
     list_active_validator_work,
     list_screener_heartbeats,
     list_validator_heartbeats,
@@ -103,9 +110,11 @@ from ditto.db.queries.scores import (
     LedgerRow,
     SubmissionRow,
     get_public_health,
+    get_score_counts,
     get_submission_scores,
     list_eligible_ledger,
     list_miner_composite_history,
+    list_provisional_ledger,
     list_public_submissions,
     list_scores_for_bench_version,
 )
@@ -113,6 +122,7 @@ from ditto.db.queries.screening import (
     get_running_screening_attempts,
     list_screening_attempts,
 )
+from ditto.db.queries.tickets import FIRST_SCORE_CONTINUATION_FLOOR
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +144,7 @@ _PUBLIC_ACTIVITY_STATUSES = frozenset(
         "screening",
         "waiting_validator",
         "evaluating",
+        "below_score_floor",
         "under_review",
         "rejected",
         "scored",
@@ -430,7 +441,13 @@ def _safe_stderr(details: dict) -> float | None:
 
 
 def _public_entry(
-    rank: int, r: LedgerRow, history: list[float] | None = None
+    rank: int,
+    r: LedgerRow,
+    agent_name: str,
+    history: list[float] | None = None,
+    *,
+    finalized: bool = True,
+    score_count: int = SCORING_QUORUM,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -449,7 +466,11 @@ def _public_entry(
     calibration_brier, calibration_n = _safe_calibration(details)
     return PublicLeaderboardEntry(
         rank=rank,
+        finalized=finalized,
+        score_count=score_count,
+        score_quorum=SCORING_QUORUM,
         agent_id=r.agent_id,
+        agent_name=agent_name,
         miner_hotkey=r.miner_hotkey,
         composite=r.composite,
         composite_stderr=_safe_stderr(details),
@@ -477,16 +498,74 @@ async def leaderboard(
     response: Response,
     session: SessionDep,
 ) -> PublicLeaderboardResponse:
-    """Best eligible score per miner, aggregate-only, highest composite first."""
+    """Best score per miner, with pre-quorum results marked provisional."""
     response.headers["Cache-Control"] = _CACHE_CONTROL
-    rows = await list_eligible_ledger(session)
+    ledger_rows = await list_eligible_ledger(session)
+    score_counts = await get_score_counts(
+        session, [row.agent_id for row in ledger_rows]
+    )
+    finalized_rows = [
+        row
+        for row in ledger_rows
+        if score_counts.get(row.agent_id, 0) >= SCORING_QUORUM
+    ]
+    finalized_miners = {row.miner_hotkey for row in finalized_rows}
+    provisional_candidates = [
+        (row, score_counts.get(row.agent_id, 0))
+        for row in ledger_rows
+        if score_counts.get(row.agent_id, 0) < SCORING_QUORUM
+    ] + list(await list_provisional_ledger(session))
+    provisional_candidates.sort(
+        key=lambda candidate: (
+            not candidate[0].eligible,
+            -candidate[0].composite,
+            candidate[0].first_seen,
+            str(candidate[0].agent_id),
+        )
+    )
+    provisional_by_miner: dict[str, tuple[LedgerRow, int]] = {}
+    for candidate in provisional_candidates:
+        if candidate[0].miner_hotkey not in finalized_miners:
+            provisional_by_miner.setdefault(candidate[0].miner_hotkey, candidate)
+    provisional_rows = list(provisional_by_miner.values())
+    rows = finalized_rows + [row for row, _count in provisional_rows]
+    agent_names: dict[UUID, str] = dict(
+        (
+            await session.execute(
+                select(Agent.agent_id, Agent.name).where(
+                    Agent.agent_id.in_([row.agent_id for row in rows])
+                )
+            )
+        )
+        .tuples()
+        .all()
+    )
     histories = await list_miner_composite_history(
         session, [r.miner_hotkey for r in rows]
     )
-    entries = [
-        _public_entry(i, r, histories.get(r.miner_hotkey))
-        for i, r in enumerate(rows, start=1)
-    ]
+    entries = []
+    for i, row in enumerate(finalized_rows, start=1):
+        entries.append(
+            _public_entry(
+                i,
+                row,
+                agent_names[row.agent_id],
+                histories.get(row.miner_hotkey),
+                finalized=True,
+                score_count=score_counts.get(row.agent_id, SCORING_QUORUM),
+            )
+        )
+    for row, count in provisional_rows:
+        entries.append(
+            _public_entry(
+                len(entries) + 1,
+                row,
+                agent_names[row.agent_id],
+                histories.get(row.miner_hotkey),
+                finalized=False,
+                score_count=count,
+            )
+        )
     return PublicLeaderboardResponse(
         generated_at=datetime.now(UTC),
         count=len(entries),
@@ -520,25 +599,18 @@ async def health(
     )
 
 
-@router.get("/validators", response_model=PublicValidatorHeartbeatsResponse)
-async def validators(
-    response: Response,
-    session: SessionDep,
+def _validator_heartbeats_response(
+    *,
+    rows: list[Any],
+    assignments: list[ActiveValidatorAssignment],
+    active_work: list[ActiveValidatorWork],
+    now: datetime,
 ) -> PublicValidatorHeartbeatsResponse:
-    """Signed software versions reported by heartbeat-capable validators.
-
-    This intentionally lists reporters, not every on-chain permit holder: a
-    missing hotkey means its software has not proved its version to the platform.
-    """
-    response.headers["Cache-Control"] = _CACHE_CONTROL
-    now = datetime.now(UTC)
-    rows = await list_validator_heartbeats(session)
-    active_by_hotkey = {
-        work.heartbeat.validator_hotkey: work
-        for work in await list_active_validator_work(
-            session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
-        )
+    """Reconcile platform leases and signed heartbeat claims without conflating them."""
+    assignment_by_hotkey = {
+        assignment.ticket.validator_hotkey: assignment for assignment in assignments
     }
+    active_by_hotkey = {work.heartbeat.validator_hotkey: work for work in active_work}
     entries = []
     for row in rows:
         seen_at = cast(datetime, _aware(row.seen_at))
@@ -546,19 +618,43 @@ async def validators(
         online, availability, health = _fleet_classification(
             state=row.state, seen_at=seen_at, now=now, metrics=metrics
         )
-        active_work = active_by_hotkey.get(row.validator_hotkey)
+        assignment = assignment_by_hotkey.get(row.validator_hotkey)
+        synchronized_work = active_by_hotkey.get(row.validator_hotkey)
+        assignment_state: ValidatorAssignmentState
+        if assignment is None:
+            assignment_state = (
+                "heartbeat_mismatch"
+                if row.active_agent_id is not None
+                else "unassigned"
+            )
+        elif seen_at < now - _VALIDATOR_ONLINE_WINDOW:
+            assignment_state = "heartbeat_stale"
+        elif synchronized_work is not None:
+            assignment_state = "synchronized"
+        else:
+            assignment_state = "heartbeat_mismatch"
         entries.append(
             PublicValidatorHeartbeat(
                 validator_hotkey=row.validator_hotkey,
                 software_version=row.software_version,
                 protocol_version=row.protocol_version,
                 state=cast(ValidatorRuntimeState, row.state),
+                assigned_agent_id=(
+                    assignment.agent.agent_id if assignment is not None else None
+                ),
+                assigned_agent_name=(
+                    assignment.agent.name if assignment is not None else None
+                ),
+                reported_agent_id=row.active_agent_id,
+                assignment_state=assignment_state,
                 active_agent_id=(
-                    active_work.agent.agent_id if active_work is not None else None
+                    synchronized_work.agent.agent_id
+                    if synchronized_work is not None
+                    else None
                 ),
                 active_benchmark=(
-                    _public_benchmark_progress(active_work)
-                    if active_work is not None
+                    _public_benchmark_progress(synchronized_work)
+                    if synchronized_work is not None
                     else None
                 ),
                 first_seen_at=_aware(row.first_seen_at),
@@ -577,6 +673,24 @@ async def validators(
         reported_count=len(entries),
         online_count=sum(entry.online for entry in entries),
         validators=entries,
+    )
+
+
+@router.get("/validators", response_model=PublicValidatorHeartbeatsResponse)
+async def validators(
+    response: Response,
+    session: SessionDep,
+) -> PublicValidatorHeartbeatsResponse:
+    """Signed reports reconciled with the platform's current assignment truth."""
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    now = datetime.now(UTC)
+    return _validator_heartbeats_response(
+        rows=await list_validator_heartbeats(session),
+        assignments=await list_active_validator_assignments(session, now=now),
+        active_work=await list_active_validator_work(
+            session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
+        ),
+        now=now,
     )
 
 
@@ -805,6 +919,8 @@ def _public_activity_status(
     screening_policy_version: int,
     has_active_attempt: bool,
     has_active_validation: bool,
+    score_count: int = 0,
+    provisional_composite: float | None = None,
 ) -> str:
     """Collapse internal moderation detail into stable public lifecycle labels."""
     needs_rescreen = (
@@ -820,12 +936,146 @@ def _public_activity_status(
     if status in (AgentStatus.UPLOADED, AgentStatus.SCREENING_FAILED) or needs_rescreen:
         return "waiting_screening"
     if status in (AgentStatus.SCREENING_PASSED, AgentStatus.EVALUATING):
+        if (
+            status == AgentStatus.EVALUATING
+            and not has_active_validation
+            and score_count == 1
+            and provisional_composite is not None
+            and provisional_composite < FIRST_SCORE_CONTINUATION_FLOOR
+        ):
+            return "below_score_floor"
         return "evaluating" if has_active_validation else "waiting_validator"
     if status in (AgentStatus.ATH_PENDING_REVIEW, AgentStatus.QUARANTINED):
         return "under_review"
     if status == AgentStatus.BANNED:
         return "rejected"
     return status.value
+
+
+def _public_activity_response(
+    *,
+    rows: list[Any],
+    active_work: list[ActiveValidatorWork],
+    now: datetime,
+    page: int,
+    limit: int,
+    requested_statuses: set[str],
+    query: str | None,
+) -> PublicActivityResponse:
+    """Project activity from the same validated work set used by fleet health."""
+    active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
+    for work in active_work:
+        active_by_agent.setdefault(work.agent.agent_id, []).append(
+            _public_benchmark_progress(work)
+        )
+    active_agent_ids = set(active_by_agent)
+
+    def public_status(row: Any) -> str:
+        return _public_activity_status(
+            row.agent.status,
+            screening_policy_version=row.agent.screening_policy_version,
+            has_active_attempt=row.screening_attempt is not None,
+            has_active_validation=row.agent.agent_id in active_agent_ids,
+            score_count=row.score_count,
+            provisional_composite=row.provisional_composite,
+        )
+
+    projected = [(row, public_status(row)) for row in rows]
+    # Mirror the validator ticket queue's global ordering. The ticket query adds
+    # validator-specific retry and eligibility checks that can still skip a row.
+    waiting_rows = sorted(
+        (row for row, row_status in projected if row_status == "waiting_validator"),
+        key=lambda row: (
+            row.score_count,
+            -(
+                row.provisional_composite or 0.0
+                if row.score_count >= SCORING_QUORUM - 1
+                else 0.0
+            ),
+            row.agent.created_at,
+            str(row.agent.agent_id),
+        ),
+    )
+    validator_queue_ranks = {
+        row.agent.agent_id: rank for rank, row in enumerate(waiting_rows, start=1)
+    }
+    normalized_query = query.strip().casefold() if query else ""
+    if normalized_query:
+        projected = [
+            (row, row_status)
+            for row, row_status in projected
+            if normalized_query
+            in " ".join(
+                (
+                    row.agent.name,
+                    str(row.agent.agent_id),
+                    row.agent.miner_hotkey,
+                    row_status,
+                )
+            ).casefold()
+        ]
+
+    status_counts: dict[str, int] = {}
+    for _, row_status in projected:
+        status_counts[row_status] = status_counts.get(row_status, 0) + 1
+    if requested_statuses:
+        projected = [
+            (row, row_status)
+            for row, row_status in projected
+            if row_status in requested_statuses
+        ]
+
+    total = len(projected)
+    page_rows = projected[(page - 1) * limit : page * limit]
+    return PublicActivityResponse(
+        generated_at=now,
+        count=len(page_rows),
+        total=total,
+        status_counts=status_counts,
+        page=page,
+        page_size=limit,
+        total_pages=max(1, math.ceil(total / limit)),
+        entries=[
+            PublicActivityEntry(
+                agent_id=row.agent.agent_id,
+                miner_hotkey=row.agent.miner_hotkey,
+                name=row.agent.name,
+                status=row_status,
+                submitted_at=row.agent.created_at,
+                last_scored_at=_aware(row.last_scored_at),
+                screening_reason=(
+                    None
+                    if row_status in ("waiting_screening", "screening")
+                    else row.agent.screening_reason
+                ),
+                duplicate_of=row.agent.duplicate_of,
+                review_reason=row.agent.review_reason,
+                score_count=row.score_count,
+                provisional_composite=row.provisional_composite,
+                validator_queue_rank=validator_queue_ranks.get(row.agent.agent_id),
+                quorum=SCORING_QUORUM,
+                screening_policy_version=row.agent.screening_policy_version,
+                required_screening_policy_version=SCREENING_POLICY_VERSION,
+                screening_attempt_id=(
+                    row.screening_attempt.attempt_id
+                    if row.screening_attempt is not None
+                    else None
+                ),
+                screening_started_at=(
+                    row.screening_attempt.started_at
+                    if row.screening_attempt is not None
+                    else None
+                ),
+                screening_deadline=(
+                    row.screening_attempt.deadline
+                    if row.screening_attempt is not None
+                    else None
+                ),
+                active_benchmarks=active_by_agent.get(row.agent.agent_id, []),
+            )
+            for row, row_status in page_rows
+        ],
+    )
 
 
 @router.get("/activity", response_model=PublicActivityResponse)
@@ -854,101 +1104,54 @@ async def activity(
             + ", ".join(sorted(unknown_statuses)),
         )
 
-    rows, _ = await list_public_activity(session)
     now = datetime.now(UTC)
-    active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
-    for work in await list_active_validator_work(
-        session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
-    ):
-        active_by_agent.setdefault(work.agent.agent_id, []).append(
-            _public_benchmark_progress(work)
-        )
-    active_agent_ids = set(active_by_agent)
-
-    def public_status(row: Any) -> str:
-        return _public_activity_status(
-            row.agent.status,
-            screening_policy_version=row.agent.screening_policy_version,
-            has_active_attempt=row.screening_attempt is not None,
-            has_active_validation=row.agent.agent_id in active_agent_ids,
-        )
-
-    projected = [(row, public_status(row)) for row in rows]
-    normalized_query = q.strip().casefold() if q else ""
-    if normalized_query:
-        projected = [
-            (row, row_status)
-            for row, row_status in projected
-            if normalized_query
-            in " ".join(
-                (
-                    row.agent.name,
-                    str(row.agent.agent_id),
-                    row.agent.miner_hotkey,
-                    row_status,
-                )
-            ).casefold()
-        ]
-
-    status_counts: dict[str, int] = {}
-    for _, row_status in projected:
-        status_counts[row_status] = status_counts.get(row_status, 0) + 1
-    if requested_statuses:
-        projected = [
-            (row, row_status)
-            for row, row_status in projected
-            if row_status in requested_statuses
-        ]
-
-    total = len(projected)
-    page_rows = projected[(page - 1) * limit : page * limit]
-
-    return PublicActivityResponse(
-        generated_at=now,
-        count=len(page_rows),
-        total=total,
-        status_counts=status_counts,
+    rows, _ = await list_public_activity(session)
+    return _public_activity_response(
+        rows=rows,
+        active_work=await list_active_validator_work(
+            session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
+        ),
+        now=now,
         page=page,
-        page_size=limit,
-        total_pages=max(1, math.ceil(total / limit)),
-        entries=[
-            PublicActivityEntry(
-                agent_id=row.agent.agent_id,
-                miner_hotkey=row.agent.miner_hotkey,
-                name=row.agent.name,
-                status=row_status,
-                submitted_at=row.agent.created_at,
-                last_scored_at=_aware(row.last_scored_at),
-                screening_reason=(
-                    None
-                    if row_status in ("waiting_screening", "screening")
-                    else row.agent.screening_reason
-                ),
-                duplicate_of=row.agent.duplicate_of,
-                review_reason=row.agent.review_reason,
-                score_count=row.score_count,
-                quorum=SCORING_QUORUM,
-                screening_policy_version=row.agent.screening_policy_version,
-                required_screening_policy_version=SCREENING_POLICY_VERSION,
-                screening_attempt_id=(
-                    row.screening_attempt.attempt_id
-                    if row.screening_attempt is not None
-                    else None
-                ),
-                screening_started_at=(
-                    row.screening_attempt.started_at
-                    if row.screening_attempt is not None
-                    else None
-                ),
-                screening_deadline=(
-                    row.screening_attempt.deadline
-                    if row.screening_attempt is not None
-                    else None
-                ),
-                active_benchmarks=active_by_agent.get(row.agent.agent_id, []),
-            )
-            for row, row_status in page_rows
-        ],
+        limit=limit,
+        requested_statuses=requested_statuses,
+        query=q,
+    )
+
+
+@router.get("/operations", response_model=PublicOperationsResponse)
+async def operations(
+    response: Response,
+    session: SessionDep,
+) -> PublicOperationsResponse:
+    """Atomic dashboard snapshot for submission pipeline and validator fleet health."""
+    response.headers["Cache-Control"] = "public, max-age=10"
+    now = datetime.now(UTC)
+    activity_rows, _ = await list_public_activity(session)
+    heartbeat_rows = await list_validator_heartbeats(session)
+    assignments = await list_active_validator_assignments(session, now=now)
+    active_work = await list_active_validator_work(
+        session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
+    )
+    activity_snapshot = _public_activity_response(
+        rows=activity_rows,
+        active_work=active_work,
+        now=now,
+        page=1,
+        limit=max(1, len(activity_rows)),
+        requested_statuses=set(),
+        query=None,
+    )
+    validator_snapshot = _validator_heartbeats_response(
+        rows=heartbeat_rows,
+        assignments=assignments,
+        active_work=active_work,
+        now=now,
+    )
+    return PublicOperationsResponse(
+        generated_at=now,
+        activity=activity_snapshot,
+        validators=validator_snapshot,
     )
 
 
@@ -1021,9 +1224,16 @@ async def agent_pipeline(
             screening_policy_version=agent.screening_policy_version,
             has_active_attempt=running_attempt is not None,
             has_active_validation=bool(active_work),
+            score_count=len(accepted_scores),
+            provisional_composite=(
+                statistics.mean(score.composite for score in accepted_scores)
+                if accepted_scores
+                else None
+            ),
         ),
         score_count=len(accepted_scores),
         quorum=SCORING_QUORUM,
+        score_floor=FIRST_SCORE_CONTINUATION_FLOOR,
         provisional_scores=[
             PublicProvisionalScore(
                 composite=score.composite,

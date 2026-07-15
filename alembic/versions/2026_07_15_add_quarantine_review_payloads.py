@@ -1,7 +1,7 @@
 """add bounded review payloads to screening quarantines
 
 Revision ID: a2d7f4c81e93
-Revises: a31d8b4c9e72
+Revises: b42e9c5d1f83
 Create Date: 2026-07-14 12:00:00.000000
 
 Quarantine rows previously carried only ``reason_code`` plus evidence digests,
@@ -27,7 +27,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "a2d7f4c81e93"
-down_revision: str | Sequence[str] | None = "a31d8b4c9e72"
+down_revision: str | Sequence[str] | None = "b42e9c5d1f83"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

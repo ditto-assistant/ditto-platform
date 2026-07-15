@@ -19,12 +19,12 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
-from ditto.db.models import Agent, ValidatorTicket
+from ditto.db.models import Agent, Score, ValidatorTicket
 from ditto.db.queries.scores import SCORING_QUORUM
 
 if TYPE_CHECKING:
@@ -47,6 +47,13 @@ _LIVE_TICKET_STATUSES = (TicketStatus.ISSUED, TicketStatus.SCORED)
 # independent attempt immediately.
 RETRY_COOLDOWN = timedelta(hours=6)
 MAX_ATTEMPTS_PER_VERSION = 2
+
+# A very low first full-benchmark score is not competitive enough to justify
+# two more independent validator runs. This is intentionally conservative: the
+# live launch sample's only first score below 0.25 later finalized at 0.344,
+# while every other finalized first score was at least 0.465. Keep this policy
+# platform-owned so every validator sees the same assignment boundary.
+FIRST_SCORE_CONTINUATION_FLOOR = 0.25
 
 
 async def expire_overdue_tickets(session: AsyncSession, *, now: datetime) -> int:
@@ -170,6 +177,28 @@ async def issue_ticket(
         .scalar_subquery()
     )
     total_coverage = accepted_score_count + live_assignment_count
+    provisional_composite = func.coalesce(
+        (
+            select(func.avg(Score.composite))
+            .where(Score.agent_id == Agent.agent_id)
+            .correlate(Agent)
+            .scalar_subquery()
+        ),
+        0.0,
+    )
+    recorded_score_count = (
+        select(func.count(Score.validator_hotkey))
+        .where(Score.agent_id == Agent.agent_id)
+        .correlate(Agent)
+        .scalar_subquery()
+    )
+    completion_lane_score = case(
+        (
+            accepted_score_count >= SCORING_QUORUM - 1,
+            provisional_composite,
+        ),
+        else_=0.0,
+    )
     # Lock one candidate Agent row before counting its tickets. The recount is a
     # separate statement after the lock is acquired, so under Postgres READ
     # COMMITTED it sees any ticket committed by the previous lock holder.
@@ -180,6 +209,8 @@ async def issue_ticket(
             Agent.status == AgentStatus.EVALUATING,
             Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
             Agent.agent_id.not_in(already_mine),
+            (recorded_score_count != 1)
+            | (provisional_composite >= FIRST_SCORE_CONTINUATION_FLOOR),
         )
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
@@ -189,10 +220,13 @@ async def issue_ticket(
             # jump from zero coverage to three concurrent validators while
             # another eligible agent remains uncovered. Within one coverage
             # round, never-attempted work precedes this validator's cooled-down
-            # retry, then the oldest submission wins with a stable UUID tie-break.
+            # retry. Once candidates reach the two-score completion lane, prefer
+            # the highest provisional composite so the likely emission winner
+            # reaches quorum first. Submission age and UUID remain stable ties.
             candidate.order_by(
                 total_coverage.asc(),
                 had_prior_ticket.asc(),
+                completion_lane_score.desc(),
                 Agent.created_at.asc(),
                 Agent.agent_id.asc(),
             )
