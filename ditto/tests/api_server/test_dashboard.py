@@ -145,6 +145,13 @@ class TestDashboard:
         assert "Network operations" in body
         assert "Waiting for screening" in body
         assert "Waiting for scores" in body
+        assert "function validatorQueueCompare(a, b)" in body
+        assert "indexed.sort(validatorQueueCompare)" in body
+        assert "validator_queue_rank" in body
+        assert "entry.provisional_composite" in body
+        assert '"Provisional " + fx(Number(entry.provisional_composite))' in body
+        assert "Highest current priority; validator eligibility can vary" in body
+        assert ">Up next</span>" in body
         assert "Evaluating" in body
         assert 'id="pipeline-scored"' in body
         assert 'data-pipeline-stage="scored"' in body

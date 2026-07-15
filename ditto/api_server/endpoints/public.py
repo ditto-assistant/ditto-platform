@@ -967,6 +967,24 @@ def _public_activity_response(
         )
 
     projected = [(row, public_status(row)) for row in rows]
+    # Mirror the validator ticket queue's global ordering. The ticket query adds
+    # validator-specific retry and eligibility checks that can still skip a row.
+    waiting_rows = sorted(
+        (row for row, row_status in projected if row_status == "waiting_validator"),
+        key=lambda row: (
+            row.score_count,
+            -(
+                row.provisional_composite or 0.0
+                if row.score_count >= SCORING_QUORUM - 1
+                else 0.0
+            ),
+            row.agent.created_at,
+            str(row.agent.agent_id),
+        ),
+    )
+    validator_queue_ranks = {
+        row.agent.agent_id: rank for rank, row in enumerate(waiting_rows, start=1)
+    }
     normalized_query = query.strip().casefold() if query else ""
     if normalized_query:
         projected = [
@@ -1019,6 +1037,8 @@ def _public_activity_response(
                 duplicate_of=row.agent.duplicate_of,
                 review_reason=row.agent.review_reason,
                 score_count=row.score_count,
+                provisional_composite=row.provisional_composite,
+                validator_queue_rank=validator_queue_ranks.get(row.agent.agent_id),
                 quorum=SCORING_QUORUM,
                 screening_policy_version=row.agent.screening_policy_version,
                 required_screening_policy_version=SCREENING_POLICY_VERSION,

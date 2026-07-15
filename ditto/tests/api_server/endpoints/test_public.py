@@ -739,6 +739,8 @@ class TestPublicActivity:
             "duplicate_of",
             "review_reason",
             "score_count",
+            "provisional_composite",
+            "validator_queue_rank",
             "quorum",
             "screening_policy_version",
             "required_screening_policy_version",
@@ -755,6 +757,56 @@ class TestPublicActivity:
             "SECRET_FROM_BUILD",
         ):
             assert private_field not in serialized
+
+    async def test_exposes_queue_priority_with_provisional_composites(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        zero_id = await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.EVALUATING,
+            name="zero",
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        one_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.5],
+            status=AgentStatus.EVALUATING,
+        )
+        low_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.2, 0.3],
+            status=AgentStatus.EVALUATING,
+        )
+        high_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.8, 0.9],
+            status=AgentStatus.EVALUATING,
+        )
+        async with session_maker() as session, session.begin():
+            for agent_id in (one_id, low_id, high_id):
+                agent = await session.get(Agent, UUID(agent_id))
+                assert agent is not None
+                agent.screening_policy_version = SCREENING_POLICY_VERSION
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/activity")
+        by_id = {entry["agent_id"]: entry for entry in response.json()["entries"]}
+
+        assert by_id[zero_id]["validator_queue_rank"] == 1
+        assert by_id[one_id]["validator_queue_rank"] == 2
+        assert by_id[high_id]["validator_queue_rank"] == 3
+        assert by_id[low_id]["validator_queue_rank"] == 4
+        assert by_id[zero_id]["provisional_composite"] is None
+        assert by_id[one_id]["provisional_composite"] == pytest.approx(0.5)
+        assert by_id[high_id]["provisional_composite"] == pytest.approx(0.85)
+        assert by_id[low_id]["provisional_composite"] == pytest.approx(0.25)
 
     async def test_filters_complete_dataset_before_paginating_with_counts(
         self,
@@ -1367,7 +1419,7 @@ class TestPublicActivity:
         assert first["page"] == 1
         assert second["page"] == 2
 
-    async def test_exposes_progress_count_without_partial_scores(
+    async def test_exposes_progress_count_with_partial_score(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -1385,7 +1437,7 @@ class TestPublicActivity:
         entry = resp.json()["entries"][0]
         assert entry["score_count"] == 1
         assert entry["quorum"] == 3
-        assert "composite" not in resp.text
+        assert entry["provisional_composite"] == pytest.approx(0.42)
         assert "signature" not in resp.text
 
     @pytest.mark.parametrize("score_count", [0, 1, 2, 3])
