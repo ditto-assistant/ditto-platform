@@ -18,11 +18,34 @@ import pytest
 from botocore.exceptions import ClientError
 
 from ditto.api_server.storage import (
+    ObjectDownloadFailedError,
     ObjectUploadFailedError,
     S3StorageClient,
     StorageConfig,
     StoredObject,
 )
+
+
+class _ChunkedBody:
+    """Mimic aiobotocore's ``StreamingBody``: ``read(amt)`` returns only the
+    next buffered chunk (never more than the fake's internal chunk size), *not*
+    the whole object. A single ``read`` therefore hands back a truncated prefix
+    for any object spanning more than one chunk — exactly the behaviour that
+    made source inspection 502 on real multi-chunk tarballs.
+    """
+
+    def __init__(self, data: bytes, *, chunk: int = 4) -> None:
+        self._data = data
+        self._chunk = chunk
+        self._pos = 0
+
+    async def read(self, amt: int = -1) -> bytes:
+        if self._pos >= len(self._data):
+            return b""
+        size = self._chunk if amt is None or amt < 0 else min(amt, self._chunk)
+        chunk = self._data[self._pos : self._pos + size]
+        self._pos += len(chunk)
+        return chunk
 
 
 def _make_config(**overrides: object) -> StorageConfig:
@@ -44,17 +67,22 @@ def _install_mock_session(
     put_side_effect: BaseException | None = None,
     head_side_effect: BaseException | None = None,
     head_result: dict[str, Any] | None = None,
+    get_side_effect: BaseException | None = None,
+    get_result: dict[str, Any] | None = None,
 ) -> MagicMock:
     """Replace the client's aioboto3 session with a MagicMock + return it.
 
     The mock chain mirrors aioboto3's ``Session().client("s3") -> async ctx mgr
     -> s3 client`` shape. Tests inspect the s3 mock's ``put_object`` /
-    ``head_object`` call args + behaviour.
+    ``head_object`` / ``get_object`` call args + behaviour.
     """
     s3_mock = MagicMock()
     s3_mock.put_object = AsyncMock(side_effect=put_side_effect)
     s3_mock.head_object = AsyncMock(
         side_effect=head_side_effect, return_value=head_result or {}
+    )
+    s3_mock.get_object = AsyncMock(
+        side_effect=get_side_effect, return_value=get_result or {}
     )
 
     @asynccontextmanager
@@ -171,6 +199,56 @@ class TestObjectExists:
 
         with pytest.raises(ObjectUploadFailedError, match="InternalError"):
             await client.object_exists(key="boom")
+
+
+class TestGetObject:
+    async def test_reassembles_object_spanning_multiple_chunks(self):
+        client = S3StorageClient(_make_config())
+        body = b"the-complete-stored-tarball-across-many-chunks"
+        _install_mock_session(
+            client, get_result={"Body": _ChunkedBody(body, chunk=4)}
+        )
+
+        result = await client.get_object(key="a/agent.tar.gz", max_bytes=1024)
+
+        # A single read would return only the first chunk; the drain loop must
+        # return the whole object so its digest matches the stored artifact
+        # (a truncated body is what surfaced to operators as a 502).
+        assert result == body
+        assert (
+            hashlib.sha256(result).hexdigest() == hashlib.sha256(body).hexdigest()
+        )
+
+    async def test_reads_object_smaller_than_one_chunk(self):
+        client = S3StorageClient(_make_config())
+        body = b"tiny"
+        _install_mock_session(
+            client, get_result={"Body": _ChunkedBody(body, chunk=64)}
+        )
+
+        assert await client.get_object(key="k", max_bytes=1024) == body
+
+    async def test_rejects_object_exceeding_max_bytes(self):
+        client = S3StorageClient(_make_config())
+        _install_mock_session(
+            client, get_result={"Body": _ChunkedBody(b"x" * 40, chunk=4)}
+        )
+
+        with pytest.raises(ObjectDownloadFailedError, match="exceeded bound"):
+            await client.get_object(key="k", max_bytes=8)
+
+    async def test_client_error_raises_typed(self):
+        client = S3StorageClient(_make_config())
+        _install_mock_session(
+            client,
+            get_side_effect=ClientError(
+                error_response={"Error": {"Code": "NoSuchKey"}},
+                operation_name="GetObject",
+            ),
+        )
+
+        with pytest.raises(ObjectDownloadFailedError, match="NoSuchKey"):
+            await client.get_object(key="missing", max_bytes=1024)
 
 
 class TestContextManager:
