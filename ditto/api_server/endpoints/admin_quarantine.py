@@ -141,10 +141,6 @@ def _item(
     history: list[ScreeningQuarantineResolution] | None = None,
 ) -> AdminQuarantineItem:
     evidence, finding, finding_verified = _review_payloads(row, agent)
-
-
-def _as_utc(value: datetime) -> datetime:
-    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     return AdminQuarantineItem(
         quarantine_id=row.quarantine_id,
         agent_id=row.agent_id,
@@ -176,6 +172,10 @@ def _as_utc(value: datetime) -> datetime:
             for event in history or []
         ],
     )
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 async def _resolution_history(
@@ -270,21 +270,39 @@ async def list_validator_assignments(
 ) -> AdminValidatorAssignmentList:
     """List live scoring leases for operator recovery tooling."""
     now = datetime.now(UTC)
+    score_count = (
+        select(func.count(Score.validator_hotkey))
+        .where(
+            Score.agent_id == ValidatorTicket.agent_id,
+            Score.details["bench_version"].as_integer()
+            == ValidatorTicket.bench_version,
+        )
+        .correlate(ValidatorTicket)
+        .scalar_subquery()
+    )
+    provisional_composite = (
+        select(func.avg(Score.composite))
+        .where(
+            Score.agent_id == ValidatorTicket.agent_id,
+            Score.details["bench_version"].as_integer()
+            == ValidatorTicket.bench_version,
+        )
+        .correlate(ValidatorTicket)
+        .scalar_subquery()
+    )
     rows = (
         await session.execute(
             select(
                 ValidatorTicket,
                 Agent,
-                func.count(Score.validator_hotkey),
-                func.avg(Score.composite),
+                score_count,
+                provisional_composite,
             )
             .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
-            .outerjoin(Score, Score.agent_id == ValidatorTicket.agent_id)
             .where(
                 ValidatorTicket.status == TicketStatus.ISSUED,
                 ValidatorTicket.deadline > now,
             )
-            .group_by(ValidatorTicket, Agent)
             .order_by(ValidatorTicket.deadline.asc(), ValidatorTicket.agent_id.asc())
         )
     ).all()
@@ -350,6 +368,10 @@ async def release_validator_assignment(
                 detail="validator assignment changed or is no longer active",
             )
         ticket.status = TicketStatus.EXPIRED
+        # Manual release starts the same full cooldown from the operator's
+        # intervention. Using the original future deadline would make a stuck
+        # assignment wait longer than the standard retry interval after it has
+        # already been explicitly cleared.
         ticket.retry_after = now + RETRY_COOLDOWN
 
     logger.warning(

@@ -38,6 +38,7 @@ from ditto.api_models.system_health import (
     SystemMetrics,
     system_metrics_signing_token,
 )
+from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.datapipeline import DataPipelineError, NullGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -64,6 +65,7 @@ from ditto.db.models import (
     ScreeningDispute,
     ScreeningQuarantine,
     ScreeningQuarantineResolution,
+    ValidatorTicket,
 )
 from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
 
@@ -1464,8 +1466,24 @@ class TestQuarantineAdmin:
                     memory_mean=0.8,
                     median_ms=123,
                     n=114,
-                    details=None,
+                    details={"bench_version": 2},
                     generated_at=now,
+                )
+            )
+            session.add(
+                Score(
+                    agent_id=agent_id,
+                    validator_hotkey="5OlderBenchValidator",
+                    run_id="admin-release-old-version-score",
+                    signature=None,
+                    seed=41,
+                    composite=0.25,
+                    tool_mean=0.2,
+                    memory_mean=0.3,
+                    median_ms=456,
+                    n=114,
+                    details={"bench_version": 1},
+                    generated_at=now - timedelta(days=1),
                 )
             )
         _install_db(app, session_maker)
@@ -1512,7 +1530,10 @@ class TestQuarantineAdmin:
             assert ticket is not None
             assert ticket.status == TicketStatus.EXPIRED
             assert ticket.retry_after is not None
-            assert len(scores) == 1
+            retry_after = ticket.retry_after.replace(tzinfo=UTC)
+            assert now + timedelta(hours=5, minutes=59) < retry_after
+            assert retry_after < deadline + timedelta(hours=6)
+            assert len(scores) == 2
 
     @pytest.mark.parametrize(
         ("resolution", "expected_status", "expected_reason"),
