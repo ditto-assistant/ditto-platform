@@ -31,6 +31,8 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import (
     SCREENING_POLICY_VERSION,
     ScreenerHeartbeatRequest,
+    SourceReviewEvidenceItem,
+    SourceReviewFinding,
 )
 from ditto.api_models.system_health import (
     SystemMetrics,
@@ -1963,3 +1965,358 @@ class TestSubmitResult:
         )
         assert response.status_code == 404
         assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_FOUND
+
+
+_ADMIN_HEADERS = {
+    "Authorization": "Bearer test-admin-token-at-least-32-characters",
+    "X-Admin-Actor": "backroom:test-user",
+}
+
+
+def _review_finding(artifact_sha256: str = _SHA256) -> SourceReviewFinding:
+    return SourceReviewFinding(
+        artifact_sha256=artifact_sha256,
+        prompt_revision="source-review-v2",
+        risk_level="high",
+        confidence=0.97,
+        categories=["benchmark_emulation"],
+        evidence=[
+            SourceReviewEvidenceItem(
+                path="src/main.rs", line=2, category="benchmark_emulation"
+            )
+        ],
+        summary="Deterministic shortcut bypasses the general provider path.",
+    )
+
+
+def _review_evidence(digest: str) -> list[dict[str, object]]:
+    return [
+        {
+            "module_id": "luna-source-review",
+            "code": "agentic-source-review-tripwire",
+            "summary": "private source analysis selected a behavioral audit",
+            "digest": digest,
+        }
+    ]
+
+
+def _source_tarball() -> tuple[bytes, str]:
+    import hashlib
+    import io
+    import tarfile
+
+    files = {
+        "Cargo.toml": b'[package]\nname="agent"\nversion="0.1.0"\n',
+        "src/main.rs": b"fn main() {\n    fast_path();\n}\n",
+        "assets/table.bin": b"\xff\xfe\x00binary-table" * 4,
+    }
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, raw in files.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(raw)
+            archive.addfile(member, io.BytesIO(raw))
+    body = buffer.getvalue()
+    return body, hashlib.sha256(body).hexdigest()
+
+
+class TestQuarantineReviewContext:
+    async def _quarantine(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        **payload_overrides: object,
+    ) -> tuple[UUID, dict]:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        finding = _review_finding()
+        digest = finding.canonical_digest()
+        payload = _result_payload(
+            agent_id,
+            passed=False,
+            attempt_id=attempt_id,
+            outcome="quarantine",
+            manifest_digest="56" * 32,
+            finding_digest=digest,
+            reason_code="agentic-source-review-tripwire",
+            evidence=_review_evidence(digest),
+            finding=finding.model_dump(mode="json"),
+        )
+        payload.update(payload_overrides)
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=payload
+        )
+        return agent_id, {"response": response, "finding": finding}
+
+    async def test_review_payloads_are_stored_listed_and_digest_verified(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id, ctx = await self._quarantine(app, client, session_maker)
+        assert ctx["response"].status_code == 200
+
+        listing = await client.get(
+            "/api/v1/admin/screening-quarantines", headers=_ADMIN_HEADERS
+        )
+        item = listing.json()["items"][0]
+        assert item["agent_id"] == str(agent_id)
+        assert item["finding_verified"] is True
+        assert item["finding"]["risk_level"] == "high"
+        assert item["finding"]["summary"] == ctx["finding"].summary
+        assert item["finding"]["evidence"] == [
+            {"path": "src/main.rs", "line": 2, "category": "benchmark_emulation"}
+        ]
+        assert [entry["code"] for entry in item["evidence"]] == [
+            "agentic-source-review-tripwire"
+        ]
+
+    async def test_finding_that_does_not_match_signed_digest_is_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        tampered = _review_finding().model_dump(mode="json")
+        tampered["summary"] = "tampered summary"
+        _agent_id, ctx = await self._quarantine(
+            app, client, session_maker, finding=tampered
+        )
+        assert ctx["response"].status_code == 422
+
+    async def test_context_reports_miner_history_and_duplicates(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id, ctx = await self._quarantine(app, client, session_maker)
+        assert ctx["response"].status_code == 200
+        now = datetime.now(UTC)
+        other_miner = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+        prior_agent = uuid4()
+        prior_attempt = uuid4()
+        duplicate_agent = uuid4()
+        async with session_maker() as session, session.begin():
+            # An earlier, already-resolved quarantine from the same miner.
+            session.add(
+                Agent(
+                    agent_id=prior_agent,
+                    miner_hotkey=_MINER_HOTKEY,
+                    name="alpha-agent-v1",
+                    sha256="99" * 32,
+                    status=AgentStatus.REJECTED,
+                    screening_policy_version=SCREENING_POLICY_VERSION,
+                    created_at=now - timedelta(days=2),
+                )
+            )
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=prior_attempt,
+                    agent_id=prior_agent,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="quarantined",
+                    started_at=now - timedelta(days=2),
+                    deadline=now - timedelta(days=2, minutes=-30),
+                    finished_at=now - timedelta(days=2),
+                )
+            )
+            session.add(
+                ScreeningQuarantine(
+                    quarantine_id=uuid4(),
+                    agent_id=prior_agent,
+                    attempt_id=prior_attempt,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    manifest_digest="11" * 32,
+                    reason_code="behavioral-oracle-wrong-answer",
+                    status="resolved",
+                    created_at=now - timedelta(days=2),
+                    resolved_at=now - timedelta(days=1),
+                    resolved_by="backroom:test-user",
+                    resolution="reject",
+                    resolution_reason="Static table confirmed",
+                )
+            )
+            # A byte-identical artifact submitted by a different miner.
+            session.add(
+                Agent(
+                    agent_id=duplicate_agent,
+                    miner_hotkey=other_miner,
+                    name="copycat-agent",
+                    sha256=_SHA256,
+                    status=AgentStatus.UPLOADED,
+                    screening_policy_version=0,
+                    created_at=now - timedelta(hours=3),
+                )
+            )
+
+        listing = await client.get(
+            "/api/v1/admin/screening-quarantines", headers=_ADMIN_HEADERS
+        )
+        quarantine_id = listing.json()["items"][0]["quarantine_id"]
+        context = await client.get(
+            f"/api/v1/admin/screening-quarantines/{quarantine_id}/context",
+            headers=_ADMIN_HEADERS,
+        )
+        assert context.status_code == 200
+        body = context.json()
+        assert body["quarantine"]["quarantine_id"] == quarantine_id
+        assert body["agent"]["agent_id"] == str(agent_id)
+        assert body["agent"]["agent_status"] == AgentStatus.QUARANTINED
+        assert [a["status"] for a in body["attempts"]] == ["quarantined"]
+        assert body["miner"]["total_submissions"] == 2
+        assert body["miner"]["quarantine_count"] == 2
+        assert body["miner"]["rejected_count"] == 1
+        assert [q["agent_name"] for q in body["miner"]["recent_quarantines"]] == [
+            "alpha-agent-v1"
+        ]
+        assert body["duplicates"] == [
+            {
+                "agent_id": str(duplicate_agent),
+                "miner_hotkey": other_miner,
+                "agent_name": "copycat-agent",
+                "agent_status": AgentStatus.UPLOADED,
+                "submitted_at": body["duplicates"][0]["submitted_at"],
+                "match": "identical_artifact",
+            }
+        ]
+
+    async def test_missing_context_is_404(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        _install_db(app, session_maker)
+        response = await client.get(
+            f"/api/v1/admin/screening-quarantines/{uuid4()}/context",
+            headers=_ADMIN_HEADERS,
+        )
+        assert response.status_code == 404
+
+
+class TestQuarantineSourceInspection:
+    async def _seed_with_tarball(
+        self,
+        app: FastAPI,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> tuple[UUID, MagicMock]:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        body, sha256 = _source_tarball()
+        agent_id = uuid4()
+        async with session_maker() as session, session.begin():
+            session.add(
+                Agent(
+                    agent_id=agent_id,
+                    miner_hotkey=_MINER_HOTKEY,
+                    name="alpha-agent",
+                    sha256=sha256,
+                    status=AgentStatus.QUARANTINED,
+                    screening_policy_version=SCREENING_POLICY_VERSION,
+                    created_at=datetime.now(UTC),
+                )
+            )
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+        storage.get_object = AsyncMock(return_value=body)
+        return agent_id, storage
+
+    async def test_listing_surfaces_files_and_opaque_blobs(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id, storage = await self._seed_with_tarball(app, session_maker)
+        response = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/source-files",
+            headers=_ADMIN_HEADERS,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["file_count"] == 3
+        assert {entry["path"] for entry in body["files"]} == {
+            "Cargo.toml",
+            "src/main.rs",
+            "assets/table.bin",
+        }
+        assert body["opaque_blobs"] == [
+            {
+                "path": "assets/table.bin",
+                "bytes": body["opaque_blobs"][0]["bytes"],
+                "reason": "non_utf8",
+            }
+        ]
+        storage.get_object.assert_awaited_once()
+
+    async def test_excerpt_reads_bounded_flagged_lines(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id, _storage = await self._seed_with_tarball(app, session_maker)
+        response = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/source-file",
+            params={"path": "src/main.rs", "start_line": 1, "end_line": 999},
+            headers=_ADMIN_HEADERS,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["path"] == "src/main.rs"
+        assert body["total_lines"] == 3
+        assert body["lines"][1] == {"line": 2, "text": "    fast_path();"}
+
+        missing = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/source-file",
+            params={"path": "src/nope.rs"},
+            headers=_ADMIN_HEADERS,
+        )
+        assert missing.status_code == 404
+
+        binary = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/source-file",
+            params={"path": "assets/table.bin"},
+            headers=_ADMIN_HEADERS,
+        )
+        assert binary.status_code == 422
+
+    async def test_source_reads_require_admin_actor_and_matching_digest(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id, storage = await self._seed_with_tarball(app, session_maker)
+        headers = dict(_ADMIN_HEADERS)
+        headers.pop("X-Admin-Actor")
+        anonymous = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/source-files",
+            headers=headers,
+        )
+        assert anonymous.status_code == 422
+
+        storage.get_object = AsyncMock(return_value=b"not the stored artifact")
+        tampered = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/source-files",
+            headers=_ADMIN_HEADERS,
+        )
+        assert tampered.status_code == 502

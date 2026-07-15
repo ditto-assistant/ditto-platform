@@ -62,8 +62,11 @@ from ditto.api_models.screener import (
     ScreenerHeartbeatResponse,
     ScreenerQueueItem,
     ScreenerQueueResponse,
+    ScreenEvidenceItem,
     ScreenResultRequest,
     ScreenResultResponse,
+    SourceReviewEvidenceItem,
+    SourceReviewFinding,
 )
 from ditto.api_models.upload import (
     EvalPricingResponse,
@@ -133,8 +136,11 @@ __all__ = [
     "PublicValidatorName",
     "PublicValidatorNamesResponse",
     "ScoreReport",
+    "ScreenEvidenceItem",
     "ScreenResultRequest",
     "ScreenResultResponse",
+    "SourceReviewEvidenceItem",
+    "SourceReviewFinding",
     "ScreenerHeartbeatRequest",
     "ScreenerHeartbeatResponse",
     "ScreenerQueueItem",

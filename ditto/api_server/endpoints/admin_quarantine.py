@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
 from collections import defaultdict
@@ -10,10 +11,15 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.admin_quarantine import (
+    AdminArtifactDuplicate,
+    AdminMinerContext,
+    AdminMinerQuarantineSummary,
+    AdminQuarantineAgentContext,
+    AdminQuarantineContext,
     AdminQuarantineItem,
     AdminQuarantineList,
     AdminQuarantineResolveRequest,
@@ -23,8 +29,11 @@ from ditto.api_models.admin_quarantine import (
     AdminScreeningRescreenResponse,
     AdminScreeningSubmission,
     AdminScreeningSubmissionList,
+    AdminSourceExcerpt,
+    AdminSourceListing,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
 from ditto.api_models.validator import ArtifactResponse
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
@@ -34,7 +43,13 @@ from ditto.api_server.dependencies import (
 )
 from ditto.api_server.endpoints.screener import _derive_dataset_seed
 from ditto.api_server.endpoints.validator import ChainDep
-from ditto.api_server.storage import S3StorageClient
+from ditto.api_server.source_inspect import (
+    MAX_READ_LINES,
+    MAX_TARBALL_BYTES,
+    SourceInspectError,
+    TarSourceInspector,
+)
+from ditto.api_server.storage import ObjectDownloadFailedError, S3StorageClient
 from ditto.db.models import Agent, Score, ScreeningAttempt, ScreeningQuarantine
 
 logger = logging.getLogger(__name__)
@@ -63,7 +78,40 @@ async def require_admin(
 AdminDep = Annotated[None, Depends(require_admin)]
 
 
+def _review_payloads(
+    row: ScreeningQuarantine,
+) -> tuple[list[ScreenEvidenceItem] | None, SourceReviewFinding | None, bool]:
+    """Parse the stored review payloads, tolerating legacy/foreign shapes.
+
+    Rows written before the payloads landed have nulls; a row whose JSON no
+    longer parses (schema drift) degrades to null rather than breaking the
+    whole listing. ``finding_verified`` re-derives the digest binding at read
+    time so the console never has to trust a stored boolean.
+    """
+    evidence: list[ScreenEvidenceItem] | None = None
+    if isinstance(row.evidence, list):
+        try:
+            evidence = [
+                ScreenEvidenceItem.model_validate(item) for item in row.evidence[:16]
+            ]
+        except ValueError:
+            evidence = None
+    finding: SourceReviewFinding | None = None
+    if isinstance(row.finding, dict):
+        try:
+            finding = SourceReviewFinding.model_validate(row.finding)
+        except ValueError:
+            finding = None
+    verified = (
+        finding is not None
+        and row.finding_digest is not None
+        and finding.canonical_digest() == row.finding_digest
+    )
+    return evidence, finding, verified
+
+
 def _item(row: ScreeningQuarantine, agent: Agent) -> AdminQuarantineItem:
+    evidence, finding, finding_verified = _review_payloads(row)
     return AdminQuarantineItem(
         quarantine_id=row.quarantine_id,
         agent_id=row.agent_id,
@@ -75,6 +123,9 @@ def _item(row: ScreeningQuarantine, agent: Agent) -> AdminQuarantineItem:
         manifest_digest=row.manifest_digest,
         finding_digest=row.finding_digest,
         reason_code=row.reason_code,
+        evidence=evidence,
+        finding=finding,
+        finding_verified=finding_verified,
         status=row.status,  # type: ignore[arg-type]
         created_at=row.created_at,
         resolved_at=row.resolved_at,
@@ -129,6 +180,158 @@ async def get_quarantine(
     if result is None:
         raise HTTPException(status_code=404, detail="quarantine not found")
     return _item(*result)
+
+
+@router.get(
+    "/screening-quarantines/{quarantine_id}/context",
+    response_model=AdminQuarantineContext,
+)
+async def get_quarantine_context(
+    quarantine_id: UUID, _admin: AdminDep, session: SessionDep
+) -> AdminQuarantineContext:
+    """One-stop review context: finding, attempts, miner history, duplicates."""
+    result = (
+        await session.execute(
+            select(ScreeningQuarantine, Agent)
+            .join(Agent, Agent.agent_id == ScreeningQuarantine.agent_id)
+            .where(ScreeningQuarantine.quarantine_id == quarantine_id)
+        )
+    ).one_or_none()
+    if result is None:
+        raise HTTPException(status_code=404, detail="quarantine not found")
+    quarantine, agent = result
+
+    attempts = (
+        (
+            await session.execute(
+                select(ScreeningAttempt)
+                .where(ScreeningAttempt.agent_id == agent.agent_id)
+                .order_by(
+                    ScreeningAttempt.started_at.desc(),
+                    ScreeningAttempt.attempt_id.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    total_submissions = int(
+        (
+            await session.scalar(
+                select(func.count())
+                .select_from(Agent)
+                .where(Agent.miner_hotkey == agent.miner_hotkey)
+            )
+        )
+        or 0
+    )
+    miner_rows = (
+        await session.execute(
+            select(ScreeningQuarantine, Agent)
+            .join(Agent, Agent.agent_id == ScreeningQuarantine.agent_id)
+            .where(Agent.miner_hotkey == agent.miner_hotkey)
+            .order_by(
+                ScreeningQuarantine.created_at.desc(),
+                ScreeningQuarantine.quarantine_id.desc(),
+            )
+        )
+    ).all()
+    resolutions = [row.resolution for row, _ in miner_rows]
+    recent = [
+        AdminMinerQuarantineSummary(
+            quarantine_id=row.quarantine_id,
+            agent_id=row.agent_id,
+            agent_name=other.name,
+            reason_code=row.reason_code,
+            status=row.status,  # type: ignore[arg-type]
+            resolution=row.resolution,  # type: ignore[arg-type]
+            resolution_reason=row.resolution_reason,
+            created_at=row.created_at,
+            resolved_at=row.resolved_at,
+        )
+        for row, other in miner_rows[:10]
+        if row.quarantine_id != quarantine_id
+    ]
+
+    # Exact-duplicate signals only: identical tarball bytes, or identical
+    # canonicalized source (reformat/re-comment/reorder repack). Fuzzy MinHash
+    # similarity stays in the scoring gate; here a hit must be self-evident.
+    duplicate_conditions = [Agent.sha256 == agent.sha256]
+    if agent.normalized_source_hash is not None:
+        duplicate_conditions.append(
+            Agent.normalized_source_hash == agent.normalized_source_hash
+        )
+    duplicate_rows = (
+        (
+            await session.execute(
+                select(Agent)
+                .where(
+                    Agent.agent_id != agent.agent_id,
+                    or_(*duplicate_conditions),
+                )
+                .order_by(Agent.created_at.desc(), Agent.agent_id.desc())
+                .limit(20)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    duplicates = [
+        AdminArtifactDuplicate(
+            agent_id=other.agent_id,
+            miner_hotkey=other.miner_hotkey,
+            agent_name=other.name,
+            agent_status=other.status,
+            submitted_at=other.created_at,
+            match=(
+                "identical_artifact"
+                if other.sha256 == agent.sha256
+                else "identical_normalized_source"
+            ),
+        )
+        for other in duplicate_rows
+    ]
+
+    return AdminQuarantineContext(
+        quarantine=_item(quarantine, agent),
+        agent=AdminQuarantineAgentContext(
+            agent_id=agent.agent_id,
+            miner_hotkey=agent.miner_hotkey,
+            agent_name=agent.name,
+            artifact_sha256=agent.sha256,
+            agent_status=agent.status,
+            size_bytes=agent.size_bytes,
+            submitted_at=agent.created_at,
+            screening_policy_version=agent.screening_policy_version,
+            screening_reason=agent.screening_reason,
+        ),
+        attempts=[
+            AdminScreeningAttempt(
+                attempt_id=attempt.attempt_id,
+                policy_version=attempt.policy_version,
+                status=attempt.status,  # type: ignore[arg-type]
+                screener_hotkey=attempt.screener_hotkey,
+                started_at=attempt.started_at,
+                deadline=attempt.deadline,
+                finished_at=attempt.finished_at,
+                reason=attempt.public_reason,
+                reason_code=attempt.reason_code,
+                duplicate_of=attempt.duplicate_of,
+            )
+            for attempt in attempts
+        ],
+        miner=AdminMinerContext(
+            miner_hotkey=agent.miner_hotkey,
+            total_submissions=total_submissions,
+            quarantine_count=len(miner_rows),
+            released_count=resolutions.count("release"),
+            rescreened_count=resolutions.count("rescreen"),
+            rejected_count=resolutions.count("reject"),
+            recent_quarantines=recent,
+        ),
+        duplicates=duplicates,
+    )
 
 
 @router.post(
@@ -375,6 +578,96 @@ async def get_screening_artifact(
         download_url=url,
         expires_at=datetime.now(UTC) + timedelta(seconds=expires_in),
     )
+
+
+async def _load_inspector(
+    agent_id: UUID, session: AsyncSession, storage: S3StorageClient
+) -> tuple[Agent, TarSourceInspector]:
+    """Fetch the stored tarball, verify its digest, and open a bounded reader."""
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    try:
+        tar_bytes = await storage.get_object(
+            key=f"{agent_id}/agent.tar.gz", max_bytes=MAX_TARBALL_BYTES
+        )
+    except ObjectDownloadFailedError as error:
+        raise HTTPException(
+            status_code=502, detail="artifact is unavailable in storage"
+        ) from error
+    if hashlib.sha256(tar_bytes).hexdigest() != agent.sha256:
+        raise HTTPException(
+            status_code=502, detail="stored artifact does not match its digest"
+        )
+    try:
+        return agent, TarSourceInspector(tar_bytes)
+    except SourceInspectError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get(
+    "/screening-submissions/{agent_id}/source-files",
+    response_model=AdminSourceListing,
+)
+async def list_screening_source_files(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+    storage: StorageDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminSourceListing:
+    """Audited, bounded file inventory of one submission tarball."""
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    agent, inspector = await _load_inspector(agent_id, session, storage)
+    logger.info(
+        "admin_actor=%s listed screening source for agent_id=%s",
+        x_admin_actor,
+        agent_id,
+    )
+    return AdminSourceListing(
+        agent_id=agent_id,
+        artifact_sha256=agent.sha256,
+        **inspector.listing(),  # type: ignore[arg-type]
+    )
+
+
+@router.get(
+    "/screening-submissions/{agent_id}/source-file",
+    response_model=AdminSourceExcerpt,
+)
+async def read_screening_source_file(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+    storage: StorageDep,
+    path: Annotated[str, Query(min_length=1, max_length=240)],
+    start_line: Annotated[int, Query(ge=1)] = 1,
+    end_line: Annotated[int, Query(ge=1)] = MAX_READ_LINES,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminSourceExcerpt:
+    """Audited, bounded line excerpt from one submission source file.
+
+    Pairs with the source-review finding's ``path:line`` evidence so the
+    operator can see exactly the flagged code without a full download.
+    """
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    _agent, inspector = await _load_inspector(agent_id, session, storage)
+    try:
+        excerpt = inspector.read(path, start_line, end_line)
+    except SourceInspectError as error:
+        status = 404 if error.code == "file-not-found" else 422
+        raise HTTPException(status_code=status, detail=str(error)) from error
+    logger.info(
+        "admin_actor=%s read screening source agent_id=%s path=%s lines=%s-%s",
+        x_admin_actor,
+        agent_id,
+        path,
+        excerpt["start_line"],
+        excerpt["end_line"],
+    )
+    return AdminSourceExcerpt(agent_id=agent_id, **excerpt)  # type: ignore[arg-type]
 
 
 __all__ = ["router"]

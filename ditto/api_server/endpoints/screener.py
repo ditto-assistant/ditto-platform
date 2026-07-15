@@ -746,6 +746,18 @@ async def submit_result(
                 raise AgentNotScreenableError(
                     "quarantine result is missing bounded evidence"
                 )
+            # The review payloads were digest/bounds-validated at parse time
+            # (the finding must hash to the signed finding_digest).
+            evidence_json = (
+                [item.model_dump(mode="json") for item in payload.evidence]
+                if payload.evidence
+                else None
+            )
+            finding_json = (
+                payload.finding.model_dump(mode="json")
+                if payload.finding is not None
+                else None
+            )
             existing_quarantine = await session.scalar(
                 select(ScreeningQuarantine).where(
                     ScreeningQuarantine.attempt_id == attempt.attempt_id
@@ -762,9 +774,22 @@ async def submit_result(
                         manifest_digest=payload.manifest_digest,
                         finding_digest=payload.finding_digest,
                         reason_code=payload.reason_code,
+                        evidence=evidence_json,
+                        finding=finding_json,
                         status="active",
                     )
                 )
+            else:
+                # A re-reported verdict may carry payloads an older worker (or
+                # an earlier retry) omitted; backfill without rewriting history.
+                if existing_quarantine.evidence is None and evidence_json:
+                    existing_quarantine.evidence = evidence_json
+                if (
+                    existing_quarantine.finding is None
+                    and finding_json
+                    and existing_quarantine.finding_digest == payload.finding_digest
+                ):
+                    existing_quarantine.finding = finding_json
         # Pin the generated dataset once, when evaluating and not yet set (the
         # `is None` guard keeps a concurrent/duplicate verdict from overwriting).
         if (
