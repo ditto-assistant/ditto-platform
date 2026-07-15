@@ -261,6 +261,38 @@ class AdminSourceExcerpt(BaseModel):
     lines: list[AdminSourceLine]
 
 
+class AdminValidatorAssignment(BaseModel):
+    agent_id: UUID
+    agent_name: str
+    miner_hotkey: str
+    validator_hotkey: str
+    issued_at: datetime
+    deadline: datetime
+    bench_version: int
+    attempt_count: int
+    score_count: int
+    provisional_composite: float | None
+
+
+class AdminValidatorAssignmentList(BaseModel):
+    items: list[AdminValidatorAssignment]
+    count: int
+
+
+class AdminValidatorAssignmentReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_deadline: datetime
+    reason: Annotated[str, Field(min_length=8, max_length=500)]
+
+
+class AdminValidatorAssignmentReleaseResponse(BaseModel):
+    agent_id: UUID
+    validator_hotkey: str
+    status: Literal["expired"]
+    retry_after: datetime
+
+
 __all__ = [
     "AdminArtifactDuplicate",
     "AdminDuplicateSummary",
@@ -287,4 +319,8 @@ __all__ = [
     "AdminSourceFileEntry",
     "AdminSourceLine",
     "AdminSourceListing",
+    "AdminValidatorAssignment",
+    "AdminValidatorAssignmentList",
+    "AdminValidatorAssignmentReleaseRequest",
+    "AdminValidatorAssignmentReleaseResponse",
 ]

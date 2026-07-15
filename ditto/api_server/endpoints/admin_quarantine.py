@@ -38,9 +38,14 @@ from ditto.api_models.admin_quarantine import (
     AdminScreeningSubmissionList,
     AdminSourceExcerpt,
     AdminSourceListing,
+    AdminValidatorAssignment,
+    AdminValidatorAssignmentList,
+    AdminValidatorAssignmentReleaseRequest,
+    AdminValidatorAssignmentReleaseResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
+from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator import ArtifactResponse
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
@@ -64,7 +69,9 @@ from ditto.db.models import (
     ScreeningDispute,
     ScreeningQuarantine,
     ScreeningQuarantineResolution,
+    ValidatorTicket,
 )
+from ditto.db.queries.tickets import RETRY_COOLDOWN
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +141,10 @@ def _item(
     history: list[ScreeningQuarantineResolution] | None = None,
 ) -> AdminQuarantineItem:
     evidence, finding, finding_verified = _review_payloads(row, agent)
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     return AdminQuarantineItem(
         quarantine_id=row.quarantine_id,
         agent_id=row.agent_id,
@@ -249,6 +260,113 @@ def _dispute_item(
         resolved_by=dispute.resolved_by,
         resolution=dispute.resolution,  # type: ignore[arg-type]
         resolution_reason=dispute.resolution_reason,
+    )
+
+
+@router.get("/validator-assignments", response_model=AdminValidatorAssignmentList)
+async def list_validator_assignments(
+    _admin: AdminDep,
+    session: SessionDep,
+) -> AdminValidatorAssignmentList:
+    """List live scoring leases for operator recovery tooling."""
+    now = datetime.now(UTC)
+    rows = (
+        await session.execute(
+            select(
+                ValidatorTicket,
+                Agent,
+                func.count(Score.validator_hotkey),
+                func.avg(Score.composite),
+            )
+            .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
+            .outerjoin(Score, Score.agent_id == ValidatorTicket.agent_id)
+            .where(
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.deadline > now,
+            )
+            .group_by(ValidatorTicket, Agent)
+            .order_by(ValidatorTicket.deadline.asc(), ValidatorTicket.agent_id.asc())
+        )
+    ).all()
+    items = [
+        AdminValidatorAssignment(
+            agent_id=ticket.agent_id,
+            agent_name=agent.name,
+            miner_hotkey=agent.miner_hotkey,
+            validator_hotkey=ticket.validator_hotkey,
+            issued_at=ticket.issued_at,
+            deadline=ticket.deadline,
+            bench_version=ticket.bench_version,
+            attempt_count=ticket.attempt_count,
+            score_count=int(score_count),
+            provisional_composite=(
+                float(provisional_composite)
+                if provisional_composite is not None
+                else None
+            ),
+        )
+        for ticket, agent, score_count, provisional_composite in rows
+    ]
+    return AdminValidatorAssignmentList(items=items, count=len(items))
+
+
+@router.post(
+    "/validator-assignments/{agent_id}/{validator_hotkey}/release",
+    response_model=AdminValidatorAssignmentReleaseResponse,
+)
+async def release_validator_assignment(
+    agent_id: UUID,
+    validator_hotkey: str,
+    payload: AdminValidatorAssignmentReleaseRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminValidatorAssignmentReleaseResponse:
+    """Expire one exact live lease without deleting its submission or scores."""
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+
+    now = datetime.now(UTC)
+    async with session.begin():
+        ticket = await session.scalar(
+            select(ValidatorTicket)
+            .where(
+                ValidatorTicket.agent_id == agent_id,
+                ValidatorTicket.validator_hotkey == validator_hotkey,
+            )
+            .with_for_update()
+        )
+        if ticket is None:
+            raise HTTPException(
+                status_code=404, detail="validator assignment not found"
+            )
+        if (
+            ticket.status != TicketStatus.ISSUED
+            or _as_utc(ticket.deadline) <= now
+            or _as_utc(ticket.deadline) != _as_utc(payload.expected_deadline)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="validator assignment changed or is no longer active",
+            )
+        ticket.status = TicketStatus.EXPIRED
+        ticket.retry_after = now + RETRY_COOLDOWN
+
+    logger.warning(
+        "admin released validator assignment actor=%s agent_id=%s validator=%s "
+        "deadline=%s retry_after=%s reason=%r",
+        x_admin_actor,
+        agent_id,
+        validator_hotkey,
+        payload.expected_deadline.isoformat(),
+        ticket.retry_after.isoformat(),
+        payload.reason,
+    )
+    return AdminValidatorAssignmentReleaseResponse(
+        agent_id=agent_id,
+        validator_hotkey=validator_hotkey,
+        status="expired",
+        retry_after=ticket.retry_after,
     )
 
 
