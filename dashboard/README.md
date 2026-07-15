@@ -20,6 +20,10 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 - **Validator fleet** — signed worker availability, coarse system health, and
   the public active agent with the same stage/progress shown in the pipeline.
   Old clients render as progress not reported; expired or stale work disappears.
+- **Stable object links** — agents, miners, validators, and screeners have
+  bookmarkable paths (`/agents/{id}`, `/miners/{hotkey}`,
+  `/validators/{hotkey}`, and `/screeners/{hotkey}`). Direct visits restore the
+  matching detail or fleet row, and browser back/forward navigation stays useful.
 - **Anti-overfit assurance** — states plainly that only aggregates are published
   and that dataset seeds rotate every submission.
 
