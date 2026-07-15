@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
@@ -12,11 +13,31 @@ from sqlalchemy.sql.selectable import ScalarSelect
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
-from ditto.db.models import Agent, Score, ScreeningAttempt
+from ditto.db.models import Agent, Score, ScreeningAttempt, ScreeningQuarantine
 from ditto.db.queries.scores import SCORING_QUORUM
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+# Expired attempts under the current policy after which an agent is parked for
+# operator review instead of re-queued forever. An inconclusive screen (the
+# harness never completes the private audit) submits no verdict, so its lease
+# expires; a permanently-inconclusive agent would otherwise re-attempt every
+# lease indefinitely. Only "expired" attempts count -- infrastructure "failed"
+# attempts are usually screener-side, so a screener outage must not mass-park
+# every in-flight agent.
+MAX_SCREENING_EXPIRIES = 5
+
+# A platform-raised quarantine has no screener finding, but the row's
+# manifest_digest is NOT NULL and shown verbatim in the operator console. This
+# stable sentinel marks the origin as "platform, attempts exhausted".
+_EXHAUSTED_REASON_CODE = "repeatedly-inconclusive"
+_EXHAUSTED_PUBLIC_REASON = (
+    "Screening was inconclusive repeatedly; held for operator review"
+)
+_EXHAUSTED_MANIFEST_DIGEST = hashlib.sha256(
+    b"ditto:repeatedly-inconclusive:v1"
+).hexdigest()
 
 
 def screening_score_count() -> ScalarSelect[int]:
@@ -84,6 +105,70 @@ async def expire_screening_attempts(session: AsyncSession, *, now: datetime) -> 
     return len(attempts)
 
 
+async def _expired_attempt_count(session: AsyncSession, *, agent_id: UUID) -> int:
+    """Count this agent's expired screening leases under the current policy."""
+    count = await session.scalar(
+        select(func.count())
+        .select_from(ScreeningAttempt)
+        .where(
+            ScreeningAttempt.agent_id == agent_id,
+            ScreeningAttempt.policy_version == SCREENING_POLICY_VERSION,
+            ScreeningAttempt.status == "expired",
+        )
+    )
+    return int(count or 0)
+
+
+async def _park_repeatedly_inconclusive(
+    session: AsyncSession,
+    agent: Agent,
+    *,
+    screener_hotkey: str,
+    now: datetime,
+) -> None:
+    """Quarantine an agent that keeps expiring its lease, for operator review.
+
+    Records a terminal ``quarantined`` attempt plus an active quarantine row
+    (the operator console is driven entirely by ``ScreeningQuarantine``) so the
+    agent leaves the retry pool and a human decides its fate instead of the
+    screener re-attempting it every lease forever.
+    """
+    attempt = ScreeningAttempt(
+        attempt_id=uuid4(),
+        agent_id=agent.agent_id,
+        screener_hotkey=screener_hotkey,
+        policy_version=SCREENING_POLICY_VERSION,
+        status="quarantined",
+        started_at=now,
+        deadline=now,
+        finished_at=now,
+        public_reason=_EXHAUSTED_PUBLIC_REASON,
+        reason_code=_EXHAUSTED_REASON_CODE,
+    )
+    session.add(attempt)
+    # Flush so the attempt row exists before the quarantine's FK references it
+    # (no ORM relationship links them to order the inserts automatically).
+    await session.flush()
+    session.add(
+        ScreeningQuarantine(
+            quarantine_id=uuid4(),
+            agent_id=agent.agent_id,
+            attempt_id=attempt.attempt_id,
+            screener_hotkey=screener_hotkey,
+            policy_version=SCREENING_POLICY_VERSION,
+            manifest_digest=_EXHAUSTED_MANIFEST_DIGEST,
+            finding_digest=None,
+            reason_code=_EXHAUSTED_REASON_CODE,
+            evidence=None,
+            finding=None,
+            status="active",
+        )
+    )
+    agent.status = AgentStatus.QUARANTINED
+    agent.screening_reason = _EXHAUSTED_PUBLIC_REASON
+    agent.screening_reason_code = _EXHAUSTED_REASON_CODE
+
+
 async def claim_screening_attempts(
     session: AsyncSession,
     *,
@@ -149,6 +234,17 @@ async def claim_screening_attempts(
     )
     claimed: list[tuple[Agent, ScreeningAttempt, UUID | None]] = []
     for agent in agents:
+        # An agent that keeps coming back inconclusive expires its lease every
+        # cycle; after the cap, park it for operator review instead of leasing
+        # it out again to loop forever.
+        if (
+            await _expired_attempt_count(session, agent_id=agent.agent_id)
+            >= MAX_SCREENING_EXPIRIES
+        ):
+            await _park_repeatedly_inconclusive(
+                session, agent, screener_hotkey=screener_hotkey, now=now
+            )
+            continue
         owner = aliased(Agent)
         duplicate_of = await session.scalar(
             select(owner.agent_id)
