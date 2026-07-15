@@ -697,6 +697,7 @@ class PublicValidationAttempt(BaseModel):
     status: Annotated[str, Field(pattern=r"^(issued|scored|expired)$")]
     issued_at: datetime
     deadline: datetime
+    retry_after: datetime | None = None
     actively_running: bool = False
     benchmark_progress: PublicBenchmarkProgress | None = None
 
