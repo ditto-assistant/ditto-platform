@@ -264,6 +264,8 @@ async def list_screening_submissions(
                     deadline=attempt.deadline,
                     finished_at=attempt.finished_at,
                     reason=attempt.public_reason,
+                    reason_code=attempt.reason_code,
+                    duplicate_of=attempt.duplicate_of,
                 )
             )
     return AdminScreeningSubmissionList(
@@ -277,6 +279,7 @@ async def list_screening_submissions(
                 agent_status=agent.status,
                 screening_policy_version=agent.screening_policy_version,
                 screening_reason=agent.screening_reason,
+                screening_reason_code=agent.screening_reason_code,
                 submitted_at=agent.created_at,
                 attempts=attempts_by_agent[agent.agent_id],
             )

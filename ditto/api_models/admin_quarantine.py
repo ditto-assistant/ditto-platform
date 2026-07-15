@@ -56,6 +56,8 @@ class AdminScreeningAttempt(BaseModel):
     deadline: datetime
     finished_at: datetime | None
     reason: str | None
+    reason_code: str | None
+    duplicate_of: UUID | None
 
 
 class AdminScreeningSubmission(BaseModel):
@@ -66,6 +68,7 @@ class AdminScreeningSubmission(BaseModel):
     agent_status: str
     screening_policy_version: int
     screening_reason: str | None
+    screening_reason_code: str | None
     submitted_at: datetime
     attempts: list[AdminScreeningAttempt]
 

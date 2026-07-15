@@ -197,6 +197,9 @@ class Agent(Base):
     so the endpoint maps it to a fixed category before persisting it here.
     """
 
+    screening_reason_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Stable public/operator-safe machine code for the screening outcome."""
+
     screening_policy_version: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
@@ -230,6 +233,7 @@ class Agent(Base):
             "agent_id", "miner_hotkey", name="agents_agent_id_miner_hotkey_key"
         ),
         Index("agents_miner_hotkey_idx", "miner_hotkey"),
+        Index("agents_sha256_idx", "sha256"),
         Index(
             "agents_status_evaluating_idx",
             "status",
@@ -277,6 +281,10 @@ class ScreeningAttempt(Base):
         TIMESTAMP(timezone=True), nullable=True
     )
     public_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reason_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    duplicate_of: Mapped[UUID | None] = mapped_column(
+        SaUUID(as_uuid=True), nullable=True
+    )
 
     __table_args__ = (
         ForeignKeyConstraint(
@@ -284,6 +292,12 @@ class ScreeningAttempt(Base):
             ["agents.agent_id"],
             ondelete="CASCADE",
             name="screening_attempts_agent_id_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["duplicate_of"],
+            ["agents.agent_id"],
+            ondelete="SET NULL",
+            name="screening_attempts_duplicate_of_fkey",
         ),
         CheckConstraint(
             "policy_version > 0",
@@ -301,6 +315,10 @@ class ScreeningAttempt(Base):
         CheckConstraint(
             "finished_at IS NULL OR finished_at >= started_at",
             name="screening_attempts_finished_check",
+        ),
+        CheckConstraint(
+            "reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 64",
+            name="screening_attempts_reason_code_check",
         ),
         Index("screening_attempts_agent_started_idx", "agent_id", "started_at"),
         Index(

@@ -38,6 +38,10 @@ class AgentResponse(BaseModel):
             description="Public-safe reason for the current screening outcome.",
         ),
     ] = None
+    screening_reason_code: Annotated[
+        str | None,
+        Field(description="Stable machine-readable screening outcome code."),
+    ] = None
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -69,6 +73,10 @@ class AgentStatusResponse(BaseModel):
         Field(
             description="Public-safe reason for the current screening outcome.",
         ),
+    ] = None
+    screening_reason_code: Annotated[
+        str | None,
+        Field(description="Stable machine-readable screening outcome code."),
     ] = None
 
     model_config = ConfigDict(
