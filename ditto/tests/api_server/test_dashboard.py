@@ -273,11 +273,16 @@ class TestDashboard:
         assert 'type="checkbox"' in body
         assert '<label class="fleet-toggle" for="show-screeners">' in body
         assert '<table class="fleet-table"' in body
-        assert '<th scope="col" style="width:105px">First seen</th>' in body
-        assert '<th scope="col" style="width:110px">Last heartbeat</th>' in body
-        assert '<th scope="col" style="width:118px">Status</th>' in body
-        assert '<th scope="col" style="width:108px">CPU</th>' in body
-        assert '<th scope="col" style="width:120px">Containers</th>' in body
+        assert (
+            '<th scope="col" id="fleet-node-heading" style="width:240px">Validator</th>'
+            in body
+        )
+        assert '<th scope="col" style="width:88px">First seen</th>' in body
+        assert '<th scope="col" style="width:96px">Last heartbeat</th>' in body
+        assert '<th scope="col" style="width:100px">Status</th>' in body
+        assert '<th scope="col" style="width:88px">CPU</th>' in body
+        assert '<th scope="col" style="width:78px">Containers</th>' in body
+        assert 'showScreeners ? "Screener" : "Validator"' in body
         assert "Missing optional telemetry is not an outage." in body
         assert "allowlisted" not in body
         assert 'id="fleet-count-unknown"' in body
