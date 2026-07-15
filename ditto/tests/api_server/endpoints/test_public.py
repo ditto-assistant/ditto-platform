@@ -45,6 +45,7 @@ from ditto.db.queries.audit import (
     append_audit_entry,
 )
 from ditto.db.queries.scores import upsert_score
+from ditto.db.queries.tickets import FIRST_SCORE_CONTINUATION_FLOOR
 
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
@@ -1191,6 +1192,49 @@ class TestPublicActivity:
 
         evaluating = (await client.get("/api/v1/public/activity")).json()["entries"][0]
         assert evaluating["status"] == "evaluating"
+
+    async def test_below_floor_score_is_a_terminal_public_stage(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        async with session_maker() as session, session.begin():
+            await upsert_score(
+                session,
+                agent_id=agent_id,
+                validator_hotkey=_VALIDATOR_C,
+                run_id="below-floor",
+                seed=42,
+                composite=FIRST_SCORE_CONTINUATION_FLOOR - 0.01,
+                tool_mean=0.24,
+                memory_mean=0.24,
+                median_ms=500,
+                n=114,
+                generated_at=datetime.now(UTC),
+                signature="ab" * 64,
+                details=None,
+            )
+        _install_db(app, session_maker)
+
+        activity = (await client.get("/api/v1/public/activity")).json()["entries"][0]
+        assert activity["status"] == "below_score_floor"
+        assert activity["score_count"] == 1
+
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()
+        assert pipeline["status"] == "below_score_floor"
+        assert pipeline["score_count"] == 1
+        assert pipeline["score_floor"] == FIRST_SCORE_CONTINUATION_FLOOR
 
     async def test_progress_is_multi_validator_allowlisted_and_recursively_redacted(
         self,

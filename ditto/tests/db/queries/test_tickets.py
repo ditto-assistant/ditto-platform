@@ -13,6 +13,7 @@ from ditto.api_models.ticket_status import TicketStatus
 from ditto.db.models import Agent, Score, ValidatorTicket
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import (
+    FIRST_SCORE_CONTINUATION_FLOOR,
     expire_overdue_tickets,
     get_open_ticket,
     issue_ticket,
@@ -69,6 +70,118 @@ class TestIssueTicket:
         assert t.agent_id == aid
         assert t.status == TicketStatus.ISSUED
         assert t.deadline == _NOW + _TTL
+
+    async def test_score_below_floor_does_not_receive_another_ticket(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=aid,
+                    validator_hotkey="5Scored",
+                    status=TicketStatus.SCORED,
+                    issued_at=_NOW,
+                    deadline=_NOW + _TTL,
+                    bench_version=2,
+                    attempt_count=1,
+                )
+            )
+            session.add(
+                Score(
+                    agent_id=aid,
+                    validator_hotkey="5Scored",
+                    run_id="below-floor",
+                    signature=None,
+                    seed=123,
+                    composite=FIRST_SCORE_CONTINUATION_FLOOR - 0.01,
+                    tool_mean=0.24,
+                    memory_mean=0.24,
+                    median_ms=100,
+                    n=114,
+                    details=None,
+                    generated_at=_NOW,
+                )
+            )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Next", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is None
+
+    async def test_score_at_floor_receives_another_ticket(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=aid,
+                    validator_hotkey="5Scored",
+                    status=TicketStatus.SCORED,
+                    issued_at=_NOW,
+                    deadline=_NOW + _TTL,
+                    bench_version=2,
+                    attempt_count=1,
+                )
+            )
+            session.add(
+                Score(
+                    agent_id=aid,
+                    validator_hotkey="5Scored",
+                    run_id="at-floor",
+                    signature=None,
+                    seed=123,
+                    composite=FIRST_SCORE_CONTINUATION_FLOOR,
+                    tool_mean=FIRST_SCORE_CONTINUATION_FLOOR,
+                    memory_mean=FIRST_SCORE_CONTINUATION_FLOOR,
+                    median_ms=100,
+                    n=114,
+                    details=None,
+                    generated_at=_NOW,
+                )
+            )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Next", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == aid
+
+    async def test_floor_does_not_interrupt_submission_after_second_score(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            for validator, composite in (("5First", 0.30), ("5Second", 0.10)):
+                session.add(
+                    Score(
+                        agent_id=aid,
+                        validator_hotkey=validator,
+                        run_id=f"run-{validator}",
+                        signature=None,
+                        seed=123,
+                        composite=composite,
+                        tool_mean=composite,
+                        memory_mean=composite,
+                        median_ms=100,
+                        n=114,
+                        details=None,
+                        generated_at=_NOW,
+                    )
+                )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Third", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == aid
 
     async def test_no_evaluating_agent_returns_none(
         self, session: AsyncSession

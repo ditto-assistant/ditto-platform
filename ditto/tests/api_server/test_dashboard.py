@@ -156,7 +156,7 @@ class TestDashboard:
         assert 'id="pipeline-scored"' in body
         assert 'data-pipeline-stage="scored"' in body
         assert "Recent scores" in body
-        assert 'statuses: ["scored", "live"]' in body
+        assert 'statuses: ["scored", "live", "below_score_floor"]' in body
         assert 'getJSON("/public/operations")' in body
         assert "max-height: 390px" in body
         assert "indexed.slice(0, 5)" not in body
@@ -229,6 +229,9 @@ class TestDashboard:
         assert 'data-activity-filter="waiting_validator" aria-pressed="false"' in body
         assert 'data-activity-filter="queued" aria-pressed="false"' in body
         assert 'waiting_screening", "screening", "waiting_validator' in body
+        assert 'below_score_floor: ["Below score floor", "warn"]' in body
+        assert '"below_score_floor", "under_review"' in body
+        assert "No further validator tickets will be issued." in body
         assert 'id="activity-clear" type="button" hidden' in body
         assert 'id="activity-filter-summary" role="status" aria-live="polite"' in body
         assert 'query.append("status", status)' in body

@@ -48,6 +48,13 @@ _LIVE_TICKET_STATUSES = (TicketStatus.ISSUED, TicketStatus.SCORED)
 RETRY_COOLDOWN = timedelta(hours=6)
 MAX_ATTEMPTS_PER_VERSION = 2
 
+# A very low first full-benchmark score is not competitive enough to justify
+# two more independent validator runs. This is intentionally conservative: the
+# live launch sample's only first score below 0.25 later finalized at 0.344,
+# while every other finalized first score was at least 0.465. Keep this policy
+# platform-owned so every validator sees the same assignment boundary.
+FIRST_SCORE_CONTINUATION_FLOOR = 0.25
+
 
 async def expire_overdue_tickets(session: AsyncSession, *, now: datetime) -> int:
     """Flip every overdue ``issued`` ticket to ``expired``; return the count.
@@ -179,6 +186,12 @@ async def issue_ticket(
         ),
         0.0,
     )
+    recorded_score_count = (
+        select(func.count(Score.validator_hotkey))
+        .where(Score.agent_id == Agent.agent_id)
+        .correlate(Agent)
+        .scalar_subquery()
+    )
     completion_lane_score = case(
         (
             accepted_score_count >= SCORING_QUORUM - 1,
@@ -196,6 +209,8 @@ async def issue_ticket(
             Agent.status == AgentStatus.EVALUATING,
             Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
             Agent.agent_id.not_in(already_mine),
+            (recorded_score_count != 1)
+            | (provisional_composite >= FIRST_SCORE_CONTINUATION_FLOOR),
         )
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
