@@ -318,6 +318,7 @@ class TestPublicLeaderboard:
         assert all(e["finalized"] is False for e in body["entries"])
         assert all(e["score_count"] == 1 for e in body["entries"])
         top = body["entries"][0]
+        assert top["agent_name"] == "agent"
         assert top["composite"] == pytest.approx(0.9)
         assert top["tool_mean"] == pytest.approx(0.95)
         assert top["memory_mean"] == pytest.approx(0.8)

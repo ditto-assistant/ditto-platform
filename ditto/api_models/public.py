@@ -186,6 +186,10 @@ class PublicLeaderboardEntry(BaseModel):
             )
         ),
     ]
+    agent_name: Annotated[
+        str,
+        Field(description="Human-friendly name of the miner's winning agent."),
+    ]
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Miner's SS58 hotkey.")
     ]

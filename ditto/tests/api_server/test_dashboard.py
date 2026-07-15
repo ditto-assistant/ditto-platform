@@ -131,6 +131,10 @@ class TestDashboard:
         assert "not the required 3 of 3 scores" in body
         assert "only final results drive emissions" in body
         assert 'class="quorum-badge"' in body
+        assert ">Winning agent</span>" in body
+        assert 'class="winner-identity"' in body
+        assert 'entityAnchor("agent", e.agent_id, agentName)' in body
+        assert '", agent " + agentName + ", miner "' in body
         assert "function isFinalized(e)" in body
         assert '"Provisional leaderboard"' in body
         assert '"P" + e.rank' in body
