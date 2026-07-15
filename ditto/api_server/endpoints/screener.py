@@ -82,7 +82,12 @@ router = APIRouter(prefix="/screener", tags=["screener"])
 
 # How long a pre-signed artifact URL stays valid (mirrors the validator's).
 _ARTIFACT_URL_TTL = timedelta(minutes=5)
-_SCREENING_LEASE_TTL = timedelta(minutes=30)
+# One screening attempt: download + docker build + serve/health + bounded source
+# review. Must exceed the worker's build cap (SCREENER_BUILD_TIMEOUT_SECONDS, 45m)
+# plus serve and review, or a slow-but-legitimate crate compile outlives the
+# lease and its verdict is rejected as expired, re-queuing the same agent in a
+# loop. Keep this in step with the screener's build cap when either moves.
+_SCREENING_LEASE_TTL = timedelta(minutes=45)
 _HEARTBEAT_MAX_SKEW_SECONDS = 300
 _HEARTBEAT_MAX_BYTES = 4096
 _CLAIM_FALLBACK_LOCK = asyncio.Lock()
