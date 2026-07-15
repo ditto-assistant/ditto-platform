@@ -122,6 +122,7 @@ from ditto.db.queries.screening import (
     get_running_screening_attempts,
     list_screening_attempts,
 )
+from ditto.db.queries.tickets import FIRST_SCORE_CONTINUATION_FLOOR
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,7 @@ _PUBLIC_ACTIVITY_STATUSES = frozenset(
         "screening",
         "waiting_validator",
         "evaluating",
+        "below_score_floor",
         "under_review",
         "rejected",
         "scored",
@@ -917,6 +919,8 @@ def _public_activity_status(
     screening_policy_version: int,
     has_active_attempt: bool,
     has_active_validation: bool,
+    score_count: int = 0,
+    provisional_composite: float | None = None,
 ) -> str:
     """Collapse internal moderation detail into stable public lifecycle labels."""
     needs_rescreen = (
@@ -932,6 +936,14 @@ def _public_activity_status(
     if status in (AgentStatus.UPLOADED, AgentStatus.SCREENING_FAILED) or needs_rescreen:
         return "waiting_screening"
     if status in (AgentStatus.SCREENING_PASSED, AgentStatus.EVALUATING):
+        if (
+            status == AgentStatus.EVALUATING
+            and not has_active_validation
+            and score_count == 1
+            and provisional_composite is not None
+            and provisional_composite < FIRST_SCORE_CONTINUATION_FLOOR
+        ):
+            return "below_score_floor"
         return "evaluating" if has_active_validation else "waiting_validator"
     if status in (AgentStatus.ATH_PENDING_REVIEW, AgentStatus.QUARANTINED):
         return "under_review"
@@ -964,6 +976,8 @@ def _public_activity_response(
             screening_policy_version=row.agent.screening_policy_version,
             has_active_attempt=row.screening_attempt is not None,
             has_active_validation=row.agent.agent_id in active_agent_ids,
+            score_count=row.score_count,
+            provisional_composite=row.provisional_composite,
         )
 
     projected = [(row, public_status(row)) for row in rows]
@@ -1210,9 +1224,16 @@ async def agent_pipeline(
             screening_policy_version=agent.screening_policy_version,
             has_active_attempt=running_attempt is not None,
             has_active_validation=bool(active_work),
+            score_count=len(accepted_scores),
+            provisional_composite=(
+                statistics.mean(score.composite for score in accepted_scores)
+                if accepted_scores
+                else None
+            ),
         ),
         score_count=len(accepted_scores),
         quorum=SCORING_QUORUM,
+        score_floor=FIRST_SCORE_CONTINUATION_FLOOR,
         provisional_scores=[
             PublicProvisionalScore(
                 composite=score.composite,

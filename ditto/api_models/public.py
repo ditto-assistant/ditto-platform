@@ -849,6 +849,14 @@ class PublicSubmissionPipeline(BaseModel):
     status: str
     score_count: Annotated[int, Field(ge=0)]
     quorum: Annotated[int, Field(ge=1)]
+    score_floor: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Minimum provisional score required for another ticket.",
+        ),
+    ]
     provisional_scores: list[PublicProvisionalScore] = Field(default_factory=list)
     final_composite: Annotated[
         float | None,

@@ -1976,7 +1976,7 @@
     };
     var ACTIVITY_STATUSES = [
       "waiting_screening", "screening", "waiting_validator", "evaluating",
-      "under_review", "rejected", "scored", "live"
+      "below_score_floor", "under_review", "rejected", "scored", "live"
     ];
     var activityStatuses = [];
     var activityQuery = "";
@@ -3273,6 +3273,7 @@
         screening_failed: ["Screening interrupted", "warn"],
         waiting_validator: ["Waiting for scores", "progress"],
         evaluating: ["Evaluating", "progress"],
+        below_score_floor: ["Below score floor", "warn"],
         scored: ["Scored", "good"],
         live: ["Live", "good"],
         under_review: ["Under review", "warn"],
@@ -3284,6 +3285,7 @@
     function validationProgress(e) {
       var count = Math.max(0, Number(e.score_count) || 0);
       var quorum = Math.max(1, Number(e.quorum) || 3);
+      if (e.status === "below_score_floor") return "Stopped after " + count + " score";
       var hasStarted = count > 0 || ["waiting_validator", "evaluating", "scored", "live", "under_review"].indexOf(e.status) >= 0;
       return hasStarted ? count + " of " + quorum : "Not started";
     }
@@ -3329,6 +3331,14 @@
         return attempt.status === "issued";
       }).length;
       if (count >= quorum) return "Validation complete. The canonical result uses the median of " + quorum + " independent scores.";
+      if (e.status === "below_score_floor") {
+        var provisional = e.provisional_composite == null
+          ? ((e.provisional_scores || [])[0] || {}).composite
+          : e.provisional_composite;
+        return "Evaluation stopped after the first accepted score" +
+          (provisional == null ? "" : " of " + fx(provisional)) +
+          " was below the " + fx(e.score_floor) + " continuation floor. No further validator tickets will be issued.";
+      }
       if (e.status === "waiting_screening") return "Queued for a screener to claim under the current policy.";
       if (e.status === "screening") return "A screener is currently checking this submission.";
       if (e.status === "waiting_validator") {
@@ -3432,8 +3442,11 @@
       var quorum = Math.max(1, Number(pipeline.quorum) || 3);
       var complete = scores.length >= quorum && pipeline.final_composite != null &&
         (pipeline.status === "scored" || pipeline.status === "live");
+      var stopped = pipeline.status === "below_score_floor";
       var note = complete
         ? "Validation is complete. The final aggregate below is the authoritative median of the independent accepted scores."
+        : stopped
+        ? "Evaluation stopped because the first accepted score was below the continuation floor. This result is not eligible for emissions."
         : "Each value is an accepted platform score, but remains provisional until " + quorum + " independent scores arrive. Provisional scores may change; the final median is authoritative.";
       var rows = scores.map(function (score, index) {
         var label = complete ? "Accepted score " + (index + 1) : "Provisional score " + (index + 1);
@@ -3623,7 +3636,7 @@
         { status: "screening", statuses: ["screening"], body: "pipeline-screening", count: "pipeline-screening-count", empty: "No active screening job." },
         { status: "waiting_validator", statuses: ["waiting_validator"], body: "pipeline-wait-validator", count: "pipeline-wait-validator-count", empty: "No submissions waiting." },
         { status: "evaluating", statuses: ["evaluating"], body: "pipeline-evaluating", count: "pipeline-evaluating-count", empty: "No active evaluation." },
-        { status: "scored", statuses: ["scored", "live"], body: "pipeline-scored", count: "pipeline-scored-count", empty: "No scores yet. Finalized agents will appear here." }
+        { status: "scored", statuses: ["scored", "live", "below_score_floor"], body: "pipeline-scored", count: "pipeline-scored-count", empty: "No scores yet. Finalized agents will appear here." }
       ];
       pipelineLoaded = true;
       pipelineUnavailable = unavailable;
@@ -3660,7 +3673,7 @@
         var visible = indexed.map(function (item) {
           var entry = item.entry;
           var isUpNext = column.status === "waiting_validator" && Number(entry.validator_queue_rank) === 1;
-          var meta = column.status === "waiting_validator" || column.status === "evaluating"
+          var meta = column.status === "waiting_validator" || column.status === "evaluating" || entry.status === "below_score_floor"
             ? validationProgress(entry)
             : relTime(column.status === "scored" && entry.last_scored_at ? entry.last_scored_at : entry.submitted_at);
           var benchmark = column.status === "evaluating"
