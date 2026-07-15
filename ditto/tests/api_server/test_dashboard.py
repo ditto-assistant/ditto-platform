@@ -147,6 +147,26 @@ class TestDashboard:
         assert "Validation" in body
         assert "openActivityModal" in body
         assert "scores received" in body
+        assert "renderAcceptedScores" in body
+        assert "Accepted scores" in body
+        assert "Provisional score " in body
+        assert "Provisional scores may change" in body
+        assert "final median is authoritative" in body
+        assert "No validator score has been accepted yet." in body
+        assert "Final aggregate:" in body
+        assert "median of " in body
+        assert "score.reproduction_command" in body
+        assert "score.verification_command" in body
+        assert "score.dataset_sha256" in body
+        assert 'copyButton(score.seed, "benchmark seed")' in body
+        assert 'copyButton(score.reproduction_command, "dataset command")' in body
+        assert "esc(score.reproduction_command)" in body
+        assert "esc(score.verification_command)" in body
+        assert (
+            "Derived from an on-chain block hash after submission commitment." in body
+        )
+        assert "random fallback after submission commitment" in body
+        assert "already-submitted artifact" in body
         assert "validator is assigned; its score is pending" in body
         assert "Score pending" in body
         assert "has this assignment" in body
