@@ -25,6 +25,7 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -83,6 +84,7 @@ _ARTIFACT_URL_TTL = timedelta(minutes=5)
 _SCREENING_LEASE_TTL = timedelta(minutes=30)
 _HEARTBEAT_MAX_SKEW_SECONDS = 300
 _HEARTBEAT_MAX_BYTES = 4096
+_CLAIM_FALLBACK_LOCK = asyncio.Lock()
 
 # Policy v1 used the legacy three-field signature. Every policy from v2 onward
 # binds its version, including an older worker reporting a failure during a
@@ -372,14 +374,27 @@ async def claim(
             f"{SCREENING_POLICY_VERSION}, worker declared {policy_version}"
         )
     now = datetime.now(UTC)
-    async with session.begin():
-        claimed = await claim_screening_attempts(
-            session,
-            screener_hotkey=screener_hotkey,
-            now=now,
-            ttl=_SCREENING_LEASE_TTL,
-            limit=limit,
-        )
+    if session.get_bind().dialect.name == "postgresql":
+        async with session.begin():
+            claimed = await claim_screening_attempts(
+                session,
+                screener_hotkey=screener_hotkey,
+                now=now,
+                ttl=_SCREENING_LEASE_TTL,
+                limit=limit,
+            )
+    else:
+        # SQLite is used by local/test deployments and has no advisory locks.
+        # Hold a process-local lock through commit so its behavior matches the
+        # Postgres transaction-scoped lock used in production.
+        async with _CLAIM_FALLBACK_LOCK, session.begin():
+            claimed = await claim_screening_attempts(
+                session,
+                screener_hotkey=screener_hotkey,
+                now=now,
+                ttl=_SCREENING_LEASE_TTL,
+                limit=limit,
+            )
     items = [
         ScreenerQueueItem(
             agent_id=agent.agent_id,
@@ -390,8 +405,10 @@ async def claim(
             created_at=agent.created_at,
             attempt_id=attempt.attempt_id,
             lease_deadline=attempt.deadline,
+            precheck_reason_code=attempt.reason_code,
+            duplicate_of=duplicate_of,
         )
-        for agent, attempt in claimed
+        for agent, attempt, duplicate_of in claimed
     ]
     logger.info("screener=%s claimed %d item(s)", screener_hotkey, len(items))
     return ScreenerQueueResponse(
@@ -437,13 +454,15 @@ async def agent_artifact(
     )
 
 
-def _public_screening_reason(detail: str) -> str:
+def _public_screening_reason(detail: str, reason_code: str | None = None) -> str:
     """Map untrusted screener detail to a stable, public-safe failure category.
 
     ``detail`` can include a Docker build-log tail produced by miner-controlled
     code. Never persist or return it verbatim: a malicious Dockerfile could print
     the BuildKit secret mounted for private dependency access.
     """
+    if reason_code == "exact-cross-miner-duplicate":
+        return "Artifact is an exact duplicate of another miner submission"
     normalized = detail.strip().casefold()
     if "no dockerfile at tarball root" in normalized:
         return "Dockerfile missing from archive root"
@@ -565,6 +584,13 @@ async def submit_result(
         raise AgentNotScreenableError(
             f"passing verdict requires screening policy {SCREENING_POLICY_VERSION}"
         )
+    if (
+        payload.reason_code == "exact-cross-miner-duplicate"
+        and payload.outcome != ScreenResultOutcome.DETERMINISTIC_REJECT
+    ):
+        raise AgentNotScreenableError(
+            "exact duplicate precheck requires a deterministic rejection"
+        )
 
     public_reason: str | None
     if payload.outcome == ScreenResultOutcome.QUARANTINE:
@@ -575,7 +601,7 @@ async def submit_result(
         public_reason = "Screening infrastructure error"
     elif payload.outcome == ScreenResultOutcome.DETERMINISTIC_REJECT:
         target = AgentStatus.REJECTED
-        public_reason = _public_screening_reason(payload.detail)
+        public_reason = _public_screening_reason(payload.detail, payload.reason_code)
     else:
         # Legacy workers did not send typed pass/fail outcomes. Preserve their
         # detail-based behavior during rolling upgrades.
@@ -585,7 +611,9 @@ async def submit_result(
             else _failed_screening_target(payload.detail)
         )
         public_reason = (
-            None if payload.passed else _public_screening_reason(payload.detail)
+            None
+            if payload.passed
+            else _public_screening_reason(payload.detail, payload.reason_code)
         )
 
     # 3. Generate the per-submission dataset (outside the row lock). Only on a pass,
@@ -638,6 +666,12 @@ async def submit_result(
                 raise AgentNotScreenableError(
                     "verdict does not match the claimed screening attempt"
                 )
+            if attempt.reason_code == "exact-cross-miner-duplicate" and (
+                payload.reason_code != attempt.reason_code
+            ):
+                raise AgentNotScreenableError(
+                    "verdict does not match the platform precheck disposition"
+                )
             deadline = attempt.deadline
             if deadline.tzinfo is None:
                 deadline = deadline.replace(tzinfo=UTC)
@@ -670,6 +704,15 @@ async def submit_result(
                 f"passed={payload.passed} (target {target})"
             )
         agent.screening_reason = public_reason
+        agent.screening_reason_code = None if payload.passed else payload.reason_code
+        if payload.reason_code == "exact-cross-miner-duplicate":
+            if attempt is None or attempt.duplicate_of is None:
+                raise AgentNotScreenableError(
+                    "exact duplicate verdict requires a platform precheck"
+                )
+            agent.duplicate_of = attempt.duplicate_of
+        elif payload.passed:
+            agent.duplicate_of = None
         # Persist the policy that produced either terminal verdict. Rejected
         # submissions retry only after a policy bump; infrastructure failures
         # remain retryable under the same policy.
@@ -693,6 +736,7 @@ async def submit_result(
             attempt.status = attempt_status
             attempt.finished_at = datetime.now(UTC)
             attempt.public_reason = public_reason
+            attempt.reason_code = payload.reason_code
         if target == AgentStatus.QUARANTINED:
             if attempt is None:
                 raise AgentNotScreenableError(

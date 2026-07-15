@@ -54,10 +54,16 @@ class TestAgentStatusResponse:
         assert parsed.status == AgentStatus.SCREENING
 
     def test_stable_polling_shape(self) -> None:
-        """Polling includes the optional miner-visible screening reason."""
+        """Polling includes safe human and machine-readable screening reasons."""
         parsed = AgentStatusResponse.model_validate(
             _load_fixture("agent_status_response_v1.json")
         )
         dumped = parsed.model_dump()
-        assert set(dumped.keys()) == {"agent_id", "status", "screening_reason"}
+        assert set(dumped.keys()) == {
+            "agent_id",
+            "status",
+            "screening_reason",
+            "screening_reason_code",
+        }
         assert dumped["screening_reason"] is None
+        assert dumped["screening_reason_code"] is None

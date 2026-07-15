@@ -7,6 +7,7 @@ sr25519 dev keypair so the verification path runs for real.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -315,15 +316,17 @@ async def _seed_agent(
     created_at: datetime | None = None,
     agent_id: UUID | None = None,
     screening_policy_version: int | None = None,
+    miner_hotkey: str = _MINER_HOTKEY,
+    sha256: str = _SHA256,
 ) -> UUID:
     aid = agent_id or uuid4()
     async with maker() as s, s.begin():
         s.add(
             Agent(
                 agent_id=aid,
-                miner_hotkey=_MINER_HOTKEY,
+                miner_hotkey=miner_hotkey,
                 name=name,
-                sha256=_SHA256,
+                sha256=sha256,
                 status=status,
                 screening_policy_version=(
                     SCREENING_POLICY_VERSION
@@ -940,6 +943,143 @@ class TestClaim:
         assert first.status_code == 200
         assert replay.status_code == 200
         assert replay.json()["status"] == AgentStatus.EVALUATING
+
+    async def test_exact_duplicate_waits_for_usable_owner_then_rejects_before_screen(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Three hotkeys share one hash: a failed build claims nothing durable.
+
+        Concurrent claims cannot admit both later uploads. The first later upload
+        must pass the build gate before the other receives an exact-duplicate
+        precheck. Replaying that signed rejection remains idempotent.
+        """
+        now = datetime.now(UTC)
+        first = await _seed_agent(
+            session_maker,
+            status=AgentStatus.UPLOADED,
+            miner_hotkey="5FirstMinerHotkeyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            created_at=now - timedelta(minutes=3),
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        first_claim = (await client.post(_CLAIM_URL)).json()["items"][0]
+        first_failure = await client.post(
+            f"/api/v1/screener/agent/{first}/result",
+            json=_result_payload(
+                first,
+                passed=False,
+                attempt_id=UUID(first_claim["attempt_id"]),
+                outcome="deterministic_reject",
+                detail="build failed: synthetic compiler error",
+                reason_code="docker-build",
+            ),
+        )
+        assert first_failure.status_code == 200
+
+        second = await _seed_agent(
+            session_maker,
+            status=AgentStatus.UPLOADED,
+            miner_hotkey="5SecondMinerHotkeyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            created_at=now - timedelta(minutes=2),
+        )
+        third = await _seed_agent(
+            session_maker,
+            status=AgentStatus.UPLOADED,
+            miner_hotkey="5ThirdMinerHotkeyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            created_at=now - timedelta(minutes=1),
+        )
+
+        simultaneous = await asyncio.gather(
+            client.post(_CLAIM_URL), client.post(_CLAIM_URL)
+        )
+        admitted = [
+            item for response in simultaneous for item in response.json()["items"]
+        ]
+        assert [item["agent_id"] for item in admitted] == [str(second)]
+        assert admitted[0]["precheck_reason_code"] is None
+
+        second_pass = await client.post(
+            f"/api/v1/screener/agent/{second}/result",
+            json=_result_payload(
+                second,
+                attempt_id=UUID(admitted[0]["attempt_id"]),
+                outcome="pass",
+            ),
+        )
+        assert second_pass.status_code == 200
+
+        duplicate_claim = (await client.post(_CLAIM_URL)).json()["items"][0]
+        assert duplicate_claim["agent_id"] == str(third)
+        assert duplicate_claim["precheck_reason_code"] == (
+            "exact-cross-miner-duplicate"
+        )
+        assert duplicate_claim["duplicate_of"] == str(second)
+        conflicting_pass = await client.post(
+            f"/api/v1/screener/agent/{third}/result",
+            json=_result_payload(
+                third,
+                attempt_id=UUID(duplicate_claim["attempt_id"]),
+                outcome="pass",
+            ),
+        )
+        assert conflicting_pass.status_code == 409
+        duplicate_payload = _result_payload(
+            third,
+            passed=False,
+            attempt_id=UUID(duplicate_claim["attempt_id"]),
+            outcome="deterministic_reject",
+            detail="exact cross-miner duplicate",
+            reason_code="exact-cross-miner-duplicate",
+        )
+        rejected = await client.post(
+            f"/api/v1/screener/agent/{third}/result", json=duplicate_payload
+        )
+        replay = await client.post(
+            f"/api/v1/screener/agent/{third}/result", json=duplicate_payload
+        )
+        assert rejected.status_code == replay.status_code == 200
+        assert replay.json()["status"] == AgentStatus.REJECTED
+
+        async with session_maker() as session:
+            failed = await session.get(Agent, first)
+            owner = await session.get(Agent, second)
+            duplicate = await session.get(Agent, third)
+            attempt = await session.get(
+                ScreeningAttempt, UUID(duplicate_claim["attempt_id"])
+            )
+            assert failed is not None and failed.status == AgentStatus.REJECTED
+            assert owner is not None and owner.status == AgentStatus.EVALUATING
+            assert duplicate is not None and duplicate.duplicate_of == second
+            assert duplicate.screening_reason_code == "exact-cross-miner-duplicate"
+            assert duplicate.screening_reason == (
+                "Artifact is an exact duplicate of another miner submission"
+            )
+            assert attempt is not None
+            assert attempt.reason_code == "exact-cross-miner-duplicate"
+            assert attempt.duplicate_of == second
+
+        status = await client.get(f"/api/v1/retrieval/agent/{third}/status")
+        assert status.json()["screening_reason_code"] == ("exact-cross-miner-duplicate")
+
+    async def test_same_miner_exact_hash_retry_is_not_prechecked_as_duplicate(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        retry = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+
+        claimed = (await client.post(_CLAIM_URL)).json()["items"][0]
+
+        assert claimed["agent_id"] == str(retry)
+        assert claimed["precheck_reason_code"] is None
+        assert claimed["duplicate_of"] is None
 
     async def test_policy_mismatch_does_not_create_lease(
         self,

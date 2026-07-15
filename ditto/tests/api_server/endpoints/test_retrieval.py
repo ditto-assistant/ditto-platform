@@ -87,6 +87,7 @@ class TestAgentByHotkey:
             sha256="ab" * 32,
             created_at=datetime.now(UTC),
             screening_reason="Submission needs a dependency update",
+            screening_reason_code="docker-build",
         )
 
         async def _agent(*_a: object, **_k: object) -> object:
@@ -146,6 +147,7 @@ class TestAgentStatus:
             agent_id=uuid4(),
             status=AgentStatus.REJECTED,
             screening_reason="Remove the bundled credential and resubmit",
+            screening_reason_code="source-safety",
         )
 
         async def _agent(*_args: object, **_kwargs: object) -> object:
@@ -163,6 +165,7 @@ class TestAgentStatus:
             "agent_id": str(agent.agent_id),
             "status": AgentStatus.REJECTED.value,
             "screening_reason": agent.screening_reason,
+            "screening_reason_code": agent.screening_reason_code,
         }
 
     async def test_404_envelope_when_query_returns_none(
