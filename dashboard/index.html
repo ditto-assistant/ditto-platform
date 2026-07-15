@@ -1944,7 +1944,7 @@
       ["api", "wandb"].forEach(function (key) {
         if (params.has(key)) query.set(key, params.get(key));
       });
-      return "/" + plural + "/" + encodeURIComponent(String(identifier)) + (query.toString() ? "?" + query : "");
+      return "/" + (query.toString() ? "?" + query : "") + "#/" + plural + "/" + encodeURIComponent(String(identifier));
     }
 
     function entityAnchor(kind, identifier, label, className) {
@@ -1954,10 +1954,15 @@
     }
 
     function readEntityRoute() {
-      var match = /^\/(agents|miners|validators|screeners)\/([^/]+)\/?$/.exec(location.pathname);
+      var match = /^#\/(agents|miners|validators|screeners)\/([^/?#]+)\/?$/.exec(location.hash);
+      var legacy = false;
+      if (!match) {
+        match = /^\/(agents|miners|validators|screeners)\/([^/]+)\/?$/.exec(location.pathname);
+        legacy = Boolean(match);
+      }
       if (!match) return null;
       try {
-        return { kind: match[1], id: decodeURIComponent(match[2]), key: match[1] + ":" + decodeURIComponent(match[2]) };
+        return { kind: match[1], id: decodeURIComponent(match[2]), key: match[1] + ":" + decodeURIComponent(match[2]), legacy: legacy };
       } catch (error) {
         return null;
       }
@@ -1973,7 +1978,7 @@
 
     function pushEntityRoute(kind, identifier) {
       var href = entityHref(kind, identifier);
-      if (location.pathname + location.search === href) return;
+      if (location.pathname + location.search + location.hash === href) return;
       entityReturnUrl = location.pathname + location.search + location.hash;
       history.pushState({ entity: true }, "", href);
     }
@@ -2906,7 +2911,7 @@
       var link = ev.target.closest("[data-entity-link]");
       if (!link || ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
       ev.preventDefault();
-      if (location.pathname + location.search === link.getAttribute("href")) return;
+      if (location.pathname + location.search + location.hash === link.getAttribute("href")) return;
       entityReturnUrl = location.pathname + location.search + location.hash;
       history.pushState({ entity: true }, "", link.getAttribute("href"));
       resolveEntityRoute();
@@ -3804,6 +3809,11 @@
         resolvingEntityKey = "";
         if (document.getElementById("modal").classList.contains("open")) closeModal(true);
         return;
+      }
+
+      if (entity.legacy) {
+        history.replaceState(history.state || {}, "", entityHref(entity.kind, entity.id));
+        entity = readEntityRoute();
       }
 
       var expectedPage = ENTITY_PAGES[entity.kind];
