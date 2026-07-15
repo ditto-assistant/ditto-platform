@@ -189,11 +189,27 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
             )
         else:
 
-            @app.get("/", include_in_schema=False, response_class=HTMLResponse)
-            async def dashboard() -> HTMLResponse:
+            async def dashboard_response() -> HTMLResponse:
                 return HTMLResponse(
                     content=dashboard_html,
                     headers={"Cache-Control": "public, max-age=300"},
+                )
+
+            @app.get("/", include_in_schema=False, response_class=HTMLResponse)
+            async def dashboard() -> HTMLResponse:
+                return await dashboard_response()
+
+            # Stable public URLs for dashboard objects. These routes all serve the
+            # SPA shell; the client resolves the identifier and opens the matching
+            # agent, miner, validator, or screener view after its public data loads.
+            for entity_kind in ("agents", "miners", "validators", "screeners"):
+                app.add_api_route(
+                    f"/{entity_kind}/{{entity_id}}",
+                    dashboard_response,
+                    methods=["GET"],
+                    include_in_schema=False,
+                    response_class=HTMLResponse,
+                    name=f"dashboard_{entity_kind}",
                 )
 
             if _DASHBOARD_IMAGE.is_file():

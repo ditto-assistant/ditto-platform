@@ -41,6 +41,23 @@ class TestDashboard:
         # api-base stays empty so the SPA uses its same-origin /api/v1 default.
         assert 'name="ditto:api-base" content=""' in body
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/agents/6c10d0df-fc93-4903-a939-147d51cea1cc",
+            "/miners/5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+            "/validators/5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm",
+            "/screeners/5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        ],
+    )
+    async def test_serves_dashboard_at_entity_paths(self, path: str) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        resp = await _get(app, path)
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert resp.headers["Cache-Control"] == "public, max-age=300"
+        assert '<h1 id="page-title">Overview</h1>' in resp.text
+
     async def test_includes_social_preview_metadata(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
@@ -320,7 +337,7 @@ class TestDashboard:
             in body
         )
         assert "esc(displayName)" in body
-        assert "esc(shortKey(hotkey))" in body
+        assert "entityAnchor(singular, hotkey, shortKey(hotkey))" in body
         assert "fleet-node-key copyable" in body
         assert "title=\"' + esc(hotkey)" in body
         assert 'copyButton(hotkey, "validator hotkey")' in body
@@ -357,6 +374,25 @@ class TestDashboard:
         assert "<h2>Leaderboard</h2>" in body  # folded into Overview
         assert 'data-theme-choice="system"' in body  # switcher still wired
 
+    async def test_dashboard_entities_have_stable_path_urls(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert 'agents: "submissions"' in body
+        assert 'miners: "overview"' in body
+        assert 'validators: "operations"' in body
+        assert 'screeners: "operations"' in body
+        assert (
+            'return "/" + plural + "/" + encodeURIComponent(String(identifier))' in body
+        )
+        assert 'data-entity-link="agent"' in body
+        assert 'entityAnchor("validator", a.validator_hotkey' in body
+        assert 'entityAnchor("screener", a.screener_hotkey' in body
+        assert 'data-entity-kind="' in body
+        assert 'history.pushState({ entity: true }, "", href)' in body
+        assert 'window.addEventListener("popstate"' in body
+        assert 'getJSON("/public/activity?page=1&limit=1&q="' in body
+        assert 'target.setAttribute("aria-current", "true")' in body
+
     async def test_mobile_sidebar_stays_below_modal(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
@@ -375,8 +411,8 @@ class TestDashboard:
         assert 'role="option" aria-selected="false"' in body
         assert "function searchCorpus()" in body
         assert "pipelineEntries.forEach" in body
-        assert 'location.hash = "#/overview"' in body
-        assert 'location.hash = "#/submissions"' in body
+        assert 'history.pushState({}, "", dashboardHref("overview"))' in body
+        assert 'history.pushState({}, "", dashboardHref("submissions"))' in body
         assert 'event.key === "/"' in body
         assert 'event.key.toLowerCase() === "k"' in body
         assert 'event.key === "ArrowDown"' in body

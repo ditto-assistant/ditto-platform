@@ -476,7 +476,7 @@
     .pipeline-column h3 { margin: 0; font-size: 12px; font-weight: 700; color: var(--text); }
     .pipeline-count { min-width: 24px; padding: 2px 7px; border-radius: 999px; background: var(--bg-elev-2); color: var(--text-dim); font-size: 11px; font-weight: 750; text-align: center; font-variant-numeric: tabular-nums; }
     .pipeline-items { display: flex; flex-direction: column; gap: 5px; }
-    .pipeline-item { width: 100%; min-width: 0; padding: 8px 9px; border: 0; border-radius: 7px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; transition: background .16s ease-out; }
+    .pipeline-item { display: block; width: 100%; min-width: 0; padding: 8px 9px; border: 0; border-radius: 7px; background: transparent; color: inherit; font: inherit; text-align: left; text-decoration: none; cursor: pointer; transition: background .16s ease-out; }
     .pipeline-item:hover { background: var(--bg-elev-2); }
     .pipeline-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
     .pipeline-item-name { display: block; overflow: hidden; color: var(--text); font-size: 12.5px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
@@ -486,6 +486,9 @@
     .pipeline-more { color: var(--text-dim); font-weight: 650; }
     .agent-name { display: block; font-weight: 650; color: var(--text); }
     .agent-id { display: block; margin-top: 3px; font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+    .entity-link { color: inherit; text-decoration: underline; text-decoration-color: transparent; text-underline-offset: 3px; transition: color .16s ease-out, text-decoration-color .16s ease-out; }
+    .entity-link:hover { color: var(--accent); text-decoration-color: currentColor; }
+    .entity-link:focus-visible { border-radius: 2px; outline: 2px solid var(--focus); outline-offset: 3px; }
     .stage { display: inline-flex; align-items: center; gap: 7px; border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 750; letter-spacing: .2px; white-space: nowrap; border: 1px solid var(--border); color: var(--text-dim); background: var(--bg-elev-2); }
     .stage::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
     .stage.progress { color: var(--accent-2); border-color: color-mix(in oklab, var(--accent-2) 38%, transparent); background: color-mix(in oklab, var(--accent-2) 10%, transparent); }
@@ -555,6 +558,8 @@
     .fleet-toggle input { width: 17px; height: 17px; margin: 0; accent-color: var(--accent-2); cursor: pointer; }
     .fleet-table { min-width: 940px; }
     .fleet-table tbody tr { cursor: default; }
+    .fleet-table tbody tr.entity-target { background: color-mix(in oklch, var(--accent-2) 9%, transparent); box-shadow: inset 3px 0 0 var(--accent-2); }
+    .fleet-table tbody tr.entity-target:focus { outline: 2px solid var(--focus); outline-offset: -2px; }
     .fleet-node { display: block; color: var(--text); font-family: var(--mono); font-size: 12px; }
     .fleet-node-identity { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
     .fleet-node-name { overflow: hidden; color: var(--text); font: 650 12px/1.2 var(--sans); text-overflow: ellipsis; white-space: nowrap; }
@@ -1927,6 +1932,51 @@
     var activityQuery = "";
     var searchMatches = [];
     var searchActiveIndex = -1;
+    var ENTITY_PATHS = { agent: "agents", miner: "miners", validator: "validators", screener: "screeners" };
+    var ENTITY_PAGES = { agents: "submissions", miners: "overview", validators: "operations", screeners: "operations" };
+    var activeEntityKey = "";
+    var resolvingEntityKey = "";
+    var entityReturnUrl = "";
+
+    function entityHref(kind, identifier) {
+      var plural = ENTITY_PATHS[kind] || kind;
+      var query = new URLSearchParams();
+      ["api", "wandb"].forEach(function (key) {
+        if (params.has(key)) query.set(key, params.get(key));
+      });
+      return "/" + plural + "/" + encodeURIComponent(String(identifier)) + (query.toString() ? "?" + query : "");
+    }
+
+    function entityAnchor(kind, identifier, label, className) {
+      if (!identifier) return esc(label || "");
+      return '<a class="entity-link' + (className ? " " + esc(className) : "") + '" href="' +
+        esc(entityHref(kind, identifier)) + '" data-entity-link="' + esc(kind) + '">' + esc(label || identifier) + '</a>';
+    }
+
+    function readEntityRoute() {
+      var match = /^\/(agents|miners|validators|screeners)\/([^/]+)\/?$/.exec(location.pathname);
+      if (!match) return null;
+      try {
+        return { kind: match[1], id: decodeURIComponent(match[2]), key: match[1] + ":" + decodeURIComponent(match[2]) };
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function dashboardHref(page) {
+      var query = new URLSearchParams();
+      ["api", "wandb"].forEach(function (key) {
+        if (params.has(key)) query.set(key, params.get(key));
+      });
+      return "/" + (query.toString() ? "?" + query : "") + "#/" + page;
+    }
+
+    function pushEntityRoute(kind, identifier) {
+      var href = entityHref(kind, identifier);
+      if (location.pathname + location.search === href) return;
+      entityReturnUrl = location.pathname + location.search + location.hash;
+      history.pushState({ entity: true }, "", href);
+    }
 
     function restoreActivityUrl() {
       var url = new URL(location.href);
@@ -2172,7 +2222,7 @@
           '<tr data-i="' + i + '"' + (isChamp ? ' class="champion"' : '') +
             ' role="button" tabindex="0" aria-label="' + esc(rowLabel) + '">' +
             '<td>' + rankCell + '</td>' +
-            '<td><span class="hotkey">' + esc(shortKey(e.miner_hotkey)) + '</span>' + champ + prov +
+            '<td><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' + champ + prov +
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></td>' +
             modelCell(e) +
             compositeCell(e, entries[i - 1]) +
@@ -2347,14 +2397,16 @@
         : "Scored on the current benchmark (DittoBench v" + e.bench_version + ").";
     }
 
-    function openModal(i) {
+    function openModal(i, preserveUrl) {
       var e = lastEntries[i];
       if (!e) return;
+      if (!preserveUrl) pushEntityRoute("miner", e.miner_hotkey);
+      activeEntityKey = "miners:" + e.miner_hotkey;
       document.getElementById("d-stats").classList.remove("pipeline-mode");
       document.querySelector("#modal .split").style.display = "";
       document.getElementById("d-title").textContent = "Rank #" + e.rank + (e.rank === 1 ? " · 👑 Leader" : "");
       benchChip(e);
-      document.getElementById("d-hotkey").textContent = e.miner_hotkey;
+      document.getElementById("d-hotkey").innerHTML = entityAnchor("miner", e.miner_hotkey, e.miner_hotkey);
       document.getElementById("d-hotkey-copy").setAttribute("data-key", e.miner_hotkey || "");
 
       var tool = e.tool_mean, mem = e.memory_mean, sum = tool + mem || 1;
@@ -2760,9 +2812,17 @@
       return '<details class="cases"><summary>Per-case results <span class="muted">· ' + cs.length +
         " cases</span></summary>" + overview + blocks + "</details>";
     }
-    function closeModal() {
+    function closeModal(preserveUrl) {
       var modal = document.getElementById("modal");
       if (!modal.classList.contains("open")) return;
+      var entity = readEntityRoute();
+      if (!preserveUrl && entity && (entity.kind === "agents" || entity.kind === "miners")) {
+        if (entityReturnUrl && history.state && history.state.entity) {
+          history.back();
+          return;
+        }
+        history.replaceState({}, "", dashboardHref(ENTITY_PAGES[entity.kind]));
+      }
       modal.classList.remove("open");
       modal.setAttribute("aria-hidden", "true");
       document.getElementById("modal-back").classList.remove("open");
@@ -2771,6 +2831,9 @@
       // Return focus to whatever opened the dialog (usually the row).
       if (lastFocused && lastFocused.focus) lastFocused.focus();
       lastFocused = null;
+      activeEntityKey = "";
+      resolvingEntityKey = "";
+      entityReturnUrl = "";
     }
 
     // ── Events (delegated) ───────────────────────────────────
@@ -2839,9 +2902,18 @@
       ev.stopPropagation();
       doCopy(copy);
     });
+    document.addEventListener("click", function (ev) {
+      var link = ev.target.closest("[data-entity-link]");
+      if (!link || ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+      ev.preventDefault();
+      if (location.pathname + location.search === link.getAttribute("href")) return;
+      entityReturnUrl = location.pathname + location.search + location.hash;
+      history.pushState({ entity: true }, "", link.getAttribute("href"));
+      resolveEntityRoute();
+    });
     rowsEl.addEventListener("click", function (ev) {
       var copy = ev.target.closest(".copy");
-      if (copy) return;
+      if (copy || ev.target.closest("[data-entity-link]")) return;
       var tr = ev.target.closest("tr[data-i]");
       if (tr) openModal(+tr.getAttribute("data-i"));
     });
@@ -2849,7 +2921,7 @@
     // role="button". Space is prevented from scrolling the page. Copy buttons
     // inside the row activate natively and are skipped here.
     rowsEl.addEventListener("keydown", function (ev) {
-      if (ev.target.closest(".copy")) return;
+      if (ev.target.closest(".copy") || ev.target.closest("[data-entity-link]")) return;
       var tr = ev.target.closest("tr[data-i]");
       if (!tr) return;
       if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
@@ -2874,7 +2946,7 @@
     });
     document.getElementById("pipeline-overview").addEventListener("click", function (ev) {
       var item = ev.target.closest("[data-pipeline-i]");
-      if (item) openActivityEntry(pipelineEntries[+item.getAttribute("data-pipeline-i")]);
+      if (item && !item.matches("[data-entity-link]")) openActivityEntry(pipelineEntries[+item.getAttribute("data-pipeline-i")]);
     });
     document.querySelector(".activity").addEventListener("click", function (ev) {
       var filter = ev.target.closest("[data-activity-filter]");
@@ -2898,8 +2970,8 @@
       renderActivityFilterControls();
       loadActivity(1, this);
     });
-    document.getElementById("modal-close").addEventListener("click", closeModal);
-    document.getElementById("modal-back").addEventListener("click", closeModal);
+    document.getElementById("modal-close").addEventListener("click", function () { closeModal(false); });
+    document.getElementById("modal-back").addEventListener("click", function () { closeModal(false); });
     document.addEventListener("keydown", function (e) {
       if (e.key === "Escape") closeModal();
       else trapFocus(e);
@@ -3011,11 +3083,11 @@
       if (!result) return;
       closeSearch();
       if (result.type === "miner") {
-        location.hash = "#/overview";
+        history.pushState({}, "", dashboardHref("overview"));
         route(false);
         requestAnimationFrame(function () { openModal(result.index); });
       } else {
-        location.hash = "#/submissions";
+        history.pushState({}, "", dashboardHref("submissions"));
         route(false);
         requestAnimationFrame(function () { openActivityEntry(result.entry); });
       }
@@ -3212,7 +3284,7 @@
         : "";
       var agent = showAgent
         ? '<span class="benchmark-agent" title="' + esc(progress.agent_id || "") + '">' +
-          esc(progress.agent_name || "Unnamed agent") + " · " + esc(String(progress.agent_id || "").slice(0, 8)) + '</span>'
+          entityAnchor("agent", progress.agent_id, (progress.agent_name || "Unnamed agent") + " · " + String(progress.agent_id || "").slice(0, 8)) + '</span>'
         : "";
       if (!progress.stage) {
         return '<span class="benchmark-progress unknown">' + agent +
@@ -3262,7 +3334,7 @@
         if (a.status === "running") meta += " · deadline " + new Date(a.deadline).toLocaleString();
         return '<div class="attempt"><div><span class="attempt-version">Policy v' + esc(a.policy_version) + '</span></div>' +
           '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(label[0]) + '</span></b>' +
-          '<div class="attempt-meta">' + esc(meta) + '</div></div>' +
+          '<div class="attempt-meta">' + entityAnchor("screener", a.screener_hotkey, "Screener " + shortKey(a.screener_hotkey)) + esc(meta.slice(("Screener " + shortKey(a.screener_hotkey)).length)) + '</div></div>' +
           '<div class="attempt-time" title="' + esc(when) + '">' + relTime(when) + '</div></div>';
       }
       var screening = screeningAttempts.filter(function (a) {
@@ -3287,7 +3359,7 @@
         var benchmark = a.benchmark_progress ? renderBenchmarkProgress(a.benchmark_progress, false) : "";
         return '<div class="attempt"><div><span class="attempt-version">Validator</span></div>' +
           '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(a.actively_running ? "Scoring now" : label[0]) + retryInfo + '</span></b>' +
-          '<div class="attempt-meta">' + esc(meta) + '</div>' + benchmark + '</div>' +
+          '<div class="attempt-meta">' + entityAnchor("validator", a.validator_hotkey, "Validator " + shortKey(a.validator_hotkey)) + esc(meta.slice(("Validator " + shortKey(a.validator_hotkey)).length)) + '</div>' + benchmark + '</div>' +
           '<div class="attempt-time" title="' + esc(a.issued_at) + '">' + relTime(a.issued_at) + '</div></div>';
       }).join("");
       return '<div class="pipeline-history">' +
@@ -3325,7 +3397,7 @@
           '<section class="pipeline-meta" aria-labelledby="pipeline-meta-title">' +
             '<h4 id="pipeline-meta-title">Submission details</h4>' +
             '<dl class="pipeline-meta-list">' +
-              '<div><dt>Agent ID</dt><dd><span class="copyable"><code>' + esc(String(e.agent_id || "")) + '</code>' + copyButton(e.agent_id, "agent ID") + '</span></dd></div>' +
+              '<div><dt>Agent ID</dt><dd><span class="copyable"><code>' + entityAnchor("agent", e.agent_id, String(e.agent_id || "")) + '</code>' + copyButton(e.agent_id, "agent ID") + '</span></dd></div>' +
               '<div><dt>Evidence</dt><dd>' + esc(evidence) + '</dd></div>' +
             '</dl>' +
           '</section>' +
@@ -3334,8 +3406,10 @@
       '</div>';
     }
 
-    function openActivityEntry(e) {
+    function openActivityEntry(e, preserveUrl) {
       if (!e) return;
+      if (!preserveUrl) pushEntityRoute("agent", e.agent_id);
+      activeEntityKey = "agents:" + e.agent_id;
       var stage = activityStage(e.status);
       var evidence = e.review_reason
         ? "Copy review: " + e.review_reason
@@ -3348,7 +3422,7 @@
       chip.className = stage[1];
       chip.textContent = stage[0];
       chip.title = "Current submission stage";
-      document.getElementById("d-hotkey").textContent = e.miner_hotkey;
+      document.getElementById("d-hotkey").innerHTML = entityAnchor("miner", e.miner_hotkey, e.miner_hotkey);
       document.getElementById("d-hotkey-copy").setAttribute("data-key", e.miner_hotkey || "");
       document.getElementById("d-stats").innerHTML = renderPipelineSummary(
         e, null, evidence, "Loading screening and validation history…", "loading"
@@ -3425,13 +3499,13 @@
           var policyLabel = (column.status === "waiting_screening" || column.status === "screening")
             ? policyScreeningLabel(entry)
             : "";
-          return '<button type="button" class="pipeline-item" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(entry.name || "unnamed agent") + ' details' + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
+          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(entry.name || "unnamed agent") + ' details' + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
             '<span class="pipeline-item-name">' + esc(entry.name || "Unnamed agent") + '</span>' +
             '<span class="pipeline-item-meta"><span>' + esc(String(entry.agent_id || "").slice(0, 8)) + '</span><span>' + esc(meta) + '</span></span>' +
             (policyLabel ? '<span class="pipeline-item-policy">' + esc(policyLabel) + '</span>' : '') +
             screening +
             benchmark +
-            '</button>';
+            '</a>';
         }).join("");
         body.innerHTML = visible;
       });
@@ -3548,7 +3622,7 @@
       var agentId = String(entry.active_agent_id || "");
       return '<span class="screener-progress">' +
         '<span class="screener-progress-stage">' + esc(label) + ' · <span class="screener-progress-time" data-started-at="' + esc(progress.started_at) + '">' + esc(elapsedDuration(progress.started_at)) + '</span></span>' +
-        '<span class="current-agent" title="' + esc(agentId) + '">' + esc(agent) + (agentId ? " · " + esc(agentId.slice(0, 8)) : "") + '</span></span>';
+        '<span class="current-agent" title="' + esc(agentId) + '">' + entityAnchor("agent", agentId, agent + (agentId ? " · " + agentId.slice(0, 8) : "")) + '</span></span>';
     }
 
     function activeScreenerFor(agentId) {
@@ -3676,7 +3750,7 @@
         var reportedAt = entry.seen_at || entry.reported_at;
         var firstSeen = entry.first_seen_at ? relTime(entry.first_seen_at) : "–";
         var active = entry.active_agent_id
-          ? '<span class="current-agent" title="' + esc(entry.active_agent_id) + '">' + esc(entry.active_agent_name || "Agent") + ' · ' + esc(String(entry.active_agent_id).slice(0, 8)) + '</span>'
+          ? '<span class="current-agent" title="' + esc(entry.active_agent_id) + '">' + entityAnchor("agent", entry.active_agent_id, (entry.active_agent_name || "Agent") + ' · ' + String(entry.active_agent_id).slice(0, 8)) + '</span>'
           : '';
         var currentWork = singular === "validator" && entry.active_benchmark
           ? renderBenchmarkProgress(entry.active_benchmark, true)
@@ -3692,9 +3766,9 @@
           : "Protocol " + entry.protocol_version;
         var displayName = singular === "validator" ? validatorNames[hotkey] : "";
         var identity = displayName
-          ? '<span class="fleet-node-identity"><span class="fleet-node-name" title="' + esc(displayName) + '">' + esc(displayName) + '</span><span class="fleet-node fleet-node-key copyable" title="' + esc(hotkey) + '"><span>' + esc(shortKey(hotkey)) + '</span>' + copyButton(hotkey, "validator hotkey") + '</span></span>'
-          : '<span class="fleet-node copyable" title="' + esc(hotkey) + '"><span>' + esc(shortKey(hotkey)) + '</span>' + copyButton(hotkey, singular + " hotkey") + '</span>';
-        return '<tr>' +
+          ? '<span class="fleet-node-identity"><span class="fleet-node-name" title="' + esc(displayName) + '">' + entityAnchor(singular, hotkey, displayName) + '</span><span class="fleet-node fleet-node-key copyable" title="' + esc(hotkey) + '"><span>' + entityAnchor(singular, hotkey, shortKey(hotkey)) + '</span>' + copyButton(hotkey, "validator hotkey") + '</span></span>'
+          : '<span class="fleet-node copyable" title="' + esc(hotkey) + '"><span>' + entityAnchor(singular, hotkey, shortKey(hotkey)) + '</span>' + copyButton(hotkey, singular + " hotkey") + '</span>';
+        return '<tr tabindex="-1" data-entity-kind="' + singular + '" data-entity-id="' + esc(hotkey) + '">' +
           '<td><span class="fleet-node-wrap"><span class="fleet-type" aria-label="' + (singular === "screener" ? "Screener" : "Validator") + '">' + (singular === "screener" ? "S" : "V") + '</span><span>' +
             identity + '</span></span></td>' +
           '<td><span class="stage ' + status[1] + '">' + status[0] + '</span></td>' +
@@ -3705,6 +3779,7 @@
           renderFleetMetricCells(entry.system_metrics) +
           '</tr>';
       }).join("");
+      resolveEntityRoute();
     }
 
     document.getElementById("show-screeners").addEventListener("change", renderFleet);
@@ -3717,6 +3792,65 @@
       return fetch(API_BASE + path, { signal: ctrl.signal, headers: { accept: "application/json" } })
         .then(function (r) { clearTimeout(to); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); },
               function (e) { clearTimeout(to); throw e; });
+    }
+
+    function resolveEntityRoute() {
+      var entity = readEntityRoute();
+      document.querySelectorAll("#fleet-rows tr.entity-target").forEach(function (row) {
+        row.classList.remove("entity-target");
+        row.removeAttribute("aria-current");
+      });
+      if (!entity) {
+        resolvingEntityKey = "";
+        if (document.getElementById("modal").classList.contains("open")) closeModal(true);
+        return;
+      }
+
+      var expectedPage = ENTITY_PAGES[entity.kind];
+      var visiblePage = document.querySelector(".page.active");
+      if (!visiblePage || visiblePage.getAttribute("data-page") !== expectedPage) route(false);
+      if (entity.kind === "agents") {
+        if (activeEntityKey === entity.key && document.getElementById("modal").classList.contains("open")) return;
+        if (resolvingEntityKey === entity.key) return;
+        resolvingEntityKey = entity.key;
+        getJSON("/public/activity?page=1&limit=1&q=" + encodeURIComponent(entity.id))
+          .then(function (data) {
+            if (!readEntityRoute() || readEntityRoute().key !== entity.key) return;
+            var entry = (data.entries || []).find(function (item) { return String(item.agent_id) === entity.id; });
+            if (entry) openActivityEntry(entry, true);
+          })
+          .finally(function () { if (resolvingEntityKey === entity.key) resolvingEntityKey = ""; });
+        return;
+      }
+
+      if (entity.kind === "miners") {
+        var minerIndex = lastEntries.findIndex(function (entry) { return entry.miner_hotkey === entity.id; });
+        if (minerIndex >= 0 && (activeEntityKey !== entity.key || !document.getElementById("modal").classList.contains("open"))) {
+          openModal(minerIndex, true);
+        }
+        return;
+      }
+
+      var showScreeners = entity.kind === "screeners";
+      var toggle = document.getElementById("show-screeners");
+      if (toggle.checked !== showScreeners) {
+        toggle.checked = showScreeners;
+        renderFleet();
+        return;
+      }
+      var target = Array.prototype.find.call(document.querySelectorAll("#fleet-rows tr[data-entity-id]"), function (row) {
+        return row.getAttribute("data-entity-id") === entity.id;
+      });
+      if (!target) return;
+      target.classList.add("entity-target");
+      target.setAttribute("aria-current", "true");
+      if (activeEntityKey !== entity.key) {
+        activeEntityKey = entity.key;
+        requestAnimationFrame(function () {
+          target.scrollIntoView({ block: "center", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+          target.focus({ preventScroll: true });
+        });
+      }
     }
 
     function loadActivity(page, anchor) {
@@ -3772,8 +3906,8 @@
     function load(manual) {
       if (manual) setStatus("", "Refreshing…");
       getJSON("/public/leaderboard")
-        .then(function (data) { setStatus("live", "Live"); render(data, false); })
-        .catch(function () { setStatus("sample", "Sample data"); render(SAMPLE, true); });
+        .then(function (data) { setStatus("live", "Live"); render(data, false); resolveEntityRoute(); })
+        .catch(function () { setStatus("sample", "Sample data"); render(SAMPLE, true); resolveEntityRoute(); });
       // Health is independent: a failure here must not flip the whole page to
       // sample mode or blank the leaderboard.
       getJSON("/public/health")
@@ -3880,7 +4014,8 @@
     function route(initial) {
       var m = /^#\/([a-z]+)/.exec(location.hash || "");
       if (!m && location.hash && !initial) return;
-      var page = (m && PAGES[m[1]]) ? m[1] : "overview";
+      var entity = readEntityRoute();
+      var page = entity ? ENTITY_PAGES[entity.kind] : ((m && PAGES[m[1]]) ? m[1] : "overview");
       var els = document.querySelectorAll(".page");
       for (var i = 0; i < els.length; i++) els[i].classList.toggle("active", els[i].getAttribute("data-page") === page);
       var items = document.querySelectorAll(".nav-item");
@@ -3894,6 +4029,16 @@
       document.title = "Ditto SN118 · " + PAGES[page][0];
       window.scrollTo(0, 0);
     }
+    document.querySelectorAll(".nav-item[data-page]").forEach(function (item) {
+      item.addEventListener("click", function (event) {
+        if (!readEntityRoute()) return;
+        event.preventDefault();
+        history.pushState({}, "", dashboardHref(item.getAttribute("data-page")));
+        entityReturnUrl = "";
+        resolveEntityRoute();
+        route(false);
+      });
+    });
     window.addEventListener("hashchange", function () { route(false); });
     window.addEventListener("popstate", function () {
       var sanitized = restoreActivityUrl();
@@ -3903,8 +4048,10 @@
       renderActivityFilterControls();
       activityPage = 1;
       if (/^#\/submissions/.test(location.hash || "")) loadActivity(1);
+      resolveEntityRoute();
     });
     route(true);
+    resolveEntityRoute();
 
     renderActivityFilterControls();
     load(false);
