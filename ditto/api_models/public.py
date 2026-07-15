@@ -655,6 +655,26 @@ class PublicActivityEntry(BaseModel):
         int,
         Field(ge=0, description="Independent validator scores recorded so far."),
     ]
+    provisional_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description="Mean composite across accepted validator scores so far.",
+        ),
+    ]
+    validator_queue_rank: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description=(
+                "Current global validator-assignment priority for a waiting "
+                "submission. Validator-specific eligibility may skip a row."
+            ),
+        ),
+    ]
     quorum: Annotated[
         int,
         Field(ge=1, description="Independent validator scores required to finalize."),

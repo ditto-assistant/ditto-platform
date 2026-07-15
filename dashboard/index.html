@@ -496,7 +496,15 @@
     .pipeline-item:hover { background: var(--bg-elev-2); }
     .pipeline-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
     .pipeline-item-name { display: block; overflow: hidden; color: var(--text); font-size: 12.5px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+    .pipeline-item-heading { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .pipeline-item-heading .pipeline-item-name { flex: 1 1 auto; min-width: 0; }
+    .pipeline-next-badge {
+      flex: 0 0 auto; padding: 1px 5px; border-radius: 999px;
+      color: var(--accent); background: color-mix(in oklab, var(--accent) 10%, transparent);
+      font: 700 8.5px/1.5 var(--mono); letter-spacing: .02em;
+    }
     .pipeline-item-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 3px; color: var(--text-faint); font-family: var(--mono); font-size: 10.5px; }
+    .pipeline-item-priority-detail { display: block; margin-top: 4px; color: var(--text-dim); font: 600 10px/1.35 var(--mono); }
     .pipeline-item-policy { display: block; margin-top: 5px; color: var(--accent-2); font: 650 10px/1.35 var(--mono); }
     .pipeline-empty, .pipeline-more { padding: 8px 9px; color: var(--text-faint); font-size: 11.5px; line-height: 1.4; }
     .pipeline-more { color: var(--text-dim); font-weight: 650; }
@@ -3603,6 +3611,11 @@
       openActivityEntry(lastActivityEntries[i]);
     }
 
+    function validatorQueueCompare(a, b) {
+      return Number(a.entry.validator_queue_rank || Number.MAX_SAFE_INTEGER) -
+        Number(b.entry.validator_queue_rank || Number.MAX_SAFE_INTEGER);
+    }
+
     function renderPipelineBoard(data, unavailable) {
       var entries = data && data.entries ? data.entries : [];
       var columns = [
@@ -3635,6 +3648,8 @@
             return new Date(b.entry.last_scored_at || b.entry.submitted_at) -
               new Date(a.entry.last_scored_at || a.entry.submitted_at);
           });
+        } else if (column.status === "waiting_validator") {
+          indexed.sort(validatorQueueCompare);
         }
         count.textContent = indexed.length;
         stage.setAttribute("data-active", indexed.length ? "true" : "false");
@@ -3644,6 +3659,7 @@
         }
         var visible = indexed.map(function (item) {
           var entry = item.entry;
+          var isUpNext = column.status === "waiting_validator" && Number(entry.validator_queue_rank) === 1;
           var meta = column.status === "waiting_validator" || column.status === "evaluating"
             ? validationProgress(entry)
             : relTime(column.status === "scored" && entry.last_scored_at ? entry.last_scored_at : entry.submitted_at);
@@ -3655,9 +3671,14 @@
           var policyLabel = (column.status === "waiting_screening" || column.status === "screening")
             ? policyScreeningLabel(entry)
             : "";
-          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(entry.name || "unnamed agent") + ' details' + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
-            '<span class="pipeline-item-name">' + esc(entry.name || "Unnamed agent") + '</span>' +
+          var provisionalScore = column.status === "waiting_validator" && entry.provisional_composite != null
+            ? "Provisional " + fx(Number(entry.provisional_composite))
+            : "";
+          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(entry.name || "unnamed agent") + ' details' + (isUpNext ? ', up next for validator assignment' : '') + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
+            '<span class="pipeline-item-heading"><span class="pipeline-item-name">' + esc(entry.name || "Unnamed agent") + '</span>' +
+              (isUpNext ? '<span class="pipeline-next-badge" title="Highest current priority; validator eligibility can vary">Up next</span>' : '') + '</span>' +
             '<span class="pipeline-item-meta"><span>' + esc(String(entry.agent_id || "").slice(0, 8)) + '</span><span>' + esc(meta) + '</span></span>' +
+            (provisionalScore ? '<span class="pipeline-item-priority-detail">' + esc(provisionalScore) + '</span>' : '') +
             (policyLabel ? '<span class="pipeline-item-policy">' + esc(policyLabel) + '</span>' : '') +
             screening +
             benchmark +
