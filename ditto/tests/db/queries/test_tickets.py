@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
-from ditto.db.models import Agent, ValidatorTicket
+from ditto.db.models import Agent, Score, ValidatorTicket
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import (
     expire_overdue_tickets,
@@ -159,6 +159,60 @@ class TestIssueTicket:
                 claimed.append(ticket.agent_id)
 
         assert claimed == [zero_scores, one_score, two_scores]
+
+    async def test_completion_lane_prioritizes_highest_provisional_score(
+        self, session: AsyncSession
+    ) -> None:
+        low = await _seed_evaluating(
+            session, created_at=_NOW - timedelta(hours=2), name="low"
+        )
+        high = await _seed_evaluating(
+            session, created_at=_NOW - timedelta(hours=1), name="high"
+        )
+        medium = await _seed_evaluating(session, created_at=_NOW, name="medium")
+        async with session.begin():
+            for agent_id, composites in (
+                (low, (0.20, 0.30)),
+                (high, (0.90, 0.80)),
+                (medium, (0.60, 0.70)),
+            ):
+                for index, composite in enumerate(composites):
+                    validator = f"5Scored-{agent_id}-{index}"
+                    session.add(
+                        ValidatorTicket(
+                            agent_id=agent_id,
+                            validator_hotkey=validator,
+                            status=TicketStatus.SCORED,
+                            issued_at=_NOW,
+                            deadline=_NOW + _TTL,
+                            bench_version=2,
+                            attempt_count=1,
+                        )
+                    )
+                    session.add(
+                        Score(
+                            agent_id=agent_id,
+                            validator_hotkey=validator,
+                            run_id=f"run-{agent_id}-{index}",
+                            signature=None,
+                            seed=123,
+                            composite=composite,
+                            tool_mean=composite,
+                            memory_mean=composite,
+                            median_ms=100,
+                            n=114,
+                            details=None,
+                            generated_at=_NOW,
+                        )
+                    )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Completion", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == high
 
     async def test_round_robins_live_assignments_across_zero_score_agents(
         self, session: AsyncSession
