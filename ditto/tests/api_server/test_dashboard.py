@@ -374,16 +374,17 @@ class TestDashboard:
         assert "<h2>Leaderboard</h2>" in body  # folded into Overview
         assert 'data-theme-choice="system"' in body  # switcher still wired
 
-    async def test_dashboard_entities_have_stable_path_urls(self) -> None:
+    async def test_dashboard_entities_use_smooth_hash_routes(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert 'agents: "submissions"' in body
         assert 'miners: "overview"' in body
         assert 'validators: "operations"' in body
         assert 'screeners: "operations"' in body
-        assert (
-            'return "/" + plural + "/" + encodeURIComponent(String(identifier))' in body
-        )
+        assert '"#/" + plural + "/" + encodeURIComponent(String(identifier))' in body
+        assert r"/^#\/(agents|miners|validators|screeners)\/([^/?#]+)\/?$/" in body
+        assert "if (entity.legacy)" in body
+        assert 'history.replaceState(history.state || {}, "", entityHref(' in body
         assert 'data-entity-link="agent"' in body
         assert 'entityAnchor("validator", a.validator_hotkey' in body
         assert 'entityAnchor("screener", a.screener_hotkey' in body
