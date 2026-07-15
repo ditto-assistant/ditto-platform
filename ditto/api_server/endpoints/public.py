@@ -103,9 +103,11 @@ from ditto.db.queries.scores import (
     LedgerRow,
     SubmissionRow,
     get_public_health,
+    get_score_counts,
     get_submission_scores,
     list_eligible_ledger,
     list_miner_composite_history,
+    list_provisional_ledger,
     list_public_submissions,
     list_scores_for_bench_version,
 )
@@ -430,7 +432,12 @@ def _safe_stderr(details: dict) -> float | None:
 
 
 def _public_entry(
-    rank: int, r: LedgerRow, history: list[float] | None = None
+    rank: int,
+    r: LedgerRow,
+    history: list[float] | None = None,
+    *,
+    finalized: bool = True,
+    score_count: int = SCORING_QUORUM,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -449,6 +456,9 @@ def _public_entry(
     calibration_brier, calibration_n = _safe_calibration(details)
     return PublicLeaderboardEntry(
         rank=rank,
+        finalized=finalized,
+        score_count=score_count,
+        score_quorum=SCORING_QUORUM,
         agent_id=r.agent_id,
         miner_hotkey=r.miner_hotkey,
         composite=r.composite,
@@ -477,16 +487,61 @@ async def leaderboard(
     response: Response,
     session: SessionDep,
 ) -> PublicLeaderboardResponse:
-    """Best eligible score per miner, aggregate-only, highest composite first."""
+    """Best score per miner, with pre-quorum results marked provisional."""
     response.headers["Cache-Control"] = _CACHE_CONTROL
-    rows = await list_eligible_ledger(session)
+    ledger_rows = await list_eligible_ledger(session)
+    score_counts = await get_score_counts(
+        session, [row.agent_id for row in ledger_rows]
+    )
+    finalized_rows = [
+        row
+        for row in ledger_rows
+        if score_counts.get(row.agent_id, 0) >= SCORING_QUORUM
+    ]
+    finalized_miners = {row.miner_hotkey for row in finalized_rows}
+    provisional_candidates = [
+        (row, score_counts.get(row.agent_id, 0))
+        for row in ledger_rows
+        if score_counts.get(row.agent_id, 0) < SCORING_QUORUM
+    ] + list(await list_provisional_ledger(session))
+    provisional_candidates.sort(
+        key=lambda candidate: (
+            not candidate[0].eligible,
+            -candidate[0].composite,
+            candidate[0].first_seen,
+            str(candidate[0].agent_id),
+        )
+    )
+    provisional_by_miner: dict[str, tuple[LedgerRow, int]] = {}
+    for candidate in provisional_candidates:
+        if candidate[0].miner_hotkey not in finalized_miners:
+            provisional_by_miner.setdefault(candidate[0].miner_hotkey, candidate)
+    provisional_rows = list(provisional_by_miner.values())
+    rows = finalized_rows + [row for row, _count in provisional_rows]
     histories = await list_miner_composite_history(
         session, [r.miner_hotkey for r in rows]
     )
-    entries = [
-        _public_entry(i, r, histories.get(r.miner_hotkey))
-        for i, r in enumerate(rows, start=1)
-    ]
+    entries = []
+    for i, row in enumerate(finalized_rows, start=1):
+        entries.append(
+            _public_entry(
+                i,
+                row,
+                histories.get(row.miner_hotkey),
+                finalized=True,
+                score_count=score_counts.get(row.agent_id, SCORING_QUORUM),
+            )
+        )
+    for row, count in provisional_rows:
+        entries.append(
+            _public_entry(
+                len(entries) + 1,
+                row,
+                histories.get(row.miner_hotkey),
+                finalized=False,
+                score_count=count,
+            )
+        )
     return PublicLeaderboardResponse(
         generated_at=datetime.now(UTC),
         count=len(entries),

@@ -121,7 +121,18 @@ class TestDashboard:
         assert "<h2>Recent submissions</h2>" not in body
         assert "<h2>What DittoBench v2 measures</h2>" not in body
         assert "Submission pipeline" in body
-        assert body.index("<h2>Leaderboard</h2>") < body.index('class="operations"')
+        assert body.index('id="leaderboard-title">Leaderboard</h2>') < body.index(
+            'class="operations"'
+        )
+        assert 'id="leaderboard-title">Leaderboard' in body
+        assert 'id="leaderboard-notice" role="status" aria-live="polite"' in body
+        assert "Provisional standings." in body
+        assert "not the required 3 of 3 scores" in body
+        assert "only final results drive emissions" in body
+        assert 'class="quorum-badge"' in body
+        assert "function isFinalized(e)" in body
+        assert '"Provisional leaderboard"' in body
+        assert '"P" + e.rank' in body
         assert "getJSON(activityRequestPath(page))" in body
         assert 'id="activity-rows"' in body
         assert 'id="activity-pager"' in body
@@ -401,7 +412,7 @@ class TestDashboard:
             assert f'href="#/{page}"' in body
             assert f'data-page="{page}"' in body
         assert 'href="#/leaderboard"' not in body
-        assert "<h2>Leaderboard</h2>" in body  # folded into Overview
+        assert 'id="leaderboard-title">Leaderboard</h2>' in body  # folded into Overview
         assert 'data-theme-choice="system"' in body  # switcher still wired
 
     async def test_dashboard_entities_use_smooth_hash_routes(self) -> None:

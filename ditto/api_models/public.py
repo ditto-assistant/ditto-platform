@@ -154,6 +154,28 @@ class PublicLeaderboardEntry(BaseModel):
     """
 
     rank: Annotated[int, Field(ge=1, description="1-based rank by composite.")]
+    finalized: Annotated[
+        bool,
+        Field(
+            default=True,
+            description=(
+                "Whether the submission reached the three-validator quorum. "
+                "False entries are provisional feedback and never drive weights."
+            ),
+        ),
+    ]
+    score_count: Annotated[
+        int,
+        Field(
+            default=3,
+            ge=1,
+            description="Accepted independent validator scores currently available.",
+        ),
+    ]
+    score_quorum: Annotated[
+        int,
+        Field(default=3, ge=1, description="Scores required for finalization."),
+    ]
     agent_id: Annotated[
         UUID,
         Field(
@@ -293,6 +315,9 @@ class PublicLeaderboardEntry(BaseModel):
         json_schema_extra={
             "example": {
                 "rank": 1,
+                "finalized": True,
+                "score_count": 3,
+                "score_quorum": 3,
                 "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
                 "composite": 0.587,
                 "composite_stderr": 0.014,

@@ -227,6 +227,60 @@ async def _seed_agent(
 
 
 class TestPublicLeaderboard:
+    async def test_includes_pre_quorum_scores_as_provisional_feedback(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.6, 0.8],
+            status=AgentStatus.EVALUATING,
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        assert body["count"] == 1
+        entry = body["entries"][0]
+        assert entry["miner_hotkey"] == _MINER_A
+        assert entry["composite"] == pytest.approx(0.7)
+        assert entry["tool_mean"] == pytest.approx(0.7)
+        assert entry["memory_mean"] == pytest.approx(0.7)
+        assert entry["finalized"] is False
+        assert entry["score_count"] == 2
+        assert entry["score_quorum"] == 3
+        assert entry["bench_version"] is None
+
+    async def test_finalized_miner_supersedes_partial_submission(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+        )
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.99],
+            status=AgentStatus.EVALUATING,
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        assert body["count"] == 1
+        entry = body["entries"][0]
+        assert entry["composite"] == pytest.approx(0.5)
+        assert entry["finalized"] is True
+        assert entry["score_count"] == 3
+
     async def test_ranks_by_composite_and_exposes_aggregates(
         self,
         app: FastAPI,
@@ -261,6 +315,8 @@ class TestPublicLeaderboard:
         assert body["count"] == 2
         assert [e["rank"] for e in body["entries"]] == [1, 2]
         assert [e["miner_hotkey"] for e in body["entries"]] == [_MINER_B, _MINER_A]
+        assert all(e["finalized"] is False for e in body["entries"])
+        assert all(e["score_count"] == 1 for e in body["entries"])
         top = body["entries"][0]
         assert top["composite"] == pytest.approx(0.9)
         assert top["tool_mean"] == pytest.approx(0.95)

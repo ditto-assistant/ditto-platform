@@ -238,6 +238,15 @@
     .section-head h2 { font-size: 16px; margin: 0; letter-spacing: 0.2px; }
     .section-head .hint { color: var(--text-faint); font-size: 12.5px; }
 
+    .leaderboard-notice {
+      display: none; margin: -4px 0 12px; padding: 10px 12px;
+      color: var(--text-dim); background: color-mix(in oklab, var(--warn) 9%, transparent);
+      border: 1px solid color-mix(in oklab, var(--warn) 34%, transparent);
+      border-radius: 9px; font-size: 12.5px; line-height: 1.5;
+    }
+    .leaderboard-notice.show { display: block; }
+    .leaderboard-notice strong { color: var(--warn); }
+
     /* ── Leaderboard ────────────────────────────────────────── */
     .board { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
     table { width: 100%; border-collapse: collapse; }
@@ -278,6 +287,7 @@
        amber like a previous-version run, and the rank cell is dimmed. */
     .prov { margin-left: 8px; font-family: var(--sans); font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn) 48%, transparent); background: color-mix(in oklab, var(--warn) 14%, transparent); border-radius: 5px; padding: 1px 6px; vertical-align: middle; }
     .rank.prov-rank { background: transparent; color: var(--text-faint); font-weight: 600; }
+    .quorum-badge { margin-left: 8px; font-family: var(--sans); font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn) 48%, transparent); background: color-mix(in oklab, var(--warn) 11%, transparent); border-radius: 5px; padding: 1px 6px; vertical-align: middle; white-space: nowrap; }
     /* Board-wide benchmark-version badge in the header subtitle. */
     .bench-badge { display: none; margin-left: 10px; font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--accent-2); background: color-mix(in oklab, var(--accent-2) 12%, transparent); border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent); border-radius: 6px; padding: 2px 8px; vertical-align: middle; text-transform: uppercase; }
     .bench-badge.show { display: inline-block; }
@@ -1627,9 +1637,10 @@
     </section>
 
     <div class="section-head">
-      <h2>Leaderboard</h2>
-      <span class="hint">best eligible score per miner · ranked by composite · click a row for detail</span>
+      <h2 id="leaderboard-title">Leaderboard</h2>
+      <span class="hint" id="leaderboard-hint">best final score per miner · ranked by composite · click a row for detail</span>
     </div>
+    <div class="leaderboard-notice" id="leaderboard-notice" role="status" aria-live="polite"></div>
     <div class="board">
       <table id="board" tabindex="-1" aria-label="Subnet 118 leaderboard: best score per miner">
         <thead>
@@ -2165,31 +2176,39 @@
 
     // ── Render ───────────────────────────────────────────────
     function render(data, isSample) {
-      // Eligible (full-benchmark) runs rank first; provisional smoke/practice
-      // runs (a smaller run-size profile that omits the hard memory categories)
-      // sink below them regardless of composite, so an inflated 6-case "100%
-      // memory" can never present as #1. Composite orders within each tier.
+      // Finalized submissions always rank ahead of pre-quorum feedback. Within
+      // each tier, full-benchmark runs rank ahead of smoke/practice runs and
+      // composite orders the field. Provisional values are useful feedback but
+      // never masquerade as the canonical three-validator result.
       var entries = (data.entries || []).slice().sort(function (a, b) {
+        var af = isFinalized(a), bf = isFinalized(b);
+        if (af !== bf) return af ? -1 : 1;
         var ae = isEligible(a), be = isEligible(b);
         if (ae !== be) return ae ? -1 : 1;
         return b.composite - a.composite;
       });
-      // Competitive rank is assigned only to eligible entries; provisional runs
-      // are shown for transparency but stay unranked (rank = null).
-      var rk = 0;
-      entries.forEach(function (e) { e.rank = isEligible(e) ? (++rk) : null; });
+      var finalRank = 0, provisionalRank = 0;
+      entries.forEach(function (e) {
+        e.rank = isEligible(e)
+          ? (isFinalized(e) ? (++finalRank) : (++provisionalRank))
+          : null;
+      });
       lastEntries = entries;
 
-      // Summary cards reflect the ranked (eligible) field only, a provisional
-      // run is not a real headline number.
-      var elig = entries.filter(isEligible);
-      var comps = elig.map(function (e) { return e.composite; });
+      var finalizedEntries = entries.filter(isFinalized);
+      var finalized = finalizedEntries.filter(isEligible);
+      var provisional = entries.filter(function (e) { return !isFinalized(e) && isEligible(e); });
+      var headline = finalized.length ? finalized : provisional;
+      var comps = headline.map(function (e) { return e.composite; });
+      var provisionalHeadline = !finalized.length && provisional.length;
       document.getElementById("c-miners").textContent = entries.length;
-      document.getElementById("c-top").innerHTML = comps.length ? fx(comps[0]) : "–";
-      document.getElementById("c-median").innerHTML = comps.length ? fx(median(comps)) : "–";
+      document.getElementById("c-top").innerHTML = comps.length
+        ? fx(comps[0]) + (provisionalHeadline ? ' <small>provisional</small>' : '') : "–";
+      document.getElementById("c-median").innerHTML = comps.length
+        ? fx(median(comps)) + (provisionalHeadline ? ' <small>provisional</small>' : '') : "–";
       // Top gap: how contested the #1 spot is (#1 minus #2 composite).
       document.getElementById("c-spread").innerHTML = comps.length >= 2
-        ? fx(comps[0] - comps[1]) + ' <small>#1 → #2</small>' : "–";
+        ? fx(comps[0] - comps[1]) + ' <small>' + (provisionalHeadline ? 'provisional · ' : '') + '#1 → #2</small>' : "–";
       // Scoring spend: total LLM tokens the harnesses' own calls burned (generation and grading are non-LLM).
       var toks = entries.map(function (e) { return e.tokens; }).filter(function (t) { return t != null; });
       document.getElementById("c-cost").innerHTML = toks.length
@@ -2210,7 +2229,9 @@
       // the board (which are individually marked in their rows).
       // "Older" = an explicit lower version OR a legacy run with no version recorded
       // (pre-versioning), both are marked in their rows and neither is the current bench.
-      var hasOld = entries.some(function (e) { return e.bench_version == null || e.bench_version < currentBench; });
+      var hasOld = entries.some(function (e) {
+        return isFinalized(e) && (e.bench_version == null || e.bench_version < currentBench);
+      });
       var badge = document.getElementById("bench-badge");
       badge.className = "bench-badge show";
       badge.textContent = "DittoBench v" + currentBench +
@@ -2219,6 +2240,23 @@
       // headline cards to distinct leaderboard metrics.
       var when = data.generated_at ? relTime(data.generated_at) : "–";
       if (!isSample) document.getElementById("status-text").textContent = "Live · " + when;
+
+      var title = document.getElementById("leaderboard-title");
+      var hint = document.getElementById("leaderboard-hint");
+      var notice = document.getElementById("leaderboard-notice");
+      title.textContent = finalizedEntries.length ? "Leaderboard" : (provisional.length ? "Provisional leaderboard" : "Leaderboard");
+      hint.textContent = finalizedEntries.length
+        ? "final three-validator results first · provisional feedback follows"
+        : "early accepted scores · ranked provisionally by composite";
+      if (provisional.length) {
+        notice.classList.add("show");
+        notice.innerHTML = '<strong>Provisional standings.</strong> ' + provisional.length +
+          ' miner' + (provisional.length === 1 ? ' has' : 's have') +
+          ' accepted validator feedback but not the required 3 of 3 scores. Rankings and composites can change until quorum; only final results drive emissions.';
+      } else {
+        notice.classList.remove("show");
+        notice.textContent = "";
+      }
 
       // Rows
       var tb = document.getElementById("rows");
@@ -2230,10 +2268,11 @@
       }
       tb.innerHTML = entries.map(function (e, i) {
         var elig = isEligible(e);
+        var finalizedEntry = isFinalized(e);
         // Crown + rank styling only for the top *eligible* run; provisional runs
         // are unranked and never champion.
-        var isChamp = elig && e.rank === 1;
-        var rankCls = (elig && e.rank <= 3) ? " r" + e.rank : "";
+        var isChamp = finalizedEntry && elig && e.rank === 1;
+        var rankCls = (finalizedEntry && elig && e.rank <= 3) ? " r" + e.rank : "";
         var champ = isChamp ? '<span class="badge"><span aria-hidden="true">👑</span> LEADER</span>' : "";
         var kind = unrankedKind(e);
         var prov = kind === "zero"
@@ -2242,15 +2281,18 @@
           ? '<span class="prov" title="Provisional. It ran a smaller profile that did not administer the full benchmark, so it is shown for transparency but is not ranked and not emission-eligible.">provisional</span>'
           : "";
         var rankCell = elig
-          ? '<span class="rank' + rankCls + '">' + e.rank + '</span>' + rankMove(e.miner_hotkey, e.rank)
+          ? '<span class="rank' + rankCls + '">' + (finalizedEntry ? e.rank : "P" + e.rank) + '</span>' +
+            (finalizedEntry ? rankMove(e.miner_hotkey, e.rank) : "")
           : '<span class="rank prov-rank" title="Not ranked (' + (kind === "zero" ? "scored 0.000" : "provisional run") + ').">–</span>';
-        var rowLabel = (elig ? "Rank " + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
+        var rowLabel = (elig ? (finalizedEntry ? "Rank " : "Provisional rank ") + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
           ", miner " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) + ". Activate for run detail.";
+        var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge" title="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
+          esc(e.score_count || 0) + ' of ' + esc(e.score_quorum || 3) + ' · provisional</span>';
         return '' +
           '<tr data-i="' + i + '"' + (isChamp ? ' class="champion"' : '') +
             ' role="button" tabindex="0" aria-label="' + esc(rowLabel) + '">' +
             '<td>' + rankCell + '</td>' +
-            '<td><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' + champ + prov +
+            '<td><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' + champ + prov + quorumBadge +
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></td>' +
             modelCell(e) +
             compositeCell(e, entries[i - 1]) +
@@ -2272,6 +2314,7 @@
     // did not administer the full benchmark. Older APIs / sample data omit the
     // field and are treated as eligible.
     function isEligible(e) { return !e || e.eligible !== false; }
+    function isFinalized(e) { return !e || e.finalized !== false; }
     // Why an unranked run is unranked. A full run (n >= 100) that is not ranked
     // scored a non-positive composite ("no score"); otherwise it ran a smaller
     // practice profile ("provisional"). Mirrors the backend's two-gate rule so the
@@ -2387,9 +2430,13 @@
       var name = m.harness || "";
       var bv;
       if (e.bench_version == null) {
+        if (!isFinalized(e)) {
+          bv = '<span class="bv" title="Run provenance appears after the three-validator aggregate is final.">pending quorum</span>';
+        } else {
         // No version recorded → a run from before benchmark versioning. Flag it as
         // legacy so it reads as "not on the current benchmark", same as an older v.
-        bv = '<span class="bv prev" title="' + esc("Scored before benchmark versioning. A legacy run, not comparable to the current DittoBench v" + currentBench + ".") + '">legacy</span>';
+          bv = '<span class="bv prev" title="' + esc("Scored before benchmark versioning. A legacy run, not comparable to the current DittoBench v" + currentBench + ".") + '">legacy</span>';
+        }
       } else {
         var old = e.bench_version < currentBench;
         var cls = old ? "bv prev" : "bv";
@@ -2412,9 +2459,11 @@
     function benchChip(e) {
       var el = document.getElementById("d-bench");
       if (e.bench_version == null) {
-        el.className = "prev";
-        el.textContent = "legacy";
-        el.title = "Scored before benchmark versioning. A legacy run, not comparable to the current DittoBench v" + currentBench + ".";
+        el.className = isFinalized(e) ? "prev" : "";
+        el.textContent = isFinalized(e) ? "legacy" : "pending quorum";
+        el.title = isFinalized(e)
+          ? "Scored before benchmark versioning. A legacy run, not comparable to the current DittoBench v" + currentBench + "."
+          : "Run provenance appears after the three-validator aggregate is final.";
         return;
       }
       var old = e.bench_version < currentBench;
@@ -2432,7 +2481,9 @@
       activeEntityKey = "miners:" + e.miner_hotkey;
       document.getElementById("d-stats").classList.remove("pipeline-mode");
       document.querySelector("#modal .split").style.display = "";
-      document.getElementById("d-title").textContent = "Rank #" + e.rank + (e.rank === 1 ? " · 👑 Leader" : "");
+      document.getElementById("d-title").textContent = isFinalized(e)
+        ? "Rank #" + e.rank + (e.rank === 1 ? " · 👑 Leader" : "")
+        : "Provisional rank P" + e.rank + " · " + (e.score_count || 0) + " of " + (e.score_quorum || 3) + " scores";
       benchChip(e);
       document.getElementById("d-hotkey").innerHTML = entityAnchor("miner", e.miner_hotkey, e.miner_hotkey);
       document.getElementById("d-hotkey-copy").setAttribute("data-key", e.miner_hotkey || "");
@@ -2449,12 +2500,15 @@
       var m = e.models || {};
       var mKind = unrankedKind(e);
       var det = "";
+      if (!isFinalized(e)) det += stat("Validation", (e.score_count || 0) + " of " + (e.score_quorum || 3) + " accepted scores. Not final and not used for emissions.");
       if (e.n != null) det += stat("Cases scored", String(e.n) +
         (mKind === "provisional" ? " (provisional, partial benchmark)" : ""));
       if (mKind === "zero") det += stat("Ranking", "Not ranked. This full run scored a composite of 0.000, so it earns no rank and no emissions.");
       else if (mKind === "provisional") det += stat("Ranking", "Provisional. Not ranked and not emission-eligible. It ran a smaller profile that omits the hard memory categories.");
       if (e.median_ms != null) det += stat("Median latency", e.median_ms + " ms");
-      if (e.bench_version == null) {
+      if (e.bench_version == null && !isFinalized(e)) {
+        det += stat("Benchmark version", "Pending final quorum");
+      } else if (e.bench_version == null) {
         det += stat("Benchmark version", "legacy (pre-versioning, not comparable to v" + currentBench + ")");
       } else {
         det += stat("Benchmark version", "v" + e.bench_version +
@@ -4070,7 +4124,7 @@
       generated_at: new Date(Date.now() - 12000).toISOString(),
       count: 5,
       entries: [
-        { rank: 1, miner_hotkey: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", composite: 0.658, tool_mean: 0.867, memory_mean: 0.449, first_seen: new Date(Date.now() - 86400000 * 2).toISOString(),
+        { rank: 1, finalized: true, score_count: 3, score_quorum: 3, miner_hotkey: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", composite: 0.658, tool_mean: 0.867, memory_mean: 0.449, first_seen: new Date(Date.now() - 86400000 * 2).toISOString(),
           median_ms: 2410, n: 12, bench_version: 2, dataset_sha256: "9f2c1a77b4e35d0182ac4f6b0e2d9c3a5b7148ef22d0c6a9f1e8b3d47c05a6e1",
           models: { harness: "qwen/qwen3-32b" },
           per_category: [{ category: "memory_lookup", count: 3, mean: 0.83 }, { category: "web_search", count: 2, mean: 0.75 }, { category: "artifacts_create", count: 1, mean: 0.6 }],
@@ -4082,16 +4136,16 @@
             { category: "memory_lookup", kind: "memory", score: 1.0, correct: true, latency_ms: 1330, notes: ["deterministic answer match (no judge call)"] },
             { category: "contradiction", kind: "memory", score: 0.0, correct: false, latency_ms: 2210, notes: ["deterministic answer mismatch (no judge call)"] }
           ] },
-        { rank: 2, miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.432, first_seen: new Date(Date.now() - 86400000 * 3).toISOString(),
+        { rank: 2, finalized: true, score_count: 3, score_quorum: 3, miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.432, first_seen: new Date(Date.now() - 86400000 * 3).toISOString(),
           median_ms: 3120, n: 12, bench_version: 2, dataset_sha256: "1b8e07d4c9f6a2531e0c74ab9f3d61528ac40f7e6d1b9c8a2f5e340d7b16c9a0",
           models: { harness: "qwen/qwen3-32b" },
           per_category: [{ category: "memory_lookup", count: 3, mean: 0.72 }, { category: "image_create", count: 1, mean: 0.5 }],
           integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 1, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.22, capped_tool_cases: 4, seeding_waves: 1 }, tokens: 7620,
           composite_stderr: 0.021, history: [0.544, 0.578, 0.612] },
-        { rank: 3, miner_hotkey: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", composite: 0.587, tool_mean: 0.867, memory_mean: 0.307, first_seen: new Date(Date.now() - 86400000 * 1).toISOString(),
+        { rank: 3, finalized: true, score_count: 3, score_quorum: 3, miner_hotkey: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", composite: 0.587, tool_mean: 0.867, memory_mean: 0.307, first_seen: new Date(Date.now() - 86400000 * 1).toISOString(),
           median_ms: 2880, n: 12, bench_version: 2, composite_stderr: 0.019 },
-        { rank: 4, miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.382, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
-        { rank: 5, miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.356, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
+        { rank: 4, finalized: false, score_count: 2, score_quorum: 3, miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.382, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
+        { rank: 5, finalized: false, score_count: 1, score_quorum: 3, miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.356, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
       ]
     };
     var SAMPLE_HEALTH = {
