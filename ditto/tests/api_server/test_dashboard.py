@@ -496,3 +496,9 @@ class TestDashboard:
         body = (await _get(app, "/")).text
         assert 'badge.textContent = "DittoBench v" + currentBench +' in body
         assert 'currentBench + " · latest"' not in body
+
+    async def test_leaderboard_omits_tie_labels(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert "≈ tie" not in body
+        assert "function tieChip(" not in body
