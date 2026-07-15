@@ -155,6 +155,11 @@ class TestDashboard:
         assert '<details class="old-screeners">' in body
         assert "Old screener results" in body
         assert "Screener result" in body
+        assert "Released from quarantine" in body
+        assert "Sent for rescreening" in body
+        assert "Rejected after quarantine" in body
+        assert 'return ["Quarantined", "warn"]' in body
+        assert "a.quarantine_resolved_at || a.finished_at || a.started_at" in body
         assert "Lease expired" not in body
         assert "System failure" not in body
         assert 'role === "validator" ? "Retrying" : "Expired"' in body

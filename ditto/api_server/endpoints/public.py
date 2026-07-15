@@ -32,7 +32,7 @@ import math
 import os
 import statistics
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -87,7 +87,7 @@ from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retir
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.validator import SessionDep
-from ditto.db.models import Agent, Score, ValidatorTicket
+from ditto.db.models import Agent, Score, ScreeningQuarantine, ValidatorTicket
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.heartbeats import (
@@ -929,6 +929,20 @@ async def agent_pipeline(
         raise HTTPException(status_code=404, detail="submission not found")
 
     attempts = await list_screening_attempts(session, agent_id=agent_id)
+    resolved_quarantines_by_attempt: dict[
+        UUID,
+        tuple[Literal["release", "rescreen", "reject"] | None, datetime | None],
+    ] = {
+        quarantine.attempt_id: (
+            cast(Literal["release", "rescreen", "reject"], quarantine.resolution),
+            quarantine.resolved_at,
+        )
+        for quarantine in await session.scalars(
+            select(ScreeningQuarantine).where(ScreeningQuarantine.agent_id == agent_id)
+        )
+        if quarantine.status == "resolved"
+        and quarantine.resolution in {"release", "rescreen", "reject"}
+    }
     tickets = list(
         await session.scalars(
             select(ValidatorTicket)
@@ -978,6 +992,12 @@ async def agent_pipeline(
                 deadline=attempt.deadline,
                 finished_at=attempt.finished_at,
                 reason=attempt.public_reason,
+                quarantine_resolution=resolved_quarantines_by_attempt.get(
+                    attempt.attempt_id, (None, None)
+                )[0],
+                quarantine_resolved_at=resolved_quarantines_by_attempt.get(
+                    attempt.attempt_id, (None, None)
+                )[1],
             )
             for attempt in attempts
         ],
