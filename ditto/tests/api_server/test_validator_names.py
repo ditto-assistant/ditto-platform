@@ -11,6 +11,7 @@ from ditto.api_server.validator_names import (
     TaostatsValidatorNames,
     ValidatorNamesConfig,
     parse_taostats_names,
+    parse_taostats_validator_metadata,
 )
 
 _ALICE = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
@@ -64,6 +65,30 @@ def test_parser_allowlists_fields_and_neutralizes_injection_text() -> None:
     assert names == {_ALICE: "<img src=x onerror=alert(1)>"}
 
 
+def test_parser_allowlists_finite_non_negative_stake_weights() -> None:
+    names, stake_weights = parse_taostats_validator_metadata(
+        {
+            "data": [
+                {
+                    "address": {"ss58": _ALICE},
+                    "name": "Alice",
+                    "hotkey_alpha": "12.5",
+                },
+                {"address": {"ss58": _BOB}, "hotkey_alpha": 0},
+                {
+                    "address": {"ss58": _UNKNOWN},
+                    "name": "Bad",
+                    "hotkey_alpha": "nan",
+                    "stake": 999,
+                },
+            ]
+        }
+    )
+
+    assert names == {_ALICE: "Alice", _UNKNOWN: "Bad"}
+    assert stake_weights == {_ALICE: 12.5, _BOB: 0.0}
+
+
 async def test_success_unknown_hotkey_and_duplicate_names() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "test-free-api-key"
@@ -71,8 +96,16 @@ async def test_success_unknown_hotkey_and_duplicate_names() -> None:
             200,
             json={
                 "data": [
-                    {"address": {"ss58": _ALICE}, "name": "Rizzo"},
-                    {"address": {"ss58": _BOB}, "name": "Rizzo"},
+                    {
+                        "address": {"ss58": _ALICE},
+                        "name": "Rizzo",
+                        "hotkey_alpha": "30",
+                    },
+                    {
+                        "address": {"ss58": _BOB},
+                        "name": "Rizzo",
+                        "hotkey_alpha": "20",
+                    },
                     {"address": {"ss58": _UNKNOWN}, "name": "Unknown node"},
                 ]
             },
@@ -85,6 +118,7 @@ async def test_success_unknown_hotkey_and_duplicate_names() -> None:
 
     assert snapshot.status == "fresh"
     assert snapshot.names == {_ALICE: "Rizzo", _BOB: "Rizzo"}
+    assert snapshot.stake_weights == {_ALICE: 30.0, _BOB: 20.0}
     assert _UNKNOWN not in snapshot.names
 
 
@@ -106,6 +140,7 @@ async def test_timeout_and_unavailable_service_fail_open(failure: Exception) -> 
 
     assert snapshot.status == "unavailable"
     assert snapshot.names == {}
+    assert snapshot.stake_weights == {}
 
 
 async def test_rate_limit_honors_bounded_retry_window() -> None:
@@ -156,8 +191,10 @@ async def test_stale_while_revalidate_and_expiry() -> None:
 
     assert stale.status == "stale"
     assert stale.names == {_ALICE: "Rizzo"}
+    assert stale.stake_weights == {}
     assert expired.status == "unavailable"
     assert expired.names == {}
+    assert expired.stake_weights == {}
 
 
 def test_disabled_source_never_constructs_or_requires_network_client() -> None:
@@ -166,3 +203,4 @@ def test_disabled_source_never_constructs_or_requires_network_client() -> None:
 
     assert snapshot.status == "disabled"
     assert snapshot.names == {}
+    assert snapshot.stake_weights == {}

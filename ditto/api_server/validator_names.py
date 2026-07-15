@@ -51,6 +51,7 @@ class ValidatorNamesSnapshot:
     status: ValidatorNameStatus
     refreshed_at: datetime | None
     names: dict[str, str]
+    stake_weights: dict[str, float]
 
 
 def parse_validator_names_config_from_env() -> ValidatorNamesConfig:
@@ -102,23 +103,51 @@ def _extract_hotkey(item: dict[str, Any]) -> str | None:
     return None
 
 
-def parse_taostats_names(payload: object) -> dict[str, str]:
-    """Strictly allowlist ``(hotkey.ss58/address.ss58, name)`` records."""
+def _safe_stake_weight(value: object) -> float | None:
+    """Normalize a public chain stake value without accepting invalid numbers."""
+    if isinstance(value, bool):
+        return None
+    try:
+        stake_weight = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(stake_weight) or stake_weight < 0:
+        return None
+    return stake_weight
+
+
+def parse_taostats_validator_metadata(
+    payload: object,
+) -> tuple[dict[str, str], dict[str, float]]:
+    """Strictly allowlist public names and stake weights keyed by hotkey."""
     records = payload.get("data") if isinstance(payload, dict) else payload
     if not isinstance(records, list):
         raise ValueError("Taostats response must contain a data list")
 
     names: dict[str, str] = {}
+    stake_weights: dict[str, float] = {}
+    hotkeys: set[str] = set()
     for record in records:
         if not isinstance(record, dict):
             continue
         hotkey = _extract_hotkey(record)
-        name = _safe_name(record.get("name"))
-        if hotkey is None or name is None:
+        if hotkey is None:
             continue
-        names[hotkey] = name
-        if len(names) >= _MAX_NAMES:
+        name = _safe_name(record.get("name"))
+        stake_weight = _safe_stake_weight(record.get("hotkey_alpha"))
+        if name is not None:
+            names[hotkey] = name
+        if stake_weight is not None:
+            stake_weights[hotkey] = stake_weight
+        hotkeys.add(hotkey)
+        if len(hotkeys) >= _MAX_NAMES:
             break
+    return names, stake_weights
+
+
+def parse_taostats_names(payload: object) -> dict[str, str]:
+    """Return the name-only projection retained for existing callers."""
+    names, _ = parse_taostats_validator_metadata(payload)
     return names
 
 
@@ -139,6 +168,7 @@ class TaostatsValidatorNames:
                 follow_redirects=False,
             )
         self._names: dict[str, str] = {}
+        self._stake_weights: dict[str, float] = {}
         self._refreshed_at: datetime | None = None
         self._next_attempt_at = datetime.min.replace(tzinfo=UTC)
         self._lock = asyncio.Lock()
@@ -168,9 +198,9 @@ class TaostatsValidatorNames:
         """Return cached names immediately, restricted to platform reporters."""
         current = now or datetime.now(UTC)
         if not self._config.enabled:
-            return ValidatorNamesSnapshot("disabled", None, {})
+            return ValidatorNamesSnapshot("disabled", None, {}, {})
         if self._refreshed_at is None:
-            return ValidatorNamesSnapshot("unavailable", None, {})
+            return ValidatorNamesSnapshot("unavailable", None, {}, {})
 
         age = max(0.0, (current - self._refreshed_at).total_seconds())
         if age <= self._config.refresh_seconds:
@@ -178,12 +208,17 @@ class TaostatsValidatorNames:
         elif age <= self._config.max_stale_seconds:
             status = "stale"
         else:
-            return ValidatorNamesSnapshot("unavailable", self._refreshed_at, {})
+            return ValidatorNamesSnapshot("unavailable", self._refreshed_at, {}, {})
         allowed = set(hotkeys)
         return ValidatorNamesSnapshot(
             status,
             self._refreshed_at,
             {hotkey: name for hotkey, name in self._names.items() if hotkey in allowed},
+            {
+                hotkey: stake_weight
+                for hotkey, stake_weight in self._stake_weights.items()
+                if hotkey in allowed
+            },
         )
 
     async def refresh(self, *, now: datetime | None = None) -> bool:
@@ -219,12 +254,15 @@ class TaostatsValidatorNames:
                     self._next_attempt_at = current + timedelta(seconds=retry_seconds)
                     return False
                 response.raise_for_status()
-                names = parse_taostats_names(response.json())
+                names, stake_weights = parse_taostats_validator_metadata(
+                    response.json()
+                )
             except (httpx.HTTPError, ValueError) as error:
                 logger.warning("Taostats validator-name refresh failed: %s", error)
                 return False
 
             self._names = names
+            self._stake_weights = stake_weights
             self._refreshed_at = current
             self._next_attempt_at = current + timedelta(
                 seconds=self._config.refresh_seconds

@@ -3752,6 +3752,24 @@
     var fleetReports = { validators: null, screeners: null };
     var fleetUnavailable = { validators: false, screeners: false };
     var validatorNames = {};
+    var validatorStakeWeights = {};
+
+    function sortFleetEntries(entries, singular) {
+      if (singular !== "validator") return entries;
+      return entries.slice().sort(function (left, right) {
+        var leftHotkey = String(left.validator_hotkey || "");
+        var rightHotkey = String(right.validator_hotkey || "");
+        var leftStake = validatorStakeWeights[leftHotkey];
+        var rightStake = validatorStakeWeights[rightHotkey];
+        var leftHasStake = Number.isFinite(leftStake);
+        var rightHasStake = Number.isFinite(rightStake);
+        if (leftHasStake && rightHasStake && leftStake !== rightStake) return rightStake - leftStake;
+        if (leftHasStake !== rightHasStake) return leftHasStake ? -1 : 1;
+        if (leftHotkey < rightHotkey) return -1;
+        if (leftHotkey > rightHotkey) return 1;
+        return 0;
+      });
+    }
 
     function fleetWork(state, role) {
       var states = {
@@ -3929,7 +3947,7 @@
         rows.innerHTML = '<tr><td colspan="10" class="empty">Loading ' + kind + '…</td></tr>';
         return;
       }
-      var entries = data[kind] || [];
+      var entries = sortFleetEntries(data[kind] || [], singular);
       updateFleetLedger(entries);
       var reported = Number(data.reported_count) || entries.length;
       var available = entries.filter(function (entry) {
@@ -4126,15 +4144,20 @@
       getJSON("/public/validator-names")
         .then(function (data) {
           validatorNames = {};
+          validatorStakeWeights = {};
           (data.validators || []).forEach(function (entry) {
             if (entry && typeof entry.validator_hotkey === "string" && typeof entry.display_name === "string") {
               validatorNames[entry.validator_hotkey] = entry.display_name;
+            }
+            if (entry && typeof entry.validator_hotkey === "string" && Number.isFinite(entry.stake_weight)) {
+              validatorStakeWeights[entry.validator_hotkey] = entry.stake_weight;
             }
           });
           renderFleet();
         })
         .catch(function () {
           validatorNames = {};
+          validatorStakeWeights = {};
           renderFleet();
         });
       getJSON("/public/screeners")

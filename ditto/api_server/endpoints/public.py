@@ -715,9 +715,10 @@ async def validator_names(
         validators=[
             PublicValidatorName(
                 validator_hotkey=hotkey,
-                display_name=display_name,
+                display_name=snapshot.names.get(hotkey),
+                stake_weight=snapshot.stake_weights.get(hotkey),
             )
-            for hotkey, display_name in sorted(snapshot.names.items())
+            for hotkey in sorted(snapshot.names.keys() | snapshot.stake_weights.keys())
             if hotkey in reporter_hotkeys
         ],
     )
