@@ -793,11 +793,20 @@ class ValidatorHeartbeat(Base):
 
 
 class ScreenerHeartbeat(Base):
-    """Latest signed runtime and host-health report for one screener hotkey."""
+    """Latest signed runtime and host-health report for one screener instance.
+
+    Keyed by (screener_hotkey, instance_id): the prod fleet shares one hotkey,
+    so instance_id (the worker's GCE instance name) is what keeps each worker a
+    distinct row instead of collapsing the fleet into one. Pre-v3 workers that
+    send no instance_id are stored under the ``"legacy"`` sentinel.
+    """
 
     __tablename__ = "screener_heartbeats"
 
     screener_hotkey: Mapped[str] = mapped_column(Text, primary_key=True)
+    instance_id: Mapped[str] = mapped_column(
+        Text, primary_key=True, server_default="legacy"
+    )
     software_version: Mapped[str] = mapped_column(Text, nullable=False)
     protocol_version: Mapped[int] = mapped_column(Integer, nullable=False)
     policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -819,6 +828,10 @@ class ScreenerHeartbeat(Base):
         CheckConstraint(
             "length(software_version) BETWEEN 1 AND 64",
             name="screener_heartbeats_software_version_length_check",
+        ),
+        CheckConstraint(
+            "length(instance_id) BETWEEN 1 AND 63",
+            name="screener_heartbeats_instance_id_length_check",
         ),
         CheckConstraint(
             "protocol_version > 0",
