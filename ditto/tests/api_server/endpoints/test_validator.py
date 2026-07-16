@@ -2115,6 +2115,39 @@ class TestAntiCopyGate:
         assert resp.status_code == 200
         assert resp.json()["status"] == AgentStatus.ATH_PENDING_REVIEW
 
+    async def test_later_scored_upload_is_not_original_for_earlier_submission(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        earlier_time = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
+        later = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            miner_hotkey=_MINER_B,
+            sha256="aa" * 32,
+            size_bytes=500000,
+            created_at=earlier_time + timedelta(hours=1),
+        )
+        await self._score(
+            client, later, maker=session_maker, run_id="run_later", composite=0.80
+        )
+        earlier = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            sha256="bb" * 32,
+            size_bytes=500100,
+            created_at=earlier_time,
+        )
+        resp = await self._score(
+            client, earlier, maker=session_maker, run_id="run_earlier", composite=0.805
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == AgentStatus.SCORED
+
     async def test_genuine_improvement_not_held(
         self,
         app: FastAPI,

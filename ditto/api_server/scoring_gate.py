@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from ditto.api_server.fingerprint import content_similarity
@@ -92,6 +93,22 @@ class ReviewDecision:
 _NOT_HELD = ReviewDecision(held=False)
 
 
+def _utc(dt: datetime) -> datetime:
+    """Normalize database timestamps for deterministic chronology comparisons."""
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _fingerprint_versions_incompatible(a: dict | None, b: dict | None) -> bool:
+    """Whether two present sketches use semantically incomparable algorithms."""
+    return bool(
+        a
+        and b
+        and a.get("v") is not None
+        and b.get("v") is not None
+        and a.get("v") != b.get("v")
+    )
+
+
 def _prompt_note(prompt_fingerprint: dict | None, e: LedgerRow) -> str:
     """Shadow-mode the prompt fingerprint suffix for a hold's audit reason.
 
@@ -110,6 +127,7 @@ def evaluate_duplicate_signals(
     *,
     agent_id: UUID,
     miner_hotkey: str,
+    submitted_at: datetime,
     sha256: str,
     composite: float,
     size_bytes: int | None,
@@ -129,7 +147,10 @@ def evaluate_duplicate_signals(
 
     Copying is only a threat *across* miners, so every rule ignores the agent's
     own submissions and this miner's other agents (a miner iterating on their own
-    harness is not a copier). Held iff, against **another miner's** eligible agent:
+    harness is not a copier). Originality attribution also follows upload chronology,
+    not score-finalization order: normalized-source and near-duplicate rules compare
+    only with another miner's strictly earlier submission. Equal timestamps use the
+    UUID as a deterministic tie-break. Held iff:
 
     1. **Exact copy** — same ``sha256``. Byte-identical resubmission.
     1b. **Exact repack** — same ``normalized_source_hash``: the same source
@@ -149,17 +170,18 @@ def evaluate_duplicate_signals(
          additionally survives identifier renaming, at higher thresholds because
          unrelated crates share more parse-tree shape than text.
 
-    3. **Size near-duplicate** — composites within ``score_tol`` *and* tarball
-       sizes within ``size_tol`` (a lightly-tweaked copy barely moves either).
-       Retained as a cheap catch for rows with no fingerprint (uploaded before
-       fingerprinting, or an unreadable tarball).
+    3. **Size near-duplicate fallback** — composites within ``score_tol`` and
+       tarball sizes within ``size_tol``, but only when neither lexical nor
+       structural fingerprints are comparable. A valid negative fingerprint is
+       evidence of distinct content and must not be overridden by similar archive
+       size. The fallback remains for legacy or unreadable artifacts.
 
-    Rules 2 and 3 check *every* other-miner eligible agent, in either score
+    Rules 2 and 3 check *every earlier* other-miner eligible agent, in either score
     direction, so a genuine unrelated agent scoring in between cannot mask the
     copy. A genuine improvement (composite more than ``score_tol`` from any other
     miner's score, with a different size and both fingerprints distinct) is never
-    held. Pure + deterministic: ``eligible`` arrives in a fixed order, so the
-    reported ``duplicate_of`` (the first match) is stable.
+    held. Pure + deterministic: candidates are ordered by upload chronology, so the
+    reported ``duplicate_of`` is the oldest matching submission.
 
     ``prompt_fingerprint`` participates in **shadow mode only**: when a hold
     fires for another reason, a high prompt overlap with the matched agent is
@@ -169,12 +191,23 @@ def evaluate_duplicate_signals(
     hold is deferred until an orthogonal-to-convergence signal (behavioral /
     code-embedding) exists to corroborate it.
     """
-    others = [
+    other_miners = [
         e for e in eligible if e.agent_id != agent_id and e.miner_hotkey != miner_hotkey
     ]
+    submitted_key = (_utc(submitted_at), agent_id.int)
+    earlier_others = sorted(
+        (
+            e
+            for e in other_miners
+            if (_utc(e.first_seen), e.agent_id.int) < submitted_key
+        ),
+        key=lambda e: (_utc(e.first_seen), e.agent_id.int),
+    )
 
     # 1. Exact byte-identical copy of another miner's eligible artifact.
-    for e in others:
+    # This is a defense-in-depth mirror of the separate admission-time exact-byte
+    # guard, so preserve its existing usable-ledger behavior here.
+    for e in other_miners:
         if e.sha256 == sha256:
             return ReviewDecision(
                 held=True,
@@ -187,7 +220,7 @@ def evaluate_duplicate_signals(
     #     match, held unconditionally like sha256 — no score-proximity requirement.
     #     Both hashes must be present (null = "no repack match", never a hit).
     if normalized_source_hash is not None:
-        for e in others:
+        for e in earlier_others:
             if e.normalized_source_hash == normalized_source_hash:
                 return ReviewDecision(
                     held=True,
@@ -199,9 +232,27 @@ def evaluate_duplicate_signals(
     #    lexical or the structural channel. Checked before the size rule because a
     #    fingerprint is the stronger, size-independent signal. Lexical is tried
     #    first (more precise / lower false-positive) then structural (rename-proof).
-    for e in others:
+    for e in earlier_others:
         if abs(composite - e.composite) > score_tol:
             continue
+        incompatible_channels = [
+            channel
+            for channel, current, stored in (
+                ("lexical", content_fingerprint, e.content_fingerprint),
+                ("structural", structural_fingerprint, e.structural_fingerprint),
+            )
+            if _fingerprint_versions_incompatible(current, stored)
+        ]
+        if incompatible_channels:
+            return ReviewDecision(
+                held=True,
+                duplicate_of=e.agent_id,
+                reason=(
+                    f"anti-copy comparison inconclusive with agent {e.agent_id}: "
+                    f"incompatible {'/'.join(incompatible_channels)} fingerprint "
+                    "versions; individual operator review required"
+                ),
+            )
         lex_j, lex_c = content_similarity(content_fingerprint, e.content_fingerprint)
         if lex_j >= jaccard_tol or lex_c >= containment_tol:
             return ReviewDecision(
@@ -229,13 +280,20 @@ def evaluate_duplicate_signals(
                 ),
             )
 
-    # 3. Size near-dup of another miner: close in both score and tarball size.
+    # 3. Size near-dup of another miner: a legacy fallback only when both rows
+    #    predate every lexical/structural fingerprint. A versioned empty sketch is
+    #    affirmative evidence that reference subtraction found too little custom
+    #    surface; cross-version sketches likewise must fail open during backfill.
     if size_bytes is not None:
-        for e in others:
+        for e in earlier_others:
             if (
                 e.size_bytes is not None
                 and abs(composite - e.composite) <= score_tol
                 and abs(size_bytes - e.size_bytes) <= size_tol
+                and content_fingerprint is None
+                and e.content_fingerprint is None
+                and structural_fingerprint is None
+                and e.structural_fingerprint is None
             ):
                 return ReviewDecision(
                     held=True,

@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from uuid import uuid4
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.fingerprint import _FP_VERSION, _MINHASH_K, _PROMPT_VERSION
-from ditto.api_server.scoring_gate import evaluate_duplicate_signals
+from ditto.api_server.scoring_gate import (
+    evaluate_duplicate_signals as _evaluate_duplicate_signals,
+)
 from ditto.db.queries.scores import LedgerRow
 
 _FIRST_SEEN = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+_CHALLENGER_SEEN = _FIRST_SEEN + timedelta(hours=1)
+
+
+def evaluate_duplicate_signals(**kwargs):
+    """Keep ordinary fixtures chronological; tests may override for edge cases."""
+    kwargs.setdefault("submitted_at", _CHALLENGER_SEEN)
+    return _evaluate_duplicate_signals(**kwargs)
 
 
 def _sk(shingles: set[str]) -> dict:
@@ -48,14 +57,16 @@ def _entry(
     structural_fingerprint: dict | None = None,
     normalized_source_hash: str | None = None,
     prompt_fingerprint: dict | None = None,
+    first_seen: datetime = _FIRST_SEEN,
+    agent_id: UUID | None = None,
 ) -> LedgerRow:
     return LedgerRow(
         miner_hotkey=miner,
-        agent_id=uuid4(),
+        agent_id=agent_id or uuid4(),
         composite=composite,
         tool_mean=composite,
         memory_mean=composite,
-        first_seen=_FIRST_SEEN,
+        first_seen=first_seen,
         sha256=sha256,
         size_bytes=size_bytes,
         run_id="run_1",
@@ -120,6 +131,72 @@ class TestEvaluateAntidup:
         assert decision.held is True
         assert decision.duplicate_of == incumbent.agent_id
         assert "repack" in (decision.reason or "")
+
+    def test_later_upload_cannot_be_attributed_as_original(self) -> None:
+        later = _entry(
+            composite=0.60,
+            normalized_source_hash="ns" * 32,
+            first_seen=_CHALLENGER_SEEN + timedelta(hours=1),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Earlier",
+            submitted_at=_CHALLENGER_SEEN,
+            sha256="dd" * 32,
+            composite=0.60,
+            size_bytes=524288,
+            normalized_source_hash="ns" * 32,
+            eligible=[later],
+        )
+        assert decision.held is False
+
+    def test_equal_timestamp_uses_agent_id_as_tie_break(self) -> None:
+        earlier_id = uuid4()
+        later_id = uuid4()
+        if earlier_id.int > later_id.int:
+            earlier_id, later_id = later_id, earlier_id
+        original = _entry(
+            composite=0.60,
+            normalized_source_hash="ns" * 32,
+            first_seen=_FIRST_SEEN,
+            agent_id=earlier_id,
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=later_id,
+            miner_hotkey="5Later",
+            submitted_at=_FIRST_SEEN,
+            sha256="dd" * 32,
+            composite=0.60,
+            size_bytes=524288,
+            normalized_source_hash="ns" * 32,
+            eligible=[original],
+        )
+        assert decision.held is True
+        assert decision.duplicate_of == earlier_id
+
+    def test_oldest_matching_submission_is_attributed_as_original(self) -> None:
+        oldest = _entry(
+            composite=0.60,
+            normalized_source_hash="ns" * 32,
+            first_seen=_FIRST_SEEN,
+        )
+        newer = _entry(
+            composite=0.60,
+            normalized_source_hash="ns" * 32,
+            first_seen=_FIRST_SEEN + timedelta(minutes=30),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Latest",
+            submitted_at=_CHALLENGER_SEEN,
+            sha256="dd" * 32,
+            composite=0.60,
+            size_bytes=524288,
+            normalized_source_hash="ns" * 32,
+            eligible=[newer, oldest],
+        )
+        assert decision.held is True
+        assert decision.duplicate_of == oldest.agent_id
 
     def test_same_miner_repack_not_held(self) -> None:
         # A miner re-uploading their OWN agent (same normalized hash) is iterating,
@@ -415,6 +492,111 @@ class TestEvaluateAntidup:
         )
         assert decision.held is True
         assert "near-duplicate" in (decision.reason or "")
+
+    def test_negative_fingerprint_evidence_disables_size_fallback(self) -> None:
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=500000,
+            content_fingerprint=_sk({f"a{i:015x}" for i in range(20)}),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Independent",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=500100,
+            content_fingerprint=_sk({f"b{i:015x}" for i in range(20)}),
+            eligible=[incumbent],
+        )
+        assert decision.held is False
+
+    def test_reference_only_fingerprint_disables_size_fallback(self) -> None:
+        # v2 records a versioned empty sketch when a valid artifact contains too
+        # little miner-authored residual after reference subtraction. That is a
+        # negative moderation signal, not a missing legacy fingerprint.
+        reference_only = {"v": 2, "k": 256, "card": 0, "m": []}
+        incumbent = _entry(
+            composite=0.80,
+            size_bytes=500000,
+            content_fingerprint=reference_only,
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            submitted_at=_CHALLENGER_SEEN,
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=500100,
+            content_fingerprint=reference_only,
+            eligible=[incumbent],
+        )
+        assert decision.held is False
+
+    def test_cross_version_comparison_routes_current_row_to_review(self) -> None:
+        shared = {f"{i:016x}" for i in range(30)}
+        legacy = _sk(shared)
+        legacy["v"] = 1
+        incumbent = _entry(
+            composite=0.80,
+            size_bytes=500000,
+            content_fingerprint=legacy,
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            submitted_at=_CHALLENGER_SEEN,
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=500100,
+            content_fingerprint=_sk(shared),
+            eligible=[incumbent],
+        )
+        assert decision.held is True
+        assert decision.duplicate_of == incumbent.agent_id
+        assert "comparison inconclusive" in (decision.reason or "")
+        assert "lexical" in (decision.reason or "")
+
+    def test_cross_version_structural_fallback_is_not_used(self) -> None:
+        legacy_content = _sk({f"a{i:015x}" for i in range(30)})
+        legacy_content["v"] = 1
+        shared_structural = _sk({f"{i:016x}" for i in range(30)})
+        incumbent = _entry(
+            composite=0.80,
+            content_fingerprint=legacy_content,
+            structural_fingerprint=shared_structural,
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            submitted_at=_CHALLENGER_SEEN,
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=None,
+            content_fingerprint=_sk({f"b{i:015x}" for i in range(30)}),
+            structural_fingerprint=shared_structural,
+            eligible=[incumbent],
+        )
+        assert decision.held is True
+        assert "comparison inconclusive" in (decision.reason or "")
+        assert "lexical" in (decision.reason or "")
+        assert "structural near-duplicate" not in (decision.reason or "")
+
+    def test_cross_version_far_score_is_not_held(self) -> None:
+        legacy = _sk({f"{i:016x}" for i in range(30)})
+        legacy["v"] = 1
+        incumbent = _entry(composite=0.60, content_fingerprint=legacy)
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            submitted_at=_CHALLENGER_SEEN,
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.80,
+            size_bytes=None,
+            content_fingerprint=_sk({f"{i:016x}" for i in range(30)}),
+            eligible=[incumbent],
+        )
+        assert decision.held is False
 
     def test_missing_sizes_skip_near_dup(self) -> None:
         incumbent = _entry(composite=0.80, sha256="aa" * 32, size_bytes=None)

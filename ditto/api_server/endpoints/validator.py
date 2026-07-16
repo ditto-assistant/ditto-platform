@@ -949,6 +949,7 @@ async def submit_score(
                 decision = evaluate_duplicate_signals(
                     agent_id=agent_id,
                     miner_hotkey=agent.miner_hotkey,
+                    submitted_at=agent.created_at,
                     sha256=agent.sha256,
                     composite=median_composite,
                     size_bytes=agent.size_bytes,
