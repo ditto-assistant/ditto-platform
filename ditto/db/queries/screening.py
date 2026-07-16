@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
@@ -133,7 +133,25 @@ async def expire_screening_attempts(session: AsyncSession, *, now: datetime) -> 
 
 
 async def _expired_attempt_count(session: AsyncSession, *, agent_id: UUID) -> int:
-    """Count this agent's expired screening leases under the current policy."""
+    """Count expired screening leases under the current policy **since the
+    agent's most recent operator rescreen**.
+
+    An operator resolving a quarantine with ``rescreen`` explicitly grants a
+    fresh attempt budget. Without the lower bound, an agent whose expiries
+    came from a screener-fleet outage carries them forever: its next claim is
+    instantly re-parked as ``repeatedly-inconclusive`` (started_at ==
+    finished_at, no screening ever runs) and no number of operator rescreens
+    can break the loop — exactly what happened on 2026-07-16 when 12 freshly
+    rescreened agents were re-parked within seconds of each other.
+    """
+    last_rescreen = (
+        select(func.max(ScreeningQuarantine.resolved_at))
+        .where(
+            ScreeningQuarantine.agent_id == agent_id,
+            ScreeningQuarantine.resolution == "rescreen",
+        )
+        .scalar_subquery()
+    )
     count = await session.scalar(
         select(func.count())
         .select_from(ScreeningAttempt)
@@ -141,6 +159,8 @@ async def _expired_attempt_count(session: AsyncSession, *, agent_id: UUID) -> in
             ScreeningAttempt.agent_id == agent_id,
             ScreeningAttempt.policy_version == SCREENING_POLICY_VERSION,
             ScreeningAttempt.status == "expired",
+            ScreeningAttempt.started_at
+            > func.coalesce(last_rescreen, datetime(1970, 1, 1, tzinfo=UTC)),
         )
     )
     return int(count or 0)

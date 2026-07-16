@@ -186,3 +186,116 @@ async def test_previous_policy_attempt_does_not_defer_current_policy_work(
     claimed = await _claim(session, limit=1)
 
     assert [agent.agent_id for agent, _, _ in claimed] == [older.agent_id]
+
+
+async def test_operator_rescreen_resets_the_expiry_budget(session: AsyncSession):
+    """A quarantine resolved with ``rescreen`` grants a fresh attempt budget.
+
+    Regression for 2026-07-16: agents whose expiries came from a screener
+    fleet outage were instantly re-parked on the next claim after an operator
+    rescreen, because the expiry count ignored the rescreen entirely.
+    """
+    agent = await _seed_failed_agent(session)
+    base = datetime.now(UTC) - timedelta(hours=6)
+    await _add_expired_attempts(session, agent, MAX_SCREENING_EXPIRIES, base=base)
+    # The exhaustion park + the operator's rescreen, AFTER the expiries.
+    async with session.begin():
+        park_attempt = ScreeningAttempt(
+            attempt_id=uuid4(),
+            agent_id=agent.agent_id,
+            screener_hotkey=_SCREENER,
+            policy_version=SCREENING_POLICY_VERSION,
+            status="quarantined",
+            started_at=base + timedelta(hours=5),
+            deadline=base + timedelta(hours=5),
+            finished_at=base + timedelta(hours=5),
+            public_reason="Screening was inconclusive repeatedly",
+            reason_code="repeatedly-inconclusive",
+        )
+        session.add(park_attempt)
+        await session.flush()
+        session.add(
+            ScreeningQuarantine(
+                quarantine_id=uuid4(),
+                agent_id=agent.agent_id,
+                attempt_id=park_attempt.attempt_id,
+                screener_hotkey=_SCREENER,
+                policy_version=SCREENING_POLICY_VERSION,
+                manifest_digest="d" * 64,
+                finding_digest=None,
+                reason_code="repeatedly-inconclusive",
+                evidence=None,
+                finding=None,
+                status="resolved",
+                resolved_at=datetime.now(UTC) - timedelta(minutes=30),
+                resolved_by="operator",
+                resolution="rescreen",
+                resolution_reason="fleet outage, not agent behavior",
+            )
+        )
+
+    claimed = await _claim(session)
+
+    # The rescreen zeroed the budget: the agent is leased out for a REAL run,
+    # not instantly re-parked.
+    claimed_ids = {claimed_agent.agent_id for claimed_agent, _, _ in claimed}
+    assert agent.agent_id in claimed_ids
+    refreshed = await session.get(Agent, agent.agent_id)
+    assert refreshed is not None
+    assert refreshed.status == AgentStatus.SCREENING
+
+
+async def test_expiries_after_a_rescreen_still_exhaust(session: AsyncSession):
+    """Only pre-rescreen expiries are forgiven; the cap still protects the pool."""
+    agent = await _seed_failed_agent(session)
+    rescreened_at = datetime.now(UTC) - timedelta(hours=5)
+    async with session.begin():
+        anchor = ScreeningAttempt(
+            attempt_id=uuid4(),
+            agent_id=agent.agent_id,
+            screener_hotkey=_SCREENER,
+            policy_version=SCREENING_POLICY_VERSION,
+            status="quarantined",
+            started_at=rescreened_at - timedelta(minutes=1),
+            deadline=rescreened_at - timedelta(minutes=1),
+            finished_at=rescreened_at - timedelta(minutes=1),
+            public_reason="parked",
+            reason_code="repeatedly-inconclusive",
+        )
+        session.add(anchor)
+        await session.flush()
+        session.add(
+            ScreeningQuarantine(
+                quarantine_id=uuid4(),
+                agent_id=agent.agent_id,
+                attempt_id=anchor.attempt_id,
+                screener_hotkey=_SCREENER,
+                policy_version=SCREENING_POLICY_VERSION,
+                manifest_digest="d" * 64,
+                finding_digest=None,
+                reason_code="repeatedly-inconclusive",
+                evidence=None,
+                finding=None,
+                status="resolved",
+                resolved_at=rescreened_at,
+                resolved_by="operator",
+                resolution="rescreen",
+                resolution_reason="grant a fresh budget",
+            )
+        )
+    # A fresh cap's worth of expiries AFTER the rescreen…
+    await _add_expired_attempts(
+        session,
+        agent,
+        MAX_SCREENING_EXPIRIES,
+        base=rescreened_at + timedelta(minutes=5),
+    )
+
+    claimed = await _claim(session)
+
+    # …parks it again: the reset is not a permanent exemption.
+    claimed_ids = {claimed_agent.agent_id for claimed_agent, _, _ in claimed}
+    assert agent.agent_id not in claimed_ids
+    refreshed = await session.get(Agent, agent.agent_id)
+    assert refreshed is not None
+    assert refreshed.status == AgentStatus.QUARANTINED
