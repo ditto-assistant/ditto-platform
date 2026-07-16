@@ -45,7 +45,6 @@ from ditto.db.queries.audit import (
     append_audit_entry,
 )
 from ditto.db.queries.scores import upsert_score
-from ditto.db.queries.tickets import FIRST_SCORE_CONTINUATION_FLOOR
 
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
@@ -192,6 +191,18 @@ async def _seed_k3(
                 details=details,
             )
     return str(agent_id)
+
+
+async def _seed_top_five_floor(
+    maker: async_sessionmaker[AsyncSession], *, fifth_place: float = 0.80
+) -> None:
+    for rank, marker in enumerate(("A", "B", "C", "D", "E")):
+        composite = fifth_place + (4 - rank) * 0.01
+        await _seed_k3(
+            maker,
+            miner="5" + marker * 47,
+            composites=[composite, composite, composite],
+        )
 
 
 async def _seed_agent(
@@ -789,6 +800,12 @@ class TestPublicActivity:
             composites=[0.5],
             status=AgentStatus.EVALUATING,
         )
+        one_high_id = await _seed_k3(
+            session_maker,
+            miner=_VALIDATOR_C,
+            composites=[0.7],
+            status=AgentStatus.EVALUATING,
+        )
         low_id = await _seed_k3(
             session_maker,
             miner=_MINER_A,
@@ -802,7 +819,7 @@ class TestPublicActivity:
             status=AgentStatus.EVALUATING,
         )
         async with session_maker() as session, session.begin():
-            for agent_id in (one_id, low_id, high_id):
+            for agent_id in (one_id, one_high_id, low_id, high_id):
                 agent = await session.get(Agent, UUID(agent_id))
                 assert agent is not None
                 agent.screening_policy_version = SCREENING_POLICY_VERSION
@@ -814,9 +831,11 @@ class TestPublicActivity:
         assert by_id[high_id]["validator_queue_rank"] == 1
         assert by_id[low_id]["validator_queue_rank"] == 2
         assert by_id[zero_id]["validator_queue_rank"] == 3
-        assert by_id[one_id]["validator_queue_rank"] == 4
+        assert by_id[one_high_id]["validator_queue_rank"] == 4
+        assert by_id[one_id]["validator_queue_rank"] == 5
         assert by_id[zero_id]["provisional_composite"] is None
         assert by_id[one_id]["provisional_composite"] == pytest.approx(0.5)
+        assert by_id[one_high_id]["provisional_composite"] == pytest.approx(0.7)
         assert by_id[high_id]["provisional_composite"] == pytest.approx(0.85)
         assert by_id[low_id]["provisional_composite"] == pytest.approx(0.25)
 
@@ -1204,12 +1223,13 @@ class TestPublicActivity:
         evaluating = (await client.get("/api/v1/public/activity")).json()["entries"][0]
         assert evaluating["status"] == "evaluating"
 
-    async def test_below_floor_score_is_a_terminal_public_stage(
+    async def test_two_scores_below_top_five_bound_are_a_terminal_public_stage(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
+        await _seed_top_five_floor(session_maker, fifth_place=0.80)
         agent_id = UUID(
             await _seed_agent(
                 session_maker,
@@ -1219,33 +1239,61 @@ class TestPublicActivity:
             )
         )
         async with session_maker() as session, session.begin():
-            await upsert_score(
-                session,
-                agent_id=agent_id,
-                validator_hotkey=_VALIDATOR_C,
-                run_id="below-floor",
-                seed=42,
-                composite=FIRST_SCORE_CONTINUATION_FLOOR - 0.01,
-                tool_mean=0.24,
-                memory_mean=0.24,
-                median_ms=500,
-                n=114,
-                generated_at=datetime.now(UTC),
-                signature="ab" * 64,
-                details=None,
-            )
+            for index, (validator, composite) in enumerate(
+                ((_VALIDATOR_C, 0.10), (_MINER_B, 0.20))
+            ):
+                await upsert_score(
+                    session,
+                    agent_id=agent_id,
+                    validator_hotkey=validator,
+                    run_id=f"below-floor-{index}",
+                    seed=42,
+                    composite=composite,
+                    tool_mean=composite,
+                    memory_mean=composite,
+                    median_ms=500,
+                    n=114,
+                    generated_at=datetime.now(UTC),
+                    signature="ab" * 64,
+                    details=None,
+                )
         _install_db(app, session_maker)
 
-        activity = (await client.get("/api/v1/public/activity")).json()["entries"][0]
+        entries = (await client.get("/api/v1/public/activity")).json()["entries"]
+        activity = next(
+            entry for entry in entries if entry["agent_id"] == str(agent_id)
+        )
         assert activity["status"] == "below_score_floor"
-        assert activity["score_count"] == 1
+        assert activity["score_count"] == 2
 
         pipeline = (
             await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
         ).json()
         assert pipeline["status"] == "below_score_floor"
-        assert pipeline["score_count"] == 1
-        assert pipeline["score_floor"] == FIRST_SCORE_CONTINUATION_FLOOR
+        assert pipeline["score_count"] == 2
+        assert pipeline["score_floor"] == pytest.approx(0.80)
+
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=_MINER_A,
+                    status=TicketStatus.ISSUED,
+                    issued_at=now,
+                    deadline=now + timedelta(minutes=30),
+                )
+            )
+
+        entries = (await client.get("/api/v1/public/activity")).json()["entries"]
+        activity = next(
+            entry for entry in entries if entry["agent_id"] == str(agent_id)
+        )
+        assert activity["status"] == "waiting_validator"
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()
+        assert pipeline["status"] == "waiting_validator"
 
     async def test_progress_is_multi_validator_allowlisted_and_recursively_redacted(
         self,

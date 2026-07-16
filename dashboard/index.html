@@ -3342,12 +3342,12 @@
       }).length;
       if (count >= quorum) return "Validation complete. The canonical result uses the median of " + quorum + " independent scores.";
       if (e.status === "below_score_floor") {
-        var provisional = e.provisional_composite == null
-          ? ((e.provisional_scores || [])[0] || {}).composite
-          : e.provisional_composite;
-        return "Evaluation stopped after the first accepted score" +
-          (provisional == null ? "" : " of " + fx(provisional)) +
-          " was below the " + fx(e.score_floor) + " continuation floor. No further validator tickets will be issued.";
+        var bestPossible = (e.provisional_scores || []).reduce(function (best, score) {
+          return Math.max(best, Number(score.composite) || 0);
+        }, 0);
+        return "Evaluation stopped after two accepted scores. Even a perfect third run could not raise the median above " +
+          fx(bestPossible) + ", below the current fifth-place score of " + fx(e.score_floor) +
+          ". No further validator tickets will be issued.";
       }
       if (e.status === "waiting_screening") return "Queued for a screener to claim under the current policy.";
       if (e.status === "screening") return "A screener is currently checking this submission.";
@@ -3456,7 +3456,7 @@
       var note = complete
         ? "Validation is complete. The final aggregate below is the authoritative median of the independent accepted scores."
         : stopped
-        ? "Evaluation stopped because the first accepted score was below the continuation floor. This result is not eligible for emissions."
+        ? "Evaluation stopped after two scores proved the best reachable median was below the current fifth-place score. This result is not eligible for emissions."
         : "Each value is an accepted platform score, but remains provisional until " + quorum + " independent scores arrive. Provisional scores may change; the final median is authoritative.";
       var rows = scores.map(function (score, index) {
         var label = complete ? "Accepted score " + (index + 1) : "Provisional score " + (index + 1);

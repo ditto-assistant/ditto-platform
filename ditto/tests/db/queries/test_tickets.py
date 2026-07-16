@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
@@ -13,7 +14,7 @@ from ditto.api_models.ticket_status import TicketStatus
 from ditto.db.models import Agent, Score, ValidatorTicket
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import (
-    FIRST_SCORE_CONTINUATION_FLOOR,
+    EMISSION_CONTENDER_COUNT,
     MAX_ATTEMPTS_PER_VERSION,
     PROVISIONAL_CONTENDER_LANE_SIZE,
     expire_overdue_tickets,
@@ -47,7 +48,70 @@ async def _seed_evaluating(
     return aid
 
 
+async def _seed_finalized_top_five(
+    session: AsyncSession, *, fifth_place: float = 0.80
+) -> None:
+    """Establish five ranked miners with ``fifth_place`` as the live floor."""
+    async with session.begin():
+        for rank in range(EMISSION_CONTENDER_COUNT):
+            agent_id = uuid4()
+            composite = fifth_place + (EMISSION_CONTENDER_COUNT - rank - 1) * 0.01
+            session.add(
+                Agent(
+                    agent_id=agent_id,
+                    miner_hotkey=f"5Ranked-{rank}",
+                    name=f"ranked-{rank}",
+                    sha256=f"{rank + 100:064x}",
+                    status=AgentStatus.SCORED,
+                    screening_policy_version=SCREENING_POLICY_VERSION,
+                    created_at=_NOW - timedelta(days=1, minutes=rank),
+                )
+            )
+            for validator_index in range(SCORING_QUORUM):
+                validator = f"5Ranked-{rank}-{validator_index}"
+                session.add(
+                    Score(
+                        agent_id=agent_id,
+                        validator_hotkey=validator,
+                        run_id=f"ranked-{rank}-{validator_index}",
+                        signature=None,
+                        seed=123,
+                        composite=composite,
+                        tool_mean=composite,
+                        memory_mean=composite,
+                        median_ms=100,
+                        n=114,
+                        details=None,
+                        generated_at=_NOW,
+                    )
+                )
+
+
 class TestIssueTicket:
+    @pytest.mark.parametrize(
+        "status",
+        (
+            AgentStatus.ATH_PENDING_REVIEW,
+            AgentStatus.QUARANTINED,
+            AgentStatus.REJECTED,
+        ),
+    )
+    async def test_terminal_review_states_do_not_receive_new_tickets(
+        self, session: AsyncSession, status: AgentStatus
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            agent = await session.get(Agent, aid)
+            assert agent is not None
+            agent.status = status
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5V1", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is None
+
     async def test_skips_agent_that_needs_rescreening(
         self, session: AsyncSession
     ) -> None:
@@ -73,9 +137,10 @@ class TestIssueTicket:
         assert t.status == TicketStatus.ISSUED
         assert t.deadline == _NOW + _TTL
 
-    async def test_score_below_floor_does_not_receive_another_ticket(
+    async def test_low_first_score_still_receives_a_second_ticket(
         self, session: AsyncSession
     ) -> None:
+        await _seed_finalized_top_five(session)
         aid = await _seed_evaluating(session)
         async with session.begin():
             session.add(
@@ -96,49 +161,9 @@ class TestIssueTicket:
                     run_id="below-floor",
                     signature=None,
                     seed=123,
-                    composite=FIRST_SCORE_CONTINUATION_FLOOR - 0.01,
-                    tool_mean=0.24,
-                    memory_mean=0.24,
-                    median_ms=100,
-                    n=114,
-                    details=None,
-                    generated_at=_NOW,
-                )
-            )
-
-        async with session.begin():
-            ticket = await issue_ticket(
-                session, validator_hotkey="5Next", now=_NOW, ttl=_TTL
-            )
-
-        assert ticket is None
-
-    async def test_score_at_floor_receives_another_ticket(
-        self, session: AsyncSession
-    ) -> None:
-        aid = await _seed_evaluating(session)
-        async with session.begin():
-            session.add(
-                ValidatorTicket(
-                    agent_id=aid,
-                    validator_hotkey="5Scored",
-                    status=TicketStatus.SCORED,
-                    issued_at=_NOW,
-                    deadline=_NOW + _TTL,
-                    bench_version=2,
-                    attempt_count=1,
-                )
-            )
-            session.add(
-                Score(
-                    agent_id=aid,
-                    validator_hotkey="5Scored",
-                    run_id="at-floor",
-                    signature=None,
-                    seed=123,
-                    composite=FIRST_SCORE_CONTINUATION_FLOOR,
-                    tool_mean=FIRST_SCORE_CONTINUATION_FLOOR,
-                    memory_mean=FIRST_SCORE_CONTINUATION_FLOOR,
+                    composite=0.10,
+                    tool_mean=0.10,
+                    memory_mean=0.10,
                     median_ms=100,
                     n=114,
                     details=None,
@@ -154,12 +179,88 @@ class TestIssueTicket:
         assert ticket is not None
         assert ticket.agent_id == aid
 
-    async def test_floor_does_not_interrupt_submission_after_second_score(
+    async def test_two_scores_below_top_five_bound_skip_the_third_ticket(
         self, session: AsyncSession
     ) -> None:
+        await _seed_finalized_top_five(session, fifth_place=0.80)
         aid = await _seed_evaluating(session)
         async with session.begin():
-            for validator, composite in (("5First", 0.30), ("5Second", 0.10)):
+            for index, composite in enumerate((0.10, 0.20)):
+                validator = f"5Scored-{index}"
+                session.add(
+                    ValidatorTicket(
+                        agent_id=aid,
+                        validator_hotkey=validator,
+                        status=TicketStatus.SCORED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                        bench_version=2,
+                        attempt_count=1,
+                    )
+                )
+                session.add(
+                    Score(
+                        agent_id=aid,
+                        validator_hotkey=validator,
+                        run_id=f"below-top-five-{index}",
+                        signature=None,
+                        seed=123,
+                        composite=composite,
+                        tool_mean=composite,
+                        memory_mean=composite,
+                        median_ms=100,
+                        n=114,
+                        details=None,
+                        generated_at=_NOW,
+                    )
+                )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Next", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is None
+
+    async def test_high_variance_two_score_candidate_can_still_reach_top_five(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_finalized_top_five(session, fifth_place=0.80)
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            for validator, composite in (("5First", 0.10), ("5Second", 0.90)):
+                session.add(
+                    Score(
+                        agent_id=aid,
+                        validator_hotkey=validator,
+                        run_id=f"run-{validator}",
+                        signature=None,
+                        seed=123,
+                        composite=composite,
+                        tool_mean=composite,
+                        memory_mean=composite,
+                        median_ms=100,
+                        n=114,
+                        details=None,
+                        generated_at=_NOW,
+                    )
+                )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Third", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == aid
+
+    async def test_exact_top_five_bound_continues_for_oldest_first_tie_break(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_finalized_top_five(session, fifth_place=0.80)
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            for validator, composite in (("5First", 0.20), ("5Second", 0.80)):
                 session.add(
                     Score(
                         agent_id=aid,
@@ -324,6 +425,52 @@ class TestIssueTicket:
         async with session.begin():
             ticket = await issue_ticket(
                 session, validator_hotkey="5Completion", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == high
+
+    async def test_one_score_round_prioritizes_highest_provisional_score(
+        self, session: AsyncSession
+    ) -> None:
+        low = await _seed_evaluating(
+            session, created_at=_NOW - timedelta(hours=1), name="low"
+        )
+        high = await _seed_evaluating(session, created_at=_NOW, name="high")
+        async with session.begin():
+            for agent_id, composite in ((low, 0.40), (high, 0.80)):
+                validator = f"5Scored-{agent_id}"
+                session.add(
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        validator_hotkey=validator,
+                        status=TicketStatus.SCORED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                        bench_version=2,
+                        attempt_count=1,
+                    )
+                )
+                session.add(
+                    Score(
+                        agent_id=agent_id,
+                        validator_hotkey=validator,
+                        run_id=f"run-{agent_id}",
+                        signature=None,
+                        seed=123,
+                        composite=composite,
+                        tool_mean=composite,
+                        memory_mean=composite,
+                        median_ms=100,
+                        n=114,
+                        details=None,
+                        generated_at=_NOW,
+                    )
+                )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Next", now=_NOW, ttl=_TTL
             )
 
         assert ticket is not None
