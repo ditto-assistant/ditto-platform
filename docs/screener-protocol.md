@@ -46,3 +46,45 @@ Resolution requires `X-Admin-Actor` and one of `release`, `rescreen`, or
 needed and promotes to evaluation; rescreen returns the preserved submission to
 the screener queue; reject retains the submission and prior scores but prevents
 evaluation until a future policy-version rescreen.
+
+## Miner disputes
+
+A miner may dispute a resolved quarantine rejection exactly once per submission.
+The request is accepted only while the submission remains rejected and only when
+its sr25519 signature verifies against the hotkey recorded at upload. The miner
+signs the following canonical UTF-8 payload, where `message` is trimmed before
+hashing:
+
+```text
+ditto-dispute-v1:{agent_id}:{sha256(message)}
+```
+
+The submission dashboard generates that payload and a ready-to-run command after
+the miner enters the local wallet and hotkey names:
+
+```bash
+btcli wallet sign --wallet-name '<wallet-name>' --wallet-hotkey '<hotkey-name>' \
+  --use-hotkey --message 'ditto-dispute-v1:<agent_id>:<sha256>' --json-output
+```
+
+`--use-hotkey` prevents an accidental coldkey signature. The miner pastes the
+128-character `signed_message` value from the command output into the dispute
+form. Wallet and hotkey names are used only to construct the command in the
+browser and are not included in the dispute request.
+
+`POST /api/v1/public/agent/{agent_id}/dispute` accepts a 20–1000 character
+message and a 128-character hexadecimal signature. Database uniqueness on both
+`agent_id` and `quarantine_id` enforces the one-dispute limit under concurrent
+requests. The public submission pipeline exposes only dispute status, timestamps,
+and the final `release` or `uphold` result; the miner's message remains private.
+
+Operators use the same admin bearer-token boundary as quarantine review:
+
+- `GET /api/v1/admin/screening-disputes`
+- `POST /api/v1/admin/screening-disputes/{dispute_id}/resolve`
+
+Resolution requires `X-Admin-Actor`. `release` atomically records the accepted
+dispute, changes the effective quarantine resolution to release, and returns the
+submission to evaluation. `uphold` records a final review while leaving the
+submission rejected. The original rejection and its operator reason remain in
+append-only quarantine history in either case.

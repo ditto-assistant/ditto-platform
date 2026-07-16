@@ -695,6 +695,47 @@
     .pipeline-detail-state { margin: 0; padding: var(--detail-space-md) 0; color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
     .pipeline-detail-state.loading { color: var(--text-faint); }
     .pipeline-detail-state.error { color: var(--warn); }
+    .screening-dispute {
+      padding: var(--detail-space-lg);
+      border: 1px solid color-mix(in oklab, var(--warn) 48%, var(--border));
+      border-radius: 10px;
+      background: color-mix(in oklab, var(--warn) 5%, transparent);
+    }
+    .screening-dispute-copy { max-width: 72ch; margin: 0 0 var(--detail-space-md); color: var(--text-dim); font-size: 12.5px; line-height: 1.55; text-wrap: pretty; }
+    .screening-dispute-form { display: grid; gap: var(--detail-space-md); }
+    .screening-dispute-form label { display: grid; gap: var(--detail-space-xs); color: var(--text); font-size: 12px; font-weight: 700; }
+    .screening-dispute-form textarea,
+    .screening-dispute-form input {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg-elev-2);
+      color: var(--text);
+      font: 12px/1.5 var(--sans);
+    }
+    .screening-dispute-form textarea { min-height: 112px; padding: 10px 12px; resize: vertical; }
+    .screening-dispute-form input { padding: 9px 11px; font-family: var(--mono); }
+    .screening-dispute-form textarea:focus,
+    .screening-dispute-form input:focus { border-color: var(--accent); outline: 2px solid color-mix(in oklab, var(--accent) 28%, transparent); outline-offset: 1px; }
+    .screening-dispute-meta { display: flex; justify-content: space-between; gap: var(--detail-space-md); color: var(--text-faint); font-size: 11px; font-weight: 500; }
+    .screening-dispute-wallets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--detail-space-md); }
+    .screening-dispute-command {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--detail-space-sm);
+      min-width: 0;
+      padding: 10px 12px;
+      border: 1px solid color-mix(in oklab, var(--border) 82%, transparent);
+      border-radius: 8px;
+      background: color-mix(in oklab, var(--bg) 52%, transparent);
+    }
+    .screening-dispute-command code { flex: 1; color: var(--text-dim); font: 10.5px/1.55 var(--mono); overflow-wrap: anywhere; user-select: all; }
+    .screening-dispute-actions { display: flex; align-items: center; gap: var(--detail-space-md); flex-wrap: wrap; }
+    .screening-dispute-submit { padding: 9px 14px; border: 0; border-radius: 8px; background: var(--accent); color: var(--bg); font: 750 12px/1 var(--sans); cursor: pointer; }
+    .screening-dispute-submit:disabled { cursor: not-allowed; opacity: .45; }
+    .screening-dispute-status { min-height: 1.5em; margin: 0; color: var(--text-dim); font-size: 11.5px; line-height: 1.5; }
+    .screening-dispute-status.error { color: var(--danger); }
     .accepted-score-list { display: grid; gap: var(--detail-space-md); }
     .accepted-score {
       display: grid;
@@ -780,6 +821,7 @@
       .attempt { grid-template-columns: 76px 1fr; gap: 12px; }
       .attempt-time { grid-column: 2; }
       .accepted-score { grid-template-columns: 1fr; gap: var(--detail-space-sm); }
+      .screening-dispute-wallets { grid-template-columns: 1fr; }
       .retry-info::after { width: min(240px, calc(100vw - 72px)); }
     }
 
@@ -2648,7 +2690,7 @@
     function trapFocus(ev) {
       var modal = document.getElementById("modal");
       if (ev.key !== "Tab" || !modal.classList.contains("open")) return;
-      var f = modal.querySelectorAll('a[href], button, [tabindex]:not([tabindex="-1"]), summary, input, [contenteditable]');
+      var f = modal.querySelectorAll('a[href], button, [tabindex]:not([tabindex="-1"]), summary, input, textarea, [contenteditable]');
       f = Array.prototype.filter.call(f, function (el) { return el.offsetParent !== null || el === document.activeElement; });
       if (!f.length) return;
       var first = f[0], last = f[f.length - 1];
@@ -3513,6 +3555,134 @@
       '</section>';
     }
 
+    function renderScreeningDispute(pipeline) {
+      var dispute = pipeline.dispute;
+      if (dispute) {
+        var heading = dispute.status === "pending"
+          ? "Dispute awaiting review"
+          : (dispute.resolution === "release" ? "Dispute accepted" : "Dispute upheld");
+        var detail = dispute.status === "pending"
+          ? "Your one dispute was submitted " + relTime(dispute.submitted_at) + ". An operator will review your private message and the source artifact."
+          : (dispute.resolution === "release"
+            ? "An operator accepted the dispute and released this submission from quarantine."
+            : "An operator reviewed the dispute and upheld the screening rejection. This appeal is final.");
+        return '<section class="pipeline-section screening-dispute" aria-labelledby="pipeline-dispute-title">' +
+          '<div class="pipeline-section-heading"><h4 id="pipeline-dispute-title">' + esc(heading) + '</h4></div>' +
+          '<p class="screening-dispute-copy">' + esc(detail) + '</p></section>';
+      }
+      if (pipeline.status !== "rejected") return "";
+      return '<section class="pipeline-section screening-dispute" aria-labelledby="pipeline-dispute-title">' +
+        '<div class="pipeline-section-heading"><h4 id="pipeline-dispute-title">Dispute screening decision</h4></div>' +
+        '<p class="screening-dispute-copy">You may submit one private dispute for this submission. Explain specifically why the screening decision is wrong. An operator will review your note and source artifact. Once submitted, this dispute cannot be edited or replaced.</p>' +
+        '<form class="screening-dispute-form" id="screening-dispute-form">' +
+          '<label for="screening-dispute-message">Your dispute' +
+            '<textarea id="screening-dispute-message" minlength="20" maxlength="1000" required placeholder="Explain what the screener misidentified and where the relevant behavior appears in your source."></textarea>' +
+            '<span class="screening-dispute-meta"><span>20–1000 characters</span><span id="screening-dispute-count">0 / 1000</span></span>' +
+          '</label>' +
+          '<div class="screening-dispute-wallets">' +
+            '<label for="screening-dispute-wallet">Wallet name' +
+              '<input id="screening-dispute-wallet" autocomplete="off" spellcheck="false" placeholder="default">' +
+            '</label>' +
+            '<label for="screening-dispute-hotkey">Hotkey name' +
+              '<input id="screening-dispute-hotkey" autocomplete="off" spellcheck="false" placeholder="miner">' +
+            '</label>' +
+          '</div>' +
+          '<label>Ready-to-run btcli command' +
+            '<span class="screening-dispute-command"><code id="screening-dispute-command">Enter your dispute, wallet name, and hotkey name to generate the command.</code><button type="button" class="copy" id="screening-dispute-command-copy" data-key="" data-copy-label="btcli signing command" aria-label="Copy btcli signing command" title="Copy btcli signing command" disabled><span aria-hidden="true">⧉</span></button></span>' +
+            '<span class="screening-dispute-meta">Run this locally, then paste the <code>signed_message</code> value below. Wallet details stay in this browser and are not submitted.</span>' +
+          '</label>' +
+          '<label for="screening-dispute-signature">Hotkey signature' +
+            '<input id="screening-dispute-signature" inputmode="text" autocomplete="off" maxlength="128" pattern="[0-9a-fA-F]{128}" required placeholder="Paste the 128-character hexadecimal signature">' +
+          '</label>' +
+          '<div class="screening-dispute-actions"><button class="screening-dispute-submit" type="submit" disabled>Submit final dispute</button><p class="screening-dispute-status" id="screening-dispute-status" role="status" aria-live="polite"></p></div>' +
+        '</form>' +
+      '</section>';
+    }
+
+    function disputeSigningMessage(agentId, message) {
+      return crypto.subtle.digest("SHA-256", new TextEncoder().encode(message)).then(function (digest) {
+        var hash = Array.prototype.map.call(new Uint8Array(digest), function (byte) {
+          return byte.toString(16).padStart(2, "0");
+        }).join("");
+        return "ditto-dispute-v1:" + agentId + ":" + hash;
+      });
+    }
+
+    function shellQuote(value) {
+      return "'" + String(value).replace(/'/g, "'\"'\"'") + "'";
+    }
+
+    function disputeSigningCommand(walletName, hotkeyName, payload) {
+      return "btcli wallet sign --wallet-name " + shellQuote(walletName) +
+        " --wallet-hotkey " + shellQuote(hotkeyName) +
+        " --use-hotkey --message " + shellQuote(payload) + " --json-output";
+    }
+
+    function bindScreeningDispute(e) {
+      var form = document.getElementById("screening-dispute-form");
+      if (!form) return;
+      var message = document.getElementById("screening-dispute-message");
+      var walletName = document.getElementById("screening-dispute-wallet");
+      var hotkeyName = document.getElementById("screening-dispute-hotkey");
+      var signature = document.getElementById("screening-dispute-signature");
+      var command = document.getElementById("screening-dispute-command");
+      var commandCopy = document.getElementById("screening-dispute-command-copy");
+      var count = document.getElementById("screening-dispute-count");
+      var submit = form.querySelector("button[type=submit]");
+      var status = document.getElementById("screening-dispute-status");
+      var updateToken = 0;
+      function update() {
+        var value = message.value.trim();
+        var token = ++updateToken;
+        count.textContent = message.value.length + " / 1000";
+        commandCopy.disabled = true;
+        commandCopy.setAttribute("data-key", "");
+        submit.disabled = true;
+        if (value.length < 20 || value.length > 1000) {
+          command.textContent = "Write at least 20 characters to generate the command.";
+          return;
+        }
+        disputeSigningMessage(e.agent_id, value).then(function (valueToSign) {
+          if (token !== updateToken) return;
+          var wallet = walletName.value.trim();
+          var hotkey = hotkeyName.value.trim();
+          if (wallet && hotkey) {
+            var valueToCopy = disputeSigningCommand(wallet, hotkey, valueToSign);
+            command.textContent = valueToCopy;
+            commandCopy.setAttribute("data-key", valueToCopy);
+            commandCopy.disabled = false;
+          } else {
+            command.textContent = "Enter your wallet name and hotkey name to generate the command.";
+          }
+          submit.disabled = !/^[0-9a-fA-F]{128}$/.test(signature.value.trim());
+        });
+      }
+      message.addEventListener("input", update);
+      walletName.addEventListener("input", update);
+      hotkeyName.addEventListener("input", update);
+      signature.addEventListener("input", update);
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var appeal = message.value.trim();
+        if (appeal.length < 20 || appeal.length > 1000 || !/^[0-9a-fA-F]{128}$/.test(signature.value.trim())) return;
+        submit.disabled = true;
+        status.className = "screening-dispute-status";
+        status.textContent = "Submitting dispute…";
+        postJSON("/public/agent/" + encodeURIComponent(e.agent_id) + "/dispute", {
+          message: appeal,
+          signature: signature.value.trim()
+        }).then(function () {
+          status.textContent = "Dispute submitted.";
+          openActivityEntry(e, true);
+        }).catch(function (error) {
+          status.className = "screening-dispute-status error";
+          status.textContent = error.message || "The dispute could not be submitted.";
+          update();
+        });
+      });
+      update();
+    }
+
     function renderPipelineDetail(e, pipeline) {
       var screeningAttempts = pipeline.screening_attempts || [];
       var currentPolicy = screeningAttempts.reduce(function (latest, attempt) {
@@ -3568,6 +3738,7 @@
           '<div class="attempt-time" title="' + esc(a.issued_at) + '">' + relTime(a.issued_at) + '</div></div>';
       }).join("");
       return '<div class="pipeline-history">' +
+        renderScreeningDispute(pipeline) +
         '<section class="pipeline-section" aria-labelledby="pipeline-screening-history">' +
           '<div class="pipeline-section-heading"><h4 id="pipeline-screening-history">Screener result</h4></div>' +
           '<div class="attempt-list">' +
@@ -3641,6 +3812,7 @@
         .then(function (pipeline) {
           document.getElementById("d-stats").innerHTML =
             renderPipelineSummary(e, pipeline, evidence) + renderPipelineDetail(e, pipeline);
+          bindScreeningDispute(e);
         })
         .catch(function () {
           var el = document.getElementById("d-stats");
@@ -4062,6 +4234,29 @@
       return fetch(API_BASE + path, { signal: ctrl.signal, headers: { accept: "application/json" } })
         .then(function (r) { clearTimeout(to); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); },
               function (e) { clearTimeout(to); throw e; });
+    }
+
+    function postJSON(path, body) {
+      var ctrl = new AbortController();
+      var to = setTimeout(function () { ctrl.abort(); }, 8000);
+      return fetch(API_BASE + path, {
+        method: "POST",
+        signal: ctrl.signal,
+        headers: { accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify(body)
+      }).then(function (r) {
+        clearTimeout(to);
+        return r.json().catch(function () { return {}; }).then(function (data) {
+          if (!r.ok) {
+            var detail = typeof data.detail === "string" ? data.detail : "Request failed (HTTP " + r.status + ").";
+            throw new Error(detail);
+          }
+          return data;
+        });
+      }, function (error) {
+        clearTimeout(to);
+        throw error;
+      });
     }
 
     function resolveEntityRoute() {

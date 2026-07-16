@@ -28,6 +28,10 @@ from ditto.api_models.admin_quarantine import (
     AdminQuarantineResolveRequest,
     AdminQuarantineResolveResponse,
     AdminScreeningAttempt,
+    AdminScreeningDisputeItem,
+    AdminScreeningDisputeList,
+    AdminScreeningDisputeResolveRequest,
+    AdminScreeningDisputeResolveResponse,
     AdminScreeningRescreenRequest,
     AdminScreeningRescreenResponse,
     AdminScreeningSubmission,
@@ -57,6 +61,7 @@ from ditto.db.models import (
     Agent,
     Score,
     ScreeningAttempt,
+    ScreeningDispute,
     ScreeningQuarantine,
     ScreeningQuarantineResolution,
 )
@@ -68,6 +73,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 GeneratorDep = Annotated[DatasetGenerator, Depends(get_dataset_generator)]
 StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
+DatasetPin = tuple[int, str, str, int | None, str | None]
 
 
 async def require_admin(
@@ -178,6 +184,72 @@ async def _resolution_history(
     for event in events:
         history[event.quarantine_id].append(event)
     return history
+
+
+async def _prepare_release_dataset(
+    session: AsyncSession,
+    chain: ChainDep,
+    generator: DatasetGenerator,
+    quarantine_id: UUID,
+) -> DatasetPin | None:
+    if generator.run_size is None:
+        return None
+    existing = await session.scalar(
+        select(Agent)
+        .join(ScreeningQuarantine, ScreeningQuarantine.agent_id == Agent.agent_id)
+        .where(ScreeningQuarantine.quarantine_id == quarantine_id)
+    )
+    await session.rollback()
+    if existing is None:
+        raise HTTPException(status_code=404, detail="quarantine not found")
+    if existing.dataset_seed is not None:
+        return None
+    seed, block_number, block_hash = await _derive_dataset_seed(
+        chain, existing.agent_id
+    )
+    dataset_sha256 = await generator.generate(seed)
+    return seed, dataset_sha256, generator.run_size, block_number, block_hash
+
+
+def _apply_dataset(agent: Agent, dataset: DatasetPin | None) -> None:
+    if dataset is None or agent.dataset_seed is not None:
+        return
+    (
+        agent.dataset_seed,
+        agent.dataset_sha256,
+        agent.dataset_run_size,
+        agent.dataset_seed_block,
+        agent.dataset_seed_block_hash,
+    ) = dataset
+
+
+def _dispute_item(
+    dispute: ScreeningDispute,
+    agent: Agent,
+    quarantine: ScreeningQuarantine,
+    history: list[ScreeningQuarantineResolution],
+) -> AdminScreeningDisputeItem:
+    original_reason = next(
+        (event.reason for event in history if event.resolution == "reject"),
+        quarantine.resolution_reason,
+    )
+    return AdminScreeningDisputeItem(
+        dispute_id=dispute.dispute_id,
+        agent_id=dispute.agent_id,
+        quarantine_id=dispute.quarantine_id,
+        miner_hotkey=dispute.miner_hotkey,
+        agent_name=agent.name,
+        agent_version=agent.version,
+        artifact_sha256=agent.sha256,
+        message=dispute.message,
+        status=dispute.status,  # type: ignore[arg-type]
+        created_at=dispute.created_at,
+        original_reason=original_reason,
+        resolved_at=dispute.resolved_at,
+        resolved_by=dispute.resolved_by,
+        resolution=dispute.resolution,  # type: ignore[arg-type]
+        resolution_reason=dispute.resolution_reason,
+    )
 
 
 @router.get("/screening-quarantines", response_model=AdminQuarantineList)
@@ -449,31 +521,11 @@ async def resolve_quarantine(
     if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
         raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
 
-    new_dataset: tuple[int, str, str, int | None, str | None] | None = None
-    if payload.resolution == "release" and generator.run_size is not None:
-        existing = await session.scalar(
-            select(Agent)
-            .join(
-                ScreeningQuarantine,
-                ScreeningQuarantine.agent_id == Agent.agent_id,
-            )
-            .where(ScreeningQuarantine.quarantine_id == quarantine_id)
-        )
-        await session.rollback()
-        if existing is None:
-            raise HTTPException(status_code=404, detail="quarantine not found")
-        if existing.dataset_seed is None:
-            seed, block_number, block_hash = await _derive_dataset_seed(
-                chain, existing.agent_id
-            )
-            dataset_sha256 = await generator.generate(seed)
-            new_dataset = (
-                seed,
-                dataset_sha256,
-                generator.run_size,
-                block_number,
-                block_hash,
-            )
+    new_dataset = (
+        await _prepare_release_dataset(session, chain, generator, quarantine_id)
+        if payload.resolution == "release"
+        else None
+    )
 
     async with session.begin():
         quarantine = await session.scalar(
@@ -510,14 +562,7 @@ async def resolve_quarantine(
         }[payload.resolution]
         agent.status = target
         agent.screening_reason = payload.reason
-        if new_dataset is not None and agent.dataset_seed is None:
-            (
-                agent.dataset_seed,
-                agent.dataset_sha256,
-                agent.dataset_run_size,
-                agent.dataset_seed_block,
-                agent.dataset_seed_block_hash,
-            ) = new_dataset
+        _apply_dataset(agent, new_dataset)
         quarantine.status = "resolved"
         quarantine.resolved_at = datetime.now(UTC)
         quarantine.resolved_by = x_admin_actor
@@ -537,6 +582,141 @@ async def resolve_quarantine(
     history = await _resolution_history(session, [quarantine.quarantine_id])
     return AdminQuarantineResolveResponse(
         quarantine=_item(quarantine, agent, history[quarantine.quarantine_id]),
+        agent_status=agent.status,
+    )
+
+
+@router.get("/screening-disputes", response_model=AdminScreeningDisputeList)
+async def list_screening_disputes(
+    _admin: AdminDep,
+    session: SessionDep,
+    status: Annotated[Literal["pending", "resolved", "all"], Query()] = "pending",
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AdminScreeningDisputeList:
+    stmt = (
+        select(ScreeningDispute, Agent, ScreeningQuarantine)
+        .join(Agent, Agent.agent_id == ScreeningDispute.agent_id)
+        .join(
+            ScreeningQuarantine,
+            ScreeningQuarantine.quarantine_id == ScreeningDispute.quarantine_id,
+        )
+        .order_by(ScreeningDispute.created_at, ScreeningDispute.dispute_id)
+        .offset(offset)
+        .limit(limit)
+    )
+    count_stmt = select(func.count()).select_from(ScreeningDispute)
+    if status != "all":
+        stmt = stmt.where(ScreeningDispute.status == status)
+        count_stmt = count_stmt.where(ScreeningDispute.status == status)
+    rows = (await session.execute(stmt)).all()
+    history = await _resolution_history(
+        session, [dispute.quarantine_id for dispute, _agent, _quarantine in rows]
+    )
+    return AdminScreeningDisputeList(
+        items=[
+            _dispute_item(
+                dispute,
+                agent,
+                quarantine,
+                history[dispute.quarantine_id],
+            )
+            for dispute, agent, quarantine in rows
+        ],
+        count=int((await session.scalar(count_stmt)) or 0),
+    )
+
+
+@router.post(
+    "/screening-disputes/{dispute_id}/resolve",
+    response_model=AdminScreeningDisputeResolveResponse,
+)
+async def resolve_screening_dispute(
+    dispute_id: UUID,
+    payload: AdminScreeningDisputeResolveRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    chain: ChainDep,
+    generator: GeneratorDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminScreeningDisputeResolveResponse:
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+
+    new_dataset: DatasetPin | None = None
+    if payload.resolution == "release":
+        existing = await session.get(ScreeningDispute, dispute_id)
+        quarantine_id = existing.quarantine_id if existing is not None else None
+        await session.rollback()
+        if quarantine_id is None:
+            raise HTTPException(status_code=404, detail="dispute not found")
+        new_dataset = await _prepare_release_dataset(
+            session, chain, generator, quarantine_id
+        )
+
+    async with session.begin():
+        dispute = await session.scalar(
+            select(ScreeningDispute)
+            .where(ScreeningDispute.dispute_id == dispute_id)
+            .with_for_update()
+        )
+        if dispute is None:
+            raise HTTPException(status_code=404, detail="dispute not found")
+        quarantine = await session.scalar(
+            select(ScreeningQuarantine)
+            .where(ScreeningQuarantine.quarantine_id == dispute.quarantine_id)
+            .with_for_update()
+        )
+        agent = await session.scalar(
+            select(Agent).where(Agent.agent_id == dispute.agent_id).with_for_update()
+        )
+        if quarantine is None or agent is None:
+            raise HTTPException(status_code=404, detail="disputed submission not found")
+        if dispute.status != "pending":
+            raise HTTPException(status_code=409, detail="dispute is already resolved")
+        if (
+            agent.status != AgentStatus.REJECTED
+            or quarantine.status != "resolved"
+            or quarantine.resolution != "reject"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="the disputed rejection is no longer current",
+            )
+
+        now = datetime.now(UTC)
+        if payload.resolution == "release":
+            agent.status = AgentStatus.EVALUATING
+            agent.screening_reason = payload.reason
+            _apply_dataset(agent, new_dataset)
+            quarantine.resolved_at = now
+            quarantine.resolved_by = x_admin_actor
+            quarantine.resolution = "release"
+            quarantine.resolution_reason = payload.reason
+            session.add(
+                ScreeningQuarantineResolution(
+                    resolution_id=uuid4(),
+                    quarantine_id=quarantine.quarantine_id,
+                    resolution="release",
+                    reason=payload.reason,
+                    actor=x_admin_actor,
+                    created_at=now,
+                )
+            )
+        dispute.status = "resolved"
+        dispute.resolved_at = now
+        dispute.resolved_by = x_admin_actor
+        dispute.resolution = payload.resolution
+        dispute.resolution_reason = payload.reason
+
+    history = await _resolution_history(session, [dispute.quarantine_id])
+    return AdminScreeningDisputeResolveResponse(
+        dispute=_dispute_item(
+            dispute,
+            agent,
+            quarantine,
+            history[dispute.quarantine_id],
+        ),
         agent_status=agent.status,
     )
 

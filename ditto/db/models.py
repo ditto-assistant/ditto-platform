@@ -446,6 +446,52 @@ class ScreeningQuarantineResolution(Base):
     )
 
 
+class ScreeningDispute(Base):
+    """One miner-authenticated appeal of a rejected screening decision."""
+
+    __tablename__ = "screening_disputes"
+
+    dispute_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    quarantine_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    miner_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    resolved_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolution: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolution_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(
+            ["quarantine_id"],
+            ["screening_quarantines.quarantine_id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("agent_id", name="screening_disputes_agent_id_key"),
+        UniqueConstraint("quarantine_id", name="screening_disputes_quarantine_id_key"),
+        CheckConstraint(
+            "length(message) BETWEEN 20 AND 1000",
+            name="screening_disputes_message_length_check",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'resolved')",
+            name="screening_disputes_status_check",
+        ),
+        CheckConstraint(
+            "resolution IS NULL OR resolution IN ('release', 'uphold')",
+            name="screening_disputes_resolution_check",
+        ),
+        Index("screening_disputes_status_created_idx", "status", "created_at"),
+    )
+
+
 class EvaluationPayment(Base):
     """One row of the ``evaluation_payments`` table.
 

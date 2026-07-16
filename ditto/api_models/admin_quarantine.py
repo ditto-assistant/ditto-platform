@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
 
 QuarantineResolution = Literal["release", "rescreen", "reject"]
+DisputeResolution = Literal["release", "uphold"]
 
 
 class AdminQuarantineResolutionEvent(BaseModel):
@@ -63,6 +64,41 @@ class AdminQuarantineResolveRequest(BaseModel):
 
 class AdminQuarantineResolveResponse(BaseModel):
     quarantine: AdminQuarantineItem
+    agent_status: str
+
+
+class AdminScreeningDisputeItem(BaseModel):
+    dispute_id: UUID
+    agent_id: UUID
+    quarantine_id: UUID
+    miner_hotkey: str
+    agent_name: str
+    agent_version: int | None
+    artifact_sha256: str
+    message: str
+    status: Literal["pending", "resolved"]
+    created_at: datetime
+    original_reason: str | None
+    resolved_at: datetime | None
+    resolved_by: str | None
+    resolution: DisputeResolution | None
+    resolution_reason: str | None
+
+
+class AdminScreeningDisputeList(BaseModel):
+    items: list[AdminScreeningDisputeItem]
+    count: int
+
+
+class AdminScreeningDisputeResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: DisputeResolution
+    reason: Annotated[str, Field(min_length=3, max_length=500)]
+
+
+class AdminScreeningDisputeResolveResponse(BaseModel):
+    dispute: AdminScreeningDisputeItem
     agent_status: str
 
 
@@ -239,6 +275,10 @@ __all__ = [
     "AdminQuarantineResolveRequest",
     "AdminQuarantineResolveResponse",
     "AdminScreeningAttempt",
+    "AdminScreeningDisputeItem",
+    "AdminScreeningDisputeList",
+    "AdminScreeningDisputeResolveRequest",
+    "AdminScreeningDisputeResolveResponse",
     "AdminScreeningSubmission",
     "AdminScreeningSubmissionList",
     "AdminScreeningRescreenRequest",

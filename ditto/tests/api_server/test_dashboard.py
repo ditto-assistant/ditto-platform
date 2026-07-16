@@ -226,6 +226,26 @@ class TestDashboard:
         assert 'class="pipeline-history"' in body
         assert 'class="pipeline-detail-state"' in body
         assert 'style="margin-top:18px">Validator progress' not in body
+        assert "Dispute screening decision" in body
+        assert "one private dispute" in body
+        assert "cannot be edited or replaced" in body
+        assert "ditto-dispute-v1:" in body
+        assert 'id="screening-dispute-wallet"' in body
+        assert 'id="screening-dispute-hotkey"' in body
+        assert "Ready-to-run btcli command" in body
+        assert "btcli wallet sign --wallet-name" in body
+        assert '" --wallet-hotkey "' in body
+        assert '" --use-hotkey --message "' in body
+        assert '" --json-output"' in body
+        assert 'data-copy-label="btcli signing command"' in body
+        assert "Wallet details stay in this browser and are not submitted." in body
+        assert 'maxlength="1000"' in body
+        assert 'maxlength="128"' in body
+        assert 'pattern="[0-9a-fA-F]{128}"' in body
+        assert 'postJSON("/public/agent/"' in body
+        assert "renderScreeningDispute(pipeline)" in body
+        assert "Your one dispute was submitted" in body
+        assert "private message" in body
 
     async def test_includes_server_backed_submission_quick_filters(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
