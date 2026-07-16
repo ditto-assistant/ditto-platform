@@ -4511,7 +4511,19 @@
 
     renderActivityFilterControls();
     load(false);
-    setInterval(function () { load(false); }, REFRESH_MS);
+    // Background tabs skip network refreshes entirely and catch up once on
+    // return, so idle dashboards stop polling the API.
+    var refreshStale = false;
+    setInterval(function () {
+      if (document.hidden) { refreshStale = true; return; }
+      load(false);
+    }, REFRESH_MS);
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden && refreshStale) {
+        refreshStale = false;
+        load(false);
+      }
+    });
   })();
   </script>
 </body>
