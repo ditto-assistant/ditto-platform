@@ -19,7 +19,7 @@ import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -54,6 +54,7 @@ from ditto.api_server.middleware.error_envelope import (
 from ditto.chain.models import NeuronInfo
 from ditto.db.models import (
     Agent,
+    AthReview,
     Base,
     Score,
     ScreenerHeartbeat,
@@ -2079,10 +2080,25 @@ class TestAntiCopyGate:
 
         async with session_maker() as s:
             held = await s.get(Agent, copy)
+            review = await s.scalar(select(AthReview).where(AthReview.agent_id == copy))
             assert held is not None
+            assert review is not None
             assert held.status == AgentStatus.ATH_PENDING_REVIEW
             assert held.duplicate_of == incumbent
             assert "sha256" in (held.review_reason or "")
+            assert review.algorithm_provenance == {
+                "snapshot": "score-finalization",
+                "algorithm_version": "reference-aware-v2",
+                "canonical_reference_revision": (
+                    "959cd69a1a8d3b0defbfb8296518adb7d4f17c14"
+                ),
+                "reference_corpus_id": (
+                    "21dc06cd72aafefb56d0e89e8b3127280dda249ae26cb649ee855185121e9ce6"
+                ),
+                "reference_exclusion_mode": "starter-kit-mainline-history",
+                "backfilled": False,
+                "opened_at_source": "agent_finalized_audit",
+            }
 
     async def test_near_dup_dethroner_is_held(
         self,
@@ -2114,6 +2130,39 @@ class TestAntiCopyGate:
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == AgentStatus.ATH_PENDING_REVIEW
+
+    async def test_later_scored_upload_is_not_original_for_earlier_submission(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        earlier_time = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
+        later = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            miner_hotkey=_MINER_B,
+            sha256="aa" * 32,
+            size_bytes=500000,
+            created_at=earlier_time + timedelta(hours=1),
+        )
+        await self._score(
+            client, later, maker=session_maker, run_id="run_later", composite=0.80
+        )
+        earlier = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            sha256="aa" * 32,
+            size_bytes=500100,
+            created_at=earlier_time,
+        )
+        resp = await self._score(
+            client, earlier, maker=session_maker, run_id="run_earlier", composite=0.805
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == AgentStatus.SCORED
 
     async def test_genuine_improvement_not_held(
         self,

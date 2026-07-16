@@ -16,12 +16,41 @@ class AdminCopyReviewEvidence(BaseModel):
     backfilled: bool = False
 
 
+class AdminCopySimilarityEvidence(BaseModel):
+    candidate_version: int | str | None
+    reference_version: int | str | None
+    compatible: bool
+    applicable: bool
+    candidate_cardinality: int | None
+    reference_cardinality: int | None
+    jaccard: float | None
+    containment: float | None
+    above_threshold: bool
+    decision_role: str
+
+
 class AdminCopyReviewCurrentComparison(BaseModel):
-    label: Literal["current_comparison"] = "current_comparison"
-    availability: Literal["unavailable"] = "unavailable"
-    bulk_eligible: Literal[False] = False
-    reason: str
-    algorithm_provenance: dict[str, str | int | bool | None]
+    availability: Literal["available"]
+    bulk_eligible: bool
+    algorithm_version: str
+    lexical_fingerprint_version: int
+    normalized_source_fingerprint_version: str
+    prompt_fingerprint_version: str
+    canonical_reference_revision: str
+    reference_corpus_id: str
+    reference_exclusion_mode: str
+    miner_exclusion_mode: str
+    same_miner_excluded: bool
+    chronology_direction: str
+    chronology_eligible: bool
+    exact_byte_match: bool
+    normalized_source_match: bool
+    lexical: AdminCopySimilarityEvidence
+    structural: AdminCopySimilarityEvidence
+    prompt: AdminCopySimilarityEvidence
+    triggered: bool
+    triggered_signal: str | None
+    current_decision: str
 
 
 class AdminCopyReviewItem(BaseModel):
