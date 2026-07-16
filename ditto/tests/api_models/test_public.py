@@ -28,6 +28,26 @@ def test_provisional_score_accepts_reproducible_safe_fields() -> None:
 
 
 @pytest.mark.parametrize(
+    "seed_source", ["on_chain", "random_fallback", "validator_local"]
+)
+def test_provisional_score_accepts_each_seed_source(seed_source: str) -> None:
+    score = PublicProvisionalScore(
+        composite=0.5,
+        seed="123456789",
+        run_size=None,
+        bench_version=None,
+        datagen_version=None,
+        seed_source=seed_source,
+        dataset_sha256=None,
+        accepted_at=datetime(2026, 7, 14, tzinfo=UTC),
+        reproduction_command=None,
+        verification_command=None,
+    )
+
+    assert score.seed_source == seed_source
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("run_size", "custom; rm -rf /"),

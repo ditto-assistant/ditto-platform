@@ -3524,10 +3524,14 @@
         var accepted = score.accepted_at ? relTime(score.accepted_at) : "Accepted";
         var seedSource = score.seed_source === "on_chain"
           ? "Derived from an on-chain block hash after submission commitment."
+          : score.seed_source === "validator_local"
+          ? "Chosen unpredictably by the scoring validator's benchmark harness after submission commitment; per-submission dataset pinning was not enabled for this run."
           : "Generated from an unpredictable random fallback after submission commitment; no block provenance is available.";
         var command = score.reproduction_command
           ? '<div class="accepted-score-meta-row"><b>Reproduce dataset</b><div class="accepted-score-command"><code>' +
             esc(score.reproduction_command) + '</code>' + copyButton(score.reproduction_command, "dataset command") + '</div></div>'
+          : score.seed_source === "validator_local"
+          ? '<div class="accepted-score-meta-row">No reproduction command: this run was scored before per-submission dataset pinning was enabled.</div>'
           : '<div class="accepted-score-meta-row">Dataset command unavailable for this legacy score.</div>';
         var verify = score.verification_command && score.dataset_sha256
           ? '<div class="accepted-score-meta-row"><b>Verify hash</b> <code>' + esc(score.dataset_sha256) + '</code>' +
