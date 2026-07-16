@@ -57,7 +57,7 @@ defaults are correct and the query string is only needed for testing.
 ## Run / preview
 
 ```sh
-# Preview the layout (renders SAMPLE data since no API is reachable):
+# Preview the API-unavailable state:
 open dashboard/index.html            # or drag it into a browser
 
 # Against a locally-running API (make api-up):
@@ -65,8 +65,8 @@ python -m http.server -d dashboard 8080
 # then visit http://localhost:8080/?api=http://localhost:8000/api/v1
 ```
 
-If the API can't be reached the page renders **sample data** behind a clearly
-marked amber banner, so the layout is always previewable before deploy.
+If the API can't be reached the page renders an explicit unavailable state. It
+never substitutes sample values for live subnet data.
 
 ## Deploy
 
