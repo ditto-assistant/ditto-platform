@@ -38,6 +38,7 @@ from ditto.api_server.endpoints import (
 from ditto.api_server.errors import ApiServerLifespanError
 from ditto.api_server.middleware import (
     AuthPassThroughMiddleware,
+    PublicCacheMiddleware,
     RequestIDMiddleware,
     register_exception_handlers,
 )
@@ -163,6 +164,9 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     # must be outermost so its contextvar is live for every downstream
     # middleware + handler + log line, including any future auth that
     # short-circuits before reaching the app.
+    # PublicCacheMiddleware is innermost: cache hits skip the endpoint (and
+    # its database work) while request-id logging still records every hit.
+    app.add_middleware(PublicCacheMiddleware)
     app.add_middleware(AuthPassThroughMiddleware)
     app.add_middleware(RequestIDMiddleware)
 

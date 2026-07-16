@@ -9,6 +9,7 @@ or set on the app directly.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal
 from typing import Any
@@ -113,6 +114,10 @@ def make_api_server_config(**overrides: Any) -> ApiServerConfig:
 @pytest.fixture
 def app() -> Iterator[FastAPI]:
     """A fresh FastAPI app per test, with auto-cleared dependency overrides."""
+    # Endpoint tests assert per-request behavior; the public TTL cache would
+    # serve stale bodies across a test's mutate-then-refetch sequence. The
+    # middleware has its own coverage in tests/api_server/middleware.
+    os.environ["PUBLIC_CACHE_DISABLED"] = "1"
     a = create_api_server(make_api_server_config())
     # Lifespan does not run under ASGITransport, so set the bits the
     # health endpoint reads via app.state directly.
