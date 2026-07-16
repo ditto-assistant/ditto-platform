@@ -6,13 +6,16 @@ dethrone the original. The KOTH+ATH fold already defeats a *verbatim* copy — i
 ties the incumbent, never clears the 2% margin, and first-seen protects the
 original. This gate adds cheap signals against a *lightly-tweaked* copy that
 nudges its score just past the incumbent: such a submission scores within a hair
-of the agent it surpasses and matches on tarball size or on one of two fingerprint
-channels — a *lexical* sketch of the tarball text
-(:mod:`ditto.api_server.fingerprint`), which survives reindent/rename/reformat/edit
-and padding, or a *structural* sketch of the crate's AST shape (computed by
-dittobench, arriving on the score report), which additionally survives identifier
-renaming. Both channels are compared by Jaccard (edit-in-place) or containment
-(padded copy).
+of the agent it surpasses and matches on the *lexical* fingerprint channel — a
+reference-aware sketch of the tarball text (:mod:`ditto.api_server.fingerprint`,
+official starter-kit scaffolding subtracted before sketching), which survives
+reindent/reformat/localized-edit and junk-file padding, compared by Jaccard
+(edit-in-place) or containment (padded copy). The *structural* sketch of the
+crate's AST shape (computed by dittobench, arriving on the score report) and the
+prompt sketch corroborate a hold's audit reason but never trigger one: both are
+whole-crate, so they saturate between independent starter-kit derivatives until
+they are reference-aware too. Tarball-size proximity is a fallback for rows with
+no comparable fingerprints only.
 
 This is **moderation, not weight logic** — it decides only whether a suspicious
 high-scorer is held in ``ath_pending_review`` for human review (see
@@ -57,10 +60,10 @@ _DEFAULT_SIZE_TOL = 8192
 # (see the subnet's KOTH-parameter validation task).
 _DEFAULT_JACCARD_TOL = 0.75
 _DEFAULT_CONTAINMENT_TOL = 0.95
-# Structural (AST) thresholds are higher than the lexical ones: the structural
+# Structural (AST) thresholds gate the ADVISORY structural annotation on a hold
+# (see _structural_note): higher than the lexical ones because the structural
 # sketch discards identifiers + formatting, so two independent crates built on the
 # same reference harness share far more of their parse-tree shape than their text.
-# Only a near-total structural match should trip this rename-resistant channel.
 _DEFAULT_STRUCTURAL_JACCARD_TOL = 0.85
 _DEFAULT_STRUCTURAL_CONTAINMENT_TOL = 0.98
 # prompt overlap above which a hold's audit reason notes the corroboration.
@@ -107,6 +110,31 @@ def _fingerprint_versions_incompatible(a: dict | None, b: dict | None) -> bool:
         and b.get("v") is not None
         and a.get("v") != b.get("v")
     )
+
+
+def _structural_note(
+    structural_fingerprint: dict | None,
+    e: LedgerRow,
+    *,
+    jaccard_tol: float,
+    containment_tol: float,
+) -> str:
+    """Advisory structural-overlap suffix for a hold's audit reason.
+
+    The structural (AST-shape) sketch arrives from dittobench computed over the
+    WHOLE crate — ``astfp`` performs no reference subtraction — so on
+    starter-kit-derived submissions it saturates between independent miners
+    exactly like the pre-reference lexical channel did (measured on the audited
+    corpus: 12 of the 66 current holds sit at/above the structural thresholds,
+    concentrated in the smallest-edit submissions, which the lexical
+    residual-cardinality floor deliberately routes past the lexical check).
+    Until dittobench ships reference-subtracted structural sketches this
+    channel corroborates a hold that already fired; it never triggers one.
+    """
+    j, c = content_similarity(structural_fingerprint, e.structural_fingerprint)
+    if j >= jaccard_tol or c >= containment_tol:
+        return f"; structural jaccard {j:.3f}, containment {c:.3f}"
+    return ""
 
 
 def _prompt_note(prompt_fingerprint: dict | None, e: LedgerRow) -> str:
@@ -159,16 +187,14 @@ def evaluate_duplicate_signals(
        matches. Like rule 1, held on the hash equality alone — no score proximity,
        because an exact-source match is copy evidence regardless of the score it
        happened to land.
-    2. **Near-duplicate fingerprint** — composites within ``score_tol`` *and*
-       either sketch channel matches:
-
-       - *lexical* (``content_fingerprint``, from the tarball text) at least
-         ``jaccard_tol`` Jaccard or ``containment_tol`` contained — survives
-         re-indent / rename / reformat / localized edits / junk-file padding;
-       - *structural* (``structural_fingerprint``, the AST shape from dittobench)
-         at least ``structural_jaccard_tol`` / ``structural_containment_tol`` —
-         additionally survives identifier renaming, at higher thresholds because
-         unrelated crates share more parse-tree shape than text.
+    2. **Near-duplicate lexical fingerprint** — composites within ``score_tol``
+       *and* the lexical channel (``content_fingerprint``, reference-aware) at
+       least ``jaccard_tol`` Jaccard or ``containment_tol`` contained — survives
+       re-indent / reformat / localized edits / junk-file padding. Structural
+       (``structural_fingerprint``, whole-crate AST from dittobench — measured
+       at/above its thresholds for 12 of the 66 audited holds, concentrated in
+       the smallest-edit submissions) and prompt overlap annotate the hold's
+       audit reason as corroboration; neither triggers until reference-aware.
 
     3. **Size near-duplicate fallback** — composites within ``score_tol`` and
        tarball sizes within ``size_tol``, but only when neither lexical nor
@@ -228,29 +254,25 @@ def evaluate_duplicate_signals(
                     reason=f"normalized-source (repack) match of agent {e.agent_id}",
                 )
 
-    # 2. Near-dup fingerprint: close in score AND a matching sketch on either the
-    #    lexical or the structural channel. Checked before the size rule because a
-    #    fingerprint is the stronger, size-independent signal. Lexical is tried
-    #    first (more precise / lower false-positive) then structural (rename-proof).
+    # 2. Near-dup fingerprint: close in score AND a matching lexical sketch.
+    #    Checked before the size rule because a fingerprint is the stronger,
+    #    size-independent signal. The structural (whole-crate AST) channel
+    #    saturates between independent starter-kit derivatives — astfp performs
+    #    no reference subtraction — so it corroborates the audit reason instead
+    #    of triggering until its sketches are reference-aware.
     for e in earlier_others:
         if abs(composite - e.composite) > score_tol:
             continue
-        incompatible_channels = [
-            channel
-            for channel, current, stored in (
-                ("lexical", content_fingerprint, e.content_fingerprint),
-                ("structural", structural_fingerprint, e.structural_fingerprint),
-            )
-            if _fingerprint_versions_incompatible(current, stored)
-        ]
-        if incompatible_channels:
+        if _fingerprint_versions_incompatible(
+            content_fingerprint, e.content_fingerprint
+        ):
             return ReviewDecision(
                 held=True,
                 duplicate_of=e.agent_id,
                 reason=(
                     f"anti-copy comparison inconclusive with agent {e.agent_id}: "
-                    f"incompatible {'/'.join(incompatible_channels)} fingerprint "
-                    "versions; individual operator review required"
+                    "incompatible lexical fingerprint versions; "
+                    "individual operator review required"
                 ),
             )
         lex_j, lex_c = content_similarity(content_fingerprint, e.content_fingerprint)
@@ -262,20 +284,12 @@ def evaluate_duplicate_signals(
                     f"content near-duplicate of agent {e.agent_id}: "
                     f"composite delta {abs(composite - e.composite):.4f}, "
                     f"jaccard {lex_j:.3f}, containment {lex_c:.3f}"
-                    + _prompt_note(prompt_fingerprint, e)
-                ),
-            )
-        str_j, str_c = content_similarity(
-            structural_fingerprint, e.structural_fingerprint
-        )
-        if str_j >= structural_jaccard_tol or str_c >= structural_containment_tol:
-            return ReviewDecision(
-                held=True,
-                duplicate_of=e.agent_id,
-                reason=(
-                    f"structural near-duplicate of agent {e.agent_id}: "
-                    f"composite delta {abs(composite - e.composite):.4f}, "
-                    f"structural jaccard {str_j:.3f}, containment {str_c:.3f}"
+                    + _structural_note(
+                        structural_fingerprint,
+                        e,
+                        jaccard_tol=structural_jaccard_tol,
+                        containment_tol=structural_containment_tol,
+                    )
                     + _prompt_note(prompt_fingerprint, e)
                 ),
             )

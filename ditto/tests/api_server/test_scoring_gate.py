@@ -363,10 +363,13 @@ class TestEvaluateAntidup:
         assert decision.held is True
         assert "containment" in (decision.reason or "")
 
-    def test_structural_dup_held_when_lexical_differs(self) -> None:
-        # An identifier-renamed copy: the LEXICAL sketch diverges (text changed),
-        # but the STRUCTURAL (AST) sketch still matches => held via the structural
-        # channel. Lexical fingerprints are made deliberately disjoint.
+    def test_structural_match_alone_never_holds(self) -> None:
+        # The structural (AST) sketch is whole-crate — astfp performs no
+        # reference subtraction — so it saturates between independent
+        # starter-kit derivatives exactly like the pre-reference lexical
+        # channel did (12 of the 66 audited holds sit at/above its
+        # thresholds). Until dittobench ships reference-aware structural
+        # sketches it corroborates, never triggers.
         struct = {f"{i:016x}" for i in range(30)}
         incumbent = _entry(
             composite=0.80,
@@ -381,14 +384,62 @@ class TestEvaluateAntidup:
             sha256="bb" * 32,
             composite=0.805,
             size_bytes=700000,
-            # Different lexical text (renamed identifiers) but identical AST shape.
             content_fingerprint=_sk({f"other{i:011x}" for i in range(30)}),
             structural_fingerprint=_sk(struct),
             eligible=[incumbent],
         )
+        assert decision.held is False
+
+    def test_below_floor_lexical_does_not_fall_through_to_structural(self) -> None:
+        # THE audited-corpus regression: a near-pristine kit edit gets a
+        # versioned EMPTY lexical sketch (residual below the cardinality
+        # floor), which matches nothing — it must not fall through to the
+        # saturated whole-crate structural channel and be re-held there.
+        struct = {f"{i:016x}" for i in range(30)}
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=524288,
+            content_fingerprint=_sk(set()),
+            structural_fingerprint=_sk(struct),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.801,
+            size_bytes=524289,
+            content_fingerprint=_sk(set()),
+            structural_fingerprint=_sk(struct),
+            eligible=[incumbent],
+        )
+        assert decision.held is False
+
+    def test_structural_overlap_annotates_lexical_hold(self) -> None:
+        # When the lexical channel fires, high structural overlap with the
+        # matched agent is appended to the audit reason as corroboration.
+        lex = {f"lex{i:013x}" for i in range(30)}
+        struct = {f"{i:016x}" for i in range(30)}
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=500000,
+            content_fingerprint=_sk(lex),
+            structural_fingerprint=_sk(struct),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Copier",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=700000,
+            content_fingerprint=_sk(lex),
+            structural_fingerprint=_sk(struct),
+            eligible=[incumbent],
+        )
         assert decision.held is True
-        assert decision.duplicate_of == incumbent.agent_id
-        assert "structural near-duplicate" in (decision.reason or "")
+        assert "content near-duplicate" in (decision.reason or "")
+        assert "structural jaccard" in (decision.reason or "")
 
     def test_structural_below_tol_not_held(self) -> None:
         # Two crates sharing reference-harness AST scaffolding but well under the
