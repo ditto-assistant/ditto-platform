@@ -14,6 +14,13 @@ class AdminCopyReviewEvidence(BaseModel):
     fingerprint_versions: dict[str, int | str | None]
     reference_provenance: str
     backfilled: bool = False
+    # Identity of the originally matched agent, so operators see WHICH
+    # submission triggered the hold instead of a bare UUID. Null when the
+    # matched agent row no longer exists.
+    duplicate_of_name: str | None = None
+    duplicate_of_version: int | None = None
+    duplicate_of_hotkey: str | None = None
+    duplicate_of_submitted_at: datetime | None = None
 
 
 class AdminCopySimilarityEvidence(BaseModel):

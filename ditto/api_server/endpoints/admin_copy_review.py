@@ -39,7 +39,9 @@ def _fingerprint_versions(evidence: dict) -> dict[str, int | str | None]:
     }
 
 
-def _item(review: AthReview, agent: Agent) -> AdminCopyReviewItem:
+def _item(
+    review: AthReview, agent: Agent, matched: Agent | None = None
+) -> AdminCopyReviewItem:
     provenance = review.algorithm_provenance
     return AdminCopyReviewItem(
         review_id=review.review_id,
@@ -64,8 +66,27 @@ def _item(review: AthReview, agent: Agent) -> AdminCopyReviewItem:
                 or provenance.get("reference_provenance", "unknown")
             ),
             backfilled=bool(provenance.get("backfilled", False)),
+            duplicate_of_name=matched.name if matched else None,
+            duplicate_of_version=matched.version if matched else None,
+            duplicate_of_hotkey=matched.miner_hotkey if matched else None,
+            duplicate_of_submitted_at=matched.created_at if matched else None,
         ),
     )
+
+
+async def _matched_agents(
+    session: AsyncSession, reviews: list[AthReview]
+) -> dict[UUID, Agent]:
+    """Batch-load the originally matched agents for a page of reviews."""
+    ids = {r.original_duplicate_of for r in reviews if r.original_duplicate_of}
+    if not ids:
+        return {}
+    rows = (
+        (await session.execute(select(Agent).where(Agent.agent_id.in_(ids))))
+        .scalars()
+        .all()
+    )
+    return {row.agent_id: row for row in rows}
 
 
 async def _get_review(
@@ -139,8 +160,12 @@ async def list_copy_reviews(
             .offset(offset)
         )
     ).all()
+    matched = await _matched_agents(session, [review for review, _ in rows])
     return AdminCopyReviewList(
-        items=[_item(review, agent) for review, agent in rows],
+        items=[
+            _item(review, agent, matched.get(review.original_duplicate_of))
+            for review, agent in rows
+        ],
         count=count or 0,
         limit=limit,
         offset=offset,
@@ -154,7 +179,13 @@ async def get_copy_review(
     row = await _get_review(session, agent_id)
     if row is None:
         raise HTTPException(status_code=404, detail="copy review not found")
-    return _item(*row)
+    review, agent = row
+    matched = (
+        await session.get(Agent, review.original_duplicate_of)
+        if review.original_duplicate_of
+        else None
+    )
+    return _item(review, agent, matched)
 
 
 @router.get(
@@ -213,11 +244,16 @@ async def resolve_copy_review(
         if row is None:
             raise HTTPException(status_code=404, detail="copy review not found")
         review, agent = row
+        matched = (
+            await session.get(Agent, review.original_duplicate_of)
+            if review.original_duplicate_of
+            else None
+        )
         if review.status == "resolved":
             if review.resolution != canonical:
                 raise HTTPException(status_code=409, detail="review already resolved")
             return AdminCopyReviewResolveResponse(
-                review=_item(review, agent),
+                review=_item(review, agent, matched),
                 agent_status=agent.status.value,
                 idempotent=True,
             )
@@ -241,7 +277,7 @@ async def resolve_copy_review(
         review.resolution_reason = payload.reason
         await session.flush()
     return AdminCopyReviewResolveResponse(
-        review=_item(review, agent),
+        review=_item(review, agent, matched),
         agent_status=agent.status.value,
         idempotent=False,
     )

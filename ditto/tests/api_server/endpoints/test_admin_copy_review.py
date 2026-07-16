@@ -175,6 +175,47 @@ async def test_list_is_bounded_oldest_first_and_private(
     assert "sha256" not in serialized and '"m":' not in serialized
 
 
+async def test_original_evidence_names_the_matched_submission(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id, original_id = await _seed(maker)
+    _install(app, maker)
+    listing = await client.get("/api/v1/admin/copy-reviews", headers=_HEADERS)
+    assert listing.status_code == 200
+    original = listing.json()["items"][0]["original"]
+    assert original["duplicate_of"] == str(original_id)
+    assert original["duplicate_of_name"] == "original"
+    assert original["duplicate_of_hotkey"] == "5Original"
+    assert original["duplicate_of_submitted_at"] is not None
+    detail = await client.get(
+        f"/api/v1/admin/copy-reviews/{agent_id}", headers=_HEADERS
+    )
+    assert detail.status_code == 200
+    assert detail.json()["original"]["duplicate_of_name"] == "original"
+
+
+async def test_matched_identity_is_null_when_reference_row_is_gone(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id, _ = await _seed(maker)
+    async with maker() as session, session.begin():
+        review = (
+            await session.execute(
+                select(AthReview).where(AthReview.agent_id == agent_id)
+            )
+        ).scalar_one()
+        review.original_duplicate_of = None
+    _install(app, maker)
+    detail = await client.get(
+        f"/api/v1/admin/copy-reviews/{agent_id}", headers=_HEADERS
+    )
+    assert detail.status_code == 200
+    original = detail.json()["original"]
+    assert original["duplicate_of"] is None
+    assert original["duplicate_of_name"] is None
+    assert original["duplicate_of_hotkey"] is None
+
+
 async def test_current_comparison_is_unavailable_without_finalized_scores(
     app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
 ) -> None:
