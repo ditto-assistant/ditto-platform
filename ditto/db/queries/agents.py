@@ -228,6 +228,7 @@ class PublicActivityRow:
     agent: Agent
     score_count: int
     provisional_composite: float | None
+    highest_composite: float | None
     last_scored_at: datetime | None
     screening_attempt: ScreeningAttempt | None
 
@@ -249,6 +250,7 @@ async def list_public_activity(
             Score.agent_id,
             func.count(Score.validator_hotkey).label("score_count"),
             func.avg(Score.composite).label("provisional_composite"),
+            func.max(Score.composite).label("highest_composite"),
             func.max(Score.updated_at).label("last_scored_at"),
         )
         .group_by(Score.agent_id)
@@ -259,6 +261,7 @@ async def list_public_activity(
             Agent,
             func.coalesce(score_counts.c.score_count, 0),
             score_counts.c.provisional_composite,
+            score_counts.c.highest_composite,
             score_counts.c.last_scored_at,
             ScreeningAttempt,
         )
@@ -285,6 +288,9 @@ async def list_public_activity(
                     if provisional_composite is not None
                     else None
                 ),
+                highest_composite=(
+                    float(highest_composite) if highest_composite is not None else None
+                ),
                 last_scored_at=last_scored_at,
                 screening_attempt=screening_attempt,
             )
@@ -292,6 +298,7 @@ async def list_public_activity(
                 agent,
                 score_count,
                 provisional_composite,
+                highest_composite,
                 last_scored_at,
                 screening_attempt,
             ) in result.all()

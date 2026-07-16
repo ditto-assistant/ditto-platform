@@ -884,7 +884,10 @@ class PublicSubmissionPipeline(BaseModel):
         Field(
             ge=0.0,
             le=1.0,
-            description="Minimum provisional score required for another ticket.",
+            description=(
+                "Current finalized fifth-place score used for safe continuation "
+                "after two scores; 0 when fewer than five ranked miners exist."
+            ),
         ),
     ]
     provisional_scores: list[PublicProvisionalScore] = Field(default_factory=list)

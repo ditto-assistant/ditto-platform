@@ -26,7 +26,7 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.db.models import Agent, Score, ValidatorTicket
-from ditto.db.queries.scores import SCORING_QUORUM
+from ditto.db.queries.scores import SCORING_QUORUM, list_eligible_ledger
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,18 +49,32 @@ _LIVE_TICKET_STATUSES = (TicketStatus.ISSUED, TicketStatus.SCORED)
 RETRY_COOLDOWN = timedelta(hours=6)
 MAX_ATTEMPTS_PER_VERSION = 2
 
-# A very low first full-benchmark score is not competitive enough to justify
-# two more independent validator runs. This is intentionally conservative: the
-# live launch sample's only first score below 0.25 later finalized at 0.344,
-# while every other finalized first score was at least 0.465. Keep this policy
-# platform-owned so every validator sees the same assignment boundary.
-FIRST_SCORE_CONTINUATION_FLOOR = 0.25
+# The KOTH champion plus four participation-tail miners receive emissions.
+# Ticket continuation uses the current fifth finalized score as a dynamic floor,
+# but only after two scores: with median-of-three, the highest final score still
+# reachable from two observations is their maximum. A single low first score is
+# never sufficient to eliminate a submission because two later high scores can
+# make that first score irrelevant to the median.
+EMISSION_CONTENDER_COUNT = 5
 
 # Finish a bounded set of likely leaderboard contenders before starting more
 # uncovered work. Keeping one best submission per miner in this small lane
 # makes strong 2-of-3 submissions emission-eligible quickly without allowing
 # the whole completion backlog to starve new miners.
 PROVISIONAL_CONTENDER_LANE_SIZE = 10
+
+
+async def get_score_continuation_floor(session: AsyncSession) -> float | None:
+    """Return the current finalized fifth-place score, if five exist.
+
+    The ledger is already best-agent-per-miner and ordered by the same
+    eligibility, composite, age, and UUID rules used for emissions. Provisional
+    rows remain visible in that ledger, so filter them before selecting fifth.
+    """
+    eligible = [row for row in await list_eligible_ledger(session) if row.eligible]
+    if len(eligible) < EMISSION_CONTENDER_COUNT:
+        return None
+    return eligible[EMISSION_CONTENDER_COUNT - 1].composite
 
 
 async def expire_overdue_tickets(session: AsyncSession, *, now: datetime) -> int:
@@ -139,6 +153,8 @@ async def issue_ticket(
     if existing is not None:
         return existing
 
+    score_continuation_floor = await get_score_continuation_floor(session)
+
     # Agents this validator must not receive right now: live/scored tickets,
     # same-version tickets cooling down after expiry, and same-version tickets
     # that already consumed the two-attempt budget. A benchmark-version bump
@@ -201,9 +217,18 @@ async def issue_ticket(
         .correlate(Agent)
         .scalar_subquery()
     )
-    completion_lane_score = case(
+    highest_recorded_score = func.coalesce(
         (
-            accepted_score_count >= SCORING_QUORUM - 1,
+            select(func.max(Score.composite))
+            .where(Score.agent_id == Agent.agent_id)
+            .correlate(Agent)
+            .scalar_subquery()
+        ),
+        0.0,
+    )
+    covered_lane_score = case(
+        (
+            accepted_score_count >= 1,
             provisional_composite,
         ),
         else_=0.0,
@@ -278,9 +303,16 @@ async def issue_ticket(
             Agent.status == AgentStatus.EVALUATING,
             Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
             Agent.agent_id.not_in(already_mine),
-            (recorded_score_count != 1)
-            | (provisional_composite >= FIRST_SCORE_CONTINUATION_FLOOR),
         )
+        if score_continuation_floor is not None:
+            # A median-of-three cannot be bounded safely after one score. Once
+            # two scores exist, their maximum is the best final median the
+            # third score can produce. Only skip the third run when that strict
+            # upper bound is below the current finalized fifth place.
+            candidate = candidate.where(
+                (recorded_score_count != SCORING_QUORUM - 1)
+                | (highest_recorded_score >= score_continuation_floor)
+            )
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
         candidate = (
@@ -292,14 +324,14 @@ async def issue_ticket(
             # jump from zero coverage to three concurrent validators while
             # another eligible agent remains uncovered. Within one coverage
             # round, never-attempted work precedes this validator's cooled-down
-            # retry. Once candidates reach the two-score completion lane, prefer
-            # the highest provisional composite so the likely emission winner
-            # reaches quorum first. Submission age and UUID remain stable ties.
+            # retry. Within any accepted-score coverage round, prefer the
+            # highest provisional composite so the likely emission winner
+            # advances first. Submission age and UUID remain stable ties.
             candidate.order_by(
                 contender_lane.asc(),
                 total_coverage.asc(),
                 had_prior_ticket.asc(),
-                completion_lane_score.desc(),
+                covered_lane_score.desc(),
                 Agent.created_at.asc(),
                 Agent.agent_id.asc(),
             )

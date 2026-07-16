@@ -90,6 +90,7 @@ from ditto.api_models.screener import (
     ScreenerRuntimeState,
 )
 from ditto.api_models.system_health import SystemMetrics
+from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.datapipeline import DataPipelineError
@@ -124,8 +125,8 @@ from ditto.db.queries.screening import (
     list_screening_attempts,
 )
 from ditto.db.queries.tickets import (
-    FIRST_SCORE_CONTINUATION_FLOOR,
     PROVISIONAL_CONTENDER_LANE_SIZE,
+    get_score_continuation_floor,
 )
 
 logger = logging.getLogger(__name__)
@@ -927,8 +928,10 @@ def _public_activity_status(
     screening_policy_version: int,
     has_active_attempt: bool,
     has_active_validation: bool,
+    has_live_assignment: bool = False,
     score_count: int = 0,
-    provisional_composite: float | None = None,
+    highest_composite: float | None = None,
+    score_continuation_floor: float | None = None,
 ) -> str:
     """Collapse internal moderation detail into stable public lifecycle labels."""
     needs_rescreen = (
@@ -946,10 +949,11 @@ def _public_activity_status(
     if status in (AgentStatus.SCREENING_PASSED, AgentStatus.EVALUATING):
         if (
             status == AgentStatus.EVALUATING
-            and not has_active_validation
-            and score_count == 1
-            and provisional_composite is not None
-            and provisional_composite < FIRST_SCORE_CONTINUATION_FLOOR
+            and not has_live_assignment
+            and score_count == SCORING_QUORUM - 1
+            and highest_composite is not None
+            and score_continuation_floor is not None
+            and highest_composite < score_continuation_floor
         ):
             return "below_score_floor"
         return "evaluating" if has_active_validation else "waiting_validator"
@@ -969,6 +973,8 @@ def _public_activity_response(
     limit: int,
     requested_statuses: set[str],
     query: str | None,
+    score_continuation_floor: float | None,
+    active_assignment_agent_ids: set[UUID],
     duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
 ) -> PublicActivityResponse:
     """Project activity from the same validated work set used by fleet health."""
@@ -985,8 +991,10 @@ def _public_activity_response(
             screening_policy_version=row.agent.screening_policy_version,
             has_active_attempt=row.screening_attempt is not None,
             has_active_validation=row.agent.agent_id in active_agent_ids,
+            has_live_assignment=row.agent.agent_id in active_assignment_agent_ids,
             score_count=row.score_count,
-            provisional_composite=row.provisional_composite,
+            highest_composite=row.highest_composite,
+            score_continuation_floor=score_continuation_floor,
         )
 
     projected = [(row, public_status(row)) for row in rows]
@@ -1022,11 +1030,7 @@ def _public_activity_response(
         key=lambda row: (
             0 if row.agent.agent_id in provisional_contender_ids else 1,
             row.score_count,
-            -(
-                row.provisional_composite or 0.0
-                if row.score_count >= SCORING_QUORUM - 1
-                else 0.0
-            ),
+            -(row.provisional_composite or 0.0),
             row.agent.created_at,
             str(row.agent.agent_id),
         ),
@@ -1171,6 +1175,7 @@ async def activity(
 
     now = datetime.now(UTC)
     rows, _ = await list_public_activity(session)
+    assignments = await list_active_validator_assignments(session, now=now)
     return _public_activity_response(
         rows=rows,
         active_work=await list_active_validator_work(
@@ -1181,6 +1186,10 @@ async def activity(
         limit=limit,
         requested_statuses=requested_statuses,
         query=q,
+        score_continuation_floor=await get_score_continuation_floor(session),
+        active_assignment_agent_ids={
+            assignment.agent.agent_id for assignment in assignments
+        },
         duplicate_metadata=await _duplicate_submission_metadata(session, rows),
     )
 
@@ -1207,6 +1216,10 @@ async def operations(
         limit=max(1, len(activity_rows)),
         requested_statuses=set(),
         query=None,
+        score_continuation_floor=await get_score_continuation_floor(session),
+        active_assignment_agent_ids={
+            assignment.agent.agent_id for assignment in assignments
+        },
         duplicate_metadata=await _duplicate_submission_metadata(session, activity_rows),
     )
     validator_snapshot = _validator_heartbeats_response(
@@ -1283,6 +1296,7 @@ async def agent_pipeline(
     running_attempt = next(
         (attempt for attempt in attempts if attempt.status == "running"), None
     )
+    score_continuation_floor = await get_score_continuation_floor(session)
     return PublicSubmissionPipeline(
         generated_at=now,
         agent_id=agent_id,
@@ -1291,16 +1305,22 @@ async def agent_pipeline(
             screening_policy_version=agent.screening_policy_version,
             has_active_attempt=running_attempt is not None,
             has_active_validation=bool(active_work),
+            has_live_assignment=any(
+                ticket.status == TicketStatus.ISSUED
+                and cast(datetime, _aware(ticket.deadline)) > now
+                for ticket in tickets
+            ),
             score_count=len(accepted_scores),
-            provisional_composite=(
-                statistics.mean(score.composite for score in accepted_scores)
+            highest_composite=(
+                max(score.composite for score in accepted_scores)
                 if accepted_scores
                 else None
             ),
+            score_continuation_floor=score_continuation_floor,
         ),
         score_count=len(accepted_scores),
         quorum=SCORING_QUORUM,
-        score_floor=FIRST_SCORE_CONTINUATION_FLOOR,
+        score_floor=score_continuation_floor or 0.0,
         provisional_scores=[
             PublicProvisionalScore(
                 composite=score.composite,
