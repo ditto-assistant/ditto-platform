@@ -1260,8 +1260,14 @@ class PublicScreenerProgress(BaseModel):
 
 
 class PublicScreenerHeartbeat(BaseModel):
-    """Latest public-safe report from one authenticated screener."""
+    """Latest public-safe report from one authenticated screener instance."""
 
+    instance_id: Annotated[
+        str,
+        Field(
+            description="Per-worker instance id (fleet shares one hotkey).",
+        ),
+    ]
     screener_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Screener's public hotkey.")
     ]

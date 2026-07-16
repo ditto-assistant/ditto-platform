@@ -4234,9 +4234,12 @@
         var protocol = singular === "screener"
           ? "Health " + entry.protocol_version + " · Policy " + entry.policy_version
           : "Protocol " + entry.protocol_version;
-        var displayName = singular === "validator" ? validatorNames[hotkey] : "";
+        // Validators are keyed by a distinct hotkey; the screener fleet shares
+        // one hotkey, so each worker is distinguished by its instance_id.
+        var displayName = singular === "validator" ? validatorNames[hotkey] : (entry.instance_id || "");
+        var nameNode = singular === "validator" ? entityAnchor(singular, hotkey, displayName) : esc(displayName);
         var identity = displayName
-          ? '<span class="fleet-node-identity"><span class="fleet-node-name" title="' + esc(displayName) + '">' + entityAnchor(singular, hotkey, displayName) + '</span><span class="fleet-node fleet-node-key copyable" title="' + esc(hotkey) + '"><span>' + entityAnchor(singular, hotkey, shortKey(hotkey)) + '</span>' + copyButton(hotkey, "validator hotkey") + '</span></span>'
+          ? '<span class="fleet-node-identity"><span class="fleet-node-name" title="' + esc(displayName) + '">' + nameNode + '</span><span class="fleet-node fleet-node-key copyable" title="' + esc(hotkey) + '"><span>' + entityAnchor(singular, hotkey, shortKey(hotkey)) + '</span>' + copyButton(hotkey, singular + " hotkey") + '</span></span>'
           : '<span class="fleet-node copyable" title="' + esc(hotkey) + '"><span>' + entityAnchor(singular, hotkey, shortKey(hotkey)) + '</span>' + copyButton(hotkey, singular + " hotkey") + '</span>';
         return '<tr tabindex="-1" data-entity-kind="' + singular + '" data-entity-id="' + esc(hotkey) + '">' +
           '<td><span class="fleet-node-wrap">' + identity + '</span></td>' +

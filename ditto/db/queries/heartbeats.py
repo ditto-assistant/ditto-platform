@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -332,6 +332,7 @@ async def upsert_screener_heartbeat(
     session: AsyncSession,
     *,
     screener_hotkey: str,
+    instance_id: str,
     software_version: str,
     protocol_version: int,
     policy_version: int,
@@ -343,10 +344,14 @@ async def upsert_screener_heartbeat(
     seen_at: datetime,
     signature: str,
 ) -> tuple[ScreenerHeartbeat, bool]:
-    """Persist only a strictly newer screener heartbeat."""
-    row = await session.get(ScreenerHeartbeat, screener_hotkey)
+    """Persist only a strictly newer heartbeat for one (hotkey, instance)."""
+    row = await session.get(ScreenerHeartbeat, (screener_hotkey, instance_id))
     if row is None:
-        row = ScreenerHeartbeat(screener_hotkey=screener_hotkey, first_seen_at=seen_at)
+        row = ScreenerHeartbeat(
+            screener_hotkey=screener_hotkey,
+            instance_id=instance_id,
+            first_seen_at=seen_at,
+        )
         session.add(row)
     else:
         existing_reported_at = row.reported_at
@@ -380,10 +385,29 @@ async def upsert_screener_heartbeat(
 async def list_screener_heartbeats(
     session: AsyncSession,
 ) -> list[ScreenerHeartbeat]:
-    """Return every reporting screener, newest heartbeat first."""
+    """Return every reporting screener instance, newest heartbeat first."""
     result = await session.scalars(
         select(ScreenerHeartbeat).order_by(
-            ScreenerHeartbeat.seen_at.desc(), ScreenerHeartbeat.screener_hotkey
+            ScreenerHeartbeat.seen_at.desc(),
+            ScreenerHeartbeat.screener_hotkey,
+            ScreenerHeartbeat.instance_id,
         )
     )
     return list(result)
+
+
+async def prune_stale_screener_heartbeats(
+    session: AsyncSession,
+    *,
+    before: datetime,
+) -> int:
+    """Delete heartbeat rows last seen before ``before``; returns the count.
+
+    Bounds the per-instance table: a scaled-in fleet instance (unique name)
+    stops reporting and would otherwise leave a permanent dead row.
+    """
+    result = await session.execute(
+        delete(ScreenerHeartbeat).where(ScreenerHeartbeat.seen_at < before),
+        execution_options={"synchronize_session": False},
+    )
+    return result.rowcount or 0

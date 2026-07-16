@@ -887,6 +887,7 @@ async def screeners(
                 )
         entries.append(
             PublicScreenerHeartbeat(
+                instance_id=row.instance_id,
                 screener_hotkey=row.screener_hotkey,
                 software_version=row.software_version,
                 protocol_version=row.protocol_version,

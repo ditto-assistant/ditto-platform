@@ -131,6 +131,7 @@ def _heartbeat_payload(
     state: str = "polling",
     active_agent_id: UUID | None = None,
     protocol_version: int = 1,
+    instance_id: str | None = None,
     progress: dict[str, object] | None = None,
     system_metrics: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -140,16 +141,23 @@ def _heartbeat_payload(
         if system_metrics is not None
         else None
     )
+    progress_token = (
+        f"{progress['stage']},{progress['started_at']}" if progress else "-"
+    )
     if protocol_version == 1:
         message = (
             "ditto-screener-heartbeat:v1:"
             f"{_SCREENER_HOTKEY}:0.4.2:1:{SCREENING_POLICY_VERSION}:{state}:"
             f"{active_agent_id or ''}:{system_metrics_signing_token(metrics)}:{ts}"
         ).encode()
+    elif protocol_version >= 3:
+        message = (
+            "ditto-screener-heartbeat:v3:"
+            f"{_SCREENER_HOTKEY}:0.4.2:{protocol_version}:"
+            f"{SCREENING_POLICY_VERSION}:{state}:{active_agent_id or ''}:{instance_id}:"
+            f"{progress_token}:{system_metrics_signing_token(metrics)}:{ts}"
+        ).encode()
     else:
-        progress_token = (
-            f"{progress['stage']},{progress['started_at']}" if progress else "-"
-        )
         message = (
             "ditto-screener-heartbeat:v2:"
             f"{_SCREENER_HOTKEY}:0.4.2:{protocol_version}:"
@@ -167,6 +175,8 @@ def _heartbeat_payload(
     }
     if active_agent_id is not None:
         payload["active_agent_id"] = str(active_agent_id)
+    if instance_id is not None:
+        payload["instance_id"] = instance_id
     if progress is not None:
         payload["progress"] = progress
     if system_metrics is not None:
@@ -543,7 +553,9 @@ class TestHeartbeat:
         )
         assert response.status_code == 200
         async with session_maker() as session, session.begin():
-            heartbeat = await session.get(ScreenerHeartbeat, _SCREENER_HOTKEY)
+            heartbeat = await session.get(
+                ScreenerHeartbeat, (_SCREENER_HOTKEY, "legacy")
+            )
             assert heartbeat is not None
             heartbeat.seen_at = datetime.now(UTC) - timedelta(minutes=10)
         entry = (await client.get("/api/v1/public/screeners")).json()["screeners"][0]
@@ -576,7 +588,7 @@ class TestHeartbeat:
         assert response.json()["accepted"] is True
 
         async with session_maker() as session:
-            stored = await session.get(ScreenerHeartbeat, _SCREENER_HOTKEY)
+            stored = await session.get(ScreenerHeartbeat, (_SCREENER_HOTKEY, "legacy"))
             assert stored is not None
             assert stored.first_seen_at is not None
             assert stored.system_metrics is not None
@@ -594,6 +606,48 @@ class TestHeartbeat:
         replay = await client.post("/api/v1/screener/heartbeat", json=payload)
         assert replay.status_code == 200
         assert replay.json()["accepted"] is False
+
+    async def test_v3_lists_each_fleet_instance_separately(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The shared-hotkey fleet no longer collapses into one /screeners row."""
+        _install_db(app, session_maker)
+        ts = int(datetime.now(UTC).timestamp())
+        for name in ("ditto-screener-prod", "ditto-screener-fleet-abcd"):
+            resp = await client.post(
+                "/api/v1/screener/heartbeat",
+                json=_heartbeat_payload(
+                    timestamp=ts, protocol_version=3, instance_id=name
+                ),
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["accepted"] is True
+
+        public = (await client.get("/api/v1/public/screeners")).json()
+        assert public["reported_count"] == 2
+        by_instance = {e["instance_id"]: e for e in public["screeners"]}
+        assert set(by_instance) == {
+            "ditto-screener-prod",
+            "ditto-screener-fleet-abcd",
+        }
+        assert all(
+            e["screener_hotkey"] == _SCREENER_HOTKEY for e in public["screeners"]
+        )
+
+    async def test_v3_requires_instance_id(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        payload = _heartbeat_payload(protocol_version=3, instance_id=None)
+        payload.pop("instance_id", None)
+        resp = await client.post("/api/v1/screener/heartbeat", json=payload)
+        assert resp.status_code == 422
 
     async def test_rejects_tampering_arbitrary_metrics_and_wrong_auth(
         self,

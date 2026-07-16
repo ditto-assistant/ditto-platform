@@ -65,7 +65,10 @@ from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.models import Agent, ScreeningAttempt, ScreeningQuarantine
 from ditto.db.queries.agents import get_agent_by_id
-from ditto.db.queries.heartbeats import upsert_screener_heartbeat
+from ditto.db.queries.heartbeats import (
+    prune_stale_screener_heartbeats,
+    upsert_screener_heartbeat,
+)
 from ditto.db.queries.screening import (
     claim_screening_attempts,
     get_screening_attempt,
@@ -90,6 +93,13 @@ _ARTIFACT_URL_TTL = timedelta(minutes=5)
 _SCREENING_LEASE_TTL = timedelta(minutes=45)
 _HEARTBEAT_MAX_SKEW_SECONDS = 300
 _HEARTBEAT_MAX_BYTES = 4096
+# instance_id stored for pre-v3 (no per-instance identity) heartbeats. Distinct
+# from any real GCE instance name, so upgraded workers never collide with it.
+_LEGACY_INSTANCE_ID = "legacy"
+# Drop heartbeat rows unseen this long so scaled-in fleet instances (each has a
+# unique name) don't accumulate dead rows. Far beyond the online/stale windows,
+# so a briefly-offline worker is never pruned out from under the dashboard.
+_HEARTBEAT_RETENTION = timedelta(days=1)
 _CLAIM_FALLBACK_LOCK = asyncio.Lock()
 
 # Policy v1 used the legacy three-field signature. Every policy from v2 onward
@@ -208,6 +218,17 @@ def _heartbeat_signing_message(payload: ScreenerHeartbeatRequest) -> bytes:
         if payload.progress is not None
         else "-"
     )
+    if payload.protocol_version >= 3:
+        # v3 signs the per-instance identity (the fleet shares one hotkey).
+        # instance_id is required for v3 (validated on the request model).
+        return (
+            "ditto-screener-heartbeat:v3:"
+            f"{payload.screener_hotkey}:{payload.software_version}:"
+            f"{payload.protocol_version}:{payload.policy_version}:{payload.state}:"
+            f"{payload.active_agent_id or ''}:{payload.instance_id}:"
+            f"{progress}:"
+            f"{system_metrics_signing_token(payload.system_metrics)}:{payload.timestamp}"
+        ).encode()
     return (
         "ditto-screener-heartbeat:v2:"
         f"{payload.screener_hotkey}:{payload.software_version}:"
@@ -266,10 +287,12 @@ async def heartbeat(
         raise ScreenerAuthError("heartbeat signature verification failed")
 
     reported_at = datetime.fromtimestamp(request_body.timestamp, tz=UTC)
+    instance_id = request_body.instance_id or _LEGACY_INSTANCE_ID
     async with session.begin():
         row, accepted = await upsert_screener_heartbeat(
             session,
             screener_hotkey=screener_hotkey,
+            instance_id=instance_id,
             software_version=request_body.software_version,
             protocol_version=request_body.protocol_version,
             policy_version=request_body.policy_version,
@@ -288,6 +311,11 @@ async def heartbeat(
             reported_at=reported_at,
             seen_at=now,
             signature=request_body.signature,
+        )
+        # Reap heartbeats from long-gone instances (scaled-in fleet workers)
+        # so the per-instance list stays bounded. Cheap indexed delete.
+        await prune_stale_screener_heartbeats(
+            session, before=now - _HEARTBEAT_RETENTION
         )
     seen_at = row.seen_at
     if seen_at.tzinfo is None:
