@@ -400,14 +400,13 @@ async def prune_stale_screener_heartbeats(
     session: AsyncSession,
     *,
     before: datetime,
-) -> int:
-    """Delete heartbeat rows last seen before ``before``; returns the count.
+) -> None:
+    """Delete heartbeat rows last seen before ``before``.
 
     Bounds the per-instance table: a scaled-in fleet instance (unique name)
     stops reporting and would otherwise leave a permanent dead row.
     """
-    result = await session.execute(
+    await session.execute(
         delete(ScreenerHeartbeat).where(ScreenerHeartbeat.seen_at < before),
         execution_options={"synchronize_session": False},
     )
-    return result.rowcount or 0
