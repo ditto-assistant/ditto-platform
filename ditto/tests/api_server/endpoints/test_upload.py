@@ -901,3 +901,61 @@ class TestUploadAgentChainOutageDuringVerify:
         response = await client.post("/api/v1/upload/agent", data=data, files=files)
 
         assert response.status_code == 503
+
+
+class TestUploadReleasesSessionDuringSlowWork:
+    async def test_no_transaction_held_across_tarball_read(
+        self, app: FastAPI, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The pooled session must hold NO transaction while the tarball streams.
+
+        The ban check autobegins a transaction; the endpoint must end it before
+        the slow middle (tarball read, payment verify, storage write,
+        fingerprinting), or concurrent slow uploads pin every pool slot
+        (the 2026-07-16 production outage).
+        """
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from ditto.api_server.dependencies import get_session
+        from ditto.api_server.endpoints import upload as upload_mod
+        from ditto.db.models import Base
+        from ditto.db.queries.bans import is_hotkey_banned as real_is_hotkey_banned
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        session_holder: dict[str, Any] = {}
+
+        async def _real_session():
+            async with maker() as s:
+                session_holder["session"] = s
+                yield s
+
+        app.dependency_overrides[get_session] = _real_session
+        # The autouse fixture stubs the ban check; restore the real query so the
+        # session autobegins exactly as in production.
+        monkeypatch.setattr(upload_mod, "is_hotkey_banned", real_is_hotkey_banned)
+
+        override_get_storage_client(app)
+        override_get_chain_client(app)
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        _override_payment_verifier(
+            app, verified=_make_verified_payment(miner_hotkey=kp.ss58_address)
+        )
+
+        real_read = upload_mod._read_tar_capped_with_sha
+        seen: dict[str, Any] = {}
+
+        async def _spy(file: Any, max_bytes: int):
+            seen["in_transaction"] = session_holder["session"].in_transaction()
+            return await real_read(file, max_bytes)
+
+        monkeypatch.setattr(upload_mod, "_read_tar_capped_with_sha", _spy)
+
+        data, files = _upload_agent_form(keypair=kp)
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 200, response.text
+        assert seen["in_transaction"] is False
+        await engine.dispose()

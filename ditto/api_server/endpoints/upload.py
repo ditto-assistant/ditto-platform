@@ -258,6 +258,18 @@ async def upload_agent(
     if await is_hotkey_banned(session, hotkey=hotkey):
         raise HTTPException(status_code=403, detail="hotkey is banned from submitting")
 
+    # The ban check autobegan a transaction on the pooled session. End it NOW:
+    # nothing until the atomic insert (step 8) touches the database, and holding
+    # a checked-out connection across the slow middle — streaming the tarball
+    # from a possibly-slow miner, chain payment verification, the storage write,
+    # and the CPU-bound fingerprint computes — starves the pool under concurrent
+    # uploads (the 2026-07-16 outage: idle-in-transaction sessions pinned every
+    # slot while requests queued 30s for a connection).
+    if session.in_transaction():
+        rollback_result = session.rollback()
+        if inspect.isawaitable(rollback_result):
+            await rollback_result
+
     # 3. Hotkey must be registered on this subnet. Chain outage surfaces
     # as 503; falling through would silently accept off-subnet hotkeys.
     try:
