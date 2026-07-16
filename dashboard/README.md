@@ -11,7 +11,10 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
   leaderboard, throughput, and latency metrics in one top-level panel.
 - **Leaderboard** — best eligible score per miner, ranked by composite, with
   composite / tool / memory bars; the leader is highlighted. Click a row for a
-  drill-down (tool-vs-memory split, first-seen, rank).
+  drill-down (tool-vs-memory split, first-seen, rank). Current SN118 registration
+  is reported separately: a deregistered hotkey's immutable score stays visible
+  but is marked inactive and excluded from weights and emissions until that same
+  hotkey registers again.
 - **Submission pipeline** — screening and validator-ticket history, including a
   compact accessible benchmark progress bar for each validator currently
   evaluating the submission. Accepted numeric scores appear immediately as

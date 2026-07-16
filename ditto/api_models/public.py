@@ -201,6 +201,30 @@ class PublicLeaderboardEntry(BaseModel):
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Miner's SS58 hotkey.")
     ]
+    registered: Annotated[
+        bool | None,
+        Field(
+            default=None,
+            description=(
+                "Whether the miner hotkey currently has a UID on this subnet. "
+                "False pauses weight and emission eligibility without deleting "
+                "the submission or score; null means the chain snapshot was "
+                "temporarily unavailable."
+            ),
+        ),
+    ]
+    emission_eligible: Annotated[
+        bool | None,
+        Field(
+            default=None,
+            description=(
+                "Whether this entry is finalized on the current benchmark, "
+                "full-benchmark eligible, and currently registered, so validators "
+                "may include it in the active weight fold. Null when registration "
+                "could not be read."
+            ),
+        ),
+    ]
     composite: Annotated[
         float, Field(ge=0.0, le=1.0, description="Best composite in [0,1].")
     ]
@@ -267,7 +291,9 @@ class PublicLeaderboardEntry(BaseModel):
             default=True,
             description=(
                 "Whether this run administered the full benchmark and is therefore "
-                "ranked + emission-eligible. False marks a provisional smoke/practice "
+                "score-rank eligible. Current weight and emission eligibility also "
+                "requires finalized=true and registered=true. False marks a "
+                "provisional smoke/practice "
                 "run (a smaller run-size profile that omits the hard memory "
                 "categories): it is shown for transparency but is not ranked and "
                 "never earns emissions. The rank field is only meaningful for "

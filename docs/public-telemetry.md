@@ -68,7 +68,8 @@ New router `endpoints/public.py`, mounted at `/api/v1/public`, **no auth**,
 rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
 
 - `GET /api/v1/public/leaderboard` → `{ generated_at, count, entries: [
-  { rank, agent_id, agent_name, miner_hotkey, composite, tool_mean, memory_mean, first_seen, n,
+  { rank, agent_id, agent_name, miner_hotkey, registered, emission_eligible,
+    composite, tool_mean, memory_mean, first_seen, n,
     median_ms, bench_version, dataset_sha256, models, per_category,
     integrity, tokens } ] }`.
   Best-per-miner, ranked by composite. The provenance block (`models` =
@@ -83,6 +84,13 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   `tokens` (LLM spend to generate+judge) publish the benchmark's **anti-overfit
   posture** so the community can audit *how gaming is resisted*, not just the
   scores.
+  `registered` is a live chain decoration, not platform ownership: `false`
+  preserves the immutable submission and score while excluding that hotkey from
+  active weights and emissions; `null` means the chain snapshot was unavailable.
+  The optional chain lookup has a one-second deadline and a bounded, short-lived
+  in-process snapshot cache, so Pylon latency or failure cannot fail the public
+  leaderboard. The dashboard presents `null` explicitly as unknown and requires
+  `emission_eligible: true` before showing leader or active-rank treatment.
   **Never** included: `seed` (anti-overfit), `per_case` `expected`/`called` (the
   answer key), agent_id/sha256/signature/validator_hotkey (integrity-internal).
   `is_champion`/weights stay validator-side (KOTH fold), not served here.

@@ -28,10 +28,13 @@ weights from wandb or the chain.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
 import statistics
+import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, cast
 from uuid import UUID
@@ -95,6 +98,7 @@ from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retir
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.validator import SessionDep
+from ditto.chain import ChainError
 from ditto.db.models import Agent, Score, ScreeningQuarantine, ValidatorTicket
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
@@ -135,6 +139,9 @@ router = APIRouter(prefix="/public", tags=["public"])
 # The ledger only moves when a sweep records a new best score, so a short shared
 # cache is safe and shields the DB from dashboard/CDN traffic.
 _CACHE_CONTROL = "public, max-age=30"
+_REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 1.0
+_REGISTRATION_CACHE_TTL_SECONDS = 15.0
+_REGISTRATION_FAILURE_CACHE_TTL_SECONDS = 5.0
 # Historical reproduction must fail closed: only benchmark epochs whose exact
 # generator release is known get a copyable command. Add a mapping deliberately
 # when a future epoch pins its generator; never point an old score at ``latest``.
@@ -155,6 +162,12 @@ _PUBLIC_ACTIVITY_STATUSES = frozenset(
         "live",
     }
 )
+
+
+@dataclass(frozen=True)
+class _RegistrationSnapshot:
+    expires_at: float
+    hotkeys: set[str] | None
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -453,6 +466,7 @@ def _public_entry(
     *,
     finalized: bool = True,
     score_count: int = SCORING_QUORUM,
+    registered: bool | None = None,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -478,6 +492,15 @@ def _public_entry(
         agent_name=agent_name,
         agent_version=agent_version,
         miner_hotkey=r.miner_hotkey,
+        registered=registered,
+        emission_eligible=(
+            finalized
+            and r.eligible
+            and registered
+            and bench_version == CURRENT_BENCH_VERSION
+            if registered is not None
+            else None
+        ),
         composite=r.composite,
         composite_stderr=_safe_stderr(details),
         calibration_brier=calibration_brier,
@@ -501,12 +524,14 @@ def _public_entry(
 
 @router.get("/leaderboard", response_model=PublicLeaderboardResponse)
 async def leaderboard(
+    request: Request,
     response: Response,
     session: SessionDep,
 ) -> PublicLeaderboardResponse:
-    """Best score per miner, with pre-quorum results marked provisional."""
+    """Best score per miner, with quorum and current registration eligibility."""
     response.headers["Cache-Control"] = _CACHE_CONTROL
     ledger_rows = await list_eligible_ledger(session)
+    registered_hotkeys = await _current_registered_hotkeys(request)
     score_counts = await get_score_counts(
         session, [row.agent_id for row in ledger_rows]
     )
@@ -560,6 +585,11 @@ async def leaderboard(
                 histories.get(row.miner_hotkey),
                 finalized=True,
                 score_count=score_counts.get(row.agent_id, SCORING_QUORUM),
+                registered=(
+                    row.miner_hotkey in registered_hotkeys
+                    if registered_hotkeys is not None
+                    else None
+                ),
             )
         )
     for row, count in provisional_rows:
@@ -571,6 +601,11 @@ async def leaderboard(
                 histories.get(row.miner_hotkey),
                 finalized=False,
                 score_count=count,
+                registered=(
+                    row.miner_hotkey in registered_hotkeys
+                    if registered_hotkeys is not None
+                    else None
+                ),
             )
         )
     return PublicLeaderboardResponse(
@@ -579,6 +614,39 @@ async def leaderboard(
         current_bench_version=CURRENT_BENCH_VERSION,
         entries=entries,
     )
+
+
+async def _current_registered_hotkeys(request: Request) -> set[str] | None:
+    """Current subnet hotkeys, or ``None`` when the chain read is unavailable.
+
+    Registration decorates the durable score ledger; it never deletes or changes
+    a submission. Public reads therefore degrade to an explicit unknown state
+    instead of failing or pretending a stale registration result is current.
+    """
+    chain = getattr(request.app.state, "chain", None)
+    config = getattr(request.app.state, "config", None)
+    if chain is None or config is None:
+        return None
+    now = time.monotonic()
+    cached = getattr(request.app.state, "public_registration_snapshot", None)
+    if isinstance(cached, _RegistrationSnapshot) and cached.expires_at > now:
+        return cached.hotkeys
+    try:
+        async with asyncio.timeout(_REGISTRATION_LOOKUP_TIMEOUT_SECONDS):
+            neurons = await chain.get_recent_neurons(config.chain.netuid)
+    except (ChainError, TimeoutError) as e:
+        logger.warning("public leaderboard registration read failed: %s", e)
+        request.app.state.public_registration_snapshot = _RegistrationSnapshot(
+            expires_at=now + _REGISTRATION_FAILURE_CACHE_TTL_SECONDS,
+            hotkeys=None,
+        )
+        return None
+    hotkeys = {neuron.hotkey for neuron in neurons}
+    request.app.state.public_registration_snapshot = _RegistrationSnapshot(
+        expires_at=now + _REGISTRATION_CACHE_TTL_SECONDS,
+        hotkeys=hotkeys,
+    )
+    return hotkeys
 
 
 @router.get("/health", response_model=PublicHealthResponse)
