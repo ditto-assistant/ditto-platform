@@ -50,15 +50,41 @@ def screening_score_count() -> ScalarSelect[int]:
     )
 
 
+def screening_last_served_at() -> ColumnElement[Any]:
+    """Return when current-policy screening last consumed a queue turn."""
+    latest_attempt = (
+        select(
+            func.max(
+                func.coalesce(
+                    ScreeningAttempt.finished_at,
+                    ScreeningAttempt.deadline,
+                    ScreeningAttempt.started_at,
+                )
+            )
+        )
+        .where(
+            ScreeningAttempt.agent_id == Agent.agent_id,
+            ScreeningAttempt.policy_version == SCREENING_POLICY_VERSION,
+        )
+        .correlate(Agent)
+        .scalar_subquery()
+    )
+    return func.coalesce(latest_attempt, Agent.created_at)
+
+
 def screening_priority_order() -> tuple[ColumnElement[Any], ...]:
-    """Prioritize likely finalists, then preserve least-scored fairness.
+    """Prioritize finalists while interleaving bounded screening retries.
 
     A policy bump can return the whole scored field to screening. Submissions
     already one score from quorum should not lose their chance to finalize
-    behind the rescreen backlog, so that completion lane drains by provisional
-    score. Everything else keeps the existing least-scored, oldest-first order.
+    behind the rescreen backlog. Within each lane, the least recently served
+    submission goes first: an expired lease moves an item behind the untouched
+    backlog, but it remains ahead of submissions arriving later. This prevents
+    either retries or fresh arrivals from monopolizing the worker while
+    preserving the existing score and age tie-breakers.
     """
     score_count = screening_score_count()
+    last_served_at = screening_last_served_at()
     provisional_composite = (
         select(func.avg(Score.composite))
         .where(Score.agent_id == Agent.agent_id)
@@ -77,6 +103,7 @@ def screening_priority_order() -> tuple[ColumnElement[Any], ...]:
         in_completion_lane.desc(),
         completion_lane_score.desc(),
         score_count.asc(),
+        last_served_at.asc(),
         Agent.created_at.asc(),
         Agent.agent_id.asc(),
     )

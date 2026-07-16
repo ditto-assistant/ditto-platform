@@ -1789,7 +1789,7 @@
         <div class="activity-filter-list" role="group" aria-label="Quick submission filters">
           <button class="activity-filter" type="button" data-activity-filter="all" aria-pressed="true">All <span class="activity-filter-count" data-activity-count="all">–</span></button>
           <button class="activity-filter" type="button" data-activity-filter="rejected" aria-pressed="false">Rejected <span class="activity-filter-count" data-activity-count="rejected">–</span></button>
-          <button class="activity-filter" type="button" data-activity-filter="under_review" aria-pressed="false">Under review <span class="activity-filter-count" data-activity-count="under_review">–</span></button>
+          <button class="activity-filter" type="button" data-activity-filter="under_review" aria-pressed="false">Operator review <span class="activity-filter-count" data-activity-count="under_review">–</span></button>
           <button class="activity-filter" type="button" data-activity-filter="waiting_validator" aria-pressed="false">Waiting for scores <span class="activity-filter-count" data-activity-count="waiting_validator">–</span></button>
           <button class="activity-filter" type="button" data-activity-filter="queued" aria-pressed="false">Queued work <span class="activity-filter-count" data-activity-count="queued">–</span></button>
         </div>
@@ -3304,7 +3304,7 @@
         below_score_floor: ["Below score floor", "warn"],
         scored: ["Scored", "good"],
         live: ["Live", "good"],
-        under_review: ["Under review", "warn"],
+        under_review: ["Operator review", "warn"],
         rejected: ["Rejected", "bad"]
       };
       return stages[status] || ["Pending", ""];
@@ -3369,6 +3369,7 @@
       }
       if (e.status === "waiting_screening") return "Queued for a screener to claim under the current policy.";
       if (e.status === "screening") return "A screener is currently checking this submission.";
+      if (e.status === "under_review") return "Automated processing is paused while an operator reviews this submission. No screener or validator is currently working on it.";
       if (e.status === "waiting_validator") {
         var waiting = Math.max(0, quorum - count - assignments);
         var assignmentCopy = assignments === 0
