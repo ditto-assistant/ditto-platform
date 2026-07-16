@@ -68,6 +68,7 @@ from ditto.api_models.system_health import (
     system_metrics_signing_token,
 )
 from ditto.api_models.upload import _SS58_PATTERN
+from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, stamp_bench_version
 from ditto.api_server.config import ValidatorCompatibilityConfig
 from ditto.api_server.dependencies import (
@@ -76,6 +77,7 @@ from ditto.api_server.dependencies import (
     get_storage_client,
 )
 from ditto.api_server.endpoints.retrieval import AgentNotFoundError
+from ditto.api_server.fingerprint import reference_corpus_provenance
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
@@ -949,6 +951,7 @@ async def submit_score(
                 decision = evaluate_duplicate_signals(
                     agent_id=agent_id,
                     miner_hotkey=agent.miner_hotkey,
+                    submitted_at=agent.created_at,
                     sha256=agent.sha256,
                     composite=median_composite,
                     size_bytes=agent.size_bytes,
@@ -959,6 +962,7 @@ async def submit_score(
                     eligible=eligible,
                 )
                 if decision.held:
+                    reference_provenance = reference_corpus_provenance()
                     agent.status = AgentStatus.ATH_PENDING_REVIEW
                     agent.duplicate_of = decision.duplicate_of
                     agent.review_reason = decision.reason
@@ -984,7 +988,16 @@ async def submit_score(
                             },
                             algorithm_provenance={
                                 "snapshot": "score-finalization",
-                                "reference_provenance": "legacy-current-main",
+                                "algorithm_version": ANTI_COPY_ALGORITHM_VERSION,
+                                "canonical_reference_revision": (
+                                    reference_provenance["revision"]
+                                ),
+                                "reference_corpus_id": reference_provenance[
+                                    "corpus_id"
+                                ],
+                                "reference_exclusion_mode": reference_provenance[
+                                    "exclusion_mode"
+                                ],
                                 "backfilled": False,
                                 "opened_at_source": "agent_finalized_audit",
                             },

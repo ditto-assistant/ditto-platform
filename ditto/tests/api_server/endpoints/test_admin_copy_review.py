@@ -17,11 +17,13 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_server.dependencies import get_session
-from ditto.db.models import Agent, AgentStatus, AthReview, Base
+from ditto.api_server.fingerprint import reference_corpus_provenance
+from ditto.db.models import Agent, AgentStatus, AthReview, Base, Score
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "X-Admin-Actor": "operator"}
 _T0 = datetime(2026, 7, 16, 12, tzinfo=UTC)
+_CORPUS_ID = reference_corpus_provenance()["corpus_id"]
 
 
 @pytest.fixture
@@ -106,6 +108,56 @@ async def _seed(
     return agent_id, original_id
 
 
+def _fingerprint(prefix: str, *, corpus: str = _CORPUS_ID) -> dict:
+    values = [f"{prefix}{i:015x}" for i in range(12)]
+    return {"v": 2, "corpus": corpus, "k": 256, "card": 12, "m": values}
+
+
+async def _add_finalized_scores(
+    maker: async_sessionmaker[AsyncSession], *, agent_ids: tuple[UUID, UUID]
+) -> None:
+    async with maker() as session, session.begin():
+        for agent_id in agent_ids:
+            for index, composite in enumerate((0.79, 0.80, 0.81)):
+                session.add(
+                    Score(
+                        agent_id=agent_id,
+                        validator_hotkey=f"validator-{index}",
+                        run_id=f"run-{index}",
+                        signature=None,
+                        seed=7,
+                        composite=composite,
+                        tool_mean=composite,
+                        memory_mean=composite,
+                        median_ms=100 + index,
+                        n=114,
+                        details={"bench_version": 2},
+                        generated_at=_T0 + timedelta(minutes=index),
+                    )
+                )
+
+
+async def _seed_current_comparison(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    reference_corpus: str = _CORPUS_ID,
+) -> tuple[UUID, UUID]:
+    agent_id, original_id = await _seed(maker)
+    async with maker() as session, session.begin():
+        candidate = await session.get(Agent, agent_id)
+        reference = await session.get(Agent, original_id)
+        assert candidate is not None and reference is not None
+        candidate.content_fingerprint = _fingerprint("c")
+        reference.content_fingerprint = _fingerprint("r", corpus=reference_corpus)
+        candidate.size_bytes = 500_001
+        reference.size_bytes = 500_000
+        # The endpoint must use AthReview.original_duplicate_of, not this mutable
+        # field, when it reconstructs current comparison evidence.
+        candidate.duplicate_of = None
+    await _add_finalized_scores(maker, agent_ids=(agent_id, original_id))
+    return agent_id, original_id
+
+
 async def test_list_is_bounded_oldest_first_and_private(
     app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
 ) -> None:
@@ -123,7 +175,7 @@ async def test_list_is_bounded_oldest_first_and_private(
     assert "sha256" not in serialized and '"m":' not in serialized
 
 
-async def test_detail_and_comparison_unavailable_until_corrected_adapter(
+async def test_current_comparison_is_unavailable_without_finalized_scores(
     app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
 ) -> None:
     agent_id, _ = await _seed(maker)
@@ -135,14 +187,62 @@ async def test_detail_and_comparison_unavailable_until_corrected_adapter(
     comparison = await client.get(
         f"/api/v1/admin/copy-reviews/{agent_id}/current-comparison", headers=_HEADERS
     )
-    assert comparison.status_code == 200
-    assert comparison.json() == {
-        "label": "current_comparison",
-        "availability": "unavailable",
-        "bulk_eligible": False,
-        "reason": "corrected reference-aware comparison is not deployed",
-        "algorithm_provenance": {"adapter": "unavailable", "reference_aware": False},
-    }
+    assert comparison.status_code == 409
+    assert "current comparison unavailable" in comparison.text
+
+
+async def test_current_comparison_returns_only_corrected_aggregate_wire(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id, _ = await _seed_current_comparison(maker)
+    _install(app, maker)
+    response = await client.get(
+        f"/api/v1/admin/copy-reviews/{agent_id}/current-comparison", headers=_HEADERS
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["availability"] == "available"
+    assert body["bulk_eligible"] is True
+    assert body["current_decision"] == "clear"
+    assert body["chronology_direction"] == "reference_earlier"
+    assert body["lexical"]["candidate_cardinality"] == 12
+    serialized = response.text.lower()
+    for forbidden in (
+        "sha256",
+        "normalized_source_hash",
+        "artifact",
+        "source_path",
+        '"m"',
+        "credential",
+    ):
+        assert forbidden not in serialized
+    async with maker() as session:
+        agent = await session.get(Agent, agent_id)
+        review = await session.scalar(
+            select(AthReview).where(AthReview.agent_id == agent_id)
+        )
+        assert agent is not None and review is not None
+        assert agent.status == AgentStatus.ATH_PENDING_REVIEW
+        assert agent.duplicate_of is None
+        assert review.algorithm_provenance == {
+            "reference_provenance": "legacy",
+            "backfilled": True,
+        }
+
+
+async def test_incompatible_current_comparison_is_never_bulk_eligible(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id, _ = await _seed_current_comparison(maker, reference_corpus="older-corpus")
+    _install(app, maker)
+    response = await client.get(
+        f"/api/v1/admin/copy-reviews/{agent_id}/current-comparison", headers=_HEADERS
+    )
+
+    assert response.status_code == 200
+    assert response.json()["current_decision"] == "inconclusive_review"
+    assert response.json()["bulk_eligible"] is False
 
 
 async def test_clear_is_durable_preserves_evidence_and_retries_idempotently(
