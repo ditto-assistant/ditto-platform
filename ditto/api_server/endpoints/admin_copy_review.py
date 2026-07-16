@@ -1,5 +1,7 @@
 """Durable admin review surface for ``ath_pending_review`` holds."""
 
+import asyncio
+from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Annotated, Literal, cast
 from uuid import UUID
@@ -9,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.admin_copy_review import (
+    AdminCopyReviewComparisonUnavailable,
     AdminCopyReviewCurrentComparison,
     AdminCopyReviewEvidence,
     AdminCopyReviewItem,
@@ -40,7 +43,12 @@ def _fingerprint_versions(evidence: dict) -> dict[str, int | str | None]:
 
 
 def _item(
-    review: AthReview, agent: Agent, matched: Agent | None = None
+    review: AthReview,
+    agent: Agent,
+    matched: Agent | None = None,
+    comparison: (
+        AdminCopyReviewCurrentComparison | AdminCopyReviewComparisonUnavailable | None
+    ) = None,
 ) -> AdminCopyReviewItem:
     provenance = review.algorithm_provenance
     return AdminCopyReviewItem(
@@ -71,6 +79,7 @@ def _item(
             duplicate_of_hotkey=matched.miner_hotkey if matched else None,
             duplicate_of_submitted_at=matched.created_at if matched else None,
         ),
+        current_comparison=comparison,
     )
 
 
@@ -87,6 +96,89 @@ async def _matched_agents(
         .all()
     )
     return {row.agent_id: row for row in rows}
+
+
+_UNAVAILABLE = "current comparison unavailable"
+
+
+async def _batch_comparisons(
+    session: AsyncSession,
+    rows: list[tuple[AthReview, Agent]],
+    matched: dict[UUID, Agent],
+) -> dict[
+    UUID, AdminCopyReviewCurrentComparison | AdminCopyReviewComparisonUnavailable
+]:
+    """Recompute the pair comparison for a whole page of reviews.
+
+    Consumers previously fanned out one ``/current-comparison`` request per
+    row (~4 queries each). This loads every involved agent's scores with ONE
+    ``IN`` query and runs the pure per-pair compares in a worker thread so
+    the event loop stays responsive. Rows the dedicated endpoint would 409
+    embed the same fail-closed unavailable state instead.
+    """
+    involved: set[UUID] = set()
+    for review, agent in rows:
+        if (
+            review.status == "pending"
+            and agent.status == AgentStatus.ATH_PENDING_REVIEW
+            and review.original_duplicate_of is not None
+            and review.original_duplicate_of in matched
+        ):
+            involved.add(agent.agent_id)
+            involved.add(review.original_duplicate_of)
+    scores_by_agent: defaultdict[UUID, list[Score]] = defaultdict(list)
+    if involved:
+        score_rows = (
+            (await session.execute(select(Score).where(Score.agent_id.in_(involved))))
+            .scalars()
+            .all()
+        )
+        for score in score_rows:
+            scores_by_agent[score.agent_id].append(score)
+
+    pairs: list[tuple[UUID, LedgerRow, LedgerRow]] = []
+    out: dict[
+        UUID, AdminCopyReviewCurrentComparison | AdminCopyReviewComparisonUnavailable
+    ] = {}
+    for review, agent in rows:
+        reference = (
+            matched.get(review.original_duplicate_of)
+            if review.original_duplicate_of
+            else None
+        )
+        if (
+            review.status != "pending"
+            or agent.status != AgentStatus.ATH_PENDING_REVIEW
+            or reference is None
+        ):
+            out[review.review_id] = AdminCopyReviewComparisonUnavailable(
+                reason=_UNAVAILABLE
+            )
+            continue
+        candidate = _canonical_ledger_row(
+            agent, scores_by_agent.get(agent.agent_id, [])
+        )
+        reference_row = _canonical_ledger_row(
+            reference, scores_by_agent.get(reference.agent_id, [])
+        )
+        if candidate is None or reference_row is None:
+            out[review.review_id] = AdminCopyReviewComparisonUnavailable(
+                reason=_UNAVAILABLE
+            )
+            continue
+        pairs.append((review.review_id, candidate, reference_row))
+
+    def _compute() -> dict[UUID, dict[str, object]]:
+        return {
+            review_id: compare_anti_copy_pair(
+                candidate=candidate, reference=reference_row
+            ).to_wire()
+            for review_id, candidate, reference_row in pairs
+        }
+
+    for review_id, wire in (await asyncio.to_thread(_compute)).items():
+        out[review_id] = AdminCopyReviewCurrentComparison.model_validate(wire)
+    return out
 
 
 async def _get_review(
@@ -145,6 +237,7 @@ async def list_copy_reviews(
     status: Literal["pending", "resolved", "all"] = "pending",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
+    include: Literal["current_comparison"] | None = None,
 ) -> AdminCopyReviewList:
     where = [] if status == "all" else [AthReview.status == status]
     count = await session.scalar(
@@ -160,11 +253,22 @@ async def list_copy_reviews(
             .offset(offset)
         )
     ).all()
-    matched = await _matched_agents(session, [review for review, _ in rows])
+    row_pairs = [(review, agent) for review, agent in rows]
+    matched = await _matched_agents(session, [review for review, _ in row_pairs])
+    comparisons: dict[
+        UUID, AdminCopyReviewCurrentComparison | AdminCopyReviewComparisonUnavailable
+    ] = {}
+    if include == "current_comparison":
+        comparisons = await _batch_comparisons(session, row_pairs, matched)
     return AdminCopyReviewList(
         items=[
-            _item(review, agent, matched.get(review.original_duplicate_of))
-            for review, agent in rows
+            _item(
+                review,
+                agent,
+                matched.get(review.original_duplicate_of),
+                comparison=comparisons.get(review.review_id),
+            )
+            for review, agent in row_pairs
         ],
         count=count or 0,
         limit=limit,
