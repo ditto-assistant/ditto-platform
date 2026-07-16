@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from statistics import median
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from sqlalchemy import ColumnElement, and_, func, null, or_, select
@@ -562,6 +562,7 @@ async def list_eligible_ledger(
         )
         .label("srn"),
     ).subquery()
+    sketch_columns: tuple[ColumnElement[Any], ...]
     if include_fingerprints:
         sketch_columns = (
             Agent.content_fingerprint.label("content_fingerprint"),
