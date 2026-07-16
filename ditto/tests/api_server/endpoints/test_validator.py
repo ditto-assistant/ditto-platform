@@ -163,6 +163,27 @@ def _job_payload(
     }
 
 
+def _artifact_headers(
+    agent_id: UUID,
+    keypair: bittensor.Keypair = _KEYPAIR,
+    *,
+    nonce: UUID | None = None,
+    requested_at: datetime | None = None,
+) -> dict[str, str]:
+    nonce = nonce or uuid4()
+    requested_at = requested_at or datetime.now(UTC)
+    requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
+    signed = (
+        f"validator-artifact:v1:{keypair.ss58_address}:{agent_id}:{nonce}:{requested}"
+    ).encode()
+    return {
+        "X-Validator-Hotkey": keypair.ss58_address,
+        "X-Validator-Artifact-Nonce": str(nonce),
+        "X-Validator-Artifact-Requested-At": requested_at.isoformat(),
+        "X-Validator-Artifact-Signature": keypair.sign(signed).hex(),
+    }
+
+
 def _heartbeat_payload(
     *,
     keypair: bittensor.Keypair = _KEYPAIR,
@@ -1335,7 +1356,8 @@ class TestArtifact:
         storage = _install_storage(app)
 
         response = await client.get(
-            f"/api/v1/validator/agent/{agent_id}/artifact", headers=_AUTH_HEADER
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
         )
         assert response.status_code == 200
         body = response.json()
@@ -1357,11 +1379,52 @@ class TestArtifact:
         _install_db(app, session_maker)
         _install_chain(app)
         _install_storage(app)
+        agent_id = uuid4()
         response = await client.get(
-            f"/api/v1/validator/agent/{uuid4()}/artifact", headers=_AUTH_HEADER
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
         )
         assert response.status_code == 404
         assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_FOUND
+
+    async def test_public_validator_identity_without_signature_is_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact", headers=_AUTH_HEADER
+        )
+
+        assert response.status_code == 401
+
+    async def test_replayed_artifact_proof_is_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        _install_storage(app)
+        headers = _artifact_headers(agent_id)
+
+        first = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact", headers=headers
+        )
+        replay = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact", headers=headers
+        )
+
+        assert first.status_code == 200
+        assert replay.status_code == 409
 
 
 # --- Submit score ----------------------------------------------------------
