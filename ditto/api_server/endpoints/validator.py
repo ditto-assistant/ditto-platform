@@ -817,7 +817,9 @@ async def submit_score(
     #    serializes concurrent scorers so the status guard + transition below
     #    can't be lost-updated.
     async with session.begin():
-        agent = await get_agent_by_id(session, agent_id=agent_id, for_update=True)
+        agent = await get_agent_by_id(
+            session, agent_id=agent_id, for_update=True, include_anticopy=True
+        )
         if agent is None:
             raise AgentNotFoundError(f"no agent with id={agent_id}")
         if agent.status not in _SCOREABLE_STATUSES:

@@ -88,8 +88,17 @@ class Agent(Base):
     """Uploaded tarball size in bytes. Nullable for rows written before the
     ledger migration; a cheap near-dup signal (a copy has a near-identical size)."""
 
+    # The four anti-copy sketch columns below hold multi-hundred-KB JSON blobs
+    # (k=256 minhash arrays, embedding vectors). They are deferred behind the
+    # "anticopy" group: the dominant DB cost in production was serializing them
+    # on every Agent read (leaderboard/ticket/screener paths that never look at
+    # them). Readers that DO need them — the scoring gate, the admin copy-review
+    # comparison, the fingerprint backfill — load with
+    # ``undefer_group("anticopy")`` / ``include_anticopy=True``; under the async
+    # session a forgotten undefer fails loudly (MissingGreenlet) rather than
+    # silently re-fetching.
     content_fingerprint: Mapped[dict | None] = mapped_column(
-        _JSON_VARIANT, nullable=True
+        _JSON_VARIANT, nullable=True, deferred=True, deferred_group="anticopy"
     )
     """Shingle MinHash sketch of the tarball source (see
     :mod:`ditto.api_server.fingerprint`). Feeds the anti-copy gate's content-level
@@ -100,7 +109,7 @@ class Agent(Base):
     content match")."""
 
     structural_fingerprint: Mapped[dict | None] = mapped_column(
-        _JSON_VARIANT, nullable=True
+        _JSON_VARIANT, nullable=True, deferred=True, deferred_group="anticopy"
     )
     """AST-level shingle MinHash sketch of the crate, same ``{v,k,card,m}`` shape as
     :attr:`content_fingerprint` (see the dittobench ``astfp`` package). Computed by
@@ -153,7 +162,9 @@ class Agent(Base):
     verifier need not trust the platform's block lookup: it recomputes the seed
     directly from this hash + the agent id. Null until job-ready / on fallback."""
 
-    code_embedding: Mapped[list | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    code_embedding: Mapped[list | None] = mapped_column(
+        _JSON_VARIANT, nullable=True, deferred=True, deferred_group="anticopy"
+    )
     """Unit-norm code-embedding vector (JSON float array) of the crate's canonical
     source, from the self-hosted the code-embedding signal embedding service (see
     :mod:`ditto.api_server.embedding`). The rename/refactor-robust anti-copy signal:
@@ -170,7 +181,7 @@ class Agent(Base):
     (a cross-model cosine is meaningless). Nullable alongside the vector."""
 
     prompt_fingerprint: Mapped[dict | None] = mapped_column(
-        _JSON_VARIANT, nullable=True
+        _JSON_VARIANT, nullable=True, deferred=True, deferred_group="anticopy"
     )
     """Word-shingle MinHash sketch of the crate's prompt-length string literals
     (see :func:`ditto.api_server.fingerprint.compute_prompt_fingerprint`), same

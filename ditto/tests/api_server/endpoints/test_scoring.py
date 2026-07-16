@@ -304,7 +304,7 @@ class TestScoringLiveness:
 
     @staticmethod
     def _break_db(monkeypatch: pytest.MonkeyPatch) -> None:
-        async def _boom(_session: object) -> list:
+        async def _boom(_session: object, **_kwargs: object) -> list:
             raise OperationalError("SELECT ...", {}, Exception("db down"))
 
         monkeypatch.setattr(scoring_mod, "list_eligible_ledger", _boom)

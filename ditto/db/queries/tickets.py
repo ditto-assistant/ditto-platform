@@ -71,7 +71,11 @@ async def get_score_continuation_floor(session: AsyncSession) -> float | None:
     eligibility, composite, age, and UUID rules used for emissions. Provisional
     rows remain visible in that ledger, so filter them before selecting fifth.
     """
-    eligible = [row for row in await list_eligible_ledger(session) if row.eligible]
+    eligible = [
+        row
+        for row in await list_eligible_ledger(session, include_fingerprints=False)
+        if row.eligible
+    ]
     if len(eligible) < EMISSION_CONTENDER_COUNT:
         return None
     return eligible[EMISSION_CONTENDER_COUNT - 1].composite

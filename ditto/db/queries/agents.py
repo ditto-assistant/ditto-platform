@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
+from sqlalchemy.orm import undefer_group
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
@@ -185,6 +186,7 @@ async def get_agent_by_id(
     *,
     agent_id: UUID,
     for_update: bool = False,
+    include_anticopy: bool = False,
 ) -> Agent | None:
     """Return the ``agents`` row for the given id, or ``None``.
 
@@ -192,9 +194,15 @@ async def get_agent_by_id(
     read-then-conditional-write transition (screener promotion, score finalize)
     serializes against a concurrent writer instead of last-writer-wins. The lock
     is a no-op on the SQLite unit-test fallback and a real row lock on Postgres.
+
+    ``include_anticopy=True`` also loads the deferred anti-copy sketch columns
+    (fingerprints + code embedding); only the scoring-gate path reads them.
     """
     return await session.get(
-        Agent, agent_id, with_for_update=True if for_update else None
+        Agent,
+        agent_id,
+        with_for_update=True if for_update else None,
+        options=[undefer_group("anticopy")] if include_anticopy else None,
     )
 
 

@@ -559,7 +559,7 @@ async def leaderboard(
 ) -> PublicLeaderboardResponse:
     """Best score per miner, with quorum and current registration eligibility."""
     response.headers["Cache-Control"] = _CACHE_CONTROL
-    ledger_rows = await list_eligible_ledger(session)
+    ledger_rows = await list_eligible_ledger(session, include_fingerprints=False)
     registered_hotkeys = await _current_registered_hotkeys(request)
     score_counts = await get_score_counts(
         session, [row.agent_id for row in ledger_rows]

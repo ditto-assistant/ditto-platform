@@ -21,6 +21,7 @@ import sys
 from typing import Protocol
 
 from sqlalchemy import select
+from sqlalchemy.orm import undefer_group
 
 from ditto.api_server.endpoints.upload import DEFAULT_MAX_TARBALL_SIZE_BYTES
 from ditto.api_server.fingerprint import (
@@ -83,7 +84,13 @@ async def _run(*, apply: bool, limit: int | None, batch_size: int) -> int:
             last_agent_id = None
             stop = False
             while not stop:
-                statement = select(Agent).order_by(Agent.agent_id).limit(batch_size)
+                statement = (
+                    select(Agent)
+                    # This script reads + rewrites the deferred sketch columns.
+                    .options(undefer_group("anticopy"))
+                    .order_by(Agent.agent_id)
+                    .limit(batch_size)
+                )
                 if last_agent_id is not None:
                     statement = statement.where(Agent.agent_id > last_agent_id)
                 agents = (await session.scalars(statement)).all()

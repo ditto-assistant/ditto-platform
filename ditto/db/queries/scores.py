@@ -15,10 +15,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from statistics import median
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, and_, func, or_, select
+from sqlalchemy import ColumnElement, and_, func, null, or_, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
@@ -485,8 +485,17 @@ async def list_miner_composite_history(
     return {hotkey: series[-limit_per:] for hotkey, series in out.items()}
 
 
-async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
+async def list_eligible_ledger(
+    session: AsyncSession, *, include_fingerprints: bool = True
+) -> list[LedgerRow]:
     """Return the best eligible score per miner, highest composite first.
+
+    ``include_fingerprints=False`` selects NULL for the anti-copy sketch
+    columns (fingerprints + code embedding, several hundred KB per row) —
+    the right call for every consumer except the scoring gate, which is the
+    only reader that compares them. The public leaderboard, validator ledger
+    read, and ticket-eligibility paths were paying that serialization cost on
+    every poll for data they never used.
 
     The persistent ledger the validator folds into KOTH+ATH weights (via
     ``GET /scoring/scores``). "Eligible" = agents in ``scored`` — this excludes
@@ -553,17 +562,29 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         )
         .label("srn"),
     ).subquery()
+    sketch_columns: tuple[ColumnElement[Any], ...]
+    if include_fingerprints:
+        sketch_columns = (
+            Agent.content_fingerprint.label("content_fingerprint"),
+            Agent.structural_fingerprint.label("structural_fingerprint"),
+            Agent.prompt_fingerprint.label("prompt_fingerprint"),
+            Agent.code_embedding.label("code_embedding"),
+        )
+    else:
+        sketch_columns = (
+            null().label("content_fingerprint"),
+            null().label("structural_fingerprint"),
+            null().label("prompt_fingerprint"),
+            null().label("code_embedding"),
+        )
     per_agent = (
         select(
             Agent.agent_id.label("agent_id"),
             Agent.miner_hotkey.label("miner_hotkey"),
             Agent.sha256.label("sha256"),
             Agent.size_bytes.label("size_bytes"),
-            Agent.content_fingerprint.label("content_fingerprint"),
-            Agent.structural_fingerprint.label("structural_fingerprint"),
+            *sketch_columns,
             Agent.normalized_source_hash.label("normalized_source_hash"),
-            Agent.prompt_fingerprint.label("prompt_fingerprint"),
-            Agent.code_embedding.label("code_embedding"),
             Agent.code_embed_model.label("code_embed_model"),
             Agent.created_at.label("first_seen"),
             Agent.status.label("status"),

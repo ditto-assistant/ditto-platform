@@ -9,6 +9,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Load, undefer_group
 
 from ditto.api_models.admin_copy_review import (
     AdminCopyReviewComparisonUnavailable,
@@ -84,17 +85,20 @@ def _item(
 
 
 async def _matched_agents(
-    session: AsyncSession, reviews: list[AthReview]
+    session: AsyncSession, reviews: list[AthReview], *, with_anticopy: bool = False
 ) -> dict[UUID, Agent]:
-    """Batch-load the originally matched agents for a page of reviews."""
+    """Batch-load the originally matched agents for a page of reviews.
+
+    ``with_anticopy=True`` also loads the deferred sketch columns — needed
+    only when the matched agents serve as comparison references.
+    """
     ids = {r.original_duplicate_of for r in reviews if r.original_duplicate_of}
     if not ids:
         return {}
-    rows = (
-        (await session.execute(select(Agent).where(Agent.agent_id.in_(ids))))
-        .scalars()
-        .all()
-    )
+    stmt = select(Agent).where(Agent.agent_id.in_(ids))
+    if with_anticopy:
+        stmt = stmt.options(undefer_group("anticopy"))
+    rows = (await session.execute(stmt)).scalars().all()
     return {row.agent_id: row for row in rows}
 
 
@@ -182,13 +186,21 @@ async def _batch_comparisons(
 
 
 async def _get_review(
-    session: AsyncSession, agent_id: UUID, *, lock: bool = False
+    session: AsyncSession,
+    agent_id: UUID,
+    *,
+    lock: bool = False,
+    with_anticopy: bool = False,
 ) -> tuple[AthReview, Agent] | None:
+    """``with_anticopy=True`` also loads the agent's deferred sketch columns —
+    needed only when the row feeds a pair comparison."""
     stmt = (
         select(AthReview, Agent)
         .join(Agent, Agent.agent_id == AthReview.agent_id)
         .where(AthReview.agent_id == agent_id)
     )
+    if with_anticopy:
+        stmt = stmt.options(Load(Agent).undefer_group("anticopy"))
     if lock:
         stmt = stmt.with_for_update()
     row = (await session.execute(stmt)).one_or_none()
@@ -243,22 +255,28 @@ async def list_copy_reviews(
     count = await session.scalar(
         select(func.count()).select_from(AthReview).where(*where)
     )
-    rows = (
-        await session.execute(
-            select(AthReview, Agent)
-            .join(Agent, Agent.agent_id == AthReview.agent_id)
-            .where(*where)
-            .order_by(AthReview.opened_at.asc(), AthReview.review_id.asc())
-            .limit(limit)
-            .offset(offset)
-        )
-    ).all()
+    with_comparisons = include == "current_comparison"
+    stmt = (
+        select(AthReview, Agent)
+        .join(Agent, Agent.agent_id == AthReview.agent_id)
+        .where(*where)
+        .order_by(AthReview.opened_at.asc(), AthReview.review_id.asc())
+        .limit(limit)
+        .offset(offset)
+    )
+    if with_comparisons:
+        stmt = stmt.options(Load(Agent).undefer_group("anticopy"))
+    rows = (await session.execute(stmt)).all()
     row_pairs = [(review, agent) for review, agent in rows]
-    matched = await _matched_agents(session, [review for review, _ in row_pairs])
+    matched = await _matched_agents(
+        session,
+        [review for review, _ in row_pairs],
+        with_anticopy=with_comparisons,
+    )
     comparisons: dict[
         UUID, AdminCopyReviewCurrentComparison | AdminCopyReviewComparisonUnavailable
     ] = {}
-    if include == "current_comparison":
+    if with_comparisons:
         comparisons = await _batch_comparisons(session, row_pairs, matched)
     return AdminCopyReviewList(
         items=[
@@ -299,7 +317,7 @@ async def get_copy_review(
 async def get_copy_review_current_comparison(
     agent_id: UUID, _admin: AdminDep, session: SessionDep
 ) -> dict[str, object]:
-    row = await _get_review(session, agent_id)
+    row = await _get_review(session, agent_id, with_anticopy=True)
     if row is None:
         raise HTTPException(status_code=404, detail="copy review not found")
     review, candidate_agent = row
@@ -309,7 +327,9 @@ async def get_copy_review_current_comparison(
         or review.original_duplicate_of is None
     ):
         raise HTTPException(status_code=409, detail="current comparison unavailable")
-    reference_agent = await session.get(Agent, review.original_duplicate_of)
+    reference_agent = await session.get(
+        Agent, review.original_duplicate_of, options=[undefer_group("anticopy")]
+    )
     if reference_agent is None:
         raise HTTPException(status_code=409, detail="current comparison unavailable")
     candidate_scores = await list_scores_for_agent(
