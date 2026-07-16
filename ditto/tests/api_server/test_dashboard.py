@@ -196,6 +196,8 @@ class TestDashboard:
             "Derived from an on-chain block hash after submission commitment." in body
         )
         assert "random fallback after submission commitment" in body
+        assert "per-submission dataset pinning was not enabled" in body
+        assert "before per-submission dataset pinning was enabled" in body
         assert "already-submitted artifact" in body
         assert "validator is assigned; its score is pending" in body
         assert "Score pending" in body

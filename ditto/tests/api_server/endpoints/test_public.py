@@ -1719,6 +1719,36 @@ class TestPublicActivity:
 
         assert body["provisional_scores"][0]["seed_source"] == "random_fallback"
 
+    async def test_pipeline_labels_validator_local_seed_without_pinned_dataset(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """No pinned dataset at all (generation disabled when screened)."""
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.52],
+            status=AgentStatus.EVALUATING,
+            dataset_seed=None,
+            dataset_sha256=None,
+            dataset_run_size=None,
+            dataset_seed_block=None,
+            dataset_seed_block_hash=None,
+            details={"bench_version": 2},
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")).json()
+
+        score = body["provisional_scores"][0]
+        assert score["seed_source"] == "validator_local"
+        assert score["run_size"] is None
+        assert score["dataset_sha256"] is None
+        assert score["reproduction_command"] is None
+        assert score["verification_command"] is None
+
     async def test_pipeline_keeps_accepted_score_visible_during_retry(
         self,
         app: FastAPI,

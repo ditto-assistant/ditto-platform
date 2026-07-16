@@ -883,10 +883,11 @@ class PublicProvisionalScore(BaseModel):
     seed_source: Annotated[
         str,
         Field(
-            pattern=r"^(on_chain|random_fallback)$",
+            pattern=r"^(on_chain|random_fallback|validator_local)$",
             description=(
-                "Whether the post-commit seed was derived from an on-chain block "
-                "or an unpredictable fallback."
+                "Whether the post-commit seed was derived from an on-chain block, "
+                "an unpredictable platform fallback, or chosen by the scoring "
+                "validator because no per-submission dataset was pinned."
             ),
         ),
     ]

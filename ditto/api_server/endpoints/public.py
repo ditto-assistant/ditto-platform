@@ -1501,7 +1501,12 @@ async def agent_pipeline(
                 bench_version=_score_bench_version(score),
                 datagen_version=_datagen_version(_score_bench_version(score)),
                 seed_source=(
-                    "on_chain"
+                    # No pinned dataset (generation disabled when this agent was
+                    # screened): the platform never derived a seed, so the one on
+                    # the score is the validator's own benchmark seed.
+                    "validator_local"
+                    if agent.dataset_seed is None
+                    else "on_chain"
                     if agent.dataset_seed_block is not None
                     and agent.dataset_seed_block_hash is not None
                     else "random_fallback"
