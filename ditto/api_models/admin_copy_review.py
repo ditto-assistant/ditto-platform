@@ -97,6 +97,46 @@ class AdminCopyReviewList(BaseModel):
     offset: int
 
 
+class AdminSourceDiffFile(BaseModel):
+    path: str
+    status: Literal["added", "removed", "modified", "identical"]
+    candidate_lines: int
+    reference_lines: int
+    added_lines: int
+    removed_lines: int
+    similarity: float
+    # Identical after comments/whitespace are canonicalized — a reformatted or
+    # re-commented copy of the same code even when the raw text differs.
+    normalized_identical: bool
+
+
+class AdminSourceDiffManifest(BaseModel):
+    agent_id: UUID
+    reference_agent_id: UUID
+    candidate_sha256: str
+    reference_sha256: str
+    files: list[AdminSourceDiffFile]
+    file_count: int
+    identical_count: int
+    modified_count: int
+    added_count: int
+    removed_count: int
+    # True when more files exist than the manifest bound returns; file_count
+    # still reflects the real total so the omission is never silent.
+    truncated: bool
+
+
+class AdminSourceDiffFileDetail(BaseModel):
+    agent_id: UUID
+    reference_agent_id: UUID
+    path: str
+    candidate_present: bool
+    reference_present: bool
+    identical: bool
+    diff_lines: list[str]
+    truncated: bool
+
+
 class AdminCopyReviewResolveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # release/ban remain accepted for Backroom #20 wire compatibility.

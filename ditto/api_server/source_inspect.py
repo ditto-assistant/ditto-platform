@@ -149,6 +149,49 @@ class TarSourceInspector:
             "truncated": len(ordered) > len(rows),
         }
 
+    def read_all_text(
+        self, *, max_files: int = MAX_LISTING_FILES, max_total_bytes: int | None = None
+    ) -> dict[str, str]:
+        """Extract every UTF-8 text member's full content in ONE pass.
+
+        Feeds pair diffing, which needs whole-file bodies for both artifacts at
+        once; doing that with per-file :meth:`read` calls would reopen the gzip
+        stream once per file. The result is bounded: at most ``max_files``
+        members (smallest first, so a hostile archive of many tiny files can't
+        crowd out the real sources) and, when set, ``max_total_bytes`` of
+        cumulative decoded text. Members past either bound are simply omitted —
+        the diff manifest reports the archive's true ``file_count`` separately
+        so the omission is visible, never silent.
+        """
+        budget = TEXT_SIZE_LIMIT if max_total_bytes is None else max_total_bytes
+        wanted = {
+            member.archive_name: member
+            for member in sorted(
+                (m for m in self._members.values() if m.is_text),
+                key=lambda item: (item.size, item.name),
+            )[:max_files]
+        }
+        out: dict[str, str] = {}
+        if not wanted:
+            return out
+        total = 0
+        with tarfile.open(fileobj=io.BytesIO(self._tar_bytes), mode="r|gz") as archive:
+            for member in archive:
+                info = wanted.get(member.name)
+                if info is None:
+                    continue
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    continue
+                text = extracted.read(TEXT_SIZE_LIMIT + 1).decode("utf-8")
+                if total + len(text) > budget:
+                    continue
+                total += len(text)
+                out[info.name] = text
+                if len(out) == len(wanted):
+                    break
+        return out
+
     def read(self, path: str, start_line: int, end_line: int) -> dict[str, object]:
         """Read a bounded line range from one UTF-8 text member."""
         normalized = path.removeprefix("./")

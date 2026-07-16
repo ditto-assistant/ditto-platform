@@ -1,6 +1,8 @@
 """Durable admin review surface for ``ath_pending_review`` holds."""
 
 import asyncio
+import hashlib
+import logging
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Annotated, Literal, cast
@@ -19,10 +21,22 @@ from ditto.api_models.admin_copy_review import (
     AdminCopyReviewList,
     AdminCopyReviewResolveRequest,
     AdminCopyReviewResolveResponse,
+    AdminSourceDiffFileDetail,
+    AdminSourceDiffManifest,
 )
 from ditto.api_server.anti_copy_comparison import compare_anti_copy_pair
-from ditto.api_server.dependencies import get_session
+from ditto.api_server.dependencies import get_session, get_storage_client
 from ditto.api_server.endpoints.admin_quarantine import require_admin
+from ditto.api_server.source_diff import (
+    build_source_diff_manifest,
+    unified_diff_for_file,
+)
+from ditto.api_server.source_inspect import (
+    MAX_TARBALL_BYTES,
+    SourceInspectError,
+    TarSourceInspector,
+)
+from ditto.api_server.storage import ObjectDownloadFailedError, S3StorageClient
 from ditto.db.models import Agent, AgentStatus, AthReview, Score
 from ditto.db.queries.scores import (
     MIN_ELIGIBLE_CASES,
@@ -30,8 +44,10 @@ from ditto.db.queries.scores import (
     list_scores_for_agent,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
 AdminDep = Annotated[None, Depends(require_admin)]
 
 
@@ -404,4 +420,138 @@ async def resolve_copy_review(
         review=_item(review, agent, matched),
         agent_status=agent.status.value,
         idempotent=False,
+    )
+
+
+async def _open_inspector(agent: Agent, storage: S3StorageClient) -> TarSourceInspector:
+    """Fetch one agent's stored tarball, verify its digest, open a bounded reader."""
+    try:
+        tar_bytes = await storage.get_object(
+            key=f"{agent.agent_id}/agent.tar.gz", max_bytes=MAX_TARBALL_BYTES
+        )
+    except ObjectDownloadFailedError as error:
+        raise HTTPException(
+            status_code=502, detail="artifact is unavailable in storage"
+        ) from error
+
+    def _verify_and_open() -> TarSourceInspector:
+        if hashlib.sha256(tar_bytes).hexdigest() != agent.sha256:
+            raise HTTPException(
+                status_code=502, detail="stored artifact does not match its digest"
+            )
+        return TarSourceInspector(tar_bytes)
+
+    try:
+        return await asyncio.to_thread(_verify_and_open)
+    except SourceInspectError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+async def _diff_pair(
+    agent_id: UUID, session: AsyncSession, storage: S3StorageClient
+) -> tuple[Agent, Agent, dict[str, str], dict[str, str]]:
+    """Load the held agent, its matched reference, and both text-file maps.
+
+    Both tarballs are fetched, digest-verified, and read in one pass each; the
+    per-file text maps feed either the manifest or a single-file unified diff.
+    """
+    row = await _get_review(session, agent_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="copy review not found")
+    review, candidate_agent = row
+    if review.original_duplicate_of is None:
+        raise HTTPException(
+            status_code=409, detail="review has no matched reference to diff against"
+        )
+    reference_agent = await session.get(Agent, review.original_duplicate_of)
+    if reference_agent is None:
+        raise HTTPException(
+            status_code=409, detail="matched reference agent no longer exists"
+        )
+    candidate_inspector = await _open_inspector(candidate_agent, storage)
+    reference_inspector = await _open_inspector(reference_agent, storage)
+    candidate_text, reference_text = await asyncio.gather(
+        asyncio.to_thread(candidate_inspector.read_all_text),
+        asyncio.to_thread(reference_inspector.read_all_text),
+    )
+    return candidate_agent, reference_agent, candidate_text, reference_text
+
+
+@router.get(
+    "/copy-reviews/{agent_id}/source-diff",
+    response_model=AdminSourceDiffManifest,
+)
+async def get_copy_review_source_diff(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+    storage: StorageDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminSourceDiffManifest:
+    """Per-file diff manifest between a held agent and the agent it copied.
+
+    Classifies every path as added / removed / modified / identical with change
+    stats so an operator can see at a glance which files were copied verbatim
+    and which were altered. Unified-diff bodies come from the per-file endpoint.
+    """
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    candidate, reference, candidate_text, reference_text = await _diff_pair(
+        agent_id, session, storage
+    )
+    manifest = await asyncio.to_thread(
+        build_source_diff_manifest, candidate_text, reference_text
+    )
+    logger.info(
+        "admin_actor=%s viewed copy-review source diff agent_id=%s reference_id=%s",
+        x_admin_actor,
+        agent_id,
+        reference.agent_id,
+    )
+    return AdminSourceDiffManifest(
+        agent_id=agent_id,
+        reference_agent_id=reference.agent_id,
+        candidate_sha256=candidate.sha256,
+        reference_sha256=reference.sha256,
+        **manifest,  # type: ignore[arg-type]
+    )
+
+
+@router.get(
+    "/copy-reviews/{agent_id}/source-diff/file",
+    response_model=AdminSourceDiffFileDetail,
+)
+async def get_copy_review_source_diff_file(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+    storage: StorageDep,
+    path: Annotated[str, Query(min_length=1, max_length=240)],
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminSourceDiffFileDetail:
+    """Bounded unified diff (reference -> candidate) for one file in the pair."""
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    normalized = path.removeprefix("./")
+    candidate, reference, candidate_text, reference_text = await _diff_pair(
+        agent_id, session, storage
+    )
+    try:
+        detail = await asyncio.to_thread(
+            unified_diff_for_file, normalized, candidate_text, reference_text
+        )
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404, detail=f"no file at {normalized!r} in either artifact"
+        ) from error
+    logger.info(
+        "admin_actor=%s viewed copy-review file diff agent_id=%s path=%s",
+        x_admin_actor,
+        agent_id,
+        normalized,
+    )
+    return AdminSourceDiffFileDetail(
+        agent_id=agent_id,
+        reference_agent_id=reference.agent_id,
+        **detail,  # type: ignore[arg-type]
     )

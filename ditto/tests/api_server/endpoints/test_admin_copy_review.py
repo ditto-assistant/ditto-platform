@@ -1,8 +1,13 @@
 """Durable ATH copy-review API regression coverage."""
 
+import gzip
+import hashlib
+import io
+import tarfile
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import httpx
@@ -16,8 +21,9 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from ditto.api_server.dependencies import get_session
+from ditto.api_server.dependencies import get_session, get_storage_client
 from ditto.api_server.fingerprint import reference_corpus_provenance
+from ditto.api_server.storage import ObjectDownloadFailedError
 from ditto.db.models import Agent, AgentStatus, AthReview, Base, Score
 
 _TOKEN = "test-admin-token-at-least-32-characters"
@@ -415,3 +421,188 @@ async def test_changed_hold_reason_fails_closed(
         headers=_HEADERS,
     )
     assert response.status_code == 409
+
+
+def _tarball(files: dict[str, str]) -> bytes:
+    """Build a gzip tarball of ``path -> text`` files, like an agent artifact."""
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as archive:
+        for path, text in files.items():
+            data = text.encode("utf-8")
+            info = tarfile.TarInfo(name=path)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return gzip.compress(raw.getvalue())
+
+
+async def _seed_diff_pair(
+    maker: async_sessionmaker[AsyncSession],
+    candidate_files: dict[str, str],
+    reference_files: dict[str, str],
+) -> tuple[UUID, UUID, dict[str, bytes]]:
+    """Seed a held/reference pair whose sha256 match real tarball bytes.
+
+    Returns the ids plus the ``key -> tar bytes`` map the storage stub serves.
+    """
+    candidate_tar = _tarball(candidate_files)
+    reference_tar = _tarball(reference_files)
+    reference_id, candidate_id, review_id = uuid4(), uuid4(), uuid4()
+    objects = {
+        f"{candidate_id}/agent.tar.gz": candidate_tar,
+        f"{reference_id}/agent.tar.gz": reference_tar,
+    }
+    async with maker() as session, session.begin():
+        session.add_all(
+            [
+                Agent(
+                    agent_id=reference_id,
+                    miner_hotkey="5Original",
+                    name="original",
+                    sha256=hashlib.sha256(reference_tar).hexdigest(),
+                    status=AgentStatus.SCORED,
+                    created_at=_T0 - timedelta(hours=1),
+                ),
+                Agent(
+                    agent_id=candidate_id,
+                    miner_hotkey="5Held",
+                    name="held",
+                    sha256=hashlib.sha256(candidate_tar).hexdigest(),
+                    status=AgentStatus.ATH_PENDING_REVIEW,
+                    duplicate_of=reference_id,
+                    review_reason="near-copy signal",
+                    screening_policy_version=8,
+                    created_at=_T0,
+                ),
+                AthReview(
+                    review_id=review_id,
+                    agent_id=candidate_id,
+                    status="pending",
+                    opened_at=_T0,
+                    original_duplicate_of=reference_id,
+                    original_reason="near-copy signal",
+                    original_policy_version=8,
+                    original_evidence={},
+                    algorithm_provenance={},
+                ),
+            ]
+        )
+    return candidate_id, reference_id, objects
+
+
+def _install_storage(app: FastAPI, objects: dict[str, bytes]) -> None:
+    storage = MagicMock()
+
+    async def _get_object(*, key: str, max_bytes: int) -> bytes:
+        del max_bytes
+        if key not in objects:
+            raise ObjectDownloadFailedError(key)
+        return objects[key]
+
+    storage.get_object = AsyncMock(side_effect=_get_object)
+
+    async def _fake_storage() -> MagicMock:
+        return storage
+
+    app.dependency_overrides[get_storage_client] = _fake_storage
+
+
+async def test_source_diff_manifest_classifies_files(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    candidate_id, reference_id, objects = await _seed_diff_pair(
+        maker,
+        candidate_files={
+            "src/main.rs": "fn main() {}\n",
+            "src/util.rs": "fn util() -> i32 { 1 }\n",
+            "src/new.rs": "fn extra() {}\n",
+        },
+        reference_files={
+            "src/main.rs": "fn main() {}\n",
+            "src/util.rs": "fn util() -> i32 { 2 }\n",
+            "src/gone.rs": "fn gone() {}\n",
+        },
+    )
+    _install(app, maker)
+    _install_storage(app, objects)
+    response = await client.get(
+        f"/api/v1/admin/copy-reviews/{candidate_id}/source-diff", headers=_HEADERS
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reference_agent_id"] == str(reference_id)
+    assert (body["identical_count"], body["modified_count"]) == (1, 1)
+    assert (body["added_count"], body["removed_count"]) == (1, 1)
+    by_path = {entry["path"]: entry for entry in body["files"]}
+    assert by_path["src/main.rs"]["status"] == "identical"
+    assert by_path["src/util.rs"]["status"] == "modified"
+    assert by_path["src/new.rs"]["status"] == "added"
+    assert by_path["src/gone.rs"]["status"] == "removed"
+
+
+async def test_source_diff_file_returns_unified_body(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    candidate_id, _, objects = await _seed_diff_pair(
+        maker,
+        candidate_files={"src/util.rs": "fn util() -> i32 { 1 }\n"},
+        reference_files={"src/util.rs": "fn util() -> i32 { 2 }\n"},
+    )
+    _install(app, maker)
+    _install_storage(app, objects)
+    response = await client.get(
+        f"/api/v1/admin/copy-reviews/{candidate_id}/source-diff/file",
+        params={"path": "src/util.rs"},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["candidate_present"] and body["reference_present"]
+    joined = "\n".join(body["diff_lines"])
+    assert "{ 2 }" in joined and "{ 1 }" in joined
+
+
+async def test_source_diff_requires_admin_actor(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    candidate_id, _, objects = await _seed_diff_pair(
+        maker, {"a.rs": "x\n"}, {"a.rs": "y\n"}
+    )
+    _install(app, maker)
+    _install_storage(app, objects)
+    response = await client.get(
+        f"/api/v1/admin/copy-reviews/{candidate_id}/source-diff",
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+    )
+    assert response.status_code == 422
+
+
+async def test_source_diff_missing_file_is_404(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    candidate_id, _, objects = await _seed_diff_pair(
+        maker, {"a.rs": "x\n"}, {"a.rs": "y\n"}
+    )
+    _install(app, maker)
+    _install_storage(app, objects)
+    response = await client.get(
+        f"/api/v1/admin/copy-reviews/{candidate_id}/source-diff/file",
+        params={"path": "ghost.rs"},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 404
+
+
+async def test_source_diff_digest_mismatch_is_502(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    candidate_id, _, objects = await _seed_diff_pair(
+        maker, {"a.rs": "x\n"}, {"a.rs": "y\n"}
+    )
+    # Corrupt the stored candidate bytes so they no longer match agent.sha256.
+    objects[f"{candidate_id}/agent.tar.gz"] = _tarball({"a.rs": "tampered\n"})
+    _install(app, maker)
+    _install_storage(app, objects)
+    response = await client.get(
+        f"/api/v1/admin/copy-reviews/{candidate_id}/source-diff", headers=_HEADERS
+    )
+    assert response.status_code == 502
