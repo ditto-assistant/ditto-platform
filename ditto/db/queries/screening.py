@@ -252,6 +252,11 @@ async def claim_screening_attempts(
                 owner.sha256 == agent.sha256,
                 owner.miner_hotkey != agent.miner_hotkey,
                 owner.agent_id != agent.agent_id,
+                (owner.created_at < agent.created_at)
+                | (
+                    (owner.created_at == agent.created_at)
+                    & (owner.agent_id < agent.agent_id)
+                ),
                 owner.status.in_(
                     (
                         AgentStatus.EVALUATING,
