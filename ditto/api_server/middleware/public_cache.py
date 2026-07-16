@@ -28,7 +28,8 @@ import os
 import re
 import time
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
@@ -105,11 +106,11 @@ class PublicCacheMiddleware(BaseHTTPMiddleware):
     def _respond(entry: _Entry) -> Response:
         headers = dict(entry.headers)
         headers["X-Public-Cache"] = "HIT"
-        return Response(
-            content=entry.body, status_code=entry.status, headers=headers
-        )
+        return Response(content=entry.body, status_code=entry.status, headers=headers)
 
-    async def _fetch(self, request: Request, call_next) -> tuple[Response, _Entry | None]:
+    async def _fetch(
+        self, request: Request, call_next
+    ) -> tuple[Response, _Entry | None]:
         """Run the downstream app and capture the body when cacheable."""
         response = await call_next(request)
         ttl = _ttl_from_cache_control(response.headers.get("cache-control"))
@@ -152,7 +153,9 @@ class PublicCacheMiddleware(BaseHTTPMiddleware):
                 return self._respond(entry)
             return await call_next(request)
 
-        future: asyncio.Future[_Entry | None] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[_Entry | None] = (
+            asyncio.get_running_loop().create_future()
+        )
         self._inflight[key] = future
         try:
             response, entry = await self._fetch(request, call_next)

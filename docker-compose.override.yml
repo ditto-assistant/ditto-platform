@@ -1,0 +1,8 @@
+# localnet e2e: point Pylon at the local subtensor (netuid 2), read-only.
+services:
+  pylon:
+    environment:
+      PYLON_BITTENSOR_NETWORK: ws://host.docker.internal:9944
+      PYLON_BITTENSOR_ARCHIVE_NETWORK: ws://host.docker.internal:9944
+      PYLON_RECENT_OBJECTS_NETUIDS: "[2]"
+      PYLON_IDENTITIES: "[]"
