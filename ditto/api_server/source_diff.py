@@ -18,7 +18,7 @@ reformat repack. Pure CPU work — callers run it via ``asyncio.to_thread``.
 from __future__ import annotations
 
 import difflib
-from typing import Literal
+from typing import Any, Literal
 
 from ditto.api_server.fingerprint import _normalized_source
 
@@ -63,7 +63,7 @@ def build_source_diff_manifest(
     reference: dict[str, str],
     *,
     max_files: int = MAX_MANIFEST_FILES,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Classify every file across the two artifacts with change statistics."""
     paths = sorted(set(candidate) | set(reference))
     files: list[dict[str, object]] = []
@@ -152,7 +152,7 @@ def unified_diff_for_file(
     reference: dict[str, str],
     *,
     max_lines: int = MAX_UNIFIED_DIFF_LINES,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Bounded unified diff (reference -> candidate) for a single file.
 
     Returns ``present`` flags for each side so the UI can render an add/remove
