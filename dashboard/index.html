@@ -4121,7 +4121,7 @@
         dockerTone = "bad";
       }
       var memoryTone = metrics.memory_percent >= 90 ? "warn" : "";
-      var diskTone = metrics.disk_percent >= 85 ? "warn" : "";
+      var diskTone = metrics.disk_percent >= 95 ? "warn" : "";
       return '<td>' + fleetMeter(metrics.cpu_percent, "") + '</td>' +
         '<td>' + fleetMeter(metrics.memory_percent, memoryTone) + '</td>' +
         '<td>' + fleetMeter(metrics.disk_percent, diskTone) + '</td>' +

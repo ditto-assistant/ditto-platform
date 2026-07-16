@@ -45,7 +45,7 @@ def test_classifies_availability_without_turning_missing_metrics_into_outage(
     now = datetime.now(UTC)
     metrics: PublicSystemMetrics | None = healthy_metrics
     if metrics_kind == "warning":
-        metrics = healthy_metrics.model_copy(update={"disk_percent": 90})
+        metrics = healthy_metrics.model_copy(update={"disk_percent": 95})
     elif metrics_kind == "missing":
         metrics = None
     elif metrics_kind == "partial":
@@ -59,6 +59,20 @@ def test_classifies_availability_without_turning_missing_metrics_into_outage(
         )
         == expected
     )
+
+
+def test_disk_usage_below_warning_threshold_is_healthy(
+    healthy_metrics: PublicSystemMetrics,
+) -> None:
+    now = datetime.now(UTC)
+    metrics = healthy_metrics.model_copy(update={"disk_percent": 90})
+
+    assert _fleet_classification(
+        state="idle",
+        seen_at=now - timedelta(seconds=30),
+        now=now,
+        metrics=metrics,
+    ) == (True, "available", "healthy")
 
 
 def test_saturated_cpu_is_healthy_workload(
