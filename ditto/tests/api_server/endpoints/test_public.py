@@ -8,8 +8,11 @@ per-case detail.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import httpx
@@ -28,8 +31,10 @@ from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import get_dataset_generator, get_session
+from ditto.api_server.endpoints import public as public_endpoint
 from ditto.api_server.endpoints.public import _fleet_classification
 from ditto.api_server.validator_names import ValidatorNamesSnapshot
+from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
     Base,
@@ -239,6 +244,96 @@ async def _seed_agent(
 
 
 class TestPublicLeaderboard:
+    async def test_marks_deregistered_scores_retained_but_emission_ineligible(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.7, 0.8, 0.9],
+            details={"bench_version": 2},
+        )
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.6, 0.7, 0.8],
+            details={"bench_version": 2},
+        )
+        _install_db(app, session_maker)
+        app.state.chain = SimpleNamespace(
+            get_recent_neurons=AsyncMock(
+                return_value=[SimpleNamespace(hotkey=_MINER_B)]
+            )
+        )
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        by_miner = {e["miner_hotkey"]: e for e in body["entries"]}
+        assert by_miner[_MINER_A]["registered"] is False
+        assert by_miner[_MINER_A]["emission_eligible"] is False
+        assert by_miner[_MINER_A]["finalized"] is True
+        assert by_miner[_MINER_A]["score_count"] == 3
+        assert by_miner[_MINER_B]["registered"] is True
+        assert by_miner[_MINER_B]["emission_eligible"] is True
+
+    async def test_chain_error_keeps_leaderboard_available_with_unknown_registration(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.7, 0.8, 0.9],
+            details={"bench_version": 2},
+        )
+        _install_db(app, session_maker)
+        app.state.chain = SimpleNamespace(
+            get_recent_neurons=AsyncMock(side_effect=ChainError("pylon unavailable"))
+        )
+
+        response = await client.get("/api/v1/public/leaderboard")
+
+        assert response.status_code == 200
+        entry = response.json()["entries"][0]
+        assert entry["registered"] is None
+        assert entry["emission_eligible"] is None
+
+    async def test_chain_timeout_keeps_leaderboard_available_with_unknown_registration(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.7, 0.8, 0.9],
+            details={"bench_version": 2},
+        )
+        _install_db(app, session_maker)
+
+        async def _never_returns(_netuid: int) -> list[object]:
+            await asyncio.Event().wait()
+            return []
+
+        app.state.chain = SimpleNamespace(get_recent_neurons=_never_returns)
+        monkeypatch.setattr(
+            public_endpoint, "_REGISTRATION_LOOKUP_TIMEOUT_SECONDS", 0.001
+        )
+
+        response = await client.get("/api/v1/public/leaderboard")
+
+        assert response.status_code == 200
+        entry = response.json()["entries"][0]
+        assert entry["registered"] is None
+        assert entry["emission_eligible"] is None
+
     async def test_includes_pre_quorum_scores_as_provisional_feedback(
         self,
         app: FastAPI,

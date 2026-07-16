@@ -130,6 +130,12 @@ class TestDashboard:
         assert "Provisional standings." in body
         assert "not the required 3 of 3 scores" in body
         assert "only final results drive emissions" in body
+        assert "Registration unavailable." in body
+        assert (
+            "function isRegistered(e) { return !!e && e.registered === true; }" in body
+        )
+        assert "e.emission_eligible === true" in body
+        assert ">registration unknown</span>" in body
         assert 'class="quorum-badge"' in body
         assert ">Winning agent</span>" in body
         assert 'class="winner-identity"' in body

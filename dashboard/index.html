@@ -2277,15 +2277,23 @@
       var title = document.getElementById("leaderboard-title");
       var hint = document.getElementById("leaderboard-hint");
       var notice = document.getElementById("leaderboard-notice");
+      var inactive = entries.filter(function (e) { return e.registered === false; });
+      var registrationUnknown = entries.filter(function (e) { return e.registered == null; });
       title.textContent = finalizedEntries.length ? "Leaderboard" : (provisional.length ? "Provisional leaderboard" : "Leaderboard");
       hint.textContent = finalizedEntries.length
-        ? "final three-validator results first · provisional feedback follows"
+        ? "final scores first · current SN118 registration required for emissions"
         : "early accepted scores · ranked provisionally by composite";
-      if (provisional.length) {
+      if (provisional.length || inactive.length || registrationUnknown.length) {
         notice.classList.add("show");
-        notice.innerHTML = '<strong>Provisional standings.</strong> ' + provisional.length +
+        var notices = [];
+        if (provisional.length) notices.push('<strong>Provisional standings.</strong> ' + provisional.length +
           ' miner' + (provisional.length === 1 ? ' has' : 's have') +
-          ' accepted validator feedback but not the required 3 of 3 scores. Rankings and composites can change until quorum; only final results drive emissions.';
+          ' accepted validator feedback but not the required 3 of 3 scores. Rankings and composites can change until quorum; only final results drive emissions, and current SN118 registration is also required.');
+        if (inactive.length) notices.push('<strong>Registration inactive.</strong> ' + inactive.length +
+          ' scored hotkey' + (inactive.length === 1 ? ' is' : 's are') +
+          ' not currently registered on SN118. Their submissions and scores are retained, but they are excluded from active weights and emissions until the same hotkey registers again.');
+        if (registrationUnknown.length) notices.push('<strong>Registration unavailable.</strong> Current SN118 registration could not be confirmed. Scores remain visible, but active weight and emission eligibility are unknown; no leader crown or active-rank styling is shown until registration is confirmed.');
+        notice.innerHTML = notices.join(' ');
       } else {
         notice.classList.remove("show");
         notice.textContent = "";
@@ -2304,8 +2312,10 @@
         var finalizedEntry = isFinalized(e);
         // Crown + rank styling only for the top *eligible* run; provisional runs
         // are unranked and never champion.
-        var isChamp = finalizedEntry && elig && e.rank === 1;
-        var rankCls = (finalizedEntry && elig && e.rank <= 3) ? " r" + e.rank : "";
+        var registered = isRegistered(e);
+        var activelyEligible = e.emission_eligible === true;
+        var isChamp = finalizedEntry && elig && activelyEligible && e.rank === 1;
+        var rankCls = (finalizedEntry && elig && activelyEligible && e.rank <= 3) ? " r" + e.rank : "";
         var champ = isChamp ? '<span class="badge"><span aria-hidden="true">👑</span> LEADER</span>' : "";
         var kind = unrankedKind(e);
         var prov = kind === "zero"
@@ -2323,11 +2333,16 @@
           ", agent " + accessibleAgentName + ", miner " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) + ". Activate for run detail.";
         var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge" title="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
           esc(e.score_count || 0) + ' of ' + esc(e.score_quorum || 3) + ' · provisional</span>';
+        var registrationBadge = registered
+          ? ""
+          : e.registered === false
+          ? '<span class="prov" title="This hotkey is not currently registered on SN118. Its score is retained, but it is excluded from active weights and emissions until the same hotkey registers again.">registration inactive</span>'
+          : '<span class="prov" title="Current SN118 registration could not be confirmed. The score is retained, but active weight and emission eligibility are unknown.">registration unknown</span>';
         return '' +
           '<tr data-i="' + i + '"' + (isChamp ? ' class="champion"' : '') +
             ' role="button" tabindex="0" aria-label="' + esc(rowLabel) + '">' +
             '<td>' + rankCell + '</td>' +
-            '<td><span class="winner-identity"><span class="winner-name">' + entityAnchor("agent", e.agent_id, displayAgentName) + champ + prov + quorumBadge + '</span>' +
+            '<td><span class="winner-identity"><span class="winner-name">' + entityAnchor("agent", e.agent_id, displayAgentName) + champ + prov + quorumBadge + registrationBadge + '</span>' +
               agentVersionBadge(e.agent_version) +
               '<span class="winner-miner" title="' + esc(e.miner_hotkey) + '"><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' +
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></span></span></td>' +
@@ -2352,6 +2367,7 @@
     // field and are treated as eligible.
     function isEligible(e) { return !e || e.eligible !== false; }
     function isFinalized(e) { return !e || e.finalized !== false; }
+    function isRegistered(e) { return !!e && e.registered === true; }
     // Why an unranked run is unranked. A full run (n >= 100) that is not ranked
     // scored a non-positive composite ("no score"); otherwise it ran a smaller
     // practice profile ("provisional"). Mirrors the backend's two-gate rule so the
@@ -2508,7 +2524,7 @@
       document.getElementById("d-stats").classList.remove("pipeline-mode");
       document.querySelector("#modal .split").style.display = "";
       document.getElementById("d-title").textContent = isFinalized(e)
-        ? "Rank #" + e.rank + (e.rank === 1 ? " · 👑 Leader" : "")
+        ? "Rank #" + e.rank + (e.rank === 1 && e.emission_eligible === true ? " · 👑 Leader" : "")
         : "Provisional rank P" + e.rank + " · " + (e.score_count || 0) + " of " + (e.score_quorum || 3) + " scores";
       benchChip(e);
       document.getElementById("d-hotkey").innerHTML = entityAnchor("miner", e.miner_hotkey, e.miner_hotkey);
@@ -2527,6 +2543,8 @@
       var mKind = unrankedKind(e);
       var det = "";
       if (!isFinalized(e)) det += stat("Validation", (e.score_count || 0) + " of " + (e.score_quorum || 3) + " accepted scores. Not final and not used for emissions.");
+      if (e.registered === false) det += stat("Registration", "Not currently registered on SN118. The submission, fee record, and scores are retained, but this hotkey is excluded from active weights and emissions until the same hotkey registers again.");
+      else if (e.registered == null) det += stat("Registration", "Current SN118 registration could not be confirmed. The score is retained, but active weight and emission eligibility are unknown.");
       if (e.n != null) det += stat("Cases scored", String(e.n) +
         (mKind === "provisional" ? " (provisional, partial benchmark)" : ""));
       if (mKind === "zero") det += stat("Ranking", "Not ranked. This full run scored a composite of 0.000, so it earns no rank and no emissions.");
@@ -2686,7 +2704,7 @@
     // Plain-language help for the metric and telemetry terms in this drawer. Each
     // is a short paragraph, rendered collapsed so the panel stays clean by default.
     var TERM_HELP = [
-      ["Composite", "The headline score from 0 to 1: (0.5 × tool mean + 0.5 × memory mean) scaled by the integrity gates (efficiency, consistency, and canary integrity: a canary leak ×0.5, an honest miss ×0.85). Miners are ranked and paid emissions on it."],
+      ["Composite", "The headline score from 0 to 1: (0.5 × tool mean + 0.5 × memory mean) scaled by the integrity gates (efficiency, consistency, and canary integrity: a canary leak ×0.5, an honest miss ×0.85). Final full-benchmark scores drive the competition only while the miner hotkey is currently registered on SN118."],
       ["Standard error (± SE)", "The uncertainty on the composite, estimated from how much the per-case scores vary. Two miners within about 1 SE of each other are a statistical tie, not a real gap."],
       ["Tool mean", "Average score over the tool-use cases. Did the agent call the right tools, ground its arguments, and read memory instead of the web when the fact was already known?"],
       ["Memory mean", "Average score over the memory cases. Did the agent recall and reason over stored facts across sessions, over time, and while resisting instructions hidden in the data?"],
