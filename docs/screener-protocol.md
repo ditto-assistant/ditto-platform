@@ -47,6 +47,10 @@ needed and promotes to evaluation; rescreen returns the preserved submission to
 the screener queue; reject retains the submission and prior scores but prevents
 evaluation until a future policy-version rescreen.
 
+Quarantine listings default to `sort=oldest` so operator queues process the
+longest-waiting submission first. Clients may request `sort=newest`; pagination
+uses the same timestamp and quarantine-ID direction for deterministic results.
+
 ## Miner disputes
 
 A miner may dispute a resolved quarantine rejection exactly once per submission.
