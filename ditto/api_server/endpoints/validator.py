@@ -43,7 +43,7 @@ import statistics
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import bittensor
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
@@ -79,7 +79,7 @@ from ditto.api_server.endpoints.retrieval import AgentNotFoundError
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
-from ditto.db.models import Agent, Score, ValidatorHeartbeat
+from ditto.db.models import Agent, AthReview, Score, ValidatorHeartbeat
 from ditto.db.queries.agents import get_agent_by_id
 from ditto.db.queries.audit import (
     EVENT_FINALIZED,
@@ -962,6 +962,34 @@ async def submit_score(
                     agent.status = AgentStatus.ATH_PENDING_REVIEW
                     agent.duplicate_of = decision.duplicate_of
                     agent.review_reason = decision.reason
+                    session.add(
+                        AthReview(
+                            review_id=uuid4(),
+                            agent_id=agent.agent_id,
+                            status="pending",
+                            opened_at=audit_now,
+                            original_duplicate_of=decision.duplicate_of,
+                            original_reason=decision.reason,
+                            original_policy_version=agent.screening_policy_version,
+                            original_evidence={
+                                "content_fingerprint_version": (
+                                    agent.content_fingerprint or {}
+                                ).get("v"),
+                                "structural_fingerprint_version": (
+                                    agent.structural_fingerprint or {}
+                                ).get("v"),
+                                "prompt_fingerprint_version": (
+                                    agent.prompt_fingerprint or {}
+                                ).get("v"),
+                            },
+                            algorithm_provenance={
+                                "snapshot": "score-finalization",
+                                "reference_provenance": "legacy-current-main",
+                                "backfilled": False,
+                                "opened_at_source": "agent_finalized_audit",
+                            },
+                        )
+                    )
                     logger.warning(
                         "agent %s held for copy review: %s", agent_id, decision.reason
                     )

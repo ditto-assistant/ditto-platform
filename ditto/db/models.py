@@ -345,6 +345,56 @@ class ScreeningAttempt(Base):
     )
 
 
+class AthReview(Base):
+    """Durable, immutable-evidence audit record for an ATH copy hold."""
+
+    __tablename__ = "ath_reviews"
+
+    review_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    opened_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    resolved_by: Mapped[str | None] = mapped_column(Text)
+    resolution: Mapped[str | None] = mapped_column(Text)
+    resolution_reason: Mapped[str | None] = mapped_column(Text)
+    original_duplicate_of: Mapped[UUID | None] = mapped_column(SaUUID(as_uuid=True))
+    original_reason: Mapped[str | None] = mapped_column(Text)
+    original_policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    original_evidence: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    algorithm_provenance: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="RESTRICT"),
+        ForeignKeyConstraint(
+            ["original_duplicate_of"], ["agents.agent_id"], ondelete="RESTRICT"
+        ),
+        UniqueConstraint("agent_id", name="ath_reviews_agent_id_key"),
+        CheckConstraint(
+            "status IN ('pending', 'resolved')", name="ath_reviews_status_check"
+        ),
+        CheckConstraint(
+            "resolution IS NULL OR resolution IN ('clear', 'reject')",
+            name="ath_reviews_resolution_check",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND resolved_at IS NULL AND resolved_by IS NULL "
+            "AND resolution IS NULL AND resolution_reason IS NULL) OR "
+            "(status = 'resolved' AND resolved_at IS NOT NULL "
+            "AND resolved_by IS NOT NULL "
+            "AND length(trim(resolved_by)) BETWEEN 1 AND 120 "
+            "AND resolution IS NOT NULL "
+            "AND resolution IN ('clear', 'reject') "
+            "AND resolution_reason IS NOT NULL "
+            "AND length(trim(resolution_reason)) BETWEEN 3 AND 500)",
+            name="ath_reviews_lifecycle_check",
+        ),
+        Index("ath_reviews_status_opened_idx", "status", "opened_at", "review_id"),
+    )
+
+
 class ScreeningQuarantine(Base):
     """Append-only quarantine decision plus its operator resolution."""
 
