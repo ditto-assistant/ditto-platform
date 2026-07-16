@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import undefer_group
 
 from ditto.db import IntegrityError as DbIntegrityError
 from ditto.db.models import Agent, AgentStatus
@@ -156,7 +157,10 @@ class TestInsertAgentHappyPath:
 
         row = (
             await session.execute(
-                select(Agent).where(Agent.agent_id == kwargs["agent_id"])
+                # The sketch columns are deferred; readers must undefer.
+                select(Agent)
+                .options(undefer_group("anticopy"))
+                .where(Agent.agent_id == kwargs["agent_id"])
             )
         ).scalar_one()
         assert row.prompt_fingerprint == sketch
@@ -173,7 +177,9 @@ class TestInsertAgentHappyPath:
 
         row = (
             await session.execute(
-                select(Agent).where(Agent.agent_id == kwargs["agent_id"])
+                select(Agent)
+                .options(undefer_group("anticopy"))
+                .where(Agent.agent_id == kwargs["agent_id"])
             )
         ).scalar_one()
         assert row.code_embedding == [0.1, 0.2, 0.3]

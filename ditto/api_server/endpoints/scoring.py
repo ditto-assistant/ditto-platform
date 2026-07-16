@@ -245,7 +245,7 @@ async def scores(
                 detail="scoring ledger authorization temporarily unavailable",
             ) from exc
     try:
-        rows = await list_eligible_ledger(session)
+        rows = await list_eligible_ledger(session, include_fingerprints=False)
         # The k=3 quorum spread per agent -> composite_stderr when the run itself
         # did not stash one, so the KOTH z-band is noise-aware with no re-score.
         quorum = await quorum_composites(session, [r.agent_id for r in rows])
