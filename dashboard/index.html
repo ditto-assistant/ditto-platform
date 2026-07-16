@@ -38,9 +38,8 @@
 
     wandb project link is configured the same way via ?wandb= or the meta tag.
 
-    If the API can't be reached (before deploy, offline, or in a sandbox that
-    blocks fetch) the page renders SAMPLE data behind a clearly-marked banner so
-    the layout is always previewable.
+    If the API can't be reached, the page renders an explicit unavailable state.
+    It never substitutes example values for live subnet data.
   -->
   <meta name="ditto:api-base" content="" />
   <meta name="ditto:wandb-url" content="https://wandb.ai/" />
@@ -198,7 +197,7 @@
     }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
     .pill.live .dot { background: var(--good); box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.18); animation: pulse 2s infinite; }
-    .pill.sample .dot { background: var(--warn); }
+    .pill.error .dot { background: var(--danger); }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
 
     .btn {
@@ -213,7 +212,7 @@
     .btn:active { transform: translateY(1px); }
     .btn.ghost { background: transparent; }
 
-    /* ── Sample banner ──────────────────────────────────────── */
+    /* ── Data availability banner ───────────────────────────── */
     .banner {
       margin: 16px 0 0; padding: 11px 15px; border-radius: 12px;
       background: rgba(251, 191, 36, 0.08); border: 1px solid rgba(251, 191, 36, 0.35);
@@ -1674,9 +1673,9 @@
       <span id="status" class="pill" role="status" aria-live="polite"><span class="dot" aria-hidden="true"></span><span id="status-text">Connecting…</span></span>
     </header>
 
-    <div id="banner" class="banner">
+    <div id="banner" class="banner" role="status" aria-live="polite">
       <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
-      <span><b>Sample data.</b> The live API couldn't be reached, so the layout is shown with example numbers. Configure the API base with <code>?api=</code> or the <code>ditto:api-base</code> meta tag.</span>
+      <span id="banner-text"><b>Live data unavailable.</b> The leaderboard could not be loaded. No example data is shown. Try refreshing in a moment.</span>
     </div>
 
     <section class="page active" data-page="overview">
@@ -2246,11 +2245,11 @@
       var pill = document.getElementById("status");
       pill.className = "pill " + mode;
       document.getElementById("status-text").textContent = text;
-      document.getElementById("banner").classList.toggle("show", mode === "sample");
+      document.getElementById("banner").classList.toggle("show", mode === "error");
     }
 
     // ── Render ───────────────────────────────────────────────
-    function render(data, isSample) {
+    function render(data) {
       // Finalized submissions always rank ahead of pre-quorum feedback. Within
       // each tier, full-benchmark runs rank ahead of smoke/practice runs and
       // composite orders the field. Provisional values are useful feedback but
@@ -2290,7 +2289,7 @@
         ? fmtTokens(toks.reduce(function (a, b) { return a + b; }, 0)) + ' <small>tokens</small>' : "–";
       // The latest benchmark version (single source of truth from the API), with a
       // fallback to the highest version on the board so the header still resolves
-      // against the sample data / an older API.
+      // against an older API.
       var maxBv = entries
         .map(function (e) { return e.bench_version; })
         .filter(function (v) { return v != null; })
@@ -2314,7 +2313,7 @@
       // Freshness lives on the status pill (no separate card), keeping the
       // headline cards to distinct leaderboard metrics.
       var when = data.generated_at ? relTime(data.generated_at) : "–";
-      if (!isSample) document.getElementById("status-text").textContent = "Live · " + when;
+      document.getElementById("status-text").textContent = "Live · " + when;
 
       var title = document.getElementById("leaderboard-title");
       var hint = document.getElementById("leaderboard-hint");
@@ -2400,12 +2399,30 @@
       updateSearch();
     }
 
+    function renderLeaderboardUnavailable() {
+      lastEntries = [];
+      ["c-miners", "c-top", "c-median", "c-baseline", "c-spread", "c-cost"].forEach(function (id) {
+        document.getElementById(id).textContent = "–";
+      });
+      var badge = document.getElementById("bench-badge");
+      badge.className = "bench-badge";
+      badge.textContent = "";
+      document.getElementById("leaderboard-title").textContent = "Leaderboard";
+      document.getElementById("leaderboard-hint").textContent = "Live standings are temporarily unavailable";
+      var notice = document.getElementById("leaderboard-notice");
+      notice.classList.remove("show");
+      notice.textContent = "";
+      document.getElementById("rows").innerHTML =
+        '<tr><td colspan="8" class="empty">Could not load live leaderboard data. Try refreshing in a moment.</td></tr>';
+      updateSearch();
+    }
+
     function fmtTokens(t) { return t >= 1e6 ? (t / 1e6).toFixed(1) + "M" : t >= 1e3 ? (t / 1e3).toFixed(1) + "k" : String(t); }
     function fmtMs(ms) { return ms >= 1000 ? (ms / 1000).toFixed(ms >= 10000 ? 0 : 1) + " s" : ms + " ms"; }
     function clamp01(v) { return Math.max(0, Math.min(1, v)); }
     // A run is eligible (ranked + emission-eligible) unless the API explicitly
     // flags it provisional (eligible === false), a smaller run-size profile that
-    // did not administer the full benchmark. Older APIs / sample data omit the
+    // did not administer the full benchmark. Older APIs may omit the
     // field and are treated as eligible.
     function isEligible(e) { return !e || e.eligible !== false; }
     function isFinalized(e) { return !e || e.finalized !== false; }
@@ -2740,7 +2757,7 @@
           (r.quorum || r.score_count) + ')</div>' +
           '<div class="muted" style="margin:0 0 6px">Independent validators that scored this agent; the platform finalizes on the median, so no single validator decides the score.</div>' +
           rows + med + '</div>';
-      }).catch(function () { /* held / still-evaluating / sample mode: leave empty */ });
+      }).catch(function () { /* held / still-evaluating: leave empty */ });
     }
 
     // Plain-language help for the metric and telemetry terms in this drawer. Each
@@ -3332,6 +3349,12 @@
         h.avg_latency_ms == null ? "–" : h.avg_latency_ms + ' <small>ms</small>';
       document.getElementById("h-last").innerHTML =
         h.last_scored_at ? relTime(h.last_scored_at) : "–";
+    }
+
+    function renderHealthUnavailable() {
+      ["h-miners", "h-agents", "h-24h", "h-lat", "h-last"].forEach(function (id) {
+        document.getElementById(id).textContent = "–";
+      });
     }
 
     function activityStage(status) {
@@ -4379,13 +4402,13 @@
     function load(manual) {
       if (manual) setStatus("", "Refreshing…");
       getJSON("/public/leaderboard")
-        .then(function (data) { setStatus("live", "Live"); render(data, false); resolveEntityRoute(); })
-        .catch(function () { setStatus("sample", "Sample data"); render(SAMPLE, true); resolveEntityRoute(); });
+        .then(function (data) { setStatus("live", "Live"); render(data); resolveEntityRoute(); })
+        .catch(function () { setStatus("error", "Data unavailable"); renderLeaderboardUnavailable(); });
       // Health is independent: a failure here must not flip the whole page to
-      // sample mode or blank the leaderboard.
+      // unavailable mode or blank the leaderboard.
       getJSON("/public/health")
         .then(function (h) { renderHealth(h); })
-        .catch(function () { renderHealth(SAMPLE_HEALTH); });
+        .catch(function () { renderHealthUnavailable(); });
       loadActivity(activityPage);
       loadOperations();
       getJSON("/public/validator-names")
@@ -4435,41 +4458,6 @@
         }
       }).catch(function () {});
     }
-
-    // ── Sample data (mirrors the real /public/leaderboard shape) ──
-    var SAMPLE = {
-      generated_at: new Date(Date.now() - 12000).toISOString(),
-      count: 5,
-      entries: [
-        { rank: 1, finalized: true, score_count: 3, score_quorum: 3, agent_id: "11111111-1111-4111-8111-111111111111", agent_name: "Atlas Memory", agent_version: 3, miner_hotkey: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", composite: 0.658, tool_mean: 0.867, memory_mean: 0.449, first_seen: new Date(Date.now() - 86400000 * 2).toISOString(),
-          median_ms: 2410, n: 12, bench_version: 2, dataset_sha256: "9f2c1a77b4e35d0182ac4f6b0e2d9c3a5b7148ef22d0c6a9f1e8b3d47c05a6e1",
-          models: { harness: "qwen/qwen3-32b" },
-          per_category: [{ category: "memory_lookup", count: 3, mean: 0.83 }, { category: "web_search", count: 2, mean: 0.75 }, { category: "artifacts_create", count: 1, mean: 0.6 }],
-          integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 0, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.2, capped_tool_cases: 3, seeding_waves: 2 }, tokens: 8140,
-          composite_stderr: 0.017, history: [0.481, 0.523, 0.559, 0.601, 0.658],
-          case_results: [
-            { category: "web_search", kind: "tool", score: 0.75, correct: true, latency_ms: 2410, notes: ["deterministic trajectory match; args grounded"] },
-            { category: "artifacts_create", kind: "tool", score: 0.60, correct: false, latency_ms: 8740, notes: ["capped: observable case not executed via tool_endpoint (self-report untrusted)"] },
-            { category: "memory_lookup", kind: "memory", score: 1.0, correct: true, latency_ms: 1330, notes: ["deterministic answer match (no judge call)"] },
-            { category: "contradiction", kind: "memory", score: 0.0, correct: false, latency_ms: 2210, notes: ["deterministic answer mismatch (no judge call)"] }
-          ] },
-        { rank: 2, finalized: true, score_count: 3, score_quorum: 3, agent_id: "22222222-2222-4222-8222-222222222222", agent_name: "Recall Relay", agent_version: 2, miner_hotkey: "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm", composite: 0.612, tool_mean: 0.792, memory_mean: 0.432, first_seen: new Date(Date.now() - 86400000 * 3).toISOString(),
-          median_ms: 3120, n: 12, bench_version: 2, dataset_sha256: "1b8e07d4c9f6a2531e0c74ab9f3d61528ac40f7e6d1b9c8a2f5e340d7b16c9a0",
-          models: { harness: "qwen/qwen3-32b" },
-          per_category: [{ category: "memory_lookup", count: 3, mean: 0.72 }, { category: "image_create", count: 1, mean: 0.5 }],
-          integrity: { paraphrase_applied: 20, paraphrase_attempted: 20, paraphrase_fallback: 1, lexical_gap_rewritten: 2, lexical_gap_questions: 5, lexical_gap_mean_before: 0.45, lexical_gap_mean_after: 0.22, capped_tool_cases: 4, seeding_waves: 1 }, tokens: 7620,
-          composite_stderr: 0.021, history: [0.544, 0.578, 0.612] },
-        { rank: 3, finalized: true, score_count: 3, score_quorum: 3, agent_id: "33333333-3333-4333-8333-333333333333", agent_name: "Threadkeeper", agent_version: null, miner_hotkey: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY", composite: 0.587, tool_mean: 0.867, memory_mean: 0.307, first_seen: new Date(Date.now() - 86400000 * 1).toISOString(),
-          median_ms: 2880, n: 12, bench_version: 2, composite_stderr: 0.019 },
-        { rank: 4, finalized: false, score_count: 2, score_quorum: 3, agent_id: "44444444-4444-4444-8444-444444444444", agent_name: "Context Forge", agent_version: 2, miner_hotkey: "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp", composite: 0.541, tool_mean: 0.700, memory_mean: 0.382, first_seen: new Date(Date.now() - 3600000 * 8).toISOString() },
-        { rank: 5, finalized: false, score_count: 1, score_quorum: 3, agent_id: "55555555-5555-4555-8555-555555555555", agent_name: "Longview", agent_version: 1, miner_hotkey: "5EexQS8UZkxYVRxHnFXsCwuUxwaLuTnHXcRQZeh1pR2iCwRr", composite: 0.498, tool_mean: 0.640, memory_mean: 0.356, first_seen: new Date(Date.now() - 3600000 * 2).toISOString() }
-      ]
-    };
-    var SAMPLE_HEALTH = {
-      miners: 8, scored_miners: 5, scored_agents: 7,
-      scores_24h: 11, avg_latency_ms: 812,
-      last_scored_at: new Date(Date.now() - 1000 * 60 * 6).toISOString()
-    };
 
     // ── Go ───────────────────────────────────────────────────
     // ── Hash router: each sidebar section is a deep-linkable page ──

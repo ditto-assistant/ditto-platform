@@ -249,6 +249,23 @@ class TestDashboard:
         assert "Your one dispute was submitted" in body
         assert "private message" in body
 
+    async def test_api_failures_do_not_render_sample_data(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+
+        assert "var SAMPLE" not in body
+        assert "SAMPLE_HEALTH" not in body
+        assert "render(SAMPLE" not in body
+        assert "function renderLeaderboardUnavailable()" in body
+        assert "function renderHealthUnavailable()" in body
+        assert "<b>Live data unavailable.</b>" in body
+        assert "No example data is shown." in body
+        assert (
+            '.catch(function () { setStatus("error", "Data unavailable"); '
+            "renderLeaderboardUnavailable(); });" in body
+        )
+        assert ".catch(function () { renderHealthUnavailable(); });" in body
+
     async def test_includes_server_backed_submission_quick_filters(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
