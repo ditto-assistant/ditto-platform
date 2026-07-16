@@ -9,12 +9,12 @@ or set on the app directly.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-import os
 import httpx
 import pytest
 from fastapi import FastAPI
