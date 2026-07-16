@@ -14,6 +14,13 @@ class AdminCopyReviewEvidence(BaseModel):
     fingerprint_versions: dict[str, int | str | None]
     reference_provenance: str
     backfilled: bool = False
+    # Identity of the originally matched agent, so operators see WHICH
+    # submission triggered the hold instead of a bare UUID. Null when the
+    # matched agent row no longer exists.
+    duplicate_of_name: str | None = None
+    duplicate_of_version: int | None = None
+    duplicate_of_hotkey: str | None = None
+    duplicate_of_submitted_at: datetime | None = None
 
 
 class AdminCopySimilarityEvidence(BaseModel):
@@ -53,6 +60,14 @@ class AdminCopyReviewCurrentComparison(BaseModel):
     current_decision: str
 
 
+class AdminCopyReviewComparisonUnavailable(BaseModel):
+    """Per-row fail-closed comparison state for the embedded list form."""
+
+    availability: Literal["unavailable"] = "unavailable"
+    bulk_eligible: Literal[False] = False
+    reason: str
+
+
 class AdminCopyReviewItem(BaseModel):
     review_id: UUID
     agent_id: UUID
@@ -67,6 +82,12 @@ class AdminCopyReviewItem(BaseModel):
     resolution: Literal["clear", "reject"] | None = None
     resolution_reason: str | None = None
     original: AdminCopyReviewEvidence
+    # Populated only when the list is requested with
+    # ``include=current_comparison``; None otherwise (and on the detail and
+    # resolve responses, whose consumers use the dedicated endpoint).
+    current_comparison: (
+        AdminCopyReviewCurrentComparison | AdminCopyReviewComparisonUnavailable | None
+    ) = None
 
 
 class AdminCopyReviewList(BaseModel):
