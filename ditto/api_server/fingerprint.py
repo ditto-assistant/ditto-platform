@@ -53,6 +53,13 @@ logger = logging.getLogger(__name__)
 # (a cross-version Jaccard is meaningless). :func:`content_similarity` returns no
 # match unless both sketches carry the same version.
 _FP_VERSION = 1
+# Novelty sketches (shared-scaffolding baseline subtracted before sketching; see
+# :mod:`ditto.anticopy.baseline`) are a distinct version: they measure a different
+# quantity (the submission's own contribution, not the whole tarball), so a
+# whole-tarball v1 sketch must never be compared against one. Sketches of this
+# version additionally carry ``"bl"``, the corpus identity that was subtracted;
+# :func:`content_similarity` refuses mismatched corpora for the same reason.
+_FP_NOVELTY_VERSION = 2
 
 # Version of the normalized-source-hash canonicalization
 # (:func:`compute_normalized_source_hash`). Bumped independently of ``_FP_VERSION``
@@ -115,13 +122,26 @@ _PROMPT_SHINGLE_WORDS = 5
 _EMBED_INPUT_MAX_CHARS = 24000
 
 
-def compute_content_fingerprint(tar_gz_bytes: bytes) -> dict | None:
+def compute_content_fingerprint(
+    tar_gz_bytes: bytes,
+    *,
+    exclude: frozenset[str] | None = None,
+    baseline_id: str | None = None,
+) -> dict | None:
     """Return a MinHash shingle sketch of the tarball's source, or ``None``.
 
     The returned dict is ``{"v", "k", "card", "m"}`` — algorithm version, sketch
     budget, true shingle-set cardinality, and the sorted bottom-``k`` shingle
     hashes — JSON-serializable for the ``agents.content_fingerprint`` column and
     consumed by :func:`content_similarity`.
+
+    With ``exclude`` (the shared-scaffolding baseline corpus from
+    :mod:`ditto.anticopy.baseline`), those shingles are subtracted **before**
+    sketching, so the sketch describes only the submission's novel content at
+    full resolution, versioned ``_FP_NOVELTY_VERSION`` and stamped with
+    ``"bl": baseline_id``. A submission with *no* novel content (a pristine
+    starter kit) yields an empty sketch (``card=0``) that matches nothing —
+    the exact-equality rules still catch literal re-submissions.
 
     Returns ``None`` — "no usable fingerprint", which the gate treats as no
     content match — when the bytes are not a readable tar.gz, contain no source
@@ -166,11 +186,20 @@ def compute_content_fingerprint(tar_gz_bytes: bytes) -> dict | None:
 
     if not shingles:
         return None
+    if exclude is None:
+        return {
+            "v": _FP_VERSION,
+            "k": _MINHASH_K,
+            "card": len(shingles),
+            "m": sorted(shingles)[:_MINHASH_K],
+        }
+    novel = shingles - exclude
     return {
-        "v": _FP_VERSION,
+        "v": _FP_NOVELTY_VERSION,
         "k": _MINHASH_K,
-        "card": len(shingles),
-        "m": sorted(shingles)[:_MINHASH_K],
+        "card": len(novel),
+        "m": sorted(novel)[:_MINHASH_K],
+        "bl": baseline_id,
     }
 
 
@@ -578,6 +607,11 @@ def content_similarity(a: dict | None, b: dict | None) -> tuple[float, float]:
         return (0.0, 0.0)
     va = a.get("v")
     if va is None or va != b.get("v"):
+        return (0.0, 0.0)
+    # Novelty sketches are only comparable when the SAME scaffolding corpus was
+    # subtracted from both — different corpora leave different residues, so the
+    # overlap of their "novel" sets is meaningless.
+    if a.get("bl") != b.get("bl"):
         return (0.0, 0.0)
     ma, mb = set(a.get("m", ())), set(b.get("m", ()))
     if not ma or not mb:

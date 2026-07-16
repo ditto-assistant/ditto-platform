@@ -6,7 +6,12 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_server.fingerprint import _FP_VERSION, _MINHASH_K, _PROMPT_VERSION
+from ditto.api_server.fingerprint import (
+    _FP_NOVELTY_VERSION,
+    _FP_VERSION,
+    _MINHASH_K,
+    _PROMPT_VERSION,
+)
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.db.queries.scores import LedgerRow
 
@@ -25,6 +30,17 @@ def _sk(shingles: set[str]) -> dict:
         "k": _MINHASH_K,
         "card": len(shingles),
         "m": sorted(shingles)[:_MINHASH_K],
+    }
+
+
+def _nsk(shingles: set[str], *, baseline_id: str = "c8d712f1addf") -> dict:
+    """Build a NOVELTY sketch (baseline-subtracted, fingerprint v2)."""
+    return {
+        "v": _FP_NOVELTY_VERSION,
+        "k": _MINHASH_K,
+        "card": len(shingles),
+        "m": sorted(shingles)[:_MINHASH_K],
+        "bl": baseline_id,
     }
 
 
@@ -286,10 +302,13 @@ class TestEvaluateAntidup:
         assert decision.held is True
         assert "containment" in (decision.reason or "")
 
-    def test_structural_dup_held_when_lexical_differs(self) -> None:
-        # An identifier-renamed copy: the LEXICAL sketch diverges (text changed),
-        # but the STRUCTURAL (AST) sketch still matches => held via the structural
-        # channel. Lexical fingerprints are made deliberately disjoint.
+    def test_structural_match_alone_never_holds(self) -> None:
+        # The structural (AST) sketch is whole-crate, so on starter-kit-derived
+        # submissions it saturates between independent miners exactly like the
+        # pre-novelty lexical channel did. Until dittobench ships
+        # baseline-subtracted structural sketches it corroborates, never
+        # triggers — an identical AST shape with distinct lexical novelty stays
+        # unheld.
         struct = {f"{i:016x}" for i in range(30)}
         incumbent = _entry(
             composite=0.80,
@@ -304,14 +323,37 @@ class TestEvaluateAntidup:
             sha256="bb" * 32,
             composite=0.805,
             size_bytes=700000,
-            # Different lexical text (renamed identifiers) but identical AST shape.
             content_fingerprint=_sk({f"other{i:011x}" for i in range(30)}),
             structural_fingerprint=_sk(struct),
             eligible=[incumbent],
         )
+        assert decision.held is False
+
+    def test_structural_overlap_annotates_lexical_hold(self) -> None:
+        # When the lexical channel fires, a high structural overlap with the
+        # matched agent is appended to the audit reason as corroboration.
+        lex = {f"lex{i:013x}" for i in range(30)}
+        struct = {f"{i:016x}" for i in range(30)}
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=500000,
+            content_fingerprint=_sk(lex),
+            structural_fingerprint=_sk(struct),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Copier",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=700000,
+            content_fingerprint=_sk(lex),
+            structural_fingerprint=_sk(struct),
+            eligible=[incumbent],
+        )
         assert decision.held is True
-        assert decision.duplicate_of == incumbent.agent_id
-        assert "structural near-duplicate" in (decision.reason or "")
+        assert "content near-duplicate" in (decision.reason or "")
+        assert "structural jaccard" in (decision.reason or "")
 
     def test_structural_below_tol_not_held(self) -> None:
         # Two crates sharing reference-harness AST scaffolding but well under the
@@ -557,3 +599,162 @@ class TestPromptShadowSignal:
         )
         assert decision.held is True
         assert "prompt" not in (decision.reason or "")
+
+
+class TestNoveltyAwareGate:
+    """The starter-kit false-positive regression suite.
+
+    Every SN118 submission derives from the same public starter kit, so before
+    baseline subtraction two INDEPENDENT miners each editing a couple of lines
+    of ``baseline.rs`` scored jaccard/containment ~1.0 (and were kit-sized and
+    score-adjacent), holding honest work on every channel at once. These tests
+    pin the redesigned behavior end to end at the gate level.
+    """
+
+    def test_independent_kit_edits_not_held(self) -> None:
+        # Two honest miners, each with a small DISJOINT novel contribution,
+        # kit-sized tarballs (size delta 1B) and near-identical scores: the
+        # pre-novelty gate held this pair via rule 2 AND rule 3.
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=524288,
+            content_fingerprint=_nsk({f"a{i:015x}" for i in range(8)}),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.801,
+            size_bytes=524289,
+            content_fingerprint=_nsk({f"b{i:015x}" for i in range(8)}),
+            eligible=[incumbent],
+        )
+        assert decision.held is False
+
+    def test_tweaked_copy_held_by_novel_containment(self) -> None:
+        # A copier lifts the incumbent's novel work and pads a cosmetic tweak
+        # of their own: the incumbent's novel set is contained in the copy's.
+        stolen = {f"a{i:015x}" for i in range(8)}
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=524288,
+            content_fingerprint=_nsk(stolen),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Copier",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=524900,
+            content_fingerprint=_nsk(stolen | {f"pad{i:013x}" for i in range(3)}),
+            eligible=[incumbent],
+        )
+        assert decision.held is True
+        assert decision.duplicate_of == incumbent.agent_id
+        assert "content near-duplicate" in (decision.reason or "")
+
+    def test_below_novelty_floor_abstains(self) -> None:
+        # Near-pristine kits (fewer novel shingles than one edited region) have
+        # nothing meaningful to compare — identical tiny novel sets stay unheld
+        # (a literal resubmission is still caught by sha256 / repack equality).
+        tiny = {f"a{i:015x}" for i in range(3)}
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=524288,
+            content_fingerprint=_nsk(tiny),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.801,
+            size_bytes=524289,
+            content_fingerprint=_nsk(tiny),
+            eligible=[incumbent],
+        )
+        assert decision.held is False
+
+    def test_size_rule_never_fires_when_both_fingerprinted(self) -> None:
+        # Identical size and score but distinct novel fingerprints: the size
+        # fallback must stay silent when the content channel can see the pair.
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=524288,
+            content_fingerprint=_nsk({f"a{i:015x}" for i in range(30)}),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.80,
+            size_bytes=524288,
+            content_fingerprint=_nsk({f"b{i:015x}" for i in range(30)}),
+            eligible=[incumbent],
+        )
+        assert decision.held is False
+
+    def test_size_fallback_still_covers_unfingerprinted_rows(self) -> None:
+        # A row with no usable sketch keeps the old cheap size+score catch.
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=524288,
+            content_fingerprint=None,
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Copier",
+            sha256="bb" * 32,
+            composite=0.801,
+            size_bytes=524300,
+            content_fingerprint=_nsk({f"b{i:015x}" for i in range(30)}),
+            eligible=[incumbent],
+        )
+        assert decision.held is True
+        assert "size delta" in (decision.reason or "")
+
+    def test_legacy_and_novelty_sketches_never_match(self) -> None:
+        # A v1 whole-tarball sketch measures a different quantity than a v2
+        # novelty sketch; identical members must not cross-fire.
+        shared = {f"a{i:015x}" for i in range(30)}
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=None,
+            content_fingerprint=_sk(shared),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.801,
+            size_bytes=None,
+            content_fingerprint=_nsk(shared),
+            eligible=[incumbent],
+        )
+        assert decision.held is False
+
+    def test_mismatched_baseline_corpora_never_match(self) -> None:
+        # Sketches subtracted against different corpus versions leave different
+        # residues; their overlap is meaningless and must not hold.
+        shared = {f"a{i:015x}" for i in range(30)}
+        incumbent = _entry(
+            composite=0.80,
+            sha256="aa" * 32,
+            size_bytes=None,
+            content_fingerprint=_nsk(shared, baseline_id="000000000000"),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5Challenger",
+            sha256="bb" * 32,
+            composite=0.801,
+            size_bytes=None,
+            content_fingerprint=_nsk(shared, baseline_id="c8d712f1addf"),
+            eligible=[incumbent],
+        )
+        assert decision.held is False

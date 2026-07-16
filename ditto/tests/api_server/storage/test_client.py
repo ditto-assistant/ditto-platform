@@ -205,9 +205,7 @@ class TestGetObject:
     async def test_reassembles_object_spanning_multiple_chunks(self):
         client = S3StorageClient(_make_config())
         body = b"the-complete-stored-tarball-across-many-chunks"
-        _install_mock_session(
-            client, get_result={"Body": _ChunkedBody(body, chunk=4)}
-        )
+        _install_mock_session(client, get_result={"Body": _ChunkedBody(body, chunk=4)})
 
         result = await client.get_object(key="a/agent.tar.gz", max_bytes=1024)
 
@@ -215,16 +213,12 @@ class TestGetObject:
         # return the whole object so its digest matches the stored artifact
         # (a truncated body is what surfaced to operators as a 502).
         assert result == body
-        assert (
-            hashlib.sha256(result).hexdigest() == hashlib.sha256(body).hexdigest()
-        )
+        assert hashlib.sha256(result).hexdigest() == hashlib.sha256(body).hexdigest()
 
     async def test_reads_object_smaller_than_one_chunk(self):
         client = S3StorageClient(_make_config())
         body = b"tiny"
-        _install_mock_session(
-            client, get_result={"Body": _ChunkedBody(body, chunk=64)}
-        )
+        _install_mock_session(client, get_result={"Body": _ChunkedBody(body, chunk=64)})
 
         assert await client.get_object(key="k", max_bytes=1024) == body
 

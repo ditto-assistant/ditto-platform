@@ -102,7 +102,7 @@ Everything below ships after launch. None of it blocks launch.
 ### Decentralization / trust
 - **X-TRAJ** (DECISION): the forwarded `ScoreReport` carries only tool names, not `(name, args, hop)`. Enrich the export before building the behavioral anti-copy gate, or the clone signal can only compare name-sequences.
 - **X-SHADOW** (KNOWN): semantic-clone prevention is not live (the code-embedding vector is stored but not gating; the embedder is off). State it plainly at launch.
-- **C-TUNE**: tune the plagiarism thresholds against a real corpus and build a reviewer workflow (today `ath_pending_review` is drained by hand).
+- **C-TUNE**: the lexical channel is baseline-aware (the public starter-kit scaffolding is subtracted before sketching, so independent kit derivatives no longer look near-identical; regenerate `ditto/anticopy/data/` on each kit release and run `scripts/rebaseline_anticopy.py`). Remaining: tune thresholds against a real corpus, restore the structural channel as a trigger once dittobench ships baseline-subtracted AST sketches, and build a reviewer workflow (today `ath_pending_review` is drained by hand).
 - **C-RATE / X-HARDEN**: the dev permit-bypass flag is refused on finney in code (keep it unset in prod). Remaining is deploy-layer: front the platform with a TLS + rate-limiting reverse proxy and global/per-hotkey limits.
 
 ### Infra / ops

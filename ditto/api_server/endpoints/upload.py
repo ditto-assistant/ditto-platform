@@ -27,6 +27,7 @@ import bittensor
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ditto.anticopy.baseline import BaselineCorpus, load_baseline
 from ditto.api_models import (
     EvalPricingResponse,
     UploadAgentResponse,
@@ -320,8 +321,14 @@ async def upload_agent(
     # block the event loop for every concurrent request. Best-effort: an
     # unreadable/empty tarball yields None (the gate then relies on sha256 + size),
     # never a 500.
+    # The shared-scaffolding baseline (the public starter kit's shingles) is
+    # subtracted before sketching, so the stored sketch is the submission's
+    # NOVEL content — two independent miners editing the same reference kit no
+    # longer look near-identical to the gate. Missing corpus file -> legacy
+    # whole-tarball sketch.
+    baseline = load_baseline()
     content_fingerprint = await asyncio.to_thread(
-        compute_content_fingerprint, tar_bytes
+        _fingerprint_with_baseline, tar_bytes, baseline
     )
     # 7c. exact-repack hash: the canonicalized-source equality signal for the
     # gate (comments/whitespace stripped, files sorted). Same CPU-bound offload +
@@ -372,6 +379,17 @@ async def upload_agent(
         f"amount_rao={verified.amount_rao} block_hash={verified.block_hash}"
     )
     return UploadAgentResponse(agent_id=agent_id, status=AgentStatus.UPLOADED)
+
+
+def _fingerprint_with_baseline(
+    tar_bytes: bytes, baseline: BaselineCorpus | None
+) -> dict | None:
+    """Novelty sketch when a scaffolding corpus is deployed, legacy otherwise."""
+    if baseline is None:
+        return compute_content_fingerprint(tar_bytes)
+    return compute_content_fingerprint(
+        tar_bytes, exclude=baseline.shingles, baseline_id=baseline.baseline_id
+    )
 
 
 def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:

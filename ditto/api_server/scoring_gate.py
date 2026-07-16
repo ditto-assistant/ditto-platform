@@ -6,13 +6,17 @@ dethrone the original. The KOTH+ATH fold already defeats a *verbatim* copy — i
 ties the incumbent, never clears the 1% margin, and first-seen protects the
 original. This gate adds cheap signals against a *lightly-tweaked* copy that
 nudges its score just past the incumbent: such a submission scores within a hair
-of the agent it surpasses and matches on tarball size or on one of two fingerprint
-channels — a *lexical* sketch of the tarball text
-(:mod:`ditto.api_server.fingerprint`), which survives reindent/rename/reformat/edit
-and padding, or a *structural* sketch of the crate's AST shape (computed by
-dittobench, arriving on the score report), which additionally survives identifier
-renaming. Both channels are compared by Jaccard (edit-in-place) or containment
-(padded copy).
+of the agent it surpasses and matches on the *lexical* fingerprint channel — a
+sketch of the tarball text (:mod:`ditto.api_server.fingerprint`) computed over the
+submission's NOVEL content (the public starter-kit scaffolding is subtracted at
+fingerprint time; see :mod:`ditto.anticopy.baseline`), which survives
+reindent/reformat/localized-edit and junk-file padding. Comparison is by Jaccard
+(edit-in-place) or containment (padded copy). The *structural* AST-shape sketch
+(computed by dittobench, arriving on the score report) and the prompt sketch are
+corroborating annotations on a hold, not triggers: both are computed over the
+whole crate, so on starter-kit-derived submissions they saturate between
+independent miners. Tarball-size proximity is a fallback for rows with no usable
+fingerprint only.
 
 This is **moderation, not weight logic** — it decides only whether a suspicious
 high-scorer is held in ``ath_pending_review`` for human review (see
@@ -71,6 +75,13 @@ _DEFAULT_STRUCTURAL_CONTAINMENT_TOL = 0.98
 # its per-agent sketch is stored for calibration, but the active fusion hold waits
 # on an orthogonal signal (the code-embedding or behavioral channel).
 _PROMPT_ADVISORY_TOL = 0.5
+# Minimum observed novel-shingle evidence (novelty sketches, fingerprint v2)
+# before the lexical channel may hold. One edited line disturbs up to
+# _SHINGLE_LINES(=4) shingles, so below this floor the "novel content" is less
+# than a single edited region — statistically nothing to compare, and nothing a
+# copier would need to steal (the exact-equality rules still catch literal
+# resubmissions of near-pristine kits).
+_MIN_NOVEL_SHINGLES = 4
 
 
 @dataclass(frozen=True)
@@ -105,6 +116,40 @@ def _prompt_note(prompt_fingerprint: dict | None, e: LedgerRow) -> str:
     return ""
 
 
+def _structural_note(
+    structural_fingerprint: dict | None,
+    e: LedgerRow,
+    *,
+    jaccard_tol: float,
+    containment_tol: float,
+) -> str:
+    """Advisory structural-overlap note appended to a hold's audit reason.
+
+    The structural (AST-shape) sketch arrives from dittobench computed over the
+    WHOLE crate, so on starter-kit-derived submissions it saturates near 1.0
+    between independent miners exactly like the pre-novelty lexical channel did.
+    Until dittobench ships baseline-subtracted structural sketches it therefore
+    corroborates instead of triggering: high overlap is recorded on a hold that
+    already fired so the moderator sees the rename-resistant channel's opinion.
+    """
+    j, c = content_similarity(structural_fingerprint, e.structural_fingerprint)
+    if j >= jaccard_tol or c >= containment_tol:
+        return f"; structural jaccard {j:.3f}, containment {c:.3f}"
+    return ""
+
+
+def _lexical_abstains(fingerprint: dict | None) -> bool:
+    """Whether a novelty sketch carries too little evidence to hold on.
+
+    Applies only to novelty sketches (``"bl"`` present): a whole-tarball legacy
+    sketch keeps its original semantics until the re-fingerprint backfill
+    replaces it.
+    """
+    if not fingerprint or "bl" not in fingerprint:
+        return False
+    return int(fingerprint.get("card", 0)) < _MIN_NOVEL_SHINGLES
+
+
 def evaluate_duplicate_signals(
     *,
     agent_id: UUID,
@@ -137,21 +182,24 @@ def evaluate_duplicate_signals(
        matches. Like rule 1, held on the hash equality alone — no score proximity,
        because an exact-source match is copy evidence regardless of the score it
        happened to land.
-    2. **Near-duplicate fingerprint** — composites within ``score_tol`` *and*
-       either sketch channel matches:
-
-       - *lexical* (``content_fingerprint``, from the tarball text) at least
-         ``jaccard_tol`` Jaccard or ``containment_tol`` contained — survives
-         re-indent / rename / reformat / localized edits / junk-file padding;
-       - *structural* (``structural_fingerprint``, the AST shape from dittobench)
-         at least ``structural_jaccard_tol`` / ``structural_containment_tol`` —
-         additionally survives identifier renaming, at higher thresholds because
-         unrelated crates share more parse-tree shape than text.
+    2. **Near-duplicate lexical fingerprint** — composites within ``score_tol``
+       *and* the lexical channel (``content_fingerprint``) at least
+       ``jaccard_tol`` Jaccard or ``containment_tol`` contained. On novelty
+       sketches (the shared starter-kit scaffolding subtracted at fingerprint
+       time) this compares only what each miner actually wrote, so independent
+       few-line edits of the reference harness score ~0 against each other while
+       a tweaked copy still carries the incumbent's novel shingles. The channel
+       abstains when either side's observed novelty is below
+       ``_MIN_NOVEL_SHINGLES`` (nothing meaningful to compare). Structural
+       (``structural_fingerprint``, whole-crate AST shape from dittobench) and
+       prompt overlap annotate the hold's audit reason as corroboration; neither
+       triggers on its own until they are baseline-aware.
 
     3. **Size near-duplicate** — composites within ``score_tol`` *and* tarball
-       sizes within ``size_tol`` (a lightly-tweaked copy barely moves either).
-       Retained as a cheap catch for rows with no fingerprint (uploaded before
-       fingerprinting, or an unreadable tarball).
+       sizes within ``size_tol``, checked ONLY when either side has no usable
+       content fingerprint (uploaded before fingerprinting, or an unreadable
+       tarball). Starter-kit-derived tarballs are all kit-sized, so size+score
+       alone must never hold a pair the content channel can actually see.
 
     Rules 2 and 3 check *every* other-miner eligible agent, in either score
     direction, so a genuine unrelated agent scoring in between cannot mask the
@@ -194,43 +242,51 @@ def evaluate_duplicate_signals(
                     reason=f"normalized-source (repack) match of agent {e.agent_id}",
                 )
 
-    # 2. Near-dup fingerprint: close in score AND a matching sketch on either the
-    #    lexical or the structural channel. Checked before the size rule because a
-    #    fingerprint is the stronger, size-independent signal. Lexical is tried
-    #    first (more precise / lower false-positive) then structural (rename-proof).
-    for e in others:
-        if abs(composite - e.composite) > score_tol:
-            continue
-        lex_j, lex_c = content_similarity(content_fingerprint, e.content_fingerprint)
-        if lex_j >= jaccard_tol or lex_c >= containment_tol:
-            return ReviewDecision(
-                held=True,
-                duplicate_of=e.agent_id,
-                reason=(
-                    f"content near-duplicate of agent {e.agent_id}: "
-                    f"composite delta {abs(composite - e.composite):.4f}, "
-                    f"jaccard {lex_j:.3f}, containment {lex_c:.3f}"
-                    + _prompt_note(prompt_fingerprint, e)
-                ),
+    # 2. Near-dup fingerprint: close in score AND the lexical sketch matches.
+    #    On novelty sketches (fingerprint v2) the comparison covers only the
+    #    submission's OWN contribution — the shared public starter kit is
+    #    subtracted at fingerprint time — so two independent miners each editing
+    #    a few lines of the reference harness no longer look near-identical.
+    #    The channel abstains below _MIN_NOVEL_SHINGLES of observed novelty
+    #    (nothing meaningful to compare); structural and prompt overlap are
+    #    appended to the audit reason as corroboration, never triggers.
+    if not _lexical_abstains(content_fingerprint):
+        for e in others:
+            if abs(composite - e.composite) > score_tol:
+                continue
+            if _lexical_abstains(e.content_fingerprint):
+                continue
+            lex_j, lex_c = content_similarity(
+                content_fingerprint, e.content_fingerprint
             )
-        str_j, str_c = content_similarity(
-            structural_fingerprint, e.structural_fingerprint
-        )
-        if str_j >= structural_jaccard_tol or str_c >= structural_containment_tol:
-            return ReviewDecision(
-                held=True,
-                duplicate_of=e.agent_id,
-                reason=(
-                    f"structural near-duplicate of agent {e.agent_id}: "
-                    f"composite delta {abs(composite - e.composite):.4f}, "
-                    f"structural jaccard {str_j:.3f}, containment {str_c:.3f}"
-                    + _prompt_note(prompt_fingerprint, e)
-                ),
-            )
+            if lex_j >= jaccard_tol or lex_c >= containment_tol:
+                return ReviewDecision(
+                    held=True,
+                    duplicate_of=e.agent_id,
+                    reason=(
+                        f"content near-duplicate of agent {e.agent_id}: "
+                        f"composite delta {abs(composite - e.composite):.4f}, "
+                        f"jaccard {lex_j:.3f}, containment {lex_c:.3f}"
+                        + _structural_note(
+                            structural_fingerprint,
+                            e,
+                            jaccard_tol=structural_jaccard_tol,
+                            containment_tol=structural_containment_tol,
+                        )
+                        + _prompt_note(prompt_fingerprint, e)
+                    ),
+                )
 
     # 3. Size near-dup of another miner: close in both score and tarball size.
+    #    A FALLBACK for pairs the content channel cannot see (a row uploaded
+    #    before fingerprinting or an unreadable tarball) — never fired when both
+    #    sides carry a usable sketch, because on starter-kit-derived submissions
+    #    every honest tarball is kit-sized and score-adjacent, which made
+    #    size+score the gate's dominant false-positive source.
     if size_bytes is not None:
         for e in others:
+            if content_fingerprint and e.content_fingerprint:
+                continue
             if (
                 e.size_bytes is not None
                 and abs(composite - e.composite) <= score_tol
