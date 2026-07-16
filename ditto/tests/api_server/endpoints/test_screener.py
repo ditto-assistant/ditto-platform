@@ -1360,6 +1360,72 @@ class TestClaim:
 
 
 class TestQuarantineAdmin:
+    async def test_list_sorts_oldest_by_default_and_accepts_newest(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        timestamps = [
+            datetime(2026, 7, 13, 12, tzinfo=UTC),
+            datetime(2026, 7, 15, 12, tzinfo=UTC),
+        ]
+        agent_ids: list[UUID] = []
+
+        for index, created_at in enumerate(timestamps, start=1):
+            agent_id = await _seed_agent(
+                session_maker,
+                status=AgentStatus.UPLOADED,
+                name=f"quarantine-{index}",
+                sha256=f"{index:02x}" * 32,
+            )
+            agent_ids.append(agent_id)
+            claimed = await client.post(_CLAIM_URL)
+            attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+            held = await client.post(
+                f"/api/v1/screener/agent/{agent_id}/result",
+                json=_result_payload(
+                    agent_id,
+                    passed=False,
+                    attempt_id=attempt_id,
+                    outcome="quarantine",
+                    manifest_digest=f"{index + 10:02x}" * 32,
+                    finding_digest=f"{index + 20:02x}" * 32,
+                    reason_code="agentic-source-review-tripwire",
+                ),
+            )
+            assert held.status_code == 200
+            async with session_maker() as session, session.begin():
+                quarantine = await session.scalar(
+                    select(ScreeningQuarantine).where(
+                        ScreeningQuarantine.agent_id == agent_id
+                    )
+                )
+                assert quarantine is not None
+                quarantine.created_at = created_at
+
+        headers = {"Authorization": "Bearer test-admin-token-at-least-32-characters"}
+        oldest = await client.get(
+            "/api/v1/admin/screening-quarantines", headers=headers
+        )
+        newest = await client.get(
+            "/api/v1/admin/screening-quarantines?sort=newest", headers=headers
+        )
+
+        assert oldest.status_code == newest.status_code == 200
+        assert [item["agent_id"] for item in oldest.json()["items"]] == [
+            str(agent_id) for agent_id in agent_ids
+        ]
+        assert [item["agent_id"] for item in newest.json()["items"]] == [
+            str(agent_id) for agent_id in reversed(agent_ids)
+        ]
+
     @pytest.mark.parametrize(
         ("resolution", "expected_status", "expected_reason"),
         [

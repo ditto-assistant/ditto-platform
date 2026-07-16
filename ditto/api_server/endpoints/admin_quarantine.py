@@ -257,16 +257,25 @@ async def list_quarantines(
     _admin: AdminDep,
     session: SessionDep,
     status: Annotated[Literal["active", "resolved", "all"], Query()] = "active",
+    sort: Annotated[Literal["oldest", "newest"], Query()] = "oldest",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> AdminQuarantineList:
-    stmt = (
-        select(ScreeningQuarantine, Agent)
-        .join(Agent, Agent.agent_id == ScreeningQuarantine.agent_id)
-        .order_by(
+    order = (
+        (
+            ScreeningQuarantine.created_at.asc(),
+            ScreeningQuarantine.quarantine_id.asc(),
+        )
+        if sort == "oldest"
+        else (
             ScreeningQuarantine.created_at.desc(),
             ScreeningQuarantine.quarantine_id.desc(),
         )
+    )
+    stmt = (
+        select(ScreeningQuarantine, Agent)
+        .join(Agent, Agent.agent_id == ScreeningQuarantine.agent_id)
+        .order_by(*order)
         .offset(offset)
         .limit(limit)
     )
