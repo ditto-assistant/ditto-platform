@@ -295,6 +295,19 @@ def _job_signing_message(
     return f"validator-job:{validator_hotkey}:{nonce}:{requested}".encode()
 
 
+def _artifact_signing_message(
+    validator_hotkey: str,
+    agent_id: UUID,
+    nonce: UUID,
+    requested_at: datetime,
+) -> bytes:
+    """Canonical proof-of-possession bytes for one artifact URL request."""
+    requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
+    return (
+        f"validator-artifact:v1:{validator_hotkey}:{agent_id}:{nonce}:{requested}"
+    ).encode()
+
+
 def _heartbeat_signing_message(
     *,
     validator_hotkey: str,
@@ -669,23 +682,76 @@ async def _assert_validator_compatible(
 )
 async def agent_artifact(
     agent_id: UUID,
+    request: Request,
     response: Response,
-    validator_hotkey: ValidatorDep,
+    chain: ChainDep,
     session: SessionDep,
     storage: StorageDep,
+    x_validator_hotkey: Annotated[str | None, Header()] = None,
+    x_validator_artifact_nonce: Annotated[UUID | None, Header()] = None,
+    x_validator_artifact_requested_at: Annotated[datetime | None, Header()] = None,
+    x_validator_artifact_signature: Annotated[str | None, Header()] = None,
 ) -> ArtifactResponse:
-    """Return a short-lived pre-signed download URL for the agent's tarball."""
+    """Return an artifact URL after fresh proof of validator-key possession."""
     response.headers["Cache-Control"] = "no-store"
-    agent = await get_agent_by_id(session, agent_id=agent_id)
-    if agent is None:
-        raise AgentNotFoundError(f"no agent with id={agent_id}")
+    if (
+        x_validator_hotkey is None
+        or not re.fullmatch(_SS58_PATTERN, x_validator_hotkey)
+        or x_validator_artifact_nonce is None
+        or x_validator_artifact_requested_at is None
+        or x_validator_artifact_signature is None
+    ):
+        raise ValidatorAuthError("artifact request proof is missing or malformed")
+    if x_validator_artifact_requested_at.tzinfo is None:
+        raise ValidatorAuthError("artifact request timestamp must include a timezone")
+    signed = _artifact_signing_message(
+        x_validator_hotkey,
+        agent_id,
+        x_validator_artifact_nonce,
+        x_validator_artifact_requested_at,
+    )
+    if not _verify_signature(
+        x_validator_hotkey, signed, x_validator_artifact_signature
+    ):
+        raise ValidatorAuthError("artifact request signature did not verify")
+    now = datetime.now(UTC)
+    if (
+        abs(now - x_validator_artifact_requested_at.astimezone(UTC))
+        > _JOB_REQUEST_MAX_AGE
+    ):
+        raise HTTPException(
+            status_code=409, detail="artifact request timestamp is stale"
+        )
+    await _assert_validator_permitted(
+        chain,
+        request.app.state.config.chain.netuid,
+        x_validator_hotkey,
+        network=request.app.state.config.chain.subtensor_network,
+    )
+    async with session.begin():
+        try:
+            await consume_validator_nonce(
+                session,
+                nonce=x_validator_artifact_nonce,
+                validator_hotkey=x_validator_hotkey,
+                now=now,
+                expires_at=now + _JOB_REQUEST_MAX_AGE,
+            )
+        except ValidatorRequestReplayError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="artifact request nonce has already been used",
+            ) from exc
+        agent = await get_agent_by_id(session, agent_id=agent_id)
+        if agent is None:
+            raise AgentNotFoundError(f"no agent with id={agent_id}")
     url = await storage.presigned_get_url(
         key=_artifact_key(agent_id),
         expires_in=int(_ARTIFACT_URL_TTL.total_seconds()),
     )
     logger.info(
         "validator=%s fetched artifact url for agent_id=%s",
-        validator_hotkey,
+        x_validator_hotkey,
         agent_id,
     )
     return ArtifactResponse(
