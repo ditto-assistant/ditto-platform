@@ -234,12 +234,19 @@ class TestDashboard:
         assert 'data-activity-filter="all" aria-pressed="true"' in body
         assert 'data-activity-filter="rejected" aria-pressed="false"' in body
         assert 'data-activity-filter="under_review" aria-pressed="false"' in body
+        assert "Operator review" in body
         assert 'data-activity-filter="waiting_validator" aria-pressed="false"' in body
         assert 'data-activity-filter="queued" aria-pressed="false"' in body
         assert 'waiting_screening", "screening", "waiting_validator' in body
         assert 'below_score_floor: ["Below score floor", "warn"]' in body
+        assert 'under_review: ["Operator review", "warn"]' in body
         assert '"below_score_floor", "under_review"' in body
         assert "No further validator tickets will be issued." in body
+        assert (
+            "Automated processing is paused while an operator reviews this submission."
+            in body
+        )
+        assert "No screener or validator is currently working on it." in body
         assert 'id="activity-clear" type="button" hidden' in body
         assert 'id="activity-filter-summary" role="status" aria-live="polite"' in body
         assert 'query.append("status", status)' in body

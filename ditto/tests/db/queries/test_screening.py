@@ -36,10 +36,32 @@ async def _seed_failed_agent(session: AsyncSession) -> Agent:
     return agent
 
 
+async def _seed_failed_agent_with_age(
+    session: AsyncSession, *, name: str, age: timedelta
+) -> Agent:
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey=f"5HK-{name}",
+        name=name,
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.SCREENING_FAILED,
+        created_at=datetime.now(UTC) - age,
+    )
+    agent.screening_policy_version = SCREENING_POLICY_VERSION
+    async with session.begin():
+        session.add(agent)
+    return agent
+
+
 async def _add_expired_attempts(
-    session: AsyncSession, agent: Agent, count: int
+    session: AsyncSession,
+    agent: Agent,
+    count: int,
+    *,
+    policy_version: int = SCREENING_POLICY_VERSION,
+    base: datetime | None = None,
 ) -> None:
-    base = datetime.now(UTC) - timedelta(hours=6)
+    base = base or datetime.now(UTC) - timedelta(hours=6)
     async with session.begin():
         for index in range(count):
             started = base + timedelta(minutes=45 * index)
@@ -48,7 +70,7 @@ async def _add_expired_attempts(
                     attempt_id=uuid4(),
                     agent_id=agent.agent_id,
                     screener_hotkey=_SCREENER,
-                    policy_version=SCREENING_POLICY_VERSION,
+                    policy_version=policy_version,
                     status="expired",
                     started_at=started,
                     deadline=started + timedelta(minutes=45),
@@ -58,14 +80,14 @@ async def _add_expired_attempts(
             )
 
 
-async def _claim(session: AsyncSession) -> list:
+async def _claim(session: AsyncSession, *, limit: int = 10) -> list:
     async with session.begin():
         return await claim_screening_attempts(
             session,
             screener_hotkey=_SCREENER,
             now=datetime.now(UTC),
             ttl=timedelta(minutes=45),
-            limit=10,
+            limit=limit,
         )
 
 
@@ -112,3 +134,55 @@ async def test_agent_still_claimed_below_the_cap(session: AsyncSession):
         )
     )
     assert quarantine is None
+
+
+async def test_fresh_agent_runs_before_older_retry(session: AsyncSession):
+    retry = await _seed_failed_agent_with_age(
+        session, name="older-retry", age=timedelta(days=2)
+    )
+    fresh = await _seed_failed_agent_with_age(
+        session, name="fresh-work", age=timedelta(days=1)
+    )
+    await _add_expired_attempts(session, retry, 1)
+
+    claimed = await _claim(session, limit=1)
+
+    assert [agent.agent_id for agent, _, _ in claimed] == [fresh.agent_id]
+
+
+async def test_retry_runs_before_a_later_arriving_fresh_agent(
+    session: AsyncSession,
+):
+    retry = await _seed_failed_agent_with_age(
+        session, name="retry", age=timedelta(days=2)
+    )
+    await _seed_failed_agent_with_age(
+        session, name="later-fresh", age=timedelta(hours=1)
+    )
+    await _add_expired_attempts(session, retry, 1)
+
+    claimed = await _claim(session, limit=1)
+
+    assert [agent.agent_id for agent, _, _ in claimed] == [retry.agent_id]
+
+
+async def test_previous_policy_attempt_does_not_defer_current_policy_work(
+    session: AsyncSession,
+):
+    older = await _seed_failed_agent_with_age(
+        session, name="older-policy-history", age=timedelta(days=2)
+    )
+    await _seed_failed_agent_with_age(
+        session, name="newer-current-work", age=timedelta(days=1)
+    )
+    await _add_expired_attempts(
+        session,
+        older,
+        1,
+        policy_version=SCREENING_POLICY_VERSION - 1,
+        base=datetime.now(UTC) - timedelta(minutes=45),
+    )
+
+    claimed = await _claim(session, limit=1)
+
+    assert [agent.agent_id for agent, _, _ in claimed] == [older.agent_id]
