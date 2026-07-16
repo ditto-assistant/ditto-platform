@@ -317,6 +317,52 @@ class TestReferenceAwareFingerprints:
         )
         assert prompt_j < 0.75 and prompt_c < 0.95
 
+    def test_small_block_theft_is_still_caught(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the floor value: a ~12-line innovation block leaves a
+        # residual between the floor (8) and the old floor (16). At 16 both the
+        # original and a verbatim copy sketched EMPTY and the theft escaped
+        # every channel; at 8 the copy is caught at exact containment 1.0.
+        baseline = self._source("starter", self._BASELINE_PROMPT)
+        _install_reference_fixture(monkeypatch, baseline)
+        block = "\n".join(
+            f"fn tuned_{i}(x: u64) -> u64 {{ x.rotate_left({i + 1}) ^ 0xA5 }}"
+            for i in range(12)
+        ).encode()
+        original = _tar_gz({"baseline": baseline, "custom": block})
+        copy = _tar_gz(
+            {
+                "baseline": baseline,
+                "custom": block,
+                "padding": b"fn pad(x: u64) -> u64 { x }",
+            }
+        )
+        original_fp = compute_content_fingerprint(original)
+        copy_fp = compute_content_fingerprint(copy)
+        assert original_fp is not None and original_fp["m"] != []
+        assert 8 <= original_fp["card"] < 16
+        _, containment = content_similarity(original_fp, copy_fp)
+        assert containment >= 0.95
+
+    def test_below_floor_residual_sketches_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One edited region (a couple of lines, < 8 residual shingles) stays
+        # below the floor: nothing to compare, nothing worth stealing.
+        baseline = self._source("starter", self._BASELINE_PROMPT)
+        _install_reference_fixture(monkeypatch, baseline)
+        tweaked = _tar_gz(
+            {
+                "baseline": baseline,
+                "custom": b"fn tiny(x: u64) -> u64 { x + 3 }",
+            }
+        )
+        sketch = compute_content_fingerprint(tweaked)
+        assert sketch is not None and sketch["m"] == []
+        assert 0 < sketch["card"] < 8
+        assert content_similarity(sketch, sketch) == (0.0, 0.0)
+
     def test_shared_custom_residual_still_matches(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

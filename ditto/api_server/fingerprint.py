@@ -83,14 +83,28 @@ _MINHASH_K = 256
 _HASH_HEX = 16
 
 # Reference-aware v2 fingerprints remove shingles found anywhere in the official
-# starter-kit history before sketching.  Small residual surfaces are too unstable
-# for fuzzy moderation: at 16 lexical shingles one mismatch already puts exact
-# containment below the 0.95 hold threshold, while smaller sets can cross a
-# threshold on only a handful of shared boilerplate windows. Prompt remains an
-# advisory channel and uses an eight-shingle floor. The exact normalized-source
-# channel has a smaller floor because equality of the complete residual set is
-# stronger than a fuzzy ratio.
-_MIN_CONTENT_SHINGLES = 16
+# starter-kit history before sketching. Below the floor the sketch is emptied:
+# a residual smaller than this is statistically nothing to compare (and nothing
+# a copier needs to steal — the exact-equality rules still catch literal
+# resubmissions). The floor is EIGHT shingles — two full edited regions, since a
+# shingle spans _SHINGLE_LINES(=4) normalized lines and one edited line disturbs
+# at most that many shingles:
+#
+# - 16 was measured to miss real theft: a 12-line innovation block yields a
+#   residual of ~12 shingles, so BOTH the original and a verbatim copy of it
+#   sketched empty and the copy escaped every channel.
+# - 4 (one region) is too coincidence-prone: two honest agents sharing a single
+#   verbatim boilerplate window (a pasted community fix, a common config stanza)
+#   would match on it alone.
+# - Estimator instability is not a factor in this range: for card < k the
+#   sketch IS the full set, so Jaccard/containment are exact — a verbatim
+#   subset scores exactly 1.0 and a one-shingle mismatch drops cleanly below
+#   the 0.95 containment hold either way.
+#
+# Prompt remains an advisory channel with the same eight-shingle floor. The
+# exact normalized-source channel has a smaller floor because equality of the
+# complete residual set is stronger than a fuzzy ratio.
+_MIN_CONTENT_SHINGLES = 8
 _MIN_PROMPT_SHINGLES = 8
 _MIN_NSH_SHINGLES = 4
 _REFERENCE_BUNDLES = {
