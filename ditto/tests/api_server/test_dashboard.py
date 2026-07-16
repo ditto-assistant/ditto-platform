@@ -435,7 +435,6 @@ class TestDashboard:
         assert 'copyButton(e.agent_id, "agent ID")' in body
         assert 'copyButton(e.miner_hotkey, "miner hotkey")' in body
         assert 'copyButton(hotkey, singular + " hotkey")' in body
-        assert 'copyButton(hotkey, "validator hotkey")' in body
         assert 'copyButton(s.validator_hotkey, "validator hotkey")' in body
         assert 'id="copy-status"' in body
         assert 'role="status"' in body
@@ -476,7 +475,7 @@ class TestDashboard:
         assert "entityAnchor(singular, hotkey, shortKey(hotkey))" in body
         assert "fleet-node-key copyable" in body
         assert "title=\"' + esc(hotkey)" in body
-        assert 'copyButton(hotkey, "validator hotkey")' in body
+        assert 'copyButton(hotkey, singular + " hotkey")' in body
         assert "fleetUnavailable.validators = true" in body
 
     async def test_includes_system_and_time_aware_theme_switcher(self) -> None:
