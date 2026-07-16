@@ -60,6 +60,14 @@ class AdminCopyReviewCurrentComparison(BaseModel):
     current_decision: str
 
 
+class AdminCopyReviewComparisonUnavailable(BaseModel):
+    """Per-row fail-closed comparison state for the embedded list form."""
+
+    availability: Literal["unavailable"] = "unavailable"
+    bulk_eligible: Literal[False] = False
+    reason: str
+
+
 class AdminCopyReviewItem(BaseModel):
     review_id: UUID
     agent_id: UUID
@@ -74,6 +82,12 @@ class AdminCopyReviewItem(BaseModel):
     resolution: Literal["clear", "reject"] | None = None
     resolution_reason: str | None = None
     original: AdminCopyReviewEvidence
+    # Populated only when the list is requested with
+    # ``include=current_comparison``; None otherwise (and on the detail and
+    # resolve responses, whose consumers use the dedicated endpoint).
+    current_comparison: (
+        AdminCopyReviewCurrentComparison | AdminCopyReviewComparisonUnavailable | None
+    ) = None
 
 
 class AdminCopyReviewList(BaseModel):

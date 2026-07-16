@@ -216,6 +216,59 @@ async def test_matched_identity_is_null_when_reference_row_is_gone(
     assert original["duplicate_of_hotkey"] is None
 
 
+async def test_list_can_embed_current_comparisons_in_one_request(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    comparable, _ = await _seed_current_comparison(maker)
+    scoreless, _ = await _seed(maker, opened_at=_T0 + timedelta(hours=1))
+    _install(app, maker)
+    response = await client.get(
+        "/api/v1/admin/copy-reviews?include=current_comparison", headers=_HEADERS
+    )
+    assert response.status_code == 200
+    by_agent = {item["agent_id"]: item for item in response.json()["items"]}
+    embedded = by_agent[str(comparable)]["current_comparison"]
+    assert embedded["availability"] == "available"
+    assert embedded["algorithm_version"] == "reference-aware-v2"
+    assert embedded["current_decision"] in {"clear", "hold", "inconclusive_review"}
+    # A row the dedicated endpoint would 409 embeds the fail-closed state.
+    failed_closed = by_agent[str(scoreless)]["current_comparison"]
+    assert failed_closed == {
+        "availability": "unavailable",
+        "bulk_eligible": False,
+        "reason": "current comparison unavailable",
+    }
+    # No fingerprint material leaks through the embedded form either.
+    serialized = response.text.lower()
+    assert "sha256" not in serialized and '"m":' not in serialized
+
+
+async def test_list_without_include_omits_comparisons(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    await _seed_current_comparison(maker)
+    _install(app, maker)
+    response = await client.get("/api/v1/admin/copy-reviews", headers=_HEADERS)
+    assert response.status_code == 200
+    assert response.json()["items"][0]["current_comparison"] is None
+
+
+async def test_embedded_comparison_matches_the_dedicated_endpoint(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id, _ = await _seed_current_comparison(maker)
+    _install(app, maker)
+    dedicated = await client.get(
+        f"/api/v1/admin/copy-reviews/{agent_id}/current-comparison", headers=_HEADERS
+    )
+    listing = await client.get(
+        "/api/v1/admin/copy-reviews?include=current_comparison", headers=_HEADERS
+    )
+    assert dedicated.status_code == 200 and listing.status_code == 200
+    embedded = listing.json()["items"][0]["current_comparison"]
+    assert embedded == dedicated.json()
+
+
 async def test_current_comparison_is_unavailable_without_finalized_scores(
     app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
 ) -> None:
