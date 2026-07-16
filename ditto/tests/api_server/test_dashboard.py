@@ -373,6 +373,8 @@ class TestDashboard:
         assert "running_benchmark" in body
         assert "metrics.cpu_percent >= 95" not in body
         assert 'fleetMeter(metrics.cpu_percent, "")' in body
+        assert 'metrics.disk_percent >= 95 ? "warn" : ""' in body
+        assert "metrics.disk_percent >= 85" not in body
         assert "privacy-note" not in body
         assert "fleet-health-note" not in body
         assert '" reporting " + kind' not in body

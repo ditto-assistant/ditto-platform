@@ -303,7 +303,7 @@ def _fleet_classification(
         health = "unknown"
     elif (
         metrics.memory_percent >= 90
-        or metrics.disk_percent >= 85
+        or metrics.disk_percent >= 95
         or metrics.docker_status == "degraded"
     ):
         health = "warning"
