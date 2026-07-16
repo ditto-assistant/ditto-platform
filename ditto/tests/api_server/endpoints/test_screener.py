@@ -1188,6 +1188,34 @@ class TestClaim:
         assert claimed["precheck_reason_code"] is None
         assert claimed["duplicate_of"] is None
 
+    async def test_rescreened_older_hash_does_not_use_later_submission_as_owner(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        older = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCREENING_FAILED,
+            miner_hotkey="5OlderMinerHotkeyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            created_at=now - timedelta(minutes=2),
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            miner_hotkey="5LaterMinerHotkeyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            created_at=now - timedelta(minutes=1),
+        )
+        _install_db(app, session_maker)
+
+        claimed = (await client.post(_CLAIM_URL)).json()["items"][0]
+
+        assert claimed["agent_id"] == str(older)
+        assert claimed["precheck_reason_code"] is None
+        assert claimed["duplicate_of"] is None
+
     async def test_policy_mismatch_does_not_create_lease(
         self,
         app: FastAPI,
