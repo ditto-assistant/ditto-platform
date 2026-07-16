@@ -230,6 +230,15 @@ class TestDashboard:
         assert "one private dispute" in body
         assert "cannot be edited or replaced" in body
         assert "ditto-dispute-v1:" in body
+        assert 'id="screening-dispute-wallet"' in body
+        assert 'id="screening-dispute-hotkey"' in body
+        assert "Ready-to-run btcli command" in body
+        assert "btcli wallet sign --wallet-name" in body
+        assert '" --wallet-hotkey "' in body
+        assert '" --use-hotkey --message "' in body
+        assert '" --json-output"' in body
+        assert 'data-copy-label="btcli signing command"' in body
+        assert "Wallet details stay in this browser and are not submitted." in body
         assert 'maxlength="1000"' in body
         assert 'maxlength="128"' in body
         assert 'pattern="[0-9a-fA-F]{128}"' in body

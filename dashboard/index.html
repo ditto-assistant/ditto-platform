@@ -719,8 +719,18 @@
     .screening-dispute-form textarea:focus,
     .screening-dispute-form input:focus { border-color: var(--accent); outline: 2px solid color-mix(in oklab, var(--accent) 28%, transparent); outline-offset: 1px; }
     .screening-dispute-meta { display: flex; justify-content: space-between; gap: var(--detail-space-md); color: var(--text-faint); font-size: 11px; font-weight: 500; }
-    .screening-dispute-payload { display: flex; align-items: flex-start; gap: var(--detail-space-xs); min-width: 0; }
-    .screening-dispute-payload code { flex: 1; color: var(--text-dim); font: 10.5px/1.5 var(--mono); overflow-wrap: anywhere; }
+    .screening-dispute-wallets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--detail-space-md); }
+    .screening-dispute-command {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--detail-space-sm);
+      min-width: 0;
+      padding: 10px 12px;
+      border: 1px solid color-mix(in oklab, var(--border) 82%, transparent);
+      border-radius: 8px;
+      background: color-mix(in oklab, var(--bg) 52%, transparent);
+    }
+    .screening-dispute-command code { flex: 1; color: var(--text-dim); font: 10.5px/1.55 var(--mono); overflow-wrap: anywhere; user-select: all; }
     .screening-dispute-actions { display: flex; align-items: center; gap: var(--detail-space-md); flex-wrap: wrap; }
     .screening-dispute-submit { padding: 9px 14px; border: 0; border-radius: 8px; background: var(--accent); color: var(--bg); font: 750 12px/1 var(--sans); cursor: pointer; }
     .screening-dispute-submit:disabled { cursor: not-allowed; opacity: .45; }
@@ -811,6 +821,7 @@
       .attempt { grid-template-columns: 76px 1fr; gap: 12px; }
       .attempt-time { grid-column: 2; }
       .accepted-score { grid-template-columns: 1fr; gap: var(--detail-space-sm); }
+      .screening-dispute-wallets { grid-template-columns: 1fr; }
       .retry-info::after { width: min(240px, calc(100vw - 72px)); }
     }
 
@@ -3568,9 +3579,17 @@
             '<textarea id="screening-dispute-message" minlength="20" maxlength="1000" required placeholder="Explain what the screener misidentified and where the relevant behavior appears in your source."></textarea>' +
             '<span class="screening-dispute-meta"><span>20–1000 characters</span><span id="screening-dispute-count">0 / 1000</span></span>' +
           '</label>' +
-          '<label>Signing payload' +
-            '<span class="screening-dispute-payload"><code id="screening-dispute-payload">Write your dispute to generate the payload.</code><button type="button" class="copy" id="screening-dispute-copy" data-key="" data-copy-label="dispute signing payload" aria-label="Copy dispute signing payload" title="Copy dispute signing payload" disabled><span aria-hidden="true">⧉</span></button></span>' +
-            '<span class="screening-dispute-meta">Sign this exact payload with the hotkey that submitted the agent.</span>' +
+          '<div class="screening-dispute-wallets">' +
+            '<label for="screening-dispute-wallet">Wallet name' +
+              '<input id="screening-dispute-wallet" autocomplete="off" spellcheck="false" placeholder="default">' +
+            '</label>' +
+            '<label for="screening-dispute-hotkey">Hotkey name' +
+              '<input id="screening-dispute-hotkey" autocomplete="off" spellcheck="false" placeholder="miner">' +
+            '</label>' +
+          '</div>' +
+          '<label>Ready-to-run btcli command' +
+            '<span class="screening-dispute-command"><code id="screening-dispute-command">Enter your dispute, wallet name, and hotkey name to generate the command.</code><button type="button" class="copy" id="screening-dispute-command-copy" data-key="" data-copy-label="btcli signing command" aria-label="Copy btcli signing command" title="Copy btcli signing command" disabled><span aria-hidden="true">⧉</span></button></span>' +
+            '<span class="screening-dispute-meta">Run this locally, then paste the <code>signed_message</code> value below. Wallet details stay in this browser and are not submitted.</span>' +
           '</label>' +
           '<label for="screening-dispute-signature">Hotkey signature' +
             '<input id="screening-dispute-signature" inputmode="text" autocomplete="off" maxlength="128" pattern="[0-9a-fA-F]{128}" required placeholder="Paste the 128-character hexadecimal signature">' +
@@ -3589,13 +3608,25 @@
       });
     }
 
+    function shellQuote(value) {
+      return "'" + String(value).replace(/'/g, "'\"'\"'") + "'";
+    }
+
+    function disputeSigningCommand(walletName, hotkeyName, payload) {
+      return "btcli wallet sign --wallet-name " + shellQuote(walletName) +
+        " --wallet-hotkey " + shellQuote(hotkeyName) +
+        " --use-hotkey --message " + shellQuote(payload) + " --json-output";
+    }
+
     function bindScreeningDispute(e) {
       var form = document.getElementById("screening-dispute-form");
       if (!form) return;
       var message = document.getElementById("screening-dispute-message");
+      var walletName = document.getElementById("screening-dispute-wallet");
+      var hotkeyName = document.getElementById("screening-dispute-hotkey");
       var signature = document.getElementById("screening-dispute-signature");
-      var payload = document.getElementById("screening-dispute-payload");
-      var copy = document.getElementById("screening-dispute-copy");
+      var command = document.getElementById("screening-dispute-command");
+      var commandCopy = document.getElementById("screening-dispute-command-copy");
       var count = document.getElementById("screening-dispute-count");
       var submit = form.querySelector("button[type=submit]");
       var status = document.getElementById("screening-dispute-status");
@@ -3604,22 +3635,31 @@
         var value = message.value.trim();
         var token = ++updateToken;
         count.textContent = message.value.length + " / 1000";
-        copy.disabled = true;
-        copy.setAttribute("data-key", "");
+        commandCopy.disabled = true;
+        commandCopy.setAttribute("data-key", "");
         submit.disabled = true;
         if (value.length < 20 || value.length > 1000) {
-          payload.textContent = "Write at least 20 characters to generate the payload.";
+          command.textContent = "Write at least 20 characters to generate the command.";
           return;
         }
         disputeSigningMessage(e.agent_id, value).then(function (valueToSign) {
           if (token !== updateToken) return;
-          payload.textContent = valueToSign;
-          copy.setAttribute("data-key", valueToSign);
-          copy.disabled = false;
+          var wallet = walletName.value.trim();
+          var hotkey = hotkeyName.value.trim();
+          if (wallet && hotkey) {
+            var valueToCopy = disputeSigningCommand(wallet, hotkey, valueToSign);
+            command.textContent = valueToCopy;
+            commandCopy.setAttribute("data-key", valueToCopy);
+            commandCopy.disabled = false;
+          } else {
+            command.textContent = "Enter your wallet name and hotkey name to generate the command.";
+          }
           submit.disabled = !/^[0-9a-fA-F]{128}$/.test(signature.value.trim());
         });
       }
       message.addEventListener("input", update);
+      walletName.addEventListener("input", update);
+      hotkeyName.addEventListener("input", update);
       signature.addEventListener("input", update);
       form.addEventListener("submit", function (event) {
         event.preventDefault();

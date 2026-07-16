@@ -59,6 +59,19 @@ hashing:
 ditto-dispute-v1:{agent_id}:{sha256(message)}
 ```
 
+The submission dashboard generates that payload and a ready-to-run command after
+the miner enters the local wallet and hotkey names:
+
+```bash
+btcli wallet sign --wallet-name '<wallet-name>' --wallet-hotkey '<hotkey-name>' \
+  --use-hotkey --message 'ditto-dispute-v1:<agent_id>:<sha256>' --json-output
+```
+
+`--use-hotkey` prevents an accidental coldkey signature. The miner pastes the
+128-character `signed_message` value from the command output into the dispute
+form. Wallet and hotkey names are used only to construct the command in the
+browser and are not included in the dispute request.
+
 `POST /api/v1/public/agent/{agent_id}/dispute` accepts a 20–1000 character
 message and a 128-character hexadecimal signature. Database uniqueness on both
 `agent_id` and `quarantine_id` enforces the one-dispute limit under concurrent
