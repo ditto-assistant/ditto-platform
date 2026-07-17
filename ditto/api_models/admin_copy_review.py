@@ -98,6 +98,17 @@ class AdminCopyReviewList(BaseModel):
     offset: int
 
 
+class AdminCopyReviewAudit(BaseModel):
+    """Operator audit context for one durable ATH hold."""
+
+    review: AdminCopyReviewItem
+    agent_status: str
+    held_artifact_sha256: str | None = None
+    held_score_count: int | None = None
+    previous_status: str | None = None
+    opened_by: str | None = None
+
+
 class AdminSourceDiffFile(BaseModel):
     path: str
     status: Literal["added", "removed", "modified", "identical"]

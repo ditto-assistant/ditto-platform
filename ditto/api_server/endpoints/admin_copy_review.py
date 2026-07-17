@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Load, undefer_group
 
 from ditto.api_models.admin_copy_review import (
+    AdminCopyReviewAudit,
     AdminCopyReviewComparisonUnavailable,
     AdminCopyReviewCurrentComparison,
     AdminCopyReviewEvidence,
@@ -103,6 +104,37 @@ def _item(
             duplicate_of_submitted_at=matched.created_at if matched else None,
         ),
         current_comparison=comparison,
+    )
+
+
+def _audit(
+    review: AthReview, agent: Agent, matched: Agent | None = None
+) -> AdminCopyReviewAudit:
+    evidence = review.original_evidence
+    provenance = review.algorithm_provenance
+    held_artifact_sha256 = evidence.get("sha256")
+    if not isinstance(held_artifact_sha256, str):
+        held_artifact_sha256 = None
+    held_score_count = evidence.get("score_count")
+    if (
+        not isinstance(held_score_count, int)
+        or isinstance(held_score_count, bool)
+        or held_score_count < 0
+    ):
+        held_score_count = None
+    previous_status = evidence.get("previous_status")
+    if not isinstance(previous_status, str):
+        previous_status = None
+    opened_by = provenance.get("opened_by")
+    if not isinstance(opened_by, str):
+        opened_by = None
+    return AdminCopyReviewAudit(
+        review=_item(review, agent, matched),
+        agent_status=agent.status.value,
+        held_artifact_sha256=held_artifact_sha256,
+        held_score_count=held_score_count,
+        previous_status=previous_status,
+        opened_by=opened_by,
     )
 
 
@@ -330,6 +362,23 @@ async def get_copy_review(
         else None
     )
     return _item(review, agent, matched)
+
+
+@router.get("/copy-reviews/{agent_id}/audit", response_model=AdminCopyReviewAudit)
+async def get_copy_review_audit(
+    agent_id: UUID, _admin: AdminDep, session: SessionDep
+) -> AdminCopyReviewAudit:
+    """Return the durable reason and attribution needed to explain an ATH hold."""
+    row = await _get_review(session, agent_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="copy review not found")
+    review, agent = row
+    matched = (
+        await session.get(Agent, review.original_duplicate_of)
+        if review.original_duplicate_of
+        else None
+    )
+    return _audit(review, agent, matched)
 
 
 @router.get(

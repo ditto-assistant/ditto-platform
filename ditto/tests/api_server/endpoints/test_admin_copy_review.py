@@ -235,6 +235,22 @@ async def test_manual_open_holds_exact_scored_artifact_and_removes_it_from_ledge
     )
     assert retry.status_code == 200 and retry.json()["idempotent"] is True
 
+    audit = await client.get(
+        f"/api/v1/admin/copy-reviews/{agent_id}/audit", headers=_HEADERS
+    )
+    assert audit.status_code == 200
+    audit_body = audit.json()
+    assert audit_body["review"]["review_id"] == body["review"]["review_id"]
+    assert audit_body["review"]["original"]["review_kind"] == "benchmark_overfit"
+    assert audit_body["review"]["original"]["reason"] == payload["reason"]
+    assert {key: value for key, value in audit_body.items() if key != "review"} == {
+        "agent_status": AgentStatus.ATH_PENDING_REVIEW,
+        "held_artifact_sha256": sha256,
+        "held_score_count": 3,
+        "previous_status": AgentStatus.SCORED,
+        "opened_by": "operator",
+    }
+
     async with maker() as session:
         agent = await session.get(Agent, agent_id)
         review = await session.scalar(
