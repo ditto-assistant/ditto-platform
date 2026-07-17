@@ -44,6 +44,8 @@ class TestDashboard:
     @pytest.mark.parametrize(
         "path",
         [
+            "/agent/6c10d0df-fc93-4903-a939-147d51cea1cc",
+            "/miner/5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
             "/agents/6c10d0df-fc93-4903-a939-147d51cea1cc",
             "/miners/5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
             "/validators/5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm",
@@ -586,14 +588,23 @@ class TestDashboard:
         assert 'id="leaderboard-title">Leaderboard</h2>' in body  # folded into Overview
         assert 'data-theme-choice="system"' in body  # switcher still wired
 
-    async def test_dashboard_entities_use_smooth_hash_routes(self) -> None:
+    async def test_dashboard_entities_use_query_popovers_and_pages(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert 'agents: "submissions"' in body
         assert 'miners: "overview"' in body
         assert 'validators: "operations"' in body
         assert 'screeners: "operations"' in body
-        assert '"#/" + plural + "/" + encodeURIComponent(String(identifier))' in body
+        assert "url.searchParams.set(ENTITY_PARAMS[plural], String(identifier))" in body
+        assert 'url.hash = "#/" + ENTITY_PAGES[plural]' in body
+        assert (
+            'return "/" + singular + "/" + encodeURIComponent(String(identifier))'
+            in body
+        )
+        assert 'id="d-open-full"' in body
+        assert 'id="d-back-dashboard"' in body
+        assert r"/^\/(agent|miner)\/([^/]+)\/?$/" in body
+        assert "query.has(ENTITY_PARAMS[kind])" in body
         assert r"/^#\/(agents|miners|validators|screeners)\/([^/?#]+)\/?$/" in body
         assert "if (entity.legacy)" in body
         assert 'history.replaceState(history.state || {}, "", entityHref(' in body

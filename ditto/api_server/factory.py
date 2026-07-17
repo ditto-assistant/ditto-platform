@@ -205,10 +205,18 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
             async def dashboard() -> HTMLResponse:
                 return await dashboard_response()
 
-            # Stable public URLs for dashboard objects. These routes all serve the
-            # SPA shell; the client resolves the identifier and opens the matching
-            # agent, miner, validator, or screener view after its public data loads.
+            # Backward-compatible plural URLs serve the SPA shell and normalize to
+            # query-param popovers. Singular agent/miner URLs are dedicated views.
             for entity_kind in ("agents", "miners", "validators", "screeners"):
+                app.add_api_route(
+                    f"/{entity_kind}/{{entity_id}}",
+                    dashboard_response,
+                    methods=["GET"],
+                    include_in_schema=False,
+                    response_class=HTMLResponse,
+                    name=f"dashboard_{entity_kind}",
+                )
+            for entity_kind in ("agent", "miner"):
                 app.add_api_route(
                     f"/{entity_kind}/{{entity_id}}",
                     dashboard_response,

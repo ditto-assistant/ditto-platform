@@ -25,12 +25,12 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 - **Validator fleet** — signed worker availability, coarse system health, and
   the public active agent with the same stage/progress shown in the pipeline.
   Old clients render as progress not reported; expired or stale work disappears.
-- **Stable object links** — agents, miners, validators, and screeners have
-  bookmarkable SPA routes (`/#/agents/{id}`, `/#/miners/{hotkey}`,
-  `/#/validators/{hotkey}`, and `/#/screeners/{hotkey}`). Direct visits restore
-  the matching detail or fleet row, and browser back/forward navigation stays
-  useful without leaving the dashboard's hash-routed shell. The original
-  pathname routes remain backward-compatible entry points.
+- **Stable object links** — popup and selected-row state lives in query params on
+  the current dashboard page (`?agent={id}#/submissions`,
+  `?miner={hotkey}#/overview`, and `?validator={hotkey}#/operations`). Agent and
+  miner popovers link to dedicated `/agent/{id}` and `/miner/{hotkey}` pages.
+  Direct visits and browser back/forward navigation restore the same state; the
+  original plural pathname and hash routes remain backward-compatible.
 - **Anti-overfit assurance** — explains that seeds are fixed only after the
   submission is committed, rotate per submission, and can reproduce a completed
   evaluation without changing the already-submitted artifact.
