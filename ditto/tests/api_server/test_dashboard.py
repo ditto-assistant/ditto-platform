@@ -185,6 +185,9 @@ class TestDashboard:
         assert "scores received" in body
         assert "renderAcceptedScores" in body
         assert "Accepted scores" in body
+        assert "Per-question results" in body
+        assert "casesSection(score)" in body
+        assert "casesSection(s)" in body
         assert "Provisional score " in body
         assert "Provisional scores may change" in body
         assert "final median is authoritative" in body

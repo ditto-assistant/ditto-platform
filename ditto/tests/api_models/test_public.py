@@ -20,6 +20,7 @@ def test_provisional_score_accepts_reproducible_safe_fields() -> None:
         accepted_at=datetime(2026, 7, 14, tzinfo=UTC),
         reproduction_command="generate -seed 123456789 -run-size full",
         verification_command="generate -seed 123456789 -run-size full -sha",
+        case_results=None,
     )
 
     assert score.composite == pytest.approx(0.625)
@@ -42,6 +43,7 @@ def test_provisional_score_accepts_each_seed_source(seed_source: str) -> None:
         accepted_at=datetime(2026, 7, 14, tzinfo=UTC),
         reproduction_command=None,
         verification_command=None,
+        case_results=None,
     )
 
     assert score.seed_source == seed_source

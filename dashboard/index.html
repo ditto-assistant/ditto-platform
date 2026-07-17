@@ -2909,9 +2909,9 @@
         var rows = r.scores.slice()
           .sort(function (a, b) { return b.composite - a.composite; })
           .map(function (s) {
-            return '<div class="stat-row"><span class="k copyable" title="' + esc(s.validator_hotkey) +
+            return '<div class="consensus-score"><div class="stat-row"><span class="k copyable" title="' + esc(s.validator_hotkey) +
               '"><span>' + esc(shortKey(s.validator_hotkey)) + '</span>' + copyButton(s.validator_hotkey, "validator hotkey") + '</span><span class="v">' +
-              fx(s.composite) + '</span></div>';
+              fx(s.composite) + '</span></div>' + casesSection(s) + '</div>';
           }).join("");
         var med = r.median_composite != null
           ? stat("Median (canonical)", fx(r.median_composite))
@@ -3159,7 +3159,7 @@
         '<span class="good">' + totals.pass + ' pass</span> · ' +
         '<span class="danger">' + totals.fail + ' fail</span>' +
         (totals.partial ? ' · <span class="muted">' + totals.partial + ' partial</span>' : "") + "</div>";
-      return '<details class="cases"><summary>Per-case results <span class="muted">· ' + cs.length +
+      return '<details class="cases"><summary>Per-question results <span class="muted">· ' + cs.length +
         " cases</span></summary>" + overview + blocks + "</details>";
     }
     function closeModal(preserveUrl) {
@@ -3728,7 +3728,7 @@
           '<div class="accepted-score-meta">' +
             '<div class="accepted-score-meta-row"><b>Seed</b> <code>' + esc(score.seed) + '</code> ' + copyButton(score.seed, "benchmark seed") + '<br>' + esc(seedSource) + '</div>' +
             command + verify +
-          '</div></div>';
+          '</div>' + casesSection(score) + '</div>';
       }).join("");
       var finalScore = complete
         ? '<p class="accepted-score-final">Final aggregate: ' + fx(pipeline.final_composite) + ' · median of ' + quorum + '</p>'

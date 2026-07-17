@@ -9,6 +9,7 @@ per-case detail.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -1440,7 +1441,22 @@ class TestPublicActivity:
                     n=114,
                     generated_at=datetime.now(UTC),
                     signature="ab" * 64,
-                    details=None,
+                    details={
+                        "per_case": [
+                            {
+                                "kind": "memory",
+                                "category": "temporal_reasoning",
+                                "score": composite,
+                                "correct": False,
+                                "latency_ms": 500,
+                                "notes": ["answer did not match"],
+                                "expected": "private answer key",
+                                "called": ["private tool trace"],
+                                "case_id": f"private-{index}",
+                                "raw_response": "private response",
+                            }
+                        ]
+                    },
                 )
         _install_db(app, session_maker)
 
@@ -1457,6 +1473,35 @@ class TestPublicActivity:
         assert pipeline["status"] == "below_score_floor"
         assert pipeline["score_count"] == 2
         assert pipeline["score_floor"] == pytest.approx(0.80)
+        assert len(pipeline["provisional_scores"]) == 2
+        case_results = [
+            score["case_results"][0] for score in pipeline["provisional_scores"]
+        ]
+        assert {case["score"] for case in case_results} == {0.10, 0.20}
+        for case in case_results:
+            assert set(case) == {
+                "category",
+                "kind",
+                "score",
+                "correct",
+                "latency_ms",
+                "notes",
+            }
+            assert case["category"] == "temporal_reasoning"
+            assert case["kind"] == "memory"
+            assert case["correct"] is False
+            assert case["latency_ms"] == 500
+            assert case["notes"] == ["answer did not match"]
+        for leaked in (
+            '"expected"',
+            '"called"',
+            '"case_id"',
+            '"raw_response"',
+            "private answer key",
+            "private tool trace",
+            "private response",
+        ):
+            assert leaked not in json.dumps(pipeline)
 
         now = datetime.now(UTC)
         async with session_maker() as session, session.begin():
