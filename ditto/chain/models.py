@@ -157,6 +157,35 @@ class NeuronInfo:
         )
 
 
+@dataclass(frozen=True)
+class ChainWeight:
+    """One revealed destination weight from a validator's on-chain vector."""
+
+    uid: int
+    hotkey: str
+    value: int
+
+
+@dataclass(frozen=True)
+class ChainWeightVector:
+    """One validator's latest publicly revealed weight vector."""
+
+    validator_uid: int
+    validator_hotkey: str
+    weights: tuple[ChainWeight, ...]
+
+
+@dataclass(frozen=True)
+class ChainWeightsSnapshot:
+    """A block-consistent read of the subnet's public weight matrix."""
+
+    netuid: int
+    block: int
+    block_hash: str
+    owner_hotkey: str | None
+    vectors: tuple[ChainWeightVector, ...]
+
+
 def _axon_info_to_dict(axon: Any) -> dict[str, Any]:
     """Flatten a Pylon ``AxonInfo`` (Pydantic model) into a plain dict.
 

@@ -246,12 +246,12 @@ class PublicLeaderboardEntry(BaseModel):
             default=None,
             ge=0.0,
             description=(
-                "Standard error of the composite, estimated from the per-case "
-                "score spread — the measurement uncertainty behind the headline "
-                "number. Lets a consumer draw error bars and judge whether two "
-                "miners are a statistical tie (the same signal the validator's "
-                "indifference-band dethroning uses). None when the run carries no "
-                "per-case data to estimate from."
+                "The exact standard error surfaced to the validator's KOTH fold: "
+                "a stashed confirmation re-score SE when present, otherwise the "
+                "between-validator SEM of the finalized k=3 quorum. This is the "
+                "measurement uncertainty used by the public dethrone decision and "
+                "the validator's indifference band. None when neither estimate is "
+                "available."
             ),
         ),
     ]
@@ -424,8 +424,63 @@ class PublicLeaderboardEntry(BaseModel):
     )
 
 
+class PublicEmissionRecipient(BaseModel):
+    """One miner projected to receive a non-zero share of the KOTH miner pool."""
+
+    role: Annotated[
+        Literal["champion", "tail"],
+        Field(description="Champion or participation-tail recipient."),
+    ]
+    agent_id: Annotated[UUID, Field(description="The recipient's folded agent id.")]
+    miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    raw_rank: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="This entry's independent rank by finalized composite.",
+        ),
+    ]
+    share_of_miner_pool: Annotated[
+        float,
+        Field(
+            gt=0.0,
+            le=1.0,
+            description=(
+                "Relative KOTH weight within the miner pool, before the subnet's "
+                "separate miner-emission cap."
+            ),
+        ),
+    ]
+
+
+class PublicDethroneDecision(BaseModel):
+    """The raw leader's comparison against the incumbent KOTH champion."""
+
+    challenger_lead: float
+    required_lead: Annotated[float, Field(ge=0.0)]
+    margin_lead: Annotated[float, Field(ge=0.0)]
+    statistical_lead: Annotated[float | None, Field(default=None, ge=0.0)]
+    method: Literal["flat", "unpaired", "paired"]
+    dethrones: bool
+
+
+class PublicKothEmissions(BaseModel):
+    """Current read-only projection of the validator's KOTH weight fold."""
+
+    margin: Annotated[float, Field(ge=0.0, le=1.0)]
+    dethrone_z: Annotated[float, Field(ge=0.0)]
+    champion_share: Annotated[float, Field(gt=0.0, le=1.0)]
+    tail_size: Annotated[int, Field(ge=0)]
+    champion_agent_id: UUID
+    champion_miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    raw_leader_agent_id: UUID
+    raw_leader_miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    raw_leader_decision: PublicDethroneDecision | None = None
+    recipients: list[PublicEmissionRecipient] = Field(default_factory=list)
+
+
 class PublicLeaderboardResponse(BaseModel):
-    """The public best-score-per-miner leaderboard, highest composite first."""
+    """Raw score standings plus the current KOTH emissions projection."""
 
     generated_at: Annotated[
         datetime, Field(description="When this snapshot was read (UTC).")
@@ -445,6 +500,43 @@ class PublicLeaderboardResponse(BaseModel):
         list[PublicLeaderboardEntry],
         Field(default_factory=list, description="Ranked miners, best composite first."),
     ]
+    emissions: Annotated[
+        PublicKothEmissions | None,
+        Field(
+            default=None,
+            description=(
+                "Current KOTH fold over finalized, full-benchmark entries on the "
+                "current benchmark. Null when no entry can receive emissions."
+            ),
+        ),
+    ] = None
+
+
+class PublicChainWeight(BaseModel):
+    """One non-zero destination in a validator's revealed chain vector."""
+
+    uid: Annotated[int, Field(ge=0)]
+    hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    value: Annotated[int, Field(gt=0, le=65535)]
+
+
+class PublicValidatorWeightVector(BaseModel):
+    """One validator's latest publicly revealed on-chain weights."""
+
+    validator_uid: Annotated[int, Field(ge=0)]
+    validator_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    weights: list[PublicChainWeight] = Field(default_factory=list)
+
+
+class PublicChainWeightsResponse(BaseModel):
+    """Block-consistent SN118 weight matrix read from Subtensor storage."""
+
+    generated_at: datetime
+    netuid: Annotated[int, Field(ge=0)]
+    block: Annotated[int, Field(ge=0)]
+    block_hash: Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{64}$")]
+    owner_hotkey: Annotated[str | None, Field(default=None, pattern=_SS58_PATTERN)]
+    vectors: list[PublicValidatorWeightVector] = Field(default_factory=list)
 
 
 class PublicValidatorScore(BaseModel):

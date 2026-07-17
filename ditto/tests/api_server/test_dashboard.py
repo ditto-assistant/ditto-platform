@@ -104,6 +104,7 @@ class TestDashboard:
         "path",
         [
             "/api/v1/public/leaderboard",
+            "/api/v1/public/weights",
             "/api/v1/public/activity",
             "/api/v1/public/operations",
             "/api/v1/public/validators",
@@ -139,13 +140,32 @@ class TestDashboard:
         assert "e.emission_eligible === true" in body
         assert ">registration unknown</span>" in body
         assert 'class="quorum-badge"' in body
-        assert ">Winning agent</span>" in body
+        assert ">Best-scoring agent</span>" in body
         assert 'class="miner-uid" title="Current SN118 UID">UID ' in body
         assert ">Total scores</span>" in body
         assert ">Validators</span>" in body
         assert "Scoring Spend" not in body
         assert "Avg latency" not in body
         assert "Scores · 24h" not in body
+        assert ">Score rank</span>" in body
+        assert ">Emissions</span>" in body
+        assert 'id="emissions-strip" role="status" aria-live="polite"' in body
+        assert 'id="chain-observation"' in body
+        assert 'getJSON("/public/weights")' in body
+        assert "Commit-reveal can make this lag active commitments" in body
+        assert "Yuma combines validator inputs stake-weightedly" in body
+        assert 'return "Validator top choice · "' in body
+        assert 'return "Validator support · "' in body
+        assert "Chain · champion" not in body
+        assert "Chain · weighted" not in body
+        assert "is the validator top choice in" in body
+        assert "Revealed validator support" in body
+        assert "Top choice means the miner received" in body
+        assert "KOTH champion and recipients shown separately" in body
+        assert "Raw score rank #" in body
+        assert 'emission.role === "champion"' in body
+        assert "must lead by more than" in body
+        assert "2% protection margin" in body
         assert 'class="winner-identity"' in body
         assert 'entityAnchor("agent", e.agent_id, displayAgentName)' in body
         assert "agentVersionBadge(e.agent_version)" in body
@@ -272,7 +292,8 @@ class TestDashboard:
         assert "<b>Live data unavailable.</b>" in body
         assert "No example data is shown." in body
         assert (
-            '.catch(function () { setStatus("error", "Data unavailable"); '
+            ".catch(function () { lastLeaderboardData = null; "
+            'setStatus("error", "Data unavailable"); '
             "renderLeaderboardUnavailable(); });" in body
         )
         assert ".catch(function () { renderHealthUnavailable(); });" in body

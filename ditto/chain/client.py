@@ -11,7 +11,15 @@ from ditto.chain.errors import (
     ChainTimeoutError,
     ExtrinsicNotFoundError,
 )
-from ditto.chain.models import BlockInfo, ChainConfig, ExtrinsicInfo, NeuronInfo
+from ditto.chain.models import (
+    BlockInfo,
+    ChainConfig,
+    ChainWeight,
+    ChainWeightsSnapshot,
+    ChainWeightVector,
+    ExtrinsicInfo,
+    NeuronInfo,
+)
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -38,6 +46,9 @@ _EXTRINSIC_FAILED_EVENT = "ExtrinsicFailed"
 
 _SUBTENSOR_MODULE = "SubtensorModule"
 _OWNER_STORAGE = "Owner"
+_SUBNET_OWNER_HOTKEY_STORAGE = "SubnetOwnerHotkey"
+_KEYS_STORAGE = "Keys"
+_WEIGHTS_STORAGE = "Weights"
 _TIMESTAMP_MODULE = "Timestamp"
 _TIMESTAMP_NOW_STORAGE = "Now"
 
@@ -246,6 +257,84 @@ class ChainClient:
         logger.info(
             f"put_weights submitted for netuid={self._config.netuid} "
             f"with {len(weights)} entries"
+        )
+
+    async def get_weights(self, netuid: int) -> ChainWeightsSnapshot:
+        """Read the latest publicly revealed validator weight matrix natively.
+
+        ``SubtensorModule.Weights`` is the chain's public, last-revealed matrix.
+        Under commit-reveal it intentionally lags encrypted active commitments;
+        callers must present it as observed chain state, not as a pending vector
+        or a direct miner-emission calculation.
+        """
+        from async_substrate_interface import AsyncSubstrateInterface
+
+        try:
+            async with AsyncSubstrateInterface(url=self._substrate_url()) as substrate:
+                block_hash = await substrate.get_chain_head()
+                header = await substrate.get_block_header(block_hash=block_hash)
+                block = _block_number_from_header(header)
+                weight_map = await substrate.query_map(
+                    module=_SUBTENSOR_MODULE,
+                    storage_function=_WEIGHTS_STORAGE,
+                    params=[netuid],
+                    block_hash=block_hash,
+                    fully_exhaust=True,
+                )
+                key_map = await substrate.query_map(
+                    module=_SUBTENSOR_MODULE,
+                    storage_function=_KEYS_STORAGE,
+                    params=[netuid],
+                    block_hash=block_hash,
+                    fully_exhaust=True,
+                )
+                owner_result = await substrate.query(
+                    module=_SUBTENSOR_MODULE,
+                    storage_function=_SUBNET_OWNER_HOTKEY_STORAGE,
+                    params=[netuid],
+                    block_hash=block_hash,
+                )
+                raw_weights = [
+                    (int(uid), value or []) async for uid, value in weight_map
+                ]
+                hotkeys = {
+                    int(uid): str(hotkey) async for uid, hotkey in key_map if hotkey
+                }
+                owner_hotkey_value = _unwrap_substrate_value(owner_result)
+        except TimeoutError as e:
+            raise ChainTimeoutError(f"get_weights(netuid={netuid}) timed out") from e
+        except Exception as e:
+            raise ChainConnectionError(
+                f"get_weights(netuid={netuid}) failed: {e}"
+            ) from e
+
+        vectors = []
+        for validator_uid, raw_vector in raw_weights:
+            validator_hotkey = hotkeys.get(validator_uid)
+            if not validator_hotkey or not isinstance(raw_vector, (list, tuple)):
+                continue
+            weights = []
+            for item in raw_vector:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    continue
+                uid, value = int(item[0]), int(item[1])
+                hotkey = hotkeys.get(uid)
+                if hotkey and value > 0:
+                    weights.append(ChainWeight(uid=uid, hotkey=hotkey, value=value))
+            if weights:
+                vectors.append(
+                    ChainWeightVector(
+                        validator_uid=validator_uid,
+                        validator_hotkey=validator_hotkey,
+                        weights=tuple(weights),
+                    )
+                )
+        return ChainWeightsSnapshot(
+            netuid=netuid,
+            block=block,
+            block_hash=str(block_hash),
+            owner_hotkey=(str(owner_hotkey_value) if owner_hotkey_value else None),
+            vectors=tuple(vectors),
         )
 
     # --- Success status (Pylon gap) ---
@@ -461,6 +550,19 @@ def _translate_pylon_error(exc: Exception, op: str) -> Exception:
     if isinstance(exc, TimeoutError):
         return ChainTimeoutError(f"{op} timed out: {exc}")
     return ChainConnectionError(f"{op} failed: {exc}")
+
+
+def _block_number_from_header(header: Any) -> int:
+    """Extract the decoded block number from async-substrate header shapes."""
+    if isinstance(header, dict):
+        nested = header.get("header")
+        source = nested if isinstance(nested, dict) else header
+        value = source.get("number")
+        if isinstance(value, str):
+            return int(value, 0)
+        if isinstance(value, int):
+            return value
+    raise ValueError("substrate block header omitted a valid number")
 
 
 def _iter_event_records(events: Any) -> list[dict[str, Any]]:
