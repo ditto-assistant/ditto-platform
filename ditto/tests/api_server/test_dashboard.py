@@ -154,7 +154,13 @@ class TestDashboard:
         assert 'getJSON("/public/weights")' in body
         assert "Commit-reveal can make this lag active commitments" in body
         assert "Yuma combines validator inputs stake-weightedly" in body
-        assert 'return "Chain · champion "' in body
+        assert 'return "Validator top choice · "' in body
+        assert 'return "Validator support · "' in body
+        assert "Chain · champion" not in body
+        assert "Chain · weighted" not in body
+        assert "is the validator top choice in" in body
+        assert "Revealed validator support" in body
+        assert "Top choice means the miner received" in body
         assert "KOTH champion and recipients shown separately" in body
         assert "Raw score rank #" in body
         assert 'emission.role === "champion"' in body

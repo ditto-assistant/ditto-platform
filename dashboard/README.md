@@ -17,7 +17,8 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
   overlays the last publicly revealed validator vectors at one block, while
   explicitly separating those lagging commit-reveal inputs from stake-weighted
   Yuma emissions. Click a row for a drill-down (tool-vs-memory split, first-seen,
-  raw rank, projected emissions role, revealed chain support). Current SN118 registration
+  raw rank, projected emissions role, and revealed validator top-choice/support
+  counts). Current SN118 registration
   is reported separately: a deregistered hotkey's immutable score stays visible
   but is marked inactive and excluded from weights and emissions until that same
   hotkey registers again.

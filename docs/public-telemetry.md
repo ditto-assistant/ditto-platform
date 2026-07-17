@@ -190,7 +190,10 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   hotkey so clients can separate the 80% burn route from the KOTH miner pool.
   Under commit-reveal these are necessarily the last **revealed** vectors and may
   lag encrypted active commitments; they are validator inputs to stake-weighted
-  Yuma consensus, not a claim about final miner emissions.
+  Yuma consensus, not a claim about final miner emissions. The dashboard calls a
+  miner a validator's **top choice** when it has that validator's highest revealed
+  miner weight, and counts **validator support** whenever it has any revealed
+  weight. The term **champion** is reserved for the KOTH emissions projection.
 - `GET /api/v1/public/health` → subnet rollup **from what the platform records**:
   `miners`, `scored_miners`, `scored_agents`, `last_scored_at`, `scores_24h`,
   `avg_latency_ms`. Note: no `success_rate` — the platform only ever sees a

@@ -2538,10 +2538,10 @@
       var projectedEntry = projectedHotkey && byHotkey[projectedHotkey];
       var projectedLabel = projectedEntry ? agentName(projectedEntry.agent_name) : (projectedHotkey ? shortKey(projectedHotkey) : "The projected champion");
       var summary = projectedHotkey
-        ? projectedLabel + " is champion in " + (championCounts[projectedHotkey] || 0) + " of " + minerVectors + " revealed miner-bearing validator vectors. "
+        ? projectedLabel + " is the validator top choice in " + (championCounts[projectedHotkey] || 0) + " of " + minerVectors + " revealed miner-bearing vectors. "
         : "The chain exposes " + minerVectors + " revealed miner-bearing validator vectors. ";
       if (revealedLeader && revealedLeader !== projectedHotkey) {
-        summary += revealedLabel + " leads the revealed matrix at " + championCounts[revealedLeader] + " of " + minerVectors + ". ";
+        summary += revealedLabel + " is the most common validator top choice at " + championCounts[revealedLeader] + " of " + minerVectors + ". ";
       }
       summary += "Block " + Number(snapshot.block).toLocaleString() + ". Commit-reveal can make this lag active commitments; Yuma combines validator inputs stake-weightedly.";
       copy.textContent = summary;
@@ -2550,8 +2550,8 @@
 
     function chainWeightLabel(chainWeight) {
       if (!chainWeight || !chainWeight.vectors) return "";
-      if (chainWeight.champion) return "Chain · champion " + chainWeight.champion + "/" + chainWeight.vectors;
-      return "Chain · weighted " + chainWeight.weighted + "/" + chainWeight.vectors;
+      if (chainWeight.champion) return "Validator top choice · " + chainWeight.champion + "/" + chainWeight.vectors;
+      return "Validator support · " + chainWeight.weighted + "/" + chainWeight.vectors;
     }
 
     // ── Render ───────────────────────────────────────────────
@@ -2742,7 +2742,7 @@
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></span></span></td>' +
             '<td>' + (emission ? '<span class="emission-badge ' + esc(emission.role) + '"><span aria-hidden="true">●</span> ' +
               (emission.role === "champion" ? "Champion" : "Tail") + ' · ' + pct(emission.share_of_miner_pool) + '</span>' : '<span class="muted">—</span>') +
-              (chainWeight ? '<span class="chain-weight-note" title="Latest publicly revealed validator vectors at chain block ' + esc(lastChainWeights.block) + '. These can lag active commitments and are not final Yuma emissions.">' + esc(chainWeightLabel(chainWeight)) + '</span>' : '') + '</td>' +
+              (chainWeight ? '<span class="chain-weight-note" title="How many validators most recently revealed this miner as their top choice, or assigned it any weight. Block ' + esc(lastChainWeights.block) + '; this can lag active commitments and is not final Yuma emissions.">' + esc(chainWeightLabel(chainWeight)) + '</span>' : '') + '</td>' +
             modelCell(e) +
             compositeCell(e) +
             '<td class="hide-sm">' + bar("tool", e.tool_mean) + '</td>' +
@@ -2960,7 +2960,7 @@
       var mKind = unrankedKind(e);
       var det = "";
       if (e._emission) det += stat("KOTH emissions", (e._emission.role === "champion" ? "Champion · " : "Participation tail · ") + pct(e._emission.share_of_miner_pool) + " of the miner pool. Raw score rank is shown separately.");
-      if (e._chainWeight) det += stat("Revealed chain weights", chainWeightLabel(e._chainWeight) + ". Latest public validator inputs at block " + lastChainWeights.block.toLocaleString() + "; commit-reveal can make them lag active commitments, and Yuma combines them stake-weightedly.");
+      if (e._chainWeight) det += stat("Revealed validator support", chainWeightLabel(e._chainWeight) + ". Top choice means the miner received that validator's highest revealed miner weight; support means it received any weight. Block " + lastChainWeights.block.toLocaleString() + "; commit-reveal can make this lag active commitments, and Yuma combines validator inputs stake-weightedly.");
       if (!isFinalized(e)) det += stat("Validation", (e.score_count || 0) + " of " + (e.score_quorum || 3) + " accepted scores. Not final and not used for emissions.");
       if (e.registered === false) det += stat("Registration", "Not currently registered on SN118. The submission, fee record, and scores are retained, but this hotkey is excluded from active weights and emissions until the same hotkey registers again.");
       else if (e.registered == null) det += stat("Registration", "Current SN118 registration could not be confirmed. The score is retained, but active weight and emission eligibility are unknown.");
