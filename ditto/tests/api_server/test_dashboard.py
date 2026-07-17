@@ -452,6 +452,22 @@ class TestDashboard:
         assert "Could not copy " in body
         assert "Select the full value and copy it manually." in body
 
+    async def test_includes_miner_facing_review_details_copy(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+
+        assert "function reviewPacket(entry)" in body
+        assert '"Please review agent " + agentId' in body
+        assert '"Name: " + name + " (" + agentVersionLabel(version) + ")"' in body
+        assert '"Miner hotkey: " + reviewPacketLine(entry.miner_hotkey)' in body
+        assert 'lines.push("Status: " + reviewPacketLine(entry.status))' in body
+        assert 'lines.push("Artifact SHA-256: "' in body
+        assert 'canonicalEntityUrl("agent", agentId)' in body
+        assert 'class="copy review-copy"' in body
+        assert body.count("reviewPacketButton(e)") == 2
+        assert 'aria-label="Copy review details"' in body
+        assert ".review-copy { width: 100%;" in body
+
     async def test_validator_names_remain_optional_untrusted_decoration(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text

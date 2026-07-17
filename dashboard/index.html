@@ -345,6 +345,11 @@
     .copy.copied > span { display: none; }
     .copy.copied::after { content: "✓"; }
     .copy.failed { color: var(--danger); opacity: 1; }
+    .review-copy-row { display: flex; justify-content: flex-end; margin-top: 12px; }
+    .review-copy { display: inline-flex; align-items: center; min-height: 36px; margin-left: 0; padding: 7px 11px; border: 1px solid var(--border); border-radius: 8px; opacity: 1; background: var(--bg-elev-2); color: var(--text); font-size: 11px; font-weight: 700; line-height: 1.2; }
+    .review-copy:hover, .review-copy:focus-visible { border-color: var(--accent); background: var(--bg-elev); }
+    .review-copy.copied::after { content: "Copied ✓"; }
+    @media (max-width: 520px) { .review-copy { width: 100%; justify-content: center; min-height: 44px; } }
     @media (hover: none) { .copy { opacity: 1; } }
 
     .metric { display: flex; align-items: center; gap: 10px; min-width: 150px; }
@@ -2674,6 +2679,7 @@
         ? '<div class="sha-row"><span class="k">Dataset SHA-256</span><span class="copyable"><code>' + esc(e.dataset_sha256) + '</code>' + copyButton(e.dataset_sha256, "dataset SHA-256") + '</span></div>'
         : "";
       document.getElementById("d-stats").innerHTML =
+        reviewPacketButton(e) +
         '<div class="stat-cols">' + colStats + '</div>' +
         '<div id="d-consensus"></div>' +
         pc +
@@ -2729,6 +2735,38 @@
         '" data-copy-label="' + safeLabel + '" aria-label="Copy ' + safeLabel +
         '" aria-describedby="copy-status" title="Copy ' + safeLabel +
         '"><span aria-hidden="true">⧉</span></button>';
+    }
+    function canonicalEntityUrl(kind, identifier) {
+      var plural = ENTITY_PATHS[kind] || kind;
+      var url = new URL("/", location.href);
+      url.search = "";
+      url.hash = "#/" + plural + "/" + encodeURIComponent(String(identifier));
+      return url.href;
+    }
+    function reviewPacketLine(value) {
+      return String(value == null ? "" : value).replace(/[\r\n\t]+/g, " ").trim();
+    }
+    function reviewPacket(entry) {
+      var agentId = reviewPacketLine(entry.agent_id);
+      var name = reviewPacketLine(entry.name || entry.agent_name || "Unnamed agent");
+      var version = entry.version != null ? entry.version : entry.agent_version;
+      var lines = [
+        "Please review agent " + agentId,
+        "Name: " + name + " (" + agentVersionLabel(version) + ")",
+        "Miner hotkey: " + reviewPacketLine(entry.miner_hotkey)
+      ];
+      if (entry.status) lines.push("Status: " + reviewPacketLine(entry.status));
+      if (entry.artifact_sha256) {
+        lines.push("Artifact SHA-256: " + reviewPacketLine(entry.artifact_sha256));
+      }
+      lines.push("URL: " + canonicalEntityUrl("agent", agentId));
+      return lines.join("\n");
+    }
+    function reviewPacketButton(entry) {
+      if (!entry || !entry.agent_id) return "";
+      return '<div class="review-copy-row"><button type="button" class="copy review-copy" data-key="' +
+        esc(reviewPacket(entry)) + '" data-copy-label="review details" aria-label="Copy review details" ' +
+        'aria-describedby="copy-status" title="Copy review details"><span>Copy review details</span></button></div>';
     }
     // The k=3 consensus record: which independent validators scored this agent,
     // each one's composite, and the median the platform finalized on. Fetched on
@@ -3805,7 +3843,7 @@
               '<div><dt>Submission</dt><dd>' + esc(agentVersionLabel(e.version)) + '</dd></div>' +
               '<div><dt>Agent ID</dt><dd><span class="copyable"><code>' + entityAnchor("agent", e.agent_id, String(e.agent_id || "")) + '</code>' + copyButton(e.agent_id, "agent ID") + '</span></dd></div>' +
               '<div><dt>Evidence</dt><dd>' + esc(evidence) + '</dd></div>' +
-            '</dl>' +
+            '</dl>' + reviewPacketButton(e) +
           '</section>' +
         '</div>' +
         (stateMessage ? '<p class="pipeline-detail-state ' + esc(stateClass || "") + '">' + esc(stateMessage) + '</p>' : '') +
