@@ -192,14 +192,20 @@ async def _prepare_release_dataset(
     generator: DatasetGenerator,
     quarantine_id: UUID,
 ) -> DatasetPin | None:
-    if generator.run_size is None:
+    run_size = generator.run_size
+    if run_size is None:
         return None
-    existing = await session.scalar(
-        select(Agent)
-        .join(ScreeningQuarantine, ScreeningQuarantine.agent_id == Agent.agent_id)
-        .where(ScreeningQuarantine.quarantine_id == quarantine_id)
-    )
-    await session.rollback()
+    async with session.begin():
+        existing = (
+            await session.execute(
+                select(Agent.agent_id, Agent.dataset_seed)
+                .join(
+                    ScreeningQuarantine,
+                    ScreeningQuarantine.agent_id == Agent.agent_id,
+                )
+                .where(ScreeningQuarantine.quarantine_id == quarantine_id)
+            )
+        ).one_or_none()
     if existing is None:
         raise HTTPException(status_code=404, detail="quarantine not found")
     if existing.dataset_seed is not None:
@@ -208,7 +214,7 @@ async def _prepare_release_dataset(
         chain, existing.agent_id
     )
     dataset_sha256 = await generator.generate(seed)
-    return seed, dataset_sha256, generator.run_size, block_number, block_hash
+    return seed, dataset_sha256, run_size, block_number, block_hash
 
 
 def _apply_dataset(agent: Agent, dataset: DatasetPin | None) -> None:
