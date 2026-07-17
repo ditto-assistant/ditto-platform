@@ -138,6 +138,12 @@ class TestDashboard:
         assert ">registration unknown</span>" in body
         assert 'class="quorum-badge"' in body
         assert ">Winning agent</span>" in body
+        assert 'class="miner-uid" title="Current SN118 UID">UID ' in body
+        assert ">Total scores</span>" in body
+        assert ">Validators</span>" in body
+        assert "Scoring Spend" not in body
+        assert "Avg latency" not in body
+        assert "Scores · 24h" not in body
         assert 'class="winner-identity"' in body
         assert 'entityAnchor("agent", e.agent_id, displayAgentName)' in body
         assert "agentVersionBadge(e.agent_version)" in body

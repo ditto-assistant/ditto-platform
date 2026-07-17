@@ -181,7 +181,7 @@ _PUBLIC_ACTIVITY_STATUSES = frozenset(
 @dataclass(frozen=True)
 class _RegistrationSnapshot:
     expires_at: float
-    hotkeys: set[str] | None
+    uids_by_hotkey: dict[str, int] | None
 
 
 def screening_dispute_signing_message(agent_id: UUID, message: str) -> bytes:
@@ -497,6 +497,7 @@ def _public_entry(
     finalized: bool = True,
     score_count: int = SCORING_QUORUM,
     registered: bool | None = None,
+    miner_uid: int | None = None,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -522,6 +523,7 @@ def _public_entry(
         agent_name=agent_name,
         agent_version=agent_version,
         miner_hotkey=r.miner_hotkey,
+        miner_uid=miner_uid,
         registered=registered,
         emission_eligible=(
             finalized
@@ -561,7 +563,7 @@ async def leaderboard(
     """Best score per miner, with quorum and current registration eligibility."""
     response.headers["Cache-Control"] = _CACHE_CONTROL
     ledger_rows = await list_eligible_ledger(session, include_fingerprints=False)
-    registered_hotkeys = await _current_registered_hotkeys(request)
+    registered_uids = await _current_registered_uids(request)
     score_counts = await get_score_counts(
         session, [row.agent_id for row in ledger_rows]
     )
@@ -616,8 +618,13 @@ async def leaderboard(
                 finalized=True,
                 score_count=score_counts.get(row.agent_id, SCORING_QUORUM),
                 registered=(
-                    row.miner_hotkey in registered_hotkeys
-                    if registered_hotkeys is not None
+                    row.miner_hotkey in registered_uids
+                    if registered_uids is not None
+                    else None
+                ),
+                miner_uid=(
+                    registered_uids.get(row.miner_hotkey)
+                    if registered_uids is not None
                     else None
                 ),
             )
@@ -632,8 +639,13 @@ async def leaderboard(
                 finalized=False,
                 score_count=count,
                 registered=(
-                    row.miner_hotkey in registered_hotkeys
-                    if registered_hotkeys is not None
+                    row.miner_hotkey in registered_uids
+                    if registered_uids is not None
+                    else None
+                ),
+                miner_uid=(
+                    registered_uids.get(row.miner_hotkey)
+                    if registered_uids is not None
                     else None
                 ),
             )
@@ -646,8 +658,8 @@ async def leaderboard(
     )
 
 
-async def _current_registered_hotkeys(request: Request) -> set[str] | None:
-    """Current subnet hotkeys, or ``None`` when the chain read is unavailable.
+async def _current_registered_uids(request: Request) -> dict[str, int] | None:
+    """Current subnet hotkeys and UIDs, or ``None`` when chain data is unavailable.
 
     Registration decorates the durable score ledger; it never deletes or changes
     a submission. Public reads therefore degrade to an explicit unknown state
@@ -660,7 +672,7 @@ async def _current_registered_hotkeys(request: Request) -> set[str] | None:
     now = time.monotonic()
     cached = getattr(request.app.state, "public_registration_snapshot", None)
     if isinstance(cached, _RegistrationSnapshot) and cached.expires_at > now:
-        return cached.hotkeys
+        return cached.uids_by_hotkey
     try:
         async with asyncio.timeout(_REGISTRATION_LOOKUP_TIMEOUT_SECONDS):
             neurons = await chain.get_recent_neurons(config.chain.netuid)
@@ -668,15 +680,15 @@ async def _current_registered_hotkeys(request: Request) -> set[str] | None:
         logger.warning("public leaderboard registration read failed: %s", e)
         request.app.state.public_registration_snapshot = _RegistrationSnapshot(
             expires_at=now + _REGISTRATION_FAILURE_CACHE_TTL_SECONDS,
-            hotkeys=None,
+            uids_by_hotkey=None,
         )
         return None
-    hotkeys = {neuron.hotkey for neuron in neurons}
+    uids_by_hotkey = {neuron.hotkey: int(neuron.uid) for neuron in neurons}
     request.app.state.public_registration_snapshot = _RegistrationSnapshot(
         expires_at=now + _REGISTRATION_CACHE_TTL_SECONDS,
-        hotkeys=hotkeys,
+        uids_by_hotkey=uids_by_hotkey,
     )
-    return hotkeys
+    return uids_by_hotkey
 
 
 @router.get("/health", response_model=PublicHealthResponse)
@@ -699,6 +711,7 @@ async def health(
         scored_miners=roll.scored_miners,
         scored_agents=roll.scored_agents,
         last_scored_at=roll.last_scored_at,
+        total_scores=roll.total_scores,
         scores_24h=roll.scores_24h,
         avg_latency_ms=roll.avg_latency_ms,
     )
