@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
 
@@ -59,7 +59,7 @@ class AdminQuarantineResolveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     resolution: QuarantineResolution
-    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3)]
 
 
 class AdminQuarantineResolveResponse(BaseModel):
