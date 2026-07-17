@@ -708,6 +708,22 @@ class PublicActivityEntry(BaseModel):
             description="Anti-copy signals that routed this submission to review.",
         ),
     ]
+    review_opened_at: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description="When the active ATH review hold began (UTC).",
+        ),
+    ]
+    preserved_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description=("Median composite preserved while an ATH review is active."),
+        ),
+    ]
     score_count: Annotated[
         int,
         Field(ge=0, description="Independent validator scores recorded so far."),

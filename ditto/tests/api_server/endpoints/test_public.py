@@ -37,6 +37,7 @@ from ditto.api_server.validator_names import ValidatorNamesSnapshot
 from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
+    AthReview,
     Base,
     Score,
     ScreeningAttempt,
@@ -856,6 +857,8 @@ class TestPublicActivity:
             "duplicate_name",
             "duplicate_version",
             "review_reason",
+            "review_opened_at",
+            "preserved_composite",
             "score_count",
             "provisional_composite",
             "validator_queue_rank",
@@ -875,6 +878,89 @@ class TestPublicActivity:
             "SECRET_FROM_BUILD",
         ):
             assert private_field not in serialized
+
+    async def test_ath_review_filter_is_public_safe_and_includes_hold_snapshot(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        held_id = UUID(
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.4, 0.8, 0.9],
+                status=AgentStatus.ATH_PENDING_REVIEW,
+            )
+        )
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_B,
+            status=AgentStatus.QUARANTINED,
+            name="screening-review",
+        )
+        opened_at = datetime(2026, 7, 16, 15, 30, tzinfo=UTC)
+        async with session_maker() as session, session.begin():
+            held = await session.get(Agent, held_id)
+            assert held is not None
+            held.name = "memory-harness"
+            held.version = 4
+            held.review_reason = "Submission requires ATH similarity review"
+            session.add(
+                AthReview(
+                    review_id=uuid4(),
+                    agent_id=held_id,
+                    status="pending",
+                    opened_at=opened_at,
+                    original_duplicate_of=None,
+                    original_reason=held.review_reason,
+                    original_policy_version=8,
+                    original_evidence={
+                        "sha256": held.sha256,
+                        "challenge_value": "private-challenge",
+                        "answer_key": "private-answer-key",
+                        "source_path": "/private/source.rs",
+                    },
+                    algorithm_provenance={
+                        "opened_by": "private-operator",
+                        "credential": "private-credential",
+                    },
+                )
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get(
+            "/api/v1/public/activity?review=ath&status=under_review&limit=200"
+        )
+
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "public, max-age=10"
+        body = response.json()
+        assert body["total"] == body["count"] == 1
+        entry = body["entries"][0]
+        assert entry["agent_id"] == str(held_id)
+        assert entry["name"] == "memory-harness"
+        assert entry["version"] == 4
+        assert entry["miner_hotkey"] == _MINER_A
+        assert entry["status"] == "under_review"
+        assert datetime.fromisoformat(entry["review_opened_at"]) == opened_at.replace(
+            tzinfo=None
+        )
+        assert entry["review_reason"] == "Submission requires ATH similarity review"
+        assert entry["score_count"] == 3
+        assert entry["provisional_composite"] == pytest.approx(0.7)
+        assert entry["preserved_composite"] == pytest.approx(0.8)
+        serialized = response.text.lower()
+        for private_value in (
+            "sha256",
+            "private-challenge",
+            "private-answer-key",
+            "private/source.rs",
+            "private-operator",
+            "private-credential",
+            "opened_by",
+        ):
+            assert private_value not in serialized
 
     async def test_exposes_queue_priority_with_provisional_composites(
         self,
