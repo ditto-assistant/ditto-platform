@@ -277,6 +277,7 @@
     .submission-version { display: inline-flex; align-items: center; width: fit-content; border: 1px solid var(--border); border-radius: 999px; padding: 1px 6px; color: var(--text-dim); background: var(--bg-elev-2); font: 650 9.5px/1.4 var(--mono); letter-spacing: .15px; white-space: nowrap; }
     .winner-miner { display: flex; min-width: 0; max-width: 100%; align-items: center; color: var(--text-faint); }
     .winner-miner::before { content: "Miner"; margin-right: 6px; color: var(--text-dim); font-family: var(--sans); font-size: 10px; font-weight: 650; }
+    .miner-uid { flex: none; margin-right: 7px; padding-right: 7px; border-right: 1px solid var(--border); color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; font-weight: 650; }
     .hotkey { overflow: hidden; font-family: var(--mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
     .winner-name .badge { font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--gold); border: 1px solid color-mix(in oklab, var(--gold) 42%, transparent); border-radius: 6px; padding: 1px 6px; vertical-align: middle; }
     /* Model column cell: harness model + bench-version chip. */
@@ -1179,6 +1180,7 @@
     .card.primary .label { color: var(--accent); font-size: 10px; }
     .card.primary .value { margin-top: 12px; font-size: 52px; }
     .card.primary .context { max-width: 20ch; margin-top: 12px; color: var(--text-dim); font-size: 12px; line-height: 1.45; }
+    .cards > .card:last-child { grid-column: span 2; }
 
     .section-head { align-items: flex-end; margin: 34px 0 10px; }
     .section-head h2 { font-family: var(--display); font-size: 21px; font-weight: 400; line-height: 1.1; letter-spacing: -0.01em; }
@@ -1753,11 +1755,10 @@
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="The highest composite among ranked (full-benchmark) runs. Composite = (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates (efficiency, consistency, and canary integrity: a canary leak ×0.5, an honest miss ×0.85). Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
       <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" title="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 24 seeds at run_size=full. The score a submission must beat. Source: dittobench-api docs/BASELINES.md (bench_version 2).">Reference Baseline</span></div><div class="value" id="c-baseline">–</div></div>
-      <div class="card"><div class="label">Scores · 24h</div><div class="value" id="h-24h">–</div></div>
+      <div class="card"><div class="label"><span class="tip" title="All validator score records stored by the platform, including the independent scores that make up each finalized result.">Total scores</span></div><div class="value" id="h-scores">–</div></div>
+      <div class="card"><div class="label"><span class="tip" title="Validators currently reporting heartbeat-capable software to the platform.">Validators</span></div><div class="value" id="h-validators">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--memory)"></div><div class="label"><span class="tip" title="Total LLM tokens the runs on the board spent (the harnesses' own calls to the locked model). Generation and grading are non-LLM, so scoring itself spends nothing.">Scoring Spend</span></div><div class="value" id="c-cost">–</div></div>
       <div class="card"><div class="label">Scored agents</div><div class="value" id="h-agents">–</div></div>
-      <div class="card"><div class="label">Avg latency</div><div class="value" id="h-lat">–</div></div>
       <div class="card"><div class="label">Last scored</div><div class="value" id="h-last">–</div></div>
     </section>
 
@@ -1771,7 +1772,7 @@
         <thead>
           <tr>
             <th scope="col" style="width:52px"><span class="tip" title="Rank by composite among ranked (full-benchmark) runs. Provisional runs are shown but unranked (–).">#</span></th>
-            <th scope="col"><span class="tip" title="The miner's winning agent, with its on-chain hotkey below. Open either identity for details, or copy the hotkey.">Winning agent</span></th>
+            <th scope="col"><span class="tip" title="The miner's winning agent, with its current SN118 UID and on-chain hotkey below. Open either identity for details, or copy the hotkey.">Winning agent</span></th>
             <th scope="col" class="hide-md" style="width:180px"><span class="tip" title="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under.">Model</span></th>
             <th scope="col" style="width:190px"><span class="tip" title="Headline score in [0,1]: (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates. The band on the bar is ±1 standard error. The second line shows the score trend.">Composite</span></th>
             <th scope="col" class="hide-sm" style="width:140px"><span class="tip" title="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span></th>
@@ -2401,10 +2402,6 @@
       // Top gap: how contested the #1 spot is (#1 minus #2 composite).
       document.getElementById("c-spread").innerHTML = comps.length >= 2
         ? fx(comps[0] - comps[1]) + ' <small>' + (provisionalHeadline ? 'provisional · ' : '') + '#1 → #2</small>' : "–";
-      // Scoring spend: total LLM tokens the harnesses' own calls burned (generation and grading are non-LLM).
-      var toks = entries.map(function (e) { return e.tokens; }).filter(function (t) { return t != null; });
-      document.getElementById("c-cost").innerHTML = toks.length
-        ? fmtTokens(toks.reduce(function (a, b) { return a + b; }, 0)) + ' <small>tokens</small>' : "–";
       // The latest benchmark version (single source of truth from the API), with a
       // fallback to the highest version on the board so the header still resolves
       // against an older API.
@@ -2489,7 +2486,8 @@
         var displayAgentName = agentName(e.agent_name);
         var accessibleAgentName = agentLabel(e.agent_name, e.agent_version);
         var rowLabel = (elig ? (finalizedEntry ? "Rank " : "Provisional rank ") + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
-          ", agent " + accessibleAgentName + ", miner " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) + ". Activate for run detail.";
+          ", agent " + accessibleAgentName + ", miner UID " + (e.miner_uid == null ? "unavailable" : e.miner_uid) +
+          ", hotkey " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) + ". Activate for run detail.";
         var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge" title="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
           esc(e.score_count || 0) + ' of ' + esc(e.score_quorum || 3) + ' · provisional</span>';
         var registrationBadge = registered
@@ -2503,7 +2501,7 @@
             '<td>' + rankCell + '</td>' +
             '<td><span class="winner-identity"><span class="winner-name">' + entityAnchor("agent", e.agent_id, displayAgentName) + champ + prov + quorumBadge + registrationBadge + '</span>' +
               agentVersionBadge(e.agent_version) +
-              '<span class="winner-miner" title="' + esc(e.miner_hotkey) + '"><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' +
+              '<span class="winner-miner" title="' + esc(e.miner_hotkey) + '"><span class="miner-uid" title="Current SN118 UID">UID ' + (e.miner_uid == null ? "–" : esc(e.miner_uid)) + '</span><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' +
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></span></span></td>' +
             modelCell(e) +
             compositeCell(e) +
@@ -2519,7 +2517,7 @@
 
     function renderLeaderboardUnavailable() {
       lastEntries = [];
-      ["c-miners", "c-top", "c-median", "c-baseline", "c-spread", "c-cost"].forEach(function (id) {
+      ["c-miners", "c-top", "c-median", "c-baseline", "c-spread"].forEach(function (id) {
         document.getElementById(id).textContent = "–";
       });
       var badge = document.getElementById("bench-badge");
@@ -2535,7 +2533,6 @@
       updateSearch();
     }
 
-    function fmtTokens(t) { return t >= 1e6 ? (t / 1e6).toFixed(1) + "M" : t >= 1e3 ? (t / 1e3).toFixed(1) + "k" : String(t); }
     function fmtMs(ms) { return ms >= 1000 ? (ms / 1000).toFixed(ms >= 10000 ? 0 : 1) + " s" : ms + " ms"; }
     function clamp01(v) { return Math.max(0, Math.min(1, v)); }
     // A run is eligible (ranked + emission-eligible) unless the API explicitly
@@ -3495,15 +3492,13 @@
     function renderHealth(h) {
       document.getElementById("h-miners").textContent = h.miners;
       document.getElementById("h-agents").textContent = h.scored_agents == null ? "–" : h.scored_agents;
-      document.getElementById("h-24h").textContent = h.scores_24h;
-      document.getElementById("h-lat").innerHTML =
-        h.avg_latency_ms == null ? "–" : h.avg_latency_ms + ' <small>ms</small>';
+      document.getElementById("h-scores").textContent = h.total_scores == null ? "–" : h.total_scores;
       document.getElementById("h-last").innerHTML =
         h.last_scored_at ? relTime(h.last_scored_at) : "–";
     }
 
     function renderHealthUnavailable() {
-      ["h-miners", "h-agents", "h-24h", "h-lat", "h-last"].forEach(function (id) {
+      ["h-miners", "h-agents", "h-scores", "h-last"].forEach(function (id) {
         document.getElementById(id).textContent = "–";
       });
     }
@@ -4701,6 +4696,7 @@
         .then(function (data) {
           fleetReports.validators = data.validators;
           fleetUnavailable.validators = false;
+          document.getElementById("h-validators").textContent = data.validators.reported_count;
           renderPipelineBoard(data.activity, false);
           renderFleet();
           document.getElementById("operations-snapshot").textContent =
@@ -4708,6 +4704,7 @@
         })
         .catch(function () {
           fleetUnavailable.validators = true;
+          document.getElementById("h-validators").textContent = "–";
           renderPipelineBoard(null, true);
           renderFleet();
           document.getElementById("operations-snapshot").textContent =

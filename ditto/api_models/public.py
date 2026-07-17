@@ -202,6 +202,17 @@ class PublicLeaderboardEntry(BaseModel):
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Miner's SS58 hotkey.")
     ]
+    miner_uid: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description=(
+                "Miner's current UID on this subnet; null when the hotkey is "
+                "not registered or the chain snapshot is unavailable."
+            ),
+        ),
+    ] = None
     registered: Annotated[
         bool | None,
         Field(
@@ -358,6 +369,7 @@ class PublicLeaderboardEntry(BaseModel):
                 "score_count": 3,
                 "score_quorum": 3,
                 "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+                "miner_uid": 42,
                 "composite": 0.587,
                 "composite_stderr": 0.014,
                 "tool_mean": 0.867,
@@ -1159,6 +1171,9 @@ class PublicHealthResponse(BaseModel):
         datetime | None,
         Field(default=None, description="When a validator last scored anything (UTC)."),
     ]
+    total_scores: Annotated[
+        int, Field(ge=0, description="All validator score records ever recorded.")
+    ]
     scores_24h: Annotated[
         int, Field(ge=0, description="Scores generated in the last 24h.")
     ]
@@ -1177,6 +1192,7 @@ class PublicHealthResponse(BaseModel):
                 "scored_miners": 5,
                 "scored_agents": 7,
                 "last_scored_at": "2026-07-04T11:52:00Z",
+                "total_scores": 18,
                 "scores_24h": 9,
                 "avg_latency_ms": 812,
             }

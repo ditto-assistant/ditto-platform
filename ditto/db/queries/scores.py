@@ -161,6 +161,8 @@ class HealthRollup:
     """``scored`` agents that actually carry a score row (eligible submissions)."""
     last_scored_at: datetime | None
     """Newest platform score-write time — when a validator last scored anything."""
+    total_scores: int
+    """All validator score records currently stored by the platform."""
     scores_24h: int
     """Scores generated in the last 24h — scoring throughput."""
     avg_latency_ms: int | None
@@ -220,6 +222,7 @@ async def get_public_health(session: AsyncSession, *, now: datetime) -> HealthRo
         scored_miners=int(scored[0]),
         scored_agents=int(scored[1]),
         last_scored_at=max(generated) if generated else None,
+        total_scores=len(rows),
         scores_24h=sum(1 for g in generated if g >= cutoff),
         avg_latency_ms=(round(sum(r[1] for r in rows) / len(rows)) if rows else None),
     )

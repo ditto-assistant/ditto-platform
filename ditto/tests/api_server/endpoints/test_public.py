@@ -266,7 +266,7 @@ class TestPublicLeaderboard:
         _install_db(app, session_maker)
         app.state.chain = SimpleNamespace(
             get_recent_neurons=AsyncMock(
-                return_value=[SimpleNamespace(hotkey=_MINER_B)]
+                return_value=[SimpleNamespace(hotkey=_MINER_B, uid=42)]
             )
         )
 
@@ -274,10 +274,12 @@ class TestPublicLeaderboard:
 
         by_miner = {e["miner_hotkey"]: e for e in body["entries"]}
         assert by_miner[_MINER_A]["registered"] is False
+        assert by_miner[_MINER_A]["miner_uid"] is None
         assert by_miner[_MINER_A]["emission_eligible"] is False
         assert by_miner[_MINER_A]["finalized"] is True
         assert by_miner[_MINER_A]["score_count"] == 3
         assert by_miner[_MINER_B]["registered"] is True
+        assert by_miner[_MINER_B]["miner_uid"] == 42
         assert by_miner[_MINER_B]["emission_eligible"] is True
 
     async def test_chain_error_keeps_leaderboard_available_with_unknown_registration(
@@ -594,6 +596,7 @@ class TestPublicHealth:
         assert body["miners"] == 3
         assert body["scored_miners"] == 2
         assert body["scored_agents"] == 2
+        assert body["total_scores"] == 2
         assert body["scores_24h"] == 1  # only MINER_A is within 24h
         assert body["avg_latency_ms"] == 600
         # last_scored_at is the newest platform write (MINER_A, ~5 min ago).
@@ -667,6 +670,7 @@ class TestPublicHealth:
             "scored_miners": 0,
             "scored_agents": 0,
             "last_scored_at": None,
+            "total_scores": 0,
             "scores_24h": 0,
             "avg_latency_ms": None,
         }
