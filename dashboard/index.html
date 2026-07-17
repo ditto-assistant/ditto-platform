@@ -246,6 +246,20 @@
     .leaderboard-notice.show { display: block; }
     .leaderboard-notice strong { color: var(--warn); }
 
+    .emissions-strip {
+      display: none; margin: -2px 0 12px; padding: 12px 14px;
+      border: 1px solid var(--border); border-radius: 9px; background: var(--bg-elev);
+    }
+    .emissions-strip.show { display: flex; align-items: flex-start; gap: 16px; }
+    .emissions-summary { min-width: 0; flex: 1 1 auto; }
+    .emissions-title { color: var(--text); font-size: 13px; font-weight: 750; }
+    .emissions-title .entity-link { color: inherit; }
+    .emissions-reason { margin-top: 3px; color: var(--text-dim); font-size: 12px; line-height: 1.5; }
+    .emissions-recipients { flex: 0 1 320px; color: var(--text-dim); font-size: 11.5px; line-height: 1.5; text-align: right; }
+    .emission-badge { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; font-family: var(--sans); font-size: 10px; font-weight: 750; }
+    .emission-badge.champion { color: var(--gold); }
+    .emission-badge.tail { color: var(--accent-2); }
+
     /* ── Leaderboard ────────────────────────────────────────── */
     .board { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
     table { width: 100%; border-collapse: collapse; }
@@ -1207,7 +1221,7 @@
     .view-all:hover { text-decoration: none; border-bottom: 1px solid var(--accent); }
 
     .board { border-color: var(--border); border-radius: 4px; background: var(--bg-elev); overflow-x: auto; }
-    table { min-width: 720px; }
+    table { min-width: 850px; }
     thead th { padding: 11px 14px; border-color: var(--border); background: var(--bg-elev-2); color: var(--text-dim); font-family: var(--mono); font-size: 9px; letter-spacing: .06em; }
     tbody td { padding: 11px 14px; border-color: color-mix(in oklch, var(--border) 72%, transparent); font-size: 13px; }
     tbody tr:hover,
@@ -1309,6 +1323,8 @@
       .card.primary .value { font-size: 44px; }
       .section-head { display: block; }
       .section-head .hint { display: block; margin-top: 6px; line-height: 1.5; }
+      .emissions-strip.show { display: block; }
+      .emissions-recipients { margin-top: 8px; text-align: left; }
       .view-all { display: inline-block; margin: 8px 0 0; }
       .pager { gap: 6px; padding-inline: 8px; }
       .pager .btn { min-width: 84px; padding-inline: 9px; }
@@ -1782,15 +1798,23 @@
 
     <div class="section-head">
       <h2 id="leaderboard-title">Leaderboard</h2>
-      <span class="hint" id="leaderboard-hint">best final score per miner · ranked by composite · click a row for detail</span>
+      <span class="hint" id="leaderboard-hint">raw score rank · KOTH emissions shown separately · click a row for detail</span>
+    </div>
+    <div class="emissions-strip" id="emissions-strip" role="status" aria-live="polite">
+      <div class="emissions-summary">
+        <div class="emissions-title" id="emissions-title"></div>
+        <div class="emissions-reason" id="emissions-reason"></div>
+      </div>
+      <div class="emissions-recipients" id="emissions-recipients"></div>
     </div>
     <div class="leaderboard-notice" id="leaderboard-notice" role="status" aria-live="polite"></div>
     <div class="board">
       <table id="board" tabindex="-1" aria-label="Subnet 118 leaderboard: best score per miner">
         <thead>
           <tr>
-            <th scope="col" style="width:52px"><span class="tip" title="Rank by composite among ranked (full-benchmark) runs. Provisional runs are shown but unranked (–).">#</span></th>
-            <th scope="col"><span class="tip" title="The miner's winning agent, with its current SN118 UID and on-chain hotkey below. Open either identity for details, or copy the hotkey.">Winning agent</span></th>
+            <th scope="col" style="width:72px"><span class="tip" title="Raw rank by finalized composite among full-benchmark runs. This is independent of KOTH emissions; provisional runs are unranked (–).">Score rank</span></th>
+            <th scope="col"><span class="tip" title="The miner's best-scoring agent, with its current SN118 UID and on-chain hotkey below. Open either identity for details, or copy the hotkey.">Best-scoring agent</span></th>
+            <th scope="col" style="width:128px"><span class="tip" title="Current KOTH role. The incumbent receives 90% of the miner pool; up to four participation-tail recipients split the remaining 10%.">Emissions</span></th>
             <th scope="col" class="hide-md" style="width:180px"><span class="tip" title="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under.">Model</span></th>
             <th scope="col" style="width:190px"><span class="tip" title="Headline score in [0,1]: (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates. The band on the bar is ±1 standard error. The second line shows the score trend.">Composite</span></th>
             <th scope="col" class="hide-sm" style="width:140px"><span class="tip" title="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span></th>
@@ -1800,7 +1824,7 @@
           </tr>
         </thead>
         <tbody id="rows">
-          <tr><td colspan="8" class="empty">Loading leaderboard…</td></tr>
+          <tr><td colspan="9" class="empty">Loading leaderboard…</td></tr>
         </tbody>
       </table>
     </div>
@@ -2513,7 +2537,7 @@
       var registrationUnknown = entries.filter(function (e) { return e.registered == null; });
       title.textContent = finalizedEntries.length ? "Leaderboard" : (provisional.length ? "Provisional leaderboard" : "Leaderboard");
       hint.textContent = finalizedEntries.length
-        ? "final scores first · current SN118 registration required for emissions"
+        ? "raw composite rank · KOTH champion and recipients shown separately"
         : "early accepted scores · ranked provisionally by composite";
       if (provisional.length || inactive.length || registrationUnknown.length) {
         notice.classList.add("show");
@@ -2524,17 +2548,65 @@
         if (inactive.length) notices.push('<strong>Registration inactive.</strong> ' + inactive.length +
           ' scored hotkey' + (inactive.length === 1 ? ' is' : 's are') +
           ' not currently registered on SN118. Their submissions and scores are retained, but they are excluded from active weights and emissions until the same hotkey registers again.');
-        if (registrationUnknown.length) notices.push('<strong>Registration unavailable.</strong> Current SN118 registration could not be confirmed. Scores remain visible, but active weight and emission eligibility are unknown; no leader crown or active-rank styling is shown until registration is confirmed.');
+        if (registrationUnknown.length) notices.push('<strong>Registration unavailable.</strong> Current SN118 registration could not be confirmed. The deterministic KOTH fold remains visible, but actual chain eligibility and active-rank styling stay unknown until registration is confirmed.');
         notice.innerHTML = notices.join(' ');
       } else {
         notice.classList.remove("show");
         notice.textContent = "";
       }
 
+      var emissions = data.emissions || null;
+      var emissionsByAgent = {};
+      if (emissions) {
+        (emissions.recipients || []).forEach(function (recipient) {
+          emissionsByAgent[String(recipient.agent_id)] = recipient;
+        });
+      }
+      entries.forEach(function (entry) {
+        entry._emission = emissionsByAgent[String(entry.agent_id)] || null;
+      });
+      var emissionsStrip = document.getElementById("emissions-strip");
+      if (emissions) {
+        var championEntry = entries.find(function (entry) { return String(entry.agent_id) === String(emissions.champion_agent_id); });
+        var rawLeaderEntry = entries.find(function (entry) { return String(entry.agent_id) === String(emissions.raw_leader_agent_id); });
+        var championName = championEntry ? agentName(championEntry.agent_name) : shortKey(emissions.champion_miner_hotkey);
+        var championRank = championEntry && championEntry.rank ? "raw #" + championEntry.rank : "current score pool";
+        document.getElementById("emissions-title").innerHTML =
+          '<span class="emission-badge champion"><span aria-hidden="true">●</span> KOTH champion</span> · ' +
+          (championEntry ? entityAnchor("agent", championEntry.agent_id, championName) : esc(championName)) +
+          ' (' + esc(championRank) + ') receives ' + pct(emissions.champion_share) + ' of the miner pool.';
+        var decision = emissions.raw_leader_decision;
+        if (decision && rawLeaderEntry) {
+          var method = decision.method === "paired" ? "paired-seed uncertainty band" :
+            decision.method === "unpaired" ? "statistical uncertainty band" : "2% incumbent margin";
+          document.getElementById("emissions-reason").textContent =
+            "Raw #1 " + agentName(rawLeaderEntry.agent_name) + " leads by " + fx(decision.challenger_lead) +
+            " but must lead by more than " + fx(decision.required_lead) + " to dethrone the older incumbent. " +
+            "The fold uses the larger of the 2% protection margin and the " + method + ".";
+        } else {
+          document.getElementById("emissions-reason").textContent =
+            "The raw score leader also wins the first-seen KOTH fold after the 2% protection margin and statistical band are applied.";
+        }
+        var tails = (emissions.recipients || []).filter(function (recipient) { return recipient.role === "tail"; });
+        document.getElementById("emissions-recipients").innerHTML = tails.length
+          ? '<span class="emission-badge tail">Participation tail</span> · ' + tails.map(function (recipient) {
+              var entry = entries.find(function (candidate) { return String(candidate.agent_id) === String(recipient.agent_id); });
+              var label = entry ? agentName(entry.agent_name) : shortKey(recipient.miner_hotkey);
+              return (entry ? entityAnchor("agent", entry.agent_id, label) : esc(label)) + " " + pct(recipient.share_of_miner_pool);
+            }).join(" · ")
+          : "No participation-tail recipients in the current pool.";
+        emissionsStrip.classList.add("show");
+      } else {
+        emissionsStrip.classList.remove("show");
+        document.getElementById("emissions-title").textContent = "";
+        document.getElementById("emissions-reason").textContent = "";
+        document.getElementById("emissions-recipients").textContent = "";
+      }
+
       // Rows
       var tb = document.getElementById("rows");
       if (!entries.length) {
-        tb.innerHTML = '<tr><td colspan="8" class="empty">No miners have been scored yet. As soon as a submission clears scoring it appears here.</td></tr>';
+        tb.innerHTML = '<tr><td colspan="9" class="empty">No miners have been scored yet. As soon as a submission clears scoring it appears here.</td></tr>';
         persistRanks();
         updateSearch();
         return;
@@ -2542,13 +2614,11 @@
       tb.innerHTML = entries.map(function (e, i) {
         var elig = isEligible(e);
         var finalizedEntry = isFinalized(e);
-        // Crown + rank styling only for the top *eligible* run; provisional runs
-        // are unranked and never champion.
         var registered = isRegistered(e);
         var activelyEligible = e.emission_eligible === true;
-        var isChamp = finalizedEntry && elig && activelyEligible && e.rank === 1;
+        var emission = e._emission;
+        var isChamp = emission && emission.role === "champion";
         var rankCls = (finalizedEntry && elig && activelyEligible && e.rank <= 3) ? " r" + e.rank : "";
-        var champ = isChamp ? '<span class="badge"><span aria-hidden="true">👑</span> LEADER</span>' : "";
         var kind = unrankedKind(e);
         var prov = kind === "zero"
           ? '<span class="prov" title="This full run scored a composite of 0.000, so it is shown for transparency but is not ranked and not emission-eligible.">no score</span>'
@@ -2563,7 +2633,8 @@
         var accessibleAgentName = agentLabel(e.agent_name, e.agent_version);
         var rowLabel = (elig ? (finalizedEntry ? "Rank " : "Provisional rank ") + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
           ", agent " + accessibleAgentName + ", miner UID " + (e.miner_uid == null ? "unavailable" : e.miner_uid) +
-          ", hotkey " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) + ". Activate for run detail.";
+          ", hotkey " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) +
+          (emission ? ", KOTH " + emission.role + " receiving " + pct(emission.share_of_miner_pool) + " of the miner pool" : "") + ". Activate for run detail.";
         var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge" title="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
           esc(e.score_count || 0) + ' of ' + esc(e.score_quorum || 3) + ' · provisional</span>';
         var registrationBadge = registered
@@ -2575,10 +2646,12 @@
           '<tr data-i="' + i + '"' + (isChamp ? ' class="champion"' : '') +
             ' role="button" tabindex="0" aria-label="' + esc(rowLabel) + '">' +
             '<td>' + rankCell + '</td>' +
-            '<td><span class="winner-identity"><span class="winner-name">' + entityAnchor("agent", e.agent_id, displayAgentName) + champ + prov + quorumBadge + registrationBadge + '</span>' +
+            '<td><span class="winner-identity"><span class="winner-name">' + entityAnchor("agent", e.agent_id, displayAgentName) + prov + quorumBadge + registrationBadge + '</span>' +
               agentVersionBadge(e.agent_version) +
               '<span class="winner-miner" title="' + esc(e.miner_hotkey) + '"><span class="miner-uid" title="Current SN118 UID">UID ' + (e.miner_uid == null ? "–" : esc(e.miner_uid)) + '</span><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' +
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></span></span></td>' +
+            '<td>' + (emission ? '<span class="emission-badge ' + esc(emission.role) + '"><span aria-hidden="true">●</span> ' +
+              (emission.role === "champion" ? "Champion" : "Tail") + ' · ' + pct(emission.share_of_miner_pool) + '</span>' : '<span class="muted">—</span>') + '</td>' +
             modelCell(e) +
             compositeCell(e) +
             '<td class="hide-sm">' + bar("tool", e.tool_mean) + '</td>' +
@@ -2601,11 +2674,12 @@
       badge.textContent = "";
       document.getElementById("leaderboard-title").textContent = "Leaderboard";
       document.getElementById("leaderboard-hint").textContent = "Live standings are temporarily unavailable";
+      document.getElementById("emissions-strip").classList.remove("show");
       var notice = document.getElementById("leaderboard-notice");
       notice.classList.remove("show");
       notice.textContent = "";
       document.getElementById("rows").innerHTML =
-        '<tr><td colspan="8" class="empty">Could not load live leaderboard data. Try refreshing in a moment.</td></tr>';
+        '<tr><td colspan="9" class="empty">Could not load live leaderboard data. Try refreshing in a moment.</td></tr>';
       updateSearch();
     }
 
@@ -2775,7 +2849,7 @@
       document.getElementById("d-stats").classList.remove("pipeline-mode");
       document.querySelector("#modal .split").style.display = "";
       document.getElementById("d-title").textContent = isFinalized(e)
-        ? "Rank #" + e.rank + (e.rank === 1 && e.emission_eligible === true ? " · 👑 Leader" : "")
+        ? "Raw score rank #" + e.rank + (e._emission && e._emission.role === "champion" ? " · KOTH champion" : "")
         : "Provisional rank P" + e.rank + " · " + (e.score_count || 0) + " of " + (e.score_quorum || 3) + " scores";
       benchChip(e);
       document.getElementById("d-hotkey").innerHTML = entityAnchor("miner", e.miner_hotkey, e.miner_hotkey);
@@ -2793,6 +2867,7 @@
       var m = e.models || {};
       var mKind = unrankedKind(e);
       var det = "";
+      if (e._emission) det += stat("KOTH emissions", (e._emission.role === "champion" ? "Champion · " : "Participation tail · ") + pct(e._emission.share_of_miner_pool) + " of the miner pool. Raw score rank is shown separately.");
       if (!isFinalized(e)) det += stat("Validation", (e.score_count || 0) + " of " + (e.score_quorum || 3) + " accepted scores. Not final and not used for emissions.");
       if (e.registered === false) det += stat("Registration", "Not currently registered on SN118. The submission, fee record, and scores are retained, but this hotkey is excluded from active weights and emissions until the same hotkey registers again.");
       else if (e.registered == null) det += stat("Registration", "Current SN118 registration could not be confirmed. The score is retained, but active weight and emission eligibility are unknown.");
@@ -2842,7 +2917,7 @@
       // table, glossaries) render full width below the columns.
       function group(head, body) { return body ? '<div class="stat-group"><div class="stat-head">' + head + '</div>' + body + '</div>' : ""; }
       var overview =
-        stat("Winning agent", agentName(e.agent_name)) +
+        stat("Best-scoring agent", agentName(e.agent_name)) +
         stat("Submission", agentVersionLabel(e.agent_version)) +
         stat("Composite", fx(e.composite) +
           (e.composite_stderr != null ? "  ± " + fx(e.composite_stderr) + " SE" : "")) +

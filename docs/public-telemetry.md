@@ -71,8 +71,14 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   { rank, agent_id, agent_name, miner_hotkey, registered, emission_eligible,
     composite, tool_mean, memory_mean, first_seen, n,
     median_ms, bench_version, dataset_sha256, models, per_category,
-    integrity, tokens } ] }`.
-  Best-per-miner, ranked by composite. The provenance block (`models` =
+    integrity, tokens } ], emissions: { champion_agent_id, recipients,
+    raw_leader_decision, margin, dethrone_z, champion_share, tail_size } }`.
+  Entries are best-per-miner and ranked by raw finalized composite. `emissions`
+  is a public-safe, read-only projection of the validator's frozen first-seen
+  KOTH fold over finalized current-benchmark entries: the 2% incumbent margin, the
+  statistical band, the 90% champion share, and the participation tail. It is
+  `null` when no eligible entry exists. Validators still compute and submit their
+  own authoritative weight vectors. The provenance block (`models` =
   generator/judge/judge_audit/harness, `bench_version`, `dataset_sha256`,
   `per_category` means, `median_ms`, `n`) is the **transparency payload**: it
   lets anyone see *what model produced a run and how it was scored* and pins the
@@ -90,10 +96,10 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   The optional chain lookup has a one-second deadline and a bounded, short-lived
   in-process snapshot cache, so Pylon latency or failure cannot fail the public
   leaderboard. The dashboard presents `null` explicitly as unknown and requires
-  `emission_eligible: true` before showing leader or active-rank treatment.
+  the KOTH projection before showing champion or recipient treatment.
   **Never** included: `seed` (anti-overfit), `per_case` `expected`/`called` (the
-  answer key), agent_id/sha256/signature/validator_hotkey (integrity-internal).
-  `is_champion`/weights stay validator-side (KOTH fold), not served here.
+  answer key), sha256/signature/validator_hotkey (integrity-internal). The full
+  submitted vector stays validator-side; only the explainable projection is public.
 - `GET /api/v1/public/activity?limit=` → `{ generated_at, count, entries: [
   { agent_id, miner_hotkey, name, status, submitted_at, screening_reason,
     duplicate_of, review_reason } ] }`.
@@ -320,9 +326,9 @@ idea); no server needed since all data comes from the public API + wandb.
 ## Build order
 
 1. ✅ Public API — `/api/v1/public/leaderboard` + `/api/v1/public/health`.
-   `/weights` is intentionally **not** served: the KOTH weight vector is
-   validator-side (see the scoring endpoint boundary); the dashboard links wandb
-   / the chain for weights.
+   `/weights` remains intentionally absent: validators own weight submission.
+   The leaderboard embeds a read-only champion/tail projection so raw score rank
+   cannot be confused with emissions recipients.
 2. ✅ wandb `telemetry.py` in the validator (ditto-subnet #27) — aggregate +
    per-category tables, opt-in and off by default.
 3. ✅ Dashboard SPA (`dashboard/index.html`) against the public API + wandb link.

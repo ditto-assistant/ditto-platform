@@ -152,6 +152,7 @@ async def _seed_k3(
     dataset_seed_block_hash: str | None = "0x" + "9f" * 32,
     details: dict | None = None,
     base_time: datetime = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
+    created_at: datetime | None = None,
 ) -> str:
     """Seed one agent scored by ``len(composites)`` distinct validators.
 
@@ -177,7 +178,7 @@ async def _seed_k3(
             dataset_run_size=dataset_run_size,
             dataset_seed_block=dataset_seed_block,
             dataset_seed_block_hash=dataset_seed_block_hash,
-            created_at=datetime.now(UTC),
+            created_at=created_at or datetime.now(UTC),
         )
         s.add(agent)
         await s.flush()
@@ -246,6 +247,69 @@ async def _seed_agent(
 
 
 class TestPublicLeaderboard:
+    async def test_distinguishes_raw_rank_one_from_koth_emissions_champion(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        details = {"bench_version": 2, "composite_stderr": 0.03}
+        incumbent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.80, 0.80, 0.80],
+            details=details,
+            created_at=datetime(2026, 7, 15, tzinfo=UTC),
+        )
+        raw_leader_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.85, 0.85, 0.85],
+            details=details,
+            created_at=datetime(2026, 7, 16, tzinfo=UTC),
+        )
+        _install_db(app, session_maker)
+        app.state.chain = SimpleNamespace(
+            get_recent_neurons=AsyncMock(
+                return_value=[
+                    SimpleNamespace(hotkey=_MINER_A, uid=41),
+                    SimpleNamespace(hotkey=_MINER_B, uid=42),
+                ]
+            )
+        )
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        assert body["entries"][0]["agent_id"] == raw_leader_id
+        assert body["entries"][0]["rank"] == 1
+        assert body["emissions"]["raw_leader_agent_id"] == raw_leader_id
+        assert body["emissions"]["champion_agent_id"] == incumbent_id
+        assert body["emissions"]["margin"] == pytest.approx(0.02)
+        assert body["emissions"]["dethrone_z"] == pytest.approx(1.64)
+        decision = body["emissions"]["raw_leader_decision"]
+        assert decision["challenger_lead"] == pytest.approx(0.05)
+        assert decision["required_lead"] == pytest.approx(
+            1.64 * (0.03**2 + 0.03**2) ** 0.5
+        )
+        assert decision["method"] == "unpaired"
+        assert decision["dethrones"] is False
+        assert body["emissions"]["recipients"] == [
+            {
+                "role": "champion",
+                "agent_id": incumbent_id,
+                "miner_hotkey": _MINER_A,
+                "raw_rank": 2,
+                "share_of_miner_pool": 0.9,
+            },
+            {
+                "role": "tail",
+                "agent_id": raw_leader_id,
+                "miner_hotkey": _MINER_B,
+                "raw_rank": 1,
+                "share_of_miner_pool": pytest.approx(0.1),
+            },
+        ]
+
     async def test_marks_deregistered_scores_retained_but_emission_ineligible(
         self,
         app: FastAPI,

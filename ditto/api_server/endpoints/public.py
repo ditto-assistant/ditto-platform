@@ -21,9 +21,9 @@ validator-gated ``/scoring/scores`` reads:
 
 Responses are cacheable (``max-age=30``) so a CDN / the dashboard can front this
 cheaply; the underlying rows only change when a sweep records a new score. The
-KOTH champion / weight vector is deliberately **not** served here — that is
-validator-side (see the scoring endpoint's boundary note); the dashboard reads
-weights from wandb or the chain.
+leaderboard includes a read-only projection of the validator's frozen KOTH fold
+so raw score rank is never mistaken for the emissions champion. Validators remain
+the authority that independently computes and submits the real weight vector.
 """
 
 from __future__ import annotations
@@ -63,7 +63,10 @@ from ditto.api_models import (
     PublicCaseResult,
     PublicCategoryStat,
     PublicDatasetReveal,
+    PublicDethroneDecision,
+    PublicEmissionRecipient,
     PublicHealthResponse,
+    PublicKothEmissions,
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
     PublicOperationsResponse,
@@ -102,9 +105,22 @@ from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.datapipeline import DataPipelineError
+from ditto.api_server.endpoints.scoring import (
+    _confirmation_composites,
+    _confirmation_seeds,
+    _ledger_stderr,
+)
 from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.upload import _verify_signature
 from ditto.api_server.endpoints.validator import SessionDep
+from ditto.api_server.koth import (
+    KOTH_CHAMPION_SHARE,
+    KOTH_DETHRONE_Z,
+    KOTH_MARGIN,
+    KOTH_TAIL_SIZE,
+    KothEntry,
+    project_koth,
+)
 from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
@@ -136,6 +152,7 @@ from ditto.db.queries.scores import (
     list_provisional_ledger,
     list_public_submissions,
     list_scores_for_bench_version,
+    quorum_composites,
 )
 from ditto.db.queries.screening import (
     get_running_screening_attempts,
@@ -444,49 +461,6 @@ def _safe_calibration(details: dict) -> tuple[float | None, int | None]:
     return b, count
 
 
-def _safe_stderr(details: dict) -> float | None:
-    """Estimate the composite's standard error from the per-case score spread.
-
-    ``composite = 0.5 * tool_mean + 0.5 * memory_mean`` (B6 weighting). Treating
-    the tool and memory case sets as independent samples, the SE of that weighted
-    sum is ``sqrt(0.25*se_tool^2 + 0.25*se_memory^2)`` where each ``se`` is the
-    standard error of the mean of its kind's per-case scores. Derived from the
-    stored ``details.per_case`` (never exposed itself) — so the leaderboard can
-    show error bars / a statistical-tie band without a re-score. ``None`` when
-    there is no usable per-case data; a kind with <2 cases contributes SE 0.
-    """
-    per_case = details.get("per_case")
-    if not isinstance(per_case, list):
-        return None
-    tool: list[float] = []
-    memory: list[float] = []
-    for c in per_case:
-        if not isinstance(c, dict):
-            continue
-        score = c.get("score")
-        if not isinstance(score, (int, float)) or isinstance(score, bool):
-            continue
-        kind = c.get("kind")
-        if kind == "tool":
-            tool.append(float(score))
-        elif kind == "memory":
-            memory.append(float(score))
-    if not tool and not memory:
-        return None
-
-    def _sem(xs: list[float]) -> float:
-        n = len(xs)
-        if n < 2:
-            return 0.0
-        mean = sum(xs) / n
-        var = sum((x - mean) ** 2 for x in xs) / (n - 1)
-        return math.sqrt(var / n)
-
-    se_t = _sem(tool)
-    se_m = _sem(memory)
-    return math.sqrt(0.25 * se_t * se_t + 0.25 * se_m * se_m)
-
-
 def _public_entry(
     rank: int,
     r: LedgerRow,
@@ -498,6 +472,7 @@ def _public_entry(
     score_count: int = SCORING_QUORUM,
     registered: bool | None = None,
     miner_uid: int | None = None,
+    fold_stderr: float | None = None,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -534,7 +509,10 @@ def _public_entry(
             else None
         ),
         composite=r.composite,
-        composite_stderr=_safe_stderr(details),
+        # Use the exact uncertainty value sent to validators: a stashed re-score
+        # SE when present, otherwise the k=3 quorum SEM. This keeps the displayed
+        # band and the KOTH projection aligned with the real fold.
+        composite_stderr=fold_stderr,
         calibration_brier=calibration_brier,
         calibration_n=calibration_n,
         tool_mean=r.tool_mean,
@@ -554,6 +532,98 @@ def _public_entry(
     )
 
 
+def _public_koth_emissions(
+    rows: list[LedgerRow],
+    *,
+    stderrs: dict[UUID, float | None],
+) -> PublicKothEmissions | None:
+    """Project the finalized score pool through the validator's pure fold."""
+    candidates: list[LedgerRow] = []
+    for row in rows:
+        details = row.details if isinstance(row.details, dict) else {}
+        if (
+            row.eligible
+            and row.composite > 0.0
+            and details.get("bench_version") == CURRENT_BENCH_VERSION
+        ):
+            candidates.append(row)
+    candidates.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
+
+    fold_entries = []
+    for raw_rank, row in enumerate(candidates, start=1):
+        details = row.details if isinstance(row.details, dict) else {}
+        fold_entries.append(
+            KothEntry(
+                miner_hotkey=row.miner_hotkey,
+                agent_id=row.agent_id,
+                composite=row.composite,
+                first_seen=row.first_seen,
+                raw_rank=raw_rank,
+                composite_stderr=stderrs.get(row.agent_id),
+                confirmation_composites=(
+                    tuple(values)
+                    if (values := _confirmation_composites(details)) is not None
+                    else None
+                ),
+                confirmation_seeds=(
+                    tuple(seeds)
+                    if (seeds := _confirmation_seeds(details)) is not None
+                    else None
+                ),
+            )
+        )
+
+    projection = project_koth(fold_entries)
+    if projection is None:
+        return None
+    tail_share = (
+        (1.0 - KOTH_CHAMPION_SHARE) / len(projection.tail) if projection.tail else 0.0
+    )
+    recipients = [
+        PublicEmissionRecipient(
+            role="champion",
+            agent_id=projection.champion.agent_id,
+            miner_hotkey=projection.champion.miner_hotkey,
+            raw_rank=projection.champion.raw_rank,
+            share_of_miner_pool=KOTH_CHAMPION_SHARE,
+        )
+    ]
+    recipients.extend(
+        PublicEmissionRecipient(
+            role="tail",
+            agent_id=entry.agent_id,
+            miner_hotkey=entry.miner_hotkey,
+            raw_rank=entry.raw_rank,
+            share_of_miner_pool=tail_share,
+        )
+        for entry in projection.tail
+    )
+    decision = projection.raw_leader_decision
+    return PublicKothEmissions(
+        margin=KOTH_MARGIN,
+        dethrone_z=KOTH_DETHRONE_Z,
+        champion_share=KOTH_CHAMPION_SHARE,
+        tail_size=KOTH_TAIL_SIZE,
+        champion_agent_id=projection.champion.agent_id,
+        champion_miner_hotkey=projection.champion.miner_hotkey,
+        raw_leader_agent_id=projection.raw_leader.agent_id,
+        raw_leader_miner_hotkey=projection.raw_leader.miner_hotkey,
+        raw_leader_decision=(
+            PublicDethroneDecision(
+                challenger_lead=decision.challenger_lead,
+                required_lead=decision.required_lead,
+                margin_lead=decision.margin_lead,
+                statistical_lead=decision.statistical_lead,
+                method=decision.method,
+                dethrones=decision.dethrones,
+            )
+            if decision is not None
+            else None
+        ),
+        recipients=recipients,
+    )
+
+
 @router.get("/leaderboard", response_model=PublicLeaderboardResponse)
 async def leaderboard(
     request: Request,
@@ -564,6 +634,14 @@ async def leaderboard(
     response.headers["Cache-Control"] = _CACHE_CONTROL
     ledger_rows = await list_eligible_ledger(session, include_fingerprints=False)
     registered_uids = await _current_registered_uids(request)
+    quorum = await quorum_composites(session, [row.agent_id for row in ledger_rows])
+    fold_stderrs = {
+        row.agent_id: _ledger_stderr(
+            row.details if isinstance(row.details, dict) else None,
+            quorum.get(row.agent_id, []),
+        )
+        for row in ledger_rows
+    }
     score_counts = await get_score_counts(
         session, [row.agent_id for row in ledger_rows]
     )
@@ -627,6 +705,7 @@ async def leaderboard(
                     if registered_uids is not None
                     else None
                 ),
+                fold_stderr=fold_stderrs.get(row.agent_id),
             )
         )
     for row, count in provisional_rows:
@@ -648,6 +727,7 @@ async def leaderboard(
                     if registered_uids is not None
                     else None
                 ),
+                fold_stderr=fold_stderrs.get(row.agent_id),
             )
         )
     return PublicLeaderboardResponse(
@@ -655,6 +735,10 @@ async def leaderboard(
         count=len(entries),
         current_bench_version=CURRENT_BENCH_VERSION,
         entries=entries,
+        emissions=_public_koth_emissions(
+            finalized_rows,
+            stderrs=fold_stderrs,
+        ),
     )
 
 

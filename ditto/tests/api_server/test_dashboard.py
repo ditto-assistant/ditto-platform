@@ -139,13 +139,21 @@ class TestDashboard:
         assert "e.emission_eligible === true" in body
         assert ">registration unknown</span>" in body
         assert 'class="quorum-badge"' in body
-        assert ">Winning agent</span>" in body
+        assert ">Best-scoring agent</span>" in body
         assert 'class="miner-uid" title="Current SN118 UID">UID ' in body
         assert ">Total scores</span>" in body
         assert ">Validators</span>" in body
         assert "Scoring Spend" not in body
         assert "Avg latency" not in body
         assert "Scores · 24h" not in body
+        assert ">Score rank</span>" in body
+        assert ">Emissions</span>" in body
+        assert 'id="emissions-strip" role="status" aria-live="polite"' in body
+        assert "KOTH champion and recipients shown separately" in body
+        assert "Raw score rank #" in body
+        assert 'emission.role === "champion"' in body
+        assert "must lead by more than" in body
+        assert "2% protection margin" in body
         assert 'class="winner-identity"' in body
         assert 'entityAnchor("agent", e.agent_id, displayAgentName)' in body
         assert "agentVersionBadge(e.agent_version)" in body
