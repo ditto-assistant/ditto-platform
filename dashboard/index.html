@@ -2064,6 +2064,9 @@
           <li><b>Model</b>: <code id="bs-model">qwen/qwen3-32b</code> served as <code id="bs-serving">Qwen/Qwen3-32B-TEE</code> (hardware-attested TEE), reasoning mode locked <b id="bs-thinking">off</b>. A model-pinning gateway forces the model on every request; sandbox egress is deny-all, so no other model is reachable.</li>
           <li><b>Grading</b>: no LLM judge. Deterministic per-kind checks from the public <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">dittobench-datagen</a> module (also the generator: dataset + answer keys are byte-reproducible from the seed).</li>
           <li><b>Seed</b>: derived from an on-chain block hash fixed <i>after</i> the miner commits. The result is unpredictable: one fresh dataset per submission, pinned by <code>dataset_sha256</code> in every score.</li>
+          <li><b>Observed execution</b>: tool cases are scored on the trajectory the validator watched through its mock tool endpoint, not the harness's self-report. Every scored run opens with a reachability probe; if the harness cannot reach the endpoint, the run <b>fails and is retried</b> — it is never scored as zeros.</li>
+          <li><b>Transcript</b>: each scored run publishes its graded inputs (every response and observed tool call) content-addressed as <code>transcript_sha256</code>, and that digest is bound <i>inside</i> the validator's score signature. Dataset + transcript + public grader reproduce any score offline — no trust in the platform or validators required.</li>
+          <li><b>Crown contests</b>: a challenger inside the dethrone band is re-scored, together with the champion, on shared confirmation seeds; the crown then moves or holds on the paired comparison, so dataset luck can never decide emissions.</li>
           <li id="bs-mirror-li" style="display:none"><b>Verify it yourself</b>: finalized run records (dataset pin + all signed scores) are public. View the <a id="bs-mirror" href="#" target="_blank" rel="noopener">run record mirror ↗</a> and signed <a id="bs-ledger" href="#" target="_blank" rel="noopener">score ledger ↗</a>.</li>
         </ul>
       </div>
@@ -2667,10 +2670,13 @@
         if (decision && rawLeaderEntry) {
           var method = decision.method === "paired" ? "paired-seed uncertainty band" :
             decision.method === "unpaired" ? "statistical uncertainty band" : "2% incumbent margin";
+          var contestNote = decision.method === "paired"
+            ? " Both sides were scored on shared confirmation seeds, so this decision is a paired comparison: per-dataset difficulty cancels and cannot decide the crown."
+            : " A lead inside the band is never left to dataset luck: validators re-score both agents on shared confirmation seeds and the next fold decides the contest on the paired comparison.";
           document.getElementById("emissions-reason").textContent =
             "Raw #1 " + agentName(rawLeaderEntry.agent_name) + " leads by " + fx(decision.challenger_lead) +
             " but must lead by more than " + fx(decision.required_lead) + " to dethrone the older incumbent. " +
-            "The fold uses the larger of the 2% protection margin and the " + method + ".";
+            "The fold uses the larger of the 2% protection margin and the " + method + "." + contestNote;
         } else {
           document.getElementById("emissions-reason").textContent =
             "The raw score leader also wins the first-seen KOTH fold after the 2% protection margin and statistical band are applied.";
@@ -3930,6 +3936,11 @@
 
     var VALIDATOR_RETRY_EXPLANATION = "Validator took too long to post a score. Another validator will score you soon.";
 
+    // Anonymous-read URL template for content-addressed run transcripts
+    // ({sha256} placeholder), from /public/bench/config. Null until the config
+    // loads or when mirroring is off; the digest still renders without it.
+    var TRANSCRIPT_URL_TEMPLATE = null;
+
     function validatorRetryInfo(status) {
       if (status !== "expired") return "";
       return '<span class="retry-info" role="img" tabindex="0" aria-label="' + esc(VALIDATOR_RETRY_EXPLANATION) + '" data-tooltip="' + esc(VALIDATOR_RETRY_EXPLANATION) + '">i</span>';
@@ -3965,12 +3976,20 @@
             '<div class="accepted-score-command"><code>' + esc(score.verification_command) + '</code>' +
             copyButton(score.verification_command, "dataset verification command") + '</div></div>'
           : "";
+        var transcript = score.transcript_sha256
+          ? '<div class="accepted-score-meta-row"><b>Transcript</b> <code>' + esc(score.transcript_sha256) + '</code> ' +
+            copyButton(score.transcript_sha256, "transcript digest") +
+            (TRANSCRIPT_URL_TEMPLATE
+              ? ' <a href="' + esc(TRANSCRIPT_URL_TEMPLATE.replace("{sha256}", score.transcript_sha256)) + '" target="_blank" rel="noopener">download ↗</a>'
+              : '') +
+            '<br>Signature-bound digest of this run’s published transcript (every graded response and observed tool call). Regenerate the dataset with the command above and re-run the public grader over the transcript: the result must equal this score exactly.</div>'
+          : "";
         return '<div class="accepted-score">' +
           '<div><span class="accepted-score-value">' + fx(score.composite) + '</span>' +
             '<span class="accepted-score-label">' + esc(label) + ' · ' + esc(accepted) + '</span></div>' +
           '<div class="accepted-score-meta">' +
             '<div class="accepted-score-meta-row"><b>Seed</b> <code>' + esc(score.seed) + '</code> ' + copyButton(score.seed, "benchmark seed") + '<br>' + esc(seedSource) + '</div>' +
-            command + verify +
+            command + verify + transcript +
           '</div>' + casesSection(score) + '</div>';
       }).join("");
       var finalScore = complete
@@ -5065,6 +5084,7 @@
             c.public_mirror_url_template.replace("{agent_id}", "");
           document.getElementById("bs-ledger").href = API_BASE + c.ledger_path.replace("/api/v1", "");
         }
+        TRANSCRIPT_URL_TEMPLATE = c.public_transcript_url_template || null;
       }).catch(function () {});
       if (document.querySelector('.page[data-page="reviews"].active')) loadAthReviews(manual);
     }

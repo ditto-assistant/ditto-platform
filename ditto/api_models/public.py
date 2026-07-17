@@ -1069,6 +1069,22 @@ class PublicProvisionalScore(BaseModel):
             ),
         ),
     ]
+    transcript_sha256: Annotated[
+        str | None,
+        Field(
+            default=None,
+            pattern=r"^[0-9a-f]{64}$",
+            description=(
+                "SHA-256 of this run's published transcript artifact (the "
+                "graded per-case inputs), bound into the validator's score "
+                "signature. The bytes live content-addressed in the public "
+                "bucket at ``transcripts/{sha256}.json``; regenerating the "
+                "dataset from the seed and re-running the public grader over "
+                "the transcript reproduces this composite offline. Null when "
+                "the validator published no transcript."
+            ),
+        ),
+    ] = None
 
 
 class PublicSubmissionPipeline(BaseModel):
@@ -1506,6 +1522,14 @@ class PublicBenchConfigResponse(BaseModel):
             "Anonymous-read URL template for finalized run records "
             "(dataset pin + k=3 signed scores), or null when mirroring is off."
         )
+    )
+    public_transcript_url_template: str | None = Field(
+        default=None,
+        description=(
+            "Anonymous-read URL template for content-addressed run transcripts "
+            "(``{sha256}`` = a score's signature-bound ``transcript_sha256``), "
+            "or null when mirroring is off."
+        ),
     )
     ledger_path: str = Field(description="The self-verifying signed score ledger.")
     generated_at: datetime

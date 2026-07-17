@@ -1916,6 +1916,7 @@ class TestPublicActivity:
         score_count: int,
     ) -> None:
         composites = [0.41, 0.58, 0.73][:score_count]
+        transcript_sha256 = "ef" * 32
         if score_count:
             agent_id = await _seed_k3(
                 session_maker,
@@ -1924,7 +1925,10 @@ class TestPublicActivity:
                 status=(
                     AgentStatus.SCORED if score_count == 3 else AgentStatus.EVALUATING
                 ),
-                details={"bench_version": 2},
+                details={
+                    "bench_version": 2,
+                    "transcript_sha256": transcript_sha256,
+                },
             )
         else:
             agent_id = await _seed_agent(
@@ -1962,6 +1966,9 @@ class TestPublicActivity:
             assert score["verification_command"].endswith(
                 "-seed 987654321 -run-size full -sha"
             )
+            # The signature-bound transcript digest is public; the offline
+            # verification path depends on it.
+            assert score["transcript_sha256"] == transcript_sha256
             assert "validator_hotkey" not in score
             assert "signature" not in score
             assert "ticket_deadline" not in score
@@ -2574,6 +2581,7 @@ class TestBenchConfig:
         assert "dittobench-datagen" in body["grading"]["grader"]
         assert "dataset_sha256" in body["dataset"]["reproduce"]
         assert body["public_mirror_url_template"] is None
+        assert body["public_transcript_url_template"] is None
         assert body["ledger_path"] == "/api/v1/scoring/scores"
 
     async def test_mirror_template_from_env(
@@ -2583,4 +2591,7 @@ class TestBenchConfig:
         body = (await client.get("/api/v1/public/bench/config")).json()
         assert body["public_mirror_url_template"] == (
             "https://storage.googleapis.com/ditto-platform-public-dev/scored/{agent_id}.json"
+        )
+        assert body["public_transcript_url_template"] == (
+            "https://storage.googleapis.com/ditto-platform-public-dev/transcripts/{sha256}.json"
         )

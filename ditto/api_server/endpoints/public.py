@@ -1773,6 +1773,9 @@ async def agent_pipeline(
                 case_results=_safe_case_results(
                     score.details if isinstance(score.details, dict) else {}
                 ),
+                transcript_sha256=_safe_transcript_sha256(
+                    score.details if isinstance(score.details, dict) else {}
+                ),
             )
             for score in accepted_scores
         ],
@@ -2044,6 +2047,11 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
         if public_bucket
         else None
     )
+    transcript_template = (
+        f"https://storage.googleapis.com/{public_bucket}/transcripts/{{sha256}}.json"
+        if public_bucket
+        else None
+    )
     return PublicBenchConfigResponse(
         bench_version=CURRENT_BENCH_VERSION,
         harness=BenchHarnessConfig(
@@ -2078,6 +2086,7 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
             ),
         ),
         public_mirror_url_template=mirror,
+        public_transcript_url_template=transcript_template,
         ledger_path="/api/v1/scoring/scores",
         generated_at=datetime.now(UTC),
     )
