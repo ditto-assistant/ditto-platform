@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Load, undefer_group
 
 from ditto.api_models.admin_copy_review import (
+    AdminCopyReviewAction,
     AdminCopyReviewAudit,
     AdminCopyReviewComparisonUnavailable,
     AdminCopyReviewCurrentComparison,
@@ -40,7 +41,7 @@ from ditto.api_server.source_inspect import (
     TarSourceInspector,
 )
 from ditto.api_server.storage import ObjectDownloadFailedError, S3StorageClient
-from ditto.db.models import Agent, AgentStatus, AthReview, Score
+from ditto.db.models import Agent, AgentStatus, AthReview, AthReviewAction, Score
 from ditto.db.queries.scores import (
     MIN_ELIGIBLE_CASES,
     LedgerRow,
@@ -82,7 +83,7 @@ def _item(
         agent_version=agent.version,
         submitted_at=agent.created_at,
         status=cast(Literal["pending", "resolved"], review.status),
-        opened_at=review.opened_at,
+        opened_at=review.reopened_at or review.opened_at,
         resolved_at=review.resolved_at,
         resolved_by=review.resolved_by,
         resolution=cast(Literal["clear", "reject"] | None, review.resolution),
@@ -108,7 +109,10 @@ def _item(
 
 
 def _audit(
-    review: AthReview, agent: Agent, matched: Agent | None = None
+    review: AthReview,
+    agent: Agent,
+    matched: Agent | None = None,
+    actions: list[AthReviewAction] | None = None,
 ) -> AdminCopyReviewAudit:
     evidence = review.original_evidence
     provenance = review.algorithm_provenance
@@ -135,6 +139,30 @@ def _audit(
         held_score_count=held_score_count,
         previous_status=previous_status,
         opened_by=opened_by,
+        action_history=[
+            AdminCopyReviewAction(
+                action=cast(Literal["reopen", "clear", "reject"], action.action),
+                reason=action.reason,
+                actor=action.actor,
+                created_at=action.created_at,
+                previous_status=action.evidence.get("previous_status"),
+                artifact_sha256=action.evidence.get("sha256"),
+                score_count=action.evidence.get("score_count"),
+            )
+            for action in actions or []
+        ],
+    )
+
+
+async def _review_actions(
+    session: AsyncSession, review_id: UUID
+) -> list[AthReviewAction]:
+    return list(
+        await session.scalars(
+            select(AthReviewAction)
+            .where(AthReviewAction.review_id == review_id)
+            .order_by(AthReviewAction.created_at, AthReviewAction.action_id)
+        )
     )
 
 
@@ -314,7 +342,10 @@ async def list_copy_reviews(
         select(AthReview, Agent)
         .join(Agent, Agent.agent_id == AthReview.agent_id)
         .where(*where)
-        .order_by(AthReview.opened_at.asc(), AthReview.review_id.asc())
+        .order_by(
+            func.coalesce(AthReview.reopened_at, AthReview.opened_at).asc(),
+            AthReview.review_id.asc(),
+        )
         .limit(limit)
         .offset(offset)
     )
@@ -378,7 +409,8 @@ async def get_copy_review_audit(
         if review.original_duplicate_of
         else None
     )
-    return _audit(review, agent, matched)
+    actions = await _review_actions(session, review.review_id)
+    return _audit(review, agent, matched, actions)
 
 
 @router.get(
@@ -463,20 +495,85 @@ async def open_copy_review(
         if existing is not None:
             evidence = existing.original_evidence
             provenance = existing.algorithm_provenance
+            latest_reopen = await session.scalar(
+                select(AthReviewAction)
+                .where(
+                    AthReviewAction.review_id == existing.review_id,
+                    AthReviewAction.action == "reopen",
+                )
+                .order_by(
+                    AthReviewAction.created_at.desc(),
+                    AthReviewAction.action_id.desc(),
+                )
+                .limit(1)
+            )
+            reopened_hold = (
+                latest_reopen is not None
+                and latest_reopen.reason == payload.reason
+                and latest_reopen.evidence.get("sha256") == payload.expected_sha256
+                and latest_reopen.evidence.get("score_count")
+                == payload.expected_score_count
+            )
             same_hold = (
                 existing.status == "pending"
                 and agent.status == AgentStatus.ATH_PENDING_REVIEW
-                and existing.original_reason == payload.reason
-                and evidence.get("sha256") == payload.expected_sha256
-                and evidence.get("score_count") == payload.expected_score_count
-                and provenance.get("review_kind") == "benchmark_overfit"
+                and (
+                    (
+                        existing.original_reason == payload.reason
+                        and evidence.get("sha256") == payload.expected_sha256
+                        and evidence.get("score_count") == payload.expected_score_count
+                        and provenance.get("review_kind") == "benchmark_overfit"
+                    )
+                    or reopened_hold
+                )
             )
-            if not same_hold:
+            if same_hold:
+                return AdminCopyReviewOpenResponse(
+                    review=_item(existing, agent),
+                    agent_status=agent.status.value,
+                    idempotent=True,
+                    reopened=latest_reopen is not None,
+                )
+            if existing.status != "resolved":
                 raise HTTPException(status_code=409, detail="ATH review already exists")
+            if agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"agent is {agent.status.value}, not scored or live",
+                )
+
+            reopened_at = datetime.now(UTC)
+            previous_status = agent.status.value
+            existing.status = "pending"
+            existing.reopened_at = reopened_at
+            existing.resolved_at = None
+            existing.resolved_by = None
+            existing.resolution = None
+            existing.resolution_reason = None
+            agent.status = AgentStatus.ATH_PENDING_REVIEW
+            agent.duplicate_of = existing.original_duplicate_of
+            agent.review_reason = existing.original_reason
+            session.add(
+                AthReviewAction(
+                    action_id=uuid4(),
+                    review_id=existing.review_id,
+                    action="reopen",
+                    reason=payload.reason,
+                    actor=actor,
+                    evidence={
+                        "sha256": payload.expected_sha256,
+                        "score_count": payload.expected_score_count,
+                        "previous_status": previous_status,
+                    },
+                    created_at=reopened_at,
+                )
+            )
+            await session.flush()
             return AdminCopyReviewOpenResponse(
                 review=_item(existing, agent),
                 agent_status=agent.status.value,
-                idempotent=True,
+                idempotent=False,
+                reopened=True,
             )
 
         if agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
@@ -525,6 +622,7 @@ async def open_copy_review(
         review=_item(review, agent),
         agent_status=agent.status.value,
         idempotent=False,
+        reopened=False,
     )
 
 
@@ -573,7 +671,22 @@ async def resolve_copy_review(
             raise HTTPException(
                 status_code=409, detail="agent hold reason no longer matches review"
             )
-        previous_status = review.original_evidence.get("previous_status")
+        latest_reopen = await session.scalar(
+            select(AthReviewAction)
+            .where(
+                AthReviewAction.review_id == review.review_id,
+                AthReviewAction.action == "reopen",
+            )
+            .order_by(
+                AthReviewAction.created_at.desc(), AthReviewAction.action_id.desc()
+            )
+            .limit(1)
+        )
+        previous_status = (
+            latest_reopen.evidence.get("previous_status")
+            if latest_reopen is not None
+            else review.original_evidence.get("previous_status")
+        )
         agent.status = (
             AgentStatus.LIVE
             if canonical == "clear" and previous_status == AgentStatus.LIVE.value
@@ -586,6 +699,17 @@ async def resolve_copy_review(
         review.resolved_by = actor
         review.resolution = canonical
         review.resolution_reason = payload.reason
+        session.add(
+            AthReviewAction(
+                action_id=uuid4(),
+                review_id=review.review_id,
+                action=canonical,
+                reason=payload.reason,
+                actor=actor,
+                evidence={"previous_status": previous_status},
+                created_at=review.resolved_at,
+            )
+        )
         await session.flush()
     return AdminCopyReviewResolveResponse(
         review=_item(review, agent, matched),

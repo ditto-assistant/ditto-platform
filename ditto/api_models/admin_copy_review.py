@@ -98,6 +98,16 @@ class AdminCopyReviewList(BaseModel):
     offset: int
 
 
+class AdminCopyReviewAction(BaseModel):
+    action: Literal["reopen", "clear", "reject"]
+    reason: str
+    actor: str
+    created_at: datetime
+    previous_status: str | None = None
+    artifact_sha256: str | None = None
+    score_count: int | None = None
+
+
 class AdminCopyReviewAudit(BaseModel):
     """Operator audit context for one durable ATH hold."""
 
@@ -107,6 +117,7 @@ class AdminCopyReviewAudit(BaseModel):
     held_score_count: int | None = None
     previous_status: str | None = None
     opened_by: str | None = None
+    action_history: list[AdminCopyReviewAction] = Field(default_factory=list)
 
 
 class AdminSourceDiffFile(BaseModel):
@@ -173,6 +184,7 @@ class AdminCopyReviewOpenResponse(BaseModel):
     review: AdminCopyReviewItem
     agent_status: str
     idempotent: bool
+    reopened: bool
 
 
 class AdminCopyReviewResolveResponse(BaseModel):

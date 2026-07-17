@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import (
 from ditto.api_server.dependencies import get_session, get_storage_client
 from ditto.api_server.fingerprint import reference_corpus_provenance
 from ditto.api_server.storage import ObjectDownloadFailedError
-from ditto.db.models import Agent, AgentStatus, AthReview, Base, Score
+from ditto.db.models import Agent, AgentStatus, AthReview, AthReviewAction, Base, Score
 from ditto.db.queries.scores import list_eligible_ledger
 
 _TOKEN = "test-admin-token-at-least-32-characters"
@@ -249,6 +249,7 @@ async def test_manual_open_holds_exact_scored_artifact_and_removes_it_from_ledge
         "held_score_count": 3,
         "previous_status": AgentStatus.SCORED,
         "opened_by": "operator",
+        "action_history": [],
     }
 
     async with maker() as session:
@@ -333,6 +334,130 @@ async def test_clearing_manual_hold_restores_live_status(
 
     assert resolved.status_code == 200
     assert resolved.json()["agent_status"] == AgentStatus.LIVE
+
+
+async def test_resolved_review_reopens_without_rewriting_original_evidence(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id, sha256 = await _seed_scored_agent(maker, status=AgentStatus.LIVE)
+    _install(app, maker)
+    first_reason = "Deterministic benchmark-family routing"
+    opened = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json={
+            "expected_sha256": sha256,
+            "expected_score_count": 3,
+            "reason": first_reason,
+        },
+        headers=_HEADERS,
+    )
+    assert opened.status_code == 200
+    review_id = UUID(opened.json()["review"]["review_id"])
+    initial_opened_at = datetime.fromisoformat(opened.json()["review"]["opened_at"])
+    assert opened.json()["reopened"] is False
+    cleared = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/resolve",
+        json={"resolution": "clear", "reason": "Initial source review cleared it"},
+        headers=_HEADERS,
+    )
+    assert cleared.status_code == 200
+
+    reopen_payload = {
+        "expected_sha256": sha256,
+        "expected_score_count": 3,
+        "reason": "New benchmark-overfit evidence requires another review",
+    }
+    reopened = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json=reopen_payload,
+        headers=_HEADERS,
+    )
+    assert reopened.status_code == 200
+    assert reopened.json()["reopened"] is True
+    assert reopened.json()["idempotent"] is False
+    assert reopened.json()["review"]["review_id"] == str(review_id)
+    assert reopened.json()["review"]["original"]["reason"] == first_reason
+    retry = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json=reopen_payload,
+        headers=_HEADERS,
+    )
+    assert retry.status_code == 200
+    assert retry.json()["idempotent"] is True
+    assert retry.json()["reopened"] is True
+
+    audit = await client.get(
+        f"/api/v1/admin/copy-reviews/{agent_id}/audit", headers=_HEADERS
+    )
+    assert audit.status_code == 200
+    assert [event["action"] for event in audit.json()["action_history"]] == [
+        "clear",
+        "reopen",
+    ]
+    assert audit.json()["action_history"][1] == {
+        "action": "reopen",
+        "reason": reopen_payload["reason"],
+        "actor": "operator",
+        "created_at": audit.json()["action_history"][1]["created_at"],
+        "previous_status": "live",
+        "artifact_sha256": sha256,
+        "score_count": 3,
+    }
+
+    recleared = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/resolve",
+        json={"resolution": "clear", "reason": "Second review also cleared it"},
+        headers=_HEADERS,
+    )
+    assert recleared.status_code == 200
+    assert recleared.json()["agent_status"] == AgentStatus.LIVE
+    async with maker() as session:
+        review = await session.scalar(
+            select(AthReview).where(AthReview.agent_id == agent_id)
+        )
+        actions = list(
+            await session.scalars(
+                select(AthReviewAction).where(AthReviewAction.review_id == review_id)
+            )
+        )
+        assert review is not None and review.original_reason == first_reason
+        assert review.opened_at.replace(tzinfo=UTC) == initial_opened_at
+        assert review.reopened_at is not None and review.reopened_at > review.opened_at
+        assert len(actions) == 3
+
+
+async def test_reopen_still_fails_closed_on_changed_score_count(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id, sha256 = await _seed_scored_agent(maker)
+    _install(app, maker)
+    opened = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json={
+            "expected_sha256": sha256,
+            "expected_score_count": 3,
+            "reason": "Manual benchmark-overfit review",
+        },
+        headers=_HEADERS,
+    )
+    assert opened.status_code == 200
+    cleared = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/resolve",
+        json={"resolution": "clear", "reason": "Initial evidence was clear"},
+        headers=_HEADERS,
+    )
+    assert cleared.status_code == 200
+    response = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json={
+            "expected_sha256": sha256,
+            "expected_score_count": 2,
+            "reason": "New evidence requires another review",
+        },
+        headers=_HEADERS,
+    )
+    assert response.status_code == 409
+    assert "score count changed" in response.text
 
 
 async def test_list_is_bounded_oldest_first_and_private(
