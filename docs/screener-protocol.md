@@ -9,19 +9,28 @@ The protocol package contains request/response models, `AgentStatus`, artifact
 metadata, `SCREENING_POLICY_VERSION`, and the canonical signing function. The
 API never imports worker application code.
 
-The pin remains policy 6. Moving the package changes neither public statuses nor
-canonical verdict bytes. The platform accepts only the exact current policy and
-lease-bound attempt, and continues rejecting expired, late, conflicting,
-wrong-agent, wrong-policy, and wrong-signer verdicts. Private screener outcomes
-do not widen the API: pass, deterministic reject, and retryable infrastructure
-use the existing signed boolean verdict; quarantine and inconclusive submit no
-public verdict and leave the lease authoritative.
+Policy 9 adds the screener-built image handoff. A passing worker initiates an
+attempt-bound multipart upload to a unique immutable key. After completion the
+platform streams every final byte to verify the declared full-archive SHA-256
+and size; multipart ETags and per-part checksums are not treated as equivalent.
+The upload identity and image metadata are bound into the canonical v5 verdict
+signature. Accepted objects cannot be replaced through an old part URL, and
+validators receive short-lived URLs for both the source and screened image.
+Legacy agents without image metadata remain scoreable through the source-build
+fallback.
 
-Merge `ditto-screener` first, deploy its core-only v6 worker alongside the old
-v6 worker, then merge/deploy this pin. Stop the old worker only after equivalent
-signed pass/reject/retry behavior is observed. Merge the subnet runtime-removal
-PR last. This order requires no migration and preserves screening history,
-active leases, waiting-validator submissions, evaluations, and score receipts.
+Run `scripts/cleanup_screened_images.py` daily. It aborts incomplete multipart
+uploads and removes completed-but-unaccepted objects after one day. Accepted
+images are retained while evaluating and for each miner's current best eligible
+scored agent; non-champion images older than 30 days are detached first (which
+restores source-build fallback) and then deleted. Infrastructure lifecycle rules
+may abort stale multipart uploads and expire noncurrent versions, but must not
+apply a blanket age expiry to current objects needed for rescoring.
+
+Roll out the backward-compatible validator scorer and subnet worker first, then
+the platform migration and policy-9 pin, and finally the policy-9 screener. The
+old screener halts safely when the platform requires the new policy; old
+evaluating records continue through the build fallback.
 ## Quarantine management
 
 A current worker can return a signed, attempt-bound `quarantine` outcome with

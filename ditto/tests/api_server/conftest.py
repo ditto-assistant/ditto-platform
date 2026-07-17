@@ -36,7 +36,7 @@ from ditto.api_server.dependencies import (
 )
 from ditto.api_server.embedding import EmbeddingConfig, NullEmbedder
 from ditto.api_server.pricing import PricingConfig
-from ditto.api_server.storage import StorageConfig
+from ditto.api_server.storage import ObjectMetadata, StorageConfig
 from ditto.chain import ChainConfig
 from ditto.db.config import PostgresConfig
 
@@ -135,6 +135,19 @@ def app() -> Iterator[FastAPI]:
 
     default_storage = MagicMock()
     default_storage.public_bucket = None
+
+    async def _head_screened_image(*, key: str) -> ObjectMetadata:
+        agent_id = key.split("/", 1)[0]
+        return ObjectMetadata(
+            size_bytes=123,
+            metadata={
+                "sha256": "12" * 32,
+                "image-id": "sha256:" + "34" * 32,
+                "image-ref": f"ditto-screen/{agent_id}:latest",
+            },
+        )
+
+    default_storage.head_object = AsyncMock(side_effect=_head_screened_image)
     a.state.storage = default_storage
     yield a
     a.dependency_overrides.clear()

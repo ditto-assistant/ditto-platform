@@ -19,6 +19,8 @@ from botocore.exceptions import ClientError
 
 from ditto.api_server.storage import (
     ObjectDownloadFailedError,
+    ObjectMetadata,
+    ObjectNotFoundError,
     ObjectUploadFailedError,
     S3StorageClient,
     StorageConfig,
@@ -69,6 +71,7 @@ def _install_mock_session(
     head_result: dict[str, Any] | None = None,
     get_side_effect: BaseException | None = None,
     get_result: dict[str, Any] | None = None,
+    presigned_url: str = "https://storage.example/signed",
 ) -> MagicMock:
     """Replace the client's aioboto3 session with a MagicMock + return it.
 
@@ -84,6 +87,13 @@ def _install_mock_session(
     s3_mock.get_object = AsyncMock(
         side_effect=get_side_effect, return_value=get_result or {}
     )
+    s3_mock.generate_presigned_url = AsyncMock(return_value=presigned_url)
+    s3_mock.create_multipart_upload = AsyncMock(return_value={"UploadId": "upload-1"})
+    s3_mock.complete_multipart_upload = AsyncMock()
+    s3_mock.abort_multipart_upload = AsyncMock()
+    s3_mock.delete_object = AsyncMock()
+    s3_mock.list_objects_v2 = AsyncMock(return_value={"Contents": []})
+    s3_mock.list_multipart_uploads = AsyncMock(return_value={"Uploads": []})
 
     @asynccontextmanager
     async def _client_ctx(*_args: object, **_kwargs: object):
@@ -199,6 +209,105 @@ class TestObjectExists:
 
         with pytest.raises(ObjectUploadFailedError, match="InternalError"):
             await client.object_exists(key="boom")
+
+
+class TestScreenedImageStorage:
+    async def test_presigned_put_binds_size_type_and_metadata(self):
+        client = S3StorageClient(_make_config())
+        _install_mock_session(client)
+
+        url = await client.presigned_put_url(
+            key="abc/screened-image.tar",
+            size_bytes=123,
+            metadata={"sha256": "ab" * 32},
+            expires_in=900,
+        )
+
+        assert url == "https://storage.example/signed"
+        call = client._mock_s3.generate_presigned_url.await_args  # type: ignore[attr-defined]
+        assert call.args == ("put_object",)
+        assert call.kwargs["Params"] == {
+            "Bucket": "ditto-agents",
+            "Key": "abc/screened-image.tar",
+            "ContentLength": 123,
+            "ContentType": "application/x-tar",
+            "Metadata": {"sha256": "ab" * 32},
+        }
+        assert call.kwargs["ExpiresIn"] == 900
+
+    async def test_head_returns_size_and_user_metadata(self):
+        client = S3StorageClient(_make_config())
+        _install_mock_session(
+            client,
+            head_result={
+                "ContentLength": 123,
+                "Metadata": {"sha256": "ab" * 32, "image-id": "sha256:123"},
+            },
+        )
+
+        result = await client.head_object(key="abc/screened-image.tar")
+
+        assert result == ObjectMetadata(
+            size_bytes=123,
+            metadata={"sha256": "ab" * 32, "image-id": "sha256:123"},
+        )
+
+    async def test_multipart_create_part_complete_and_abort(self):
+        client = S3StorageClient(_make_config())
+        _install_mock_session(client)
+        key = "abc/screened-images/session.tar"
+
+        upload_id = await client.create_multipart_upload(
+            key=key, metadata={"sha256": "ab" * 32}
+        )
+        part_url = await client.presigned_upload_part_url(
+            key=key, upload_id=upload_id, part_number=1, expires_in=60
+        )
+        await client.complete_multipart_upload(
+            key=key,
+            upload_id=upload_id,
+            parts=[{"PartNumber": 1, "ETag": '"etag"'}],
+        )
+        await client.abort_multipart_upload(key=key, upload_id="other")
+
+        assert upload_id == "upload-1"
+        assert part_url == "https://storage.example/signed"
+        assert client._mock_s3.create_multipart_upload.await_args.kwargs[  # type: ignore[attr-defined]
+            "Metadata"
+        ] == {"sha256": "ab" * 32}
+        assert client._mock_s3.generate_presigned_url.await_args.args == (  # type: ignore[attr-defined]
+            "upload_part",
+        )
+        assert client._mock_s3.complete_multipart_upload.await_args.kwargs[  # type: ignore[attr-defined]
+            "MultipartUpload"
+        ] == {"Parts": [{"PartNumber": 1, "ETag": '"etag"'}]}
+        client._mock_s3.abort_multipart_upload.assert_awaited_once()  # type: ignore[attr-defined]
+
+    async def test_verify_streams_full_object_sha256(self):
+        client = S3StorageClient(_make_config())
+        body = b"full-multipart-object"
+        _install_mock_session(client, get_result={"Body": _ChunkedBody(body, chunk=3)})
+
+        verified = await client.verify_object_sha256(
+            key="abc/screened-images/session.tar",
+            expected_size_bytes=len(body),
+        )
+
+        assert verified.size_bytes == len(body)
+        assert verified.sha256 == hashlib.sha256(body).hexdigest()
+
+    async def test_head_missing_object_is_typed(self):
+        client = S3StorageClient(_make_config())
+        _install_mock_session(
+            client,
+            head_side_effect=ClientError(
+                error_response={"Error": {"Code": "NoSuchKey"}},
+                operation_name="HeadObject",
+            ),
+        )
+
+        with pytest.raises(ObjectNotFoundError):
+            await client.head_object(key="missing")
 
 
 class TestGetObject:
