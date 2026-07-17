@@ -384,7 +384,7 @@ class TestDashboard:
         assert '" reporting " + kind' not in body
         assert 'available + " of " + entries.length + " active " + kind' in body
         assert 'entry.availability === "offline"' in body
-        assert 'retired.hidden = !showScreeners || !retiredEntries.length' in body
+        assert "retired.hidden = !showScreeners || !retiredEntries.length" in body
         assert '" · " + retiredEntries.length + " recently offline"' in body
 
     async def test_operations_panels_share_one_snapshot_and_show_skew(self) -> None:
