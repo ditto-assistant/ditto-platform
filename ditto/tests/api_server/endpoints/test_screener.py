@@ -1590,34 +1590,43 @@ class TestQuarantineAdmin:
             assert len(scores) == 2
 
     @pytest.mark.parametrize(
-        ("resolution", "expected_status", "expected_reason"),
+        ("resolution", "expected_status"),
         [
-            (
-                "release",
-                AgentStatus.EVALUATING,
-                "Remove the bundled credential and resubmit",
-            ),
-            (
-                "rescreen",
-                AgentStatus.SCREENING_FAILED,
-                "Remove the bundled credential and resubmit",
-            ),
-            (
-                "reject",
-                AgentStatus.REJECTED,
-                "Remove the bundled credential and resubmit",
-            ),
+            ("release", AgentStatus.EVALUATING),
+            ("rescreen", AgentStatus.SCREENING_FAILED),
+            ("reject", AgentStatus.REJECTED),
         ],
     )
-    async def test_list_resolution_reason_and_conflicting_second_resolution(
+    async def test_detailed_resolution_reason_and_conflicting_second_resolution(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
         resolution: str,
         expected_status: AgentStatus,
-        expected_reason: str | None,
     ) -> None:
+        detailed_reason = " ".join(
+            [
+                "Source review evidence shows src/router.py:118 selects providers from "
+                "the declared runtime configuration instead of matching benchmark "
+                "prompts.",
+                "The branch at src/router.py:146 handles a documented timeout fallback "
+                "and does not inspect prompt text, expected answers, evaluator "
+                "metadata, or test fixture identifiers.",
+                "A repository-wide search found no embedded benchmark answers, prompt "
+                "hashes, fixture names, response lookup tables, or network calls to "
+                "undeclared services.",
+                "The submitted image was rebuilt from the reviewed archive, then "
+                "smoke-tested with unrelated prompts that exercised both the primary "
+                "provider and fallback path.",
+                "Observed outputs varied with the request and provider response, which "
+                "is inconsistent with replay or benchmark emulation.",
+                "Release is appropriate because the suspicious fast path is general "
+                "routing logic; retain this source-level evidence in the audited "
+                "miner-visible decision.",
+            ]
+        )
+        assert len(detailed_reason) > 500
         app.state.config = replace(
             app.state.config,
             admin_api_token="test-admin-token-at-least-32-characters",
@@ -1654,12 +1663,17 @@ class TestQuarantineAdmin:
         assert item["reason_code"] == "agentic-source-review-tripwire"
         assert "source" not in item
 
+        blank_reason = await client.post(
+            f"/api/v1/admin/screening-quarantines/{item['quarantine_id']}/resolve",
+            headers=admin_headers,
+            json={"resolution": resolution, "reason": "   "},
+        )
         resolved = await client.post(
             f"/api/v1/admin/screening-quarantines/{item['quarantine_id']}/resolve",
             headers=admin_headers,
             json={
                 "resolution": resolution,
-                "reason": "Remove the bundled credential and resubmit",
+                "reason": detailed_reason,
             },
         )
         conflict = await client.post(
@@ -1667,14 +1681,21 @@ class TestQuarantineAdmin:
             headers=admin_headers,
             json={"resolution": "reject", "reason": "Conflicting action"},
         )
+        assert blank_reason.status_code == 422
         assert resolved.status_code == 200
         assert resolved.json()["agent_status"] == expected_status
-        assert len(resolved.json()["quarantine"]["resolution_history"]) == 1
+        resolved_quarantine = resolved.json()["quarantine"]
+        assert resolved_quarantine["resolution_reason"] == detailed_reason
+        assert len(resolved_quarantine["resolution_history"]) == 1
+        history_event = resolved_quarantine["resolution_history"][0]
+        assert history_event["resolution"] == resolution
+        assert history_event["reason"] == detailed_reason
+        assert history_event["actor"] == "backroom:test-user"
         assert conflict.status_code == 409
         async with session_maker() as session:
             agent = await session.get(Agent, agent_id)
             assert agent is not None
-            assert agent.screening_reason == expected_reason
+            assert agent.screening_reason == detailed_reason
 
     async def test_rejected_quarantine_can_be_corrected_to_release_with_history(
         self,
