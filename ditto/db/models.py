@@ -367,6 +367,7 @@ class AthReview(Base):
     opened_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
+    reopened_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     resolved_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     resolved_by: Mapped[str | None] = mapped_column(Text)
     resolution: Mapped[str | None] = mapped_column(Text)
@@ -403,6 +404,46 @@ class AthReview(Base):
             name="ath_reviews_lifecycle_check",
         ),
         Index("ath_reviews_status_opened_idx", "status", "opened_at", "review_id"),
+    )
+
+
+class AthReviewAction(Base):
+    """Append-only operator lifecycle history for an ATH review."""
+
+    __tablename__ = "ath_review_actions"
+
+    action_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    review_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["review_id"], ["ath_reviews.review_id"], ondelete="CASCADE"
+        ),
+        CheckConstraint(
+            "action IN ('reopen', 'clear', 'reject')",
+            name="ath_review_actions_action_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 3 AND 500",
+            name="ath_review_actions_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="ath_review_actions_actor_check",
+        ),
+        Index(
+            "ath_review_actions_review_created_idx",
+            "review_id",
+            "created_at",
+            "action_id",
+        ),
     )
 
 
