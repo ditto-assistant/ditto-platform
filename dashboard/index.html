@@ -446,13 +446,28 @@
       transition: transform .2s cubic-bezier(.4,0,.2,1), opacity .18s;
     }
     .modal.open { opacity: 1; pointer-events: auto; transform: translate(-50%, -50%) scale(1); }
+    .modal-actions { position: absolute; top: 14px; right: 14px; display: flex; align-items: center; gap: 8px; }
+    .modal-actions .open-full { min-height: 44px; padding-inline: 13px; }
+    .modal-actions .close { position: static; }
+    body.entity-page .wrap { display: none; }
+    body.entity-page .modal {
+      position: relative; top: auto; left: auto;
+      width: min(1040px, calc(100vw - 32px)); max-height: none;
+      margin: 32px auto; overflow: visible;
+      opacity: 1; pointer-events: auto;
+      transform: none;
+    }
+    body.entity-page .modal.open { transform: none; }
+    body.entity-page .modal-actions .open-full,
+    body.entity-page .modal-actions .close { display: none; }
+    body:not(.entity-page) .modal-actions .back-dashboard { display: none; }
     /* Title row: rank heading + the run's benchmark-version chip side by side. */
-    .modal .dhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-right: 28px; }
+    .modal .dhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-right: 150px; }
     .modal h3 { margin: 0; font-size: 16px; }
     .modal .dk { display: flex; gap: 8px; align-items: baseline; min-width: 0; margin: 6px 0 20px; color: var(--text-dim); font-family: var(--mono); font-size: 12px; }
     .modal .dk-label { flex: none; color: var(--text-faint); font-family: var(--sans); font-size: 11px; font-weight: 650; }
     .modal #d-hotkey { min-width: 0; overflow-wrap: anywhere; }
-    .modal .close { position: absolute; top: 14px; right: 14px; width: 44px; height: 44px; justify-content: center; padding: 0; }
+    .modal .close { width: 44px; height: 44px; justify-content: center; padding: 0; }
     /* Benchmark-version chip in the modal header (larger than the row chip). */
     #d-bench { font-family: var(--sans); font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; border-radius: 6px; padding: 2px 8px; color: var(--accent-2); border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent); background: color-mix(in oklab, var(--accent-2) 12%, transparent); }
     #d-bench.prev { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 48%, transparent); background: color-mix(in oklab, var(--warn) 14%, transparent); }
@@ -819,6 +834,9 @@
     }
     @media (max-width: 560px) {
       .modal { padding-inline: 20px; }
+      body.entity-page .modal { width: 100%; margin: 0; min-height: 100vh; border: 0; }
+      .modal .dhead { padding-right: 0; padding-top: 54px; }
+      .modal-actions { left: 20px; right: 20px; justify-content: space-between; }
       .modal .dk { display: block; }
       .modal .dk-label { display: block; margin-bottom: 2px; }
       .pipeline-key-facts { display: grid; grid-template-columns: 1fr 1fr; gap: var(--detail-space-md); }
@@ -2029,7 +2047,11 @@
   <!-- Drill-down modal -->
   <div id="modal-back" class="modal-back"></div>
   <aside id="modal" class="modal" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="d-title" tabindex="-1">
-    <button class="btn ghost close" id="modal-close" aria-label="Close detail"><span aria-hidden="true">✕</span></button>
+    <div class="modal-actions">
+      <a class="btn ghost back-dashboard" id="d-back-dashboard" href="/#/overview">← Dashboard</a>
+      <a class="btn ghost open-full" id="d-open-full" href="/">Open full page</a>
+      <button class="btn ghost close" id="modal-close" aria-label="Close detail"><span aria-hidden="true">✕</span></button>
+    </div>
     <div class="dhead">
       <h3 id="d-title">Miner</h3>
       <span id="d-bench"></span>
@@ -2144,18 +2166,33 @@
     var searchMatches = [];
     var searchActiveIndex = -1;
     var ENTITY_PATHS = { agent: "agents", miner: "miners", validator: "validators", screener: "screeners" };
+    var ENTITY_PARAMS = { agents: "agent", miners: "miner", validators: "validator", screeners: "screener" };
     var ENTITY_PAGES = { agents: "submissions", miners: "overview", validators: "operations", screeners: "operations" };
     var activeEntityKey = "";
     var resolvingEntityKey = "";
     var entityReturnUrl = "";
 
+    function clearEntityParams(query) {
+      Object.keys(ENTITY_PARAMS).forEach(function (kind) { query.delete(ENTITY_PARAMS[kind]); });
+    }
+
     function entityHref(kind, identifier) {
       var plural = ENTITY_PATHS[kind] || kind;
+      var url = new URL(location.href);
+      url.pathname = "/";
+      clearEntityParams(url.searchParams);
+      url.searchParams.set(ENTITY_PARAMS[plural], String(identifier));
+      url.hash = "#/" + ENTITY_PAGES[plural];
+      return url.pathname + url.search + url.hash;
+    }
+
+    function fullEntityHref(kind, identifier) {
+      var singular = ENTITY_PARAMS[ENTITY_PATHS[kind] || kind];
       var query = new URLSearchParams();
       ["api", "wandb"].forEach(function (key) {
         if (params.has(key)) query.set(key, params.get(key));
       });
-      return "/" + (query.toString() ? "?" + query : "") + "#/" + plural + "/" + encodeURIComponent(String(identifier));
+      return "/" + singular + "/" + encodeURIComponent(String(identifier)) + (query.toString() ? "?" + query : "");
     }
 
     function entityAnchor(kind, identifier, label, className) {
@@ -2165,7 +2202,25 @@
     }
 
     function readEntityRoute() {
-      var match = /^#\/(agents|miners|validators|screeners)\/([^/?#]+)\/?$/.exec(location.hash);
+      var match = /^\/(agent|miner)\/([^/]+)\/?$/.exec(location.pathname);
+      if (match) {
+        try {
+          var fullKind = match[1] + "s";
+          var fullId = decodeURIComponent(match[2]);
+          return { kind: fullKind, id: fullId, key: fullKind + ":" + fullId, full: true, legacy: false };
+        } catch (error) {
+          return null;
+        }
+      }
+
+      var query = new URLSearchParams(location.search);
+      var queryKind = Object.keys(ENTITY_PARAMS).find(function (kind) { return query.has(ENTITY_PARAMS[kind]); });
+      if (queryKind) {
+        var queryId = query.get(ENTITY_PARAMS[queryKind]);
+        if (queryId) return { kind: queryKind, id: queryId, key: queryKind + ":" + queryId, full: false, legacy: false };
+      }
+
+      match = /^#\/(agents|miners|validators|screeners)\/([^/?#]+)\/?$/.exec(location.hash);
       var legacy = false;
       if (!match) {
         match = /^\/(agents|miners|validators|screeners)\/([^/]+)\/?$/.exec(location.pathname);
@@ -2173,18 +2228,24 @@
       }
       if (!match) return null;
       try {
-        return { kind: match[1], id: decodeURIComponent(match[2]), key: match[1] + ":" + decodeURIComponent(match[2]), legacy: legacy };
+        return { kind: match[1], id: decodeURIComponent(match[2]), key: match[1] + ":" + decodeURIComponent(match[2]), full: false, legacy: true };
       } catch (error) {
         return null;
       }
     }
 
     function dashboardHref(page) {
-      var query = new URLSearchParams();
-      ["api", "wandb"].forEach(function (key) {
-        if (params.has(key)) query.set(key, params.get(key));
-      });
-      return "/" + (query.toString() ? "?" + query : "") + "#/" + page;
+      var url = new URL(location.href);
+      url.pathname = "/";
+      clearEntityParams(url.searchParams);
+      url.hash = "#/" + page;
+      return url.pathname + url.search + url.hash;
+    }
+
+    function configureEntityActions(kind, identifier) {
+      var plural = ENTITY_PATHS[kind] || kind;
+      document.getElementById("d-open-full").href = fullEntityHref(kind, identifier);
+      document.getElementById("d-back-dashboard").href = dashboardHref(ENTITY_PAGES[plural]);
     }
 
     function pushEntityRoute(kind, identifier) {
@@ -2710,6 +2771,7 @@
       if (!e) return;
       if (!preserveUrl) pushEntityRoute("miner", e.miner_hotkey);
       activeEntityKey = "miners:" + e.miner_hotkey;
+      configureEntityActions("miner", e.miner_hotkey);
       document.getElementById("d-stats").classList.remove("pipeline-mode");
       document.querySelector("#modal .split").style.display = "";
       document.getElementById("d-title").textContent = isFinalized(e)
@@ -2819,18 +2881,24 @@
 
     function showModal() {
       var modal = document.getElementById("modal");
+      var entity = readEntityRoute();
+      var fullPage = Boolean(entity && entity.full);
+      document.body.classList.toggle("entity-page", fullPage);
+      modal.classList.toggle("full-page", fullPage);
+      modal.setAttribute("role", fullPage ? "main" : "dialog");
+      modal.setAttribute("aria-modal", fullPage ? "false" : "true");
       // Remember what had focus so it can be restored when the dialog closes.
       lastFocused = document.activeElement;
       modal.classList.add("open");
       modal.setAttribute("aria-hidden", "false");
-      document.getElementById("modal-back").classList.add("open");
+      document.getElementById("modal-back").classList.toggle("open", !fullPage);
       // Take the background out of the tab order and the AT tree while the dialog
       // is open (the modal is a sibling of .wrap, so it stays reachable).
       var wrap = document.querySelector(".wrap");
-      if (wrap) wrap.inert = true;
+      if (wrap) wrap.inert = !fullPage;
       modal.scrollTop = 0;
       // Move focus into the dialog (the close button) for keyboard/AT users.
-      document.getElementById("modal-close").focus();
+      (fullPage ? document.getElementById("d-back-dashboard") : document.getElementById("modal-close")).focus();
     }
     // The element focused before the dialog opened, restored on close.
     var lastFocused = null;
@@ -2862,11 +2930,7 @@
         '"><span aria-hidden="true">⧉</span></button>';
     }
     function canonicalEntityUrl(kind, identifier) {
-      var plural = ENTITY_PATHS[kind] || kind;
-      var url = new URL("/", location.href);
-      url.search = "";
-      url.hash = "#/" + plural + "/" + encodeURIComponent(String(identifier));
-      return url.href;
+      return new URL(fullEntityHref(kind, identifier), location.href).href;
     }
     function reviewPacketLine(value) {
       return String(value == null ? "" : value).replace(/[\r\n\t]+/g, " ").trim();
@@ -3166,6 +3230,7 @@
       var modal = document.getElementById("modal");
       if (!modal.classList.contains("open")) return;
       var entity = readEntityRoute();
+      if (!preserveUrl && entity && entity.full) return;
       if (!preserveUrl && entity && (entity.kind === "agents" || entity.kind === "miners")) {
         if (entityReturnUrl && history.state && history.state.entity) {
           history.back();
@@ -3174,8 +3239,12 @@
         history.replaceState({}, "", dashboardHref(ENTITY_PAGES[entity.kind]));
       }
       modal.classList.remove("open");
+      modal.classList.remove("full-page");
       modal.setAttribute("aria-hidden", "true");
+      modal.setAttribute("role", "dialog");
+      modal.setAttribute("aria-modal", "true");
       document.getElementById("modal-back").classList.remove("open");
+      document.body.classList.remove("entity-page");
       var wrap = document.querySelector(".wrap");
       if (wrap) wrap.inert = false;
       // Return focus to whatever opened the dialog (usually the row).
@@ -3977,6 +4046,7 @@
       if (!e) return;
       if (!preserveUrl) pushEntityRoute("agent", e.agent_id);
       activeEntityKey = "agents:" + e.agent_id;
+      configureEntityActions("agent", e.agent_id);
       var stage = activityStage(e.status);
       var evidence = e.review_reason
         ? "Copy review: " + e.review_reason
