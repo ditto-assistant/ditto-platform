@@ -2206,7 +2206,15 @@
       });
       activityStatuses = ACTIVITY_STATUSES.filter(function (value) { return valid.indexOf(value) >= 0; });
       activityQuery = (url.searchParams.get("q") || "").trim().slice(0, 200);
-      return valid.length !== values.length || activityQuery !== (url.searchParams.get("q") || "");
+      var requestedPage = url.searchParams.get("page");
+      var parsedPage = Number(requestedPage);
+      activityPage = requestedPage !== null && /^[1-9][0-9]*$/.test(requestedPage) &&
+          Number.isSafeInteger(parsedPage)
+        ? parsedPage
+        : 1;
+      var pageNeedsSanitizing = requestedPage !== null &&
+        (activityPage === 1 || String(activityPage) !== requestedPage);
+      return valid.length !== values.length || activityQuery !== (url.searchParams.get("q") || "") || pageNeedsSanitizing;
     }
 
     function writeActivityUrl(push) {
@@ -2214,7 +2222,14 @@
       url.searchParams.delete("status");
       activityStatuses.forEach(function (status) { url.searchParams.append("status", status); });
       if (activityQuery) url.searchParams.set("q", activityQuery); else url.searchParams.delete("q");
+      if (activityPage > 1) url.searchParams.set("page", String(activityPage)); else url.searchParams.delete("page");
       history[push ? "pushState" : "replaceState"]({}, "", url.pathname + url.search + url.hash);
+    }
+
+    function navigateActivityPage(page, anchor, push) {
+      activityPage = page;
+      writeActivityUrl(push !== false);
+      loadActivity(page, anchor);
     }
 
     function filterCount(name) {
@@ -3292,8 +3307,8 @@
       var control = ev.target.closest("[data-activity-page]");
       if (!control) return;
       var direction = control.getAttribute("data-activity-page");
-      if (direction === "prev" && activityPage > 1) loadActivity(activityPage - 1, control);
-      if (direction === "next" && activityPage < activityTotalPages) loadActivity(activityPage + 1, control);
+      if (direction === "prev" && activityPage > 1) navigateActivityPage(activityPage - 1, control);
+      if (direction === "next" && activityPage < activityTotalPages) navigateActivityPage(activityPage + 1, control);
     });
     document.getElementById("activity-clear").addEventListener("click", function () {
       activityStatuses = [];
@@ -4673,7 +4688,7 @@
         .then(function (data) {
           if (requestId !== activityRequestId) return;
           if (!data.entries.length && page > 1 && data.total_pages < page) {
-            loadActivity(data.total_pages, anchor);
+            navigateActivityPage(Math.max(1, data.total_pages), anchor, false);
             return;
           }
           renderActivity(data, false);
@@ -4818,8 +4833,7 @@
       searchInput.value = activityQuery;
       updateSearch();
       renderActivityFilterControls();
-      activityPage = 1;
-      if (/^#\/submissions/.test(location.hash || "")) loadActivity(1);
+      if (/^#\/submissions/.test(location.hash || "")) loadActivity(activityPage);
       resolveEntityRoute();
     });
     route(true);

@@ -329,7 +329,9 @@ class TestDashboard:
         assert "No submissions match these filters." in body
         assert "Could not load submissions. Try again." in body
 
-    async def test_submission_filters_restore_and_sanitize_the_url(self) -> None:
+    async def test_submission_filters_and_page_restore_and_sanitize_the_url(
+        self,
+    ) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert "function restoreActivityUrl()" in body
@@ -338,10 +340,22 @@ class TestDashboard:
         assert "function writeActivityUrl(push)" in body
         assert 'url.searchParams.append("status", status)' in body
         assert 'url.searchParams.set("q", activityQuery)' in body
+        assert 'url.searchParams.get("page")' in body
+        assert "/^[1-9][0-9]*$/.test(requestedPage)" in body
+        assert "Number.isSafeInteger(parsedPage)" in body
+        assert 'url.searchParams.set("page", String(activityPage))' in body
+        assert 'url.searchParams.delete("page")' in body
+        assert "function navigateActivityPage(page, anchor, push)" in body
+        assert "navigateActivityPage(activityPage - 1, control)" in body
+        assert "navigateActivityPage(activityPage + 1, control)" in body
+        assert (
+            "navigateActivityPage(Math.max(1, data.total_pages), anchor, false)" in body
+        )
         assert 'history[push ? "pushState" : "replaceState"]' in body
         assert 'window.addEventListener("popstate"' in body
         assert "if (activityUrlWasSanitized) writeActivityUrl(false)" in body
         assert "searchInput.value = activityQuery" in body
+        assert "loadActivity(activityPage)" in body
 
     async def test_submission_filters_are_mobile_and_keyboard_accessible(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
