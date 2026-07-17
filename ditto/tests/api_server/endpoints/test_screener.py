@@ -38,6 +38,7 @@ from ditto.api_models.system_health import (
     SystemMetrics,
     system_metrics_signing_token,
 )
+from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.datapipeline import DataPipelineError, NullGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -64,6 +65,7 @@ from ditto.db.models import (
     ScreeningDispute,
     ScreeningQuarantine,
     ScreeningQuarantineResolution,
+    ValidatorTicket,
 )
 from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
 
@@ -1479,6 +1481,113 @@ class TestQuarantineAdmin:
         assert [item["agent_id"] for item in newest.json()["items"]] == [
             str(agent_id) for agent_id in reversed(agent_ids)
         ]
+
+    async def test_lists_and_safely_releases_live_validator_assignment(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        now = datetime.now(UTC)
+        deadline = now + timedelta(minutes=45)
+        validator_hotkey = "5ValidatorHotkeyForAdminReleaseTest"
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=validator_hotkey,
+                    status=TicketStatus.ISSUED,
+                    issued_at=now,
+                    deadline=deadline,
+                    bench_version=2,
+                    attempt_count=1,
+                )
+            )
+            session.add(
+                Score(
+                    agent_id=agent_id,
+                    validator_hotkey="5CompletedValidator",
+                    run_id="admin-release-preserved-score",
+                    signature=None,
+                    seed=42,
+                    composite=0.75,
+                    tool_mean=0.7,
+                    memory_mean=0.8,
+                    median_ms=123,
+                    n=114,
+                    details={"bench_version": 2},
+                    generated_at=now,
+                )
+            )
+            session.add(
+                Score(
+                    agent_id=agent_id,
+                    validator_hotkey="5OlderBenchValidator",
+                    run_id="admin-release-old-version-score",
+                    signature=None,
+                    seed=41,
+                    composite=0.25,
+                    tool_mean=0.2,
+                    memory_mean=0.3,
+                    median_ms=456,
+                    n=114,
+                    details={"bench_version": 1},
+                    generated_at=now - timedelta(days=1),
+                )
+            )
+        _install_db(app, session_maker)
+        headers = {
+            "Authorization": "Bearer test-admin-token-at-least-32-characters",
+            "X-Admin-Actor": "backroom:test-user",
+        }
+
+        listing = await client.get(
+            "/api/v1/admin/validator-assignments", headers=headers
+        )
+        assert listing.status_code == 200
+        assignment = listing.json()["items"][0]
+        assert assignment["agent_id"] == str(agent_id)
+        assert assignment["validator_hotkey"] == validator_hotkey
+        assert assignment["score_count"] == 1
+        assert assignment["provisional_composite"] == pytest.approx(0.75)
+
+        released = await client.post(
+            f"/api/v1/admin/validator-assignments/{agent_id}/{validator_hotkey}/release",
+            headers=headers,
+            json={
+                "expected_deadline": assignment["deadline"],
+                "reason": "Operator stopped a stale validator process",
+            },
+        )
+        replay = await client.post(
+            f"/api/v1/admin/validator-assignments/{agent_id}/{validator_hotkey}/release",
+            headers=headers,
+            json={
+                "expected_deadline": assignment["deadline"],
+                "reason": "Operator stopped a stale validator process",
+            },
+        )
+        assert released.status_code == 200
+        assert released.json()["status"] == TicketStatus.EXPIRED
+        assert replay.status_code == 409
+
+        async with session_maker() as session:
+            ticket = await session.get(ValidatorTicket, (agent_id, validator_hotkey))
+            scores = (
+                await session.scalars(select(Score).where(Score.agent_id == agent_id))
+            ).all()
+            assert ticket is not None
+            assert ticket.status == TicketStatus.EXPIRED
+            assert ticket.retry_after is not None
+            retry_after = ticket.retry_after.replace(tzinfo=UTC)
+            assert now + timedelta(hours=5, minutes=59) < retry_after
+            assert retry_after < deadline + timedelta(hours=6)
+            assert len(scores) == 2
 
     @pytest.mark.parametrize(
         ("resolution", "expected_status", "expected_reason"),
