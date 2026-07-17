@@ -340,6 +340,12 @@ class TestDashboard:
         assert 'below_score_floor: ["Below score floor", "warn"]' in body
         assert 'under_review: ["Operator review", "warn"]' in body
         assert '"below_score_floor", "under_review"' in body
+        assert "var provisionalScores = e.provisional_scores || [];" in body
+        assert "if (!provisionalScores.length || !Number.isFinite(scoreFloor))" in body
+        assert (
+            "Evaluation stopped after two accepted scores below the current score "
+            "floor." in body
+        )
         assert "No further validator tickets will be issued." in body
         assert (
             "Automated processing is paused while an operator reviews this submission."
