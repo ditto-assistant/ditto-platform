@@ -4,10 +4,11 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 class AdminCopyReviewEvidence(BaseModel):
+    review_kind: Literal["copy", "benchmark_overfit"] = "copy"
     duplicate_of: UUID | None
     reason: str | None
     policy_version: int
@@ -144,6 +145,23 @@ class AdminCopyReviewResolveRequest(BaseModel):
     reason: Annotated[
         str, StringConstraints(strip_whitespace=True, min_length=3, max_length=500)
     ]
+
+
+class AdminCopyReviewOpenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_sha256: Annotated[
+        str, StringConstraints(strip_whitespace=True, pattern=r"^[0-9a-f]{64}$")
+    ]
+    expected_score_count: Annotated[int, Field(ge=0)]
+    reason: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=3, max_length=500)
+    ]
+
+
+class AdminCopyReviewOpenResponse(BaseModel):
+    review: AdminCopyReviewItem
+    agent_status: str
+    idempotent: bool
 
 
 class AdminCopyReviewResolveResponse(BaseModel):
