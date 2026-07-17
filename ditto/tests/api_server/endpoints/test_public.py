@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import (
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import get_dataset_generator, get_session
 from ditto.api_server.endpoints import public as public_endpoint
@@ -323,7 +324,7 @@ class TestPublicLeaderboard:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        details = {"bench_version": 2, "composite_stderr": 0.03}
+        details = {"bench_version": CURRENT_BENCH_VERSION, "composite_stderr": 0.03}
         incumbent_id = await _seed_k3(
             session_maker,
             miner=_MINER_A,
@@ -390,13 +391,13 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.7, 0.8, 0.9],
-            details={"bench_version": 2},
+            details={"bench_version": CURRENT_BENCH_VERSION},
         )
         await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.6, 0.7, 0.8],
-            details={"bench_version": 2},
+            details={"bench_version": CURRENT_BENCH_VERSION},
         )
         _install_db(app, session_maker)
         app.state.chain = SimpleNamespace(
@@ -2455,15 +2456,18 @@ class TestPublicBenchCorpus:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        # v2 is the current (live) version: its answer keys must never be released.
+        # The current (live) version: its answer keys must never be released.
         await _seed_k3(
             session_maker,
             miner=_MINER_A,
             composites=[0.4, 0.5, 0.6],
-            details={"bench_version": 2, "per_case": [{"expected": ["x"]}]},
+            details={
+                "bench_version": CURRENT_BENCH_VERSION,
+                "per_case": [{"expected": ["x"]}],
+            },
         )
         _install_db(app, session_maker)
-        resp = await client.get("/api/v1/public/bench/2/corpus")
+        resp = await client.get(f"/api/v1/public/bench/{CURRENT_BENCH_VERSION}/corpus")
         assert resp.status_code == 409
         # ...and the live answer key is not in the refusal body.
         assert '"expected"' not in resp.text

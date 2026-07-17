@@ -187,7 +187,11 @@ _CHAIN_WEIGHTS_TIMEOUT_SECONDS = 4.0
 # Historical reproduction must fail closed: only benchmark epochs whose exact
 # generator release is known get a copyable command. Add a mapping deliberately
 # when a future epoch pins its generator; never point an old score at ``latest``.
-_DATAGEN_VERSION_BY_BENCH_VERSION = {2: "v0.7.0"}
+
+# The exact generator release each benchmark version's reproduction commands
+# pin. v0.8.0 is the tag cut from dittobench-datagen's anti-gaming branch at
+# the v3 release (see dittobench-api docs/v3-release.md for the merge order).
+_DATAGEN_VERSION_BY_BENCH_VERSION = {2: "v0.7.0", 3: "v0.8.0"}
 _DATAGEN_RUN_SIZES = frozenset({"small", "medium", "full"})
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 _VALIDATOR_STALE_WINDOW = timedelta(minutes=15)

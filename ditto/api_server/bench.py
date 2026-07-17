@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import Any
 
 # The current DittoBench benchmark version. See module docstring.
-CURRENT_BENCH_VERSION = 2
+CURRENT_BENCH_VERSION = 3
 
 
 def is_bench_version_retired(version: int) -> bool:
