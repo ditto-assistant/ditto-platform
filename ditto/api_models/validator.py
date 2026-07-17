@@ -376,6 +376,64 @@ class CaseScore(BaseModel):
     notes: Annotated[
         list[str], Field(default_factory=list, description="Scorer annotations.")
     ]
+    # bench_version 3 audit fields. Declared so ingest retains them — pydantic's
+    # default ``extra="ignore"`` silently discarded them before, stripping audit
+    # context (v3 review finding 16). None affects the composite; they mirror
+    # ``dittobench-datagen/protocol`` ``CaseScore`` and must stay in sync with
+    # the ditto-subnet copy (guarded by the wire round-trip test).
+    result_usage: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            default=0.0,
+            description=(
+                "Result-usage half of an observed tool case: did the final "
+                "answer incorporate the value only the executed tool served."
+            ),
+        ),
+    ] = 0.0
+    twin_group: Annotated[
+        str,
+        Field(
+            default="",
+            description=(
+                "Metamorphic twin-group id tying rephrasings of one fact, for "
+                "consistency audits."
+            ),
+        ),
+    ] = ""
+    confidence: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Harness self-reported confidence echoed for Brier calibration "
+                "(None = not reported; distinct from 0.0)."
+            ),
+        ),
+    ] = None
+    observed: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "True when the graded trajectory is the validator-observed one "
+                "(mock tool endpoint), i.e. ``called`` is authoritative."
+            ),
+        ),
+    ] = False
+    injection: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "True when the grader flagged injection compliance on this case."
+            ),
+        ),
+    ] = False
 
     @field_validator("called", "expected", "notes", mode="before")
     @classmethod
@@ -404,6 +462,28 @@ class CodeFingerprint(BaseModel):
     m: Annotated[
         list[str], Field(default_factory=list, description="Sorted bottom-k hashes.")
     ]
+
+
+class CategoryStat(BaseModel):
+    """Per-category aggregate inside a :class:`ScoreReport`.
+
+    Mirrors the DittoBench ``CategoryStat`` wire shape (``pkg/protocol``).
+    Advisory audit context only; the composite never depends on it.
+    """
+
+    category: Annotated[str, Field(description="Case category, e.g. ``web_search``.")]
+    count: Annotated[int, Field(ge=0, description="Cases scored in the category.")]
+    mean: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Mean case score in [0,1].")
+    ]
+    std_err: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            default=0.0,
+            description="Standard error of the category mean (0 when omitted).",
+        ),
+    ] = 0.0
 
 
 class ScoreReport(BaseModel):
@@ -499,6 +579,17 @@ class ScoreReport(BaseModel):
         list[CaseScore],
         Field(default_factory=list, description="Optional per-case breakdown."),
     ]
+    per_category: Annotated[
+        list[CategoryStat] | None,
+        Field(
+            default=None,
+            description=(
+                "Optional per-category aggregates (bench_version 3 audit "
+                "context). Advisory: not covered by the signature and never "
+                "affects the score."
+            ),
+        ),
+    ] = None
     structural_fingerprint: Annotated[
         CodeFingerprint | None,
         Field(
@@ -790,3 +881,28 @@ class SubmitScoreResponse(BaseModel):
             }
         }
     )
+
+
+class SubmitTranscriptResponse(BaseModel):
+    """Response of ``PUT /validator/agent/{agent_id}/transcript/{run_id}``.
+
+    ``stored`` is ``False`` only when the public bucket is unconfigured (the
+    upload was accepted and verified but has nowhere public to land); a digest
+    mismatch is a 409, never a silent drop.
+    """
+
+    agent_id: Annotated[UUID, Field(description="Echoes the path-param id.")]
+    run_id: Annotated[str, Field(description="Echoes the path-param run id.")]
+    transcript_sha256: Annotated[
+        str,
+        Field(description="SHA-256 hex digest of the stored transcript bytes."),
+    ]
+    stored: Annotated[
+        bool,
+        Field(
+            description=(
+                "``True`` when the artifact now exists in the public bucket "
+                "(content-addressed at ``transcripts/{sha256}.json``)."
+            )
+        ),
+    ]

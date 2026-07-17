@@ -565,12 +565,14 @@ class S3StorageClient:
             ) from e
         return b"".join(chunks)
 
-    async def object_exists(self, *, key: str) -> bool:
+    async def object_exists(self, *, key: str, bucket: str | None = None) -> bool:
         """Return ``True`` iff a HEAD against ``key`` succeeds.
 
-        Used by integration tests + future janitor sweeps. Returns
-        ``False`` on 404, raises :class:`ObjectUploadFailedError`-style
-        errors for any other failure (wrapped via :class:`StorageError`).
+        Used by integration tests, the content-addressed transcript upload
+        (idempotence check), and future janitor sweeps. ``bucket`` defaults to
+        the main bucket, mirroring :meth:`put_object`. Returns ``False`` on
+        404, raises :class:`ObjectUploadFailedError`-style errors for any
+        other failure (wrapped via :class:`StorageError`).
 
         Raises:
             ObjectUploadFailedError: When the endpoint returns an error
@@ -578,6 +580,7 @@ class S3StorageClient:
         """
         from botocore.exceptions import BotoCoreError, ClientError
 
+        target = bucket or self._config.bucket
         try:
             async with self._session.client(
                 "s3",
@@ -585,18 +588,16 @@ class S3StorageClient:
                 use_ssl=self._config.use_tls,
                 config=self._client_config,
             ) as s3:
-                await s3.head_object(Bucket=self._config.bucket, Key=key)
+                await s3.head_object(Bucket=target, Key=key)
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
             if code in {"404", "NoSuchKey", "NotFound"}:
                 return False
             raise ObjectUploadFailedError(
-                f"head_object failed: bucket={self._config.bucket!r} "
-                f"key={key!r} cause={e}"
+                f"head_object failed: bucket={target!r} key={key!r} cause={e}"
             ) from e
         except BotoCoreError as e:
             raise ObjectUploadFailedError(
-                f"head_object failed: bucket={self._config.bucket!r} "
-                f"key={key!r} cause={e}"
+                f"head_object failed: bucket={target!r} key={key!r} cause={e}"
             ) from e
         return True

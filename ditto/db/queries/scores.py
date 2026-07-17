@@ -318,6 +318,25 @@ async def list_scores_for_agent(
     return list(result.scalars().all())
 
 
+async def get_score_for_validator(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    validator_hotkey: str,
+) -> Score | None:
+    """One validator's recorded score row for an agent, or ``None``.
+
+    Backs the transcript upload path: the declared ``transcript_sha256`` in
+    this row's details is what an uploaded artifact's bytes must hash to.
+    """
+    stmt = select(Score).where(
+        Score.agent_id == agent_id,
+        Score.validator_hotkey == validator_hotkey,
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
 # Agents whose scoring has settled into a public, non-provisional state. A held
 # copy (``ath_pending_review``) is deliberately excluded — its score is not yet
 # public and surfacing "under review" before resolution would be premature.

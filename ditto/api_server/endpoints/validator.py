@@ -35,6 +35,7 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -59,6 +60,7 @@ from ditto.api_models import (
     ScoreReport,
     SubmitScoreRequest,
     SubmitScoreResponse,
+    SubmitTranscriptResponse,
     ValidatorHeartbeatRequest,
     ValidatorHeartbeatResponse,
 )
@@ -118,6 +120,7 @@ from ditto.db.queries.heartbeats import (
 )
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
+    get_score_for_validator,
     list_eligible_ledger,
     list_scores_for_agent,
     upsert_score,
@@ -298,6 +301,23 @@ def _lease_token(deadline: datetime) -> str:
     return deadline.astimezone(UTC).isoformat(timespec="microseconds")
 
 
+def _reported_transcript_sha256(report: ScoreReport) -> str | None:
+    """The transcript digest a report declares, or ``None``.
+
+    The scoring engine content-addresses the run's transcript artifact (the
+    graded per-case inputs) and the validator forwards the digest under
+    ``details["transcript_sha256"]``. ``details`` is otherwise opaque; this is
+    the one key the platform reads back out of it at ingest, because the digest
+    is bound into the signed payload (offline reproducibility, v3 review
+    finding 3).
+    """
+    details = report.details if isinstance(report.details, dict) else {}
+    value = details.get("transcript_sha256")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
 def _score_signing_message(
     validator_hotkey: str,
     agent_id: UUID,
@@ -308,8 +328,13 @@ def _score_signing_message(
 
     Must match the validator's ``sign_score`` byte-for-byte:
     ``{validator_hotkey}:{agent_id}:{ticket_deadline}:{run_id}:``
-    ``{composite!r}:{seed}``. Binding the exact lease means a response from an
-    expired attempt cannot be replayed after the ticket is reissued.
+    ``{composite!r}:{seed}`` — and, when the report declares a transcript
+    digest, ``:{transcript_sha256}`` is appended (both sides derive presence
+    from the same report field, so old validators that publish no transcript
+    keep the previous format). Binding the exact lease means a response from an
+    expired attempt cannot be replayed after the ticket is reissued; binding
+    the transcript digest means the published artifact cannot be swapped after
+    the fact without breaking the signature.
     """
     lease = _lease_token(ticket_deadline) if ticket_deadline is not None else ""
     # CANONICAL FIELD ORDER, mirrored byte-for-byte by ditto-subnet
@@ -334,17 +359,6 @@ def _score_signing_message(
     if transcript:
         msg += f":{transcript}"
     return msg.encode()
-
-
-def _reported_transcript_sha256(report: ScoreReport) -> str | None:
-    """The transcript digest a report declares, or None.
-
-    Both sides derive presence from the same report field, so a validator that
-    publishes no transcript signs the shorter payload and still verifies.
-    """
-    details = report.details if isinstance(report.details, dict) else {}
-    raw = details.get("transcript_sha256")
-    return raw if isinstance(raw, str) and raw else None
 
 
 def _job_signing_message(
@@ -1352,9 +1366,18 @@ async def _publish_finalized_run(
                 if sc.generated_at
                 else None,
                 "signature": sc.signature,
+                # Where the validator's transcript artifact lives (finding 3):
+                # the digest is inside the signed payload; the key is derived
+                # from it, so the record always names immutable bytes. Null for
+                # scores whose validator published no transcript.
+                "transcript_sha256": digest,
+                "transcript_key": transcript_object_key(digest) if digest else None,
                 "details": sc.details,
             }
-            for sc in sorted(scores, key=lambda sc: sc.validator_hotkey)
+            for sc, digest in (
+                (sc, _score_transcript_sha256(sc))
+                for sc in sorted(scores, key=lambda sc: sc.validator_hotkey)
+            )
         ],
     }
     body = json.dumps(record, sort_keys=True, default=str).encode()
@@ -1367,3 +1390,121 @@ async def _publish_finalized_run(
         )
     except Exception:  # noqa: BLE001 - additive mirror, never fail the write
         logger.exception("public mirror publish failed for agent %s", agent.agent_id)
+
+
+# Transcript artifacts are content-addressed in the public bucket so a record
+# referencing a digest always names immutable bytes.
+_TRANSCRIPT_KEY_TEMPLATE = "transcripts/{sha256}.json"
+
+# A transcript carries every graded final_text for a full run; cap well above
+# any legitimate size while bounding a hostile body.
+_TRANSCRIPT_MAX_BYTES = 32 << 20
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def transcript_object_key(sha256_hex: str) -> str:
+    """Public-bucket key for a transcript digest."""
+    return _TRANSCRIPT_KEY_TEMPLATE.format(sha256=sha256_hex)
+
+
+def _score_transcript_sha256(score: Score) -> str | None:
+    """The well-formed transcript digest a stored score declares, or ``None``."""
+    details = score.details if isinstance(score.details, dict) else {}
+    value = details.get("transcript_sha256")
+    if isinstance(value, str) and _SHA256_HEX.fullmatch(value):
+        return value
+    return None
+
+
+@router.put(
+    "/agent/{agent_id}/transcript/{run_id}",
+    response_model=SubmitTranscriptResponse,
+)
+async def submit_transcript(
+    agent_id: UUID,
+    run_id: str,
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    validator: ValidatorDep,
+    storage: StorageDep,
+) -> SubmitTranscriptResponse:
+    """Publish the transcript artifact behind a signed score (finding 3).
+
+    The body is the scoring engine's canonical transcript for ``run_id`` — the
+    graded per-case inputs whose digest the validator declared under
+    ``details["transcript_sha256"]`` and bound into its score signature. The
+    platform accepts the bytes only when their SHA-256 equals that declared
+    digest, then stores them content-addressed in the public bucket. Because
+    the binding is *content* equality against an already-signed digest, a
+    caller spoofing another validator's hotkey can only ever upload the exact
+    bytes that validator attested — so the header + permit check is sufficient
+    auth here. Idempotent: re-uploading an existing digest is a no-op.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    body = await request.body()
+    if len(body) > _TRANSCRIPT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="transcript exceeds size cap")
+    if not body:
+        raise HTTPException(status_code=400, detail="empty transcript body")
+    digest = hashlib.sha256(body).hexdigest()
+
+    score = await get_score_for_validator(
+        session, agent_id=agent_id, validator_hotkey=validator
+    )
+    if score is None or score.run_id != run_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "no recorded score by this validator for this agent and run; "
+                "submit the score (with details.transcript_sha256) first"
+            ),
+        )
+    declared = (
+        score.details.get("transcript_sha256")
+        if isinstance(score.details, dict)
+        else None
+    )
+    if not isinstance(declared, str) or not _SHA256_HEX.fullmatch(declared):
+        raise HTTPException(
+            status_code=409,
+            detail="the recorded score declares no transcript_sha256",
+        )
+    if digest != declared:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"transcript bytes hash to {digest} but the signed score "
+                f"declared {declared}"
+            ),
+        )
+
+    if storage.public_bucket is None:
+        logger.warning(
+            "transcript %s for agent %s accepted but STORAGE_PUBLIC_BUCKET is "
+            "unset; nothing published",
+            digest,
+            agent_id,
+        )
+        return SubmitTranscriptResponse(
+            agent_id=agent_id, run_id=run_id, transcript_sha256=digest, stored=False
+        )
+    key = transcript_object_key(digest)
+    if not await storage.object_exists(key=key, bucket=storage.public_bucket):
+        await storage.put_object(
+            key=key,
+            body=body,
+            content_type="application/json",
+            bucket=storage.public_bucket,
+        )
+        logger.info(
+            "transcript published agent_id=%s run_id=%s sha256=%s bytes=%d",
+            agent_id,
+            run_id,
+            digest,
+            len(body),
+        )
+    return SubmitTranscriptResponse(
+        agent_id=agent_id, run_id=run_id, transcript_sha256=digest, stored=True
+    )

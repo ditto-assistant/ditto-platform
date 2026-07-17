@@ -96,6 +96,7 @@ from ditto.api_models.upload import (
 from ditto.api_models.validator import (
     ArtifactResponse,
     CaseScore,
+    CategoryStat,
     JobRequest,
     JobResponse,
     LedgerEntry,
@@ -103,6 +104,7 @@ from ditto.api_models.validator import (
     ScoreReport,
     SubmitScoreRequest,
     SubmitScoreResponse,
+    SubmitTranscriptResponse,
     ValidatorHeartbeatRequest,
     ValidatorHeartbeatResponse,
 )
@@ -113,6 +115,7 @@ __all__ = [
     "ArtifactResponse",
     "BenchmarkProgress",
     "CaseScore",
+    "CategoryStat",
     "EvalPricingResponse",
     "HealthResponse",
     "JobRequest",
@@ -185,6 +188,7 @@ __all__ = [
     "ScreenerQueueResponse",
     "SubmitScoreRequest",
     "SubmitScoreResponse",
+    "SubmitTranscriptResponse",
     "ValidatorHeartbeatRequest",
     "ValidatorHeartbeatResponse",
     "UploadAgentResponse",

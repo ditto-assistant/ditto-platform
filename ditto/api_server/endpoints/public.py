@@ -33,6 +33,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 import statistics
 import time
 from dataclasses import dataclass
@@ -399,6 +400,17 @@ def _safe_models(details: dict) -> PublicRunModels | None:
         return PublicRunModels.model_validate(raw)
     except Exception:  # noqa: BLE001 - a bad blob must not break the leaderboard
         return None
+
+
+_TRANSCRIPT_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _safe_transcript_sha256(details: dict) -> str | None:
+    """Pull the score's declared transcript digest, tolerating malformed blobs."""
+    raw = details.get("transcript_sha256")
+    if isinstance(raw, str) and _TRANSCRIPT_SHA256_HEX.fullmatch(raw):
+        return raw
+    return None
 
 
 def _safe_categories(details: dict) -> list[PublicCategoryStat] | None:
@@ -1167,6 +1179,9 @@ def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
                 signature=s.signature,
                 generated_at=s.generated_at,
                 case_results=_safe_case_results(
+                    s.details if isinstance(s.details, dict) else {}
+                ),
+                transcript_sha256=_safe_transcript_sha256(
                     s.details if isinstance(s.details, dict) else {}
                 ),
             )

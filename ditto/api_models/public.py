@@ -620,6 +620,21 @@ class PublicValidatorScore(BaseModel):
             ),
         ),
     ]
+    transcript_sha256: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "SHA-256 of this validator's published transcript artifact (the "
+                "graded per-case inputs), bound into the score signature. The "
+                "bytes live content-addressed in the public bucket at "
+                "``transcripts/{sha256}.json``; regenerating the dataset from "
+                "the seed and re-running the public grader over the transcript "
+                "reproduces this score offline. Null for scores whose validator "
+                "published no transcript."
+            ),
+        ),
+    ]
 
 
 class PublicSubmissionScores(BaseModel):
