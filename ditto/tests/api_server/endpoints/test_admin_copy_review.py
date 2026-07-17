@@ -25,6 +25,7 @@ from ditto.api_server.dependencies import get_session, get_storage_client
 from ditto.api_server.fingerprint import reference_corpus_provenance
 from ditto.api_server.storage import ObjectDownloadFailedError
 from ditto.db.models import Agent, AgentStatus, AthReview, Base, Score
+from ditto.db.queries.scores import list_eligible_ledger
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "X-Admin-Actor": "operator"}
@@ -162,6 +163,176 @@ async def _seed_current_comparison(
         candidate.duplicate_of = None
     await _add_finalized_scores(maker, agent_ids=(agent_id, original_id))
     return agent_id, original_id
+
+
+async def _seed_scored_agent(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    score_count: int = 3,
+    status: AgentStatus = AgentStatus.SCORED,
+) -> tuple[UUID, str]:
+    agent_id = uuid4()
+    sha256 = agent_id.hex * 2
+    async with maker() as session, session.begin():
+        session.add(
+            Agent(
+                agent_id=agent_id,
+                miner_hotkey="5Benchmax",
+                name="benchmax",
+                sha256=sha256,
+                status=status,
+                screening_policy_version=8,
+                created_at=_T0,
+            )
+        )
+        for index in range(score_count):
+            session.add(
+                Score(
+                    agent_id=agent_id,
+                    validator_hotkey=f"validator-{index}",
+                    run_id=f"manual-hold-run-{index}",
+                    signature=None,
+                    seed=7,
+                    composite=0.97,
+                    tool_mean=0.97,
+                    memory_mean=0.90,
+                    median_ms=100,
+                    n=114,
+                    details={"bench_version": 2},
+                    generated_at=_T0 + timedelta(minutes=index),
+                )
+            )
+    return agent_id, sha256
+
+
+async def test_manual_open_holds_exact_scored_artifact_and_removes_it_from_ledger(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id, sha256 = await _seed_scored_agent(maker)
+    _install(app, maker)
+    payload = {
+        "expected_sha256": sha256,
+        "expected_score_count": 3,
+        "reason": "Deterministic benchmark-family routing requires ATH review",
+    }
+
+    response = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json=payload,
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["agent_status"] == AgentStatus.ATH_PENDING_REVIEW
+    assert body["idempotent"] is False
+    assert body["review"]["original"]["review_kind"] == "benchmark_overfit"
+    assert body["review"]["original"]["duplicate_of"] is None
+    retry = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json=payload,
+        headers=_HEADERS,
+    )
+    assert retry.status_code == 200 and retry.json()["idempotent"] is True
+
+    audit = await client.get(
+        f"/api/v1/admin/copy-reviews/{agent_id}/audit", headers=_HEADERS
+    )
+    assert audit.status_code == 200
+    audit_body = audit.json()
+    assert audit_body["review"]["review_id"] == body["review"]["review_id"]
+    assert audit_body["review"]["original"]["review_kind"] == "benchmark_overfit"
+    assert audit_body["review"]["original"]["reason"] == payload["reason"]
+    assert {key: value for key, value in audit_body.items() if key != "review"} == {
+        "agent_status": AgentStatus.ATH_PENDING_REVIEW,
+        "held_artifact_sha256": sha256,
+        "held_score_count": 3,
+        "previous_status": AgentStatus.SCORED,
+        "opened_by": "operator",
+    }
+
+    async with maker() as session:
+        agent = await session.get(Agent, agent_id)
+        review = await session.scalar(
+            select(AthReview).where(AthReview.agent_id == agent_id)
+        )
+        ledger = await list_eligible_ledger(session)
+        assert agent is not None and review is not None
+        assert agent.status == AgentStatus.ATH_PENDING_REVIEW
+        assert agent.review_reason == payload["reason"]
+        assert review.original_evidence["sha256"] == sha256
+        assert review.original_evidence["score_count"] == 3
+        assert review.algorithm_provenance["opened_by"] == "operator"
+        assert all(row.agent_id != agent_id for row in ledger)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "detail"),
+    [
+        ("expected_sha256", "0" * 64, "artifact sha256 changed"),
+        ("expected_score_count", 2, "score count changed"),
+    ],
+)
+async def test_manual_open_rejects_stale_identity_guards(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    field: str,
+    value: str | int,
+    detail: str,
+) -> None:
+    agent_id, sha256 = await _seed_scored_agent(maker)
+    _install(app, maker)
+    payload: dict[str, object] = {
+        "expected_sha256": sha256,
+        "expected_score_count": 3,
+        "reason": "Manual benchmark-overfit review",
+    }
+    payload[field] = value
+
+    response = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json=payload,
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 409
+    assert detail in response.text
+    async with maker() as session:
+        agent = await session.get(Agent, agent_id)
+        assert agent is not None and agent.status == AgentStatus.SCORED
+        assert (
+            await session.scalar(
+                select(AthReview).where(AthReview.agent_id == agent_id)
+            )
+            is None
+        )
+
+
+async def test_clearing_manual_hold_restores_live_status(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id, sha256 = await _seed_scored_agent(maker, status=AgentStatus.LIVE)
+    _install(app, maker)
+    opened = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json={
+            "expected_sha256": sha256,
+            "expected_score_count": 3,
+            "reason": "Manual benchmark-overfit review",
+        },
+        headers=_HEADERS,
+    )
+    assert opened.status_code == 200
+
+    resolved = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/resolve",
+        json={"resolution": "clear", "reason": "General behavior confirmed"},
+        headers=_HEADERS,
+    )
+
+    assert resolved.status_code == 200
+    assert resolved.json()["agent_status"] == AgentStatus.LIVE
 
 
 async def test_list_is_bounded_oldest_first_and_private(

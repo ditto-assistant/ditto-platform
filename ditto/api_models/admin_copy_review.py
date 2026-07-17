@@ -4,10 +4,11 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 class AdminCopyReviewEvidence(BaseModel):
+    review_kind: Literal["copy", "benchmark_overfit"] = "copy"
     duplicate_of: UUID | None
     reason: str | None
     policy_version: int
@@ -97,6 +98,17 @@ class AdminCopyReviewList(BaseModel):
     offset: int
 
 
+class AdminCopyReviewAudit(BaseModel):
+    """Operator audit context for one durable ATH hold."""
+
+    review: AdminCopyReviewItem
+    agent_status: str
+    held_artifact_sha256: str | None = None
+    held_score_count: int | None = None
+    previous_status: str | None = None
+    opened_by: str | None = None
+
+
 class AdminSourceDiffFile(BaseModel):
     path: str
     status: Literal["added", "removed", "modified", "identical"]
@@ -144,6 +156,23 @@ class AdminCopyReviewResolveRequest(BaseModel):
     reason: Annotated[
         str, StringConstraints(strip_whitespace=True, min_length=3, max_length=500)
     ]
+
+
+class AdminCopyReviewOpenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_sha256: Annotated[
+        str, StringConstraints(strip_whitespace=True, pattern=r"^[0-9a-f]{64}$")
+    ]
+    expected_score_count: Annotated[int, Field(ge=0)]
+    reason: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=3, max_length=500)
+    ]
+
+
+class AdminCopyReviewOpenResponse(BaseModel):
+    review: AdminCopyReviewItem
+    agent_status: str
+    idempotent: bool
 
 
 class AdminCopyReviewResolveResponse(BaseModel):

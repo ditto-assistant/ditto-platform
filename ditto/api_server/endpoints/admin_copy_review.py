@@ -6,7 +6,7 @@ import logging
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Annotated, Literal, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import func, select
@@ -14,11 +14,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Load, undefer_group
 
 from ditto.api_models.admin_copy_review import (
+    AdminCopyReviewAudit,
     AdminCopyReviewComparisonUnavailable,
     AdminCopyReviewCurrentComparison,
     AdminCopyReviewEvidence,
     AdminCopyReviewItem,
     AdminCopyReviewList,
+    AdminCopyReviewOpenRequest,
+    AdminCopyReviewOpenResponse,
     AdminCopyReviewResolveRequest,
     AdminCopyReviewResolveResponse,
     AdminSourceDiffFileDetail,
@@ -68,6 +71,9 @@ def _item(
     ) = None,
 ) -> AdminCopyReviewItem:
     provenance = review.algorithm_provenance
+    review_kind = provenance.get("review_kind")
+    if review_kind not in ("copy", "benchmark_overfit"):
+        review_kind = "copy"
     return AdminCopyReviewItem(
         review_id=review.review_id,
         agent_id=agent.agent_id,
@@ -82,6 +88,7 @@ def _item(
         resolution=cast(Literal["clear", "reject"] | None, review.resolution),
         resolution_reason=review.resolution_reason,
         original=AdminCopyReviewEvidence(
+            review_kind=cast(Literal["copy", "benchmark_overfit"], review_kind),
             duplicate_of=review.original_duplicate_of,
             reason=review.original_reason,
             policy_version=review.original_policy_version,
@@ -97,6 +104,37 @@ def _item(
             duplicate_of_submitted_at=matched.created_at if matched else None,
         ),
         current_comparison=comparison,
+    )
+
+
+def _audit(
+    review: AthReview, agent: Agent, matched: Agent | None = None
+) -> AdminCopyReviewAudit:
+    evidence = review.original_evidence
+    provenance = review.algorithm_provenance
+    held_artifact_sha256 = evidence.get("sha256")
+    if not isinstance(held_artifact_sha256, str):
+        held_artifact_sha256 = None
+    held_score_count = evidence.get("score_count")
+    if (
+        not isinstance(held_score_count, int)
+        or isinstance(held_score_count, bool)
+        or held_score_count < 0
+    ):
+        held_score_count = None
+    previous_status = evidence.get("previous_status")
+    if not isinstance(previous_status, str):
+        previous_status = None
+    opened_by = provenance.get("opened_by")
+    if not isinstance(opened_by, str):
+        opened_by = None
+    return AdminCopyReviewAudit(
+        review=_item(review, agent, matched),
+        agent_status=agent.status.value,
+        held_artifact_sha256=held_artifact_sha256,
+        held_score_count=held_score_count,
+        previous_status=previous_status,
+        opened_by=opened_by,
     )
 
 
@@ -326,6 +364,23 @@ async def get_copy_review(
     return _item(review, agent, matched)
 
 
+@router.get("/copy-reviews/{agent_id}/audit", response_model=AdminCopyReviewAudit)
+async def get_copy_review_audit(
+    agent_id: UUID, _admin: AdminDep, session: SessionDep
+) -> AdminCopyReviewAudit:
+    """Return the durable reason and attribution needed to explain an ATH hold."""
+    row = await _get_review(session, agent_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="copy review not found")
+    review, agent = row
+    matched = (
+        await session.get(Agent, review.original_duplicate_of)
+        if review.original_duplicate_of
+        else None
+    )
+    return _audit(review, agent, matched)
+
+
 @router.get(
     "/copy-reviews/{agent_id}/current-comparison",
     response_model=AdminCopyReviewCurrentComparison,
@@ -360,6 +415,117 @@ async def get_copy_review_current_comparison(
         raise HTTPException(status_code=409, detail="current comparison unavailable")
     comparison = compare_anti_copy_pair(candidate=candidate, reference=reference)
     return comparison.to_wire()
+
+
+@router.post(
+    "/copy-reviews/{agent_id}/open",
+    response_model=AdminCopyReviewOpenResponse,
+)
+async def open_copy_review(
+    agent_id: UUID,
+    payload: AdminCopyReviewOpenRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminCopyReviewOpenResponse:
+    """Manually hold one exact scored artifact for benchmark-overfit review.
+
+    The identity guards keep a stale Backroom tab from holding a replacement
+    artifact or a submission whose score set changed after the operator's
+    review. Scores remain durable; changing the agent status removes it from
+    the emission-eligible ledger until an operator resolves the review.
+    """
+    actor = x_admin_actor.strip() if x_admin_actor is not None else ""
+    if not 1 <= len(actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+
+    async with session.begin():
+        agent = await session.scalar(
+            select(Agent)
+            .options(undefer_group("anticopy"))
+            .where(Agent.agent_id == agent_id)
+            .with_for_update()
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        score_count = await session.scalar(
+            select(func.count()).select_from(Score).where(Score.agent_id == agent_id)
+        )
+        score_count = int(score_count or 0)
+        if agent.sha256 != payload.expected_sha256:
+            raise HTTPException(status_code=409, detail="artifact sha256 changed")
+        if score_count != payload.expected_score_count:
+            raise HTTPException(status_code=409, detail="score count changed")
+
+        existing = await session.scalar(
+            select(AthReview).where(AthReview.agent_id == agent_id).with_for_update()
+        )
+        if existing is not None:
+            evidence = existing.original_evidence
+            provenance = existing.algorithm_provenance
+            same_hold = (
+                existing.status == "pending"
+                and agent.status == AgentStatus.ATH_PENDING_REVIEW
+                and existing.original_reason == payload.reason
+                and evidence.get("sha256") == payload.expected_sha256
+                and evidence.get("score_count") == payload.expected_score_count
+                and provenance.get("review_kind") == "benchmark_overfit"
+            )
+            if not same_hold:
+                raise HTTPException(status_code=409, detail="ATH review already exists")
+            return AdminCopyReviewOpenResponse(
+                review=_item(existing, agent),
+                agent_status=agent.status.value,
+                idempotent=True,
+            )
+
+        if agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
+            raise HTTPException(
+                status_code=409,
+                detail=f"agent is {agent.status.value}, not scored or live",
+            )
+
+        opened_at = datetime.now(UTC)
+        review = AthReview(
+            review_id=uuid4(),
+            agent_id=agent.agent_id,
+            status="pending",
+            opened_at=opened_at,
+            original_duplicate_of=None,
+            original_reason=payload.reason,
+            original_policy_version=agent.screening_policy_version,
+            original_evidence={
+                "sha256": agent.sha256,
+                "score_count": score_count,
+                "previous_status": agent.status.value,
+                "content_fingerprint_version": (agent.content_fingerprint or {}).get(
+                    "v"
+                ),
+                "structural_fingerprint_version": (
+                    agent.structural_fingerprint or {}
+                ).get("v"),
+                "prompt_fingerprint_version": (agent.prompt_fingerprint or {}).get("v"),
+            },
+            algorithm_provenance={
+                "snapshot": "manual-admin-hold",
+                "review_kind": "benchmark_overfit",
+                "algorithm_version": "manual-ath-review-v1",
+                "opened_by": actor,
+                "backfilled": False,
+                "opened_at_source": "admin-request",
+            },
+        )
+        agent.status = AgentStatus.ATH_PENDING_REVIEW
+        agent.duplicate_of = None
+        agent.review_reason = payload.reason
+        session.add(review)
+        await session.flush()
+
+    return AdminCopyReviewOpenResponse(
+        review=_item(review, agent),
+        agent_status=agent.status.value,
+        idempotent=False,
+    )
 
 
 @router.post(
@@ -407,8 +573,13 @@ async def resolve_copy_review(
             raise HTTPException(
                 status_code=409, detail="agent hold reason no longer matches review"
             )
+        previous_status = review.original_evidence.get("previous_status")
         agent.status = (
-            AgentStatus.SCORED if canonical == "clear" else AgentStatus.BANNED
+            AgentStatus.LIVE
+            if canonical == "clear" and previous_status == AgentStatus.LIVE.value
+            else AgentStatus.SCORED
+            if canonical == "clear"
+            else AgentStatus.BANNED
         )
         review.status = "resolved"
         review.resolved_at = datetime.now(UTC)
