@@ -108,6 +108,7 @@ from ditto.api_server.endpoints.validator import SessionDep
 from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
+    AthReview,
     Score,
     ScreeningDispute,
     ScreeningQuarantine,
@@ -1073,6 +1074,9 @@ def _public_activity_response(
     score_continuation_floor: float | None,
     active_assignment_agent_ids: set[UUID],
     duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
+    ath_review_opened_at: dict[UUID, datetime] | None = None,
+    ath_review_composite: dict[UUID, float] | None = None,
+    ath_only: bool = False,
 ) -> PublicActivityResponse:
     """Project activity from the same validated work set used by fleet health."""
     active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
@@ -1095,6 +1099,12 @@ def _public_activity_response(
         )
 
     projected = [(row, public_status(row)) for row in rows]
+    if ath_only:
+        projected = [
+            (row, row_status)
+            for row, row_status in projected
+            if row.agent.status == AgentStatus.ATH_PENDING_REVIEW
+        ]
     # Mirror the validator ticket queue's global ordering. The ticket query adds
     # validator-specific retry and eligibility checks that can still skip a row.
     waiting_candidates = [
@@ -1193,6 +1203,10 @@ def _public_activity_response(
                     row.agent.duplicate_of, (None, None)
                 )[1],
                 review_reason=row.agent.review_reason,
+                review_opened_at=(ath_review_opened_at or {}).get(row.agent.agent_id),
+                preserved_composite=(ath_review_composite or {}).get(
+                    row.agent.agent_id
+                ),
                 score_count=row.score_count,
                 provisional_composite=row.provisional_composite,
                 validator_queue_rank=validator_queue_ranks.get(row.agent.agent_id),
@@ -1244,6 +1258,43 @@ async def _duplicate_submission_metadata(
     }
 
 
+async def _ath_review_public_snapshot(
+    session: AsyncSession, rows: list[Any]
+) -> tuple[dict[UUID, datetime], dict[UUID, float]]:
+    """Load public-safe hold times and canonical composites for active reviews."""
+    agent_ids = {
+        row.agent.agent_id
+        for row in rows
+        if row.agent.status == AgentStatus.ATH_PENDING_REVIEW
+    }
+    if not agent_ids:
+        return {}, {}
+    opened_at = dict(
+        (
+            await session.execute(
+                select(AthReview.agent_id, AthReview.opened_at).where(
+                    AthReview.agent_id.in_(agent_ids), AthReview.status == "pending"
+                )
+            )
+        )
+        .tuples()
+        .all()
+    )
+    composites: dict[UUID, list[float]] = {}
+    for agent_id, composite in (
+        await session.execute(
+            select(Score.agent_id, Score.composite).where(Score.agent_id.in_(agent_ids))
+        )
+    ).tuples():
+        composites.setdefault(agent_id, []).append(float(composite))
+    # Match the canonical median used when the score quorum finalized.
+    medians = {
+        agent_id: float(statistics.median(values))
+        for agent_id, values in composites.items()
+    }
+    return opened_at, medians
+
+
 @router.get("/activity", response_model=PublicActivityResponse)
 async def activity(
     response: Response,
@@ -1251,6 +1302,7 @@ async def activity(
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=50, ge=1, le=200),
     status: Annotated[list[str] | None, Query()] = None,
+    review: Literal["ath"] | None = Query(default=None),
     q: str | None = Query(default=None, min_length=1, max_length=200),
 ) -> PublicActivityResponse:
     """Recent submissions and their safe public pipeline stage, newest first.
@@ -1272,6 +1324,10 @@ async def activity(
 
     now = datetime.now(UTC)
     rows, _ = await list_public_activity(session)
+    ath_opened_at: dict[UUID, datetime] = {}
+    ath_composite: dict[UUID, float] = {}
+    if review == "ath":
+        ath_opened_at, ath_composite = await _ath_review_public_snapshot(session, rows)
     assignments = await list_active_validator_assignments(session, now=now)
     return _public_activity_response(
         rows=rows,
@@ -1288,6 +1344,9 @@ async def activity(
             assignment.agent.agent_id for assignment in assignments
         },
         duplicate_metadata=await _duplicate_submission_metadata(session, rows),
+        ath_review_opened_at=ath_opened_at,
+        ath_review_composite=ath_composite,
+        ath_only=review == "ath",
     )
 
 

@@ -1595,6 +1595,53 @@
     @media (prefers-reduced-motion: reduce) {
       .fleet-option { transition: none; }
     }
+    /* ATH review queue: a public, miner-facing ledger. The amber rule and
+       ticket-like rows distinguish a temporary hold from a failed submission. */
+    .ath-intro {
+      display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(260px, .8fr);
+      gap: 18px; margin-bottom: 18px; padding: 20px;
+      border: 1px solid var(--border); border-left: 4px solid var(--warn);
+      background: linear-gradient(120deg, color-mix(in oklch, var(--warn) 8%, var(--bg-elev)), var(--bg-elev));
+    }
+    .ath-intro h2 { margin: 3px 0 8px; font-family: var(--display); font-size: 22px; font-weight: 400; }
+    .ath-intro p { margin: 0; color: var(--text-dim); font-size: 13px; }
+    .ath-eyebrow { color: var(--warn); font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+    .ath-outcomes { display: grid; gap: 7px; align-content: center; }
+    .ath-outcome { display: grid; grid-template-columns: 54px 1fr; gap: 10px; align-items: baseline; padding-top: 7px; border-top: 1px solid var(--border); font-size: 12px; color: var(--text-dim); }
+    .ath-outcome b { color: var(--text); font-family: var(--mono); font-size: 10px; text-transform: uppercase; }
+    .ath-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin-bottom: 18px; border: 1px solid var(--border); background: var(--border); }
+    .ath-metric { min-height: 82px; padding: 14px 16px; background: var(--bg-elev); }
+    .ath-metric span { display: block; color: var(--text-faint); font-family: var(--mono); font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
+    .ath-metric strong { display: block; margin-top: 4px; color: var(--text); font-family: var(--display); font-size: 22px; font-weight: 400; }
+    .ath-review-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
+    .ath-review-head h2 { margin: 0; font-size: 16px; }
+    .ath-review-tools { display: flex; align-items: center; gap: 10px; }
+    .ath-snapshot { color: var(--text-faint); font-family: var(--mono); font-size: 10px; }
+    .ath-snapshot.stale { color: var(--warn); }
+    .ath-review-list { display: grid; gap: 10px; }
+    .ath-review-card { position: relative; overflow: hidden; border: 1px solid var(--border); background: var(--bg-elev); }
+    .ath-review-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--warn); }
+    .ath-review-main { display: grid; grid-template-columns: minmax(230px, 1.15fr) minmax(220px, 1fr) minmax(180px, .7fr); gap: 18px; padding: 17px 18px 14px 21px; }
+    .ath-agent-name { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; font-size: 15px; font-weight: 650; }
+    .ath-id-line, .ath-hotkey { display: flex; align-items: center; gap: 5px; min-width: 0; color: var(--text-faint); font-family: var(--mono); font-size: 10px; }
+    .ath-id-line code { overflow: hidden; text-overflow: ellipsis; }
+    .ath-hotkey { margin-top: 9px; color: var(--text-dim); }
+    .ath-hotkey .entity-link { font-family: var(--mono); }
+    .ath-review-status { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 9px; color: var(--warn); font-family: var(--mono); font-size: 10px; letter-spacing: .04em; text-transform: uppercase; }
+    .ath-review-status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--warn); }
+    .ath-time-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 9px; font-size: 11px; }
+    .ath-time-grid dt { color: var(--text-faint); }
+    .ath-time-grid dd { margin: 0; color: var(--text-dim); }
+    .ath-score { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .ath-score div { padding-left: 10px; border-left: 1px solid var(--border); }
+    .ath-score span { display: block; color: var(--text-faint); font-family: var(--mono); font-size: 9px; text-transform: uppercase; }
+    .ath-score strong { display: block; margin-top: 3px; font-family: var(--mono); font-size: 15px; font-weight: 500; }
+    .ath-hold-reason { display: grid; grid-template-columns: 116px 1fr; gap: 12px; padding: 12px 18px 13px 21px; border-top: 1px solid var(--border); background: color-mix(in oklch, var(--warn) 5%, var(--bg-elev-2)); }
+    .ath-hold-reason b { color: var(--text-faint); font-family: var(--mono); font-size: 9px; letter-spacing: .05em; text-transform: uppercase; }
+    .ath-hold-reason span { color: var(--text-dim); font-size: 12px; }
+    .ath-state { padding: 34px 20px; border: 1px dashed var(--border-strong); text-align: center; color: var(--text-dim); }
+    .ath-state strong { display: block; margin-bottom: 4px; color: var(--text); }
+    .ath-state.error { border-color: color-mix(in oklch, var(--danger) 55%, var(--border)); }
     /* Narrow viewports: the rail becomes a top bar. Brand + theme switch on the
        first row; sections as a horizontal, scrollable navbar strip. */
     @media (max-width: 960px) {
@@ -1617,6 +1664,11 @@
       .side-theme { flex: 1 0 100%; width: 100%; }
       .side-theme .theme-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
       .side-theme .theme-option { min-height: 44px; padding: 8px; }
+      .ath-intro, .ath-review-main { grid-template-columns: 1fr; }
+      .ath-metrics { grid-template-columns: 1fr; }
+      .ath-metric { min-height: 68px; }
+      .ath-review-head { align-items: flex-start; flex-direction: column; }
+      .ath-hold-reason { grid-template-columns: 1fr; gap: 4px; }
     }
   </style>
 </head>
@@ -1636,6 +1688,7 @@
         <a class="nav-item" href="#/overview" data-page="overview"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg></span><span class="ni-text"><span class="ni-label">Overview</span><span class="ni-desc">Snapshot &amp; leaderboard</span></span></a>
         <a class="nav-item" href="#/operations" data-page="operations"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/></svg></span><span class="ni-text"><span class="ni-label">Network ops</span><span class="ni-desc">Pipeline &amp; fleet health</span></span></a>
         <a class="nav-item" href="#/submissions" data-page="submissions"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg></span><span class="ni-text"><span class="ni-label">Submissions</span><span class="ni-desc">Recent uploads</span></span></a>
+        <a class="nav-item" href="#/reviews" data-page="reviews"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3 3.6 7.2v5.6c0 4.7 3.6 7.2 8.4 8.2 4.8-1 8.4-3.5 8.4-8.2V7.2Z"/><path d="M9 12h6M12 9v6"/></svg></span><span class="ni-text"><span class="ni-label">ATH reviews</span><span class="ni-desc">Active public holds</span></span></a>
         <a class="nav-item" href="#/benchmark" data-page="benchmark"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M21.3 15.3a2.4 2.4 0 0 1 0 3.4l-2.6 2.6a2.4 2.4 0 0 1-3.4 0L2.7 8.7a2.41 2.41 0 0 1 0-3.4l2.6-2.6a2.41 2.41 0 0 1 3.4 0Z"/><path d="m14.5 12.5 2-2"/><path d="m11.5 9.5 2-2"/><path d="m8.5 6.5 2-2"/><path d="m17.5 15.5 2-2"/></svg></span><span class="ni-text"><span class="ni-label">Benchmark</span><span class="ni-desc">What v2 measures</span></span></a>
       </nav>
       <div class="side-theme">
@@ -1900,6 +1953,37 @@
 
     </section>
 
+    <section class="page" data-page="reviews">
+      <section aria-labelledby="page-title">
+        <div class="ath-intro">
+          <div>
+            <span class="ath-eyebrow">Public review queue</span>
+            <h2>High scores get a second look.</h2>
+            <p>ATH reviews protect a competitive subnet from copied or benchmark-tuned submissions without discarding completed work. Recorded scores stay preserved, while emission eligibility pauses until the review is resolved.</p>
+          </div>
+          <div class="ath-outcomes" aria-label="Possible review outcomes">
+            <div class="ath-outcome"><b>Clear</b><span>A clear restores eligibility for emissions.</span></div>
+            <div class="ath-outcome"><b>Reject</b><span>The submission closes with a public status update.</span></div>
+            <div class="ath-outcome"><b>Rerun</b><span>A fresh evaluation replaces the held result.</span></div>
+          </div>
+        </div>
+        <div class="ath-metrics" aria-label="ATH review summary">
+          <div class="ath-metric"><span>Active reviews</span><strong id="ath-count">–</strong></div>
+          <div class="ath-metric"><span>Oldest hold</span><strong id="ath-oldest">–</strong></div>
+          <div class="ath-metric"><span>Scores preserved</span><strong id="ath-scores">–</strong></div>
+        </div>
+        <div class="ath-review-head">
+          <h2>Agents awaiting review</h2>
+          <div class="ath-review-tools">
+            <span class="ath-snapshot" id="ath-snapshot" role="status" aria-live="polite">Loading public snapshot…</span>
+            <button class="btn ghost" id="ath-refresh" type="button"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg> Refresh</button>
+          </div>
+        </div>
+        <div id="ath-review-state" class="ath-state"><strong>Loading active reviews…</strong>Reading the public submission snapshot.</div>
+        <div id="ath-review-list" class="ath-review-list" aria-live="polite"></div>
+      </section>
+    </section>
+
     <section class="page" data-page="benchmark">
     <section class="about">
       <p class="lead">A seeded, procedurally generated benchmark for agentic-memory harnesses on Subnet 118. Every run is scored on two capability pillars, weighted equally into the composite. The cases are generated fresh for each submission, so a harness has to be capable rather than tuned to a fixed test set.</p>
@@ -2034,6 +2118,9 @@
     var pipelineEntries = [];
     var pipelineLoaded = false;
     var pipelineUnavailable = false;
+    var athReviewCache = null;
+    var athReviewLoading = false;
+    var athReviewRequestId = 0;
     var activityPage = 1;
     var activityTotalPages = 1;
     var ACTIVITY_PAGE_SIZE = 10;
@@ -4362,6 +4449,136 @@
               function (e) { clearTimeout(to); throw e; });
     }
 
+    function athReviewSnapshot() {
+      var path = "/public/activity?review=ath&status=under_review&limit=200&page=1";
+      return getJSON(path).then(function (first) {
+        var pages = Number(first.total_pages) || 1;
+        if (pages <= 1) return first;
+        var requests = [];
+        for (var page = 2; page <= pages; page++) {
+          requests.push(getJSON(path.replace("page=1", "page=" + page)));
+        }
+        return Promise.all(requests).then(function (rest) {
+          var entries = (first.entries || []).slice();
+          rest.forEach(function (snapshot) {
+            entries = entries.concat(snapshot.entries || []);
+          });
+          first.entries = entries;
+          first.count = entries.length;
+          first.total = entries.length;
+          return first;
+        });
+      });
+    }
+
+    function athDate(value) {
+      if (!value) return "Not recorded";
+      var date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "Not recorded";
+      return date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+    }
+
+    function updateAthSnapshotLabel(snapshot, refreshFailed) {
+      var label = document.getElementById("ath-snapshot");
+      if (!label || !snapshot) return;
+      var generated = new Date(snapshot.generated_at);
+      var stale = refreshFailed || Number.isNaN(generated.getTime()) || Date.now() - generated.getTime() > REFRESH_MS * 2;
+      label.classList.toggle("stale", stale);
+      if (refreshFailed) {
+        label.textContent = "Refresh failed · showing last public snapshot";
+      } else if (stale) {
+        label.textContent = "Cached snapshot · " + relTime(snapshot.generated_at);
+      } else {
+        label.textContent = "Public snapshot · " + relTime(snapshot.generated_at);
+      }
+    }
+
+    function renderAthReviews(snapshot, refreshFailed) {
+      var entries = snapshot.entries || [];
+      var list = document.getElementById("ath-review-list");
+      var state = document.getElementById("ath-review-state");
+      var opened = entries.map(function (entry) { return entry.review_opened_at; }).filter(Boolean).sort();
+      var scoreTotal = entries.reduce(function (total, entry) { return total + (Number(entry.score_count) || 0); }, 0);
+      document.getElementById("ath-count").textContent = entries.length;
+      document.getElementById("ath-oldest").textContent = opened.length ? relTime(opened[0]) : "–";
+      document.getElementById("ath-scores").textContent = scoreTotal;
+      updateAthSnapshotLabel(snapshot, refreshFailed);
+      if (!entries.length) {
+        list.innerHTML = "";
+        state.hidden = false;
+        state.classList.remove("error");
+        state.innerHTML = "<strong>No active ATH reviews.</strong>Every submission has cleared the public review queue.";
+        return;
+      }
+      state.hidden = true;
+      list.innerHTML = entries.map(function (entry) {
+        var agentId = String(entry.agent_id || "");
+        var hotkey = String(entry.miner_hotkey || "");
+        var composite = entry.preserved_composite == null ? NaN : Number(entry.preserved_composite);
+        var compositeLabel = Number.isFinite(composite) ? fx(composite) : "–";
+        var scoreCount = Number(entry.score_count) || 0;
+        var reason = entry.review_reason || "This submission was routed to ATH review.";
+        return '<article class="ath-review-card" aria-label="ATH review for ' + esc(agentLabel(entry.name, entry.version)) + '">' +
+          '<div class="ath-review-main">' +
+            '<div><div class="ath-agent-name">' + entityAnchor("agent", agentId, agentLabel(entry.name, entry.version)) + '</div>' +
+              '<div class="ath-id-line"><code>' + esc(agentId) + '</code>' + copyButton(agentId, "agent ID") + '</div>' +
+              '<div class="ath-hotkey"><span>Miner</span><span title="' + esc(hotkey) + '">' + entityAnchor("miner", hotkey, shortKey(hotkey)) + '</span>' + copyButton(hotkey, "miner hotkey") + '</div></div>' +
+            '<div><span class="ath-review-status">ATH review pending</span>' +
+              '<dl class="ath-time-grid"><dt>Submitted</dt><dd>' + esc(athDate(entry.submitted_at)) + ' · ' + esc(relTime(entry.submitted_at)) + '</dd>' +
+              '<dt>Held</dt><dd>' + esc(athDate(entry.review_opened_at)) + (entry.review_opened_at ? ' · ' + esc(relTime(entry.review_opened_at)) : '') + '</dd></dl></div>' +
+            '<div class="ath-score"><div><span>Scores recorded</span><strong>' + scoreCount + '</strong></div>' +
+              '<div><span>Composite</span><strong>' + esc(compositeLabel) + '</strong></div></div>' +
+          '</div>' +
+          '<div class="ath-hold-reason"><b>Why this is held</b><span>' + esc(reason) + '</span></div>' +
+        '</article>';
+      }).join("");
+    }
+
+    function loadAthReviews(manual) {
+      if (athReviewLoading) return;
+      athReviewLoading = true;
+      var requestId = ++athReviewRequestId;
+      var refresh = document.getElementById("ath-refresh");
+      var state = document.getElementById("ath-review-state");
+      var snapshot = document.getElementById("ath-snapshot");
+      refresh.disabled = true;
+      if (!athReviewCache) {
+        state.hidden = false;
+        state.classList.remove("error");
+        state.innerHTML = "<strong>Loading active reviews…</strong>Reading the public submission snapshot.";
+      }
+      if (manual || athReviewCache) snapshot.textContent = "Refreshing public snapshot…";
+      athReviewSnapshot().then(function (data) {
+        if (requestId !== athReviewRequestId) return;
+        athReviewCache = data;
+        renderAthReviews(data, false);
+      }).catch(function () {
+        if (requestId !== athReviewRequestId) return;
+        if (athReviewCache) {
+          renderAthReviews(athReviewCache, true);
+        } else {
+          document.getElementById("ath-count").textContent = "–";
+          document.getElementById("ath-oldest").textContent = "–";
+          document.getElementById("ath-scores").textContent = "–";
+          snapshot.classList.add("stale");
+          snapshot.textContent = "Public review snapshot unavailable";
+          state.hidden = false;
+          state.classList.add("error");
+          state.innerHTML = "<strong>Could not load active reviews.</strong>Try refreshing in a moment. No example or private data is shown.";
+        }
+      }).finally(function () {
+        if (requestId === athReviewRequestId) {
+          athReviewLoading = false;
+          refresh.disabled = false;
+        }
+      });
+    }
+
+    document.getElementById("ath-refresh").addEventListener("click", function () { loadAthReviews(true); });
+    setInterval(function () {
+      if (athReviewCache) updateAthSnapshotLabel(athReviewCache, false);
+    }, 15000);
+
     function postJSON(path, body) {
       var ctrl = new AbortController();
       var to = setTimeout(function () { ctrl.abort(); }, 8000);
@@ -4556,6 +4773,7 @@
           document.getElementById("bs-ledger").href = API_BASE + c.ledger_path.replace("/api/v1", "");
         }
       }).catch(function () {});
+      if (document.querySelector('.page[data-page="reviews"].active')) loadAthReviews(manual);
     }
 
     // ── Go ───────────────────────────────────────────────────
@@ -4564,6 +4782,7 @@
       overview:    ["Overview", "Subnet snapshot and the full leaderboard · ranked by composite"],
       operations:  ["Network operations", "Live submission pipeline and validator / screener fleet health"],
       submissions: ["Recent submissions", "Screening evidence and validator quorum progress · select a row for history"],
+      reviews:     ["ATH reviews", "Public queue of held high-score submissions · scores preserved, emissions paused"],
       benchmark:   ["Benchmark", "What DittoBench v2 measures and the frozen scoring setup"]
     };
     function route(initial) {
@@ -4583,6 +4802,7 @@
       document.getElementById("page-sub").textContent = PAGES[page][1];
       document.title = "Ditto SN118 · " + PAGES[page][0];
       window.scrollTo(0, 0);
+      if (page === "reviews") loadAthReviews(false);
     }
     document.querySelectorAll(".nav-item[data-page]").forEach(function (item) {
       item.addEventListener("click", function (event) {

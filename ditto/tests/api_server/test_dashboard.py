@@ -266,6 +266,34 @@ class TestDashboard:
         )
         assert ".catch(function () { renderHealthUnavailable(); });" in body
 
+    async def test_includes_public_miner_facing_ath_review_queue(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+
+        assert 'href="#/reviews" data-page="reviews"' in body
+        assert '<section class="page" data-page="reviews">' in body
+        assert "High scores get a second look." in body
+        assert "Recorded scores stay preserved" in body
+        assert "emission eligibility pauses" in body
+        assert "A clear restores eligibility" in body
+        assert "A fresh evaluation replaces the held result" in body
+        assert 'id="ath-review-list" class="ath-review-list" aria-live="polite"' in body
+        assert 'id="ath-review-state" class="ath-state"' in body
+        assert "No active ATH reviews." in body
+        assert "Could not load active reviews." in body
+        assert "Cached snapshot" in body
+        assert "Refresh failed · showing last public snapshot" in body
+        assert 'var path = "/public/activity?review=ath&status=' in body
+        assert 'under_review&limit=200&page=1"' in body
+        assert 'requests.push(getJSON(path.replace("page=1", "page=" + page)))' in body
+        assert "entry.review_opened_at" in body
+        assert "entry.preserved_composite" in body
+        assert 'copyButton(hotkey, "miner hotkey")' in body
+        assert 'entityAnchor("agent", agentId' in body
+        assert 'entityAnchor("miner", hotkey' in body
+        assert "Authorization" not in body
+        assert "/admin/copy-reviews" not in body
+
     async def test_includes_server_backed_submission_quick_filters(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
