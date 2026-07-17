@@ -865,10 +865,11 @@ class PublicValidationAttempt(BaseModel):
 class PublicProvisionalScore(BaseModel):
     """One score the platform accepted toward a submission's quorum.
 
-    This deliberately exposes only the numeric composite and the deterministic
-    dataset inputs needed to reproduce it. Validator identity, signatures,
-    ticket leases, and scorer internals remain outside the public in-progress
-    surface.
+    This deliberately exposes only the numeric composite, the deterministic
+    dataset inputs needed to reproduce it, and the same redacted per-question
+    outcomes shown for finalized scores. Validator identity, signatures, ticket
+    leases, answer keys, and scorer internals remain outside the public
+    in-progress surface.
     """
 
     composite: Annotated[
@@ -945,6 +946,16 @@ class PublicProvisionalScore(BaseModel):
         Field(
             default=None,
             description="Copyable command that prints the regenerated dataset hash.",
+        ),
+    ]
+    case_results: Annotated[
+        list[PublicCaseResult] | None,
+        Field(
+            default=None,
+            description=(
+                "Redacted per-question outcomes; answer keys and raw responses "
+                "are never included."
+            ),
         ),
     ]
 

@@ -1598,6 +1598,9 @@ async def agent_pipeline(
                     bench_version=_score_bench_version(score),
                     sha_only=True,
                 ),
+                case_results=_safe_case_results(
+                    score.details if isinstance(score.details, dict) else {}
+                ),
             )
             for score in accepted_scores
         ],
