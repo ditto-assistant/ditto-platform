@@ -62,6 +62,8 @@ from ditto.api_models import (
     PublicBenchmarkProgress,
     PublicCaseResult,
     PublicCategoryStat,
+    PublicChainWeight,
+    PublicChainWeightsResponse,
     PublicDatasetReveal,
     PublicDethroneDecision,
     PublicEmissionRecipient,
@@ -88,6 +90,7 @@ from ditto.api_models import (
     PublicValidatorName,
     PublicValidatorNamesResponse,
     PublicValidatorScore,
+    PublicValidatorWeightVector,
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.public import (
@@ -173,6 +176,7 @@ _CACHE_CONTROL = "public, max-age=30"
 _REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 1.0
 _REGISTRATION_CACHE_TTL_SECONDS = 15.0
 _REGISTRATION_FAILURE_CACHE_TTL_SECONDS = 5.0
+_CHAIN_WEIGHTS_TIMEOUT_SECONDS = 4.0
 # Historical reproduction must fail closed: only benchmark epochs whose exact
 # generator release is known get a copyable command. Add a mapping deliberately
 # when a future epoch pins its generator; never point an old score at ``latest``.
@@ -199,6 +203,54 @@ _PUBLIC_ACTIVITY_STATUSES = frozenset(
 class _RegistrationSnapshot:
     expires_at: float
     uids_by_hotkey: dict[str, int] | None
+
+
+@router.get("/weights", response_model=PublicChainWeightsResponse)
+async def chain_weights(
+    request: Request, response: Response
+) -> PublicChainWeightsResponse:
+    """Return the latest publicly revealed SN118 validator weight matrix.
+
+    This reads Subtensor storage directly. With commit-reveal enabled the matrix
+    is necessarily the last revealed state and may lag encrypted commitments;
+    it is evidence of what is public on chain, not a substitute for Yuma's
+    stake-weighted emissions calculation.
+    """
+    response.headers["Cache-Control"] = _CACHE_CONTROL
+    chain = getattr(request.app.state, "chain", None)
+    config = getattr(request.app.state, "config", None)
+    get_weights = getattr(chain, "get_weights", None)
+    if chain is None or config is None or not callable(get_weights):
+        raise HTTPException(status_code=503, detail="chain weights unavailable")
+    try:
+        snapshot = await asyncio.wait_for(
+            get_weights(config.chain.netuid), timeout=_CHAIN_WEIGHTS_TIMEOUT_SECONDS
+        )
+    except (ChainError, TimeoutError) as error:
+        logger.warning("public chain weights unavailable: %s", error)
+        raise HTTPException(
+            status_code=503, detail="chain weights unavailable"
+        ) from error
+    return PublicChainWeightsResponse(
+        generated_at=datetime.now(UTC),
+        netuid=snapshot.netuid,
+        block=snapshot.block,
+        block_hash=snapshot.block_hash,
+        owner_hotkey=snapshot.owner_hotkey,
+        vectors=[
+            PublicValidatorWeightVector(
+                validator_uid=vector.validator_uid,
+                validator_hotkey=vector.validator_hotkey,
+                weights=[
+                    PublicChainWeight(
+                        uid=weight.uid, hotkey=weight.hotkey, value=weight.value
+                    )
+                    for weight in vector.weights
+                ],
+            )
+            for vector in snapshot.vectors
+        ],
+    )
 
 
 def screening_dispute_signing_message(agent_id: UUID, message: str) -> bytes:

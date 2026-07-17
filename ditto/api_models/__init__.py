@@ -36,6 +36,8 @@ from ditto.api_models.public import (
     PublicBenchmarkProgress,
     PublicCaseResult,
     PublicCategoryStat,
+    PublicChainWeight,
+    PublicChainWeightsResponse,
     PublicDatasetReveal,
     PublicDethroneDecision,
     PublicEmissionRecipient,
@@ -62,6 +64,7 @@ from ditto.api_models.public import (
     PublicValidatorName,
     PublicValidatorNamesResponse,
     PublicValidatorScore,
+    PublicValidatorWeightVector,
 )
 from ditto.api_models.retrieval import AgentResponse, AgentStatusResponse
 from ditto.api_models.screener import (
@@ -121,6 +124,8 @@ __all__ = [
     "PublicBenchmarkProgress",
     "PublicCaseResult",
     "PublicCategoryStat",
+    "PublicChainWeight",
+    "PublicChainWeightsResponse",
     "PublicDatasetReveal",
     "PublicDethroneDecision",
     "PublicEmissionRecipient",
@@ -149,6 +154,7 @@ __all__ = [
     "PublicValidatorHeartbeatsResponse",
     "PublicValidatorName",
     "PublicValidatorNamesResponse",
+    "PublicValidatorWeightVector",
     "ScoreReport",
     "ScreenEvidenceItem",
     "ScreenResultRequest",

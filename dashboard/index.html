@@ -250,7 +250,7 @@
       display: none; margin: -2px 0 12px; padding: 12px 14px;
       border: 1px solid var(--border); border-radius: 9px; background: var(--bg-elev);
     }
-    .emissions-strip.show { display: flex; align-items: flex-start; gap: 16px; }
+    .emissions-strip.show { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 320px); gap: 10px 16px; }
     .emissions-summary { min-width: 0; flex: 1 1 auto; }
     .emissions-title { color: var(--text); font-size: 13px; font-weight: 750; }
     .emissions-title .entity-link { color: inherit; }
@@ -259,6 +259,17 @@
     .emission-badge { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; font-family: var(--sans); font-size: 10px; font-weight: 750; }
     .emission-badge.champion { color: var(--gold); }
     .emission-badge.tail { color: var(--accent-2); }
+    .chain-observation {
+      display: none; grid-column: 1 / -1; align-items: flex-start; gap: 9px;
+      padding-top: 10px; border-top: 1px solid var(--border);
+      color: var(--text-dim); font-size: 11.5px; line-height: 1.5;
+    }
+    .chain-observation.show { display: flex; }
+    .chain-badge {
+      flex: 0 0 auto; margin-top: 1px; padding: 2px 6px; border: 1px solid color-mix(in oklab, var(--accent) 38%, var(--border));
+      border-radius: 999px; color: var(--accent); font: 700 9px/1.35 var(--mono); letter-spacing: .05em; text-transform: uppercase;
+    }
+    .chain-weight-note { display: block; margin-top: 4px; color: var(--text-faint); font: 9.5px/1.35 var(--mono); white-space: nowrap; }
 
     /* ── Leaderboard ────────────────────────────────────────── */
     .board { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
@@ -1325,6 +1336,7 @@
       .section-head .hint { display: block; margin-top: 6px; line-height: 1.5; }
       .emissions-strip.show { display: block; }
       .emissions-recipients { margin-top: 8px; text-align: left; }
+      .chain-observation { margin-top: 10px; }
       .view-all { display: inline-block; margin: 8px 0 0; }
       .pager { gap: 6px; padding-inline: 8px; }
       .pager .btn { min-width: 84px; padding-inline: 9px; }
@@ -1806,6 +1818,10 @@
         <div class="emissions-reason" id="emissions-reason"></div>
       </div>
       <div class="emissions-recipients" id="emissions-recipients"></div>
+      <div class="chain-observation" id="chain-observation">
+        <span class="chain-badge">On chain</span>
+        <span id="chain-observation-copy"></span>
+      </div>
     </div>
     <div class="leaderboard-notice" id="leaderboard-notice" role="status" aria-live="polite"></div>
     <div class="board">
@@ -2161,6 +2177,8 @@
 
     var REFRESH_MS = 30000; // matches the API's Cache-Control max-age
     var lastEntries = [];
+    var lastLeaderboardData = null;
+    var lastChainWeights = null;
     var lastActivityEntries = [];
     var pipelineEntries = [];
     var pipelineLoaded = false;
@@ -2467,6 +2485,75 @@
       document.getElementById("banner").classList.toggle("show", mode === "error");
     }
 
+    function applyChainWeights(entries, snapshot, emissions) {
+      var observation = document.getElementById("chain-observation");
+      var copy = document.getElementById("chain-observation-copy");
+      entries.forEach(function (entry) { entry._chainWeight = null; });
+      if (!snapshot || !Array.isArray(snapshot.vectors)) {
+        observation.classList.remove("show");
+        copy.textContent = "";
+        return;
+      }
+
+      var byHotkey = {};
+      entries.forEach(function (entry) { byHotkey[entry.miner_hotkey] = entry; });
+      var owner = snapshot.owner_hotkey || "";
+      var championCounts = {};
+      var minerVectors = 0;
+      snapshot.vectors.forEach(function (vector) {
+        var minerWeights = (vector.weights || []).filter(function (weight) {
+          return weight && weight.value > 0 && weight.hotkey !== owner;
+        });
+        var total = minerWeights.reduce(function (sum, weight) { return sum + weight.value; }, 0);
+        if (!total) return;
+        minerVectors += 1;
+        var champion = minerWeights.slice().sort(function (a, b) {
+          return b.value - a.value || a.uid - b.uid;
+        })[0];
+        championCounts[champion.hotkey] = (championCounts[champion.hotkey] || 0) + 1;
+        minerWeights.forEach(function (weight) {
+          var entry = byHotkey[weight.hotkey];
+          if (!entry) return;
+          if (!entry._chainWeight) entry._chainWeight = { weighted: 0, champion: 0, vectors: 0 };
+          entry._chainWeight.weighted += 1;
+          if (weight.hotkey === champion.hotkey) entry._chainWeight.champion += 1;
+        });
+      });
+      entries.forEach(function (entry) {
+        if (entry._chainWeight) entry._chainWeight.vectors = minerVectors;
+      });
+
+      if (!minerVectors) {
+        observation.classList.remove("show");
+        copy.textContent = "";
+        return;
+      }
+      var leaders = Object.keys(championCounts).sort(function (a, b) {
+        return championCounts[b] - championCounts[a] || a.localeCompare(b);
+      });
+      var revealedLeader = leaders[0];
+      var revealedEntry = byHotkey[revealedLeader];
+      var revealedLabel = revealedEntry ? agentName(revealedEntry.agent_name) : shortKey(revealedLeader);
+      var projectedHotkey = emissions && emissions.champion_miner_hotkey;
+      var projectedEntry = projectedHotkey && byHotkey[projectedHotkey];
+      var projectedLabel = projectedEntry ? agentName(projectedEntry.agent_name) : (projectedHotkey ? shortKey(projectedHotkey) : "The projected champion");
+      var summary = projectedHotkey
+        ? projectedLabel + " is champion in " + (championCounts[projectedHotkey] || 0) + " of " + minerVectors + " revealed miner-bearing validator vectors. "
+        : "The chain exposes " + minerVectors + " revealed miner-bearing validator vectors. ";
+      if (revealedLeader && revealedLeader !== projectedHotkey) {
+        summary += revealedLabel + " leads the revealed matrix at " + championCounts[revealedLeader] + " of " + minerVectors + ". ";
+      }
+      summary += "Block " + Number(snapshot.block).toLocaleString() + ". Commit-reveal can make this lag active commitments; Yuma combines validator inputs stake-weightedly.";
+      copy.textContent = summary;
+      observation.classList.add("show");
+    }
+
+    function chainWeightLabel(chainWeight) {
+      if (!chainWeight || !chainWeight.vectors) return "";
+      if (chainWeight.champion) return "Chain · champion " + chainWeight.champion + "/" + chainWeight.vectors;
+      return "Chain · weighted " + chainWeight.weighted + "/" + chainWeight.vectors;
+    }
+
     // ── Render ───────────────────────────────────────────────
     function render(data) {
       // Finalized submissions always rank ahead of pre-quorum feedback. Within
@@ -2565,6 +2652,7 @@
       entries.forEach(function (entry) {
         entry._emission = emissionsByAgent[String(entry.agent_id)] || null;
       });
+      applyChainWeights(entries, lastChainWeights, emissions);
       var emissionsStrip = document.getElementById("emissions-strip");
       if (emissions) {
         var championEntry = entries.find(function (entry) { return String(entry.agent_id) === String(emissions.champion_agent_id); });
@@ -2597,7 +2685,7 @@
           : "No participation-tail recipients in the current pool.";
         emissionsStrip.classList.add("show");
       } else {
-        emissionsStrip.classList.remove("show");
+        emissionsStrip.classList.toggle("show", document.getElementById("chain-observation").classList.contains("show"));
         document.getElementById("emissions-title").textContent = "";
         document.getElementById("emissions-reason").textContent = "";
         document.getElementById("emissions-recipients").textContent = "";
@@ -2617,6 +2705,7 @@
         var registered = isRegistered(e);
         var activelyEligible = e.emission_eligible === true;
         var emission = e._emission;
+        var chainWeight = e._chainWeight;
         var isChamp = emission && emission.role === "champion";
         var rankCls = (finalizedEntry && elig && activelyEligible && e.rank <= 3) ? " r" + e.rank : "";
         var kind = unrankedKind(e);
@@ -2634,7 +2723,8 @@
         var rowLabel = (elig ? (finalizedEntry ? "Rank " : "Provisional rank ") + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
           ", agent " + accessibleAgentName + ", miner UID " + (e.miner_uid == null ? "unavailable" : e.miner_uid) +
           ", hotkey " + shortKey(e.miner_hotkey) + ", composite " + fx(e.composite) +
-          (emission ? ", KOTH " + emission.role + " receiving " + pct(emission.share_of_miner_pool) + " of the miner pool" : "") + ". Activate for run detail.";
+          (emission ? ", KOTH " + emission.role + " receiving " + pct(emission.share_of_miner_pool) + " of the miner pool" : "") +
+          (chainWeight ? ", " + chainWeightLabel(chainWeight) : "") + ". Activate for run detail.";
         var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge" title="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
           esc(e.score_count || 0) + ' of ' + esc(e.score_quorum || 3) + ' · provisional</span>';
         var registrationBadge = registered
@@ -2651,7 +2741,8 @@
               '<span class="winner-miner" title="' + esc(e.miner_hotkey) + '"><span class="miner-uid" title="Current SN118 UID">UID ' + (e.miner_uid == null ? "–" : esc(e.miner_uid)) + '</span><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' +
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></span></span></td>' +
             '<td>' + (emission ? '<span class="emission-badge ' + esc(emission.role) + '"><span aria-hidden="true">●</span> ' +
-              (emission.role === "champion" ? "Champion" : "Tail") + ' · ' + pct(emission.share_of_miner_pool) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+              (emission.role === "champion" ? "Champion" : "Tail") + ' · ' + pct(emission.share_of_miner_pool) + '</span>' : '<span class="muted">—</span>') +
+              (chainWeight ? '<span class="chain-weight-note" title="Latest publicly revealed validator vectors at chain block ' + esc(lastChainWeights.block) + '. These can lag active commitments and are not final Yuma emissions.">' + esc(chainWeightLabel(chainWeight)) + '</span>' : '') + '</td>' +
             modelCell(e) +
             compositeCell(e) +
             '<td class="hide-sm">' + bar("tool", e.tool_mean) + '</td>' +
@@ -2675,6 +2766,7 @@
       document.getElementById("leaderboard-title").textContent = "Leaderboard";
       document.getElementById("leaderboard-hint").textContent = "Live standings are temporarily unavailable";
       document.getElementById("emissions-strip").classList.remove("show");
+      document.getElementById("chain-observation").classList.remove("show");
       var notice = document.getElementById("leaderboard-notice");
       notice.classList.remove("show");
       notice.textContent = "";
@@ -2868,6 +2960,7 @@
       var mKind = unrankedKind(e);
       var det = "";
       if (e._emission) det += stat("KOTH emissions", (e._emission.role === "champion" ? "Champion · " : "Participation tail · ") + pct(e._emission.share_of_miner_pool) + " of the miner pool. Raw score rank is shown separately.");
+      if (e._chainWeight) det += stat("Revealed chain weights", chainWeightLabel(e._chainWeight) + ". Latest public validator inputs at block " + lastChainWeights.block.toLocaleString() + "; commit-reveal can make them lag active commitments, and Yuma combines them stake-weightedly.");
       if (!isFinalized(e)) det += stat("Validation", (e.score_count || 0) + " of " + (e.score_quorum || 3) + " accepted scores. Not final and not used for emissions.");
       if (e.registered === false) det += stat("Registration", "Not currently registered on SN118. The submission, fee record, and scores are retained, but this hotkey is excluded from active weights and emissions until the same hotkey registers again.");
       else if (e.registered == null) det += stat("Registration", "Current SN118 registration could not be confirmed. The score is retained, but active weight and emission eligibility are unknown.");
@@ -4875,8 +4968,17 @@
     function load(manual) {
       if (manual) setStatus("", "Refreshing…");
       getJSON("/public/leaderboard")
-        .then(function (data) { setStatus("live", "Live"); render(data); resolveEntityRoute(); })
-        .catch(function () { setStatus("error", "Data unavailable"); renderLeaderboardUnavailable(); });
+        .then(function (data) { lastLeaderboardData = data; setStatus("live", "Live"); render(data); resolveEntityRoute(); })
+        .catch(function () { lastLeaderboardData = null; setStatus("error", "Data unavailable"); renderLeaderboardUnavailable(); });
+      getJSON("/public/weights")
+        .then(function (data) {
+          lastChainWeights = data;
+          if (lastLeaderboardData) render(lastLeaderboardData);
+        })
+        .catch(function () {
+          lastChainWeights = null;
+          if (lastLeaderboardData) render(lastLeaderboardData);
+        });
       // Health is independent: a failure here must not flip the whole page to
       // unavailable mode or blank the leaderboard.
       getJSON("/public/health")

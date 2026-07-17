@@ -184,8 +184,13 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   above is the read surface; mirroring/anchoring entries into the results bucket
   (or periodically checkpointing `head_hash` there for an external timestamp) is
   an infra add-on on top of this verifiable core, not a correctness dependency.
-- `GET /api/v1/public/weights` → the last-published normalized weight vector
-  (champion + tail) — mirrors what the validator set on-chain.
+- `GET /api/v1/public/weights` → a block-consistent native read of the public
+  `SubtensorModule.Weights` matrix: validator UID/hotkey plus each non-zero raw
+  destination UID/hotkey/u16 value. The response also names the subnet-owner
+  hotkey so clients can separate the 80% burn route from the KOTH miner pool.
+  Under commit-reveal these are necessarily the last **revealed** vectors and may
+  lag encrypted active commitments; they are validator inputs to stake-weighted
+  Yuma consensus, not a claim about final miner emissions.
 - `GET /api/v1/public/health` → subnet rollup **from what the platform records**:
   `miners`, `scored_miners`, `scored_agents`, `last_scored_at`, `scores_24h`,
   `avg_latency_ms`. Note: no `success_rate` — the platform only ever sees a
@@ -326,9 +331,10 @@ idea); no server needed since all data comes from the public API + wandb.
 ## Build order
 
 1. ✅ Public API — `/api/v1/public/leaderboard` + `/api/v1/public/health`.
-   `/weights` remains intentionally absent: validators own weight submission.
-   The leaderboard embeds a read-only champion/tail projection so raw score rank
-   cannot be confused with emissions recipients.
+   `/weights` is a read-only native Subtensor overlay; validators still own weight
+   submission. The leaderboard keeps the current champion/tail projection, the
+   last revealed validator vectors, and eventual Yuma emissions explicitly
+   separate so raw score rank cannot be confused with any of them.
 2. ✅ wandb `telemetry.py` in the validator (ditto-subnet #27) — aggregate +
    per-category tables, opt-in and off by default.
 3. ✅ Dashboard SPA (`dashboard/index.html`) against the public API + wandb link.

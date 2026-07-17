@@ -36,6 +36,11 @@ from ditto.api_server.endpoints import public as public_endpoint
 from ditto.api_server.endpoints.public import _fleet_classification
 from ditto.api_server.validator_names import ValidatorNamesSnapshot
 from ditto.chain import ChainError
+from ditto.chain.models import (
+    ChainWeight,
+    ChainWeightsSnapshot,
+    ChainWeightVector,
+)
 from ditto.db.models import (
     Agent,
     AthReview,
@@ -244,6 +249,65 @@ async def _seed_agent(
             )
         )
     return str(agent_id)
+
+
+class TestPublicChainWeights:
+    async def test_returns_native_revealed_weight_matrix(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        snapshot = ChainWeightsSnapshot(
+            netuid=118,
+            block=8_639_503,
+            block_hash="0x" + "ab" * 32,
+            owner_hotkey=_MINER_B,
+            vectors=(
+                ChainWeightVector(
+                    validator_uid=25,
+                    validator_hotkey=_VALIDATOR_C,
+                    weights=(ChainWeight(uid=169, hotkey=_MINER_A, value=14745),),
+                ),
+            ),
+        )
+        app.state.chain = SimpleNamespace(get_weights=AsyncMock(return_value=snapshot))
+
+        response = await client.get("/api/v1/public/weights")
+
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "public, max-age=30"
+        body = response.json()
+        assert body["netuid"] == 118
+        assert body["block"] == 8_639_503
+        assert body["block_hash"] == "0x" + "ab" * 32
+        assert body["owner_hotkey"] == _MINER_B
+        assert body["vectors"] == [
+            {
+                "validator_uid": 25,
+                "validator_hotkey": _VALIDATOR_C,
+                "weights": [{"uid": 169, "hotkey": _MINER_A, "value": 14745}],
+            }
+        ]
+        app.state.chain.get_weights.assert_awaited_once_with(118)
+
+    async def test_returns_503_when_chain_read_is_unavailable(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        app.state.chain = SimpleNamespace(
+            get_weights=AsyncMock(side_effect=ChainError("rpc unavailable"))
+        )
+
+        response = await client.get("/api/v1/public/weights")
+
+        assert response.status_code == 503
+        assert response.json()["message"] == "chain weights unavailable"
+
+    async def test_returns_503_when_chain_client_lacks_weight_read(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        app.state.chain = SimpleNamespace()
+
+        response = await client.get("/api/v1/public/weights")
+
+        assert response.status_code == 503
 
 
 class TestPublicLeaderboard:

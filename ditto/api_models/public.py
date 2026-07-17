@@ -512,6 +512,33 @@ class PublicLeaderboardResponse(BaseModel):
     ] = None
 
 
+class PublicChainWeight(BaseModel):
+    """One non-zero destination in a validator's revealed chain vector."""
+
+    uid: Annotated[int, Field(ge=0)]
+    hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    value: Annotated[int, Field(gt=0, le=65535)]
+
+
+class PublicValidatorWeightVector(BaseModel):
+    """One validator's latest publicly revealed on-chain weights."""
+
+    validator_uid: Annotated[int, Field(ge=0)]
+    validator_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    weights: list[PublicChainWeight] = Field(default_factory=list)
+
+
+class PublicChainWeightsResponse(BaseModel):
+    """Block-consistent SN118 weight matrix read from Subtensor storage."""
+
+    generated_at: datetime
+    netuid: Annotated[int, Field(ge=0)]
+    block: Annotated[int, Field(ge=0)]
+    block_hash: Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{64}$")]
+    owner_hotkey: Annotated[str | None, Field(default=None, pattern=_SS58_PATTERN)]
+    vectors: list[PublicValidatorWeightVector] = Field(default_factory=list)
+
+
 class PublicValidatorScore(BaseModel):
     """One validator's score for a submission, published verbatim (public).
 

@@ -13,8 +13,11 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
   composite, with a separate KOTH emissions projection that identifies the
   first-seen incumbent champion and participation-tail recipients. The projection
   applies the validator's frozen 2% protection margin and statistical dethrone
-  band, so raw rank #1 is never mislabeled as champion. Click a row for a
-  drill-down (tool-vs-memory split, first-seen, raw rank, emissions role). Current SN118 registration
+  band, so raw rank #1 is never mislabeled as champion. A native Subtensor read
+  overlays the last publicly revealed validator vectors at one block, while
+  explicitly separating those lagging commit-reveal inputs from stake-weighted
+  Yuma emissions. Click a row for a drill-down (tool-vs-memory split, first-seen,
+  raw rank, projected emissions role, revealed chain support). Current SN118 registration
   is reported separately: a deregistered hotkey's immutable score stays visible
   but is marked inactive and excluded from weights and emissions until that same
   hotkey registers again.
@@ -43,7 +46,8 @@ rows are a narrow safe projection (composite, deterministic dataset inputs, and
 acceptance time); identities, signatures, ticket leases, and scorer internals
 stay private. The leaderboard serves a read-only KOTH projection for explanation;
 validators still compute and submit the authoritative weight vector independently,
-and full per-epoch telemetry remains in wandb (linked).
+and Yuma combines their revealed inputs stake-weightedly. Full per-epoch
+telemetry remains in wandb (linked).
 
 ## Configure
 

@@ -104,6 +104,7 @@ class TestDashboard:
         "path",
         [
             "/api/v1/public/leaderboard",
+            "/api/v1/public/weights",
             "/api/v1/public/activity",
             "/api/v1/public/operations",
             "/api/v1/public/validators",
@@ -149,6 +150,11 @@ class TestDashboard:
         assert ">Score rank</span>" in body
         assert ">Emissions</span>" in body
         assert 'id="emissions-strip" role="status" aria-live="polite"' in body
+        assert 'id="chain-observation"' in body
+        assert 'getJSON("/public/weights")' in body
+        assert "Commit-reveal can make this lag active commitments" in body
+        assert "Yuma combines validator inputs stake-weightedly" in body
+        assert 'return "Chain · champion "' in body
         assert "KOTH champion and recipients shown separately" in body
         assert "Raw score rank #" in body
         assert 'emission.role === "champion"' in body
@@ -280,7 +286,8 @@ class TestDashboard:
         assert "<b>Live data unavailable.</b>" in body
         assert "No example data is shown." in body
         assert (
-            '.catch(function () { setStatus("error", "Data unavailable"); '
+            ".catch(function () { lastLeaderboardData = null; "
+            'setStatus("error", "Data unavailable"); '
             "renderLeaderboardUnavailable(); });" in body
         )
         assert ".catch(function () { renderHealthUnavailable(); });" in body
