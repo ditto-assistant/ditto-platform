@@ -1522,6 +1522,15 @@
     .fleet-table-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; margin: 32px 0 10px; }
     .fleet-table-head h2 { margin: 0; font-family: var(--display); font-size: 22px; font-weight: 400; line-height: 1.1; }
     .fleet-table-head .hint { display: block; margin-top: 5px; color: var(--text-dim); font: 400 10px/1.4 var(--mono); }
+    .fleet-retired { margin-top: 12px; border: 1px solid var(--border); background: color-mix(in oklab, var(--bg-elev) 62%, transparent); }
+    .fleet-retired summary { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 11px 14px; color: var(--text-dim); cursor: pointer; }
+    .fleet-retired summary:hover { color: var(--text); }
+    .fleet-retired summary:focus-visible { outline: 3px solid color-mix(in oklch, var(--focus) 30%, transparent); outline-offset: 2px; }
+    .fleet-retired summary strong { color: inherit; font-size: 12px; }
+    .fleet-retired summary span { font: 10px/1.4 var(--mono); }
+    .fleet-retired-note { margin: 0; padding: 0 14px 11px; color: var(--text-faint); font-size: 11px; line-height: 1.45; }
+    .fleet-retired .board { margin: 0; border-right: 0; border-bottom: 0; border-left: 0; border-radius: 0; }
+    .fleet-retired-table { min-width: 640px; }
     .fleet-table { min-width: 1220px; table-layout: fixed; }
     .fleet-table thead th,
     .fleet-table tbody td { padding-inline: 12px; }
@@ -1824,6 +1833,23 @@
           </tbody>
         </table>
       </div>
+      <details class="fleet-retired" id="fleet-retired" hidden>
+        <summary><strong>Recently offline</strong><span id="fleet-retired-summary"></span></summary>
+        <p class="fleet-retired-note">Heartbeat history remains visible for 24 hours, then expires automatically.</p>
+        <div class="board validators" tabindex="0" aria-label="Recently offline screeners, horizontally scrollable on small screens">
+          <table class="fleet-table fleet-retired-table" aria-label="Recently offline screeners">
+            <thead>
+              <tr>
+                <th scope="col" style="width:240px">Screener</th>
+                <th scope="col" style="width:130px">Last heartbeat</th>
+                <th scope="col" style="width:180px">Last reported state</th>
+                <th scope="col" style="width:108px">Version</th>
+              </tr>
+            </thead>
+            <tbody id="fleet-retired-rows"></tbody>
+          </table>
+        </div>
+      </details>
     </section>
 
     </section>
@@ -4218,32 +4244,64 @@
       var rows = document.getElementById("fleet-rows");
       var summary = document.getElementById("fleet-summary");
       var table = document.getElementById("fleet-table");
+      var retired = document.getElementById("fleet-retired");
+      var retiredSummary = document.getElementById("fleet-retired-summary");
+      var retiredRows = document.getElementById("fleet-retired-rows");
       document.getElementById("fleet-node-heading").textContent = showScreeners ? "Screener" : "Validator";
       table.setAttribute("aria-label", (showScreeners ? "Screener" : "Validator") + " fleet health");
       if (unavailable) {
         resetFleetLedger();
         summary.textContent = (showScreeners ? "Screener" : "Validator") + " status unavailable";
         rows.innerHTML = '<tr><td colspan="10" class="empty">' + (showScreeners ? "Screener" : "Validator") + ' status is temporarily unavailable.</td></tr>';
+        retired.hidden = true;
         return;
       }
       if (data === null) {
         resetFleetLedger();
         summary.textContent = "Loading " + singular + " status…";
         rows.innerHTML = '<tr><td colspan="10" class="empty">Loading ' + kind + '…</td></tr>';
+        retired.hidden = true;
         return;
       }
-      var entries = sortFleetEntries(data[kind] || [], singular);
-      updateFleetLedger(entries);
-      var reported = Number(data.reported_count) || entries.length;
+      var allEntries = sortFleetEntries(data[kind] || [], singular);
+      var retiredEntries = showScreeners ? allEntries.filter(function (entry) {
+        return entry.availability === "offline";
+      }) : [];
+      var entries = showScreeners ? allEntries.filter(function (entry) {
+        return entry.availability !== "offline";
+      }) : allEntries;
+      updateFleetLedger(allEntries);
       var available = entries.filter(function (entry) {
         return entry.availability === "available";
       }).length;
       var snapshot = data.generated_at ? " · snapshot " + relTime(data.generated_at) : "";
       summary.textContent = (entries.length
-        ? available + " of " + reported + " " + kind + " available"
-        : "No " + kind + " reporting") + snapshot;
+        ? available + " of " + entries.length + " active " + kind + " available"
+        : "No active " + kind + " reporting") +
+        (retiredEntries.length ? " · " + retiredEntries.length + " recently offline" : "") + snapshot;
+      retired.hidden = !showScreeners || !retiredEntries.length;
+      if (retiredEntries.length) {
+        retiredSummary.textContent = retiredEntries.length + (retiredEntries.length === 1 ? " screener" : " screeners");
+        retiredRows.innerHTML = retiredEntries.map(function (entry) {
+          var hotkey = entry.screener_hotkey || "Unknown";
+          var displayName = entry.instance_id || "Unknown screener";
+          var reportedAt = entry.seen_at || entry.reported_at;
+          var work = fleetWork(entry.state, "screener");
+          var version = String(entry.software_version || "Unknown");
+          if (version !== "Unknown" && version.charAt(0).toLowerCase() !== "v") version = "v" + version;
+          var identity = '<span class="fleet-node-identity"><span class="fleet-node-name" title="' + esc(displayName) + '">' + esc(displayName) + '</span><span class="fleet-node fleet-node-key copyable" title="' + esc(hotkey) + '"><span>' + entityAnchor("screener", hotkey, shortKey(hotkey)) + '</span>' + copyButton(hotkey, "screener hotkey") + '</span></span>';
+          return '<tr>' +
+            '<td><span class="fleet-node-wrap">' + identity + '</span></td>' +
+            '<td><span class="fleet-time" title="' + esc(reportedAt) + '">' + relTime(reportedAt) + '</span></td>' +
+            '<td><span class="stage unknown">' + esc(work[0]) + '</span></td>' +
+            '<td><span class="fleet-version">' + esc(version) + '</span><span class="fleet-protocol">Health ' + esc(entry.protocol_version) + ' · Policy ' + esc(entry.policy_version) + '</span></td>' +
+            '</tr>';
+        }).join("");
+      } else {
+        retiredRows.innerHTML = "";
+      }
       if (!entries.length) {
-        rows.innerHTML = '<tr><td colspan="10" class="empty">No ' + singular + ' software reports yet.</td></tr>';
+        rows.innerHTML = '<tr><td colspan="10" class="empty">No active ' + singular + ' software reports.</td></tr>';
         return;
       }
       rows.innerHTML = entries.map(function (entry) {

@@ -348,6 +348,10 @@ class TestDashboard:
         assert "Fleet health" in body
         assert 'id="fleet-summary"' in body
         assert 'id="fleet-rows"' in body
+        assert 'id="fleet-retired" hidden' in body
+        assert 'id="fleet-retired-rows"' in body
+        assert "Recently offline" in body
+        assert "Heartbeat history remains visible for 24 hours" in body
         assert 'id="show-screeners"' in body
         assert 'type="checkbox"' in body
         assert '<label class="fleet-toggle" for="show-screeners">' in body
@@ -378,6 +382,10 @@ class TestDashboard:
         assert "privacy-note" not in body
         assert "fleet-health-note" not in body
         assert '" reporting " + kind' not in body
+        assert 'available + " of " + entries.length + " active " + kind' in body
+        assert 'entry.availability === "offline"' in body
+        assert 'retired.hidden = !showScreeners || !retiredEntries.length' in body
+        assert '" · " + retiredEntries.length + " recently offline"' in body
 
     async def test_operations_panels_share_one_snapshot_and_show_skew(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
