@@ -1667,6 +1667,64 @@ class TestQuarantineAdmin:
             assert agent.screening_reason == "Second review confirmed a false positive"
             assert [event.resolution for event in history] == ["reject", "release"]
 
+    async def test_release_pins_dataset_when_generation_is_enabled(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        held = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                attempt_id=attempt_id,
+                outcome="quarantine",
+                manifest_digest="56" * 32,
+                finding_digest="78" * 32,
+                reason_code="agentic-source-review-tripwire",
+            ),
+        )
+        assert held.status_code == 200
+
+        generator = _FakeGenerator(run_size="full", sha="be" * 32)
+        _install_generator(app, generator)
+        headers = {
+            "Authorization": "Bearer test-admin-token-at-least-32-characters",
+            "X-Admin-Actor": "backroom:test-user",
+        }
+        quarantine = (
+            await client.get("/api/v1/admin/screening-quarantines", headers=headers)
+        ).json()["items"][0]
+        released = await client.post(
+            f"/api/v1/admin/screening-quarantines/{quarantine['quarantine_id']}/resolve",
+            headers=headers,
+            json={"resolution": "release", "reason": "Manual review passed"},
+        )
+
+        assert released.status_code == 200
+        assert released.json()["agent_status"] == AgentStatus.EVALUATING
+        assert [
+            event["resolution"]
+            for event in released.json()["quarantine"]["resolution_history"]
+        ] == ["release"]
+        assert generator.calls == 1
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.dataset_seed is not None
+            assert agent.dataset_sha256 == "be" * 32
+            assert agent.dataset_run_size == "full"
+
     async def test_admin_auth_is_required(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
