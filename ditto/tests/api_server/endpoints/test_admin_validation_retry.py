@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.dependencies import get_session
 from ditto.db.models import Agent, Base, Score, ValidatorRetryRecovery, ValidatorTicket
@@ -24,7 +25,11 @@ from ditto.db.queries.tickets import issue_ticket
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "X-Admin-Actor": "operator"}
-_T0 = datetime(2026, 7, 18, 12, tzinfo=UTC)
+
+
+@pytest.fixture
+def retry_epoch() -> datetime:
+    return datetime.now(UTC)
 
 
 @pytest.fixture
@@ -61,7 +66,10 @@ def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
 
 
 async def _seed(
-    maker: async_sessionmaker[AsyncSession], *, score_count: int = 0
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    now: datetime,
+    score_count: int = 0,
 ) -> UUID:
     agent_id = uuid4()
     async with maker() as session, session.begin():
@@ -73,8 +81,8 @@ async def _seed(
                 version=1,
                 sha256=agent_id.hex * 2,
                 status=AgentStatus.EVALUATING,
-                screening_policy_version=8,
-                created_at=_T0 - timedelta(days=1),
+                screening_policy_version=SCREENING_POLICY_VERSION,
+                created_at=now - timedelta(days=1),
             )
         )
         for index in range(4):
@@ -87,12 +95,12 @@ async def _seed(
                     agent_id=agent_id,
                     validator_hotkey=hotkey,
                     status=status,
-                    issued_at=_T0 - timedelta(hours=3 - index / 10),
-                    deadline=_T0 - timedelta(hours=2 - index / 10),
+                    issued_at=now - timedelta(hours=3 - index / 10),
+                    deadline=now - timedelta(hours=2 - index / 10),
                     bench_version=2,
                     attempt_count=1 if status == TicketStatus.SCORED else 2,
                     manual_retry_grants=0,
-                    retry_after=_T0 - timedelta(hours=1),
+                    retry_after=now - timedelta(hours=1),
                 )
             )
             if status == TicketStatus.SCORED:
@@ -107,7 +115,7 @@ async def _seed(
                         memory_mean=0.7,
                         median_ms=100,
                         n=114,
-                        generated_at=_T0 - timedelta(hours=1),
+                        generated_at=now - timedelta(hours=1),
                     )
                 )
     return agent_id
@@ -117,8 +125,9 @@ async def test_retry_grants_only_minimum_quorum_slots_and_preserves_history(
     app: FastAPI,
     client: httpx.AsyncClient,
     retry_maker: async_sessionmaker[AsyncSession],
+    retry_epoch: datetime,
 ) -> None:
-    agent_id = await _seed(retry_maker)
+    agent_id = await _seed(retry_maker, now=retry_epoch)
     _install(app, retry_maker)
 
     detail = await client.get(
@@ -186,8 +195,9 @@ async def test_one_score_grants_only_two_more_attempts_and_keeps_score(
     app: FastAPI,
     client: httpx.AsyncClient,
     retry_maker: async_sessionmaker[AsyncSession],
+    retry_epoch: datetime,
 ) -> None:
-    agent_id = await _seed(retry_maker, score_count=1)
+    agent_id = await _seed(retry_maker, now=retry_epoch, score_count=1)
     _install(app, retry_maker)
     detail = await client.get(
         f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
@@ -217,8 +227,9 @@ async def test_stale_snapshot_and_active_or_natural_retry_fail_closed(
     app: FastAPI,
     client: httpx.AsyncClient,
     retry_maker: async_sessionmaker[AsyncSession],
+    retry_epoch: datetime,
 ) -> None:
-    agent_id = await _seed(retry_maker)
+    agent_id = await _seed(retry_maker, now=retry_epoch)
     _install(app, retry_maker)
     await client.get(f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS)
     stale = await client.post(
@@ -257,8 +268,9 @@ async def test_manual_grant_allows_exactly_one_more_same_version_issue(
     app: FastAPI,
     client: httpx.AsyncClient,
     retry_maker: async_sessionmaker[AsyncSession],
+    retry_epoch: datetime,
 ) -> None:
-    agent_id = await _seed(retry_maker)
+    agent_id = await _seed(retry_maker, now=retry_epoch)
     _install(app, retry_maker)
     detail = await client.get(
         f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
@@ -276,7 +288,7 @@ async def test_manual_grant_allows_exactly_one_more_same_version_issue(
         ticket = await issue_ticket(
             session,
             validator_hotkey="validator-0",
-            now=datetime.now(UTC) + timedelta(seconds=1),
+            now=retry_epoch + timedelta(seconds=1),
             ttl=timedelta(minutes=90),
             bench_version=2,
         )
