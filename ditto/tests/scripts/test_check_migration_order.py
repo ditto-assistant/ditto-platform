@@ -34,15 +34,31 @@ def test_parallel_heads_are_rejected() -> None:
         migration("three", "one"),
     ]
 
-    with pytest.raises(MigrationError, match="migration history branches"):
+    with pytest.raises(MigrationError, match="expected one head revision"):
         validate_linear_history(migrations, "test")
 
 
-def test_merge_revision_is_rejected() -> None:
+def test_merge_revision_resolves_parallel_heads() -> None:
     source = """
 revision: str = "merge"
 down_revision: tuple[str, str] = ("one", "two")
 """
+    merge = parse_migration("merge.py", source)
+    migrations = [
+        migration("root", None),
+        migration("one", "root"),
+        migration("two", "root"),
+        merge,
+    ]
 
-    with pytest.raises(MigrationError, match="merge revisions are not allowed"):
+    assert validate_linear_history(migrations, "test") == "merge"
+
+
+def test_merge_revision_rejects_duplicate_parents() -> None:
+    source = """
+revision: str = "merge"
+down_revision: tuple[str, str] = ("one", "one")
+"""
+
+    with pytest.raises(MigrationError, match="down_revision contains duplicates"):
         parse_migration("merge.py", source)
