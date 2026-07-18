@@ -417,6 +417,24 @@ def _safe_transcript_sha256(details: dict) -> str | None:
     return None
 
 
+def _safe_transform_robustness(details: dict) -> tuple[float | None, int | None]:
+    """Pull the reproduce-under-transform audit result, tolerating bad blobs.
+
+    Returns ``(None, None)`` for a run that carried no audit pairs or predates
+    the audit, so an absent metric is never published as a failing one.
+    """
+    raw = details.get("transform_robustness")
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return None, None
+    value = float(raw)
+    if not 0.0 <= value <= 1.0:
+        return None, None
+    pairs = details.get("audit_case_count")
+    if not isinstance(pairs, int) or isinstance(pairs, bool) or pairs < 0:
+        pairs = None
+    return value, pairs
+
+
 def _safe_categories(details: dict) -> list[PublicCategoryStat] | None:
     """Pull the per-category breakdown, dropping any malformed entries."""
     raw = details.get("per_category")
@@ -1169,29 +1187,31 @@ def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
         dataset_run_size=row.dataset_run_size,
         dataset_seed_block=row.dataset_seed_block,
         dataset_seed_block_hash=row.dataset_seed_block_hash,
-        scores=[
-            PublicValidatorScore(
-                validator_hotkey=s.validator_hotkey,
-                composite=s.composite,
-                tool_mean=s.tool_mean,
-                memory_mean=s.memory_mean,
-                median_ms=s.median_ms,
-                n=s.n,
-                seed=s.seed,
-                run_id=s.run_id,
-                ticket_deadline=_ticket_deadline(s),
-                signature=s.signature,
-                generated_at=s.generated_at,
-                case_results=_safe_case_results(
-                    s.details if isinstance(s.details, dict) else {}
-                ),
-                transcript_sha256=_safe_transcript_sha256(
-                    s.details if isinstance(s.details, dict) else {}
-                ),
-            )
-            for s in row.scores
-        ],
+        scores=[_public_validator_score(s) for s in row.scores],
         generated_at=datetime.now(UTC),
+    )
+
+
+def _public_validator_score(s) -> PublicValidatorScore:
+    """Map one stored score row to its published, redacted form."""
+    details = s.details if isinstance(s.details, dict) else {}
+    robustness, audit_pairs = _safe_transform_robustness(details)
+    return PublicValidatorScore(
+        validator_hotkey=s.validator_hotkey,
+        composite=s.composite,
+        tool_mean=s.tool_mean,
+        memory_mean=s.memory_mean,
+        median_ms=s.median_ms,
+        n=s.n,
+        seed=s.seed,
+        run_id=s.run_id,
+        ticket_deadline=_ticket_deadline(s),
+        signature=s.signature,
+        generated_at=s.generated_at,
+        case_results=_safe_case_results(details),
+        transcript_sha256=_safe_transcript_sha256(details),
+        transform_robustness=robustness,
+        audit_case_count=audit_pairs,
     )
 
 

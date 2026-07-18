@@ -607,6 +607,40 @@ class PublicValidatorScore(BaseModel):
     generated_at: Annotated[
         datetime, Field(description="When the scoring engine produced the score (UTC).")
     ]
+    transform_robustness: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Reproduce-under-transform audit result: the fraction of audit "
+                "pairs this run answered consistently. A share of every run's "
+                "cases is re-asked under a rephrasing (or a shift that moves the "
+                "answer) derived from the block-hash-seeded dataset seed, which "
+                "postdates the submission's commit -- so the miner could not have "
+                "pre-handled it. What a low value measures is SURFACE "
+                "BRITTLENESS (right on the phrasing the harness was built for, "
+                "wrong on one it was not) or MEMORIZATION; it is not evidence "
+                "about a harness that genuinely recomputes the answer, which "
+                "scores the same under the transform. Both the selection and the "
+                "transforms are pure functions of the published seed, so anyone "
+                "can regenerate the audit set and recheck this number. Null for "
+                "a run that carried no audit pairs or predates the audit."
+            ),
+        ),
+    ]
+    audit_case_count: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description=(
+                "How many audit pairs backed ``transform_robustness``, so a value "
+                "backed by many pairs is distinguishable from one backed by two."
+            ),
+        ),
+    ]
     case_results: Annotated[
         list[PublicCaseResult] | None,
         Field(

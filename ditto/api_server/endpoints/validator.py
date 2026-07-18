@@ -101,6 +101,7 @@ from ditto.db.models import (
 )
 from ditto.db.queries.agents import get_agent_by_id
 from ditto.db.queries.audit import (
+    EVENT_AUDIT,
     EVENT_FINALIZED,
     EVENT_SCORE,
     append_audit_entry,
@@ -139,6 +140,59 @@ if TYPE_CHECKING:
     from ditto.chain import ChainClient
 
 logger = logging.getLogger(__name__)
+
+# Reproduce-under-transform audit (v3 Part A). These mirror the validator's
+# constants in ditto-subnet ``ditto/validator/transform_audit.py``, which in turn
+# mirror dittobench-datagen ``persona/transform.go``. They are part of a PUBLIC
+# derivation contract, not tunables: the whole point is that any third party can
+# recompute a verdict from the published seed and get the same answer.
+AUDIT_BPS = 1500
+AUDIT_MIN_ROBUSTNESS = 0.70
+# Below this many audit pairs behind a value, a single split swings the rate too
+# far to act on, so the run is not judged at all.
+AUDIT_MIN_PAIRS = 4
+TRANSFORM_AUDIT_REVIEW_REASON = "transform_audit_brittleness"
+
+
+def _transform_audit_verdict(
+    agent_scores: Sequence[Any],
+) -> tuple[float | None, int, bool]:
+    """Median transform robustness across an agent's finalized scores.
+
+    Returns ``(median, pair_count, failed)``. The validator attaches a
+    per-submission median over its confirmation runs; taking the median AGAIN
+    across the k=3 validators is deliberate, and matches how the platform already
+    finalizes on the median composite: no single validator's number decides an
+    agent's fate.
+
+    ``failed`` is False whenever the evidence is thin -- no score carried the
+    metric (an older scoring engine), or too few audit pairs stood behind it.
+    Absence of evidence is not a failed audit, and the cost of getting that
+    backwards is borne by a legitimate miner.
+    """
+    values: list[float] = []
+    pairs_total = 0
+    for score in agent_scores:
+        details = score.details if isinstance(score.details, dict) else {}
+        raw = details.get("transform_robustness_median")
+        if raw is None:
+            raw = details.get("transform_robustness")
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            continue
+        value = float(raw)
+        if not 0.0 <= value <= 1.0:
+            continue
+        pairs = details.get("audit_case_count")
+        pairs = pairs if isinstance(pairs, int) and not isinstance(pairs, bool) else 0
+        if pairs < AUDIT_MIN_PAIRS:
+            continue
+        values.append(value)
+        pairs_total += pairs
+    if not values:
+        return None, 0, False
+    median = statistics.median(values)
+    return median, pairs_total, median < AUDIT_MIN_ROBUSTNESS
+
 
 router = APIRouter(prefix="/validator", tags=["validator"])
 
@@ -1258,6 +1312,83 @@ async def submit_score(
                     )
                 else:
                     agent.status = AgentStatus.SCORED
+                # Reproduce-under-transform audit (v3 Part A). A share of every
+                # run's cases is re-asked under a transform derived from the
+                # block-hash-seeded dataset seed, which postdates the commit; the
+                # validator reports the median robustness over its confirmation
+                # runs. Below the public floor, the agent goes to review instead
+                # of scored, so it is excluded from emissions until an operator
+                # resolves it -- exactly like the copy-review hold.
+                #
+                # Quarantine-then-review, never an auto-ban: a low value is the
+                # surface-brittleness or memorization signature, and it is NOT
+                # evidence about a harness that genuinely recomputes its answers
+                # (that one scores the same under the transform). It reuses
+                # ATH_PENDING_REVIEW with a distinct review_reason rather than
+                # adding a sibling status, which would force a
+                # ditto-screening-protocol pin bump across every consumer for a
+                # distinction the reason string already carries.
+                audit_robustness, audit_pairs, audit_failed = _transform_audit_verdict(
+                    agent_scores
+                )
+                if audit_failed and agent.status == AgentStatus.SCORED:
+                    agent.status = AgentStatus.ATH_PENDING_REVIEW
+                    agent.review_reason = TRANSFORM_AUDIT_REVIEW_REASON
+                    session.add(
+                        AthReview(
+                            review_id=uuid4(),
+                            agent_id=agent.agent_id,
+                            status="pending",
+                            opened_at=audit_now,
+                            original_reason=TRANSFORM_AUDIT_REVIEW_REASON,
+                            original_policy_version=agent.screening_policy_version,
+                            original_evidence={
+                                "transform_robustness_median": audit_robustness,
+                                "audit_case_count": audit_pairs,
+                                "audit_min_robustness": AUDIT_MIN_ROBUSTNESS,
+                            },
+                            algorithm_provenance={
+                                "snapshot": "score-finalization",
+                                "opened_at_source": "transform_audit",
+                            },
+                        )
+                    )
+                    logger.warning(
+                        "agent %s held for transform-audit review: median "
+                        "robustness %.3f over %d pair(s) is below the %.2f floor",
+                        agent_id,
+                        audit_robustness if audit_robustness is not None else -1.0,
+                        audit_pairs,
+                        AUDIT_MIN_ROBUSTNESS,
+                    )
+                if audit_robustness is not None:
+                    # Recorded whether or not it held, so the public feed shows
+                    # the audit ran and what it found -- not only its failures.
+                    # PUBLIC INPUTS ONLY: never a transformed expected answer or
+                    # any other answer-key material, the same redaction rule the
+                    # score entry follows. Everything here is either already
+                    # published or re-derivable from the published seed, so a
+                    # third party can recompute this verdict independently.
+                    await append_audit_entry(
+                        session,
+                        agent_id=agent_id,
+                        validator_hotkey=None,
+                        event=EVENT_AUDIT,
+                        payload={
+                            "miner_hotkey": agent.miner_hotkey,
+                            "transform_robustness_median": audit_robustness,
+                            "audit_case_count": audit_pairs,
+                            "audit_min_robustness": AUDIT_MIN_ROBUSTNESS,
+                            "audit_bps": AUDIT_BPS,
+                            "failed": audit_failed,
+                            "dataset_seed": agent.dataset_seed,
+                            "dataset_sha256": agent.dataset_sha256,
+                            "dataset_seed_block": agent.dataset_seed_block,
+                            "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+                            "score_count": len(agent_scores),
+                        },
+                        recorded_at=audit_now,
+                    )
                 # Append the finalize audit entry: quorum reached, the median the
                 # platform finalized on, and which validators scored it. The
                 # moderation detail (why held / duplicate_of) is deliberately kept
