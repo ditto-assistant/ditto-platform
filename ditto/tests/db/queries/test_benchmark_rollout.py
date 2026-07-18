@@ -1,0 +1,387 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_server.endpoints.admin_benchmark_rollout import (
+    _require_v3_start_capacity,
+)
+from ditto.db.models import Agent, Base, BenchmarkRollout, Score, ValidatorHeartbeat
+from ditto.db.queries.benchmark_rollout import (
+    DatasetPin,
+    RolloutSnapshotMember,
+    active_bench_version,
+    create_rollout_snapshot,
+    heartbeat_supports_v3,
+    issue_rollout_ticket,
+    maybe_activate_rollout,
+    open_rollout,
+    rollout_state,
+)
+from ditto.db.queries.scores import list_eligible_ledger
+
+pytestmark = pytest.mark.asyncio
+
+
+def _capabilities(now: datetime) -> tuple[dict, dict]:
+    revision = "a" * 40
+    capabilities = {
+        "screened_images": True,
+        "require_screened_image": False,
+        "source_build_fallback": True,
+        "full_stack_managed": False,
+        "stack_updater": False,
+        "sandbox_egress_restricted": True,
+        "executor_isolation": "privileged_dind",
+        "scorer_benchmarks": {
+            "status": "fresh_verified",
+            "supported_bench_versions": [2, 3],
+            "observed_at": int(now.timestamp()),
+            "software_version": "1.3.0",
+            "source_revision": revision,
+        },
+    }
+    components = {
+        name: {
+            "source_revision": revision if name == "dittobench_api" else "b" * 40,
+            "version": "1.3.0" if name == "dittobench_api" else "1.2.0",
+            "provenance": "committed_pin",
+        }
+        for name in (
+            "ditto_subnet",
+            "dittobench_api",
+            "sandbox_docker",
+            "model_relay",
+            "pylon",
+            "ollama",
+        )
+    }
+    stack = {
+        "mode": "source",
+        "compose_schema": 1,
+        "release_descriptor_digest": None,
+        "components": components,
+    }
+    return capabilities, stack
+
+
+async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRollout]:
+    agent_ids = [uuid4() for _ in range(5)]
+    members = []
+    pins = {}
+    for position, agent_id in enumerate(agent_ids, start=1):
+        miner = f"miner-{position}"
+        session.add(
+            Agent(
+                agent_id=agent_id,
+                miner_hotkey=miner,
+                name=f"agent-{position}",
+                sha256=f"{position:x}" * 64,
+                status=AgentStatus.SCORED,
+                screening_policy_version=9,
+                created_at=now + timedelta(seconds=position),
+            )
+        )
+        members.append(
+            RolloutSnapshotMember(
+                agent_id=agent_id,
+                miner_hotkey=miner,
+                composite=1 - position / 100,
+            )
+        )
+        pins[agent_id] = DatasetPin(
+            seed=position,
+            sha256="c" * 64,
+            run_size="full",
+        )
+        for validator in range(3):
+            session.add(
+                Score(
+                    agent_id=agent_id,
+                    bench_version=2,
+                    validator_hotkey=f"legacy-{validator}",
+                    run_id=f"v2-{position}-{validator}",
+                    signature="aa",
+                    seed=position,
+                    composite=0.5 + position / 100,
+                    tool_mean=0.5,
+                    memory_mean=0.5,
+                    median_ms=1,
+                    n=114,
+                    details={"bench_version": 2},
+                    generated_at=now,
+                )
+            )
+    await session.flush()
+    rollout = await create_rollout_snapshot(
+        session, members=members, datasets=pins, now=now
+    )
+    capabilities, stack = _capabilities(now)
+    for hotkey in ("validator-a", "validator-b", "validator-c"):
+        session.add(
+            ValidatorHeartbeat(
+                validator_hotkey=hotkey,
+                software_version="1.0.0",
+                protocol_version=8,
+                code_digest="d" * 64,
+                state="polling",
+                first_seen_at=now,
+                reported_at=now,
+                seen_at=now,
+                signature="ab" * 64,
+                capabilities=capabilities,
+                stack=stack,
+            )
+        )
+    await session.flush()
+    return agent_ids, rollout
+
+
+async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        agent_ids, rollout = await _seed_rollout(session, now)
+        v2_only_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=v2_only_id,
+                miner_hotkey="miner-v2-only",
+                name="v2-only",
+                sha256="e" * 64,
+                status=AgentStatus.SCORED,
+                screening_policy_version=9,
+                created_at=now + timedelta(minutes=1),
+            )
+        )
+        for validator in range(3):
+            session.add(
+                Score(
+                    agent_id=v2_only_id,
+                    bench_version=2,
+                    validator_hotkey=f"legacy-{validator}",
+                    run_id=f"v2-only-{validator}",
+                    signature="dd",
+                    seed=99,
+                    composite=0.4,
+                    tool_mean=0.4,
+                    memory_mean=0.4,
+                    median_ms=1,
+                    n=114,
+                    details={"bench_version": 2},
+                    generated_at=now,
+                )
+            )
+        await session.flush()
+        heartbeat = await session.get(ValidatorHeartbeat, "validator-a")
+        assert heartbeat is not None
+        assert heartbeat_supports_v3(heartbeat, now=now)
+        heartbeat.protocol_version = 7
+        assert not heartbeat_supports_v3(heartbeat, now=now)
+        heartbeat.protocol_version = 8
+
+        for validator_index, hotkey in enumerate(("validator-a", "validator-b")):
+            for agent_index in range(5):
+                ticket = await issue_rollout_ticket(
+                    session,
+                    validator_hotkey=hotkey,
+                    now=now,
+                    ttl=timedelta(minutes=90),
+                )
+                assert ticket is not None
+                assert ticket.agent_id == agent_ids[agent_index]
+                session.add(
+                    Score(
+                        agent_id=ticket.agent_id,
+                        bench_version=3,
+                        validator_hotkey=hotkey,
+                        run_id=f"v3-{validator_index}-{agent_index}",
+                        signature="bb",
+                        seed=agent_index + 1,
+                        composite=0.7 + agent_index / 100,
+                        tool_mean=0.7,
+                        memory_mean=0.7,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": 3},
+                        generated_at=now,
+                    )
+                )
+                ticket.status = TicketStatus.SCORED
+                await session.flush()
+
+        state = await rollout_state(session)
+        assert state["active_version"] == 2
+        assert state["v3_capable_validator_count"] == 3
+        assert [member["score_count"] for member in state["members"]] == [2] * 5
+        assert await active_bench_version(session) == 2
+        assert {row.agent_id for row in await list_eligible_ledger(session)} == {
+            *agent_ids,
+            v2_only_id,
+        }
+
+        activations = []
+        for agent_index in range(5):
+            ticket = await issue_rollout_ticket(
+                session,
+                validator_hotkey="validator-c",
+                now=now,
+                ttl=timedelta(minutes=90),
+            )
+            assert ticket is not None
+            assert ticket.agent_id == agent_ids[agent_index]
+            session.add(
+                Score(
+                    agent_id=ticket.agent_id,
+                    bench_version=3,
+                    validator_hotkey="validator-c",
+                    run_id=f"v3-2-{agent_index}",
+                    signature="cc",
+                    seed=agent_index + 1,
+                    composite=0.8 + agent_index / 100,
+                    tool_mean=0.8,
+                    memory_mean=0.8,
+                    median_ms=1,
+                    n=114,
+                    details={"bench_version": 3},
+                    generated_at=now,
+                )
+            )
+            ticket.status = TicketStatus.SCORED
+            await session.flush()
+            activations.append(await maybe_activate_rollout(session, rollout, now=now))
+
+        assert activations == [False, False, False, False, True]
+        assert await active_bench_version(session) == 3
+        state = await rollout_state(session)
+        assert state["status"] == "activated"
+        assert [member["score_count"] for member in state["members"]] == [3] * 5
+        v3_ledger = await list_eligible_ledger(session)
+        assert len(v3_ledger) == 5
+        assert v2_only_id not in {row.agent_id for row in v3_ledger}
+        assert all(
+            row.details is not None and row.details["bench_version"] == 3
+            for row in v3_ledger
+        )
+    await engine.dispose()
+
+
+async def test_ineligible_frozen_member_blocks_without_reshuffle() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        agent_ids, _ = await _seed_rollout(session, now)
+        agent = await session.get(Agent, agent_ids[2])
+        assert agent is not None
+        agent.status = AgentStatus.BANNED
+        assert (
+            await issue_rollout_ticket(
+                session,
+                validator_hotkey="validator-a",
+                now=now,
+                ttl=timedelta(minutes=90),
+            )
+            is None
+        )
+        state = await rollout_state(session)
+        assert state["status"] == "blocked_ineligible"
+        assert [UUID(member["agent_id"]) for member in state["members"]] == agent_ids
+        agent.status = AgentStatus.SCORED
+        ticket = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert ticket is not None
+        assert [
+            UUID(member["agent_id"])
+            for member in (await rollout_state(session))["members"]
+        ] == agent_ids
+    await engine.dispose()
+
+
+async def test_only_one_open_rollout_across_collecting_and_blocked_states() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add_all(
+            [
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="collecting",
+                    cohort_size=5,
+                ),
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="blocked_ineligible",
+                    cohort_size=5,
+                ),
+            ]
+        )
+        with pytest.raises(IntegrityError):
+            await session.flush()
+        await session.rollback()
+    await engine.dispose()
+
+
+@pytest.mark.parametrize("capable_count", [0, 1, 2])
+async def test_v3_start_requires_two_capable_validators_and_matches_telemetry(
+    capable_count: int,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    capabilities, stack = _capabilities(now)
+    async with maker() as session, session.begin():
+        for index in range(capable_count):
+            session.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=f"validator-{index}",
+                    software_version="1.0.0",
+                    protocol_version=8,
+                    code_digest="d" * 64,
+                    state="polling",
+                    first_seen_at=now,
+                    reported_at=now,
+                    seen_at=now,
+                    signature="ab" * 64,
+                    capabilities=capabilities,
+                    stack=stack,
+                )
+            )
+        await session.flush()
+
+        telemetry = await rollout_state(session, now=now)
+        assert telemetry["v3_capable_validator_count"] == capable_count
+        if capable_count < 2:
+            with pytest.raises(HTTPException) as exc_info:
+                await _require_v3_start_capacity(session, now=now)
+            assert exc_info.value.status_code == 409
+            assert "at least two" in str(exc_info.value.detail)
+            assert await open_rollout(session) is None
+        else:
+            guarded = await _require_v3_start_capacity(session, now=now)
+            assert guarded["v3_capable_validator_count"] == capable_count
+    await engine.dispose()

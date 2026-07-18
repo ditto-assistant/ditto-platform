@@ -137,7 +137,11 @@ async def _seed_scored(
         if recorded_at is not None:
             score = await s.get(
                 Score,
-                (agent.agent_id, "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"),
+                (
+                    agent.agent_id,
+                    2,
+                    "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+                ),
             )
             assert score is not None
             score.created_at = recorded_at
@@ -170,6 +174,7 @@ async def _seed_k3(
         "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp",
     ]
     agent_id = uuid4()
+    bench_version = int(details.get("bench_version", 2)) if details else 2
     async with maker() as s, s.begin():
         agent = Agent(
             agent_id=agent_id,
@@ -202,6 +207,7 @@ async def _seed_k3(
                 generated_at=base_time + timedelta(minutes=i),
                 signature="ab" * 64,
                 details=details,
+                bench_version=bench_version,
             )
     return str(agent_id)
 

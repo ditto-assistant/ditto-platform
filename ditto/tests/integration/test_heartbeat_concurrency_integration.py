@@ -204,6 +204,6 @@ async def test_progress_waiting_behind_score_lock_rechecks_consumed_ticket(
     assert await asyncio.wait_for(progress_task, timeout=2) is False
     async with session_maker() as session:
         heartbeat = await session.get(ValidatorHeartbeat, _HOTKEY)
-        spent_ticket = await session.get(ValidatorTicket, (agent_id, _HOTKEY))
+        spent_ticket = await session.get(ValidatorTicket, (agent_id, 2, _HOTKEY))
     assert heartbeat is None
     assert spent_ticket is not None and spent_ticket.status == TicketStatus.SCORED

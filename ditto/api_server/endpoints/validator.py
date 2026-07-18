@@ -48,6 +48,7 @@ from uuid import UUID, uuid4
 import bittensor
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
@@ -68,6 +69,7 @@ from ditto.api_models.system_health import (
     SystemMetrics,
     system_metrics_signing_token,
 )
+from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
@@ -76,7 +78,7 @@ from ditto.api_models.validator_capabilities import (
     validator_identity_signing_token,
 )
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
-from ditto.api_server.bench import CURRENT_BENCH_VERSION, stamp_bench_version
+from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.config import ValidatorCompatibilityConfig
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -88,12 +90,27 @@ from ditto.api_server.fingerprint import reference_corpus_provenance
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
-from ditto.db.models import Agent, AthReview, Score, ValidatorHeartbeat
+from ditto.db.models import (
+    Agent,
+    AthReview,
+    BenchmarkDataset,
+    Score,
+    ValidatorHeartbeat,
+    ValidatorTicket,
+)
 from ditto.db.queries.agents import get_agent_by_id
 from ditto.db.queries.audit import (
     EVENT_FINALIZED,
     EVENT_SCORE,
     append_audit_entry,
+)
+from ditto.db.queries.benchmark_rollout import (
+    CANARY_BENCH_VERSION,
+    active_bench_version,
+    heartbeat_supports_v3,
+    issue_rollout_ticket,
+    maybe_activate_rollout,
+    open_rollout,
 )
 from ditto.db.queries.heartbeats import (
     HeartbeatProgressRegressionError,
@@ -295,10 +312,13 @@ def _score_signing_message(
     expired attempt cannot be replayed after the ticket is reissued.
     """
     lease = _lease_token(ticket_deadline) if ticket_deadline is not None else ""
-    return (
+    legacy = (
         f"{validator_hotkey}:{agent_id}:{lease}:{report.run_id}:"
         f"{report.composite!r}:{report.seed}"
-    ).encode()
+    )
+    if report.bench_version is not None:
+        legacy += f":{report.bench_version}"
+    return legacy.encode()
 
 
 def _job_signing_message(
@@ -337,6 +357,18 @@ def _heartbeat_signing_message(
     stack: ValidatorStackIdentity | None = None,
 ) -> bytes:
     """Canonical heartbeat payload, mirrored by ``ditto-subnet``."""
+    if protocol_version >= 8:
+        if capabilities is None or stack is None:
+            raise ValueError("heartbeat protocol v8 requires capabilities and stack")
+        active = str(active_agent_id) if active_agent_id is not None else ""
+        return (
+            "ditto-validator-heartbeat:v8:"
+            f"{validator_hotkey}:{software_version}:{protocol_version}:"
+            f"{code_digest}:{state}:{active}:"
+            f"{system_metrics_signing_token(system_metrics)}:"
+            f"{benchmark_progress_signing_token(benchmark_progress)}:"
+            f"{validator_identity_signing_token(capabilities, stack)}:{timestamp}"
+        ).encode()
     if protocol_version >= 7:
         if capabilities is None or stack is None:
             raise ValueError("heartbeat protocol v7 requires capabilities and stack")
@@ -526,7 +558,7 @@ async def heartbeat(
                 ),
                 benchmark_progress=stored_benchmark_progress,
                 capabilities=(
-                    request_body.capabilities.model_dump(mode="json")
+                    request_body.capabilities.model_dump(mode="json", exclude_none=True)
                     if request_body.capabilities is not None
                     else None
                 ),
@@ -625,30 +657,75 @@ async def request_job(
             raise HTTPException(
                 status_code=409, detail="job claim nonce has already been used"
             ) from exc
-        ticket = await issue_ticket(
+        ticket = await issue_rollout_ticket(
             session,
             validator_hotkey=payload.validator_hotkey,
             now=now,
             ttl=_TICKET_TTL,
-            bench_version=CURRENT_BENCH_VERSION,
-            artifact_mode=artifact_mode,
-            validator_running_benchmark=validator_state == "running_benchmark",
         )
+        if ticket is None:
+            # A version transition never strands an already-issued lease. This
+            # also lets a restarted v2-only validator finish its pre-activation
+            # work, without granting it any new v3 assignment.
+            ticket = await session.scalar(
+                select(ValidatorTicket)
+                .where(
+                    ValidatorTicket.validator_hotkey == payload.validator_hotkey,
+                    ValidatorTicket.status == TicketStatus.ISSUED,
+                    ValidatorTicket.deadline > now,
+                )
+                .order_by(ValidatorTicket.issued_at.asc())
+                .limit(1)
+                .with_for_update()
+            )
+        if ticket is None:
+            canonical_version = await active_bench_version(session)
+            if canonical_version >= CANARY_BENCH_VERSION:
+                heartbeat = await session.get(
+                    ValidatorHeartbeat, payload.validator_hotkey
+                )
+                if heartbeat is None or not heartbeat_supports_v3(heartbeat, now=now):
+                    return Response(
+                        status_code=204, headers={"Cache-Control": "no-store"}
+                    )
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey=payload.validator_hotkey,
+                now=now,
+                ttl=_TICKET_TTL,
+                bench_version=canonical_version,
+                artifact_mode=artifact_mode,
+                validator_running_benchmark=validator_state == "running_benchmark",
+            )
         if ticket is None:
             return Response(status_code=204, headers={"Cache-Control": "no-store"})
         agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
         # issue_ticket selected this agent from ``agents``, so it exists.
         assert agent is not None
+        dataset = await session.get(
+            BenchmarkDataset, (agent.agent_id, ticket.bench_version)
+        )
         job = JobResponse(
             agent_id=agent.agent_id,
             miner_hotkey=agent.miner_hotkey,
             sha256=agent.sha256,
             deadline=ticket.deadline,
-            seed=agent.dataset_seed,
-            dataset_sha256=agent.dataset_sha256,
-            run_size=agent.dataset_run_size,
-            dataset_seed_block=agent.dataset_seed_block,
-            dataset_seed_block_hash=agent.dataset_seed_block_hash,
+            seed=dataset.seed if dataset is not None else agent.dataset_seed,
+            dataset_sha256=(
+                dataset.sha256 if dataset is not None else agent.dataset_sha256
+            ),
+            run_size=dataset.run_size
+            if dataset is not None
+            else agent.dataset_run_size,
+            dataset_seed_block=(
+                dataset.seed_block if dataset is not None else agent.dataset_seed_block
+            ),
+            dataset_seed_block_hash=(
+                dataset.seed_block_hash
+                if dataset is not None
+                else agent.dataset_seed_block_hash
+            ),
+            bench_version=ticket.bench_version,
         )
     response.headers["Cache-Control"] = "no-store"
     logger.info(
@@ -740,8 +817,10 @@ async def _validator_artifact_routing(
             detail="validator heartbeat v7 is stale; report a fresh heartbeat",
         )
     try:
-        capabilities = ValidatorCapabilities.model_validate(heartbeat.capabilities)
-        stack = ValidatorStackIdentity.model_validate(heartbeat.stack)
+        capabilities = ValidatorCapabilities.model_validate_json(
+            json.dumps(heartbeat.capabilities)
+        )
+        stack = ValidatorStackIdentity.model_validate_json(json.dumps(heartbeat.stack))
     except ValidationError as error:
         raise HTTPException(
             status_code=428,
@@ -833,6 +912,14 @@ async def agent_artifact(
         agent = await get_agent_by_id(session, agent_id=agent_id)
         if agent is None:
             raise AgentNotFoundError(f"no agent with id={agent_id}")
+        ticket = await session.scalar(
+            select(ValidatorTicket).where(
+                ValidatorTicket.agent_id == agent_id,
+                ValidatorTicket.validator_hotkey == x_validator_hotkey,
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.deadline > now,
+            )
+        )
     url = await storage.presigned_get_url(
         key=_artifact_key(agent_id),
         expires_in=int(_ARTIFACT_URL_TTL.total_seconds()),
@@ -861,6 +948,7 @@ async def agent_artifact(
         screened_image_size_bytes=agent.screened_image_size_bytes,
         screened_image_id=agent.screened_image_id,
         screened_image_ref=agent.screened_image_ref,
+        bench_version=ticket.bench_version if ticket is not None else None,
     )
 
 
@@ -947,6 +1035,7 @@ async def submit_score(
             validator_hotkey=payload.validator_hotkey,
             now=datetime.now(UTC),
             deadline=payload.ticket_deadline,
+            bench_version=(report.bench_version or CURRENT_BENCH_VERSION),
             for_update=True,
         )
         if ticket is None:
@@ -956,6 +1045,17 @@ async def submit_score(
                     "no open scoring ticket for this validator and agent "
                     "(never issued, expired, or already scored)"
                 ),
+            )
+        if ticket.bench_version == CANARY_BENCH_VERSION:
+            if report.bench_version != CANARY_BENCH_VERSION:
+                raise HTTPException(
+                    status_code=409,
+                    detail="benchmark v3 score must explicitly bind bench_version=3",
+                )
+        elif report.bench_version not in (None, ticket.bench_version):
+            raise HTTPException(
+                status_code=409,
+                detail="score benchmark version does not match its ticket lease",
             )
         # Persist the scoring engine's opaque telemetry (models used,
         # bench_version, dataset_sha256, per-category means, token spend, …) plus
@@ -970,7 +1070,7 @@ async def submit_score(
         # Stamp the current benchmark version when the scorer omitted it, so no
         # run scored from now on is ever recorded as "legacy" (null version).
         # An explicit version in the report is left as-is (honest provenance).
-        stamp_bench_version(score_details)
+        score_details["bench_version"] = ticket.bench_version
         # Stash the composite standard error into details so the ledger can
         # surface it (mirroring bench_version; no schema migration). The
         # validator reads it back for the KOTH indifference band.
@@ -994,6 +1094,7 @@ async def submit_score(
             session,
             agent_id=agent_id,
             validator_hotkey=payload.validator_hotkey,
+            bench_version=ticket.bench_version,
             run_id=report.run_id,
             seed=report.seed,
             composite=report.composite,
@@ -1023,6 +1124,7 @@ async def submit_score(
                 "memory_mean": report.memory_mean,
                 "median_ms": report.median_ms,
                 "n": report.n,
+                "bench_version": ticket.bench_version,
                 "ticket_deadline": _lease_token(payload.ticket_deadline),
                 "signature": payload.signature,
                 "generated_at": report.generated_at.isoformat(),
@@ -1046,7 +1148,9 @@ async def submit_score(
         # still ``evaluating`` here, so it is not yet in the eligible ledger (no
         # self-match). A below-quorum score just records the row and waits.
         if agent.status == AgentStatus.EVALUATING:
-            agent_scores = await list_scores_for_agent(session, agent_id=agent_id)
+            agent_scores = await list_scores_for_agent(
+                session, agent_id=agent_id, bench_version=ticket.bench_version
+            )
             if len(agent_scores) >= SCORING_QUORUM:
                 median_composite = statistics.median(s.composite for s in agent_scores)
                 eligible = await list_eligible_ledger(session)
@@ -1146,8 +1250,15 @@ async def submit_score(
                 )
         # Consume the ticket (one ticket, one score); the slot stays occupied.
         await mark_ticket_scored(
-            session, agent_id=agent_id, validator_hotkey=payload.validator_hotkey
+            session,
+            agent_id=agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            bench_version=ticket.bench_version,
         )
+        if ticket.bench_version == CANARY_BENCH_VERSION:
+            rollout = await open_rollout(session, for_update=True)
+            if rollout is not None:
+                await maybe_activate_rollout(session, rollout, now=audit_now)
         result_status = agent.status
 
     logger.info(

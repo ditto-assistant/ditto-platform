@@ -28,10 +28,10 @@ from ditto.api_models.admin_validation_retry import (
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
-from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
 from ditto.db.models import Agent, Score, ValidatorRetryRecovery, ValidatorTicket
+from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION
 
@@ -133,6 +133,7 @@ def _recovery_gate(
     tickets: list[ValidatorTicket],
     recovery_count: int,
     now: datetime,
+    bench_version: int,
 ) -> tuple[bool, bool, str | None, list[ValidatorTicket]]:
     score_count = len(scores)
     if agent.status != AgentStatus.EVALUATING:
@@ -152,7 +153,7 @@ def _recovery_gate(
         for ticket in tickets
         if ticket.status != TicketStatus.SCORED
         and ticket.validator_hotkey not in score_hotkeys
-        and ticket.bench_version == CURRENT_BENCH_VERSION
+        and ticket.bench_version == bench_version
     ]
     naturally_retryable = [
         ticket
@@ -192,6 +193,7 @@ async def _load(
     session: AsyncSession, *, agent_id: UUID, for_update: bool
 ) -> tuple[
     Agent | None,
+    int,
     list[Score],
     list[ValidatorTicket],
     list[ValidatorRetryRecovery],
@@ -201,8 +203,8 @@ async def _load(
         agent_query = agent_query.with_for_update()
     agent = await session.scalar(agent_query)
     if agent is None:
-        return None, [], [], []
-    scores = list(
+        return None, 2, [], [], []
+    all_scores = list(
         (
             await session.scalars(
                 select(Score)
@@ -220,14 +222,36 @@ async def _load(
     )
     if for_update:
         ticket_query = ticket_query.with_for_update()
-    tickets = list((await session.scalars(ticket_query)).all())
+    all_tickets = list((await session.scalars(ticket_query)).all())
+    canonical_version = await active_bench_version(session)
+    work_tickets = [
+        ticket
+        for ticket in all_tickets
+        if ticket.status in (TicketStatus.ISSUED, TicketStatus.EXPIRED)
+    ]
+    if work_tickets:
+        bench_version = max(
+            work_tickets,
+            key=lambda ticket: (_aware(ticket.issued_at), ticket.bench_version),
+        ).bench_version
+    elif all_scores:
+        bench_version = max(
+            all_scores,
+            key=lambda score: (_aware(score.generated_at), score.bench_version),
+        ).bench_version
+    else:
+        bench_version = canonical_version
+    scores = [score for score in all_scores if score.bench_version == bench_version]
+    tickets = [
+        ticket for ticket in all_tickets if ticket.bench_version == bench_version
+    ]
     recoveries = list(
         (
             await session.scalars(
                 select(ValidatorRetryRecovery)
                 .where(
                     ValidatorRetryRecovery.agent_id == agent_id,
-                    ValidatorRetryRecovery.bench_version == CURRENT_BENCH_VERSION,
+                    ValidatorRetryRecovery.bench_version == bench_version,
                 )
                 .order_by(
                     ValidatorRetryRecovery.created_at.asc(),
@@ -236,14 +260,14 @@ async def _load(
             )
         ).all()
     )
-    return agent, scores, tickets, recoveries
+    return agent, bench_version, scores, tickets, recoveries
 
 
 @router.get("/validation-retries/{agent_id}", response_model=AdminValidationRetryDetail)
 async def get_validation_retry(
     agent_id: UUID, _admin: AdminDep, session: SessionDep
 ) -> AdminValidationRetryDetail:
-    agent, scores, tickets, recoveries = await _load(
+    agent, bench_version, scores, tickets, recoveries = await _load(
         session, agent_id=agent_id, for_update=False
     )
     if agent is None:
@@ -255,6 +279,7 @@ async def get_validation_retry(
         tickets=tickets,
         recovery_count=len(recoveries),
         now=datetime.now(UTC),
+        bench_version=bench_version,
     )
     return AdminValidationRetryDetail(
         agent_id=agent.agent_id,
@@ -288,7 +313,7 @@ async def retry_validation_after_infrastructure_failure(
     if not 1 <= len(actor) <= 120:
         raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
     async with session.begin():
-        agent, scores, tickets, recoveries = await _load(
+        agent, bench_version, scores, tickets, recoveries = await _load(
             session, agent_id=agent_id, for_update=True
         )
         if agent is None:
@@ -317,6 +342,7 @@ async def retry_validation_after_infrastructure_failure(
             tickets=tickets,
             recovery_count=len(recoveries),
             now=datetime.now(UTC),
+            bench_version=bench_version,
         )
         if not allowed:
             raise HTTPException(status_code=409, detail=reason or "retry unavailable")
@@ -333,7 +359,7 @@ async def retry_validation_after_infrastructure_failure(
             reason=payload.reason,
             expected_snapshot=current_snapshot,
             score_count=score_count,
-            bench_version=CURRENT_BENCH_VERSION,
+            bench_version=bench_version,
             ticket_snapshot=ticket_snapshot,
             granted_validator_hotkeys=[ticket.validator_hotkey for ticket in selected],
             created_at=now,

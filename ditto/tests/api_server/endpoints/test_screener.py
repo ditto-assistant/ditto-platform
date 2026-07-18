@@ -64,6 +64,8 @@ from ditto.chain.models import BlockInfo, NeuronInfo
 from ditto.db.models import (
     Agent,
     Base,
+    BenchmarkDataset,
+    BenchmarkRollout,
     Score,
     ScreenedImageUpload,
     ScreenerHeartbeat,
@@ -323,9 +325,11 @@ class _FakeGenerator:
         self._sha = sha
         self._fail = fail
         self.calls = 0
+        self.bench_versions: list[int] = []
 
-    async def generate(self, _seed: int) -> str:
+    async def generate(self, _seed: int, bench_version: int = 2) -> str:
         self.calls += 1
+        self.bench_versions.append(bench_version)
         if self._fail:
             raise DataPipelineError("generate service unavailable (test)")
         return self._sha
@@ -1681,7 +1685,7 @@ class TestQuarantineAdmin:
         assert replay.status_code == 409
 
         async with session_maker() as session:
-            ticket = await session.get(ValidatorTicket, (agent_id, validator_hotkey))
+            ticket = await session.get(ValidatorTicket, (agent_id, 2, validator_hotkey))
             scores = (
                 await session.scalars(select(Score).where(Score.agent_id == agent_id))
             ).all()
@@ -3059,6 +3063,48 @@ class TestSubmitResult:
             assert agent.dataset_seed_block == _BLOCK.number
             assert agent.dataset_seed_block_hash == _BLOCK.hash
             assert agent.dataset_seed == derive_seed(_BLOCK.hash, agent_id)
+
+    async def test_pass_after_activation_generates_and_persists_v3_dataset(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=datetime.now(UTC),
+                    activated_at=datetime.now(UTC),
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        generator = _FakeGenerator(run_size="full", sha="cd" * 32)
+        _install_generator(app, generator)
+        claim = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, passed=True, attempt_id=attempt_id),
+        )
+
+        assert response.status_code == 200, response.text
+        assert generator.bench_versions == [3]
+        async with session_maker() as session:
+            dataset = await session.get(BenchmarkDataset, (agent_id, 3))
+            assert dataset is not None
+            assert dataset.sha256 == "cd" * 32
+            assert dataset.run_size == "full"
 
     async def test_seed_falls_back_when_chain_unavailable(
         self,
