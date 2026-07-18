@@ -179,7 +179,9 @@ TRANSFORM_AUDIT_REVIEW_REASON = "transform_audit_brittleness"
 # recorded, and the value is published, which is what will produce the
 # real-world distribution a future threshold can be set from. It does not touch
 # an agent's status. Turn this on only with a calibration that shows separation
-# on the population it will judge. See docs/v3-complete-plan.md.
+# on the population it will judge. The measurement and the reproduction
+# steps live in dittobench-api docs/BASELINES.md and
+# scripts/audit-calibration.
 TRANSFORM_AUDIT_ENFORCE = os.environ.get(
     "DITTO_TRANSFORM_AUDIT_ENFORCE", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
