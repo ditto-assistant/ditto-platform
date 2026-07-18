@@ -635,6 +635,10 @@ class TestDashboard:
         assert 'data-entity-kind="' in body
         assert 'history.pushState({ entity: true }, "", href)' in body
         assert 'window.addEventListener("popstate"' in body
+        assert "if (entity.full) showAgentRouteState(" in body
+        assert '"Loading submission details…", "loading"' in body
+        assert '"This submission could not be found.", "error"' in body
+        assert '"Submission details are temporarily unavailable.' in body
         assert 'getJSON("/public/activity?page=1&limit=1&q="' in body
         assert 'target.setAttribute("aria-current", "true")' in body
 

@@ -4210,6 +4210,24 @@
       '</div>';
     }
 
+    function showAgentRouteState(entity, message, stateClass) {
+      configureEntityActions("agent", entity.id);
+      consensusToken = null;
+      document.getElementById("d-stats").classList.add("pipeline-mode");
+      document.querySelector("#modal .split").style.display = "none";
+      document.getElementById("d-title").textContent = "Agent submission";
+      var chip = document.getElementById("d-bench");
+      chip.className = stateClass || "";
+      chip.textContent = stateClass === "error" ? "Unavailable" : "Loading";
+      chip.title = stateClass === "error" ? "Submission unavailable" : "Loading submission";
+      document.getElementById("d-hotkey").textContent = "";
+      document.getElementById("d-hotkey-copy").setAttribute("data-key", "");
+      document.getElementById("d-stats").innerHTML =
+        '<div class="pipeline-detail"><p class="pipeline-detail-state ' + esc(stateClass || "loading") +
+        '" role="status">' + esc(message) + "</p></div>";
+      showModal();
+    }
+
     function openActivityEntry(e, preserveUrl) {
       if (!e) return;
       if (!preserveUrl) pushEntityRoute("agent", e.agent_id);
@@ -4874,11 +4892,21 @@
         if (activeEntityKey === entity.key && document.getElementById("modal").classList.contains("open")) return;
         if (resolvingEntityKey === entity.key) return;
         resolvingEntityKey = entity.key;
+        if (entity.full) showAgentRouteState(entity, "Loading submission details…", "loading");
         getJSON("/public/activity?page=1&limit=1&q=" + encodeURIComponent(entity.id))
           .then(function (data) {
             if (!readEntityRoute() || readEntityRoute().key !== entity.key) return;
             var entry = (data.entries || []).find(function (item) { return String(item.agent_id) === entity.id; });
-            if (entry) openActivityEntry(entry, true);
+            if (entry) {
+              openActivityEntry(entry, true);
+            } else if (entity.full) {
+              showAgentRouteState(entity, "This submission could not be found.", "error");
+            }
+          })
+          .catch(function () {
+            if (entity.full && readEntityRoute() && readEntityRoute().key === entity.key) {
+              showAgentRouteState(entity, "Submission details are temporarily unavailable. Try refreshing in a moment.", "error");
+            }
           })
           .finally(function () { if (resolvingEntityKey === entity.key) resolvingEntityKey = ""; });
         return;
