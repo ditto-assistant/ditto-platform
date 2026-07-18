@@ -210,6 +210,27 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   heartbeat-capable software; this endpoint does not pretend to enumerate every
   on-chain permit holder.
 
+  Heartbeat protocol v7 signs a closed `capabilities` object and a fixed
+  six-component `stack` identity (`ditto_subnet`, `dittobench_api`,
+  `sandbox_docker`, `model_relay`, `pylon`, and `ollama`). One length-prefixed,
+  canonical JSON token removes field-order and delimiter ambiguity. Protocols
+  v1-v6 retain their existing signing bytes. The v7 schema and canonical bytes
+  are frozen; any new signed capability requires a later protocol version and
+  is never inferred for an older reporter.
+
+  Assignment remains mixed-fleet compatible. Pre-v7 reporters retain legacy
+  source eligibility. Validators advertising screened-image support plus source
+  fallback prefer complete verified image tuples and may receive source-only
+  submissions. Image-only validators receive only complete verified tuples. An
+  incompatible unstarted lease is released when a validator becomes image-only;
+  a fresh `running_benchmark` report preserves active work. Malformed,
+  contradictory, or stale v7 identity fails closed instead of downgrading.
+
+  The public response exposes only the typed allowlist. Component versions,
+  digests, and provenance are self-reported compatibility telemetry: the
+  validator signature proves who reported them, not independent host or image
+  attestation. Signatures and arbitrary host/container fields remain private.
+
   Heartbeat protocol v4 optionally signs a ticket-bound benchmark stage and
   aggregate `completed`/`total` check counts. The platform revalidates the live
   ticket, evaluating agent, freshness, stage allowlist, bounds, and monotonic

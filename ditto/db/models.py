@@ -872,6 +872,8 @@ class ValidatorHeartbeat(Base):
     benchmark_progress_agent_id: Mapped[UUID | None] = mapped_column(
         SaUUID(as_uuid=True), nullable=True
     )
+    capabilities: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    stack: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )

@@ -18,6 +18,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.screener import ScreenerProgressStage, ScreenerRuntimeState
 from ditto.api_models.validator import ValidatorRuntimeState
+from ditto.api_models.validator_capabilities import (
+    ValidatorCapabilities,
+    ValidatorStackIdentity,
+)
 
 _SS58_PATTERN = r"^[1-9A-HJ-NP-Za-km-z]{47,48}$"
 _SIGNATURE_HEX_PATTERN = r"^[0-9a-fA-F]{128}$"
@@ -1346,6 +1350,8 @@ class PublicValidatorHeartbeat(BaseModel):
     availability: FleetAvailability
     health: FleetHealth
     system_metrics: PublicSystemMetrics | None = None
+    capabilities: ValidatorCapabilities | None = None
+    stack: ValidatorStackIdentity | None = None
 
 
 class PublicValidatorHeartbeatsResponse(BaseModel):
