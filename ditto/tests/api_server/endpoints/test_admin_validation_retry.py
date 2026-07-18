@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import (
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.dependencies import get_session
 from ditto.db.models import Agent, Base, Score, ValidatorRetryRecovery, ValidatorTicket
 from ditto.db.queries.tickets import issue_ticket
@@ -310,7 +311,7 @@ async def test_manual_grant_allows_exactly_one_more_same_version_issue(
             validator_hotkey="validator-0",
             now=datetime.now(UTC) + timedelta(seconds=1),
             ttl=timedelta(minutes=90),
-            bench_version=2,
+            bench_version=CURRENT_BENCH_VERSION,
         )
     assert ticket is not None and ticket.agent_id == agent_id
     assert ticket.attempt_count == 3
