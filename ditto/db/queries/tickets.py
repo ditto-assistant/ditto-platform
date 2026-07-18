@@ -25,7 +25,7 @@ from sqlalchemy.orm import aliased
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
-from ditto.db.models import Agent, Score, ValidatorTicket
+from ditto.db.models import Agent, BenchmarkDataset, Score, ValidatorTicket
 from ditto.db.queries.scores import SCORING_QUORUM, list_eligible_ledger
 
 if TYPE_CHECKING:
@@ -114,7 +114,7 @@ async def issue_ticket(
     validator_hotkey: str,
     now: datetime,
     ttl: timedelta,
-    bench_version: int = 2,
+    bench_version: int | None = 2,
     artifact_mode: Literal["legacy", "prefer_screened", "screened_only"] = "legacy",
     validator_running_benchmark: bool = False,
 ) -> ValidatorTicket | None:
@@ -232,6 +232,7 @@ async def issue_ticket(
         select(func.count())
         .where(
             ValidatorTicket.agent_id == Agent.agent_id,
+            ValidatorTicket.bench_version == bench_version,
             ValidatorTicket.status == TicketStatus.SCORED,
         )
         .correlate(Agent)
@@ -241,6 +242,7 @@ async def issue_ticket(
         select(func.count())
         .where(
             ValidatorTicket.agent_id == Agent.agent_id,
+            ValidatorTicket.bench_version == bench_version,
             ValidatorTicket.status == TicketStatus.ISSUED,
             ValidatorTicket.deadline > now,
         )
@@ -251,7 +253,10 @@ async def issue_ticket(
     provisional_composite = func.coalesce(
         (
             select(func.avg(Score.composite))
-            .where(Score.agent_id == Agent.agent_id)
+            .where(
+                Score.agent_id == Agent.agent_id,
+                Score.bench_version == bench_version,
+            )
             .correlate(Agent)
             .scalar_subquery()
         ),
@@ -259,14 +264,20 @@ async def issue_ticket(
     )
     recorded_score_count = (
         select(func.count(Score.validator_hotkey))
-        .where(Score.agent_id == Agent.agent_id)
+        .where(
+            Score.agent_id == Agent.agent_id,
+            Score.bench_version == bench_version,
+        )
         .correlate(Agent)
         .scalar_subquery()
     )
     highest_recorded_score = func.coalesce(
         (
             select(func.max(Score.composite))
-            .where(Score.agent_id == Agent.agent_id)
+            .where(
+                Score.agent_id == Agent.agent_id,
+                Score.bench_version == bench_version,
+            )
             .correlate(Agent)
             .scalar_subquery()
         ),
@@ -284,6 +295,7 @@ async def issue_ticket(
         select(func.count())
         .where(
             ValidatorTicket.agent_id == contender.agent_id,
+            ValidatorTicket.bench_version == bench_version,
             ValidatorTicket.status == TicketStatus.SCORED,
         )
         .correlate(contender)
@@ -291,13 +303,19 @@ async def issue_ticket(
     )
     contender_recorded_score_count = (
         select(func.count(Score.validator_hotkey))
-        .where(Score.agent_id == contender.agent_id)
+        .where(
+            Score.agent_id == contender.agent_id,
+            Score.bench_version == bench_version,
+        )
         .correlate(contender)
         .scalar_subquery()
     )
     contender_provisional_composite = (
         select(func.avg(Score.composite))
-        .where(Score.agent_id == contender.agent_id)
+        .where(
+            Score.agent_id == contender.agent_id,
+            Score.bench_version == bench_version,
+        )
         .correlate(contender)
         .scalar_subquery()
     )
@@ -350,6 +368,16 @@ async def issue_ticket(
             Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
             Agent.agent_id.not_in(already_mine),
         )
+        if bench_version != 2:
+            versioned_dataset = (
+                select(BenchmarkDataset.agent_id)
+                .where(
+                    BenchmarkDataset.agent_id == Agent.agent_id,
+                    BenchmarkDataset.bench_version == bench_version,
+                )
+                .exists()
+            )
+            candidate = candidate.where(versioned_dataset)
         if artifact_mode == "screened_only":
             candidate = candidate.where(complete_screened_image)
         if score_continuation_floor is not None:
@@ -398,6 +426,7 @@ async def issue_ticket(
         occupied = await session.scalar(
             select(func.count()).where(
                 ValidatorTicket.agent_id == agent_id,
+                ValidatorTicket.bench_version == bench_version,
                 ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES),
             )
         )
@@ -405,7 +434,9 @@ async def issue_ticket(
             break
         skipped.append(agent_id)
 
-    ticket = await session.get(ValidatorTicket, (agent_id, validator_hotkey))
+    ticket = await session.get(
+        ValidatorTicket, (agent_id, bench_version, validator_hotkey)
+    )
     if ticket is None:
         ticket = ValidatorTicket(
             agent_id=agent_id,
@@ -422,13 +453,10 @@ async def issue_ticket(
     else:
         # The composite PK preserves one validator slot per agent. Reuse the
         # expired row with a fresh lease rather than inserting a duplicate.
-        same_version = ticket.bench_version == bench_version
         ticket.status = TicketStatus.ISSUED
         ticket.issued_at = now
         ticket.deadline = now + ttl
-        ticket.bench_version = bench_version
-        ticket.attempt_count = ticket.attempt_count + 1 if same_version else 1
-        ticket.manual_retry_grants = ticket.manual_retry_grants if same_version else 0
+        ticket.attempt_count += 1
         ticket.retry_after = None
     await session.flush()
     return ticket
@@ -441,6 +469,7 @@ async def get_open_ticket(
     validator_hotkey: str,
     now: datetime,
     deadline: datetime,
+    bench_version: int = 2,
     for_update: bool = False,
 ) -> ValidatorTicket | None:
     """Return the validator's live (``issued``, not-yet-past-deadline) ticket for
@@ -449,6 +478,8 @@ async def get_open_ticket(
         ValidatorTicket.agent_id == agent_id,
         ValidatorTicket.validator_hotkey == validator_hotkey,
     )
+    if bench_version is not None:
+        statement = statement.where(ValidatorTicket.bench_version == bench_version)
     if for_update:
         statement = statement.with_for_update()
     ticket = await session.scalar(statement)
@@ -467,9 +498,12 @@ async def mark_ticket_scored(
     *,
     agent_id: UUID,
     validator_hotkey: str,
+    bench_version: int = 2,
 ) -> None:
     """Mark the validator's ticket for the agent ``scored`` (slot spent). No-op
     if there is no ticket row (e.g. a legacy score predating ticketing)."""
-    ticket = await session.get(ValidatorTicket, (agent_id, validator_hotkey))
+    ticket = await session.get(
+        ValidatorTicket, (agent_id, bench_version, validator_hotkey)
+    )
     if ticket is not None:
         ticket.status = TicketStatus.SCORED

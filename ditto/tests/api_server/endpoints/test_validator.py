@@ -40,6 +40,7 @@ from ditto.api_models.system_health import (
 )
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator_capabilities import (
+    ScorerBenchmarkCapability,
     ValidatorCapabilities,
     ValidatorStackIdentity,
     validator_identity_signing_token,
@@ -62,6 +63,8 @@ from ditto.db.models import (
     Agent,
     AthReview,
     Base,
+    BenchmarkDataset,
+    BenchmarkRollout,
     Score,
     ScreenerHeartbeat,
     ValidatorHeartbeat,
@@ -172,6 +175,48 @@ def test_v7_heartbeat_matches_shared_cross_repo_vector() -> None:
     assert actual.hex() == fixture["expected_message_hex"]
 
 
+def test_optional_scorer_capability_preserves_legacy_v7_token() -> None:
+    fixture = json.loads(
+        (
+            Path(__file__).parents[2] / "contract" / "validator_heartbeat_v7.json"
+        ).read_text()
+    )
+    request = fixture["request"]
+    capabilities = ValidatorCapabilities.model_validate(request["capabilities"])
+    stack = ValidatorStackIdentity.model_validate(request["stack"])
+
+    assert capabilities.scorer_benchmarks is None
+    assert (
+        validator_identity_signing_token(capabilities, stack)
+        in (fixture["expected_message_utf8"])
+    )
+
+
+def test_scorer_benchmark_capability_is_conservative_unless_fresh_verified() -> None:
+    legacy = ScorerBenchmarkCapability(
+        status="legacy_v2", supported_bench_versions=(2,)
+    )
+    assert legacy.supported_bench_versions == (2,)
+
+    with pytest.raises(ValueError, match="may advertise only benchmark v2"):
+        ScorerBenchmarkCapability(
+            status="identity_mismatch", supported_bench_versions=(2, 3)
+        )
+    with pytest.raises(ValueError, match="requires observation and identity"):
+        ScorerBenchmarkCapability(
+            status="fresh_verified", supported_bench_versions=(2, 3)
+        )
+
+    verified = ScorerBenchmarkCapability(
+        status="fresh_verified",
+        supported_bench_versions=(2, 3),
+        observed_at=1784020800,
+        software_version="1.3.0",
+        source_revision="a" * 40,
+    )
+    assert verified.supported_bench_versions == (2, 3)
+
+
 def _sign(message: str) -> str:
     return _KEYPAIR.sign(message.encode()).hex()
 
@@ -202,6 +247,8 @@ def _score_payload(
     signed = (
         f"{hotkey}:{agent_id}:{lease}:{run_id}:{report['composite']!r}:{report['seed']}"
     )
+    if report.get("bench_version") is not None:
+        signed += f":{report['bench_version']}"
     return {
         "validator_hotkey": hotkey,
         "ticket_deadline": ticket_deadline.isoformat(),
@@ -275,10 +322,13 @@ def _heartbeat_payload(
             if benchmark_progress is not None
             else None
         )
-        typed_capabilities = ValidatorCapabilities.model_validate(capabilities)
-        typed_stack = ValidatorStackIdentity.model_validate(stack)
+        typed_capabilities = ValidatorCapabilities.model_validate_json(
+            json.dumps(capabilities)
+        )
+        typed_stack = ValidatorStackIdentity.model_validate_json(json.dumps(stack))
+        domain = "v8" if protocol_version >= 8 else "v7"
         message = (
-            f"ditto-validator-heartbeat:v7:{hotkey}:0.1.0:{protocol_version}:"
+            f"ditto-validator-heartbeat:{domain}:{hotkey}:0.1.0:{protocol_version}:"
             f"{code_digest}:{state}:{active_agent_id or ''}:"
             f"{system_metrics_signing_token(metrics)}:"
             f"{benchmark_progress_signing_token(progress)}:"
@@ -504,7 +554,7 @@ async def _seed_ticket(
     score against that agent is accepted by the k=3 gate. Upserts so a test can
     simulate the platform re-issuing a ticket to the same validator."""
     async with maker() as s, s.begin():
-        existing = await s.get(ValidatorTicket, (agent_id, keypair.ss58_address))
+        existing = await s.get(ValidatorTicket, (agent_id, 2, keypair.ss58_address))
         if existing is None:
             s.add(
                 ValidatorTicket(
@@ -627,6 +677,53 @@ def _screener_heartbeat_payload(
 
 
 class TestHeartbeat:
+    async def test_v8_requires_signed_scorer_capability_and_v7_rejects_it(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        scorer = {
+            "status": "fresh_verified",
+            "supported_bench_versions": [2, 3],
+            "observed_at": int(datetime.now(UTC).timestamp()),
+            "software_version": "1.2.2",
+            "source_revision": "2" * 40,
+        }
+        capabilities = {**_V7_CAPABILITIES, "scorer_benchmarks": scorer}
+
+        rejected_v7 = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=7,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+            ),
+        )
+        assert rejected_v7.status_code == 422
+
+        accepted_v8 = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=8,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+            ),
+        )
+        assert accepted_v8.status_code == 200, accepted_v8.text
+        async with session_maker() as session:
+            row = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert row is not None
+            assert row.protocol_version == 8
+            assert row.capabilities is not None
+            assert row.capabilities["scorer_benchmarks"][
+                "supported_bench_versions"
+            ] == [2, 3]
+
     async def test_v7_persists_and_publishes_typed_capabilities(
         self,
         app: FastAPI,
@@ -1096,7 +1193,9 @@ class TestHeartbeat:
             session_maker, status=AgentStatus.EVALUATING, name="new-agent"
         )
         async with session_maker() as session, session.begin():
-            previous = await session.get(ValidatorTicket, (agent_id, _VALIDATOR_HOTKEY))
+            previous = await session.get(
+                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+            )
             assert previous is not None
             previous.status = TicketStatus.SCORED
         await _seed_ticket(session_maker, other_agent_id)
@@ -1242,7 +1341,9 @@ class TestHeartbeat:
             assert heartbeat is not None
             assert heartbeat.active_agent_id is None
             assert heartbeat.benchmark_progress_reported is False
-            ticket = await session.get(ValidatorTicket, (agent_id, _VALIDATOR_HOTKEY))
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.status == TicketStatus.ISSUED
             assert ticket.deadline.replace(tzinfo=UTC) == _TICKET_DEADLINE
@@ -1287,7 +1388,9 @@ class TestHeartbeat:
         assert validator["active_benchmark"] is None
 
         async with session_maker() as session:
-            ticket = await session.get(ValidatorTicket, (agent_id, _VALIDATOR_HOTKEY))
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+            )
             heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
             assert ticket is not None
             assert ticket.status == TicketStatus.ISSUED
@@ -1674,6 +1777,46 @@ class TestArtifact:
 
 class TestRequestJob:
     @staticmethod
+    def _v8_capabilities() -> dict[str, object]:
+        return {
+            **_V7_CAPABILITIES,
+            "scorer_benchmarks": {
+                "status": "fresh_verified",
+                "supported_bench_versions": [2, 3],
+                "observed_at": int(datetime.now(UTC).timestamp()),
+                "software_version": "1.2.2",
+                "source_revision": "2" * 40,
+            },
+        }
+
+    @staticmethod
+    async def _activate_v3(
+        session_maker: async_sessionmaker[AsyncSession], agent_id: UUID
+    ) -> None:
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now,
+                    activated_at=now,
+                )
+            )
+            session.add(
+                BenchmarkDataset(
+                    agent_id=agent_id,
+                    bench_version=3,
+                    seed=8675309,
+                    sha256="cd" * 32,
+                    run_size="full",
+                )
+            )
+
+    @staticmethod
     def _enable_compatibility_gate(app: FastAPI) -> None:
         app.state.config = replace(
             app.state.config,
@@ -1754,6 +1897,96 @@ class TestRequestJob:
 
         assert response.status_code == 200
         assert response.json()["agent_id"] == str(agent_id)
+
+    async def test_after_activation_v2_only_gets_no_new_v3_but_resumes_v2(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        v3_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await self._activate_v3(session_maker, v3_agent)
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=7,
+            capabilities=_V7_CAPABILITIES,
+            stack=_V7_STACK,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        no_new_work = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+        assert no_new_work.status_code == 204
+
+        legacy_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, legacy_agent)
+        resumed = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["agent_id"] == str(legacy_agent)
+        assert resumed.json()["bench_version"] == 2
+
+    async def test_after_activation_new_submission_finalizes_on_three_v3_scores(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await self._activate_v3(session_maker, agent_id)
+        capabilities = self._v8_capabilities()
+        for keypair in _KEYPAIRS:
+            await _seed_validator_heartbeat(
+                session_maker,
+                keypair=keypair,
+                protocol_version=8,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+            )
+        _install_db(app, session_maker)
+        _install_chain(app, extra_keypairs=tuple(_KEYPAIRS[1:]))
+
+        for index, keypair in enumerate(_KEYPAIRS, start=1):
+            job = await client.post(
+                "/api/v1/validator/job",
+                headers={"X-Validator-Hotkey": keypair.ss58_address},
+                json=_job_payload(keypair),
+            )
+            assert job.status_code == 200, job.text
+            assert job.json()["bench_version"] == 3
+            deadline = datetime.fromisoformat(job.json()["deadline"])
+            score = await client.post(
+                f"/api/v1/validator/agent/{agent_id}/score",
+                json=_score_payload(
+                    agent_id,
+                    run_id=f"v3-{index}",
+                    keypair=keypair,
+                    ticket_deadline=deadline,
+                    bench_version=3,
+                    n=114,
+                    details={"bench_version": 3},
+                ),
+            )
+            assert score.status_code == 200, score.text
+            expected = AgentStatus.SCORED if index == 3 else AgentStatus.EVALUATING
+            assert score.json()["status"] == expected
+
+        async with session_maker() as session:
+            scores = (
+                (
+                    await session.execute(
+                        select(Score).where(
+                            Score.agent_id == agent_id, Score.bench_version == 3
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(scores) == 3
 
     async def test_v7_screened_only_does_not_claim_source_only_work(
         self,
@@ -1948,7 +2181,7 @@ class TestSubmitScore:
         )
         assert response.status_code == 409
         async with session_maker() as session:
-            assert await session.get(Score, (agent_id, _VALIDATOR_HOTKEY)) is None
+            assert await session.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY)) is None
 
     async def test_records_score_and_finalizes(
         self,
@@ -1982,7 +2215,7 @@ class TestSubmitScore:
 
         # A scores row landed and the agent transitioned.
         async with session_maker() as s:
-            score = await s.get(Score, (agent_id, _VALIDATOR_HOTKEY))
+            score = await s.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
             assert score is not None
             assert score.composite == pytest.approx(0.82)
             agent = await s.get(Agent, agent_id)
@@ -2055,7 +2288,7 @@ class TestSubmitScore:
         assert response.status_code == 200
 
         async with session_maker() as s:
-            score = await s.get(Score, (agent_id, _VALIDATOR_HOTKEY))
+            score = await s.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
             assert score is not None
             assert score.details is not None
             assert score.details["bench_version"] == CURRENT_BENCH_VERSION
@@ -2063,14 +2296,13 @@ class TestSubmitScore:
                 _TICKET_DEADLINE.isoformat(timespec="microseconds")
             )
 
-    async def test_preserves_explicit_bench_version(
+    async def test_overwrites_advisory_detail_with_ticket_bench_version(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        # An explicit (older) version in the report is honest provenance and must
-        # not be bumped — only a missing version gets defaulted.
+        # The locked ticket, not unsigned scorer details, owns benchmark identity.
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         _install_db(app, session_maker)
         _install_chain(app)
@@ -2083,10 +2315,10 @@ class TestSubmitScore:
         assert response.status_code == 200
 
         async with session_maker() as s:
-            score = await s.get(Score, (agent_id, _VALIDATOR_HOTKEY))
+            score = await s.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
             assert score is not None
             assert score.details is not None
-            assert score.details["bench_version"] == 1
+            assert score.details["bench_version"] == 2
 
     async def test_one_ticket_one_score_no_rescore(
         self,
@@ -2622,7 +2854,9 @@ class TestMultiValidatorConsensus:
 
         # One validator's ticket lapses past its deadline, re-opening its slot.
         async with session_maker() as s, s.begin():
-            lapsed = await s.get(ValidatorTicket, (agent_id, _KEYPAIRS[0].ss58_address))
+            lapsed = await s.get(
+                ValidatorTicket, (agent_id, 2, _KEYPAIRS[0].ss58_address)
+            )
             assert lapsed is not None
             lapsed.deadline = datetime.now(UTC) - timedelta(minutes=1)
 
@@ -2651,7 +2885,7 @@ class TestMultiValidatorConsensus:
         assert claimed.status_code == 200, claimed.text
 
         async with session_maker() as s, s.begin():
-            lapsed = await s.get(ValidatorTicket, (agent_id, keypair.ss58_address))
+            lapsed = await s.get(ValidatorTicket, (agent_id, 2, keypair.ss58_address))
             assert lapsed is not None
             lapsed.deadline = datetime.now(UTC) - timedelta(minutes=1)
 
@@ -2661,7 +2895,7 @@ class TestMultiValidatorConsensus:
         assert cooling_down.status_code == 204
 
         async with session_maker() as s, s.begin():
-            lapsed = await s.get(ValidatorTicket, (agent_id, keypair.ss58_address))
+            lapsed = await s.get(ValidatorTicket, (agent_id, 2, keypair.ss58_address))
             assert lapsed is not None
             lapsed.retry_after = datetime.now(UTC) - timedelta(seconds=1)
 

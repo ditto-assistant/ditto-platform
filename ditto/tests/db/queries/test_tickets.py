@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
-from ditto.db.models import Agent, Score, ValidatorTicket
+from ditto.db.models import Agent, BenchmarkDataset, Score, ValidatorTicket
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import (
     EMISSION_CONTENDER_COUNT,
@@ -171,7 +171,7 @@ class TestIssueTicket:
             )
         assert replacement is None
         async with session.begin():
-            released = await session.get(ValidatorTicket, (source_id, "5Transition"))
+            released = await session.get(ValidatorTicket, (source_id, 2, "5Transition"))
             assert released is not None
             assert released.status == TicketStatus.EXPIRED
 
@@ -192,7 +192,7 @@ class TestIssueTicket:
             )
         assert replacement is None
         async with session.begin():
-            preserved = await session.get(ValidatorTicket, (source_id, "5Running"))
+            preserved = await session.get(ValidatorTicket, (source_id, 2, "5Running"))
             assert preserved is not None
             assert preserved.status == TicketStatus.ISSUED
 
@@ -874,7 +874,7 @@ class TestExpiry:
 
         assert third is None
         async with session.begin():
-            ticket = await session.get(ValidatorTicket, (aid, "5V1"))
+            ticket = await session.get(ValidatorTicket, (aid, 2, "5V1"))
         assert ticket is not None
         assert ticket.status == TicketStatus.EXPIRED
         assert ticket.attempt_count == 2
@@ -893,11 +893,20 @@ class TestExpiry:
             )
         assert ticket is not None
         async with session.begin():
-            ticket = await session.get(ValidatorTicket, (aid, "5V1"))
+            ticket = await session.get(ValidatorTicket, (aid, 2, "5V1"))
             assert ticket is not None
             ticket.status = TicketStatus.EXPIRED
             ticket.attempt_count = 2
             ticket.retry_after = _NOW + timedelta(days=1)
+            session.add(
+                BenchmarkDataset(
+                    agent_id=aid,
+                    bench_version=3,
+                    seed=42,
+                    sha256="cd" * 32,
+                    run_size="full",
+                )
+            )
         async with session.begin():
             reset = await issue_ticket(
                 session,
@@ -996,3 +1005,40 @@ class TestTicketLifecycle:
                 deadline=_NOW + _TTL,
             )
         assert t is None  # spent, no longer open
+
+    async def test_open_ticket_selects_explicit_version_with_dual_rows(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            session.add_all(
+                [
+                    ValidatorTicket(
+                        agent_id=aid,
+                        bench_version=2,
+                        validator_hotkey="5V1",
+                        status=TicketStatus.SCORED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                    ),
+                    ValidatorTicket(
+                        agent_id=aid,
+                        bench_version=3,
+                        validator_hotkey="5V1",
+                        status=TicketStatus.ISSUED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                    ),
+                ]
+            )
+        async with session.begin():
+            ticket = await get_open_ticket(
+                session,
+                agent_id=aid,
+                validator_hotkey="5V1",
+                now=_NOW,
+                deadline=_NOW + _TTL,
+                bench_version=3,
+            )
+        assert ticket is not None
+        assert ticket.bench_version == 3

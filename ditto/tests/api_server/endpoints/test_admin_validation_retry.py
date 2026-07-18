@@ -62,7 +62,10 @@ def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
 
 
 async def _seed(
-    maker: async_sessionmaker[AsyncSession], *, score_count: int = 0
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    score_count: int = 0,
+    bench_version: int = 2,
 ) -> UUID:
     agent_id = uuid4()
     async with maker() as session, session.begin():
@@ -90,7 +93,7 @@ async def _seed(
                     status=status,
                     issued_at=_T0 - timedelta(hours=3 - index / 10),
                     deadline=_T0 - timedelta(hours=2 - index / 10),
-                    bench_version=2,
+                    bench_version=bench_version,
                     attempt_count=1 if status == TicketStatus.SCORED else 2,
                     manual_retry_grants=0,
                     retry_after=_T0 - timedelta(hours=1),
@@ -100,6 +103,7 @@ async def _seed(
                 session.add(
                     Score(
                         agent_id=agent_id,
+                        bench_version=bench_version,
                         validator_hotkey=hotkey,
                         run_id=f"run-{index}",
                         seed=7,
@@ -112,6 +116,33 @@ async def _seed(
                     )
                 )
     return agent_id
+
+
+async def test_retry_is_bound_to_v3_ticket_and_score_epoch(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker, score_count=1, bench_version=3)
+    _install(app, retry_maker)
+
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    assert detail.status_code == 200, detail.text
+    assert {ticket["bench_version"] for ticket in detail.json()["tickets"]} == {3}
+
+    response = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/retry",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": detail.json()["snapshot"],
+            "reason": "v3 validator infrastructure recovery",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["recovery"]["bench_version"] == 3
 
 
 async def test_retry_grants_only_minimum_quorum_slots_and_preserves_history(
@@ -234,7 +265,7 @@ async def test_stale_snapshot_and_active_or_natural_retry_fail_closed(
     assert stale.status_code == 409
 
     async with retry_maker() as session, session.begin():
-        ticket = await session.get(ValidatorTicket, (agent_id, "validator-0"))
+        ticket = await session.get(ValidatorTicket, (agent_id, 2, "validator-0"))
         assert ticket is not None
         ticket.attempt_count = 1
     changed = await client.get(
