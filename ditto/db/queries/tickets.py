@@ -172,7 +172,13 @@ async def issue_ticket(
                 & (ValidatorTicket.bench_version == bench_version)
                 & (
                     (ValidatorTicket.retry_after > now)
-                    | (ValidatorTicket.attempt_count >= MAX_ATTEMPTS_PER_VERSION)
+                    | (
+                        ValidatorTicket.attempt_count
+                        >= (
+                            MAX_ATTEMPTS_PER_VERSION
+                            + ValidatorTicket.manual_retry_grants
+                        )
+                    )
                 )
             )
         ),
@@ -365,6 +371,7 @@ async def issue_ticket(
             deadline=now + ttl,
             bench_version=bench_version,
             attempt_count=1,
+            manual_retry_grants=0,
             retry_after=None,
         )
         session.add(ticket)
@@ -377,6 +384,7 @@ async def issue_ticket(
         ticket.deadline = now + ttl
         ticket.bench_version = bench_version
         ticket.attempt_count = ticket.attempt_count + 1 if same_version else 1
+        ticket.manual_retry_grants = ticket.manual_retry_grants if same_version else 0
         ticket.retry_after = None
     await session.flush()
     return ticket

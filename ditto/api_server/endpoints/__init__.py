@@ -8,6 +8,9 @@ from ditto.api_server.endpoints.admin_copy_review import (
 from ditto.api_server.endpoints.admin_quarantine import (
     router as admin_quarantine_router,
 )
+from ditto.api_server.endpoints.admin_validation_retry import (
+    router as admin_validation_retry_router,
+)
 from ditto.api_server.endpoints.health import router as health_router
 from ditto.api_server.endpoints.metrics import router as metrics_router
 from ditto.api_server.endpoints.public import router as public_router
@@ -21,6 +24,7 @@ __all__ = [
     "health_router",
     "admin_copy_review_router",
     "admin_quarantine_router",
+    "admin_validation_retry_router",
     "metrics_router",
     "public_router",
     "retrieval_router",

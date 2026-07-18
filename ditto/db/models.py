@@ -963,6 +963,14 @@ class ValidatorTicket(Base):
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     """Number of leases issued to this validator for this agent/version."""
 
+    manual_retry_grants: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    """Audited operator grants that each allow one additional lease after the
+    automatic same-version retry budget is exhausted. Grants never reduce or
+    rewrite :attr:`attempt_count`; the append-only recovery row records why the
+    extra eligibility was created."""
+
     retry_after: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
@@ -1002,6 +1010,10 @@ class ValidatorTicket(Base):
             "attempt_count > 0",
             name="validator_tickets_attempt_count_positive",
         ),
+        CheckConstraint(
+            "manual_retry_grants >= 0",
+            name="validator_tickets_manual_retry_grants_nonnegative",
+        ),
         # The expiry sweep and the live-slot count both scan open tickets only;
         # a partial index keeps those hot paths off the full table.
         Index(
@@ -1015,6 +1027,70 @@ class ValidatorTicket(Base):
             unique=True,
             postgresql_where=text("status = 'issued'"),
             sqlite_where=text("status = 'issued'"),
+        ),
+    )
+
+
+class ValidatorRetryRecovery(Base):
+    """One immutable operator action that restores bounded validation eligibility.
+
+    A recovery snapshots every ticket before changing only the selected expired
+    rows' retry grant counters. It is separate from the public score audit log:
+    no score or miner verdict is being created, replaced, or removed.
+    """
+
+    __tablename__ = "validator_retry_recoveries"
+
+    recovery_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    score_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    ticket_snapshot: Mapped[list[dict]] = mapped_column(_JSON_VARIANT, nullable=False)
+    granted_validator_hotkeys: Mapped[list[str]] = mapped_column(
+        _JSON_VARIANT, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="RESTRICT",
+            name="validator_retry_recoveries_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="validator_retry_recoveries_actor_length",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 3 AND 500",
+            name="validator_retry_recoveries_reason_length",
+        ),
+        CheckConstraint(
+            "score_count >= 0",
+            name="validator_retry_recoveries_score_count_nonnegative",
+        ),
+        CheckConstraint(
+            "bench_version > 0",
+            name="validator_retry_recoveries_bench_version_positive",
+        ),
+        Index(
+            "validator_retry_recoveries_agent_created_idx",
+            "agent_id",
+            "bench_version",
+            "created_at",
+            "recovery_id",
+        ),
+        UniqueConstraint(
+            "agent_id",
+            "bench_version",
+            "expected_snapshot",
+            name="validator_retry_recoveries_agent_snapshot_key",
         ),
     )
 
