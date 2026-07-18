@@ -3525,6 +3525,151 @@ class TestQuarantineReviewContext:
             "sample_truncated": False,
         }
 
+    async def test_batch_context_and_signed_preview_reject_changed_decisions(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id, ctx = await self._quarantine(app, client, session_maker)
+        assert ctx["response"].status_code == 200
+        listing = await client.get(
+            "/api/v1/admin/screening-quarantines", headers=_ADMIN_HEADERS
+        )
+        quarantine = listing.json()["items"][0]
+        missing_id = uuid4()
+
+        contexts = await client.post(
+            "/api/v1/admin/screening-quarantines/batch-context",
+            headers=_ADMIN_HEADERS,
+            json={"quarantine_ids": [quarantine["quarantine_id"], str(missing_id)]},
+        )
+        assert contexts.status_code == 200
+        assert contexts.json()["items"][0]["context"]["agent"]["agent_id"] == str(
+            agent_id
+        )
+        assert contexts.json()["items"][1] == {
+            "quarantine_id": str(missing_id),
+            "context": None,
+            "error": "quarantine not found",
+        }
+
+        decision = {
+            "quarantine_id": quarantine["quarantine_id"],
+            "expected_agent_id": quarantine["agent_id"],
+            "expected_artifact_sha256": quarantine["artifact_sha256"],
+            "resolution": "rescreen",
+            "reason": "Run the preserved artifact against the current screening policy",
+        }
+        preview = await client.post(
+            "/api/v1/admin/screening-quarantines/batch-preview",
+            headers=_ADMIN_HEADERS,
+            json={"decisions": [decision]},
+        )
+        assert preview.status_code == 200
+        assert preview.json()["ready_count"] == 1
+        assert preview.json()["items"][0]["resulting_agent_status"] == (
+            AgentStatus.SCREENING_FAILED
+        )
+
+        changed = {**decision, "resolution": "reject"}
+        execute = await client.post(
+            "/api/v1/admin/screening-quarantines/batch-resolve",
+            headers=_ADMIN_HEADERS,
+            json={
+                "decisions": [changed],
+                "preview_token": preview.json()["preview_token"],
+                "confirmed": True,
+            },
+        )
+        assert execute.status_code == 409
+        assert execute.json()["message"] == (
+            "batch decisions changed after preview; preview again"
+        )
+
+    async def test_batch_execute_is_idempotent_and_reports_partial_failures(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        first_agent, first_ctx = await self._quarantine(app, client, session_maker)
+        second_agent, second_ctx = await self._quarantine(app, client, session_maker)
+        assert (
+            first_ctx["response"].status_code
+            == second_ctx["response"].status_code
+            == 200
+        )
+        listing = await client.get(
+            "/api/v1/admin/screening-quarantines", headers=_ADMIN_HEADERS
+        )
+        by_agent = {item["agent_id"]: item for item in listing.json()["items"]}
+        decisions = [
+            {
+                "quarantine_id": by_agent[str(agent_id)]["quarantine_id"],
+                "expected_agent_id": str(agent_id),
+                "expected_artifact_sha256": by_agent[str(agent_id)]["artifact_sha256"],
+                "resolution": "rescreen",
+                "reason": (
+                    f"Batch review requested a current-policy rescreen for {agent_id}"
+                ),
+            }
+            for agent_id in (first_agent, second_agent)
+        ]
+        preview = await client.post(
+            "/api/v1/admin/screening-quarantines/batch-preview",
+            headers=_ADMIN_HEADERS,
+            json={"decisions": decisions},
+        )
+        assert preview.status_code == 200
+        assert preview.json()["ready_count"] == 2
+
+        # Simulate another operator changing one row after this batch preview.
+        changed = await client.post(
+            f"/api/v1/admin/screening-quarantines/{decisions[1]['quarantine_id']}/resolve",
+            headers={**_ADMIN_HEADERS, "X-Admin-Actor": "backroom:other-user"},
+            json={"resolution": "reject", "reason": "Independent review rejected it"},
+        )
+        assert changed.status_code == 200
+
+        request = {
+            "decisions": decisions,
+            "preview_token": preview.json()["preview_token"],
+            "confirmed": True,
+        }
+        executed = await client.post(
+            "/api/v1/admin/screening-quarantines/batch-resolve",
+            headers=_ADMIN_HEADERS,
+            json=request,
+        )
+        replay = await client.post(
+            "/api/v1/admin/screening-quarantines/batch-resolve",
+            headers=_ADMIN_HEADERS,
+            json=request,
+        )
+        assert executed.status_code == replay.status_code == 200
+        assert (executed.json()["applied_count"], executed.json()["failed_count"]) == (
+            1,
+            1,
+        )
+        assert (
+            replay.json()["already_applied_count"],
+            replay.json()["failed_count"],
+        ) == (1, 1)
+
+        async with session_maker() as session:
+            events = (
+                await session.scalars(
+                    select(ScreeningQuarantineResolution).where(
+                        ScreeningQuarantineResolution.quarantine_id
+                        == UUID(decisions[0]["quarantine_id"])
+                    )
+                )
+            ).all()
+            assert [(event.actor, event.resolution) for event in events] == [
+                ("backroom:test-user", "rescreen")
+            ]
+
     async def test_finding_for_a_different_artifact_is_not_verified(
         self,
         app: FastAPI,
