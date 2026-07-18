@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.dependencies import get_session
 from ditto.db.models import Agent, Base, Score, ValidatorRetryRecovery, ValidatorTicket
@@ -73,7 +74,7 @@ async def _seed(
                 version=1,
                 sha256=agent_id.hex * 2,
                 status=AgentStatus.EVALUATING,
-                screening_policy_version=8,
+                screening_policy_version=SCREENING_POLICY_VERSION,
                 created_at=_T0 - timedelta(days=1),
             )
         )
