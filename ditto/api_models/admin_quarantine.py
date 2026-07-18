@@ -222,6 +222,85 @@ class AdminQuarantineContext(BaseModel):
     duplicate_summary: AdminDuplicateSummary
 
 
+class AdminQuarantineBatchContextRequest(BaseModel):
+    """Bounded context fan-out for queue workbenches and MCP clients."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    quarantine_ids: Annotated[list[UUID], Field(min_length=1, max_length=50)]
+
+
+class AdminQuarantineBatchContextResult(BaseModel):
+    quarantine_id: UUID
+    context: AdminQuarantineContext | None = None
+    error: str | None = None
+
+
+class AdminQuarantineBatchContextResponse(BaseModel):
+    items: list[AdminQuarantineBatchContextResult]
+    count: int
+
+
+class AdminQuarantineBatchDecision(BaseModel):
+    """One guarded decision in a separately previewed batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    quarantine_id: UUID
+    expected_agent_id: UUID
+    expected_artifact_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    resolution: QuarantineResolution
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3)]
+
+
+class AdminQuarantineBatchPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: Annotated[
+        list[AdminQuarantineBatchDecision], Field(min_length=1, max_length=50)
+    ]
+
+
+class AdminQuarantineBatchPreviewItem(BaseModel):
+    quarantine_id: UUID
+    agent_id: UUID | None = None
+    agent_name: str | None = None
+    artifact_sha256: str | None = None
+    resolution: QuarantineResolution
+    reason: str
+    disposition: Literal["ready", "already_applied", "conflict", "not_found"]
+    resulting_agent_status: str | None = None
+    message: str
+
+
+class AdminQuarantineBatchPreviewResponse(BaseModel):
+    preview_token: str
+    expires_at: datetime
+    items: list[AdminQuarantineBatchPreviewItem]
+    ready_count: int
+    already_applied_count: int
+    blocked_count: int
+
+
+class AdminQuarantineBatchExecuteRequest(AdminQuarantineBatchPreviewRequest):
+    preview_token: Annotated[str, Field(min_length=32, max_length=256)]
+    confirmed: Literal[True]
+
+
+class AdminQuarantineBatchExecuteItem(BaseModel):
+    quarantine_id: UUID
+    status: Literal["applied", "already_applied", "failed"]
+    agent_status: str | None = None
+    message: str
+
+
+class AdminQuarantineBatchExecuteResponse(BaseModel):
+    items: list[AdminQuarantineBatchExecuteItem]
+    applied_count: int
+    already_applied_count: int
+    failed_count: int
+
+
 class AdminSourceFileEntry(BaseModel):
     path: str
     bytes: int

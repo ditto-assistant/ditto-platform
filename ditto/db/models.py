@@ -100,6 +100,7 @@ class Agent(Base):
     content_fingerprint: Mapped[dict | None] = mapped_column(
         _JSON_VARIANT, nullable=True, deferred=True, deferred_group="anticopy"
     )
+
     """Shingle MinHash sketch of the tarball source (see
     :mod:`ditto.api_server.fingerprint`). Feeds the anti-copy gate's content-level
     signal: a reindented/renamed/reformatted or locally-edited copy keeps a
@@ -223,6 +224,30 @@ class Agent(Base):
     Validators may score only submissions at the platform's required version.
     """
 
+    screened_image_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """SHA-256 of the screener-exported Docker image archive."""
+
+    screened_image_size_bytes: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    """Exact byte size of the screener-exported Docker image archive."""
+
+    screened_image_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Docker content ID verified by the screener and each validator."""
+
+    screened_image_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Screener-owned tag expected inside the Docker save archive."""
+
+    screened_image_upload_id: Mapped[UUID | None] = mapped_column(
+        SaUUID(as_uuid=True), nullable=True
+    )
+    """Platform-minted immutable multipart object identity."""
+
+    screened_image_verified_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    """When the platform streamed and verified the complete archive bytes."""
+
     status: Mapped[AgentStatus] = mapped_column(
         Enum(
             AgentStatus,
@@ -255,6 +280,17 @@ class Agent(Base):
         CheckConstraint(
             "version IS NULL OR version > 0", name="agents_version_positive_check"
         ),
+        CheckConstraint(
+            "(screened_image_sha256 IS NULL AND screened_image_size_bytes IS NULL "
+            "AND screened_image_id IS NULL AND screened_image_ref IS NULL "
+            "AND screened_image_upload_id IS NULL "
+            "AND screened_image_verified_at IS NULL) OR "
+            "(length(screened_image_sha256) = 64 AND screened_image_size_bytes > 0 "
+            "AND length(screened_image_id) = 71 AND length(screened_image_ref) > 0 "
+            "AND screened_image_upload_id IS NOT NULL "
+            "AND screened_image_verified_at IS NOT NULL)",
+            name="agents_screened_image_fields_check",
+        ),
         Index("agents_miner_hotkey_idx", "miner_hotkey"),
         Index("agents_sha256_idx", "sha256"),
         # Exact-repack duplicate lookups for the quarantine review console.
@@ -285,6 +321,58 @@ class Agent(Base):
             ondelete="SET NULL",
             name="agents_duplicate_of_fkey",
         ),
+    )
+
+
+class ScreenedImageUpload(Base):
+    """Attempt-bound multipart upload verified before a passing verdict."""
+
+    __tablename__ = "screened_image_uploads"
+
+    image_upload_id: Mapped[UUID] = mapped_column(
+        SaUUID(as_uuid=True), primary_key=True
+    )
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    attempt_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    screener_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    storage_upload_id: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    image_id: Mapped[str] = mapped_column(Text, nullable=False)
+    image_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="initiated"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="CASCADE",
+            name="screened_image_uploads_agent_id_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["attempt_id"],
+            ["screening_attempts.attempt_id"],
+            ondelete="CASCADE",
+            name="screened_image_uploads_attempt_id_fkey",
+        ),
+        CheckConstraint(
+            "status IN ('initiated', 'verified', 'aborted')",
+            name="screened_image_uploads_status_check",
+        ),
+        CheckConstraint("size_bytes > 0", name="screened_image_uploads_size_check"),
+        Index("screened_image_uploads_attempt_idx", "attempt_id"),
+        Index("screened_image_uploads_status_expires_idx", "status", "expires_at"),
     )
 
 
@@ -963,6 +1051,14 @@ class ValidatorTicket(Base):
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     """Number of leases issued to this validator for this agent/version."""
 
+    manual_retry_grants: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    """Audited operator grants that each allow one additional lease after the
+    automatic same-version retry budget is exhausted. Grants never reduce or
+    rewrite :attr:`attempt_count`; the append-only recovery row records why the
+    extra eligibility was created."""
+
     retry_after: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
@@ -1002,6 +1098,10 @@ class ValidatorTicket(Base):
             "attempt_count > 0",
             name="validator_tickets_attempt_count_positive",
         ),
+        CheckConstraint(
+            "manual_retry_grants >= 0",
+            name="validator_tickets_manual_retry_grants_nonnegative",
+        ),
         # The expiry sweep and the live-slot count both scan open tickets only;
         # a partial index keeps those hot paths off the full table.
         Index(
@@ -1015,6 +1115,70 @@ class ValidatorTicket(Base):
             unique=True,
             postgresql_where=text("status = 'issued'"),
             sqlite_where=text("status = 'issued'"),
+        ),
+    )
+
+
+class ValidatorRetryRecovery(Base):
+    """One immutable operator action that restores bounded validation eligibility.
+
+    A recovery snapshots every ticket before changing only the selected expired
+    rows' retry grant counters. It is separate from the public score audit log:
+    no score or miner verdict is being created, replaced, or removed.
+    """
+
+    __tablename__ = "validator_retry_recoveries"
+
+    recovery_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    score_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    ticket_snapshot: Mapped[list[dict]] = mapped_column(_JSON_VARIANT, nullable=False)
+    granted_validator_hotkeys: Mapped[list[str]] = mapped_column(
+        _JSON_VARIANT, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="RESTRICT",
+            name="validator_retry_recoveries_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="validator_retry_recoveries_actor_length",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 3 AND 500",
+            name="validator_retry_recoveries_reason_length",
+        ),
+        CheckConstraint(
+            "score_count >= 0",
+            name="validator_retry_recoveries_score_count_nonnegative",
+        ),
+        CheckConstraint(
+            "bench_version > 0",
+            name="validator_retry_recoveries_bench_version_positive",
+        ),
+        Index(
+            "validator_retry_recoveries_agent_created_idx",
+            "agent_id",
+            "bench_version",
+            "created_at",
+            "recovery_id",
+        ),
+        UniqueConstraint(
+            "agent_id",
+            "bench_version",
+            "expected_snapshot",
+            name="validator_retry_recoveries_agent_snapshot_key",
         ),
     )
 

@@ -3823,11 +3823,17 @@
       }).length;
       if (count >= quorum) return "Validation complete. The canonical result uses the median of " + quorum + " independent scores.";
       if (e.status === "below_score_floor") {
-        var bestPossible = (e.provisional_scores || []).reduce(function (best, score) {
+        var provisionalScores = e.provisional_scores || [];
+        var scoreFloor = Number(e.score_floor);
+        if (!provisionalScores.length || !Number.isFinite(scoreFloor)) {
+          return "Evaluation stopped after two accepted scores below the current score floor. " +
+            "No further validator tickets will be issued.";
+        }
+        var bestPossible = provisionalScores.reduce(function (best, score) {
           return Math.max(best, Number(score.composite) || 0);
         }, 0);
         return "Evaluation stopped after two accepted scores. Even a perfect third run could not raise the median above " +
-          fx(bestPossible) + ", below the current fifth-place score of " + fx(e.score_floor) +
+          fx(bestPossible) + ", below the current fifth-place score of " + fx(scoreFloor) +
           ". No further validator tickets will be issued.";
       }
       if (e.status === "waiting_screening") return "Queued for a screener to claim under the current policy.";

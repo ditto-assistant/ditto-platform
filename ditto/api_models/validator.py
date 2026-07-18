@@ -66,6 +66,20 @@ class ArtifactResponse(BaseModel):
     expires_at: Annotated[
         datetime, Field(description="When ``download_url`` stops being valid (UTC).")
     ]
+    screened_image_url: Annotated[
+        str | None,
+        Field(
+            description="Pre-signed Docker image archive URL when screening built one."
+        ),
+    ] = None
+    screened_image_sha256: Annotated[str | None, Field(pattern=r"^[0-9a-f]{64}$")] = (
+        None
+    )
+    screened_image_size_bytes: Annotated[int | None, Field(gt=0)] = None
+    screened_image_id: Annotated[
+        str | None, Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ] = None
+    screened_image_ref: Annotated[str | None, Field(min_length=1)] = None
 
     model_config = ConfigDict(
         json_schema_extra={

@@ -141,6 +141,11 @@ def _artifact_key(agent_id: UUID) -> str:
     return f"{agent_id}/agent.tar.gz"
 
 
+def _screened_image_key(agent_id: UUID, image_upload_id: UUID) -> str:
+    """Return the immutable accepted screener image object key."""
+    return f"{agent_id}/screened-images/{image_upload_id}.tar"
+
+
 # Agents the validator may pull as work. The partial index covers exactly
 # Agents a score may be reported against. ``scored`` / ``live`` are included
 # so a validator can re-score across epochs without a 409;
@@ -751,6 +756,15 @@ async def agent_artifact(
         key=_artifact_key(agent_id),
         expires_in=int(_ARTIFACT_URL_TTL.total_seconds()),
     )
+    image_url = None
+    if (
+        agent.screened_image_sha256 is not None
+        and agent.screened_image_upload_id is not None
+    ):
+        image_url = await storage.presigned_get_url(
+            key=_screened_image_key(agent_id, agent.screened_image_upload_id),
+            expires_in=int(_ARTIFACT_URL_TTL.total_seconds()),
+        )
     logger.info(
         "validator=%s fetched artifact url for agent_id=%s",
         x_validator_hotkey,
@@ -761,6 +775,11 @@ async def agent_artifact(
         sha256=agent.sha256,
         download_url=url,
         expires_at=datetime.now(UTC) + _ARTIFACT_URL_TTL,
+        screened_image_url=image_url,
+        screened_image_sha256=agent.screened_image_sha256,
+        screened_image_size_bytes=agent.screened_image_size_bytes,
+        screened_image_id=agent.screened_image_id,
+        screened_image_ref=agent.screened_image_ref,
     )
 
 

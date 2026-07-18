@@ -37,6 +37,10 @@ class ObjectUploadFailedError(StorageError):
     """
 
 
+class ObjectNotFoundError(ObjectUploadFailedError):
+    """Raised when a required object or multipart upload does not exist."""
+
+
 class ObjectDownloadFailedError(StorageError):
     """Raised when a get_object call cannot complete within bounds.
 

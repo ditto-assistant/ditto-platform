@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import json
 import logging
 import secrets
 from collections import defaultdict
@@ -21,6 +23,16 @@ from ditto.api_models.admin_quarantine import (
     AdminMinerContext,
     AdminMinerQuarantineSummary,
     AdminQuarantineAgentContext,
+    AdminQuarantineBatchContextRequest,
+    AdminQuarantineBatchContextResponse,
+    AdminQuarantineBatchContextResult,
+    AdminQuarantineBatchDecision,
+    AdminQuarantineBatchExecuteItem,
+    AdminQuarantineBatchExecuteRequest,
+    AdminQuarantineBatchExecuteResponse,
+    AdminQuarantineBatchPreviewItem,
+    AdminQuarantineBatchPreviewRequest,
+    AdminQuarantineBatchPreviewResponse,
     AdminQuarantineContext,
     AdminQuarantineItem,
     AdminQuarantineList,
@@ -81,6 +93,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 GeneratorDep = Annotated[DatasetGenerator, Depends(get_dataset_generator)]
 StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
 DatasetPin = tuple[int, str, str, int | None, str | None]
+BATCH_PREVIEW_TTL = timedelta(minutes=10)
 
 
 async def require_admin(
@@ -238,6 +251,62 @@ def _apply_dataset(agent: Agent, dataset: DatasetPin | None) -> None:
         agent.dataset_seed_block,
         agent.dataset_seed_block_hash,
     ) = dataset
+
+
+def _preview_signature_payload(
+    actor: str,
+    decisions: list[AdminQuarantineBatchDecision],
+    issued_at: int,
+) -> bytes:
+    return json.dumps(
+        {
+            "actor": actor,
+            "decisions": [decision.model_dump(mode="json") for decision in decisions],
+            "issued_at": issued_at,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+
+def _sign_batch_preview(
+    secret: str,
+    actor: str,
+    decisions: list[AdminQuarantineBatchDecision],
+    issued_at: int,
+) -> str:
+    digest = hmac.new(
+        secret.encode(),
+        _preview_signature_payload(actor, decisions, issued_at),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{issued_at}.{digest}"
+
+
+def _verify_batch_preview(
+    token: str,
+    secret: str,
+    actor: str,
+    decisions: list[AdminQuarantineBatchDecision],
+) -> None:
+    try:
+        issued_text, _digest = token.split(".", 1)
+        issued_at = int(issued_text)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422, detail="invalid batch preview token"
+        ) from None
+    now = int(datetime.now(UTC).timestamp())
+    if issued_at > now + 30 or now - issued_at > int(BATCH_PREVIEW_TTL.total_seconds()):
+        raise HTTPException(
+            status_code=409, detail="batch preview expired; preview again"
+        )
+    expected = _sign_batch_preview(secret, actor, decisions, issued_at)
+    if not secrets.compare_digest(token, expected):
+        raise HTTPException(
+            status_code=409,
+            detail="batch decisions changed after preview; preview again",
+        )
 
 
 def _dispute_item(
@@ -442,6 +511,319 @@ async def list_quarantines(
     return AdminQuarantineList(items=items, count=total)
 
 
+@router.post(
+    "/screening-quarantines/batch-context",
+    response_model=AdminQuarantineBatchContextResponse,
+)
+async def get_quarantine_batch_context(
+    payload: AdminQuarantineBatchContextRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+) -> AdminQuarantineBatchContextResponse:
+    """Fetch bounded full-review contexts without one HTTP round-trip per row."""
+    if len(set(payload.quarantine_ids)) != len(payload.quarantine_ids):
+        raise HTTPException(status_code=422, detail="quarantine_ids must be unique")
+    items: list[AdminQuarantineBatchContextResult] = []
+    for quarantine_id in payload.quarantine_ids:
+        try:
+            context = await _build_quarantine_context(quarantine_id, session)
+            items.append(
+                AdminQuarantineBatchContextResult(
+                    quarantine_id=quarantine_id,
+                    context=context,
+                )
+            )
+        except HTTPException as exc:
+            items.append(
+                AdminQuarantineBatchContextResult(
+                    quarantine_id=quarantine_id,
+                    error=str(exc.detail),
+                )
+            )
+    return AdminQuarantineBatchContextResponse(items=items, count=len(items))
+
+
+async def _preview_batch_decision(
+    session: AsyncSession,
+    decision: AdminQuarantineBatchDecision,
+    actor: str,
+) -> AdminQuarantineBatchPreviewItem:
+    result = (
+        await session.execute(
+            select(ScreeningQuarantine, Agent)
+            .join(Agent, Agent.agent_id == ScreeningQuarantine.agent_id)
+            .where(ScreeningQuarantine.quarantine_id == decision.quarantine_id)
+        )
+    ).one_or_none()
+    if result is None:
+        return AdminQuarantineBatchPreviewItem(
+            quarantine_id=decision.quarantine_id,
+            resolution=decision.resolution,
+            reason=decision.reason,
+            disposition="not_found",
+            message="quarantine not found",
+        )
+    quarantine, agent = result
+    base = {
+        "quarantine_id": decision.quarantine_id,
+        "agent_id": agent.agent_id,
+        "agent_name": agent.name,
+        "artifact_sha256": agent.sha256,
+        "resolution": decision.resolution,
+        "reason": decision.reason,
+    }
+    if (
+        agent.agent_id != decision.expected_agent_id
+        or agent.sha256 != decision.expected_artifact_sha256
+    ):
+        return AdminQuarantineBatchPreviewItem(
+            **base,
+            disposition="conflict",
+            message="submission identity changed",
+        )
+    target = {
+        "release": AgentStatus.EVALUATING,
+        "rescreen": AgentStatus.SCREENING_FAILED,
+        "reject": AgentStatus.REJECTED,
+    }[decision.resolution]
+    if (
+        quarantine.status == "resolved"
+        and quarantine.resolution == decision.resolution
+        and quarantine.resolution_reason == decision.reason
+        and quarantine.resolved_by == actor
+        and agent.status == target
+    ):
+        return AdminQuarantineBatchPreviewItem(
+            **base,
+            disposition="already_applied",
+            resulting_agent_status=target,
+            message="this exact operator decision is already recorded",
+        )
+    is_initial = (
+        quarantine.status == "active" and agent.status == AgentStatus.QUARANTINED
+    )
+    is_correction = (
+        quarantine.status == "resolved"
+        and quarantine.resolution == "reject"
+        and agent.status == AgentStatus.REJECTED
+        and decision.resolution == "release"
+    )
+    if not is_initial and not is_correction:
+        return AdminQuarantineBatchPreviewItem(
+            **base,
+            disposition="conflict",
+            message="quarantine is no longer actionable with this decision",
+        )
+    return AdminQuarantineBatchPreviewItem(
+        **base,
+        disposition="ready",
+        resulting_agent_status=target,
+        message=f"will set submission status to {target}",
+    )
+
+
+@router.post(
+    "/screening-quarantines/batch-preview",
+    response_model=AdminQuarantineBatchPreviewResponse,
+)
+async def preview_quarantine_batch(
+    payload: AdminQuarantineBatchPreviewRequest,
+    request: Request,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminQuarantineBatchPreviewResponse:
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    ids = [decision.quarantine_id for decision in payload.decisions]
+    if len(set(ids)) != len(ids):
+        raise HTTPException(
+            status_code=422, detail="quarantine decisions must be unique"
+        )
+    items = [
+        await _preview_batch_decision(session, decision, x_admin_actor)
+        for decision in payload.decisions
+    ]
+    issued_at = int(datetime.now(UTC).timestamp())
+    secret = request.app.state.config.admin_api_token
+    assert secret is not None
+    return AdminQuarantineBatchPreviewResponse(
+        preview_token=_sign_batch_preview(
+            secret, x_admin_actor, payload.decisions, issued_at
+        ),
+        expires_at=datetime.fromtimestamp(issued_at, UTC) + BATCH_PREVIEW_TTL,
+        items=items,
+        ready_count=sum(item.disposition == "ready" for item in items),
+        already_applied_count=sum(
+            item.disposition == "already_applied" for item in items
+        ),
+        blocked_count=sum(
+            item.disposition in {"conflict", "not_found"} for item in items
+        ),
+    )
+
+
+@router.post(
+    "/screening-quarantines/batch-resolve",
+    response_model=AdminQuarantineBatchExecuteResponse,
+)
+async def execute_quarantine_batch(
+    payload: AdminQuarantineBatchExecuteRequest,
+    request: Request,
+    _admin: AdminDep,
+    session: SessionDep,
+    chain: ChainDep,
+    generator: GeneratorDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminQuarantineBatchExecuteResponse:
+    """Apply separately audited decisions; failures never hide successful rows."""
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    ids = [decision.quarantine_id for decision in payload.decisions]
+    if len(set(ids)) != len(ids):
+        raise HTTPException(
+            status_code=422, detail="quarantine decisions must be unique"
+        )
+    secret = request.app.state.config.admin_api_token
+    assert secret is not None
+    _verify_batch_preview(
+        payload.preview_token,
+        secret,
+        x_admin_actor,
+        payload.decisions,
+    )
+
+    results: list[AdminQuarantineBatchExecuteItem] = []
+    for decision in payload.decisions:
+        try:
+            preview = await _preview_batch_decision(session, decision, x_admin_actor)
+            # End the read-only implicit transaction before the per-item write
+            # transaction (and before release dataset preparation).
+            await session.rollback()
+            if preview.disposition == "already_applied":
+                results.append(
+                    AdminQuarantineBatchExecuteItem(
+                        quarantine_id=decision.quarantine_id,
+                        status="already_applied",
+                        agent_status=preview.resulting_agent_status,
+                        message=preview.message,
+                    )
+                )
+                continue
+            if preview.disposition != "ready":
+                results.append(
+                    AdminQuarantineBatchExecuteItem(
+                        quarantine_id=decision.quarantine_id,
+                        status="failed",
+                        message=preview.message,
+                    )
+                )
+                continue
+            new_dataset = (
+                await _prepare_release_dataset(
+                    session, chain, generator, decision.quarantine_id
+                )
+                if decision.resolution == "release"
+                else None
+            )
+            async with session.begin():
+                quarantine = await session.scalar(
+                    select(ScreeningQuarantine)
+                    .where(ScreeningQuarantine.quarantine_id == decision.quarantine_id)
+                    .with_for_update()
+                )
+                if quarantine is None:
+                    raise HTTPException(status_code=404, detail="quarantine not found")
+                agent = await session.scalar(
+                    select(Agent)
+                    .where(Agent.agent_id == quarantine.agent_id)
+                    .with_for_update()
+                )
+                if agent is None:
+                    raise HTTPException(status_code=404, detail="agent not found")
+                if (
+                    agent.agent_id != decision.expected_agent_id
+                    or agent.sha256 != decision.expected_artifact_sha256
+                ):
+                    raise HTTPException(
+                        status_code=409, detail="submission identity changed"
+                    )
+                is_initial = (
+                    quarantine.status == "active"
+                    and agent.status == AgentStatus.QUARANTINED
+                )
+                is_correction = (
+                    quarantine.status == "resolved"
+                    and quarantine.resolution == "reject"
+                    and agent.status == AgentStatus.REJECTED
+                    and decision.resolution == "release"
+                )
+                if not is_initial and not is_correction:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="quarantine changed after preview",
+                    )
+                target = {
+                    "release": AgentStatus.EVALUATING,
+                    "rescreen": AgentStatus.SCREENING_FAILED,
+                    "reject": AgentStatus.REJECTED,
+                }[decision.resolution]
+                now = datetime.now(UTC)
+                agent.status = target
+                agent.screening_reason = decision.reason
+                _apply_dataset(agent, new_dataset)
+                quarantine.status = "resolved"
+                quarantine.resolved_at = now
+                quarantine.resolved_by = x_admin_actor
+                quarantine.resolution = decision.resolution
+                quarantine.resolution_reason = decision.reason
+                session.add(
+                    ScreeningQuarantineResolution(
+                        resolution_id=uuid4(),
+                        quarantine_id=quarantine.quarantine_id,
+                        resolution=decision.resolution,
+                        reason=decision.reason,
+                        actor=x_admin_actor,
+                        created_at=now,
+                    )
+                )
+            results.append(
+                AdminQuarantineBatchExecuteItem(
+                    quarantine_id=decision.quarantine_id,
+                    status="applied",
+                    agent_status=target,
+                    message="decision applied and audit event recorded",
+                )
+            )
+        except HTTPException as exc:
+            results.append(
+                AdminQuarantineBatchExecuteItem(
+                    quarantine_id=decision.quarantine_id,
+                    status="failed",
+                    message=str(exc.detail),
+                )
+            )
+        except Exception:
+            logger.exception(
+                "batch quarantine resolution failed actor=%s quarantine_id=%s",
+                x_admin_actor,
+                decision.quarantine_id,
+            )
+            results.append(
+                AdminQuarantineBatchExecuteItem(
+                    quarantine_id=decision.quarantine_id,
+                    status="failed",
+                    message="internal error while applying decision",
+                )
+            )
+    return AdminQuarantineBatchExecuteResponse(
+        items=results,
+        applied_count=sum(item.status == "applied" for item in results),
+        already_applied_count=sum(item.status == "already_applied" for item in results),
+        failed_count=sum(item.status == "failed" for item in results),
+    )
+
+
 @router.get(
     "/screening-quarantines/{quarantine_id}", response_model=AdminQuarantineItem
 )
@@ -462,12 +844,8 @@ async def get_quarantine(
     return _item(quarantine, agent, history[quarantine.quarantine_id])
 
 
-@router.get(
-    "/screening-quarantines/{quarantine_id}/context",
-    response_model=AdminQuarantineContext,
-)
-async def get_quarantine_context(
-    quarantine_id: UUID, _admin: AdminDep, session: SessionDep
+async def _build_quarantine_context(
+    quarantine_id: UUID, session: AsyncSession
 ) -> AdminQuarantineContext:
     """One-stop review context: finding, attempts, miner history, duplicates."""
     result = (
@@ -658,6 +1036,16 @@ async def get_quarantine_context(
             sample_truncated=cross_miner_count + same_miner_count > len(duplicate_rows),
         ),
     )
+
+
+@router.get(
+    "/screening-quarantines/{quarantine_id}/context",
+    response_model=AdminQuarantineContext,
+)
+async def get_quarantine_context(
+    quarantine_id: UUID, _admin: AdminDep, session: SessionDep
+) -> AdminQuarantineContext:
+    return await _build_quarantine_context(quarantine_id, session)
 
 
 @router.post(
