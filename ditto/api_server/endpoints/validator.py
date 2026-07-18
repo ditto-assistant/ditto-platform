@@ -153,6 +153,37 @@ AUDIT_MIN_ROBUSTNESS = 0.70
 AUDIT_MIN_PAIRS = 4
 TRANSFORM_AUDIT_REVIEW_REASON = "transform_audit_brittleness"
 
+# ENFORCEMENT IS OFF BY DEFAULT, and the 2026-07-18 calibration is why.
+#
+# Measured against the real locked model (OpenRouter qwen/qwen3-32b, stock
+# reference harness, 25 seeds at run_size=full) and against two purpose-built
+# local solvers, the metric does not currently separate a cheater from an honest
+# miner (docs/BASELINES.md, "Run 3"):
+#
+#   honest LLM   transform_robustness 0.910  (sd 0.148, min 0.60)
+#   BRITTLE      transform_robustness 0.863   <- the attacker we mean to catch
+#   robust solver                     0.924
+#
+# The brittle harness sits INSIDE the honest model's own spread. At the 0.70
+# floor below, 4 of 25 honest runs (16%) would be quarantined while only 2 of 12
+# brittle runs would be caught: close to no discrimination, paid for almost
+# entirely by legitimate miners.
+#
+# The cause is structural rather than a bad threshold. 81% of audit pairs came
+# back both-wrong, and a both-wrong pair counts as CONSISTENT, so on a benchmark
+# this hard the metric is dominated by pairs that carry no information about
+# brittleness at all. Only 19% of pairs were informative, and 13 of 25 runs did
+# not even reach AUDIT_MIN_PAIRS.
+#
+# So the audit ships observational: the metric is computed, EVENT_AUDIT is
+# recorded, and the value is published, which is what will produce the
+# real-world distribution a future threshold can be set from. It does not touch
+# an agent's status. Turn this on only with a calibration that shows separation
+# on the population it will judge. See docs/v3-complete-plan.md.
+TRANSFORM_AUDIT_ENFORCE = os.environ.get(
+    "DITTO_TRANSFORM_AUDIT_ENFORCE", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _transform_audit_verdict(
     agent_scores: Sequence[Any],
@@ -1331,7 +1362,26 @@ async def submit_score(
                 audit_robustness, audit_pairs, audit_failed = _transform_audit_verdict(
                     agent_scores
                 )
-                if audit_failed and agent.status == AgentStatus.SCORED:
+                if audit_failed and not TRANSFORM_AUDIT_ENFORCE:
+                    # Observational mode: record what the verdict WOULD have been
+                    # (the EVENT_AUDIT entry below carries `failed`) without
+                    # touching the agent's status. This is what accumulates the
+                    # real-world distribution a future threshold can be set from.
+                    logger.info(
+                        "agent %s: transform-audit brittleness signature "
+                        "(median robustness %.3f over %d pair(s), floor %.2f) "
+                        "— NOT enforced; the metric does not yet separate "
+                        "honest from brittle harnesses",
+                        agent_id,
+                        audit_robustness if audit_robustness is not None else -1.0,
+                        audit_pairs,
+                        AUDIT_MIN_ROBUSTNESS,
+                    )
+                if (
+                    audit_failed
+                    and TRANSFORM_AUDIT_ENFORCE
+                    and agent.status == AgentStatus.SCORED
+                ):
                     agent.status = AgentStatus.ATH_PENDING_REVIEW
                     agent.review_reason = TRANSFORM_AUDIT_REVIEW_REASON
                     session.add(
@@ -1381,6 +1431,10 @@ async def submit_score(
                             "audit_min_robustness": AUDIT_MIN_ROBUSTNESS,
                             "audit_bps": AUDIT_BPS,
                             "failed": audit_failed,
+                            # Whether the verdict was allowed to affect status.
+                            # Published so the feed is unambiguous about which
+                            # entries were observational.
+                            "enforced": TRANSFORM_AUDIT_ENFORCE,
                             "dataset_seed": agent.dataset_seed,
                             "dataset_sha256": agent.dataset_sha256,
                             "dataset_seed_block": agent.dataset_seed_block,

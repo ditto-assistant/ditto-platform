@@ -81,3 +81,18 @@ def test_public_surfacing_reads_a_good_value() -> None:
 def test_public_surfacing_tolerates_a_missing_pair_count() -> None:
     """The robustness value still publishes; only the count is unknown."""
     assert _safe_transform_robustness({"transform_robustness": 0.75}) == (0.75, None)
+
+
+def test_enforcement_is_off_by_default() -> None:
+    """The transform-audit hold must not affect an agent's status by default.
+
+    The 2026-07-18 calibration measured the brittle attacker at 0.863 and the
+    honest model at 0.910 (sd 0.148, min 0.60): the cheater sits inside the
+    honest spread, so at the 0.70 floor 16% of honest runs would be quarantined
+    while almost no brittle ones are caught. Until a calibration shows real
+    separation, the verdict is observational. If this flips to True without that
+    evidence, legitimate miners pay for it.
+    """
+    from ditto.api_server.endpoints import validator as v
+
+    assert v.TRANSFORM_AUDIT_ENFORCE is False
