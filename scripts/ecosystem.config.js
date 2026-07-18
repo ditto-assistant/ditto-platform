@@ -42,5 +42,21 @@ module.exports = {
       merge_logs: true,
       time: true, // prefix every log line with a timestamp
     },
+    {
+      // DB-aware retention: keeps evaluating/current-best images, clears old
+      // non-champions back to source-build fallback, then deletes their objects.
+      // Bucket lifecycle separately aborts abandoned multipart uploads.
+      name: "ditto-screened-image-cleanup",
+      cwd: root,
+      script: "uv",
+      args: "run python scripts/cleanup_screened_images.py",
+      interpreter: "none",
+      autorestart: false,
+      cron_restart: "17 3 * * *",
+      out_file: path.join(root, "logs", "ditto-image-cleanup.out.log"),
+      error_file: path.join(root, "logs", "ditto-image-cleanup.err.log"),
+      merge_logs: true,
+      time: true,
+    },
   ],
 };

@@ -1365,10 +1365,49 @@ class TestArtifact:
         assert body["agent_id"] == str(agent_id)
         assert body["sha256"] == _SHA256
         assert body["download_url"].startswith("https://")
+        assert body["screened_image_url"] is None
+        assert body["screened_image_sha256"] is None
         storage.presigned_get_url.assert_awaited_once()
         assert (
             storage.presigned_get_url.await_args.kwargs["key"]
             == f"{agent_id}/agent.tar.gz"
+        )
+
+    async def test_returns_verified_screened_image_fields(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        upload_id = uuid4()
+        async with session_maker() as session, session.begin():
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.screened_image_sha256 = "12" * 32
+            agent.screened_image_size_bytes = 123
+            agent.screened_image_id = "sha256:" + "34" * 32
+            agent.screened_image_ref = f"ditto-screen/{agent_id}:latest"
+            agent.screened_image_upload_id = upload_id
+            agent.screened_image_verified_at = datetime.now(UTC)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["screened_image_url"].startswith("https://")
+        assert body["screened_image_sha256"] == "12" * 32
+        assert body["screened_image_size_bytes"] == 123
+        assert body["screened_image_id"] == "sha256:" + "34" * 32
+        assert body["screened_image_ref"] == f"ditto-screen/{agent_id}:latest"
+        assert storage.presigned_get_url.await_args_list[1].kwargs["key"] == (
+            f"{agent_id}/screened-images/{upload_id}.tar"
         )
 
     async def test_unknown_agent_returns_404(

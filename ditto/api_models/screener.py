@@ -11,6 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from ditto.api_models.system_health import SystemMetrics
 from ditto_screening_protocol import (
     SCREENING_POLICY_VERSION,
+    ScreenedImageCompletedPart,
+    ScreenedImageUploadRequest,
+    ScreenedImageUploadResponse,
     ScreenerQueueItem,
     ScreenerQueueResponse,
     ScreenEvidenceItem,
@@ -18,6 +21,24 @@ from ditto_screening_protocol import (
     ScreenResultResponse,
     SourceReviewEvidenceItem,
     SourceReviewFinding,
+)
+from ditto_screening_protocol import (
+    ScreenedImagePartUploadRequest as ScreenedImagePartRequest,
+)
+from ditto_screening_protocol import (
+    ScreenedImagePartUploadResponse as ScreenedImagePartResponse,
+)
+from ditto_screening_protocol import (
+    ScreenedImageUploadAbortRequest as ScreenedImageAbortRequest,
+)
+from ditto_screening_protocol import (
+    ScreenedImageUploadAbortResponse as ScreenedImageAbortResponse,
+)
+from ditto_screening_protocol import (
+    ScreenedImageUploadCompleteRequest as ScreenedImageCompleteRequest,
+)
+from ditto_screening_protocol import (
+    ScreenedImageUploadCompleteResponse as ScreenedImageCompleteResponse,
 )
 
 _SS58_PATTERN = r"^[1-9A-HJ-NP-Za-km-z]{47,48}$"
@@ -115,6 +136,15 @@ __all__ = [
     "ScreenerProgressStage",
     "ScreenerRuntimeState",
     "ScreenEvidenceItem",
+    "ScreenedImageUploadRequest",
+    "ScreenedImageUploadResponse",
+    "ScreenedImagePartRequest",
+    "ScreenedImagePartResponse",
+    "ScreenedImageCompletedPart",
+    "ScreenedImageCompleteRequest",
+    "ScreenedImageCompleteResponse",
+    "ScreenedImageAbortRequest",
+    "ScreenedImageAbortResponse",
     "ScreenResultRequest",
     "ScreenResultResponse",
     "SourceReviewEvidenceItem",

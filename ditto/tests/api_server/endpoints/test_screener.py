@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import bittensor
 import httpx
@@ -54,12 +54,18 @@ from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_SCREENER_AUTH,
     ERROR_CODE_VALIDATION,
 )
+from ditto.api_server.storage import (
+    ObjectMetadata,
+    ObjectNotFoundError,
+    VerifiedObject,
+)
 from ditto.chain import ChainError
 from ditto.chain.models import BlockInfo, NeuronInfo
 from ditto.db.models import (
     Agent,
     Base,
     Score,
+    ScreenedImageUpload,
     ScreenerHeartbeat,
     ScreeningAttempt,
     ScreeningDispute,
@@ -91,6 +97,24 @@ def _result_payload(
     **overrides: object,
 ) -> dict:
     attempt_id = overrides.get("attempt_id")
+    if (
+        not isinstance(attempt_id, UUID)
+        and policy_version == SCREENING_POLICY_VERSION
+        and "outcome" not in overrides
+    ):
+        # Legacy no-attempt fixtures exercise the rolling compatibility path;
+        # policy 9 itself requires an attempt-bound typed outcome.
+        policy_version = SCREENING_POLICY_VERSION - 1
+    if passed and isinstance(attempt_id, UUID):
+        overrides.setdefault("outcome", ScreenResultOutcome.PASS)
+        overrides.setdefault("image_sha256", "12" * 32)
+        overrides.setdefault("image_size_bytes", 123)
+        overrides.setdefault("image_id", "sha256:" + "34" * 32)
+        overrides.setdefault("image_ref", f"ditto-screen/{agent_id}:latest")
+        overrides.setdefault(
+            "image_upload_id",
+            uuid5(NAMESPACE_URL, f"{agent_id}:{attempt_id}:screened-image"),
+        )
     outcome_raw = overrides.get("outcome")
     outcome = ScreenResultOutcome(outcome_raw) if isinstance(outcome_raw, str) else None
     signed = (
@@ -110,6 +134,21 @@ def _result_payload(
             reason_code=overrides.get("reason_code")
             if isinstance(overrides.get("reason_code"), str)
             else None,
+            image_sha256=overrides.get("image_sha256")
+            if isinstance(overrides.get("image_sha256"), str)
+            else None,
+            image_size_bytes=overrides.get("image_size_bytes")
+            if isinstance(overrides.get("image_size_bytes"), int)
+            else None,
+            image_id=overrides.get("image_id")
+            if isinstance(overrides.get("image_id"), str)
+            else None,
+            image_ref=overrides.get("image_ref")
+            if isinstance(overrides.get("image_ref"), str)
+            else None,
+            image_upload_id=overrides.get("image_upload_id")
+            if isinstance(overrides.get("image_upload_id"), UUID)
+            else None,
         )
         if isinstance(attempt_id, UUID)
         else f"{_SCREENER_HOTKEY}:{agent_id}:{passed}:{policy_version}"
@@ -124,7 +163,38 @@ def _result_payload(
     body.update(overrides)
     if isinstance(body.get("attempt_id"), UUID):
         body["attempt_id"] = str(body["attempt_id"])
+    if isinstance(body.get("image_upload_id"), UUID):
+        body["image_upload_id"] = str(body["image_upload_id"])
     return body
+
+
+async def _seed_verified_image_upload(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    agent_id: UUID,
+    attempt_id: UUID,
+) -> UUID:
+    """Persist the completed multipart proof required by a policy-9 PASS."""
+    image_upload_id = uuid5(NAMESPACE_URL, f"{agent_id}:{attempt_id}:screened-image")
+    now = datetime.now(UTC)
+    async with maker() as session, session.begin():
+        session.add(
+            ScreenedImageUpload(
+                image_upload_id=image_upload_id,
+                agent_id=agent_id,
+                attempt_id=attempt_id,
+                screener_hotkey=_SCREENER_HOTKEY,
+                storage_upload_id=f"storage-{image_upload_id}",
+                sha256="12" * 32,
+                size_bytes=123,
+                image_id="sha256:" + "34" * 32,
+                image_ref=f"ditto-screen/{agent_id}:latest",
+                status="verified",
+                expires_at=now + timedelta(minutes=15),
+                verified_at=now,
+            )
+        )
+    return image_upload_id
 
 
 def _heartbeat_payload(
@@ -317,6 +387,32 @@ def _install_storage(app: FastAPI) -> MagicMock:
     storage.presigned_get_url = AsyncMock(
         return_value="https://signed.example/ditto-agents/x.tar.gz?sig=1"
     )
+    storage.presigned_put_url = AsyncMock(
+        return_value="https://signed.example/ditto-agents/x-image.tar?sig=1"
+    )
+    storage.create_multipart_upload = AsyncMock(return_value="storage-upload-1")
+    storage.presigned_upload_part_url = AsyncMock(
+        return_value="https://signed.example/ditto-agents/x-image-part?sig=1"
+    )
+    storage.complete_multipart_upload = AsyncMock()
+    storage.abort_multipart_upload = AsyncMock()
+    storage.delete_object = AsyncMock()
+    storage.verify_object_sha256 = AsyncMock(
+        return_value=VerifiedObject(size_bytes=123, sha256="12" * 32)
+    )
+
+    async def _head(*, key: str) -> ObjectMetadata:
+        agent_id = key.split("/", 1)[0]
+        return ObjectMetadata(
+            size_bytes=123,
+            metadata={
+                "sha256": "12" * 32,
+                "image-id": "sha256:" + "34" * 32,
+                "image-ref": f"ditto-screen/{agent_id}:latest",
+            },
+        )
+
+    storage.head_object = AsyncMock(side_effect=_head)
 
     async def _storage() -> MagicMock:
         return storage
@@ -1090,6 +1186,9 @@ class TestClaim:
         assert duplicate.status_code == 200
         assert duplicate.json()["count"] == 0
 
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=UUID(item["attempt_id"])
+        )
         payload = _result_payload(
             agent_id,
             passed=True,
@@ -1167,6 +1266,11 @@ class TestClaim:
         assert [item["agent_id"] for item in admitted] == [str(second)]
         assert admitted[0]["precheck_reason_code"] is None
 
+        await _seed_verified_image_upload(
+            session_maker,
+            agent_id=second,
+            attempt_id=UUID(admitted[0]["attempt_id"]),
+        )
         second_pass = await client.post(
             f"/api/v1/screener/agent/{second}/result",
             json=_result_payload(
@@ -2247,10 +2351,417 @@ class TestArtifact:
         assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_FOUND
 
 
+class TestScreenedImageUpload:
+    async def test_active_attempt_mints_metadata_bound_upload(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = claim.json()["items"][0]["attempt_id"]
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/screened-image-upload",
+            headers=_AUTH_HEADER,
+            json={
+                "attempt_id": attempt_id,
+                "sha256": "12" * 32,
+                "size_bytes": 123,
+                "image_id": "sha256:" + "34" * 32,
+                "image_ref": f"ditto-screen/{agent_id}:latest",
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["storage_upload_id"] == "storage-upload-1"
+        assert body["part_size_bytes"] == 64 * 1024**2
+        assert storage.create_multipart_upload.await_args.kwargs == {
+            "key": f"{agent_id}/screened-images/{body['image_upload_id']}.tar",
+            "metadata": {
+                "sha256": "12" * 32,
+                "image-id": "sha256:" + "34" * 32,
+                "image-ref": f"ditto-screen/{agent_id}:latest",
+                "attempt-id": attempt_id,
+                "image-upload-id": body["image_upload_id"],
+            },
+        }
+
+    async def test_multipart_completion_hashes_full_bytes_before_verification(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = claim.json()["items"][0]["attempt_id"]
+        metadata = {
+            "attempt_id": attempt_id,
+            "sha256": "12" * 32,
+            "size_bytes": 123,
+            "image_id": "sha256:" + "34" * 32,
+            "image_ref": f"ditto-screen/{agent_id}:latest",
+        }
+        initiated = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/screened-image-upload",
+            headers=_AUTH_HEADER,
+            json=metadata,
+        )
+        upload = initiated.json()
+        part = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/screened-image-upload/"
+            f"{upload['image_upload_id']}/part",
+            headers=_AUTH_HEADER,
+            json={
+                "attempt_id": attempt_id,
+                "storage_upload_id": upload["storage_upload_id"],
+                "part_number": 1,
+                "size_bytes": 123,
+            },
+        )
+        assert part.status_code == 200
+        assert part.json()["required_headers"] == {"Content-Length": "123"}
+        storage.head_object.side_effect = None
+        storage.head_object.return_value = ObjectMetadata(
+            size_bytes=123,
+            metadata={
+                "sha256": "12" * 32,
+                "image-id": "sha256:" + "34" * 32,
+                "image-ref": f"ditto-screen/{agent_id}:latest",
+                "attempt-id": attempt_id,
+                "image-upload-id": upload["image_upload_id"],
+            },
+        )
+        completed = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/screened-image-upload/"
+            f"{upload['image_upload_id']}/complete",
+            headers=_AUTH_HEADER,
+            json={
+                **metadata,
+                "storage_upload_id": upload["storage_upload_id"],
+                "parts": [{"part_number": 1, "etag": '"etag-1"'}],
+            },
+        )
+
+        assert completed.status_code == 200, completed.text
+        assert completed.json() == {"verified": True}
+        storage.complete_multipart_upload.assert_awaited_once()
+        storage.verify_object_sha256.assert_awaited_once_with(
+            key=f"{agent_id}/screened-images/{upload['image_upload_id']}.tar",
+            expected_size_bytes=123,
+        )
+        async with session_maker() as session:
+            row = await session.get(
+                ScreenedImageUpload, UUID(upload["image_upload_id"])
+            )
+            assert row is not None and row.status == "verified"
+        reuse = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/screened-image-upload/"
+            f"{upload['image_upload_id']}/part",
+            json={
+                "attempt_id": attempt_id,
+                "storage_upload_id": upload["storage_upload_id"],
+                "part_number": 1,
+                "size_bytes": 123,
+            },
+        )
+        assert reuse.status_code == 409
+
+    async def test_mint_rejects_wrong_agent_ref_and_expired_lease(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        first = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        second = await _seed_agent(
+            session_maker,
+            status=AgentStatus.UPLOADED,
+            created_at=datetime.now(UTC) + timedelta(seconds=1),
+        )
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+        attempt_id = (await client.post(_CLAIM_URL)).json()["items"][0]["attempt_id"]
+        base = {
+            "attempt_id": attempt_id,
+            "sha256": "12" * 32,
+            "size_bytes": 123,
+            "image_id": "sha256:" + "34" * 32,
+        }
+
+        wrong_owner = await client.post(
+            f"/api/v1/screener/agent/{second}/screened-image-upload",
+            json={**base, "image_ref": f"ditto-screen/{second}:latest"},
+        )
+        wrong_ref = await client.post(
+            f"/api/v1/screener/agent/{first}/screened-image-upload",
+            json={**base, "image_ref": f"ditto-screen/{second}:latest"},
+        )
+        async with session_maker() as session, session.begin():
+            attempt = await session.get(
+                ScreeningAttempt, UUID(attempt_id), with_for_update=True
+            )
+            assert attempt is not None
+            attempt.started_at = datetime.now(UTC) - timedelta(seconds=2)
+            attempt.deadline = datetime.now(UTC) - timedelta(seconds=1)
+        expired = await client.post(
+            f"/api/v1/screener/agent/{first}/screened-image-upload",
+            json={**base, "image_ref": f"ditto-screen/{first}:latest"},
+        )
+
+        assert wrong_owner.status_code == 409
+        assert wrong_ref.status_code == 409
+        assert expired.status_code == 409
+        storage.create_multipart_upload.assert_not_awaited()
+
+    async def test_tampered_multipart_is_deleted_and_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+        attempt_id = (await client.post(_CLAIM_URL)).json()["items"][0]["attempt_id"]
+        metadata = {
+            "attempt_id": attempt_id,
+            "sha256": "12" * 32,
+            "size_bytes": 123,
+            "image_id": "sha256:" + "34" * 32,
+            "image_ref": f"ditto-screen/{agent_id}:latest",
+        }
+        upload = (
+            await client.post(
+                f"/api/v1/screener/agent/{agent_id}/screened-image-upload",
+                json=metadata,
+            )
+        ).json()
+        storage.head_object.side_effect = None
+        storage.head_object.return_value = ObjectMetadata(
+            size_bytes=123,
+            metadata={
+                "sha256": "12" * 32,
+                "image-id": "sha256:" + "34" * 32,
+                "image-ref": f"ditto-screen/{agent_id}:latest",
+                "attempt-id": attempt_id,
+                "image-upload-id": upload["image_upload_id"],
+            },
+        )
+        storage.verify_object_sha256.return_value = VerifiedObject(
+            size_bytes=123, sha256="ff" * 32
+        )
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/screened-image-upload/"
+            f"{upload['image_upload_id']}/complete",
+            json={
+                **metadata,
+                "storage_upload_id": upload["storage_upload_id"],
+                "parts": [{"part_number": 1, "etag": '"etag"'}],
+            },
+        )
+
+        assert response.status_code == 409
+        storage.delete_object.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        ("field", "bad_value"),
+        [
+            ("sha256", "ff" * 32),
+            ("image-id", "sha256:" + "ff" * 32),
+            ("image-ref", f"ditto-screen/{uuid4()}:latest"),
+        ],
+    )
+    async def test_completion_rejects_storage_metadata_mismatch(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        field: str,
+        bad_value: str,
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+        attempt_id = (await client.post(_CLAIM_URL)).json()["items"][0]["attempt_id"]
+        declared = {
+            "attempt_id": attempt_id,
+            "sha256": "12" * 32,
+            "size_bytes": 123,
+            "image_id": "sha256:" + "34" * 32,
+            "image_ref": f"ditto-screen/{agent_id}:latest",
+        }
+        upload = (
+            await client.post(
+                f"/api/v1/screener/agent/{agent_id}/screened-image-upload",
+                json=declared,
+            )
+        ).json()
+        stored_metadata = {
+            "sha256": "12" * 32,
+            "image-id": "sha256:" + "34" * 32,
+            "image-ref": f"ditto-screen/{agent_id}:latest",
+            "attempt-id": attempt_id,
+            "image-upload-id": upload["image_upload_id"],
+        }
+        stored_metadata[field] = bad_value
+        storage.head_object.side_effect = None
+        storage.head_object.return_value = ObjectMetadata(
+            size_bytes=123, metadata=stored_metadata
+        )
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/screened-image-upload/"
+            f"{upload['image_upload_id']}/complete",
+            json={
+                **declared,
+                "storage_upload_id": upload["storage_upload_id"],
+                "parts": [{"part_number": 1, "etag": '"etag"'}],
+            },
+        )
+
+        assert response.status_code == 409
+        storage.delete_object.assert_awaited_once()
+
+    async def test_missing_multipart_upload_is_typed_conflict(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+        attempt_id = (await client.post(_CLAIM_URL)).json()["items"][0]["attempt_id"]
+        metadata = {
+            "attempt_id": attempt_id,
+            "sha256": "12" * 32,
+            "size_bytes": 123,
+            "image_id": "sha256:" + "34" * 32,
+            "image_ref": f"ditto-screen/{agent_id}:latest",
+        }
+        upload = (
+            await client.post(
+                f"/api/v1/screener/agent/{agent_id}/screened-image-upload",
+                json=metadata,
+            )
+        ).json()
+        storage.complete_multipart_upload.side_effect = ObjectNotFoundError("missing")
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/screened-image-upload/"
+            f"{upload['image_upload_id']}/complete",
+            json={
+                **metadata,
+                "storage_upload_id": upload["storage_upload_id"],
+                "parts": [{"part_number": 1, "etag": '"etag"'}],
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+
+    async def test_signed_pass_verifies_and_persists_uploaded_image(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, attempt_id=attempt_id),
+        )
+
+        assert response.status_code == 200, response.text
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.status == AgentStatus.EVALUATING
+            assert agent.screened_image_sha256 == "12" * 32
+            assert agent.screened_image_size_bytes == 123
+            assert agent.screened_image_id == "sha256:" + "34" * 32
+            assert agent.screened_image_ref == f"ditto-screen/{agent_id}:latest"
+
+    async def test_signed_pass_rejects_storage_metadata_mismatch(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+        storage.head_object.side_effect = None
+        storage.head_object.return_value = ObjectMetadata(
+            size_bytes=122,
+            metadata={
+                "sha256": "12" * 32,
+                "image-id": "sha256:" + "34" * 32,
+                "image-ref": f"ditto-screen/{agent_id}:latest",
+            },
+        )
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, attempt_id=attempt_id),
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+
+
 # --- Submit result ---------------------------------------------------------
 
 
 class TestSubmitResult:
+    async def test_legacy_outcome_none_rejects_image_fields(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                policy_version=SCREENING_POLICY_VERSION - 1,
+                image_sha256="12" * 32,
+                image_size_bytes=123,
+                image_id="sha256:" + "34" * 32,
+                image_ref=f"ditto-screen/{agent_id}:latest",
+                image_upload_id=uuid4(),
+            ),
+        )
+
+        assert response.status_code == 422
+
     async def test_legacy_pass_cannot_promote(
         self,
         app: FastAPI,
@@ -2286,9 +2797,14 @@ class TestSubmitResult:
             agent.dataset_run_size = "full"
         _install_db(app, session_maker)
         _install_chain(app)
+        claim = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
         response = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id),
+            json=_result_payload(agent_id, attempt_id=attempt_id),
         )
         assert response.status_code == 200
         async with session_maker() as s:
@@ -2307,10 +2823,14 @@ class TestSubmitResult:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
         _install_db(app, session_maker)
         _install_chain(app)
-
+        claim = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
         response = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=True),
+            json=_result_payload(agent_id, passed=True, attempt_id=attempt_id),
         )
         assert response.status_code == 200
         body = response.json()
@@ -2347,7 +2867,7 @@ class TestSubmitResult:
             agent = await s.get(Agent, agent_id)
             assert agent is not None
             assert agent.screening_reason == "Docker image build failed"
-            assert agent.screening_policy_version == SCREENING_POLICY_VERSION
+            assert agent.screening_policy_version == 0
             assert "SECRET_FROM_BUILD" not in agent.screening_reason
 
     @pytest.mark.parametrize(
@@ -2406,10 +2926,14 @@ class TestSubmitResult:
         )
         _install_db(app, session_maker)
         _install_chain(app)
-
+        claim = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
         response = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=True),
+            json=_result_payload(agent_id, passed=True, attempt_id=attempt_id),
         )
 
         assert response.status_code == 200
@@ -2479,14 +3003,19 @@ class TestSubmitResult:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
         _install_db(app, session_maker)
         _install_chain(app)
-
+        claim = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
+        payload = _result_payload(agent_id, passed=True, attempt_id=attempt_id)
         first = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=True),
+            json=payload,
         )
         second = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=True),
+            json=payload,
         )
         assert first.status_code == 200
         assert second.status_code == 200
@@ -2503,10 +3032,14 @@ class TestSubmitResult:
         _install_chain(app)
         gen = _FakeGenerator(run_size="full", sha="be" * 32)
         _install_generator(app, gen)
-
+        claim = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
         response = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=True),
+            json=_result_payload(agent_id, passed=True, attempt_id=attempt_id),
         )
         assert response.status_code == 200
         assert response.json()["status"] == AgentStatus.EVALUATING
@@ -2539,10 +3072,14 @@ class TestSubmitResult:
         _install_db(app, session_maker)
         _install_chain(app, block_error=True)
         _install_generator(app, _FakeGenerator(run_size="full", sha="be" * 32))
-
+        claim = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
         response = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=True),
+            json=_result_payload(agent_id, passed=True, attempt_id=attempt_id),
         )
         assert response.status_code == 200
         async with session_maker() as s:
@@ -2564,18 +3101,22 @@ class TestSubmitResult:
         _install_db(app, session_maker)
         _install_chain(app)
         _install_generator(app, _FakeGenerator(fail=True))
-
+        claim = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
         response = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=True),
+            json=_result_payload(agent_id, passed=True, attempt_id=attempt_id),
         )
         # Required dataset failed to generate: the verdict must NOT have promoted
-        # the agent (it can be retried).
+        # the agent past its active screening lease (it can be retried).
         assert response.status_code == 500
         async with session_maker() as s:
             agent = await s.get(Agent, agent_id)
             assert agent is not None
-            assert agent.status == AgentStatus.UPLOADED
+            assert agent.status == AgentStatus.SCREENING
             assert agent.dataset_seed is None
 
     async def test_idempotent_repeat_does_not_regenerate(
@@ -2590,13 +3131,20 @@ class TestSubmitResult:
         gen = _FakeGenerator(sha="ab" * 32)
         _install_generator(app, gen)
 
+        claim = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
+        payload = _result_payload(agent_id, passed=True, attempt_id=attempt_id)
+
         first = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=True),
+            json=payload,
         )
         second = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=True),
+            json=payload,
         )
         assert first.status_code == 200
         assert second.status_code == 200
@@ -2617,9 +3165,26 @@ class TestSubmitResult:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.SCREENING)
         _install_db(app, session_maker)
         _install_chain(app)
+        attempt_id = uuid4()
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=attempt_id,
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="running",
+                    started_at=now,
+                    deadline=now + timedelta(minutes=30),
+                )
+            )
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
         response = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=True),
+            json=_result_payload(agent_id, passed=True, attempt_id=attempt_id),
         )
         assert response.status_code == 200
         assert response.json()["status"] == AgentStatus.EVALUATING
@@ -2720,7 +3285,8 @@ class TestSubmitResult:
         _install_chain(app)
         aid = uuid4()
         response = await client.post(
-            f"/api/v1/screener/agent/{aid}/result", json=_result_payload(aid)
+            f"/api/v1/screener/agent/{aid}/result",
+            json=_result_payload(aid, passed=False),
         )
         assert response.status_code == 404
         assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_FOUND

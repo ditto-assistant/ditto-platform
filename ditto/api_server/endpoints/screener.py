@@ -39,6 +39,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
     ArtifactResponse,
+    ScreenedImageAbortRequest,
+    ScreenedImageAbortResponse,
+    ScreenedImageCompleteRequest,
+    ScreenedImageCompleteResponse,
+    ScreenedImagePartRequest,
+    ScreenedImagePartResponse,
+    ScreenedImageUploadRequest,
+    ScreenedImageUploadResponse,
     ScreenerHeartbeatRequest,
     ScreenerHeartbeatResponse,
     ScreenerQueueItem,
@@ -61,9 +69,19 @@ from ditto.api_server.endpoints.validator import (
     _verify_signature,
 )
 from ditto.api_server.onchain_seed import derive_seed
-from ditto.api_server.storage import S3StorageClient
+from ditto.api_server.storage import (
+    ObjectDownloadFailedError,
+    ObjectNotFoundError,
+    ObjectUploadFailedError,
+    S3StorageClient,
+)
 from ditto.chain import ChainError
-from ditto.db.models import Agent, ScreeningAttempt, ScreeningQuarantine
+from ditto.db.models import (
+    Agent,
+    ScreenedImageUpload,
+    ScreeningAttempt,
+    ScreeningQuarantine,
+)
 from ditto.db.queries.agents import get_agent_by_id
 from ditto.db.queries.heartbeats import (
     prune_stale_screener_heartbeats,
@@ -85,12 +103,14 @@ router = APIRouter(prefix="/screener", tags=["screener"])
 
 # How long a pre-signed artifact URL stays valid (mirrors the validator's).
 _ARTIFACT_URL_TTL = timedelta(minutes=5)
-# One screening attempt: download + docker build + serve/health + bounded source
-# review. Must exceed the worker's build cap (SCREENER_BUILD_TIMEOUT_SECONDS, 45m)
-# plus serve and review, or a slow-but-legitimate crate compile outlives the
-# lease and its verdict is rejected as expired, re-queuing the same agent in a
-# loop. Keep this in step with the screener's build cap when either moves.
-_SCREENING_LEASE_TTL = timedelta(minutes=45)
+_SCREENED_IMAGE_UPLOAD_TTL = timedelta(minutes=15)
+_SCREENED_IMAGE_PART_SIZE = 64 * 1024**2
+# One screening attempt: download + Docker build + serve/health + bounded source
+# review + image export + multipart upload. Must exceed the worker's build cap
+# (SCREENER_BUILD_TIMEOUT_SECONDS, 45m) plus those finalization stages, or a
+# slow-but-legitimate crate outlives the lease and requeues in a loop. Keep this
+# in step with the screener's build and upload deadlines when either moves.
+_SCREENING_LEASE_TTL = timedelta(minutes=70)
 _HEARTBEAT_MAX_SKEW_SECONDS = 300
 _HEARTBEAT_MAX_BYTES = 4096
 # instance_id stored for pre-v3 (no per-instance identity) heartbeats. Distinct
@@ -110,6 +130,11 @@ _FIRST_VERSIONED_POLICY = 2
 
 def _artifact_key(agent_id: UUID) -> str:
     return f"{agent_id}/agent.tar.gz"
+
+
+def _screened_image_key(agent_id: UUID, image_upload_id: UUID) -> str:
+    """Return an immutable object key unique to one platform-minted upload."""
+    return f"{agent_id}/screened-images/{image_upload_id}.tar"
 
 
 # Agents a verdict may act on. ``screening`` is included for forward-compat with
@@ -484,6 +509,335 @@ async def agent_artifact(
     )
 
 
+@router.post(
+    "/agent/{agent_id}/screened-image-upload",
+    response_model=ScreenedImageUploadResponse,
+    responses={
+        401: {"description": "Missing/invalid screener auth."},
+        409: {"description": "Screening attempt is not active."},
+        422: {"description": "Malformed image metadata."},
+    },
+)
+async def screened_image_upload(
+    agent_id: UUID,
+    payload: ScreenedImageUploadRequest,
+    response: Response,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+    storage: StorageDep,
+) -> ScreenedImageUploadResponse:
+    """Initiate an immutable multipart upload bound to the active lease."""
+    response.headers["Cache-Control"] = "no-store"
+    expected_ref = f"ditto-screen/{agent_id}:latest"
+    if payload.image_ref != expected_ref:
+        raise AgentNotScreenableError("screened image ref does not match agent")
+    now = datetime.now(UTC)
+    async with session.begin():
+        attempt = await get_screening_attempt(
+            session, attempt_id=payload.attempt_id, for_update=True
+        )
+        if (
+            attempt is None
+            or attempt.agent_id != agent_id
+            or attempt.screener_hotkey != screener_hotkey
+            or attempt.policy_version != SCREENING_POLICY_VERSION
+            or attempt.status != "running"
+        ):
+            raise AgentNotScreenableError(
+                "screened image upload does not match an active screening attempt"
+            )
+        deadline = attempt.deadline
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        if now > deadline:
+            raise AgentNotScreenableError("screened image upload lease has expired")
+
+    image_upload_id = uuid4()
+    expires_at = min(now + _SCREENED_IMAGE_UPLOAD_TTL, deadline)
+    metadata = {
+        "sha256": payload.sha256,
+        "image-id": payload.image_id,
+        "image-ref": payload.image_ref,
+        "attempt-id": str(payload.attempt_id),
+        "image-upload-id": str(image_upload_id),
+    }
+    key = _screened_image_key(agent_id, image_upload_id)
+    storage_upload_id = await storage.create_multipart_upload(
+        key=key,
+        metadata=metadata,
+    )
+    try:
+        async with session.begin():
+            attempt = await get_screening_attempt(
+                session, attempt_id=payload.attempt_id, for_update=True
+            )
+            if (
+                attempt is None
+                or attempt.agent_id != agent_id
+                or attempt.screener_hotkey != screener_hotkey
+                or attempt.policy_version != SCREENING_POLICY_VERSION
+                or attempt.status != "running"
+            ):
+                raise AgentNotScreenableError(
+                    "screened image upload lease changed during initiation"
+                )
+            session.add(
+                ScreenedImageUpload(
+                    image_upload_id=image_upload_id,
+                    agent_id=agent_id,
+                    attempt_id=payload.attempt_id,
+                    screener_hotkey=screener_hotkey,
+                    storage_upload_id=storage_upload_id,
+                    sha256=payload.sha256,
+                    size_bytes=payload.size_bytes,
+                    image_id=payload.image_id,
+                    image_ref=payload.image_ref,
+                    status="initiated",
+                    expires_at=expires_at,
+                )
+            )
+    except Exception:
+        await storage.abort_multipart_upload(key=key, upload_id=storage_upload_id)
+        raise
+    return ScreenedImageUploadResponse(
+        image_upload_id=image_upload_id,
+        storage_upload_id=storage_upload_id,
+        part_size_bytes=_SCREENED_IMAGE_PART_SIZE,
+        expires_at=expires_at,
+    )
+
+
+async def _load_active_image_upload(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    image_upload_id: UUID,
+    attempt_id: UUID,
+    storage_upload_id: str,
+    screener_hotkey: str,
+    for_update: bool = False,
+) -> ScreenedImageUpload:
+    """Load and authenticate one unexpired, attempt-bound multipart session."""
+    upload = await session.get(
+        ScreenedImageUpload, image_upload_id, with_for_update=for_update
+    )
+    if (
+        upload is None
+        or upload.agent_id != agent_id
+        or upload.attempt_id != attempt_id
+        or upload.screener_hotkey != screener_hotkey
+        or upload.storage_upload_id != storage_upload_id
+        or upload.status != "initiated"
+    ):
+        raise AgentNotScreenableError(
+            "screened image multipart session is not active or does not match owner"
+        )
+    expires_at = upload.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if datetime.now(UTC) > expires_at:
+        raise AgentNotScreenableError("screened image multipart session has expired")
+    attempt = await get_screening_attempt(
+        session, attempt_id=attempt_id, for_update=for_update
+    )
+    if (
+        attempt is None
+        or attempt.agent_id != agent_id
+        or attempt.screener_hotkey != screener_hotkey
+        or attempt.status != "running"
+        or attempt.policy_version != SCREENING_POLICY_VERSION
+    ):
+        raise AgentNotScreenableError("screening attempt is no longer active")
+    return upload
+
+
+@router.post(
+    "/agent/{agent_id}/screened-image-upload/{image_upload_id}/part",
+    response_model=ScreenedImagePartResponse,
+)
+async def screened_image_upload_part(
+    agent_id: UUID,
+    image_upload_id: UUID,
+    payload: ScreenedImagePartRequest,
+    response: Response,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+    storage: StorageDep,
+) -> ScreenedImagePartResponse:
+    """Mint one short-lived, attempt-bound multipart part URL."""
+    response.headers["Cache-Control"] = "no-store"
+    async with session.begin():
+        upload = await _load_active_image_upload(
+            session,
+            agent_id=agent_id,
+            image_upload_id=image_upload_id,
+            attempt_id=payload.attempt_id,
+            storage_upload_id=payload.storage_upload_id,
+            screener_hotkey=screener_hotkey,
+        )
+        max_parts = (
+            upload.size_bytes + _SCREENED_IMAGE_PART_SIZE - 1
+        ) // _SCREENED_IMAGE_PART_SIZE
+        if payload.part_number > max_parts:
+            raise AgentNotScreenableError("multipart part exceeds declared image size")
+        expected_size = min(
+            _SCREENED_IMAGE_PART_SIZE,
+            upload.size_bytes - (payload.part_number - 1) * _SCREENED_IMAGE_PART_SIZE,
+        )
+        if payload.size_bytes != expected_size:
+            raise AgentNotScreenableError(
+                "multipart part size does not match declaration"
+            )
+        expires_at = upload.expires_at
+    ttl = max(
+        1,
+        min(
+            int(_SCREENED_IMAGE_UPLOAD_TTL.total_seconds()),
+            int(
+                (
+                    expires_at.replace(tzinfo=UTC)
+                    if expires_at.tzinfo is None
+                    else expires_at
+                ).timestamp()
+                - datetime.now(UTC).timestamp()
+            ),
+        ),
+    )
+    url = await storage.presigned_upload_part_url(
+        key=_screened_image_key(agent_id, image_upload_id),
+        upload_id=payload.storage_upload_id,
+        part_number=payload.part_number,
+        expires_in=ttl,
+    )
+    return ScreenedImagePartResponse(
+        upload_url=url,
+        expires_at=datetime.now(UTC) + timedelta(seconds=ttl),
+        required_headers={"Content-Length": str(payload.size_bytes)},
+    )
+
+
+@router.post(
+    "/agent/{agent_id}/screened-image-upload/{image_upload_id}/complete",
+    response_model=ScreenedImageCompleteResponse,
+)
+async def screened_image_upload_complete(
+    agent_id: UUID,
+    image_upload_id: UUID,
+    payload: ScreenedImageCompleteRequest,
+    response: Response,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+    storage: StorageDep,
+) -> ScreenedImageCompleteResponse:
+    """Complete multipart upload and verify the exact final archive bytes."""
+    response.headers["Cache-Control"] = "no-store"
+    async with session.begin():
+        upload = await _load_active_image_upload(
+            session,
+            agent_id=agent_id,
+            image_upload_id=image_upload_id,
+            attempt_id=payload.attempt_id,
+            storage_upload_id=payload.storage_upload_id,
+            screener_hotkey=screener_hotkey,
+        )
+        if (
+            upload.sha256 != payload.sha256
+            or upload.size_bytes != payload.size_bytes
+            or upload.image_id != payload.image_id
+            or upload.image_ref != payload.image_ref
+        ):
+            raise AgentNotScreenableError(
+                "multipart completion metadata does not match initiation"
+            )
+    key = _screened_image_key(agent_id, image_upload_id)
+    try:
+        await storage.complete_multipart_upload(
+            key=key,
+            upload_id=payload.storage_upload_id,
+            parts=[
+                {"PartNumber": part.part_number, "ETag": part.etag}
+                for part in payload.parts
+            ],
+        )
+        stored = await storage.head_object(key=key)
+        expected_metadata = {
+            "sha256": payload.sha256,
+            "image-id": payload.image_id,
+            "image-ref": payload.image_ref,
+            "attempt-id": str(payload.attempt_id),
+            "image-upload-id": str(image_upload_id),
+        }
+        verified = await storage.verify_object_sha256(
+            key=key, expected_size_bytes=payload.size_bytes
+        )
+    except ObjectNotFoundError as error:
+        raise AgentNotScreenableError(
+            "screened image upload is missing or incomplete"
+        ) from error
+    except (ObjectUploadFailedError, ObjectDownloadFailedError) as error:
+        raise HTTPException(
+            status_code=503, detail="screened image storage verification unavailable"
+        ) from error
+    if (
+        stored.size_bytes != payload.size_bytes
+        or stored.metadata != expected_metadata
+        or verified.size_bytes != payload.size_bytes
+        or verified.sha256 != payload.sha256
+    ):
+        await storage.delete_object(key=key)
+        async with session.begin():
+            stored_upload = await session.get(
+                ScreenedImageUpload, image_upload_id, with_for_update=True
+            )
+            if stored_upload is not None:
+                stored_upload.status = "aborted"
+        raise AgentNotScreenableError(
+            "completed screened image bytes do not match the declared digest"
+        )
+    async with session.begin():
+        stored_upload = await session.get(
+            ScreenedImageUpload, image_upload_id, with_for_update=True
+        )
+        if stored_upload is None or stored_upload.status != "initiated":
+            raise AgentNotScreenableError("multipart session is no longer active")
+        stored_upload.status = "verified"
+        stored_upload.verified_at = datetime.now(UTC)
+    return ScreenedImageCompleteResponse(verified=True)
+
+
+@router.post(
+    "/agent/{agent_id}/screened-image-upload/{image_upload_id}/abort",
+    response_model=ScreenedImageAbortResponse,
+)
+async def screened_image_upload_abort(
+    agent_id: UUID,
+    image_upload_id: UUID,
+    payload: ScreenedImageAbortRequest,
+    response: Response,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+    storage: StorageDep,
+) -> ScreenedImageAbortResponse:
+    """Abort a multipart upload and mark the session terminal."""
+    response.headers["Cache-Control"] = "no-store"
+    async with session.begin():
+        upload = await _load_active_image_upload(
+            session,
+            agent_id=agent_id,
+            image_upload_id=image_upload_id,
+            attempt_id=payload.attempt_id,
+            storage_upload_id=payload.storage_upload_id,
+            screener_hotkey=screener_hotkey,
+            for_update=True,
+        )
+        upload.status = "aborted"
+    await storage.abort_multipart_upload(
+        key=_screened_image_key(agent_id, image_upload_id),
+        upload_id=payload.storage_upload_id,
+    )
+    return ScreenedImageAbortResponse(aborted=True)
+
+
 def _public_screening_reason(detail: str, reason_code: str | None = None) -> str:
     """Map untrusted screener detail to a stable, public-safe failure category.
 
@@ -596,6 +950,7 @@ async def submit_result(
     chain: ChainDep,
     session: SessionDep,
     generator: GeneratorDep,
+    storage: StorageDep,
 ) -> ScreenResultResponse:
     """Record the screener's verdict and advance the agent's lifecycle.
 
@@ -616,6 +971,9 @@ async def submit_result(
 
     if payload.screener_hotkey != screener_hotkey:
         raise ScreenerAuthError("payload hotkey does not match authenticated screener")
+    if payload.policy_version >= 9 and payload.outcome is None:
+        raise AgentNotScreenableError("policy-9 verdicts require a typed outcome")
+    image_upload_id = payload.image_upload_id
 
     # Signature proves the screener owns the hotkey and binds THIS verdict:
     #    ``passed`` is signed, so a captured result can't be replayed with the
@@ -631,6 +989,11 @@ async def submit_result(
             manifest_digest=payload.manifest_digest,
             finding_digest=payload.finding_digest,
             reason_code=payload.reason_code,
+            image_sha256=payload.image_sha256,
+            image_size_bytes=payload.image_size_bytes,
+            image_id=payload.image_id,
+            image_ref=payload.image_ref,
+            image_upload_id=image_upload_id,
         )
     elif payload.attempt_id is not None:
         signed = verdict_signing_message(
@@ -667,6 +1030,41 @@ async def submit_result(
         raise AgentNotScreenableError(
             "exact duplicate precheck requires a deterministic rejection"
         )
+
+    verified_upload: ScreenedImageUpload | None = None
+    if payload.image_sha256 is not None:
+        if image_upload_id is None:
+            raise AgentNotScreenableError(
+                "passing screened image is missing its upload identity"
+            )
+        async with session.begin():
+            verified_upload = await session.get(ScreenedImageUpload, image_upload_id)
+        if (
+            verified_upload is None
+            or verified_upload.status != "verified"
+            or verified_upload.agent_id != agent_id
+            or verified_upload.attempt_id != payload.attempt_id
+            or verified_upload.screener_hotkey != screener_hotkey
+            or verified_upload.sha256 != payload.image_sha256
+            or verified_upload.size_bytes != payload.image_size_bytes
+            or verified_upload.image_id != payload.image_id
+            or verified_upload.image_ref != payload.image_ref
+            or verified_upload.verified_at is None
+        ):
+            raise AgentNotScreenableError(
+                "screened image was not verified for this screening attempt"
+            )
+        key = _screened_image_key(agent_id, image_upload_id)
+        try:
+            stored_image = await storage.head_object(key=key)
+        except ObjectNotFoundError as error:
+            raise AgentNotScreenableError(
+                "verified screened image is missing from storage"
+            ) from error
+        if stored_image.size_bytes != payload.image_size_bytes:
+            raise AgentNotScreenableError(
+                "stored screened image size changed after verification"
+            )
 
     public_reason: str | None
     if payload.outcome == ScreenResultOutcome.INCONCLUSIVE:
@@ -810,6 +1208,15 @@ async def submit_result(
         # remain retryable under the same policy.
         if payload.policy_version == SCREENING_POLICY_VERSION:
             agent.screening_policy_version = payload.policy_version
+        if payload.passed:
+            agent.screened_image_sha256 = payload.image_sha256
+            agent.screened_image_size_bytes = payload.image_size_bytes
+            agent.screened_image_id = payload.image_id
+            agent.screened_image_ref = payload.image_ref
+            agent.screened_image_upload_id = image_upload_id
+            agent.screened_image_verified_at = (
+                verified_upload.verified_at if verified_upload is not None else None
+            )
         if attempt is None and not idempotent:
             now = datetime.now(UTC)
             attempt = ScreeningAttempt(
