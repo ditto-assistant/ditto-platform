@@ -16,7 +16,7 @@ lock guarantees one validator cannot hold two live assignments across agents.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 from sqlalchemy import case, func, select
@@ -115,6 +115,8 @@ async def issue_ticket(
     now: datetime,
     ttl: timedelta,
     bench_version: int = 2,
+    artifact_mode: Literal["legacy", "prefer_screened", "screened_only"] = "legacy",
+    validator_running_benchmark: bool = False,
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
@@ -143,8 +145,17 @@ async def issue_ticket(
     # A validator executes one benchmark at a time. Polling again (including
     # after a process restart) must resume that still-live lease instead of
     # allocating unrelated work and leaving the first ticket stranded.
-    existing = await session.scalar(
+    complete_screened_image = (
+        Agent.screened_image_sha256.is_not(None)
+        & Agent.screened_image_size_bytes.is_not(None)
+        & Agent.screened_image_id.is_not(None)
+        & Agent.screened_image_ref.is_not(None)
+        & Agent.screened_image_upload_id.is_not(None)
+        & Agent.screened_image_verified_at.is_not(None)
+    )
+    existing_statement = (
         select(ValidatorTicket)
+        .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
         .where(
             ValidatorTicket.validator_hotkey == validator_hotkey,
             ValidatorTicket.status == TicketStatus.ISSUED,
@@ -154,8 +165,33 @@ async def issue_ticket(
         .limit(1)
         .with_for_update()
     )
+    if artifact_mode == "screened_only":
+        existing_statement = existing_statement.where(complete_screened_image)
+    existing = await session.scalar(existing_statement)
     if existing is not None:
         return existing
+    if artifact_mode == "screened_only":
+        incompatible_existing = await session.scalar(
+            select(ValidatorTicket)
+            .where(
+                ValidatorTicket.validator_hotkey == validator_hotkey,
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.deadline > now,
+            )
+            .limit(1)
+            .with_for_update()
+        )
+        if incompatible_existing is not None:
+            if validator_running_benchmark:
+                # Never revoke work a fresh signed heartbeat says is active.
+                return None
+            # A validator can become image-only after receiving a legacy lease.
+            # Release that unstarted assignment immediately so fallback-capable
+            # fleet members can claim it instead of stranding it for 90 minutes.
+            incompatible_existing.status = TicketStatus.EXPIRED
+            incompatible_existing.deadline = now
+            incompatible_existing.retry_after = now
+            await session.flush()
 
     score_continuation_floor = await get_score_continuation_floor(session)
 
@@ -314,6 +350,8 @@ async def issue_ticket(
             Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
             Agent.agent_id.not_in(already_mine),
         )
+        if artifact_mode == "screened_only":
+            candidate = candidate.where(complete_screened_image)
         if score_continuation_floor is not None:
             # A median-of-three cannot be bounded safely after one score. Once
             # two scores exist, their maximum is the best final median the
@@ -338,6 +376,12 @@ async def issue_ticket(
             # highest provisional composite so the likely emission winner
             # advances first. Submission age and UUID remain stable ties.
             candidate.order_by(
+                # Prefer verified screener-built images without excluding
+                # source fallback during the mixed-fleet rollout.
+                case(
+                    (complete_screened_image, 0),
+                    else_=(0 if artifact_mode == "legacy" else 1),
+                ).asc(),
                 contender_lane.asc(),
                 total_coverage.asc(),
                 had_prior_ticket.asc(),

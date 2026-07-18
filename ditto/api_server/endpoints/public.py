@@ -41,6 +41,7 @@ from typing import Annotated, Any, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -106,6 +107,10 @@ from ditto.api_models.screener import (
 from ditto.api_models.system_health import SystemMetrics
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator import ValidatorRuntimeState
+from ditto.api_models.validator_capabilities import (
+    ValidatorCapabilities,
+    ValidatorStackIdentity,
+)
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.endpoints.scoring import (
@@ -874,6 +879,16 @@ def _validator_heartbeats_response(
         )
         assignment = assignment_by_hotkey.get(row.validator_hotkey)
         synchronized_work = active_by_hotkey.get(row.validator_hotkey)
+        capabilities = None
+        stack = None
+        if row.protocol_version >= 7:
+            try:
+                capabilities = ValidatorCapabilities.model_validate(row.capabilities)
+                stack = ValidatorStackIdentity.model_validate(row.stack)
+            except ValidationError:
+                # Stored telemetry is not trusted merely because it is JSON.
+                # Malformed v7 data is omitted publicly and rejected for routing.
+                pass
         assignment_state: ValidatorAssignmentState
         if assignment is None:
             assignment_state = (
@@ -918,6 +933,8 @@ def _validator_heartbeats_response(
                 availability=availability,
                 health=health,
                 system_metrics=metrics,
+                capabilities=capabilities,
+                stack=stack,
             )
         )
     return PublicValidatorHeartbeatsResponse(

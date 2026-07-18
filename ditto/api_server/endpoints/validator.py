@@ -42,11 +42,12 @@ import re
 import statistics
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 import bittensor
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
@@ -68,6 +69,12 @@ from ditto.api_models.system_health import (
     system_metrics_signing_token,
 )
 from ditto.api_models.upload import _SS58_PATTERN
+from ditto.api_models.validator_capabilities import (
+    ValidatorCapabilities,
+    ValidatorStackIdentity,
+    validator_artifact_mode,
+    validator_identity_signing_token,
+)
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, stamp_bench_version
 from ditto.api_server.config import ValidatorCompatibilityConfig
@@ -326,8 +333,22 @@ def _heartbeat_signing_message(
     active_agent_id: UUID | None = None,
     system_metrics: SystemMetrics | None = None,
     benchmark_progress: BenchmarkProgress | None = None,
+    capabilities: ValidatorCapabilities | None = None,
+    stack: ValidatorStackIdentity | None = None,
 ) -> bytes:
     """Canonical heartbeat payload, mirrored by ``ditto-subnet``."""
+    if protocol_version >= 7:
+        if capabilities is None or stack is None:
+            raise ValueError("heartbeat protocol v7 requires capabilities and stack")
+        active = str(active_agent_id) if active_agent_id is not None else ""
+        return (
+            "ditto-validator-heartbeat:v7:"
+            f"{validator_hotkey}:{software_version}:{protocol_version}:"
+            f"{code_digest}:{state}:{active}:"
+            f"{system_metrics_signing_token(system_metrics)}:"
+            f"{benchmark_progress_signing_token(benchmark_progress)}:"
+            f"{validator_identity_signing_token(capabilities, stack)}:{timestamp}"
+        ).encode()
     if protocol_version >= 4:
         active = str(active_agent_id) if active_agent_id is not None else ""
         return (
@@ -445,6 +466,8 @@ async def heartbeat(
         active_agent_id=request_body.active_agent_id,
         system_metrics=request_body.system_metrics,
         benchmark_progress=request_body.benchmark_progress,
+        capabilities=request_body.capabilities,
+        stack=request_body.stack,
     )
     if not _verify_signature(validator_hotkey, payload, request_body.signature):
         raise ValidatorAuthError("heartbeat signature verification failed")
@@ -502,6 +525,16 @@ async def heartbeat(
                     else None
                 ),
                 benchmark_progress=stored_benchmark_progress,
+                capabilities=(
+                    request_body.capabilities.model_dump(mode="json")
+                    if request_body.capabilities is not None
+                    else None
+                ),
+                stack=(
+                    request_body.stack.model_dump(mode="json")
+                    if request_body.stack is not None
+                    else None
+                ),
                 reported_at=reported_at,
                 seen_at=now,
                 signature=request_body.signature,
@@ -572,6 +605,14 @@ async def request_job(
             now=now,
             config=request.app.state.config.validator_compatibility,
         )
+        artifact_mode, validator_state = await _validator_artifact_routing(
+            session,
+            validator_hotkey=payload.validator_hotkey,
+            now=now,
+            heartbeat_max_age_seconds=(
+                request.app.state.config.validator_compatibility.heartbeat_max_age_seconds
+            ),
+        )
         try:
             await consume_validator_nonce(
                 session,
@@ -590,6 +631,8 @@ async def request_job(
             now=now,
             ttl=_TICKET_TTL,
             bench_version=CURRENT_BENCH_VERSION,
+            artifact_mode=artifact_mode,
+            validator_running_benchmark=validator_state == "running_benchmark",
         )
         if ticket is None:
             return Response(status_code=204, headers={"Cache-Control": "no-store"})
@@ -675,6 +718,44 @@ async def _assert_validator_compatible(
                 f"{config.minimum_software_version}; update ditto-subnet"
             ),
         )
+
+
+async def _validator_artifact_routing(
+    session: AsyncSession,
+    *,
+    validator_hotkey: str,
+    now: datetime,
+    heartbeat_max_age_seconds: int,
+) -> tuple[Literal["legacy", "prefer_screened", "screened_only"], str | None]:
+    """Return signed routing mode/state; pre-v7 reporters remain legacy."""
+    heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
+    if heartbeat is None or heartbeat.protocol_version < 7:
+        return "legacy", None
+    seen_at = heartbeat.seen_at
+    if seen_at.tzinfo is None:
+        seen_at = seen_at.replace(tzinfo=UTC)
+    if now - seen_at > timedelta(seconds=heartbeat_max_age_seconds):
+        raise HTTPException(
+            status_code=428,
+            detail="validator heartbeat v7 is stale; report a fresh heartbeat",
+        )
+    try:
+        capabilities = ValidatorCapabilities.model_validate(heartbeat.capabilities)
+        stack = ValidatorStackIdentity.model_validate(heartbeat.stack)
+    except ValidationError as error:
+        raise HTTPException(
+            status_code=428,
+            detail=(
+                "validator heartbeat v7 capabilities are malformed; "
+                "report a fresh heartbeat"
+            ),
+        ) from error
+    if capabilities.full_stack_managed != (stack.mode == "managed"):
+        raise HTTPException(
+            status_code=428,
+            detail="validator heartbeat v7 capabilities contradict stack identity",
+        )
+    return validator_artifact_mode(capabilities), heartbeat.state
 
 
 @router.get(

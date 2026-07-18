@@ -12,6 +12,7 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
@@ -38,6 +39,11 @@ from ditto.api_models.system_health import (
     system_metrics_signing_token,
 )
 from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.validator_capabilities import (
+    ValidatorCapabilities,
+    ValidatorStackIdentity,
+    validator_identity_signing_token,
+)
 from ditto.api_server.config import ValidatorCompatibilityConfig
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -106,6 +112,64 @@ def test_v4_heartbeat_canonical_vector() -> None:
         b"running_benchmark,51,114,2030-01-01T00:00:00.000000+00:00:"
         b"1784020800"
     )
+
+
+@pytest.mark.parametrize(
+    ("protocol_version", "domain", "suffix"),
+    [
+        (1, "v1", "idle:1784020800"),
+        (2, "v2", "idle::1784020800"),
+        (3, "v3", "idle::-:1784020800"),
+        (5, "v4", "idle::-:-:1784020800"),
+        (6, "v4", "idle::-:-:1784020800"),
+    ],
+)
+def test_v1_v2_v3_v5_v6_heartbeat_domains_are_frozen(
+    protocol_version: int, domain: str, suffix: str
+) -> None:
+    hotkey = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+    digest = "ab" * 32
+    actual = _heartbeat_signing_message(
+        validator_hotkey=hotkey,
+        software_version="1.2.3",
+        protocol_version=protocol_version,
+        code_digest=digest,
+        state="idle",
+        timestamp=1784020800,
+    )
+    assert (
+        actual
+        == (
+            f"ditto-validator-heartbeat:{domain}:{hotkey}:1.2.3:"
+            f"{protocol_version}:{digest}:{suffix}"
+        ).encode()
+    )
+
+
+def test_v7_heartbeat_matches_shared_cross_repo_vector() -> None:
+    fixture = json.loads(
+        (
+            Path(__file__).parents[2] / "contract" / "validator_heartbeat_v7.json"
+        ).read_text()
+    )
+    request = fixture["request"]
+    capabilities = ValidatorCapabilities.model_validate(request["capabilities"])
+    stack = ValidatorStackIdentity.model_validate(request["stack"])
+    actual = _heartbeat_signing_message(
+        validator_hotkey=request["validator_hotkey"],
+        software_version=request["software_version"],
+        protocol_version=request["protocol_version"],
+        code_digest=request["code_digest"],
+        state=request["state"],
+        active_agent_id=request["active_agent_id"],
+        system_metrics=request["system_metrics"],
+        benchmark_progress=request["benchmark_progress"],
+        capabilities=capabilities,
+        stack=stack,
+        timestamp=request["timestamp"],
+    )
+    assert actual == fixture["expected_message_utf8"].encode()
+    assert actual.hex() == fixture["expected_message_hex"]
 
 
 def _sign(message: str) -> str:
@@ -195,10 +259,32 @@ def _heartbeat_payload(
     active_agent_id: UUID | None = None,
     system_metrics: dict[str, object] | None = None,
     benchmark_progress: dict[str, object] | None = None,
+    capabilities: dict[str, object] | None = None,
+    stack: dict[str, object] | None = None,
 ) -> dict[str, object]:
     ts = timestamp if timestamp is not None else int(datetime.now(UTC).timestamp())
     hotkey = keypair.ss58_address
-    if protocol_version >= 4:
+    if protocol_version >= 7:
+        metrics = (
+            SystemMetrics.model_validate(system_metrics)
+            if system_metrics is not None
+            else None
+        )
+        progress = (
+            BenchmarkProgress.model_validate_json(json.dumps(benchmark_progress))
+            if benchmark_progress is not None
+            else None
+        )
+        typed_capabilities = ValidatorCapabilities.model_validate(capabilities)
+        typed_stack = ValidatorStackIdentity.model_validate(stack)
+        message = (
+            f"ditto-validator-heartbeat:v7:{hotkey}:0.1.0:{protocol_version}:"
+            f"{code_digest}:{state}:{active_agent_id or ''}:"
+            f"{system_metrics_signing_token(metrics)}:"
+            f"{benchmark_progress_signing_token(progress)}:"
+            f"{validator_identity_signing_token(typed_capabilities, typed_stack)}:{ts}"
+        )
+    elif protocol_version >= 4:
         metrics = (
             SystemMetrics.model_validate(system_metrics)
             if system_metrics is not None
@@ -250,6 +336,10 @@ def _heartbeat_payload(
         payload["system_metrics"] = system_metrics
     if benchmark_progress is not None:
         payload["benchmark_progress"] = benchmark_progress
+    if capabilities is not None:
+        payload["capabilities"] = capabilities
+    if stack is not None:
+        payload["stack"] = stack
     return payload
 
 
@@ -437,6 +527,8 @@ async def _seed_validator_heartbeat(
     software_version: str = "0.7.0",
     protocol_version: int = 4,
     seen_at: datetime | None = None,
+    capabilities: dict[str, object] | None = None,
+    stack: dict[str, object] | None = None,
 ) -> None:
     now = seen_at or datetime.now(UTC)
     async with maker() as s, s.begin():
@@ -453,6 +545,8 @@ async def _seed_validator_heartbeat(
                 benchmark_progress=None,
                 benchmark_progress_reported=False,
                 benchmark_progress_agent_id=None,
+                capabilities=capabilities,
+                stack=stack,
                 reported_at=now,
                 seen_at=now,
                 signature="ab" * 64,
@@ -471,6 +565,40 @@ _SYSTEM_METRICS = {
         "running_containers": 4,
         "unhealthy_containers": 0,
     },
+}
+
+_V7_CAPABILITIES: dict[str, object] = {
+    "screened_images": True,
+    "require_screened_image": False,
+    "source_build_fallback": True,
+    "full_stack_managed": False,
+    "stack_updater": False,
+    "sandbox_egress_restricted": True,
+    "executor_isolation": "privileged_dind",
+}
+_V7_COMPONENTS: dict[str, object] = {
+    name: {
+        "source_revision": f"{index:x}" * 40,
+        "version": f"1.2.{index}",
+        "provenance": "committed_pin",
+    }
+    for index, name in enumerate(
+        (
+            "ditto_subnet",
+            "dittobench_api",
+            "sandbox_docker",
+            "model_relay",
+            "pylon",
+            "ollama",
+        ),
+        start=1,
+    )
+}
+_V7_STACK: dict[str, object] = {
+    "mode": "source",
+    "compose_schema": 1,
+    "release_descriptor_digest": None,
+    "components": _V7_COMPONENTS,
 }
 
 
@@ -499,6 +627,80 @@ def _screener_heartbeat_payload(
 
 
 class TestHeartbeat:
+    async def test_v7_persists_and_publishes_typed_capabilities(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        payload = _heartbeat_payload(
+            protocol_version=7,
+            capabilities=_V7_CAPABILITIES,
+            stack=_V7_STACK,
+        )
+
+        response = await client.post(
+            "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=payload
+        )
+
+        assert response.status_code == 200, response.text
+        async with session_maker() as session:
+            row = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert row is not None
+            assert row.capabilities == _V7_CAPABILITIES
+            expected_stack = ValidatorStackIdentity.model_validate(
+                _V7_STACK
+            ).model_dump(mode="json")
+            assert row.stack == expected_stack
+        public = (await client.get("/api/v1/public/validators")).json()["validators"][0]
+        assert public["capabilities"] == _V7_CAPABILITIES
+        assert public["stack"] == expected_stack
+        assert "signature" not in public
+
+    async def test_v7_rejects_missing_contradictory_and_tampered_identity(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        missing = _heartbeat_payload()
+        missing["protocol_version"] = 7
+        assert (
+            await client.post(
+                "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=missing
+            )
+        ).status_code == 422
+
+        contradictory = {**_V7_CAPABILITIES, "source_build_fallback": False}
+        payload = _heartbeat_payload(
+            protocol_version=7,
+            capabilities=_V7_CAPABILITIES,
+            stack=_V7_STACK,
+        )
+        payload["capabilities"] = contradictory
+        rejected = await client.post(
+            "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=payload
+        )
+        assert rejected.status_code == 422
+
+        tampered = _heartbeat_payload(
+            protocol_version=7,
+            capabilities=_V7_CAPABILITIES,
+            stack=_V7_STACK,
+        )
+        tampered_stack = dict(_V7_STACK)
+        tampered_stack["compose_schema"] = 2
+        tampered["stack"] = tampered_stack
+        rejected = await client.post(
+            "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=tampered
+        )
+        assert rejected.status_code == 401
+
     async def test_records_signed_build_and_publishes_status(
         self,
         app: FastAPI,
@@ -1552,6 +1754,33 @@ class TestRequestJob:
 
         assert response.status_code == 200
         assert response.json()["agent_id"] == str(agent_id)
+
+    async def test_v7_screened_only_does_not_claim_source_only_work(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        capabilities = {
+            **_V7_CAPABILITIES,
+            "require_screened_image": True,
+            "source_build_fallback": False,
+        }
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=7,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert response.status_code == 204
 
     async def test_stale_heartbeat_cannot_claim_work(
         self,

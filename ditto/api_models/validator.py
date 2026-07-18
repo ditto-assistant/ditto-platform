@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_progress import BenchmarkProgress
@@ -33,6 +33,10 @@ from ditto.api_models.system_health import SystemMetrics
 from ditto.api_models.upload import (
     _SIGNATURE_HEX_PATTERN,
     _SS58_PATTERN,
+)
+from ditto.api_models.validator_capabilities import (
+    ValidatorCapabilities,
+    ValidatorStackIdentity,
 )
 
 _CODE_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
@@ -267,6 +271,16 @@ class ValidatorHeartbeatRequest(BaseModel):
             ),
         ),
     ] = None
+    capabilities: Annotated[
+        ValidatorCapabilities | None,
+        Field(default=None, description="Signed execution capabilities (protocol v7)."),
+    ] = None
+    stack: Annotated[
+        ValidatorStackIdentity | None,
+        Field(
+            default=None, description="Signed complete stack identity (protocol v7)."
+        ),
+    ] = None
     timestamp: Annotated[
         int, Field(ge=0, description="Validator-reported Unix timestamp (UTC).")
     ]
@@ -277,6 +291,19 @@ class ValidatorHeartbeatRequest(BaseModel):
             description=("sr25519 signature over the canonical v1 heartbeat payload."),
         ),
     ]
+
+    @model_validator(mode="after")
+    def validate_protocol_fields(self) -> ValidatorHeartbeatRequest:
+        if self.protocol_version >= 7:
+            if self.capabilities is None or self.stack is None:
+                raise ValueError(
+                    "heartbeat protocol v7 requires capabilities and stack"
+                )
+            if self.capabilities.full_stack_managed != (self.stack.mode == "managed"):
+                raise ValueError("full_stack_managed contradicts stack mode")
+        elif self.capabilities is not None or self.stack is not None:
+            raise ValueError("capabilities and stack require heartbeat protocol v7")
+        return self
 
 
 class ValidatorHeartbeatResponse(BaseModel):

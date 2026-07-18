@@ -30,21 +30,31 @@ _AFTER_COOLDOWN = _NOW + timedelta(hours=7)
 
 
 async def _seed_evaluating(
-    session: AsyncSession, *, created_at: datetime = _NOW, name: str = "a"
+    session: AsyncSession,
+    *,
+    created_at: datetime = _NOW,
+    name: str = "a",
+    screened: bool = False,
 ) -> UUID:
     aid = uuid4()
     async with session.begin():
-        session.add(
-            Agent(
-                agent_id=aid,
-                miner_hotkey="5Miner",
-                name=name,
-                sha256="ab" * 32,
-                status=AgentStatus.EVALUATING,
-                screening_policy_version=SCREENING_POLICY_VERSION,
-                created_at=created_at,
-            )
+        agent = Agent(
+            agent_id=aid,
+            miner_hotkey="5Miner",
+            name=name,
+            sha256="ab" * 32,
+            status=AgentStatus.EVALUATING,
+            screening_policy_version=SCREENING_POLICY_VERSION,
+            created_at=created_at,
         )
+        if screened:
+            agent.screened_image_sha256 = "12" * 32
+            agent.screened_image_size_bytes = 123
+            agent.screened_image_id = "sha256:" + "34" * 32
+            agent.screened_image_ref = f"ditto-screen/{aid}:latest"
+            agent.screened_image_upload_id = uuid4()
+            agent.screened_image_verified_at = _NOW
+        session.add(agent)
     return aid
 
 
@@ -88,6 +98,104 @@ async def _seed_finalized_top_five(
 
 
 class TestIssueTicket:
+    async def test_screened_only_skips_source_only_agent(
+        self, session: AsyncSession
+    ) -> None:
+        source_id = await _seed_evaluating(session, created_at=_NOW)
+        image_id = await _seed_evaluating(
+            session, created_at=_NOW + timedelta(seconds=1), screened=True
+        )
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5ImageOnly",
+                now=_NOW,
+                ttl=_TTL,
+                artifact_mode="screened_only",
+            )
+        assert ticket is not None
+        assert ticket.agent_id == image_id
+        assert ticket.agent_id != source_id
+
+    async def test_prefer_screened_falls_back_to_source(
+        self, session: AsyncSession
+    ) -> None:
+        source_id = await _seed_evaluating(session)
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5Prefer",
+                now=_NOW,
+                ttl=_TTL,
+                artifact_mode="prefer_screened",
+            )
+        assert ticket is not None
+        assert ticket.agent_id == source_id
+
+    async def test_prefer_screened_prioritizes_complete_verified_tuple(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_evaluating(session, created_at=_NOW)
+        image_id = await _seed_evaluating(
+            session, created_at=_NOW + timedelta(seconds=1), screened=True
+        )
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5Prefer",
+                now=_NOW,
+                ttl=_TTL,
+                artifact_mode="prefer_screened",
+            )
+        assert ticket is not None
+        assert ticket.agent_id == image_id
+
+    async def test_screened_only_releases_unstarted_incompatible_lease(
+        self, session: AsyncSession
+    ) -> None:
+        source_id = await _seed_evaluating(session)
+        async with session.begin():
+            issued = await issue_ticket(
+                session, validator_hotkey="5Transition", now=_NOW, ttl=_TTL
+            )
+        assert issued is not None
+
+        async with session.begin():
+            replacement = await issue_ticket(
+                session,
+                validator_hotkey="5Transition",
+                now=_NOW + timedelta(seconds=1),
+                ttl=_TTL,
+                artifact_mode="screened_only",
+                validator_running_benchmark=False,
+            )
+        assert replacement is None
+        async with session.begin():
+            released = await session.get(ValidatorTicket, (source_id, "5Transition"))
+            assert released is not None
+            assert released.status == TicketStatus.EXPIRED
+
+    async def test_screened_only_preserves_actively_running_incompatible_lease(
+        self, session: AsyncSession
+    ) -> None:
+        source_id = await _seed_evaluating(session)
+        async with session.begin():
+            await issue_ticket(session, validator_hotkey="5Running", now=_NOW, ttl=_TTL)
+        async with session.begin():
+            replacement = await issue_ticket(
+                session,
+                validator_hotkey="5Running",
+                now=_NOW + timedelta(seconds=1),
+                ttl=_TTL,
+                artifact_mode="screened_only",
+                validator_running_benchmark=True,
+            )
+        assert replacement is None
+        async with session.begin():
+            preserved = await session.get(ValidatorTicket, (source_id, "5Running"))
+            assert preserved is not None
+            assert preserved.status == TicketStatus.ISSUED
+
     @pytest.mark.parametrize(
         "status",
         (
