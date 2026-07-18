@@ -2064,8 +2064,8 @@
           <li><b>Model</b>: <code id="bs-model">qwen/qwen3-32b</code> served as <code id="bs-serving">Qwen/Qwen3-32B-TEE</code> (hardware-attested TEE), reasoning mode locked <b id="bs-thinking">off</b>. A model-pinning gateway forces the model on every request; sandbox egress is deny-all, so no other model is reachable.</li>
           <li><b>Grading</b>: no LLM judge. Deterministic per-kind checks from the public <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">dittobench-datagen</a> module (also the generator: dataset + answer keys are byte-reproducible from the seed).</li>
           <li><b>Seed</b>: derived from an on-chain block hash fixed <i>after</i> the miner commits. The result is unpredictable: one fresh dataset per submission, pinned by <code>dataset_sha256</code> in every score.</li>
-          <li><b>Observed execution</b>: tool cases are scored on the trajectory the validator watched through its mock tool endpoint, not the harness's self-report. Every scored run opens with a reachability probe; if the harness cannot reach the endpoint, the run <b>fails and is retried</b> — it is never scored as zeros.</li>
-          <li><b>Transcript</b>: each scored run publishes its graded inputs (every response and observed tool call) content-addressed as <code>transcript_sha256</code>, and that digest is bound <i>inside</i> the validator's score signature. Dataset + transcript + public grader reproduce any score offline — no trust in the platform or validators required.</li>
+          <li><b>Observed execution</b>: tool cases are scored on the trajectory the validator watched through its mock tool endpoint. The harness's own self-report is never used. Every scored run opens with a reachability probe; if the harness cannot reach the endpoint, the run <b>fails and is retried</b>, never scored as zeros.</li>
+          <li><b>Transcript</b>: each scored run publishes its graded inputs (every response and observed tool call) content-addressed as <code>transcript_sha256</code>, and that digest is bound <i>inside</i> the validator's score signature. Dataset + transcript + public grader reproduce any score offline, with no trust in the platform or validators required.</li>
           <li><b>Crown contests</b>: a challenger inside the dethrone band is re-scored, together with the champion, on shared confirmation seeds; the crown then moves or holds on the paired comparison, so dataset luck can never decide emissions.</li>
           <li id="bs-mirror-li" style="display:none"><b>Verify it yourself</b>: finalized run records (dataset pin + all signed scores) are public. View the <a id="bs-mirror" href="#" target="_blank" rel="noopener">run record mirror ↗</a> and signed <a id="bs-ledger" href="#" target="_blank" rel="noopener">score ledger ↗</a>.</li>
         </ul>
@@ -3026,6 +3026,16 @@
           ? stat("Calibration (Brier)", fx(e.calibration_brier) +
               (e.calibration_n != null ? "  over " + e.calibration_n + " case(s)" : "") +
               " — advisory, unscored; lower is better")
+          : "") +
+        // Reproduce-under-transform audit. A share of every run's cases is
+        // re-asked under a rephrasing derived from the post-commit seed, so the
+        // miner could not have pre-handled it. The note says what a low value
+        // does and does not mean: it is the surface-brittleness signature, not a
+        // claim about a harness that genuinely recomputes its answers.
+        (e.transform_robustness != null
+          ? stat("Transform robustness", fx(e.transform_robustness) +
+              (e.audit_case_count != null ? "  over " + e.audit_case_count + " audit pair(s)" : "") +
+              " — agreement when a case is re-asked in wording the miner could not predict; higher is better")
           : "") +
         stat("First seen", new Date(e.first_seen).toLocaleString()) +
         stat("Rank", isEligible(e)
