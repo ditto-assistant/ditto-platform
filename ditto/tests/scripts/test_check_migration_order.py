@@ -10,7 +10,7 @@ from scripts.check_migration_order import (
 )
 
 
-def migration(revision: str, down_revision: str | None) -> Migration:
+def migration(revision: str, down_revision: str | tuple[str, ...] | None) -> Migration:
     return Migration(f"{revision}.py", revision, down_revision)
 
 
@@ -34,15 +34,22 @@ def test_parallel_heads_are_rejected() -> None:
         migration("three", "one"),
     ]
 
-    with pytest.raises(MigrationError, match="migration history branches"):
+    with pytest.raises(MigrationError, match="expected one head revision"):
         validate_linear_history(migrations, "test")
 
 
-def test_merge_revision_is_rejected() -> None:
+def test_merge_revision_rejoins_parallel_migrations() -> None:
     source = """
 revision: str = "merge"
 down_revision: tuple[str, str] = ("one", "two")
 """
+    merge = parse_migration("merge.py", source)
+    migrations = [
+        migration("root", None),
+        migration("one", "root"),
+        migration("two", "root"),
+        merge,
+    ]
 
-    with pytest.raises(MigrationError, match="merge revisions are not allowed"):
-        parse_migration("merge.py", source)
+    assert merge.down_revision == ("one", "two")
+    assert validate_linear_history(migrations, "test") == "merge"

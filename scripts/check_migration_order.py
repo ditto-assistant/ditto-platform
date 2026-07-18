@@ -19,7 +19,7 @@ MIGRATION_NAME = re.compile(r"^(?P<date>\d{4}_\d{2}_\d{2})_.+\.py$")
 class Migration:
     path: str
     revision: str
-    down_revision: str | None
+    down_revision: str | tuple[str, ...] | None
 
 
 class MigrationError(ValueError):
@@ -63,16 +63,25 @@ def parse_migration(path: str, source: str) -> Migration:
 
     if not isinstance(revision, str) or not revision:
         raise MigrationError(f"{path}: revision must be a non-empty string")
-    if down_revision is not None and not isinstance(down_revision, str):
+    if down_revision is not None and not isinstance(down_revision, (str, tuple)):
         raise MigrationError(
-            f"{path}: down_revision must be one revision string; "
-            "merge revisions are not allowed"
+            f"{path}: down_revision must be a revision string or tuple of strings"
+        )
+    if isinstance(down_revision, tuple) and (
+        not down_revision
+        or any(not isinstance(parent, str) or not parent for parent in down_revision)
+        or len(set(down_revision)) != len(down_revision)
+    ):
+        raise MigrationError(
+            f"{path}: merge down_revision must contain unique non-empty strings"
         )
     return Migration(path=path, revision=revision, down_revision=down_revision)
 
 
-def validate_linear_history(migrations: list[Migration], label: str) -> str:
-    """Return the sole head after validating a connected, non-branching chain."""
+def _validate_history(
+    migrations: list[Migration], label: str, *, require_single_head: bool
+) -> tuple[str, ...]:
+    """Return heads after validating a connected, acyclic migration graph."""
     by_revision: dict[str, Migration] = {}
     children: defaultdict[str, list[str]] = defaultdict(list)
     roots: list[str] = []
@@ -87,44 +96,54 @@ def validate_linear_history(migrations: list[Migration], label: str) -> str:
         by_revision[migration.revision] = migration
 
     for migration in migrations:
-        if migration.down_revision is None:
+        parents = migration.down_revision
+        if parents is None:
             roots.append(migration.revision)
             continue
-        if migration.down_revision not in by_revision:
-            raise MigrationError(
-                f"{migration.path}: unknown down_revision {migration.down_revision}"
-            )
-        children[migration.down_revision].append(migration.revision)
+        if isinstance(parents, str):
+            parents = (parents,)
+        for parent in parents:
+            if parent not in by_revision:
+                raise MigrationError(
+                    f"{migration.path}: unknown down_revision {parent}"
+                )
+            children[parent].append(migration.revision)
 
     if len(roots) != 1:
         raise MigrationError(f"{label}: expected one root revision, found {len(roots)}")
 
-    forks = {
-        parent: child_ids
-        for parent, child_ids in children.items()
-        if len(child_ids) > 1
-    }
-    if forks:
-        details = ", ".join(
-            f"{parent} -> {', '.join(ids)}" for parent, ids in forks.items()
-        )
-        raise MigrationError(f"{label}: migration history branches: {details}")
-
     visited: set[str] = set()
-    current = roots[0]
-    while True:
-        if current in visited:
-            raise MigrationError(f"{label}: cycle detected at revision {current}")
-        visited.add(current)
-        next_revisions = children.get(current, [])
-        if not next_revisions:
-            head = current
-            break
-        current = next_revisions[0]
+    visiting: set[str] = set()
+
+    def visit(revision: str) -> None:
+        if revision in visiting:
+            raise MigrationError(f"{label}: cycle detected at revision {revision}")
+        if revision in visited:
+            return
+        visiting.add(revision)
+        for child in children.get(revision, []):
+            visit(child)
+        visiting.remove(revision)
+        visited.add(revision)
+
+    visit(roots[0])
 
     if len(visited) != len(migrations):
         raise MigrationError(f"{label}: migration history is disconnected")
-    return head
+    heads = tuple(
+        sorted(revision for revision in by_revision if not children.get(revision))
+    )
+    if require_single_head and len(heads) != 1:
+        raise MigrationError(
+            f"{label}: expected one head revision, found {len(heads)}: "
+            + ", ".join(heads)
+        )
+    return heads
+
+
+def validate_linear_history(migrations: list[Migration], label: str) -> str:
+    """Return the sole head after validating a connected, fully merged history."""
+    return _validate_history(migrations, label, require_single_head=True)[0]
 
 
 def _paths_at(ref: str) -> list[str]:
@@ -165,7 +184,7 @@ def check(base_ref: str) -> tuple[int, str, str]:
 
     base_migrations = _migrations_at(base_ref)
     head_migrations = _head_migrations()
-    base_head = validate_linear_history(base_migrations, base_ref)
+    base_heads = _validate_history(base_migrations, base_ref, require_single_head=False)
     head_revision = validate_linear_history(head_migrations, "HEAD")
 
     new_paths = sorted(head_paths - base_paths)
@@ -190,10 +209,10 @@ def check(base_ref: str) -> tuple[int, str, str]:
                 f"{latest_base_date}"
             )
 
-    if new_paths and head_revision == base_head:
+    if new_paths and (head_revision,) == base_heads:
         raise MigrationError("new migrations do not extend the base migration head")
 
-    return len(new_paths), base_head, head_revision
+    return len(new_paths), ",".join(base_heads), head_revision
 
 
 def main() -> int:
