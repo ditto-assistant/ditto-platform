@@ -146,85 +146,91 @@ logger = logging.getLogger(__name__)
 # mirror dittobench-datagen ``persona/transform.go``. They are part of a PUBLIC
 # derivation contract, not tunables: the whole point is that any third party can
 # recompute a verdict from the published seed and get the same answer.
-AUDIT_BPS = 1500
-AUDIT_MIN_ROBUSTNESS = 0.70
-# Below this many audit pairs behind a value, a single split swings the rate too
-# far to act on, so the run is not judged at all.
-AUDIT_MIN_PAIRS = 4
+AUDIT_BPS = 2500
+
+# The brittleness verdict is a one-sided exact BINOMIAL TEST on discordant audit
+# pairs, mirroring ditto-subnet ``ditto/validator/transform_audit.py``.
+#
+# A pair answered correctly in the base phrasing and incorrectly under the
+# post-commit transform is the brittleness event; the mirror image is not. The
+# null is that discordant pairs fall either way equally, which is what an honest
+# nondeterministic model does. The 2026-07-18 calibration measured honest at 5
+# base-only vs 6 transform-only (symmetric) and a surface-gated harness at 6 vs
+# 0; the previous ratio threshold could not tell those apart.
+#
+# ALPHA *is* the false-positive rate on honest miners, by construction. The
+# ratio floor it replaces had an unknown error rate, measured at 16% of honest
+# runs.
+AUDIT_ALPHA = 0.01
+# Fewest discordant pairs that can produce a verdict: below this the exact test
+# cannot reach ALPHA even on a perfect one-directional run.
+AUDIT_MIN_DISCORDANT = 6
 TRANSFORM_AUDIT_REVIEW_REASON = "transform_audit_brittleness"
 
-# ENFORCEMENT IS OFF BY DEFAULT, and the 2026-07-18 calibration is why.
-#
-# Measured against the real locked model (OpenRouter qwen/qwen3-32b, stock
-# reference harness, 25 seeds at run_size=full) and against two purpose-built
-# local solvers, the metric does not currently separate a cheater from an honest
-# miner (docs/BASELINES.md, "Run 3"):
-#
-#   honest LLM   transform_robustness 0.910  (sd 0.148, min 0.60)
-#   BRITTLE      transform_robustness 0.863   <- the attacker we mean to catch
-#   robust solver                     0.924
-#
-# The brittle harness sits INSIDE the honest model's own spread. At the 0.70
-# floor below, 4 of 25 honest runs (16%) would be quarantined while only 2 of 12
-# brittle runs would be caught: close to no discrimination, paid for almost
-# entirely by legitimate miners.
-#
-# The cause is structural rather than a bad threshold. 81% of audit pairs came
-# back both-wrong, and a both-wrong pair counts as CONSISTENT, so on a benchmark
-# this hard the metric is dominated by pairs that carry no information about
-# brittleness at all. Only 19% of pairs were informative, and 13 of 25 runs did
-# not even reach AUDIT_MIN_PAIRS.
-#
-# So the audit ships observational: the metric is computed, EVENT_AUDIT is
-# recorded, and the value is published, which is what will produce the
-# real-world distribution a future threshold can be set from. It does not touch
-# an agent's status. Turn this on only with a calibration that shows separation
-# on the population it will judge. The measurement and the reproduction
-# steps live in dittobench-api docs/BASELINES.md and
-# scripts/audit-calibration.
+# Enforcement stays OFF by default. The metric now discriminates in principle
+# (see the calibration in dittobench-api docs/BASELINES.md Run 3), but the floor
+# has not been re-validated end to end against the population it judges --
+# champion/tail agents, which are more accurate than the stock reference harness
+# every number above came from. Turn this on only with that evidence.
 TRANSFORM_AUDIT_ENFORCE = os.environ.get(
     "DITTO_TRANSFORM_AUDIT_ENFORCE", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _transform_audit_verdict(
-    agent_scores: Sequence[Any],
-) -> tuple[float | None, int, bool]:
-    """Median transform robustness across an agent's finalized scores.
+def _binomial_tail(k: int, n: int, p: float = 0.5) -> float:
+    """P(X >= k) for X ~ Binomial(n, p). Exact, no dependencies."""
+    if n <= 0:
+        return 1.0
+    k = max(0, k)
+    total = 0.0
+    coeff = 1.0
+    for i in range(0, n + 1):
+        if i >= k:
+            total += coeff * (p**i) * ((1 - p) ** (n - i))
+        coeff = coeff * (n - i) / (i + 1)
+    return min(1.0, total)
 
-    Returns ``(median, pair_count, failed)``. The validator attaches a
-    per-submission median over its confirmation runs; taking the median AGAIN
-    across the k=3 validators is deliberate, and matches how the platform already
-    finalizes on the median composite: no single validator's number decides an
-    agent's fate.
 
-    ``failed`` is False whenever the evidence is thin -- no score carried the
-    metric (an older scoring engine), or too few audit pairs stood behind it.
-    Absence of evidence is not a failed audit, and the cost of getting that
-    backwards is borne by a legitimate miner.
+def _pool_audit_pairs(agent_scores: Sequence[Any]) -> dict[str, int]:
+    """Sum the audit 2x2 counts across an agent's finalized scores.
+
+    Each validator already pooled its own confirmation runs; this pools across
+    the k=3 validators, so the verdict rests on all the evidence rather than on
+    any one validator's handful of pairs. Same reasoning as finalizing the
+    composite on the median: no single validator decides an agent's fate.
     """
-    values: list[float] = []
-    pairs_total = 0
+    pooled = {"both_correct": 0, "base_only": 0, "transform_only": 0, "both_wrong": 0}
     for score in agent_scores:
         details = score.details if isinstance(score.details, dict) else {}
-        raw = details.get("transform_robustness_median")
-        if raw is None:
-            raw = details.get("transform_robustness")
-        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        raw = details.get("audit_pairs_pooled") or details.get("audit_pairs")
+        if not isinstance(raw, dict):
             continue
-        value = float(raw)
-        if not 0.0 <= value <= 1.0:
-            continue
-        pairs = details.get("audit_case_count")
-        pairs = pairs if isinstance(pairs, int) and not isinstance(pairs, bool) else 0
-        if pairs < AUDIT_MIN_PAIRS:
-            continue
-        values.append(value)
-        pairs_total += pairs
-    if not values:
-        return None, 0, False
-    median = statistics.median(values)
-    return median, pairs_total, median < AUDIT_MIN_ROBUSTNESS
+        for key in pooled:
+            v = raw.get(key, 0)
+            if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                pooled[key] += v
+    return pooled
+
+
+def _transform_audit_verdict(
+    agent_scores: Sequence[Any],
+) -> tuple[float | None, dict[str, int], bool]:
+    """Pooled brittleness verdict across an agent's finalized scores.
+
+    Returns ``(p_value, pooled_counts, failed)``. ``failed`` is False whenever
+    the evidence is thin -- no score carried the counts (an older scoring
+    engine), or too few discordant pairs to reach ALPHA. Absence of evidence is
+    not a failed audit, and the cost of getting that backwards is paid by a
+    legitimate miner.
+    """
+    pooled = _pool_audit_pairs(agent_scores)
+    discordant = pooled["base_only"] + pooled["transform_only"]
+    if sum(pooled.values()) == 0:
+        return None, pooled, False
+    if discordant < AUDIT_MIN_DISCORDANT:
+        return None, pooled, False
+    pvalue = _binomial_tail(pooled["base_only"], discordant)
+    return pvalue, pooled, pvalue <= AUDIT_ALPHA
 
 
 router = APIRouter(prefix="/validator", tags=["validator"])
@@ -1361,7 +1367,7 @@ async def submit_score(
                 # adding a sibling status, which would force a
                 # ditto-screening-protocol pin bump across every consumer for a
                 # distinction the reason string already carries.
-                audit_robustness, audit_pairs, audit_failed = _transform_audit_verdict(
+                audit_pvalue, audit_pairs, audit_failed = _transform_audit_verdict(
                     agent_scores
                 )
                 if audit_failed and not TRANSFORM_AUDIT_ENFORCE:
@@ -1371,13 +1377,13 @@ async def submit_score(
                     # real-world distribution a future threshold can be set from.
                     logger.info(
                         "agent %s: transform-audit brittleness signature "
-                        "(median robustness %.3f over %d pair(s), floor %.2f) "
-                        "— NOT enforced; the metric does not yet separate "
-                        "honest from brittle harnesses",
+                        "(%d base-only vs %d transform-only, p=%.4f <= %.3f) "
+                        "— NOT enforced pending champion-population validation",
                         agent_id,
-                        audit_robustness if audit_robustness is not None else -1.0,
-                        audit_pairs,
-                        AUDIT_MIN_ROBUSTNESS,
+                        audit_pairs["base_only"],
+                        audit_pairs["transform_only"],
+                        audit_pvalue if audit_pvalue is not None else 1.0,
+                        AUDIT_ALPHA,
                     )
                 if (
                     audit_failed
@@ -1395,9 +1401,9 @@ async def submit_score(
                             original_reason=TRANSFORM_AUDIT_REVIEW_REASON,
                             original_policy_version=agent.screening_policy_version,
                             original_evidence={
-                                "transform_robustness_median": audit_robustness,
-                                "audit_case_count": audit_pairs,
-                                "audit_min_robustness": AUDIT_MIN_ROBUSTNESS,
+                                "audit_pairs": audit_pairs,
+                                "transform_audit_pvalue": audit_pvalue,
+                                "audit_alpha": AUDIT_ALPHA,
                             },
                             algorithm_provenance={
                                 "snapshot": "score-finalization",
@@ -1406,14 +1412,15 @@ async def submit_score(
                         )
                     )
                     logger.warning(
-                        "agent %s held for transform-audit review: median "
-                        "robustness %.3f over %d pair(s) is below the %.2f floor",
+                        "agent %s held for transform-audit review: %d base-only "
+                        "vs %d transform-only discordant pairs, p=%.4f <= %.3f",
                         agent_id,
-                        audit_robustness if audit_robustness is not None else -1.0,
-                        audit_pairs,
-                        AUDIT_MIN_ROBUSTNESS,
+                        audit_pairs["base_only"],
+                        audit_pairs["transform_only"],
+                        audit_pvalue if audit_pvalue is not None else 1.0,
+                        AUDIT_ALPHA,
                     )
-                if audit_robustness is not None:
+                if sum(audit_pairs.values()) > 0:
                     # Recorded whether or not it held, so the public feed shows
                     # the audit ran and what it found -- not only its failures.
                     # PUBLIC INPUTS ONLY: never a transformed expected answer or
@@ -1428,9 +1435,9 @@ async def submit_score(
                         event=EVENT_AUDIT,
                         payload={
                             "miner_hotkey": agent.miner_hotkey,
-                            "transform_robustness_median": audit_robustness,
-                            "audit_case_count": audit_pairs,
-                            "audit_min_robustness": AUDIT_MIN_ROBUSTNESS,
+                            "audit_pairs": audit_pairs,
+                            "transform_audit_pvalue": audit_pvalue,
+                            "audit_alpha": AUDIT_ALPHA,
                             "audit_bps": AUDIT_BPS,
                             "failed": audit_failed,
                             # Whether the verdict was allowed to affect status.
