@@ -1783,12 +1783,14 @@ async def migrate_benchmark_contract(
     target_sha256 = await generator.generate(source_pin[0], bench_version=3)
     now = datetime.now(UTC)
     async with session.begin():
-        agent = await session.scalar(
+        # Fresh name: `agent` above is the (non-Optional) pre-check read; this is
+        # the locked re-read that the mutation below must go through.
+        locked_agent = await session.scalar(
             select(Agent).where(Agent.agent_id == agent_id).with_for_update()
         )
-        if agent is None:
+        if locked_agent is None:
             raise HTTPException(status_code=404, detail="agent not found")
-        if agent.sha256 != payload.expected_sha256:
+        if locked_agent.sha256 != payload.expected_sha256:
             raise HTTPException(status_code=409, detail="artifact identity changed")
         rollout = await open_rollout(session, for_update=True)
         if rollout is None or rollout.from_version != 2 or rollout.desired_version != 3:
@@ -1868,17 +1870,17 @@ async def migrate_benchmark_contract(
                 created_at=now,
             )
         )
-        agent.screened_image_sha256 = None
-        agent.screened_image_size_bytes = None
-        agent.screened_image_id = None
-        agent.screened_image_ref = None
-        agent.screened_image_upload_id = None
-        agent.screened_image_verified_at = None
-        agent.status = AgentStatus.SCREENING_FAILED
-        agent.screening_reason = (
+        locked_agent.screened_image_sha256 = None
+        locked_agent.screened_image_size_bytes = None
+        locked_agent.screened_image_id = None
+        locked_agent.screened_image_ref = None
+        locked_agent.screened_image_upload_id = None
+        locked_agent.screened_image_verified_at = None
+        locked_agent.status = AgentStatus.SCREENING_FAILED
+        locked_agent.screening_reason = (
             "Operator migrated zero-score benchmark contract from v2 to v3"
         )
-        agent.screening_reason_code = None
+        locked_agent.screening_reason_code = None
 
     logger.warning(
         "admin_actor=%s migrated zero-score benchmark contract agent_id=%s "
