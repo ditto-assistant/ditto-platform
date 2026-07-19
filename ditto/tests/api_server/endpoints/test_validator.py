@@ -2309,8 +2309,11 @@ class TestRequestJob:
         await _seed_ticket(session_maker, legacy_agent)
         capabilities = self._v8_capabilities()
         capabilities["scorer_benchmarks"] = {
-            **capabilities["scorer_benchmarks"],
+            "status": "fresh_verified",
             "supported_bench_versions": list(range(2, active_version + 1)),
+            "observed_at": int(datetime.now(UTC).timestamp()),
+            "software_version": "1.2.2",
+            "source_revision": "2" * 40,
         }
         await _seed_validator_heartbeat(
             session_maker,
