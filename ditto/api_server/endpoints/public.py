@@ -40,9 +40,12 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, cast
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import RedirectResponse
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -1010,6 +1013,95 @@ async def validators(
         ),
         now=now,
     )
+
+
+_WANDB_GRAPHQL_URL = "https://api.wandb.ai/graphql"
+_WANDB_RUN_QUERY = """
+query LatestValidatorRun(
+  $project: String!
+  $entity: String!
+  $filters: JSONString!
+) {
+  project(name: $project, entityName: $entity) {
+    runs(filters: $filters, first: 1, order: "-createdAt") {
+      edges { node { name } }
+    }
+  }
+}
+"""
+
+
+def _wandb_project_parts(project_url: str) -> tuple[str, str] | None:
+    parsed = urlparse(project_url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if parsed.scheme != "https" or parsed.hostname != "wandb.ai" or len(parts) != 2:
+        return None
+    return parts[0], parts[1]
+
+
+async def _latest_wandb_logs_url(
+    project_url: str,
+    validator_hotkey: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> str | None:
+    project_parts = _wandb_project_parts(project_url)
+    if project_parts is None:
+        return None
+    entity, project = project_parts
+    owns_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(timeout=3.0)
+    try:
+        result = await client.post(
+            _WANDB_GRAPHQL_URL,
+            json={
+                "query": _WANDB_RUN_QUERY,
+                "variables": {
+                    "entity": entity,
+                    "project": project,
+                    "filters": '{"config.validator_hotkey":"' + validator_hotkey + '"}',
+                },
+            },
+        )
+        result.raise_for_status()
+        edges = (
+            result.json()
+            .get("data", {})
+            .get("project", {})
+            .get("runs", {})
+            .get("edges", [])
+        )
+        run_id = edges[0].get("node", {}).get("name") if edges else None
+        if not run_id or not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+            return None
+        return f"https://wandb.ai/{entity}/{project}/runs/{run_id}/logs"
+    except (httpx.HTTPError, KeyError, TypeError, ValueError):
+        logger.warning("wandb run lookup failed for validator %s", validator_hotkey)
+        return None
+    finally:
+        if owns_client:
+            await client.aclose()
+
+
+@router.get("/validators/{validator_hotkey}/wandb-logs", include_in_schema=False)
+async def validator_wandb_logs(
+    validator_hotkey: str,
+    request: Request,
+    embed: bool = False,
+) -> RedirectResponse:
+    """Resolve the validator's newest telemetry run and open its Logs tab."""
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{40,64}", validator_hotkey):
+        raise HTTPException(status_code=404, detail="Validator telemetry not found")
+    url = await _latest_wandb_logs_url(
+        request.app.state.config.dashboard_wandb_url,
+        validator_hotkey,
+    )
+    if url is None:
+        raise HTTPException(status_code=404, detail="Validator telemetry not found")
+    if embed:
+        url += "?jupyter=true"
+    return RedirectResponse(url, status_code=307, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/validator-names", response_model=PublicValidatorNamesResponse)
