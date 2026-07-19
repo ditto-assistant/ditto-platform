@@ -2301,13 +2301,23 @@
       Object.keys(ENTITY_PARAMS).forEach(function (kind) { query.delete(ENTITY_PARAMS[kind]); });
     }
 
-    function entityHref(kind, identifier) {
+    // The page currently addressed by the hash, or null when the hash is not a
+    // valid page route (e.g. on a dedicated /agent/{id} page).
+    function currentPageName() {
+      var m = /^#\/([a-z]+)/.exec(location.hash || "");
+      return m && PAGES[m[1]] ? m[1] : null;
+    }
+
+    function entityHref(kind, identifier, page) {
       var plural = ENTITY_PATHS[kind] || kind;
       var url = new URL(location.href);
       url.pathname = "/";
       clearEntityParams(url.searchParams);
       url.searchParams.set(ENTITY_PARAMS[plural], String(identifier));
-      url.hash = "#/" + ENTITY_PAGES[plural];
+      // Drilldowns are overlays: they open over whatever page is active, so the
+      // hash keeps the current page. ENTITY_PAGES is only the fallback for cold
+      // links minted where no page route is present (dedicated entity pages).
+      url.hash = "#/" + (page || currentPageName() || ENTITY_PAGES[plural]);
       return url.pathname + url.search + url.hash;
     }
 
@@ -2373,7 +2383,7 @@
       // Full-page routes exist only for agents and miners.
       openFull.style.display = kind === "agent" || kind === "miner" ? "" : "none";
       openFull.href = fullEntityHref(kind, identifier);
-      document.getElementById("d-back-dashboard").href = dashboardHref(ENTITY_PAGES[plural]);
+      document.getElementById("d-back-dashboard").href = dashboardHref(currentPageName() || ENTITY_PAGES[plural]);
     }
 
     function pushEntityRoute(kind, identifier) {
@@ -3693,7 +3703,9 @@
           history.back();
           return;
         }
-        history.replaceState({}, "", dashboardHref(ENTITY_PAGES[entity.kind]));
+        // Return to the page the overlay was opened over (the hash still holds
+        // it); ENTITY_PAGES is only the fallback when no page route is present.
+        history.replaceState({}, "", dashboardHref(currentPageName() || ENTITY_PAGES[entity.kind]));
       }
       modal.classList.remove("open");
       modal.classList.remove("full-page");
@@ -5586,9 +5598,19 @@
         entity = readEntityRoute();
       }
 
-      var expectedPage = ENTITY_PAGES[entity.kind];
       var visiblePage = document.querySelector(".page.active");
-      if (!visiblePage || visiblePage.getAttribute("data-page") !== expectedPage) route(false);
+      var visibleName = visiblePage && visiblePage.getAttribute("data-page");
+      // Agent/miner drilldowns are overlays over whatever page is active — never
+      // switch the page underneath. Fleet-row targets (validators/screeners)
+      // live on the operations page only, so normalize the URL there first.
+      if (entity.kind === "validators" || entity.kind === "screeners") {
+        if (visibleName !== "operations") {
+          history.replaceState(history.state || {}, "", entityHref(entity.kind, entity.id, "operations"));
+          route(false);
+        }
+      } else if (!visibleName) {
+        route(false);
+      }
       if (entity.kind === "agents") {
         if (activeEntityKey === entity.key && document.getElementById("modal").classList.contains("open")) return;
         if (resolvingEntityKey === entity.key) return;
@@ -5879,7 +5901,11 @@
       // (the replaceState below requires routeHash, so the fragment survives).
       var routeHash = hash.indexOf("#/") === 0;
       if (!entity && !m && hash && !routeHash && !initial) return;
-      var page = entity ? ENTITY_PAGES[entity.kind] : ((m && PAGES[m[1]]) ? m[1] : "overview");
+      // The hash owns the page. An entity param is an overlay on top of that
+      // page, not a page itself — ENTITY_PAGES only decides where a cold link
+      // with no page route lands. (Hash must win or the URL and the sidebar
+      // disagree after closing an overlay.)
+      var page = (m && PAGES[m[1]]) ? m[1] : (entity ? ENTITY_PAGES[entity.kind] : "overview");
       // An unknown "#/…" route (e.g. "#/bogus", "#/") resolves to overview both at
       // boot and after; normalize the URL so it doesn't advertise a route that
       // doesn't exist. Entity routes own their hash and are left untouched.

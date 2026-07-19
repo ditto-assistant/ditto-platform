@@ -695,7 +695,12 @@ class TestDashboard:
         assert 'validators: "operations"' in body
         assert 'screeners: "operations"' in body
         assert "url.searchParams.set(ENTITY_PARAMS[plural], String(identifier))" in body
-        assert 'url.hash = "#/" + ENTITY_PAGES[plural]' in body
+        # Drilldowns are overlays over the current page; ENTITY_PAGES is only the
+        # cold-link fallback when no page route is present in the hash.
+        assert (
+            'url.hash = "#/" + (page || currentPageName() || ENTITY_PAGES[plural])'
+            in body
+        )
         assert (
             'return "/" + singular + "/" + encodeURIComponent(String(identifier))'
             in body
