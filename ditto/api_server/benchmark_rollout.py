@@ -23,11 +23,12 @@ from ditto.db.models import (
 from ditto.db.queries.benchmark_rollout import (
     CANARY_BENCH_VERSION,
     COHORT_SIZE,
+    DEFAULT_BENCH_VERSION,
     DatasetPin,
     RolloutSnapshotMember,
     append_rollout_member,
     create_rollout_snapshot,
-    heartbeat_supports_v3,
+    heartbeat_supports_version,
     maybe_activate_rollout,
     open_rollout,
     rolling_top_five,
@@ -170,20 +171,29 @@ async def rolling_qualification_blockers(
 async def ensure_rolling_qualification(
     session: AsyncSession, *, generator: DatasetGenerator, now: datetime
 ) -> bool:
-    """Lazily seed v3 qualification once one verified validator requests work.
+    """Lazily seed canary qualification once a verified validator requests work.
 
-    Benchmark v3 is a shipped contract, not an operator-started feature flag.
+    The canary benchmark is a shipped contract, not an operator feature flag.
     Rendering happens outside a transaction and snapshot creation remains
     idempotent under the query layer's advisory lock.
     """
     async with session.begin():
         existing = await rollout_for_transition(
-            session, from_version=2, desired_version=CANARY_BENCH_VERSION
+            session,
+            from_version=DEFAULT_BENCH_VERSION,
+            desired_version=CANARY_BENCH_VERSION,
         )
         if existing is not None:
             return False
+        # A different transition still holding the single open slot must not be
+        # auto-superseded here; abandoning a rollout is an operator decision.
+        if await open_rollout(session) is not None:
+            return False
         heartbeats = list(await session.scalars(select(ValidatorHeartbeat)))
-        if not any(heartbeat_supports_v3(item, now=now) for item in heartbeats):
+        if not any(
+            heartbeat_supports_version(item, now=now, version=CANARY_BENCH_VERSION)
+            for item in heartbeats
+        ):
             return False
         members = await rolling_top_five(session)
         if len(members) != COHORT_SIZE:
@@ -192,7 +202,7 @@ async def ensure_rolling_qualification(
         for member in members:
             candidate, reason = await qualification_candidate(
                 session,
-                source_bench_version=2,
+                source_bench_version=DEFAULT_BENCH_VERSION,
                 target_bench_version=CANARY_BENCH_VERSION,
                 member=member,
                 generator_run_size=generator.run_size,
@@ -226,7 +236,7 @@ async def ensure_rolling_qualification(
         for expected, current_member in zip(pending, current_members, strict=True):
             current, _reason = await qualification_candidate(
                 session,
-                source_bench_version=2,
+                source_bench_version=DEFAULT_BENCH_VERSION,
                 target_bench_version=CANARY_BENCH_VERSION,
                 member=current_member,
                 generator_run_size=generator.run_size,
@@ -234,7 +244,12 @@ async def ensure_rolling_qualification(
             if current != expected:
                 return False
         await create_rollout_snapshot(
-            session, members=members, datasets=datasets, now=now
+            session,
+            members=members,
+            datasets=datasets,
+            now=now,
+            from_version=DEFAULT_BENCH_VERSION,
+            desired_version=CANARY_BENCH_VERSION,
         )
     return True
 

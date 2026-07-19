@@ -1524,7 +1524,7 @@ class PublicOperationsResponse(BaseModel):
     active_bench_version: Annotated[int, Field(ge=1)]
     desired_bench_version: Annotated[int, Field(ge=1)]
     benchmark_rollout_status: Literal[
-        "inactive", "collecting", "blocked_ineligible", "activated"
+        "inactive", "collecting", "blocked_ineligible", "activated", "superseded"
     ]
     activity: PublicActivityResponse
     validators: PublicValidatorHeartbeatsResponse

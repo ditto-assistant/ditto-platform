@@ -34,8 +34,17 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
+# The version a rollout starts FROM when no rollout has ever activated. This
+# moves forward as benchmarks activate.
 DEFAULT_BENCH_VERSION = 2
-CANARY_BENCH_VERSION = 3
+# What a version-less report from a pre-bench_version validator actually ran.
+# This is a statement about history and is frozen at 2 forever: it must NOT
+# follow DEFAULT_BENCH_VERSION, or a future rollout-from bump would silently
+# reinterpret every legacy submission as a newer benchmark.
+LEGACY_BENCH_VERSION = 2
+# The version a rollout is currently driving TOWARD. Flipping this is the
+# one-line change that opens the next rollout; everything else reads it.
+CANARY_BENCH_VERSION = 4
 COHORT_SIZE = 5
 SCORING_QUORUM = 3
 # TEMPORARY authority pin (2026-07-19): the v3 benchmark still has scoring
@@ -46,6 +55,14 @@ SCORING_QUORUM = 3
 # activates; v3 medians stay visible as per-row rollout progress only. Flip
 # back to True to restore per-agent authority at quorum.
 DESIRED_AUTHORITY_AT_QUORUM = False
+
+
+class RolloutConflictError(RuntimeError):
+    """Raised when a rollout cannot be opened because another one is open.
+
+    ``benchmark_rollouts_one_open_idx`` enforces this in the database; catching
+    the condition first turns an opaque IntegrityError 500 into a clean 409.
+    """
 
 
 @dataclass(frozen=True)
@@ -260,6 +277,18 @@ async def rollout_for_transition(
     return await session.scalar(statement)
 
 
+async def rollout_for_desired_version(
+    session: AsyncSession, *, desired_version: int
+) -> BenchmarkRollout | None:
+    """Return the durable row targeting ``desired_version``, whatever it came from."""
+    return await session.scalar(
+        select(BenchmarkRollout)
+        .where(BenchmarkRollout.desired_version == desired_version)
+        .order_by(BenchmarkRollout.created_at.desc())
+        .limit(1)
+    )
+
+
 async def _audit(
     session: AsyncSession,
     rollout: BenchmarkRollout,
@@ -279,15 +308,71 @@ async def _audit(
     )
 
 
+async def supersede_open_rollout(
+    session: AsyncSession,
+    *,
+    actor: str,
+    reason: str,
+    now: datetime,
+) -> BenchmarkRollout | None:
+    """Terminally abandon the open rollout so the next one can be opened.
+
+    Returns ``None`` when no rollout is open. Refuses to touch an ``activated``
+    rollout: activation already moved chain weights and published the retired
+    corpus, so rewriting it would be rewriting history. The partial open index
+    excludes ``superseded``, so the single open slot is freed immediately.
+    """
+    # Deliberately the LATEST row rather than open_rollout(): an activated
+    # rollout must produce an explicit refusal, not a misleading "nothing open".
+    rollout = await session.scalar(
+        select(BenchmarkRollout)
+        .order_by(BenchmarkRollout.created_at.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    if rollout is None or rollout.status == "superseded":
+        return None
+    if rollout.status == "activated":
+        raise RolloutConflictError(
+            "an activated benchmark rollout cannot be superseded"
+        )
+    previous_status = rollout.status
+    rollout.status = "superseded"
+    rollout.blocked_reason = None
+    await _audit(
+        session,
+        rollout,
+        "superseded",
+        {
+            "actor": actor,
+            "reason": reason,
+            "previous_status": previous_status,
+            "from_version": rollout.from_version,
+            "desired_version": rollout.desired_version,
+        },
+        now=now,
+    )
+    await session.flush()
+    return rollout
+
+
 async def create_rollout_snapshot(
     session: AsyncSession,
     *,
     members: Sequence[RolloutSnapshotMember],
     datasets: dict[UUID, DatasetPin],
     now: datetime,
+    from_version: int = DEFAULT_BENCH_VERSION,
+    desired_version: int = CANARY_BENCH_VERSION,
 ) -> BenchmarkRollout:
-    """Freeze exactly five ranked agents and their v3 dataset pins, idempotently."""
+    """Freeze exactly five ranked agents and their target dataset pins, idempotently."""
+    if desired_version <= from_version:
+        raise ValueError("a benchmark rollout must move the version forward")
     if session.get_bind().dialect.name == "postgresql":
+        # One global rollout lock name, deliberately NOT keyed on the version:
+        # only one rollout may be open at a time, so every transition must
+        # serialise against every other. The legacy literal is kept so a
+        # mid-deploy mix of old and new code still shares the same lock.
         await session.execute(
             select(
                 func.pg_advisory_xact_lock(
@@ -297,25 +382,32 @@ async def create_rollout_snapshot(
         )
     existing = await rollout_for_transition(
         session,
-        from_version=DEFAULT_BENCH_VERSION,
-        desired_version=CANARY_BENCH_VERSION,
+        from_version=from_version,
+        desired_version=desired_version,
         for_update=True,
     )
     if existing is not None:
         return existing
+    conflicting = await open_rollout(session, for_update=True)
+    if conflicting is not None:
+        raise RolloutConflictError(
+            f"benchmark rollout {conflicting.from_version}->"
+            f"{conflicting.desired_version} is still {conflicting.status}; only one "
+            "benchmark rollout may be open at a time"
+        )
     if len(members) != COHORT_SIZE:
-        raise ValueError("benchmark v3 rollout requires exactly five members")
+        raise ValueError("a benchmark rollout requires exactly five members")
     if len({m.agent_id for m in members}) != COHORT_SIZE:
         raise ValueError("benchmark rollout agents must be distinct")
     if len({m.miner_hotkey for m in members}) != COHORT_SIZE:
         raise ValueError("benchmark rollout miners must be distinct")
     if set(datasets) != {m.agent_id for m in members}:
-        raise ValueError("every frozen rollout member requires one v3 dataset pin")
+        raise ValueError("every frozen rollout member requires one target dataset pin")
 
     rollout = BenchmarkRollout(
         rollout_id=uuid4(),
-        from_version=DEFAULT_BENCH_VERSION,
-        desired_version=CANARY_BENCH_VERSION,
+        from_version=from_version,
+        desired_version=desired_version,
         status="collecting",
         cohort_size=COHORT_SIZE,
         created_at=now,
@@ -333,13 +425,13 @@ async def create_rollout_snapshot(
         )
         pin = datasets[member.agent_id]
         existing_dataset = await session.get(
-            BenchmarkDataset, (member.agent_id, CANARY_BENCH_VERSION)
+            BenchmarkDataset, (member.agent_id, desired_version)
         )
         if existing_dataset is None:
             session.add(
                 BenchmarkDataset(
                     agent_id=member.agent_id,
-                    bench_version=CANARY_BENCH_VERSION,
+                    bench_version=desired_version,
                     seed=pin.seed,
                     sha256=pin.sha256,
                     run_size=pin.run_size,
@@ -409,8 +501,17 @@ async def _validate_frozen_members(
     return True
 
 
-def heartbeat_supports_v3(heartbeat: ValidatorHeartbeat, *, now: datetime) -> bool:
-    """Accept v3 only from a fresh scorer report matching the signed stack identity."""
+def heartbeat_supports_version(
+    heartbeat: ValidatorHeartbeat,
+    *,
+    now: datetime,
+    version: int = CANARY_BENCH_VERSION,
+) -> bool:
+    """Accept ``version`` only from a fresh scorer report matching its identity."""
+    # Protocol 8 is the floor at which a heartbeat carries a SIGNED capability
+    # and stack-identity payload at all -- it is a wire-format floor, not a
+    # per-benchmark one, so it stays fixed as the benchmark version moves. Any
+    # validator that can advertise a post-v2 benchmark is already >= 8.
     if heartbeat.protocol_version < 8:
         return False
     seen_at = (
@@ -431,7 +532,7 @@ def heartbeat_supports_v3(heartbeat: ValidatorHeartbeat, *, now: datetime) -> bo
     if (
         scorer is None
         or scorer.status != "fresh_verified"
-        or 3 not in scorer.supported_bench_versions
+        or version not in scorer.supported_bench_versions
     ):
         return False
     if (
@@ -456,15 +557,17 @@ async def issue_rollout_ticket(
     artifact_mode: Literal["legacy", "prefer_screened", "screened_only"] = "legacy",
     validator_running_benchmark: bool = False,
 ) -> ValidatorTicket | None:
-    """Issue one v3 cohort lease, balanced one score per agent per coverage round."""
+    """Issue one cohort lease, balanced one score per agent per coverage round."""
     # Retained as a keyword-compatible parameter for mixed platform callers;
-    # the version contract, not an operator-wide routing flag, governs v3.
+    # the version contract, not an operator-wide routing flag, governs this.
     _ = artifact_mode
-    heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
-    if heartbeat is None or not heartbeat_supports_v3(heartbeat, now=now):
-        return None
     rollout = await open_rollout(session, for_update=True)
     if rollout is None:
+        return None
+    heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
+    if heartbeat is None or not heartbeat_supports_version(
+        heartbeat, now=now, version=rollout.desired_version
+    ):
         return None
     contract = benchmark_contract(rollout.desired_version)
     complete_screened_image = (
@@ -603,7 +706,11 @@ async def issue_rollout_ticket(
 async def maybe_activate_rollout(
     session: AsyncSession, rollout: BenchmarkRollout, *, now: datetime
 ) -> bool:
-    """Activate after the rolling qualification set converges at v3 quorum."""
+    """Activate after the rolling qualification set converges at desired quorum."""
+    # A superseded (or already activated) rollout is terminal and must never be
+    # revived by a refresh sweep that still holds a stale reference to it.
+    if rollout.status not in ("collecting", "blocked_ineligible"):
+        return False
     count_rows = (
         await session.execute(
             select(BenchmarkRolloutMember.agent_id, func.count(Score.validator_hotkey))
@@ -659,12 +766,17 @@ async def maybe_activate_rollout(
 
 
 async def rollout_state(
-    session: AsyncSession, *, now: datetime | None = None
+    session: AsyncSession,
+    *,
+    now: datetime | None = None,
+    capability_version: int | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
+    version = CANARY_BENCH_VERSION if capability_version is None else capability_version
     heartbeats = (await session.execute(select(ValidatorHeartbeat))).scalars().all()
     capable_count = sum(
-        heartbeat_supports_v3(heartbeat, now=now) for heartbeat in heartbeats
+        heartbeat_supports_version(heartbeat, now=now, version=version)
+        for heartbeat in heartbeats
     )
     rollout = await session.scalar(
         select(BenchmarkRollout).order_by(BenchmarkRollout.created_at.desc()).limit(1)
@@ -674,6 +786,11 @@ async def rollout_state(
             "active_version": DEFAULT_BENCH_VERSION,
             "desired_version": DEFAULT_BENCH_VERSION,
             "status": "inactive",
+            "capability_bench_version": version,
+            "canary_capable_validator_count": capable_count,
+            # DEPRECATED alias of canary_capable_validator_count. It counts
+            # validators capable of capability_bench_version, which is no longer
+            # always 3. Kept because it is public API; read the new key.
             "v3_capable_validator_count": capable_count,
             "current_hybrid_top_five": [],
             "qualification_converged": False,
@@ -713,6 +830,9 @@ async def rollout_state(
         "desired_version": rollout.desired_version,
         "status": rollout.status,
         "blocked_reason": rollout.blocked_reason,
+        "capability_bench_version": version,
+        "canary_capable_validator_count": capable_count,
+        # DEPRECATED alias of canary_capable_validator_count; see above.
         "v3_capable_validator_count": capable_count,
         "current_hybrid_top_five": [str(member.agent_id) for member in current_top],
         "qualification_converged": len(current_top) == COHORT_SIZE

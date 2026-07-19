@@ -19,6 +19,9 @@ _CONTRACTS = {
     # A v3 dataset is only released after a policy-9 screener has produced an
     # archive whose complete bytes were verified by the platform.
     3: BenchmarkContract(3, 9, True),
+    # v4 supersedes v3 without relaxing any prerequisite: same policy-9 screener
+    # floor and the same verified-archive requirement.
+    4: BenchmarkContract(4, 9, True),
 }
 
 

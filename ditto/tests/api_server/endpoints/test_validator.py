@@ -2577,6 +2577,59 @@ class TestRequestJob:
 
 
 class TestSubmitScore:
+    @pytest.mark.parametrize("ticket_version", [3, 4])
+    async def test_post_legacy_ticket_requires_explicit_bench_version_binding(
+        self,
+        ticket_version: int,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A post-v2 lease is only satisfiable by a report that binds it.
+
+        v3 is no longer the canary, so this is exactly the case that a
+        canary-keyed check would stop covering once the canary moved to v4. The
+        binding is enforced twice: the ticket lookup pins a version-less report
+        to LEGACY_BENCH_VERSION (so it can never find a post-v2 lease), and the
+        endpoint re-checks the bound version against the lease it found.
+        """
+        from ditto.db.queries.benchmark_rollout import CANARY_BENCH_VERSION
+
+        assert CANARY_BENCH_VERSION != 3
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        await _seed_ticket(session_maker, agent_id, bench_version=ticket_version)
+
+        # A version-less (legacy-shaped) report cannot consume a post-v2 lease:
+        # it is pinned to v2 and finds no ticket there.
+        unbound = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id),
+        )
+        assert unbound.status_code == 409
+        assert "no open scoring ticket" in unbound.text
+
+        # Binding the WRONG post-v2 version is refused too.
+        mismatched = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id, bench_version=ticket_version + 1),
+        )
+        assert mismatched.status_code == 409
+
+        # Binding the lease's own version is accepted -- including for v3, which
+        # keeps working after the canary moved off it.
+        bound = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id, bench_version=ticket_version),
+        )
+        assert bound.status_code == 200, bound.text
+        async with session_maker() as session:
+            stored = await session.get(
+                Score, (agent_id, ticket_version, _VALIDATOR_HOTKEY)
+            )
+            assert stored is not None
+
     async def test_rejects_score_until_current_screening_policy_passes(
         self,
         app: FastAPI,

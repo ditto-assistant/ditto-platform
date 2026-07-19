@@ -120,9 +120,9 @@ from ditto.db.queries.audit import (
 )
 from ditto.db.queries.benchmark_rollout import (
     CANARY_BENCH_VERSION,
-    DEFAULT_BENCH_VERSION,
+    LEGACY_BENCH_VERSION,
     active_bench_version,
-    heartbeat_supports_v3,
+    heartbeat_supports_version,
     issue_rollout_ticket,
 )
 from ditto.db.queries.heartbeats import (
@@ -883,11 +883,13 @@ async def request_job(
             if (
                 canonical_version < CANARY_BENCH_VERSION
                 and heartbeat is not None
-                and heartbeat_supports_v3(heartbeat, now=now)
+                and heartbeat_supports_version(
+                    heartbeat, now=now, version=CANARY_BENCH_VERSION
+                )
             ):
-                # Guarded admin migrations pin a v3 dataset without adding the
-                # submission to the top-five activation cohort. Give those
-                # explicitly pinned submissions a v3-capable validation lane.
+                # Guarded admin migrations pin a canary dataset without adding
+                # the submission to the top-five activation cohort. Give those
+                # explicitly pinned submissions a canary-capable lane.
                 ticket = await issue_ticket(
                     session,
                     validator_hotkey=payload.validator_hotkey,
@@ -897,19 +899,30 @@ async def request_job(
                     artifact_mode="screened_only",
                     validator_running_benchmark=validator_state == "running_benchmark",
                 )
-            if canonical_version >= CANARY_BENCH_VERSION and (
-                heartbeat is None or not heartbeat_supports_v3(heartbeat, now=now)
-            ):
-                ticket = None
-            elif ticket is None:
-                ticket = await issue_ticket(
-                    session,
-                    validator_hotkey=payload.validator_hotkey,
-                    now=now,
-                    ttl=_TICKET_TTL,
-                    bench_version=canonical_version,
-                    artifact_mode=artifact_mode,
-                    validator_running_benchmark=validator_state == "running_benchmark",
+            if ticket is None:
+                # Any post-legacy benchmark needs a fresh, identity-matched
+                # scorer for THAT version. Keyed on the legacy floor, not on the
+                # canary: an activated v3 still gates a v3-incapable validator
+                # out once the canary has moved on to v4.
+                gated = canonical_version > LEGACY_BENCH_VERSION and (
+                    heartbeat is None
+                    or not heartbeat_supports_version(
+                        heartbeat, now=now, version=canonical_version
+                    )
+                )
+                ticket = (
+                    None
+                    if gated
+                    else await issue_ticket(
+                        session,
+                        validator_hotkey=payload.validator_hotkey,
+                        now=now,
+                        ttl=_TICKET_TTL,
+                        bench_version=canonical_version,
+                        artifact_mode=artifact_mode,
+                        validator_running_benchmark=validator_state
+                        == "running_benchmark",
+                    )
                 )
         if ticket is not None:
             agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
@@ -1263,10 +1276,11 @@ async def submit_score(
             now=datetime.now(UTC),
             deadline=payload.ticket_deadline,
             # A validator on the old protocol omits bench_version. Falling back
-            # to CURRENT would send every legacy submission hunting a ticket for
-            # whatever version is current (3 once the bump lands), find none, and
-            # 409. Legacy means v2 by definition, so pin the default.
-            bench_version=(report.bench_version or DEFAULT_BENCH_VERSION),
+            # to CURRENT would send every legacy submission hunting a ticket
+            # for whatever version is current, find none, and 409. A version-less
+            # report means v2 by definition, so pin the frozen legacy version --
+            # NOT the rollout's from_version, which moves.
+            bench_version=(report.bench_version or LEGACY_BENCH_VERSION),
             for_update=True,
         )
         if ticket is None:
@@ -1277,11 +1291,17 @@ async def submit_score(
                     "(never issued, expired, or already scored)"
                 ),
             )
-        if ticket.bench_version == CANARY_BENCH_VERSION:
-            if report.bench_version != CANARY_BENCH_VERSION:
+        # Every post-legacy benchmark must be bound EXPLICITLY, not just the
+        # current canary: a v3 ticket keeps this requirement after the canary
+        # moves to v4, instead of silently falling through to the lenient branch.
+        if ticket.bench_version > LEGACY_BENCH_VERSION:
+            if report.bench_version != ticket.bench_version:
                 raise HTTPException(
                     status_code=409,
-                    detail="benchmark v3 score must explicitly bind bench_version=3",
+                    detail=(
+                        f"benchmark v{ticket.bench_version} score must explicitly "
+                        f"bind bench_version={ticket.bench_version}"
+                    ),
                 )
         elif report.bench_version not in (None, ticket.bench_version):
             raise HTTPException(
