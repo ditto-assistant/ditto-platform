@@ -2297,28 +2297,71 @@
     var resolvingEntityKey = "";
     var entityReturnUrl = "";
 
+    // Sidebar pages (title, subtitle). Declared here — before the boot-time URL
+    // sanitizer runs — because currentPageName() consults it.
+    var PAGES = {
+      overview:    ["Overview", "Subnet snapshot and the full leaderboard · ranked by composite"],
+      operations:  ["Network operations", "Live submission pipeline and validator / screener fleet health"],
+      submissions: ["Recent submissions", "Screening evidence and validator quorum progress · select a row for history"],
+      reviews:     ["ATH reviews", "Public queue of held high-score submissions · scores preserved, emissions paused"],
+      benchmark:   ["Benchmark", "What the scoring benchmark measures and the frozen scoring setup"]
+    };
+
     function clearEntityParams(query) {
       Object.keys(ENTITY_PARAMS).forEach(function (kind) { query.delete(ENTITY_PARAMS[kind]); });
+    }
+
+    // All SPA state — the entity overlay params and the activity filters — lives
+    // in a query string INSIDE the hash ("#/submissions?agent=…&status=…"). The
+    // real (server-visible) query string carries only deploy/config knobs
+    // (?api=, ?wandb=), so the document URL and its HTTP cache entry stay
+    // stable while the SPA navigates. Legacy links with SPA state in the real
+    // query are recognized once and normalized into the hash form.
+    function parseHashRoute() {
+      var hash = location.hash || "";
+      if (hash.indexOf("#/") !== 0) return { page: null, query: new URLSearchParams() };
+      var rest = hash.slice(2);
+      var split = rest.indexOf("?");
+      return {
+        page: split === -1 ? rest : rest.slice(0, split),
+        query: new URLSearchParams(split === -1 ? "" : rest.slice(split + 1)),
+      };
+    }
+
+    // The real query string of every SPA-minted URL: config knobs only, taken
+    // from the boot-time params so stray query junk is never carried forward.
+    function configSearch() {
+      var config = new URLSearchParams();
+      ["api", "wandb"].forEach(function (key) {
+        if (params.has(key)) config.set(key, params.get(key));
+      });
+      var qs = config.toString();
+      return qs ? "?" + qs : "";
+    }
+
+    function spaHref(page, query) {
+      var qs = query ? query.toString() : "";
+      return "/" + configSearch() + "#/" + page + (qs ? "?" + qs : "");
     }
 
     // The page currently addressed by the hash, or null when the hash is not a
     // valid page route (e.g. on a dedicated /agent/{id} page).
     function currentPageName() {
-      var m = /^#\/([a-z]+)/.exec(location.hash || "");
-      return m && PAGES[m[1]] ? m[1] : null;
+      var page = parseHashRoute().page;
+      return page && PAGES[page] ? page : null;
     }
 
     function entityHref(kind, identifier, page) {
       var plural = ENTITY_PATHS[kind] || kind;
-      var url = new URL(location.href);
-      url.pathname = "/";
-      clearEntityParams(url.searchParams);
-      url.searchParams.set(ENTITY_PARAMS[plural], String(identifier));
+      // Keep the rest of the hash state (activity filters) so opening an
+      // overlay never resets the page under it.
+      var query = parseHashRoute().query;
+      clearEntityParams(query);
+      query.set(ENTITY_PARAMS[plural], String(identifier));
       // Drilldowns are overlays: they open over whatever page is active, so the
       // hash keeps the current page. ENTITY_PAGES is only the fallback for cold
       // links minted where no page route is present (dedicated entity pages).
-      url.hash = "#/" + (page || currentPageName() || ENTITY_PAGES[plural]);
-      return url.pathname + url.search + url.hash;
+      return spaHref(page || currentPageName() || ENTITY_PAGES[plural], query);
     }
 
     function fullEntityHref(kind, identifier) {
@@ -2348,12 +2391,20 @@
         }
       }
 
-      var query = new URLSearchParams(location.search);
-      var queryKind = Object.keys(ENTITY_PARAMS).find(function (kind) { return query.has(ENTITY_PARAMS[kind]); });
-      if (queryKind) {
-        var queryId = query.get(ENTITY_PARAMS[queryKind]);
-        if (queryId) return { kind: queryKind, id: queryId, key: queryKind + ":" + queryId, full: false, legacy: false };
-      }
+      var entityIn = function (query) {
+        var kind = Object.keys(ENTITY_PARAMS).find(function (candidate) { return query.has(ENTITY_PARAMS[candidate]); });
+        var id = kind && query.get(ENTITY_PARAMS[kind]);
+        return id ? { kind: kind, id: id, key: kind + ":" + id, full: false } : null;
+      };
+
+      // Canonical: entity params in the hash query ("#/operations?agent=…").
+      var hashEntity = entityIn(parseHashRoute().query);
+      if (hashEntity) { hashEntity.legacy = false; return hashEntity; }
+
+      // Legacy: entity params in the real query ("?agent=…#/submissions").
+      // Marked legacy so resolveEntityRoute normalizes the URL to the hash form.
+      var searchEntity = entityIn(new URLSearchParams(location.search));
+      if (searchEntity) { searchEntity.legacy = true; return searchEntity; }
 
       match = /^#\/(agents|miners|validators|screeners)\/([^/?#]+)\/?$/.exec(location.hash);
       var legacy = false;
@@ -2370,11 +2421,11 @@
     }
 
     function dashboardHref(page) {
-      var url = new URL(location.href);
-      url.pathname = "/";
-      clearEntityParams(url.searchParams);
-      url.hash = "#/" + page;
-      return url.pathname + url.search + url.hash;
+      // Keep the hash state (activity filters) minus any entity overlay, so
+      // switching pages or closing an overlay never resets the filters.
+      var query = parseHashRoute().query;
+      clearEntityParams(query);
+      return spaHref(page, query);
     }
 
     function configureEntityActions(kind, identifier) {
@@ -2393,10 +2444,20 @@
       history.pushState({ entity: true }, "", href);
     }
 
+    var ACTIVITY_URL_KEYS = ["status", "q", "page"];
+
     function restoreActivityUrl() {
-      var url = new URL(location.href);
+      // Canonical: filters in the hash query. Legacy links carried them in the
+      // real query — honor those once and report them for normalization.
+      var hashQuery = parseHashRoute().query;
+      var searchQuery = new URLSearchParams(location.search);
+      var hasIn = function (query) {
+        return ACTIVITY_URL_KEYS.some(function (key) { return query.has(key); });
+      };
+      var legacy = !hasIn(hashQuery) && hasIn(searchQuery);
+      var source = legacy ? searchQuery : hashQuery;
       var values = [];
-      url.searchParams.getAll("status").forEach(function (value) {
+      source.getAll("status").forEach(function (value) {
         value.split(",").forEach(function (part) { values.push(part.trim()); });
       });
       var requested = values.filter(Boolean);
@@ -2404,8 +2465,8 @@
         return ACTIVITY_STATUSES.indexOf(value) >= 0 && requested.indexOf(value) === index;
       });
       activityStatuses = ACTIVITY_STATUSES.filter(function (value) { return valid.indexOf(value) >= 0; });
-      activityQuery = (url.searchParams.get("q") || "").trim().slice(0, 200);
-      var requestedPage = url.searchParams.get("page");
+      activityQuery = (source.get("q") || "").trim().slice(0, 200);
+      var requestedPage = source.get("page");
       var parsedPage = Number(requestedPage);
       activityPage = requestedPage !== null && /^[1-9][0-9]*$/.test(requestedPage) &&
           Number.isSafeInteger(parsedPage)
@@ -2413,16 +2474,25 @@
         : 1;
       var pageNeedsSanitizing = requestedPage !== null &&
         (activityPage === 1 || String(activityPage) !== requestedPage);
-      return valid.length !== values.length || activityQuery !== (url.searchParams.get("q") || "") || pageNeedsSanitizing;
+      return legacy || valid.length !== values.length ||
+        activityQuery !== (source.get("q") || "") || pageNeedsSanitizing;
     }
 
     function writeActivityUrl(push) {
-      var url = new URL(location.href);
-      url.searchParams.delete("status");
-      activityStatuses.forEach(function (status) { url.searchParams.append("status", status); });
-      if (activityQuery) url.searchParams.set("q", activityQuery); else url.searchParams.delete("q");
-      if (activityPage > 1) url.searchParams.set("page", String(activityPage)); else url.searchParams.delete("page");
-      history[push ? "pushState" : "replaceState"]({}, "", url.pathname + url.search + url.hash);
+      // Dedicated entity pages have no filter UI and no page hash to write into.
+      if (/^\/(agent|miner)s?\//.test(location.pathname)) return;
+      var query = parseHashRoute().query;
+      query.delete("status");
+      activityStatuses.forEach(function (status) { query.append("status", status); });
+      if (activityQuery) query.set("q", activityQuery); else query.delete("q");
+      if (activityPage > 1) query.set("page", String(activityPage)); else query.delete("page");
+      // Keep an open overlay in the URL — including a legacy real-query entity
+      // that resolveEntityRoute has not normalized into the hash yet.
+      var entity = readEntityRoute();
+      if (entity && !entity.full) query.set(ENTITY_PARAMS[entity.kind], entity.id);
+      var page = currentPageName() ||
+        (entity && !entity.full ? ENTITY_PAGES[entity.kind] : "overview");
+      history[push ? "pushState" : "replaceState"]({}, "", spaHref(page, query));
     }
 
     function navigateActivityPage(page, anchor, push, userInitiated) {
@@ -5870,13 +5940,8 @@
 
     // ── Go ───────────────────────────────────────────────────
     // ── Hash router: each sidebar section is a deep-linkable page ──
-    var PAGES = {
-      overview:    ["Overview", "Subnet snapshot and the full leaderboard · ranked by composite"],
-      operations:  ["Network operations", "Live submission pipeline and validator / screener fleet health"],
-      submissions: ["Recent submissions", "Screening evidence and validator quorum progress · select a row for history"],
-      reviews:     ["ATH reviews", "Public queue of held high-score submissions · scores preserved, emissions paused"],
-      benchmark:   ["Benchmark", "What the scoring benchmark measures and the frozen scoring setup"]
-    };
+    // (PAGES itself is declared with the entity/URL helpers near the top so the
+    // boot-time URL sanitizer can consult it before this section runs.)
     // Once the live benchmark version is known, replace the neutral placeholders
     // in the nav description and the Benchmark page subtitle so a stale, hardcoded
     // version is never shown. Prefers the leaderboard's current_bench_version.
@@ -5933,11 +5998,16 @@
     }
     document.querySelectorAll(".nav-item[data-page]").forEach(function (item) {
       item.addEventListener("click", function (event) {
-        if (!readEntityRoute()) return;
+        // Route through dashboardHref rather than the static "#/page" href so
+        // the hash query (activity filters) survives page switches and any
+        // open overlay is dropped cleanly.
+        var entity = readEntityRoute();
+        var target = dashboardHref(item.getAttribute("data-page"));
+        if (location.pathname + location.search + location.hash === target) { event.preventDefault(); return; }
         event.preventDefault();
-        history.pushState({}, "", dashboardHref(item.getAttribute("data-page")));
+        history.pushState({}, "", target);
         entityReturnUrl = "";
-        resolveEntityRoute();
+        if (entity) resolveEntityRoute();
         route(false);
       });
     });

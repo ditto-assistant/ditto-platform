@@ -430,16 +430,21 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert "function restoreActivityUrl()" in body
-        assert 'url.searchParams.getAll("status")' in body
+        # Filters live in the hash query; legacy real-query filters are honored
+        # once and normalized into the hash form.
+        assert "var hashQuery = parseHashRoute().query" in body
+        assert "var legacy = !hasIn(hashQuery) && hasIn(searchQuery)" in body
+        assert 'source.getAll("status")' in body
         assert "ACTIVITY_STATUSES.indexOf(value) >= 0" in body
         assert "function writeActivityUrl(push)" in body
-        assert 'url.searchParams.append("status", status)' in body
-        assert 'url.searchParams.set("q", activityQuery)' in body
-        assert 'url.searchParams.get("page")' in body
+        assert 'query.append("status", status)' in body
+        assert 'query.set("q", activityQuery)' in body
+        assert 'source.get("page")' in body
         assert "/^[1-9][0-9]*$/.test(requestedPage)" in body
         assert "Number.isSafeInteger(parsedPage)" in body
-        assert 'url.searchParams.set("page", String(activityPage))' in body
-        assert 'url.searchParams.delete("page")' in body
+        assert 'query.set("page", String(activityPage))' in body
+        assert 'query.delete("page")' in body
+        assert "spaHref(page, query)" in body
         assert (
             "function navigateActivityPage(page, anchor, push, userInitiated)" in body
         )
@@ -694,13 +699,18 @@ class TestDashboard:
         assert 'miners: "overview"' in body
         assert 'validators: "operations"' in body
         assert 'screeners: "operations"' in body
-        assert "url.searchParams.set(ENTITY_PARAMS[plural], String(identifier))" in body
-        # Drilldowns are overlays over the current page; ENTITY_PAGES is only the
-        # cold-link fallback when no page route is present in the hash.
+        # Entity params live in the hash query; the real query carries config
+        # knobs only. Drilldowns are overlays over the current page and
+        # ENTITY_PAGES is only the cold-link fallback when no page route exists.
+        assert "query.set(ENTITY_PARAMS[plural], String(identifier))" in body
         assert (
-            'url.hash = "#/" + (page || currentPageName() || ENTITY_PAGES[plural])'
+            "return spaHref(page || currentPageName() || ENTITY_PAGES[plural], query)"
             in body
         )
+        assert "function parseHashRoute()" in body
+        assert "function configSearch()" in body
+        # Legacy real-query entity links are recognized and normalized.
+        assert "searchEntity.legacy = true" in body
         assert (
             'return "/" + singular + "/" + encodeURIComponent(String(identifier))'
             in body
@@ -708,7 +718,7 @@ class TestDashboard:
         assert 'id="d-open-full"' in body
         assert 'id="d-back-dashboard"' in body
         assert r"/^\/(agent|miner)\/([^/]+)\/?$/" in body
-        assert "query.has(ENTITY_PARAMS[kind])" in body
+        assert "query.has(ENTITY_PARAMS[candidate])" in body
         assert r"/^#\/(agents|miners|validators|screeners)\/([^/?#]+)\/?$/" in body
         assert "if (entity.legacy)" in body
         assert 'history.replaceState(history.state || {}, "", entityHref(' in body
