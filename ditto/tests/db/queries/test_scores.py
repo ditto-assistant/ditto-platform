@@ -432,18 +432,19 @@ class TestListEligibleLedger:
 
 
 class TestListScoresForBenchVersion:
-    async def test_filters_by_version_excludes_legacy(
+    async def test_filters_by_first_class_version_not_advisory_details(
         self, session: AsyncSession
     ) -> None:
         from ditto.db.queries.scores import list_scores_for_bench_version
 
         agent = await _seed_agent(session)
-        # Three rows: v1, v2, and a legacy (null details) row.
+        # First-class v1 wins even if other rows' advisory details say v2/null.
         await _upsert(
             session,
             agent.agent_id,
             validator_hotkey="5V1",
             run_id="r1",
+            bench_version=1,
             details={"bench_version": 1, "per_case": [{"expected": ["x"]}]},
         )
         await _upsert(

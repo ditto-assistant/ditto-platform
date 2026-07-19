@@ -49,7 +49,7 @@ class DatasetGenerator(Protocol):
         """Configured scoring profile, or ``None`` when disabled."""
         ...
 
-    async def generate(self, seed: int) -> str:
+    async def generate(self, seed: int, bench_version: int = 2) -> str:
         """Generate the dataset for ``seed`` and return its SHA-256 (hex).
 
         Raises:
@@ -59,7 +59,7 @@ class DatasetGenerator(Protocol):
         ...
 
     async def fetch_dataset(
-        self, seed: int, run_size: str
+        self, seed: int, run_size: str, bench_version: int = 2
     ) -> tuple[dict[str, Any], str]:
         """Return the FULL labeled dataset artifact for ``(seed, run_size)``.
 
@@ -89,17 +89,17 @@ class NullGenerator:
 
     run_size: str | None = None
 
-    async def generate(self, seed: int) -> str:
-        del seed
+    async def generate(self, seed: int, bench_version: int = 2) -> str:
+        del seed, bench_version
         raise DataPipelineError(
             "data-pipeline generate service is not configured (DATA_PIPELINE_URL "
             "unset); cannot generate a per-submission dataset"
         )
 
     async def fetch_dataset(
-        self, seed: int, run_size: str
+        self, seed: int, run_size: str, bench_version: int = 2
     ) -> tuple[dict[str, Any], str]:
-        del seed, run_size
+        del seed, run_size, bench_version
         raise DataPipelineError(
             "data-pipeline generate service is not configured (DATA_PIPELINE_URL "
             "unset); cannot reveal a dataset"
@@ -122,17 +122,17 @@ class HttpDatasetGenerator:
     def run_size(self) -> str | None:
         return self._config.run_size
 
-    async def generate(self, seed: int) -> str:
+    async def generate(self, seed: int, bench_version: int = 2) -> str:
         assert self._config.run_size is not None  # only built when enabled
         # generate() only needs the hash; the body (if any) is discarded, so it
         # never requires a parseable JSON payload.
-        _, sha = await self._post_generate(seed, self._config.run_size)
+        _, sha = await self._post_generate(seed, self._config.run_size, bench_version)
         return sha
 
     async def fetch_dataset(
-        self, seed: int, run_size: str
+        self, seed: int, run_size: str, bench_version: int = 2
     ) -> tuple[dict[str, Any], str]:
-        resp, sha = await self._post_generate(seed, run_size)
+        resp, sha = await self._post_generate(seed, run_size, bench_version)
         try:
             body = resp.json()
         except ValueError as e:
@@ -142,7 +142,7 @@ class HttpDatasetGenerator:
         return body, sha
 
     async def _post_generate(
-        self, seed: int, run_size: str
+        self, seed: int, run_size: str, bench_version: int
     ) -> tuple[httpx.Response, str]:
         """POST ``/generate``, returning the response + its verified SHA header."""
         url = self._config.url
@@ -151,7 +151,11 @@ class HttpDatasetGenerator:
         try:
             resp = await self._client.post(
                 endpoint,
-                params={"seed": str(seed), "run_size": run_size},
+                params={
+                    "seed": str(seed),
+                    "run_size": run_size,
+                    "bench_version": str(bench_version),
+                },
                 headers=await self._auth_header(url),
             )
             resp.raise_for_status()
@@ -164,6 +168,11 @@ class HttpDatasetGenerator:
             raise DataPipelineError(
                 f"generate service response missing {_SHA_HEADER} header"
             )
+        reported_version = resp.headers.get("X-Bench-Version")
+        if reported_version is not None and reported_version != str(bench_version):
+            raise DataPipelineError("generate service benchmark version mismatch")
+        if bench_version != 2 and reported_version is None:
+            raise DataPipelineError("generate service omitted benchmark version")
         return resp, sha
 
     async def _auth_header(self, audience: str) -> dict[str, str]:

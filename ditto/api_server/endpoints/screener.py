@@ -78,11 +78,13 @@ from ditto.api_server.storage import (
 from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
+    BenchmarkDataset,
     ScreenedImageUpload,
     ScreeningAttempt,
     ScreeningQuarantine,
 )
 from ditto.db.queries.agents import get_agent_by_id
+from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.heartbeats import (
     prune_stale_screener_heartbeats,
     upsert_screener_heartbeat,
@@ -1101,7 +1103,7 @@ async def submit_result(
     # 3. Generate the per-submission dataset (outside the row lock). Only on a pass,
     #    when generation is enabled, and when the agent is not already pinned (a
     #    cheap pre-read guards a re-reported verdict from regenerating).
-    new_dataset: tuple[int, str, str, int | None, str | None] | None = None
+    new_dataset: tuple[int, int, str, str, int | None, str | None] | None = None
     if payload.passed and generator.run_size is not None:
         # Own transaction so the read commits/closes before the write txn below
         # (a bare SELECT autobegins a transaction that would collide with it).
@@ -1110,10 +1112,12 @@ async def submit_result(
             if existing is None:
                 raise AgentNotFoundError(f"no agent with id={agent_id}")
             needs_dataset = existing.dataset_seed is None
+            bench_version = await active_bench_version(session)
         if needs_dataset:
             seed, block_number, block_hash = await _derive_dataset_seed(chain, agent_id)
-            dataset_sha256 = await generator.generate(seed)
+            dataset_sha256 = await generator.generate(seed, bench_version=bench_version)
             new_dataset = (
+                bench_version,
                 seed,
                 dataset_sha256,
                 generator.run_size,
@@ -1281,12 +1285,24 @@ async def submit_result(
             and agent.dataset_seed is None
         ):
             (
+                bench_version,
                 agent.dataset_seed,
                 agent.dataset_sha256,
                 agent.dataset_run_size,
                 agent.dataset_seed_block,
                 agent.dataset_seed_block_hash,
             ) = new_dataset
+            session.add(
+                BenchmarkDataset(
+                    agent_id=agent.agent_id,
+                    bench_version=bench_version,
+                    seed=agent.dataset_seed,
+                    sha256=agent.dataset_sha256,
+                    run_size=agent.dataset_run_size,
+                    seed_block=agent.dataset_seed_block,
+                    seed_block_hash=agent.dataset_seed_block_hash,
+                )
+            )
         result_status = agent.status
 
     logger.info(

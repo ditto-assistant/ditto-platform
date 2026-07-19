@@ -233,6 +233,7 @@ async def upsert_score(
     *,
     agent_id: UUID,
     validator_hotkey: str,
+    bench_version: int = 2,
     run_id: str,
     seed: int,
     composite: float,
@@ -258,12 +259,13 @@ async def upsert_score(
             handler validates ranges + agent existence first — so the
             envelope catch-all maps them to HTTP 500.
     """
-    existing = await session.get(Score, (agent_id, validator_hotkey))
+    existing = await session.get(Score, (agent_id, bench_version, validator_hotkey))
     if existing is None:
         session.add(
             Score(
                 agent_id=agent_id,
                 validator_hotkey=validator_hotkey,
+                bench_version=bench_version,
                 run_id=run_id,
                 seed=seed,
                 composite=composite,
@@ -297,6 +299,7 @@ async def list_scores_for_agent(
     session: AsyncSession,
     *,
     agent_id: UUID,
+    bench_version: int | None = None,
 ) -> list[Score]:
     """Return every validator's score for ``agent_id`` (unordered).
 
@@ -304,7 +307,13 @@ async def list_scores_for_agent(
     the validator set. Returns an empty list when no validator has scored
     the agent yet.
     """
-    stmt = select(Score).where(Score.agent_id == agent_id)
+    if bench_version is None:
+        from ditto.db.queries.benchmark_rollout import active_bench_version
+
+        bench_version = await active_bench_version(session)
+    stmt = select(Score).where(
+        Score.agent_id == agent_id, Score.bench_version == bench_version
+    )
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -430,14 +439,13 @@ async def list_scores_for_bench_version(
     (generated_at, agent_id, validator_hotkey) and paginated. Powers the retired-
     version corpus release, which serves the FULL unredacted per-case answer keys
     stored in ``scores.details`` — the caller must gate this to retired versions.
-    Filters on the stamped ``details.bench_version`` JSON field, so legacy rows
-    (null version) are excluded.
+    Filters on the first-class version column bound to the ticket and signature;
+    the JSON detail is advisory compatibility telemetry only.
     """
-    version_col = Score.details["bench_version"].as_integer()
     base = (
         select(Score, Agent.miner_hotkey)
         .join(Agent, Agent.agent_id == Score.agent_id)
-        .where(version_col == version)
+        .where(Score.bench_version == version)
     )
     total = (
         await session.execute(select(func.count()).select_from(base.subquery()))
@@ -538,33 +546,40 @@ async def list_eligible_ledger(
     same platform-generated dataset, so the median row's ``eligible`` flag
     represents the agent.
     """
-    agent_best = select(
-        Score.agent_id.label("agent_id"),
-        Score.composite.label("composite"),
-        Score.tool_mean.label("tool_mean"),
-        Score.memory_mean.label("memory_mean"),
-        Score.seed.label("seed"),
-        Score.run_id.label("run_id"),
-        Score.median_ms.label("median_ms"),
-        Score.n.label("n"),
-        _is_ranked().label("eligible"),
-        Score.details.label("details"),
-        Score.validator_hotkey.label("validator_hotkey"),
-        Score.signature.label("signature"),
-        # Row count in the agent's pool, so the median position is (cnt+1)/2.
-        func.count(Score.agent_id).over(partition_by=Score.agent_id).label("cnt"),
-        # Ascending composite so the middle row (by srn) is the median; the
-        # validator_hotkey tie-break keeps the pick deterministic.
-        func.row_number()
-        .over(
-            partition_by=Score.agent_id,
-            order_by=(
-                Score.composite.asc(),
-                Score.validator_hotkey.asc(),
-            ),
+    from ditto.db.queries.benchmark_rollout import active_bench_version
+
+    canonical_version = await active_bench_version(session)
+    agent_best = (
+        select(
+            Score.agent_id.label("agent_id"),
+            Score.composite.label("composite"),
+            Score.tool_mean.label("tool_mean"),
+            Score.memory_mean.label("memory_mean"),
+            Score.seed.label("seed"),
+            Score.run_id.label("run_id"),
+            Score.median_ms.label("median_ms"),
+            Score.n.label("n"),
+            _is_ranked().label("eligible"),
+            Score.details.label("details"),
+            Score.validator_hotkey.label("validator_hotkey"),
+            Score.signature.label("signature"),
+            # Row count in the agent's pool, so the median position is (cnt+1)/2.
+            func.count(Score.agent_id).over(partition_by=Score.agent_id).label("cnt"),
+            # Ascending composite so the middle row (by srn) is the median; the
+            # validator_hotkey tie-break keeps the pick deterministic.
+            func.row_number()
+            .over(
+                partition_by=Score.agent_id,
+                order_by=(
+                    Score.composite.asc(),
+                    Score.validator_hotkey.asc(),
+                ),
+            )
+            .label("srn"),
         )
-        .label("srn"),
-    ).subquery()
+        .where(Score.bench_version == canonical_version)
+        .subquery()
+    )
     sketch_columns: tuple[ColumnElement[Any], ...]
     if include_fingerprints:
         sketch_columns = (
@@ -692,8 +707,14 @@ async def quorum_composites(
     """
     if not agent_ids:
         return {}
+    from ditto.db.queries.benchmark_rollout import active_bench_version
+
+    canonical_version = await active_bench_version(session)
     result = await session.execute(
-        select(Score.agent_id, Score.composite).where(Score.agent_id.in_(agent_ids))
+        select(Score.agent_id, Score.composite).where(
+            Score.agent_id.in_(agent_ids),
+            Score.bench_version == canonical_version,
+        )
     )
     out: dict[UUID, list[float]] = {}
     for agent_id, composite in result:
@@ -713,11 +734,17 @@ async def list_provisional_ledger(
     reports available so far. Opaque run details are omitted because, before
     quorum, no single validator row is the canonical result.
     """
+    from ditto.db.queries.benchmark_rollout import active_bench_version
+
+    canonical_version = await active_bench_version(session)
     rows = (
         await session.execute(
             select(Agent, Score)
             .join(Score, Score.agent_id == Agent.agent_id)
-            .where(Agent.status == AgentStatus.EVALUATING)
+            .where(
+                Agent.status == AgentStatus.EVALUATING,
+                Score.bench_version == canonical_version,
+            )
             .order_by(
                 Agent.created_at.asc(),
                 Agent.agent_id.asc(),
@@ -790,10 +817,16 @@ async def get_score_counts(
     """Return accepted validator-score counts for the requested agents."""
     if not agent_ids:
         return {}
+    from ditto.db.queries.benchmark_rollout import active_bench_version
+
+    canonical_version = await active_bench_version(session)
     rows = (
         await session.execute(
             select(Score.agent_id, func.count(Score.validator_hotkey))
-            .where(Score.agent_id.in_(agent_ids))
+            .where(
+                Score.agent_id.in_(agent_ids),
+                Score.bench_version == canonical_version,
+            )
             .group_by(Score.agent_id)
         )
     ).all()

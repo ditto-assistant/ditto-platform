@@ -773,6 +773,9 @@ class Score(Base):
     validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
     """SS58 hotkey of the reporting validator. PK part 2."""
 
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    """Benchmark semantics this signed score and its dataset were produced under."""
+
     run_id: Mapped[str] = mapped_column(Text, nullable=False)
     """Scoring-engine run identifier (part of the value the signature is bound to)."""
 
@@ -823,7 +826,9 @@ class Score(Base):
     """When this row was last upserted (UTC)."""
 
     __table_args__ = (
-        PrimaryKeyConstraint("agent_id", "validator_hotkey", name="scores_pkey"),
+        PrimaryKeyConstraint(
+            "agent_id", "bench_version", "validator_hotkey", name="scores_pkey"
+        ),
         ForeignKeyConstraint(
             ["agent_id"],
             ["agents.agent_id"],
@@ -842,7 +847,115 @@ class Score(Base):
         ),
         CheckConstraint("n >= 0", name="scores_n_check"),
         CheckConstraint("median_ms >= 0", name="scores_median_ms_check"),
+        CheckConstraint("bench_version > 0", name="scores_bench_version_positive"),
         Index("scores_agent_id_idx", "agent_id"),
+    )
+
+
+class BenchmarkDataset(Base):
+    """Immutable dataset pin for one agent and benchmark version."""
+
+    __tablename__ = "benchmark_datasets"
+
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    run_size: Mapped[str] = mapped_column(Text, nullable=False)
+    seed_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    seed_block_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "agent_id", "bench_version", name="benchmark_datasets_pkey"
+        ),
+        ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="CASCADE"),
+        CheckConstraint("bench_version > 0", name="benchmark_dataset_version_positive"),
+        CheckConstraint("length(sha256) = 64", name="benchmark_dataset_sha_length"),
+    )
+
+
+class BenchmarkRollout(Base):
+    """Durable benchmark transition snapshot; there is at most one open row."""
+
+    __tablename__ = "benchmark_rollouts"
+
+    rollout_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    from_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    desired_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    cohort_size: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("from_version > 0", name="benchmark_rollout_from_positive"),
+        CheckConstraint(
+            "desired_version > from_version", name="benchmark_rollout_forward"
+        ),
+        CheckConstraint("cohort_size = 5", name="benchmark_rollout_five_members"),
+        CheckConstraint(
+            "status IN ('collecting', 'blocked_ineligible', 'activated')",
+            name="benchmark_rollout_status",
+        ),
+        Index(
+            "benchmark_rollouts_one_open_idx",
+            text("(1)"),
+            unique=True,
+            postgresql_where=text("status IN ('collecting', 'blocked_ineligible')"),
+            sqlite_where=text("status IN ('collecting', 'blocked_ineligible')"),
+        ),
+    )
+
+
+class BenchmarkRolloutMember(Base):
+    """Frozen member of a benchmark activation cohort."""
+
+    __tablename__ = "benchmark_rollout_members"
+
+    rollout_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    frozen_miner_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    frozen_composite: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("rollout_id", "agent_id"),
+        UniqueConstraint("rollout_id", "position"),
+        ForeignKeyConstraint(
+            ["rollout_id"], ["benchmark_rollouts.rollout_id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="RESTRICT"),
+        CheckConstraint("position BETWEEN 1 AND 5", name="benchmark_member_position"),
+    )
+
+
+class BenchmarkRolloutAudit(Base):
+    """Append-only operator/public-safe history for benchmark transitions."""
+
+    __tablename__ = "benchmark_rollout_audit"
+
+    audit_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    rollout_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    event: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["rollout_id"], ["benchmark_rollouts.rollout_id"], ondelete="CASCADE"
+        ),
+        Index("benchmark_rollout_audit_history_idx", "rollout_id", "recorded_at"),
     )
 
 
@@ -1083,7 +1196,10 @@ class ValidatorTicket(Base):
 
     __table_args__ = (
         PrimaryKeyConstraint(
-            "agent_id", "validator_hotkey", name="validator_tickets_pkey"
+            "agent_id",
+            "bench_version",
+            "validator_hotkey",
+            name="validator_tickets_pkey",
         ),
         ForeignKeyConstraint(
             ["agent_id"],

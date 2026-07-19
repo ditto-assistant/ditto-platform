@@ -140,6 +140,7 @@ from ditto.db.models import (
 )
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
+from ditto.db.queries.benchmark_rollout import active_bench_version, rollout_state
 from ditto.db.queries.heartbeats import (
     ActiveValidatorAssignment,
     ActiveValidatorWork,
@@ -530,6 +531,7 @@ def _public_entry(
     registered: bool | None = None,
     miner_uid: int | None = None,
     fold_stderr: float | None = None,
+    active_version: int = CURRENT_BENCH_VERSION,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -558,10 +560,7 @@ def _public_entry(
         miner_uid=miner_uid,
         registered=registered,
         emission_eligible=(
-            finalized
-            and r.eligible
-            and registered
-            and bench_version == CURRENT_BENCH_VERSION
+            finalized and r.eligible and registered and bench_version == active_version
             if registered is not None
             else None
         ),
@@ -593,6 +592,7 @@ def _public_koth_emissions(
     rows: list[LedgerRow],
     *,
     stderrs: dict[UUID, float | None],
+    active_version: int = CURRENT_BENCH_VERSION,
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
     candidates: list[LedgerRow] = []
@@ -601,7 +601,7 @@ def _public_koth_emissions(
         if (
             row.eligible
             and row.composite > 0.0
-            and details.get("bench_version") == CURRENT_BENCH_VERSION
+            and details.get("bench_version") == active_version
         ):
             candidates.append(row)
     candidates.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
@@ -689,6 +689,7 @@ async def leaderboard(
 ) -> PublicLeaderboardResponse:
     """Best score per miner, with quorum and current registration eligibility."""
     response.headers["Cache-Control"] = _CACHE_CONTROL
+    canonical_version = await active_bench_version(session)
     ledger_rows = await list_eligible_ledger(session, include_fingerprints=False)
     registered_uids = await _current_registered_uids(request)
     quorum = await quorum_composites(session, [row.agent_id for row in ledger_rows])
@@ -763,6 +764,7 @@ async def leaderboard(
                     else None
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
+                active_version=canonical_version,
             )
         )
     for row, count in provisional_rows:
@@ -785,16 +787,18 @@ async def leaderboard(
                     else None
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
+                active_version=canonical_version,
             )
         )
     return PublicLeaderboardResponse(
         generated_at=datetime.now(UTC),
         count=len(entries),
-        current_bench_version=CURRENT_BENCH_VERSION,
+        current_bench_version=canonical_version,
         entries=entries,
         emissions=_public_koth_emissions(
             finalized_rows,
             stderrs=fold_stderrs,
+            active_version=canonical_version,
         ),
     )
 
@@ -2062,3 +2066,12 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
         ledger_path="/api/v1/scoring/scores",
         generated_at=datetime.now(UTC),
     )
+
+
+@router.get("/bench/rollout")
+async def benchmark_rollout_state(
+    response: Response, session: SessionDep
+) -> dict[str, object]:
+    """Expose desired/active versions and the frozen cohort's exact progress."""
+    response.headers["Cache-Control"] = "public, max-age=30"
+    return await rollout_state(session)

@@ -84,6 +84,7 @@ class ArtifactResponse(BaseModel):
         str | None, Field(pattern=r"^sha256:[0-9a-f]{64}$")
     ] = None
     screened_image_ref: Annotated[str | None, Field(min_length=1)] = None
+    bench_version: Annotated[int | None, Field(default=None, ge=1)] = None
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -196,6 +197,14 @@ class JobResponse(BaseModel):
             "(anti-grind, prod hardening P2). Null for pre-derivation agents.",
         ),
     ] = None
+    bench_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description="Version-bound benchmark semantics for this lease.",
+        ),
+    ] = None
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -301,6 +310,16 @@ class ValidatorHeartbeatRequest(BaseModel):
                 )
             if self.capabilities.full_stack_managed != (self.stack.mode == "managed"):
                 raise ValueError("full_stack_managed contradicts stack mode")
+            if (
+                self.protocol_version == 7
+                and self.capabilities.scorer_benchmarks is not None
+            ):
+                raise ValueError("scorer benchmark capability requires heartbeat v8")
+            if (
+                self.protocol_version >= 8
+                and self.capabilities.scorer_benchmarks is None
+            ):
+                raise ValueError("heartbeat v8 requires scorer benchmark capability")
         elif self.capabilities is not None or self.stack is not None:
             raise ValueError("capabilities and stack require heartbeat protocol v7")
         return self
@@ -398,6 +417,17 @@ class ScoreReport(BaseModel):
     """
 
     run_id: Annotated[str, Field(description="Scoring-engine run identifier.")]
+    bench_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description=(
+                "Version bound into new score signatures. Omission is accepted "
+                "only for legacy benchmark-v2 leases."
+            ),
+        ),
+    ] = None
     seed: Annotated[
         int,
         Field(
