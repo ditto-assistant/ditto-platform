@@ -46,6 +46,7 @@ from ditto.db.models import (
     Agent,
     AthReview,
     Base,
+    BenchmarkRollout,
     Score,
     ScreeningAttempt,
     ScreeningQuarantine,
@@ -500,6 +501,107 @@ class TestPublicLeaderboard:
         assert entry["score_count"] == 2
         assert entry["score_quorum"] == 3
         assert entry["bench_version"] == DEFAULT_BENCH_VERSION
+
+    async def test_open_rollout_exposes_settled_and_rollout_state_per_entry(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Mid-rollout, every entry carries the settled v2 median plus the v3
+        settlement state (median so far + score count) — including agents whose
+        headline composite already flipped to v3 at quorum."""
+        flipped_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.80, 0.80, 0.80],
+        )
+        partial_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.85, 0.85, 0.85],
+        )
+        async with session_maker() as s, s.begin():
+            s.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="collecting",
+                    cohort_size=5,
+                    created_at=datetime.now(UTC),
+                )
+            )
+            for i, composite in enumerate([0.90, 0.92, 0.94]):
+                await upsert_score(
+                    s,
+                    agent_id=UUID(flipped_id),
+                    validator_hotkey=f"5Validator{i}Flipped",
+                    bench_version=3,
+                    run_id=f"v3_run_{i}",
+                    seed=1,
+                    composite=composite,
+                    tool_mean=composite,
+                    memory_mean=composite,
+                    median_ms=500,
+                    n=110,
+                    generated_at=datetime(2026, 7, 18, 12, i, tzinfo=UTC),
+                    signature="ab" * 64,
+                )
+            await upsert_score(
+                s,
+                agent_id=UUID(partial_id),
+                validator_hotkey="5Validator0Partial",
+                bench_version=3,
+                run_id="v3_run_partial",
+                seed=1,
+                composite=0.5,
+                tool_mean=0.5,
+                memory_mean=0.5,
+                median_ms=500,
+                n=110,
+                generated_at=datetime(2026, 7, 18, 12, 0, tzinfo=UTC),
+                signature="ab" * 64,
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        assert body["active_bench_version"] == 2
+        assert body["desired_bench_version"] == 3
+        by_agent = {e["agent_id"]: e for e in body["entries"]}
+        flipped = by_agent[flipped_id]
+        assert flipped["bench_version"] == 3
+        assert flipped["composite"] == pytest.approx(0.92)
+        assert flipped["settled_composite"] == pytest.approx(0.80)
+        assert flipped["rollout_composite"] == pytest.approx(0.92)
+        assert flipped["rollout_score_count"] == 3
+        partial = by_agent[partial_id]
+        assert partial["bench_version"] == DEFAULT_BENCH_VERSION
+        assert partial["composite"] == pytest.approx(0.85)
+        assert partial["settled_composite"] == pytest.approx(0.85)
+        assert partial["rollout_composite"] == pytest.approx(0.5)
+        assert partial["rollout_score_count"] == 1
+
+    async def test_rollout_state_is_null_without_an_open_rollout(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.7, 0.8, 0.9],
+        )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        entry = body["entries"][0]
+        assert entry["settled_composite"] is None
+        assert entry["rollout_composite"] is None
+        assert entry["rollout_score_count"] is None
 
     async def test_finalized_miner_supersedes_partial_submission(
         self,

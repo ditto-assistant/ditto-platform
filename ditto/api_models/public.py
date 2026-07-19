@@ -260,6 +260,49 @@ class PublicLeaderboardEntry(BaseModel):
             ),
         ),
     ]
+    settled_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "The agent's finalized median on the settled (active) benchmark "
+                "version. Only populated in authoritative mode while a rollout is "
+                "collecting the next version; null when there is no open rollout "
+                "or the agent never reached quorum on the active version. This is "
+                "the comparable baseline the dashboard ranks by mid-rollout, even "
+                "for agents whose headline composite already flipped to the "
+                "desired version."
+            ),
+        ),
+    ] = None
+    rollout_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Median of the agent's accepted scores on the desired (rolling "
+                "out) benchmark version so far. Preliminary until "
+                "rollout_score_count reaches score_quorum; null when there is no "
+                "open rollout or no accepted score on the desired version yet."
+            ),
+        ),
+    ] = None
+    rollout_score_count: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description=(
+                "Accepted validator scores on the desired benchmark version so "
+                "far (the settlement state of rollout_composite, out of "
+                "score_quorum). Null when there is no open rollout."
+            ),
+        ),
+    ] = None
     calibration_brier: Annotated[
         float | None,
         Field(
