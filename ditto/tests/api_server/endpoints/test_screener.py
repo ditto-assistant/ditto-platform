@@ -2217,6 +2217,18 @@ class TestQuarantineAdmin:
                     duplicate_of=duplicate_id,
                 )
             )
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=uuid4(),
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION - 1,
+                    status="passed",
+                    started_at=now - timedelta(days=1),
+                    deadline=now - timedelta(days=1) + timedelta(minutes=30),
+                    finished_at=now - timedelta(days=1) + timedelta(minutes=4),
+                )
+            )
         _install_db(app, session_maker)
         storage = _install_storage(app)
         headers = {
@@ -2226,6 +2238,9 @@ class TestQuarantineAdmin:
 
         listing = await client.get(
             "/api/v1/admin/screening-submissions", headers=headers
+        )
+        exact = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}", headers=headers
         )
         artifact = await client.get(
             f"/api/v1/admin/screening-submissions/{agent_id}/artifact",
@@ -2240,12 +2255,44 @@ class TestQuarantineAdmin:
         assert item["attempts"][0]["reason"] == "Docker image build failed"
         assert item["attempts"][0]["duplicate_name"] == "Jackie"
         assert item["attempts"][0]["duplicate_version"] == 2
+        assert [attempt["status"] for attempt in item["attempts"]] == [
+            "rejected",
+            "passed",
+        ]
+        assert exact.status_code == 200
+        assert exact.json() == item
+        assert "download_url" not in exact.json()
         assert artifact.status_code == 200
         assert artifact.json()["sha256"] == _SHA256
         assert storage.presigned_get_url.await_args.kwargs == {
             "key": f"{agent_id}/agent.tar.gz",
             "expires_in": 300,
         }
+
+    async def test_exact_screening_submission_requires_auth_and_returns_404(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        _install_db(app, session_maker)
+        unknown_id = uuid4()
+
+        unauthenticated = await client.get(
+            f"/api/v1/admin/screening-submissions/{unknown_id}"
+        )
+        missing = await client.get(
+            f"/api/v1/admin/screening-submissions/{unknown_id}",
+            headers={"Authorization": "Bearer test-admin-token-at-least-32-characters"},
+        )
+
+        assert unauthenticated.status_code == 401
+        assert missing.status_code == 404
+        assert missing.json()["message"] == "screening submission not found"
 
     async def test_rejected_rescreen_preserves_score_and_attempt_history(
         self,

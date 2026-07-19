@@ -1292,6 +1292,78 @@ async def resolve_screening_dispute(
     )
 
 
+async def _screening_attempts_by_agent(
+    session: AsyncSession, agent_ids: list[UUID]
+) -> dict[UUID, list[AdminScreeningAttempt]]:
+    attempts_by_agent: dict[UUID, list[AdminScreeningAttempt]] = defaultdict(list)
+    if not agent_ids:
+        return attempts_by_agent
+    attempts = (
+        (
+            await session.execute(
+                select(ScreeningAttempt)
+                .where(ScreeningAttempt.agent_id.in_(agent_ids))
+                .order_by(
+                    ScreeningAttempt.started_at.desc(),
+                    ScreeningAttempt.attempt_id.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    duplicate_ids = {
+        attempt.duplicate_of for attempt in attempts if attempt.duplicate_of is not None
+    }
+    duplicate_agents = {
+        duplicate.agent_id: duplicate
+        for duplicate in await session.scalars(
+            select(Agent).where(Agent.agent_id.in_(duplicate_ids))
+        )
+    }
+    for attempt in attempts:
+        duplicate = (
+            duplicate_agents.get(attempt.duplicate_of)
+            if attempt.duplicate_of is not None
+            else None
+        )
+        attempts_by_agent[attempt.agent_id].append(
+            AdminScreeningAttempt(
+                attempt_id=attempt.attempt_id,
+                policy_version=attempt.policy_version,
+                status=attempt.status,  # type: ignore[arg-type]
+                screener_hotkey=attempt.screener_hotkey,
+                started_at=attempt.started_at,
+                deadline=attempt.deadline,
+                finished_at=attempt.finished_at,
+                reason=attempt.public_reason,
+                reason_code=attempt.reason_code,
+                duplicate_of=attempt.duplicate_of,
+                duplicate_name=duplicate.name if duplicate is not None else None,
+                duplicate_version=duplicate.version if duplicate is not None else None,
+            )
+        )
+    return attempts_by_agent
+
+
+def _screening_submission(
+    agent: Agent, attempts: list[AdminScreeningAttempt]
+) -> AdminScreeningSubmission:
+    return AdminScreeningSubmission(
+        agent_id=agent.agent_id,
+        miner_hotkey=agent.miner_hotkey,
+        agent_name=agent.name,
+        agent_version=agent.version,
+        artifact_sha256=agent.sha256,
+        agent_status=agent.status,
+        screening_policy_version=agent.screening_policy_version,
+        screening_reason=agent.screening_reason,
+        screening_reason_code=agent.screening_reason_code,
+        submitted_at=agent.created_at,
+        attempts=attempts,
+    )
+
+
 @router.get("/screening-submissions", response_model=AdminScreeningSubmissionList)
 async def list_screening_submissions(
     _admin: AdminDep,
@@ -1313,77 +1385,30 @@ async def list_screening_submissions(
         .scalars()
         .all()
     )
-    agent_ids = [agent.agent_id for agent in agents]
-    attempts_by_agent: dict[UUID, list[AdminScreeningAttempt]] = defaultdict(list)
-    if agent_ids:
-        attempts = (
-            (
-                await session.execute(
-                    select(ScreeningAttempt)
-                    .where(ScreeningAttempt.agent_id.in_(agent_ids))
-                    .order_by(
-                        ScreeningAttempt.started_at.desc(),
-                        ScreeningAttempt.attempt_id.desc(),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        duplicate_ids = {
-            attempt.duplicate_of
-            for attempt in attempts
-            if attempt.duplicate_of is not None
-        }
-        duplicate_agents = {
-            duplicate.agent_id: duplicate
-            for duplicate in await session.scalars(
-                select(Agent).where(Agent.agent_id.in_(duplicate_ids))
-            )
-        }
-        for attempt in attempts:
-            duplicate = (
-                duplicate_agents.get(attempt.duplicate_of)
-                if attempt.duplicate_of is not None
-                else None
-            )
-            attempts_by_agent[attempt.agent_id].append(
-                AdminScreeningAttempt(
-                    attempt_id=attempt.attempt_id,
-                    policy_version=attempt.policy_version,
-                    status=attempt.status,  # type: ignore[arg-type]
-                    screener_hotkey=attempt.screener_hotkey,
-                    started_at=attempt.started_at,
-                    deadline=attempt.deadline,
-                    finished_at=attempt.finished_at,
-                    reason=attempt.public_reason,
-                    reason_code=attempt.reason_code,
-                    duplicate_of=attempt.duplicate_of,
-                    duplicate_name=duplicate.name if duplicate is not None else None,
-                    duplicate_version=(
-                        duplicate.version if duplicate is not None else None
-                    ),
-                )
-            )
+    attempts_by_agent = await _screening_attempts_by_agent(
+        session, [agent.agent_id for agent in agents]
+    )
     return AdminScreeningSubmissionList(
         count=total,
         items=[
-            AdminScreeningSubmission(
-                agent_id=agent.agent_id,
-                miner_hotkey=agent.miner_hotkey,
-                agent_name=agent.name,
-                agent_version=agent.version,
-                artifact_sha256=agent.sha256,
-                agent_status=agent.status,
-                screening_policy_version=agent.screening_policy_version,
-                screening_reason=agent.screening_reason,
-                screening_reason_code=agent.screening_reason_code,
-                submitted_at=agent.created_at,
-                attempts=attempts_by_agent[agent.agent_id],
-            )
+            _screening_submission(agent, attempts_by_agent[agent.agent_id])
             for agent in agents
         ],
     )
+
+
+@router.get(
+    "/screening-submissions/{agent_id}", response_model=AdminScreeningSubmission
+)
+async def get_screening_submission(
+    agent_id: UUID, _admin: AdminDep, session: SessionDep
+) -> AdminScreeningSubmission:
+    """Return one exact submission and its full history, without source access."""
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="screening submission not found")
+    attempts_by_agent = await _screening_attempts_by_agent(session, [agent_id])
+    return _screening_submission(agent, attempts_by_agent[agent_id])
 
 
 @router.post(
