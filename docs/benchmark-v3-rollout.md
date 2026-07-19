@@ -1,16 +1,22 @@
 # Benchmark v3 activation
 
-Benchmark v3 uses a durable five-agent collection cohort plus per-agent quorum
-authority. A median never mixes score rows from different versions: each agent
-is represented by its v3 median after 3/3, otherwise by its v2 median.
+Benchmark v3 uses a durable five-agent collection cohort. A median never mixes
+score rows from different versions, and the ledger is on exactly one version at
+a time.
 
-> **Temporary authority pin (2026-07-19).** While v3 scoring issues are being
-> fixed, per-agent quorum authority is suspended:
-> `DESIRED_AUTHORITY_AT_QUORUM = False` in `ditto/db/queries/benchmark_rollout.py`
-> keeps every agent with a v2 median on it — for the public leaderboard, the
-> validator weight fold, and KOTH — until the rollout activates. Complete v3
-> quorums are still collected and shown as per-row rollout progress. Flip the
-> constant back to `True` to restore the per-agent behavior described below.
+> **Threshold-gated authority.** The desired version takes over ledger
+> authority for the whole pool only once at least
+> `MIN_DESIRED_AUTHORITY_AGENTS` (= 5, the KOTH champion + `KOTH_TAIL_SIZE`)
+> agents hold a complete, ranked desired-version quorum
+> (`ditto/db/queries/benchmark_rollout.py`, applied in
+> `list_eligible_ledger`). Below that count the active version stays
+> authoritative for every agent — for the public leaderboard, the validator
+> weight fold, and KOTH — while desired-version quorums are collected and shown
+> as per-row rollout progress. The threshold exists because the flip drops
+> agents without a desired-version quorum: crossing it guarantees the emission
+> set still has its full complement of recipients. Authority is never mixed
+> per-agent, because composites from different benchmark versions are not on a
+> comparable scale within one KOTH fold.
 
 ## Compatibility
 
