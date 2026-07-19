@@ -38,6 +38,14 @@ DEFAULT_BENCH_VERSION = 2
 CANARY_BENCH_VERSION = 3
 COHORT_SIZE = 5
 SCORING_QUORUM = 3
+# TEMPORARY authority pin (2026-07-19): the v3 benchmark still has scoring
+# issues under investigation, so a complete desired-version (v3) quorum does
+# NOT take over an agent's ledger authority mid-rollout. Every agent with an
+# active-version (v2) median keeps it as its authoritative score — for the
+# public leaderboard, the validator weight fold, and KOTH — until the rollout
+# activates; v3 medians stay visible as per-row rollout progress only. Flip
+# back to True to restore per-agent authority at quorum.
+DESIRED_AUTHORITY_AT_QUORUM = False
 
 
 @dataclass(frozen=True)
