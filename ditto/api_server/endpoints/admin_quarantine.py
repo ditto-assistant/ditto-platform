@@ -14,11 +14,14 @@ from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.admin_quarantine import (
     AdminArtifactDuplicate,
+    AdminBenchmarkContractRefreshDetail,
+    AdminBenchmarkContractRefreshRequest,
+    AdminBenchmarkContractRefreshResponse,
     AdminDuplicateSummary,
     AdminMinerContext,
     AdminMinerQuarantineSummary,
@@ -76,6 +79,7 @@ from ditto.api_server.source_inspect import (
 from ditto.api_server.storage import ObjectDownloadFailedError, S3StorageClient
 from ditto.db.models import (
     Agent,
+    BenchmarkDataset,
     Score,
     ScreeningAttempt,
     ScreeningDispute,
@@ -83,6 +87,7 @@ from ditto.db.models import (
     ScreeningQuarantineResolution,
     ValidatorTicket,
 )
+from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.tickets import RETRY_COOLDOWN
 
 logger = logging.getLogger(__name__)
@@ -1410,6 +1415,186 @@ async def rescreen_rejected_submission(
     )
     return AdminScreeningRescreenResponse(
         agent_id=agent_id, agent_status=AgentStatus.SCREENING_FAILED
+    )
+
+
+@router.post(
+    "/screening-submissions/{agent_id}/refresh-benchmark-contract",
+    response_model=AdminBenchmarkContractRefreshResponse,
+)
+async def refresh_benchmark_contract(
+    agent_id: UUID,
+    payload: AdminBenchmarkContractRefreshRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminBenchmarkContractRefreshResponse:
+    """Rebuild one stale v3+ dataset and screened image before ticketing again.
+
+    This is an operator-only recovery path for a dataset-generator/scorer drift.
+    It preserves submission and score history, but only permits the repair when
+    the active benchmark has exactly the expected number of accepted scores.
+    """
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+
+    now = datetime.now(UTC)
+    async with session.begin():
+        agent = await session.scalar(
+            select(Agent).where(Agent.agent_id == agent_id).with_for_update()
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        if agent.sha256 != payload.expected_sha256:
+            raise HTTPException(status_code=409, detail="artifact identity changed")
+
+        bench_version = await active_bench_version(session)
+        if bench_version != payload.expected_bench_version:
+            raise HTTPException(status_code=409, detail="active benchmark changed")
+        dataset = await session.get(BenchmarkDataset, (agent_id, bench_version))
+        if dataset is None:
+            raise HTTPException(status_code=409, detail="benchmark dataset is missing")
+        if dataset.sha256 != payload.expected_dataset_sha256:
+            raise HTTPException(status_code=409, detail="benchmark dataset changed")
+
+        score_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(Score)
+                .where(
+                    Score.agent_id == agent_id,
+                    Score.bench_version == bench_version,
+                )
+            )
+            or 0
+        )
+        if score_count != payload.expected_score_count:
+            raise HTTPException(status_code=409, detail="score count changed")
+        if score_count != 0:
+            raise HTTPException(
+                status_code=409,
+                detail="benchmark contract refresh requires zero accepted scores",
+            )
+
+        running_attempt = await session.scalar(
+            select(ScreeningAttempt.attempt_id).where(
+                ScreeningAttempt.agent_id == agent_id,
+                ScreeningAttempt.status == "running",
+            )
+        )
+        if running_attempt is not None:
+            raise HTTPException(status_code=409, detail="screening attempt is active")
+
+        tickets = list(
+            await session.scalars(
+                select(ValidatorTicket)
+                .where(
+                    ValidatorTicket.agent_id == agent_id,
+                    ValidatorTicket.bench_version == bench_version,
+                    ValidatorTicket.status != TicketStatus.SCORED,
+                )
+                .with_for_update()
+            )
+        )
+        for ticket in tickets:
+            ticket.status = TicketStatus.EXPIRED
+            ticket.deadline = now
+            ticket.retry_after = now
+            # The replacement dataset is a new contract even though its public
+            # benchmark version is unchanged. Grant one clean lease without
+            # erasing the historical attempt counter.
+            ticket.manual_retry_grants += 1
+
+        await session.execute(
+            delete(BenchmarkDataset).where(
+                BenchmarkDataset.agent_id == agent_id,
+                BenchmarkDataset.bench_version == bench_version,
+            )
+        )
+        agent.screened_image_sha256 = None
+        agent.screened_image_size_bytes = None
+        agent.screened_image_id = None
+        agent.screened_image_ref = None
+        agent.screened_image_upload_id = None
+        agent.screened_image_verified_at = None
+        agent.status = AgentStatus.SCREENING_FAILED
+        agent.screening_reason = "Operator requested benchmark contract rebuild"
+        agent.screening_reason_code = None
+
+    logger.warning(
+        "admin_actor=%s refreshed benchmark contract agent_id=%s "
+        "bench_version=%s expired_tickets=%s reason=%s",
+        x_admin_actor,
+        agent_id,
+        bench_version,
+        len(tickets),
+        payload.reason,
+    )
+    return AdminBenchmarkContractRefreshResponse(
+        agent_id=agent_id,
+        agent_status=AgentStatus.SCREENING_FAILED,
+        bench_version=bench_version,
+        expired_ticket_count=len(tickets),
+    )
+
+
+@router.get(
+    "/screening-submissions/{agent_id}/refresh-benchmark-contract",
+    response_model=AdminBenchmarkContractRefreshDetail,
+)
+async def inspect_benchmark_contract_refresh(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+) -> AdminBenchmarkContractRefreshDetail:
+    """Return the exact guarded inputs Backroom must confirm before repair."""
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+
+    bench_version = await active_bench_version(session)
+    dataset = await session.get(BenchmarkDataset, (agent_id, bench_version))
+    score_count = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Score)
+            .where(
+                Score.agent_id == agent_id,
+                Score.bench_version == bench_version,
+            )
+        )
+        or 0
+    )
+    screening_attempt_active = (
+        await session.scalar(
+            select(ScreeningAttempt.attempt_id).where(
+                ScreeningAttempt.agent_id == agent_id,
+                ScreeningAttempt.status == "running",
+            )
+        )
+        is not None
+    )
+    blocking_reason: str | None = None
+    if bench_version <= 2:
+        blocking_reason = "active benchmark does not support contract refresh"
+    elif dataset is None:
+        blocking_reason = "benchmark dataset is missing"
+    elif score_count != 0:
+        blocking_reason = "submission already has an accepted active-version score"
+    elif screening_attempt_active:
+        blocking_reason = "screening attempt is active"
+
+    return AdminBenchmarkContractRefreshDetail(
+        agent_id=agent_id,
+        agent_name=agent.name,
+        agent_status=agent.status,
+        artifact_sha256=agent.sha256,
+        bench_version=bench_version,
+        dataset_sha256=dataset.sha256 if dataset is not None else None,
+        score_count=score_count,
+        screening_attempt_active=screening_attempt_active,
+        refresh_allowed=blocking_reason is None,
+        blocking_reason=blocking_reason,
     )
 
 
