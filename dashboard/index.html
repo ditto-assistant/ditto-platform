@@ -487,6 +487,7 @@
     .modal.open { opacity: 1; pointer-events: auto; visibility: visible; transform: translate(-50%, -50%) scale(1); transition: transform .2s cubic-bezier(.4,0,.2,1), opacity .18s, visibility 0s; }
     .modal-actions { position: absolute; top: 14px; right: 14px; display: flex; align-items: center; gap: 8px; }
     .modal-actions .open-full { min-height: 44px; padding-inline: 13px; }
+    .modal-actions #d-wandb-logs[hidden] { display: none; }
     .modal-actions .close { position: static; }
     body.entity-page .layout { display: none; }
     body.entity-page .modal {
@@ -2159,6 +2160,7 @@
   <aside id="modal" class="modal" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="d-title" tabindex="-1">
     <div class="modal-actions">
       <a class="btn ghost back-dashboard" id="d-back-dashboard" href="/#/overview">← Dashboard</a>
+      <a class="btn ghost" id="d-wandb-logs" href="#" target="_blank" rel="noopener" hidden>W&amp;B logs <svg class="ic ext" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6"/></svg></a>
       <a class="btn ghost open-full" id="d-open-full" href="/">Open full page</a>
       <button class="btn ghost close" id="modal-close" aria-label="Close detail"><span aria-hidden="true">✕</span></button>
     </div>
@@ -2366,9 +2368,14 @@
     function configureEntityActions(kind, identifier) {
       var plural = ENTITY_PATHS[kind] || kind;
       var openFull = document.getElementById("d-open-full");
+      var wandbLogs = document.getElementById("d-wandb-logs");
       // Full-page routes exist only for agents and miners.
       openFull.style.display = kind === "agent" || kind === "miner" ? "" : "none";
       openFull.href = fullEntityHref(kind, identifier);
+      wandbLogs.hidden = kind !== "validator";
+      wandbLogs.href = kind === "validator"
+        ? API + "/public/validators/" + encodeURIComponent(identifier) + "/wandb-logs"
+        : "#";
       document.getElementById("d-back-dashboard").href = dashboardHref(ENTITY_PAGES[plural]);
     }
 
