@@ -1131,3 +1131,41 @@ class TestTicketLifecycle:
             )
         assert ticket is not None
         assert ticket.bench_version == 3
+
+    async def test_open_ticket_selects_signed_lease_across_versions(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        v3_deadline = _NOW + _TTL + timedelta(minutes=1)
+        async with session.begin():
+            session.add_all(
+                [
+                    ValidatorTicket(
+                        agent_id=aid,
+                        bench_version=2,
+                        validator_hotkey="5V1",
+                        status=TicketStatus.SCORED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                    ),
+                    ValidatorTicket(
+                        agent_id=aid,
+                        bench_version=3,
+                        validator_hotkey="5V1",
+                        status=TicketStatus.ISSUED,
+                        issued_at=_NOW,
+                        deadline=v3_deadline,
+                    ),
+                ]
+            )
+        async with session.begin():
+            ticket = await get_open_ticket(
+                session,
+                agent_id=aid,
+                validator_hotkey="5V1",
+                now=_NOW,
+                deadline=v3_deadline,
+                bench_version=None,
+            )
+        assert ticket is not None
+        assert ticket.bench_version == 3

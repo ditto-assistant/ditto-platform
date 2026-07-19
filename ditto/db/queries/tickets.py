@@ -479,14 +479,20 @@ async def get_open_ticket(
     validator_hotkey: str,
     now: datetime,
     deadline: datetime,
-    bench_version: int = 2,
+    bench_version: int | None = 2,
     for_update: bool = False,
 ) -> ValidatorTicket | None:
-    """Return the validator's live (``issued``, not-yet-past-deadline) ticket for
-    the agent, or ``None`` if it has none, it is already spent, or it expired."""
+    """Return the validator's live ticket matching the signed lease.
+
+    ``bench_version=None`` is reserved for signed heartbeat progress, where the
+    exact lease deadline identifies work across benchmark versions. The
+    one-issued-ticket-per-validator index keeps that cross-version lookup
+    unambiguous.
+    """
     statement = select(ValidatorTicket).where(
         ValidatorTicket.agent_id == agent_id,
         ValidatorTicket.validator_hotkey == validator_hotkey,
+        ValidatorTicket.status == TicketStatus.ISSUED,
     )
     if bench_version is not None:
         statement = statement.where(ValidatorTicket.bench_version == bench_version)
@@ -495,7 +501,6 @@ async def get_open_ticket(
     ticket = await session.scalar(statement)
     if (
         ticket is None
-        or ticket.status != TicketStatus.ISSUED
         or _as_utc(ticket.deadline) <= now
         or _as_utc(ticket.deadline) != _as_utc(deadline)
     ):
