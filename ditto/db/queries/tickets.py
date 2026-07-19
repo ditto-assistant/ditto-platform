@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, literal, select
 from sqlalchemy.orm import aliased
 
 from ditto.api_models.agent_status import AgentStatus
@@ -65,16 +65,29 @@ EMISSION_CONTENDER_COUNT = 5
 PROVISIONAL_CONTENDER_LANE_SIZE = 10
 
 
-async def get_score_continuation_floor(session: AsyncSession) -> float | None:
-    """Return the current finalized fifth-place score, if five exist.
+async def get_score_continuation_floor(
+    session: AsyncSession, *, bench_version: int | None = None
+) -> float | None:
+    """Return the finalized fifth-place score for one benchmark era, if five exist.
 
     The ledger is already best-agent-per-miner and ordered by the same
     eligibility, composite, age, and UUID rules used for emissions. Provisional
     rows remain visible in that ledger, so filter them before selecting fifth.
+
+    ``bench_version`` pins the era the floor is drawn from. Composites are only
+    comparable within one benchmark version, so a floor must never be blended
+    across versions: left unset, :func:`list_eligible_ledger` pools the
+    canonical version together with an open rollout's desired version, and the
+    resulting fifth place belongs to no single era. Callers that compare a
+    version-scoped composite against this floor must pass that same version.
+    Returns ``None`` when the era does not yet have five eligible agents, which
+    correctly disables the floor for a benchmark version still filling up.
     """
     eligible = [
         row
-        for row in await list_eligible_ledger(session, include_fingerprints=False)
+        for row in await list_eligible_ledger(
+            session, include_fingerprints=False, bench_version=bench_version
+        )
         if row.eligible
     ]
     if len(eligible) < EMISSION_CONTENDER_COUNT:
@@ -127,10 +140,12 @@ async def issue_ticket(
     strongest bounded set of 2-of-3 provisional contenders comes first. The
     remaining candidates are ordered by least total coverage (accepted scores
     plus live assignments), then never-attempted work, then submission age. A
-    prior expired row is reissued only after its cooldown and only once for the
-    same benchmark version. Returns the ticket, or ``None`` when there is no
-    work for this validator ("no job for you"). Runs inside the caller's
-    transaction.
+    2-of-3 submission that can no longer reach this era's emission set sorts
+    behind every other candidate rather than being withheld, so it still
+    finalizes once the queue drains. A prior expired row is reissued only after
+    its cooldown and only once for the same benchmark version. Returns the
+    ticket, or ``None`` when there is no work for this validator ("no job for
+    you"). Runs inside the caller's transaction.
     """
     # No row exists to lock before a validator's first claim. Serialize that
     # gap explicitly on Postgres; the unique partial index remains the durable
@@ -203,7 +218,11 @@ async def issue_ticket(
             incompatible_existing.retry_after = now
             await session.flush()
 
-    score_continuation_floor = await get_score_continuation_floor(session)
+    # Scoped to the era this ticket is for: a v2 fifth place says nothing about
+    # whether a v4 two-score maximum is still in contention.
+    score_continuation_floor = await get_score_continuation_floor(
+        session, bench_version=bench_version
+    )
 
     # Agents this validator must not receive right now: live/scored tickets,
     # same-version tickets cooling down after expiry, and same-version tickets
@@ -300,6 +319,27 @@ async def issue_ticket(
         ),
         else_=0.0,
     )
+    # A median-of-three cannot be bounded safely after one score. Once two
+    # scores exist, their maximum is the best final median the third score can
+    # produce, so a submission whose strict upper bound sits below this era's
+    # finalized fifth place cannot reach the emission set. That earns it last
+    # place in the queue, not removal: the third score still finalizes the
+    # submission for the public record, and deferring rather than dropping it
+    # means a later floor move (or a new benchmark era, where the old floor
+    # never applied) cannot strand it at 2-of-3 forever. When the era has no
+    # floor yet, every candidate shares lane 0 and ordering is unchanged.
+    below_floor_lane = (
+        case(
+            (
+                (recorded_score_count == SCORING_QUORUM - 1)
+                & (highest_recorded_score < score_continuation_floor),
+                1,
+            ),
+            else_=0,
+        )
+        if score_continuation_floor is not None
+        else literal(0)
+    )
     contender = aliased(Agent)
     contender_accepted_score_count = (
         select(func.count())
@@ -390,15 +430,6 @@ async def issue_ticket(
             candidate = candidate.where(versioned_dataset)
         if requires_screened:
             candidate = candidate.where(eligible_screened_image)
-        if score_continuation_floor is not None:
-            # A median-of-three cannot be bounded safely after one score. Once
-            # two scores exist, their maximum is the best final median the
-            # third score can produce. Only skip the third run when that strict
-            # upper bound is below the current finalized fifth place.
-            candidate = candidate.where(
-                (recorded_score_count != SCORING_QUORUM - 1)
-                | (highest_recorded_score >= score_continuation_floor)
-            )
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
         candidate = (
@@ -414,6 +445,10 @@ async def issue_ticket(
             # highest provisional composite so the likely emission winner
             # advances first. Submission age and UUID remain stable ties.
             candidate.order_by(
+                # Eliminated-but-unfinished work sorts behind everything else,
+                # so it consumes a validator only once the queue is otherwise
+                # drained.
+                below_floor_lane.asc(),
                 # Prefer verified screener-built images without excluding
                 # source fallback during the mixed-fleet rollout.
                 case(
