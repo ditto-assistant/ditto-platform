@@ -211,7 +211,10 @@ class TestDashboard:
         assert "Revealed validator support" in body
         assert "Top choice means the miner received" in body
         assert '"ranked by settled v" + activeBench + " composite during the v"' in body
-        assert '" rollout · v" + data.desired_bench_version + " progress shown per row"' in body
+        assert (
+            '" rollout · v" + data.desired_bench_version + " progress shown per row"'
+            in body
+        )
         assert 'data-leaderboard-version="current"' in body
         assert 'data-leaderboard-version="2"' in body
         assert '"?bench_version=" + encodeURIComponent(leaderboardVersionView)' in body
