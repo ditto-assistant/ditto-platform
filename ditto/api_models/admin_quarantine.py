@@ -462,6 +462,62 @@ class AdminSourceExcerpt(BaseModel):
     lines: list[AdminSourceLine]
 
 
+class AdminStarterKitProvenance(BaseModel):
+    """Which starter-kit revision the submission was diffed against."""
+
+    source: str
+    revision: str
+    commit_set_sha256: str
+    commit_count: int
+
+
+class AdminBaselineDiffFile(BaseModel):
+    path: str
+    status: Literal["added", "removed", "modified", "identical"]
+    candidate_lines: int
+    reference_lines: int
+    added_lines: int
+    removed_lines: int
+    similarity: float
+    normalized_identical: bool
+    # True when this content is starter-kit code at ANY revision in the pinned
+    # lineage, not merely identical to the tip. A miner who forked an older
+    # commit ships kit files that differ from the tip but are still not theirs.
+    stock_kit: bool
+
+
+class AdminBaselineDiffManifest(BaseModel):
+    agent_id: UUID
+    artifact_sha256: str
+    baseline: AdminStarterKitProvenance
+    files: list[AdminBaselineDiffFile]
+    file_count: int
+    identical_count: int
+    modified_count: int
+    added_count: int
+    removed_count: int
+    stock_kit_count: int
+    custom_file_count: int
+    # Lines that are neither baseline code nor kit code at any revision: the
+    # size of the surface a reviewer actually has to read.
+    custom_added_lines: int
+    # True when the submission's paths were realigned by stripping one wrapping
+    # directory so they line up with the kit layout.
+    path_aligned: bool
+    truncated: bool
+
+
+class AdminBaselineDiffFileDetail(BaseModel):
+    agent_id: UUID
+    path: str
+    candidate_present: bool
+    reference_present: bool
+    identical: bool
+    stock_kit: bool
+    diff_lines: list[str]
+    truncated: bool
+
+
 class AdminValidatorAssignment(BaseModel):
     agent_id: UUID
     agent_name: str
@@ -496,6 +552,9 @@ class AdminValidatorAssignmentReleaseResponse(BaseModel):
 
 __all__ = [
     "AdminArtifactDuplicate",
+    "AdminBaselineDiffFile",
+    "AdminBaselineDiffFileDetail",
+    "AdminBaselineDiffManifest",
     "AdminBenchmarkQualificationDetail",
     "AdminBenchmarkQualificationRequest",
     "AdminBenchmarkQualificationResponse",
@@ -523,6 +582,7 @@ __all__ = [
     "AdminSourceFileEntry",
     "AdminSourceLine",
     "AdminSourceListing",
+    "AdminStarterKitProvenance",
     "AdminValidatorAssignment",
     "AdminValidatorAssignmentList",
     "AdminValidatorAssignmentReleaseRequest",

@@ -4680,3 +4680,120 @@ class TestQuarantineSourceInspection:
             headers=_ADMIN_HEADERS,
         )
         assert tampered.status_code == 502
+
+
+class TestQuarantineBaselineDiff:
+    """The starter-kit subtraction an operator relies on to find real code."""
+
+    async def _seed_kit_derived_agent(
+        self,
+        app: FastAPI,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> tuple[UUID, MagicMock]:
+        import hashlib
+        import io
+        import tarfile
+
+        from ditto.api_server.starter_kit import starter_kit_head_text
+
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        head = starter_kit_head_text()
+        # A realistic submission: verbatim kit files plus the miner's own code.
+        files = {
+            "Cargo.toml": head["Cargo.toml"].encode(),
+            "src/baseline.rs": head["src/baseline.rs"].encode(),
+            "src/solver.rs": b"fn solve_as_of() -> u64 {\n    42\n}\n",
+        }
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            for name, raw in files.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(raw)
+                archive.addfile(member, io.BytesIO(raw))
+        body = buffer.getvalue()
+        agent_id = uuid4()
+        async with session_maker() as session, session.begin():
+            session.add(
+                Agent(
+                    agent_id=agent_id,
+                    miner_hotkey=_MINER_HOTKEY,
+                    name="kit-derived-agent",
+                    sha256=hashlib.sha256(body).hexdigest(),
+                    status=AgentStatus.QUARANTINED,
+                    screening_policy_version=SCREENING_POLICY_VERSION,
+                    created_at=datetime.now(UTC),
+                )
+            )
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+        storage.get_object = AsyncMock(return_value=body)
+        return agent_id, storage
+
+    async def test_manifest_separates_stock_kit_from_miner_code(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id, _storage = await self._seed_kit_derived_agent(app, session_maker)
+        response = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/baseline-diff",
+            headers=_ADMIN_HEADERS,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        by_path = {entry["path"]: entry for entry in body["files"]}
+
+        # The two verbatim kit files are stock; only solver.rs is the miner's.
+        assert by_path["Cargo.toml"]["stock_kit"] is True
+        assert by_path["src/baseline.rs"]["stock_kit"] is True
+        assert by_path["src/solver.rs"]["stock_kit"] is False
+        assert by_path["src/solver.rs"]["status"] == "added"
+        assert body["custom_file_count"] == 1
+        assert body["custom_added_lines"] == 3
+        assert body["baseline"]["revision"]
+        assert body["baseline"]["source"].endswith("dittobench-starter-kit")
+        assert body["path_aligned"] is False
+
+    async def test_file_diff_returns_bounded_body_and_stock_flag(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id, _storage = await self._seed_kit_derived_agent(app, session_maker)
+        response = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/baseline-diff/file",
+            params={"path": "src/solver.rs"},
+            headers=_ADMIN_HEADERS,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["stock_kit"] is False
+        assert body["reference_present"] is False
+        assert any("solve_as_of" in line for line in body["diff_lines"])
+
+        missing = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/baseline-diff/file",
+            params={"path": "src/ghost.rs"},
+            headers=_ADMIN_HEADERS,
+        )
+        assert missing.status_code == 404
+
+    async def test_baseline_diff_requires_admin_actor(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id, _storage = await self._seed_kit_derived_agent(app, session_maker)
+        headers = dict(_ADMIN_HEADERS)
+        headers.pop("X-Admin-Actor")
+        response = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/baseline-diff",
+            headers=headers,
+        )
+        assert response.status_code == 422

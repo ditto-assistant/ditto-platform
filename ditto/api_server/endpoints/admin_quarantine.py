@@ -20,6 +20,8 @@ from sqlalchemy.orm import aliased
 
 from ditto.api_models.admin_quarantine import (
     AdminArtifactDuplicate,
+    AdminBaselineDiffFileDetail,
+    AdminBaselineDiffManifest,
     AdminBenchmarkContractMigrationDetail,
     AdminBenchmarkContractMigrationRequest,
     AdminBenchmarkContractMigrationResponse,
@@ -60,6 +62,7 @@ from ditto.api_models.admin_quarantine import (
     AdminScreeningSubmissionList,
     AdminSourceExcerpt,
     AdminSourceListing,
+    AdminStarterKitProvenance,
     AdminValidatorAssignment,
     AdminValidatorAssignmentList,
     AdminValidatorAssignmentReleaseRequest,
@@ -82,11 +85,21 @@ from ditto.api_server.dependencies import (
 )
 from ditto.api_server.endpoints.screener import _derive_dataset_seed
 from ditto.api_server.endpoints.validator import ChainDep
+from ditto.api_server.source_diff import (
+    build_baseline_diff_manifest,
+    unified_diff_for_file,
+)
 from ditto.api_server.source_inspect import (
     MAX_READ_LINES,
     MAX_TARBALL_BYTES,
     SourceInspectError,
     TarSourceInspector,
+)
+from ditto.api_server.starter_kit import (
+    align_candidate_paths,
+    is_stock_kit_text,
+    starter_kit_head_text,
+    starter_kit_provenance,
 )
 from ditto.api_server.storage import ObjectDownloadFailedError, S3StorageClient
 from ditto.db.models import (
@@ -2487,6 +2500,109 @@ async def read_screening_source_file(
         excerpt["end_line"],
     )
     return AdminSourceExcerpt(agent_id=agent_id, **excerpt)  # type: ignore[arg-type]
+
+
+async def _baseline_pair(
+    agent_id: UUID, session: AsyncSession, storage: S3StorageClient
+) -> tuple[Agent, dict[str, str], dict[str, str], bool]:
+    """Load one submission's text map aligned against the starter-kit baseline."""
+    agent, inspector = await _load_inspector(agent_id, session, storage)
+    raw_text = await asyncio.to_thread(inspector.read_all_text)
+    candidate = await asyncio.to_thread(align_candidate_paths, raw_text)
+    return agent, candidate, starter_kit_head_text(), candidate is not raw_text
+
+
+@router.get(
+    "/screening-submissions/{agent_id}/baseline-diff",
+    response_model=AdminBaselineDiffManifest,
+)
+async def get_screening_baseline_diff(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+    storage: StorageDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminBaselineDiffManifest:
+    """Per-file diff between one submission and the starter kit it derives from.
+
+    Every submission descends from the official starter kit, so reviewing a
+    quarantine cold means reading a whole crate to find the few files the miner
+    actually wrote. This classifies each path against the pinned baseline and
+    marks stock kit code — including files that match an older kit revision
+    rather than the tip — so the operator can go straight to the custom surface.
+
+    Unified-diff bodies come from the per-file endpoint.
+    """
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    agent, candidate, baseline, aligned = await _baseline_pair(
+        agent_id, session, storage
+    )
+    manifest = await asyncio.to_thread(
+        build_baseline_diff_manifest, candidate, baseline, is_stock_kit_text
+    )
+    provenance = starter_kit_provenance()
+    logger.info(
+        "admin_actor=%s viewed baseline diff agent_id=%s custom_lines=%s revision=%s",
+        x_admin_actor,
+        agent_id,
+        manifest["custom_added_lines"],
+        provenance["revision"],
+    )
+    return AdminBaselineDiffManifest(
+        agent_id=agent_id,
+        artifact_sha256=agent.sha256,
+        baseline=AdminStarterKitProvenance(
+            source=provenance["source"],
+            revision=provenance["revision"],
+            commit_set_sha256=provenance["commit_set_sha256"],
+            commit_count=int(provenance["commit_count"]),
+        ),
+        path_aligned=aligned,
+        **manifest,  # type: ignore[arg-type]
+    )
+
+
+@router.get(
+    "/screening-submissions/{agent_id}/baseline-diff/file",
+    response_model=AdminBaselineDiffFileDetail,
+)
+async def read_screening_baseline_diff_file(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+    storage: StorageDep,
+    path: Annotated[str, Query(min_length=1, max_length=240)],
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminBaselineDiffFileDetail:
+    """Bounded unified diff (starter kit -> submission) for one file."""
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    normalized = path.removeprefix("./")
+    _agent, candidate, baseline, _aligned = await _baseline_pair(
+        agent_id, session, storage
+    )
+    try:
+        detail = await asyncio.to_thread(
+            unified_diff_for_file, normalized, candidate, baseline
+        )
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no file at {normalized!r} in the submission or the baseline",
+        ) from error
+    text = candidate.get(normalized)
+    logger.info(
+        "admin_actor=%s viewed baseline file diff agent_id=%s path=%s",
+        x_admin_actor,
+        agent_id,
+        normalized,
+    )
+    return AdminBaselineDiffFileDetail(
+        agent_id=agent_id,
+        stock_kit=text is not None and is_stock_kit_text(text),
+        **detail,  # type: ignore[arg-type]
+    )
 
 
 __all__ = ["router"]

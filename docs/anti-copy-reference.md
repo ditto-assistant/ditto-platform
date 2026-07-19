@@ -8,6 +8,32 @@ reachable from the official starter-kit `main` history at revision
 `scripts/build_reference_fingerprints.py` regenerates the deterministic bundles and
 records both the requested ref and its resolved immutable revision.
 
+## Operator baseline bundle (text side)
+
+The corpus above is one-way: it answers "was this window ever in the kit?" and
+cannot yield a file, a path, or a line. Operator review needs the opposite, so
+`scripts/build_starter_kit_baseline.py` packages the kit's *text* as
+`ditto/anticopy/starter_kit_baseline_v1.json.gz`, read through
+`ditto.api_server.starter_kit`. Like the shingle bundles it is committed, so
+request handling never needs network access.
+
+It carries the tip tree's `path -> text` (the readable diff baseline) plus
+content digests — exact and normalized — of every text blob across mainline
+history. The historical set is what makes the subtraction honest: miners fork at
+different commits, so a file can be untouched kit code while still differing
+from the tip. Matching the whole lineage keeps those files marked `stock_kit`
+instead of inflating the reviewer's delta.
+
+`GET /admin/screening-submissions/{agent_id}/baseline-diff` and
+`.../baseline-diff/file` serve this, reusing the copy-review diff engine. The
+headline `custom_added_lines` counts only lines that are neither baseline nor
+kit code at any revision.
+
+Note the two bundles are versioned and regenerated independently, so their
+pinned revisions can drift apart. The corpus identity is load-bearing for stored
+fingerprints (`nsh2:{corpus_id}:…`) and must not be regenerated casually; the
+baseline bundle is review-only and safe to refresh whenever the kit moves.
+
 ## Active comparison policy
 
 - Exact-byte routing remains a separate defense-in-depth path.
