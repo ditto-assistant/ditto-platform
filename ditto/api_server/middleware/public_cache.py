@@ -24,6 +24,7 @@ Set ``PUBLIC_CACHE_DISABLED=1`` to bypass entirely (ops kill switch).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import time
@@ -44,15 +45,52 @@ _MAX_AGE = re.compile(r"max-age=(\d+)")
 _CACHEABLE_HEADERS = ("cache-control", "content-type")
 
 
+def compute_etag(body: bytes) -> str:
+    """Return a strong ETag (quoted) for ``body``.
+
+    A truncated SHA-256 is plenty for revalidation: collisions across two
+    distinct public responses at the same URL are astronomically unlikely, and
+    the shorter token keeps the header small. Computed once when the entry is
+    stored (or, for the dashboard HTML, once at boot).
+    """
+    return '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+
+
+def if_none_match(header: str | None, etag: str) -> bool:
+    """Return ``True`` when ``If-None-Match`` matches ``etag`` (so serve 304).
+
+    Accepts the comma-separated list form, the ``*`` wildcard, and weak
+    validators (``W/"..."``); we compare ignoring the weak prefix since our
+    strong ETag is byte-stable.
+    """
+    if not header:
+        return False
+    for raw in header.split(","):
+        token = raw.strip()
+        if token == "*":
+            return True
+        if token.startswith("W/"):
+            token = token[2:]
+        if token == etag:
+            return True
+    return False
+
+
 class _Entry:
-    __slots__ = ("body", "expires_at", "headers", "status")
+    __slots__ = ("body", "etag", "expires_at", "headers", "status")
 
     def __init__(
-        self, status: int, headers: dict[str, str], body: bytes, expires_at: float
+        self,
+        status: int,
+        headers: dict[str, str],
+        body: bytes,
+        etag: str,
+        expires_at: float,
     ) -> None:
         self.status = status
         self.headers = headers
         self.body = body
+        self.etag = etag
         self.expires_at = expires_at
 
 
@@ -103,9 +141,29 @@ class PublicCacheMiddleware(BaseHTTPMiddleware):
             self._entries.popitem(last=False)
 
     @staticmethod
-    def _respond(entry: _Entry) -> Response:
+    def _not_modified(entry: _Entry, cache_state: str) -> Response:
+        """Build a 304 with an empty body but the entry's revalidation headers."""
+        # The 200 this revalidates carries "Vary: Accept-Encoding" (added by
+        # the outer gzip layer, which never touches an under-floor 304); RFC
+        # 9110 §15.4.5 says the 304 must repeat it.
+        headers = {
+            "ETag": entry.etag,
+            "X-Public-Cache": cache_state,
+            "Vary": "Accept-Encoding",
+        }
+        cache_control = entry.headers.get("cache-control")
+        if cache_control is not None:
+            headers["Cache-Control"] = cache_control
+        return Response(status_code=304, headers=headers)
+
+    @classmethod
+    def _respond(cls, entry: _Entry, inm: str | None, cache_state: str) -> Response:
+        """Serve a cached entry: a 304 when the client's ETag matches, else 200."""
+        if if_none_match(inm, entry.etag):
+            return cls._not_modified(entry, cache_state)
         headers = dict(entry.headers)
-        headers["X-Public-Cache"] = "HIT"
+        headers["ETag"] = entry.etag
+        headers["X-Public-Cache"] = cache_state
         return Response(content=entry.body, status_code=entry.status, headers=headers)
 
     async def _fetch(
@@ -122,10 +180,12 @@ class PublicCacheMiddleware(BaseHTTPMiddleware):
             for name, value in response.headers.items()
             if name.lower() in _CACHEABLE_HEADERS
         }
-        entry = _Entry(response.status_code, headers, body, self._now() + ttl)
+        etag = compute_etag(body)
+        entry = _Entry(response.status_code, headers, body, etag, self._now() + ttl)
         rebuilt = Response(
             content=body, status_code=response.status_code, headers=dict(headers)
         )
+        rebuilt.headers["ETag"] = etag
         rebuilt.headers["X-Public-Cache"] = "MISS"
         return rebuilt, entry
 
@@ -138,9 +198,10 @@ class PublicCacheMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         key = f"{request.url.path}?{request.url.query}"
+        inm = request.headers.get("if-none-match")
         cached = self._get_fresh(key)
         if cached is not None:
-            return self._respond(cached)
+            return self._respond(cached, inm, "HIT")
 
         waiting = self._inflight.get(key)
         if waiting is not None:
@@ -150,7 +211,7 @@ class PublicCacheMiddleware(BaseHTTPMiddleware):
             except Exception:
                 entry = None
             if entry is not None:
-                return self._respond(entry)
+                return self._respond(entry, inm, "HIT")
             return await call_next(request)
 
         future: asyncio.Future[_Entry | None] = (
@@ -163,6 +224,8 @@ class PublicCacheMiddleware(BaseHTTPMiddleware):
                 self._store(key, entry)
             if not future.done():
                 future.set_result(entry)
+            if entry is not None and if_none_match(inm, entry.etag):
+                return self._not_modified(entry, "MISS")
             return response
         except BaseException:
             if not future.done():
