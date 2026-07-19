@@ -868,23 +868,38 @@ async def request_job(
             ticket = await session.scalar(live_ticket_statement)
         if ticket is None:
             canonical_version = await active_bench_version(session)
-            if canonical_version >= CANARY_BENCH_VERSION:
-                heartbeat = await session.get(
-                    ValidatorHeartbeat, payload.validator_hotkey
+            heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
+            if (
+                canonical_version < CANARY_BENCH_VERSION
+                and heartbeat is not None
+                and heartbeat_supports_v3(heartbeat, now=now)
+            ):
+                # Guarded admin migrations pin a v3 dataset without adding the
+                # submission to the top-five activation cohort. Give those
+                # explicitly pinned submissions a v3-capable validation lane.
+                ticket = await issue_ticket(
+                    session,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                    ttl=_TICKET_TTL,
+                    bench_version=CANARY_BENCH_VERSION,
+                    artifact_mode="screened_only",
+                    validator_running_benchmark=validator_state == "running_benchmark",
                 )
-                if heartbeat is None or not heartbeat_supports_v3(heartbeat, now=now):
-                    return Response(
-                        status_code=204, headers={"Cache-Control": "no-store"}
-                    )
-            ticket = await issue_ticket(
-                session,
-                validator_hotkey=payload.validator_hotkey,
-                now=now,
-                ttl=_TICKET_TTL,
-                bench_version=canonical_version,
-                artifact_mode=artifact_mode,
-                validator_running_benchmark=validator_state == "running_benchmark",
-            )
+            if canonical_version >= CANARY_BENCH_VERSION and (
+                heartbeat is None or not heartbeat_supports_v3(heartbeat, now=now)
+            ):
+                return Response(status_code=204, headers={"Cache-Control": "no-store"})
+            if ticket is None:
+                ticket = await issue_ticket(
+                    session,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                    ttl=_TICKET_TTL,
+                    bench_version=canonical_version,
+                    artifact_mode=artifact_mode,
+                    validator_running_benchmark=validator_state == "running_benchmark",
+                )
         if ticket is None:
             return Response(status_code=204, headers={"Cache-Control": "no-store"})
         agent = await get_agent_by_id(session, agent_id=ticket.agent_id)

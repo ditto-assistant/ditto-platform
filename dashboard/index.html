@@ -834,6 +834,10 @@
     .accepted-score-command code { color: var(--text); font: 10.5px/1.5 var(--mono); overflow-wrap: anywhere; }
     .accepted-score-note { max-width: 74ch; margin: 0 0 var(--detail-space-sm); color: var(--text-dim); font-size: 12px; line-height: 1.5; text-wrap: pretty; }
     .accepted-score-final { margin: var(--detail-space-sm) 0 0; color: var(--good); font-size: 12.5px; font-weight: 700; }
+    .benchmark-cohort + .benchmark-cohort { margin-top: var(--detail-space-lg); padding-top: var(--detail-space-lg); border-top: 1px solid var(--border); }
+    .benchmark-cohort-heading { display: flex; align-items: baseline; justify-content: space-between; gap: var(--detail-space-sm); margin-bottom: var(--detail-space-sm); }
+    .benchmark-cohort-heading h5 { margin: 0; color: var(--text); font: 700 12px/1.35 var(--mono); }
+    .benchmark-cohort-summary { color: var(--text-faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
     .attempt-list { margin-top: 0; }
     .attempt { display: grid; grid-template-columns: 88px minmax(0, 1fr) auto; gap: 16px; align-items: start; padding: 12px 0; border-bottom: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
     .attempt:last-child { border-bottom: 0; }
@@ -4145,7 +4149,8 @@
       var count = Math.max(0, Number(e.score_count) || 0);
       var quorum = Math.max(1, Number(e.quorum) || 3);
       var assignments = (e.validation_attempts || []).filter(function (attempt) {
-        return attempt.status === "issued";
+        return attempt.status === "issued" &&
+          benchmarkVersionKey(attempt.bench_version) === benchmarkVersionKey(e.active_bench_version);
       }).length;
       if (count >= quorum) return "Validation complete. The canonical result uses the median of " + quorum + " independent scores.";
       if (e.status === "below_score_floor") {
@@ -4266,18 +4271,60 @@
       return '<span class="retry-info" role="img" tabindex="0" aria-label="' + esc(VALIDATOR_RETRY_EXPLANATION) + '" data-tooltip="' + esc(VALIDATOR_RETRY_EXPLANATION) + '">i</span>';
     }
 
+    function benchmarkVersionKey(version) {
+      var numeric = Number(version);
+      return version != null && Number.isInteger(numeric) && numeric > 0 ? String(numeric) : "unknown";
+    }
+
+    function benchmarkVersionLabel(key) {
+      return key === "unknown" ? "Bench version unknown" : "Bench v" + key;
+    }
+
+    function benchmarkCohorts(pipeline) {
+      var cohorts = {};
+      function cohort(version) {
+        var key = benchmarkVersionKey(version);
+        if (!cohorts[key]) cohorts[key] = { key: key, scores: [], attempts: [] };
+        return cohorts[key];
+      }
+      (pipeline.provisional_scores || []).forEach(function (score) {
+        cohort(score.bench_version).scores.push(score);
+      });
+      (pipeline.validation_attempts || []).forEach(function (attempt) {
+        cohort(attempt.bench_version).attempts.push(attempt);
+      });
+      var activeKey = benchmarkVersionKey(pipeline.active_bench_version);
+      return Object.keys(cohorts).map(function (key) { return cohorts[key]; }).sort(function (a, b) {
+        if (a.key === activeKey) return -1;
+        if (b.key === activeKey) return 1;
+        if (a.key === "unknown") return 1;
+        if (b.key === "unknown") return -1;
+        return Number(a.key) - Number(b.key);
+      });
+    }
+
+    function cohortProgressSummary(cohort, quorum) {
+      var running = cohort.attempts.filter(function (attempt) { return attempt.actively_running; }).length;
+      var pending = cohort.attempts.filter(function (attempt) {
+        return attempt.status === "issued" && !attempt.actively_running;
+      }).length;
+      var summary = cohort.scores.length + " of " + quorum + " scores received";
+      if (running) summary += " · " + running + " running";
+      if (pending) summary += " · " + pending + " pending";
+      return summary;
+    }
+
+    function cohortMedian(scores) {
+      var values = scores.map(function (score) { return Number(score.composite); }).sort(function (a, b) { return a - b; });
+      var middle = Math.floor(values.length / 2);
+      return values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2;
+    }
+
     function renderAcceptedScores(pipeline) {
-      var scores = pipeline.provisional_scores || [];
       var quorum = Math.max(1, Number(pipeline.quorum) || 3);
-      var complete = scores.length >= quorum && pipeline.final_composite != null &&
-        (pipeline.status === "scored" || pipeline.status === "live");
       var stopped = pipeline.status === "below_score_floor";
-      var note = complete
-        ? "Validation is complete. The final aggregate below is the authoritative median of the independent accepted scores."
-        : stopped
-        ? "Evaluation stopped after two scores proved the best reachable median was below the current fifth-place score. This result is not eligible for emissions."
-        : "Each value is an accepted platform score, but remains provisional until " + quorum + " independent scores arrive. Provisional scores may change; the final median is authoritative.";
-      var rows = scores.map(function (score, index) {
+      var cohorts = benchmarkCohorts(pipeline).filter(function (cohort) { return cohort.scores.length; });
+      function renderScore(score, index, complete) {
         var label = complete ? "Accepted score " + (index + 1) : "Provisional score " + (index + 1);
         var benchLabel = score.bench_version == null ? "Bench version unknown" : "Bench v" + score.bench_version;
         var accepted = score.accepted_at ? relTime(score.accepted_at) : "Accepted";
@@ -4312,17 +4359,29 @@
             '<div class="accepted-score-meta-row"><b>Seed</b> <code>' + esc(score.seed) + '</code> ' + copyButton(score.seed, "benchmark seed") + '<br>' + esc(seedSource) + '</div>' +
             command + verify + transcript +
           '</div>' + casesSection(score) + '</div>';
+      }
+      var groups = cohorts.map(function (cohort) {
+        var complete = cohort.scores.length >= quorum;
+        var note = complete
+          ? "This benchmark version has reached quorum. Its aggregate is the median of these independent accepted scores."
+          : stopped && cohort.key === benchmarkVersionKey(pipeline.active_bench_version)
+          ? "Evaluation stopped after two scores proved the best reachable median was below the current fifth-place score. This result is not eligible for emissions."
+          : "Scores in this benchmark version remain provisional until " + quorum + " independent scores arrive. Provisional scores may change; the final median is authoritative within this benchmark version.";
+        var rows = cohort.scores.map(function (score, index) {
+          return renderScore(score, index, complete);
+        }).join("");
+        var median = complete ? cohortMedian(cohort.scores) : null;
+        return '<div class="benchmark-cohort">' +
+          '<div class="benchmark-cohort-heading"><h5>' + esc(benchmarkVersionLabel(cohort.key)) + '</h5>' +
+            '<span class="benchmark-cohort-summary">' + esc(cohort.scores.length) + ' of ' + esc(quorum) + ' scores received</span></div>' +
+          '<p class="accepted-score-note">' + esc(note) + ' Every seed is fixed only after submission commitment, so it makes the completed evaluation reproducible without allowing the already-submitted artifact to be retuned.</p>' +
+          '<div class="accepted-score-list">' + rows + '</div>' +
+          (median == null ? "" : '<p class="accepted-score-final">' + esc(benchmarkVersionLabel(cohort.key)) + ' aggregate: ' + fx(median) + ' · median of ' + quorum + '</p>') +
+        '</div>';
       }).join("");
-      var finalScore = complete
-        ? '<p class="accepted-score-final">Final aggregate: ' + fx(pipeline.final_composite) + ' · median of ' + quorum + '</p>'
-        : "";
       return '<section class="pipeline-section" aria-labelledby="pipeline-accepted-scores">' +
-        '<div class="pipeline-section-heading"><h4 id="pipeline-accepted-scores">Accepted scores</h4>' +
-          '<span class="pipeline-section-count">' + esc(scores.length) + ' of ' + esc(quorum) + ' received</span></div>' +
-        '<p class="accepted-score-note">' + esc(note) + ' Every seed is fixed only after submission commitment, so it makes the completed evaluation reproducible without allowing the already-submitted artifact to be retuned.</p>' +
-        '<div class="accepted-score-list">' +
-          (rows || '<p class="pipeline-detail-state">No validator score has been accepted yet.</p>') +
-        '</div>' + finalScore +
+        '<div class="pipeline-section-heading"><h4 id="pipeline-accepted-scores">Accepted scores</h4></div>' +
+        (groups || '<p class="pipeline-detail-state">No validator score has been accepted yet.</p>') +
       '</section>';
     }
 
@@ -4489,7 +4548,7 @@
       var oldScreening = screeningAttempts.filter(function (a) {
         return (Number(a.policy_version) || 0) !== currentPolicy;
       }).map(function (a) { return renderScreeningAttempt(a, true); }).join("");
-      var validation = (pipeline.validation_attempts || []).map(function (a) {
+      function renderValidationAttempt(a) {
         var label = attemptLabel(a.actively_running ? "running" : a.status, "validator");
         var retryInfo = validatorRetryInfo(a.actively_running ? "running" : a.status);
         var meta = "Validator " + shortKey(a.validator_hotkey);
@@ -4508,6 +4567,15 @@
           '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(a.actively_running ? "Scoring now" : label[0]) + retryInfo + '</span></b>' +
           '<div class="attempt-meta">' + entityAnchor("validator", a.validator_hotkey, "Validator " + shortKey(a.validator_hotkey)) + esc(meta.slice(("Validator " + shortKey(a.validator_hotkey)).length)) + '</div>' + benchmark + '</div>' +
           '<div class="attempt-time" title="' + esc(a.issued_at) + '">' + relTime(a.issued_at) + '</div></div>';
+      }
+      var validation = benchmarkCohorts(pipeline).map(function (cohort) {
+        var attempts = cohort.attempts.map(renderValidationAttempt).join("");
+        return '<div class="benchmark-cohort">' +
+          '<div class="benchmark-cohort-heading"><h5>' + esc(benchmarkVersionLabel(cohort.key)) + '</h5>' +
+            '<span class="benchmark-cohort-summary">' + esc(cohortProgressSummary(cohort, pipeline.quorum)) + '</span></div>' +
+          '<div class="attempt-list">' +
+            (attempts || '<p class="pipeline-detail-state">No validator assignment history is available for this benchmark version.</p>') +
+          '</div></div>';
       }).join("");
       return '<div class="pipeline-history">' +
         renderScreeningDispute(pipeline) +
@@ -4520,9 +4588,8 @@
         '</section>' +
         renderAcceptedScores(pipeline) +
         '<section class="pipeline-section" aria-labelledby="pipeline-validator-history">' +
-          '<div class="pipeline-section-heading"><h4 id="pipeline-validator-history">Validator progress</h4>' +
-            '<span class="pipeline-section-count">' + esc(pipeline.score_count) + ' of ' + esc(pipeline.quorum) + ' scores received</span></div>' +
-          '<div class="attempt-list">' +
+          '<div class="pipeline-section-heading"><h4 id="pipeline-validator-history">Validator progress</h4></div>' +
+          '<div class="benchmark-cohort-list">' +
             (validation || '<p class="pipeline-detail-state">No validator is assigned yet.</p>') +
           '</div>' +
         '</section>' +

@@ -259,6 +259,14 @@ class TestDashboard:
         assert '"Bench v" + score.bench_version' in body
         assert '"Bench v" + a.bench_version' in body
         assert 'class="bench-version-badge"' in body
+        assert "function benchmarkCohorts(pipeline)" in body
+        assert "function cohortProgressSummary(cohort, quorum)" in body
+        assert '" · " + running + " running"' in body
+        assert '" · " + pending + " pending"' in body
+        assert "benchmarkVersionKey(pipeline.active_bench_version)" in body
+        assert "cohortMedian(cohort.scores)" in body
+        assert "pipeline.score_count) + ' of ' + esc(pipeline.quorum)" not in body
+        assert "pipeline.final_composite" not in body
         assert "Per-question results" in body
         assert "casesSection(score)" in body
         assert "casesSection(s)" in body
@@ -266,7 +274,7 @@ class TestDashboard:
         assert "Provisional scores may change" in body
         assert "final median is authoritative" in body
         assert "No validator score has been accepted yet." in body
-        assert "Final aggregate:" in body
+        assert "esc(benchmarkVersionLabel(cohort.key)) + ' aggregate: '" in body
         assert "median of " in body
         assert "score.reproduction_command" in body
         assert "score.verification_command" in body
