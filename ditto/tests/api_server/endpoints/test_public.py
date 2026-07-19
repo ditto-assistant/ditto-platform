@@ -509,9 +509,8 @@ class TestPublicLeaderboard:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         """Mid-rollout, every entry carries the settled v2 median plus the v3
-        settlement state (median so far + score count). With the temporary
-        authority pin, even a complete v3 quorum stays on its v2 median until
-        the rollout activates."""
+        settlement state (median so far + score count) — including agents
+        whose headline composite already flipped to v3 at quorum."""
         flipped_id = await _seed_k3(
             session_maker,
             miner=_MINER_A,
@@ -572,8 +571,8 @@ class TestPublicLeaderboard:
         assert body["desired_bench_version"] == 3
         by_agent = {e["agent_id"]: e for e in body["entries"]}
         flipped = by_agent[flipped_id]
-        assert flipped["bench_version"] == DEFAULT_BENCH_VERSION
-        assert flipped["composite"] == pytest.approx(0.80)
+        assert flipped["bench_version"] == 3
+        assert flipped["composite"] == pytest.approx(0.92)
         assert flipped["settled_composite"] == pytest.approx(0.80)
         assert flipped["rollout_composite"] == pytest.approx(0.92)
         assert flipped["rollout_score_count"] == 3

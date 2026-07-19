@@ -307,13 +307,10 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
             await session.flush()
             activations.append(await maybe_activate_rollout(session, rollout, now=now))
             if agent_index == 0:
-                # Agent 0 has a complete v3 quorum, but the temporary authority
-                # pin (DESIRED_AUTHORITY_AT_QUORUM = False) keeps every agent on
-                # its settled v2 median until the rollout activates.
-                pinned = await list_eligible_ledger(session)
-                by_agent = {row.agent_id: row for row in pinned}
-                assert by_agent[agent_ids[0]].bench_version == 2
-                assert by_agent[agent_ids[0]].composite == pytest.approx(0.51)
+                hybrid = await list_eligible_ledger(session)
+                by_agent = {row.agent_id: row for row in hybrid}
+                assert by_agent[agent_ids[0]].bench_version == 3
+                assert by_agent[agent_ids[0]].composite == pytest.approx(0.7)
                 assert all(
                     by_agent[agent_id].bench_version == 2 for agent_id in agent_ids[1:]
                 )
