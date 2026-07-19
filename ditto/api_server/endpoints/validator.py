@@ -680,6 +680,7 @@ async def heartbeat(
                 validator_hotkey=validator_hotkey,
                 now=now,
                 deadline=request_body.benchmark_progress.ticket_deadline,
+                bench_version=None,
                 for_update=True,
             )
             if (

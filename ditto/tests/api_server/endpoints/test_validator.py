@@ -617,16 +617,20 @@ async def _seed_ticket(
     *,
     keypair: bittensor.Keypair = _KEYPAIR,
     deadline: datetime = _TICKET_DEADLINE,
+    bench_version: int = 2,
 ) -> None:
     """Seat (or re-open) an issued ticket for a specific (agent, validator) so a
     score against that agent is accepted by the k=3 gate. Upserts so a test can
     simulate the platform re-issuing a ticket to the same validator."""
     async with maker() as s, s.begin():
-        existing = await s.get(ValidatorTicket, (agent_id, 2, keypair.ss58_address))
+        existing = await s.get(
+            ValidatorTicket, (agent_id, bench_version, keypair.ss58_address)
+        )
         if existing is None:
             s.add(
                 ValidatorTicket(
                     agent_id=agent_id,
+                    bench_version=bench_version,
                     validator_hotkey=keypair.ss58_address,
                     status=TicketStatus.ISSUED,
                     issued_at=datetime.now(UTC) - timedelta(seconds=1),
@@ -1542,7 +1546,7 @@ class TestHeartbeat:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=status)
-        await _seed_ticket(session_maker, agent_id)
+        await _seed_ticket(session_maker, agent_id, bench_version=3)
         _install_db(app, session_maker)
         _install_chain(app)
 
@@ -1569,6 +1573,7 @@ class TestHeartbeat:
             await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
         ).json()
         attempt = pipeline["validation_attempts"][0]
+        assert attempt["bench_version"] == 3
         assert attempt["actively_running"] is True
         assert attempt["benchmark_progress"]["completed_checks"] == 51
 
