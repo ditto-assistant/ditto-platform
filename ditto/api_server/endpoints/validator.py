@@ -55,6 +55,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ditto.api_models import (
     ArtifactResponse,
     BenchmarkProgress,
+    ConfirmationJobRequest,
     JobRequest,
     JobResponse,
     ScoreReport,
@@ -88,6 +89,7 @@ from ditto.api_server.dependencies import (
 )
 from ditto.api_server.endpoints.retrieval import AgentNotFoundError
 from ditto.api_server.fingerprint import reference_corpus_provenance
+from ditto.api_server.koth import KothEntry, confirmation_pair, project_koth
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
@@ -124,10 +126,12 @@ from ditto.db.queries.scores import (
     get_score_for_validator,
     list_eligible_ledger,
     list_scores_for_agent,
+    quorum_composites,
     upsert_score,
 )
 from ditto.db.queries.tickets import (
     get_open_ticket,
+    issue_confirmation_ticket,
     issue_ticket,
     mark_ticket_scored,
 )
@@ -460,6 +464,22 @@ def _job_signing_message(
     """Canonical bytes proving possession of a hotkey for one job claim."""
     requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
     return f"validator-job:{validator_hotkey}:{nonce}:{requested}".encode()
+
+
+def _confirmation_job_signing_message(
+    validator_hotkey: str,
+    champion_agent_id: UUID,
+    challenger_agent_id: UUID,
+    nonce: UUID,
+    requested_at: datetime,
+) -> bytes:
+    """Canonical ownership proof for one bounded KOTH confirmation claim."""
+    requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
+    return (
+        "validator-confirmation-job:v1:"
+        f"{validator_hotkey}:{champion_agent_id}:{challenger_agent_id}:"
+        f"{nonce}:{requested}"
+    ).encode()
 
 
 def _artifact_signing_message(
@@ -879,6 +899,176 @@ async def request_job(
         job.agent_id,
         payload.validator_hotkey,
         job.deadline.isoformat(),
+    )
+    return job
+
+
+async def _current_confirmation_pair(
+    session: AsyncSession,
+    *,
+    canonical_version: int,
+) -> tuple[KothEntry, KothEntry] | None:
+    """Project the authoritative current-version ledger and find one contest."""
+    # Imported lazily because the scoring endpoint imports validator auth
+    # dependencies from this module. The pure parsing helpers themselves have
+    # no state and are safe to share after module initialization.
+    from ditto.api_server.endpoints.scoring import (
+        _confirmation_composites,
+        _confirmation_seeds,
+        _ledger_stderr,
+    )
+
+    rows = [
+        row
+        for row in await list_eligible_ledger(session, include_fingerprints=False)
+        if row.eligible
+        and row.composite > 0.0
+        and isinstance(row.details, dict)
+        and row.details.get("bench_version") == canonical_version
+    ]
+    rows.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
+    quorum = await quorum_composites(session, [row.agent_id for row in rows])
+    entries = [
+        KothEntry(
+            miner_hotkey=row.miner_hotkey,
+            agent_id=row.agent_id,
+            composite=row.composite,
+            first_seen=row.first_seen,
+            raw_rank=rank,
+            composite_stderr=_ledger_stderr(row.details, quorum.get(row.agent_id, [])),
+            confirmation_composites=(
+                tuple(values)
+                if (values := _confirmation_composites(row.details)) is not None
+                else None
+            ),
+            confirmation_seeds=(
+                tuple(seeds)
+                if (seeds := _confirmation_seeds(row.details)) is not None
+                else None
+            ),
+        )
+        for rank, row in enumerate(rows, start=1)
+    ]
+    return confirmation_pair(project_koth(entries))
+
+
+@router.post(
+    "/confirmation-job",
+    response_model=JobResponse,
+    responses={
+        401: {"description": "Missing/invalid validator auth."},
+        409: {"description": "Stale/replayed claim or no matching contest."},
+        426: {"description": "Validator software or protocol must be upgraded."},
+        428: {"description": "A fresh signed validator heartbeat is required."},
+        503: {"description": "Chain unavailable for the permit check."},
+    },
+)
+async def request_confirmation_job(
+    payload: ConfirmationJobRequest,
+    request: Request,
+    response: Response,
+    chain: ChainDep,
+    session: SessionDep,
+    x_validator_hotkey: Annotated[str | None, Header()] = None,
+) -> JobResponse:
+    """Lease the current raw leader for a paired KOTH confirmation run.
+
+    This endpoint cannot choose arbitrary finalized work. The platform rebuilds
+    the same current-version KOTH projection served publicly and issues a lease
+    only when the signed pair is exactly its incumbent plus raw leader, the raw
+    leader clears the flat 2% floor, and only unpaired uncertainty blocks the
+    crown. The validator then benchmarks that challenger on the incumbent's
+    already-published common seeds and submits through the ordinary score API.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    if x_validator_hotkey != payload.validator_hotkey:
+        raise ValidatorAuthError(
+            "confirmation claim header does not match signed hotkey"
+        )
+    signed = _confirmation_job_signing_message(
+        payload.validator_hotkey,
+        payload.champion_agent_id,
+        payload.challenger_agent_id,
+        payload.nonce,
+        payload.requested_at,
+    )
+    if not _verify_signature(payload.validator_hotkey, signed, payload.signature):
+        raise ValidatorAuthError("confirmation claim signature did not verify")
+    now = datetime.now(UTC)
+    if abs(now - payload.requested_at.astimezone(UTC)) > _JOB_REQUEST_MAX_AGE:
+        raise HTTPException(
+            status_code=409, detail="confirmation claim timestamp is stale"
+        )
+
+    await _assert_validator_permitted(
+        chain,
+        request.app.state.config.chain.netuid,
+        payload.validator_hotkey,
+        network=request.app.state.config.chain.subtensor_network,
+    )
+    async with session.begin():
+        await _assert_validator_compatible(
+            session,
+            validator_hotkey=payload.validator_hotkey,
+            now=now,
+            config=request.app.state.config.validator_compatibility,
+        )
+        try:
+            await consume_validator_nonce(
+                session,
+                nonce=payload.nonce,
+                validator_hotkey=payload.validator_hotkey,
+                now=now,
+                expires_at=now + _JOB_REQUEST_MAX_AGE,
+            )
+        except ValidatorRequestReplayError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="confirmation claim nonce has already been used",
+            ) from exc
+        canonical_version = await active_bench_version(session)
+        pair = await _current_confirmation_pair(
+            session, canonical_version=canonical_version
+        )
+        if pair is None or (
+            pair[0].agent_id != payload.champion_agent_id
+            or pair[1].agent_id != payload.challenger_agent_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="the requested KOTH confirmation pair is no longer current",
+            )
+        ticket = await issue_confirmation_ticket(
+            session,
+            agent_id=payload.challenger_agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            now=now,
+            ttl=_TICKET_TTL,
+            bench_version=canonical_version,
+        )
+        if ticket is None:
+            raise HTTPException(
+                status_code=409,
+                detail="validator has another live scoring assignment",
+            )
+        agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
+        assert agent is not None
+        job = JobResponse(
+            agent_id=agent.agent_id,
+            miner_hotkey=agent.miner_hotkey,
+            sha256=agent.sha256,
+            deadline=ticket.deadline,
+            seed=agent.dataset_seed,
+            dataset_sha256=agent.dataset_sha256,
+            run_size=agent.dataset_run_size,
+            dataset_seed_block=agent.dataset_seed_block,
+            dataset_seed_block_hash=agent.dataset_seed_block_hash,
+        )
+    logger.info(
+        "issued KOTH confirmation job champion=%s challenger=%s validator=%s",
+        payload.champion_agent_id,
+        payload.challenger_agent_id,
+        payload.validator_hotkey,
     )
     return job
 

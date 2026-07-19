@@ -2673,10 +2673,13 @@
           var contestNote = decision.method === "paired"
             ? " Both sides were scored on shared confirmation seeds, so this decision is a paired comparison: per-dataset difficulty cancels and cannot decide the crown."
             : " A lead inside the band is never left to dataset luck: validators re-score both agents on shared confirmation seeds and the next fold decides the contest on the paired comparison.";
-          document.getElementById("emissions-reason").textContent =
-            "Raw #1 " + agentName(rawLeaderEntry.agent_name) + " leads by " + fx(decision.challenger_lead) +
-            " but must lead by more than " + fx(decision.required_lead) + " to dethrone the older incumbent. " +
-            "The fold uses the larger of the 2% protection margin and the " + method + "." + contestNote;
+          var confirmationPending = decision.method === "unpaired" && !decision.dethrones &&
+            decision.challenger_lead > decision.margin_lead;
+          document.getElementById("emissions-reason").textContent = confirmationPending
+            ? "Raw #1 " + agentName(rawLeaderEntry.agent_name) + " clears the 2% incumbent margin, but its separate-seed scores remain inside the statistical uncertainty band. A shared-seed head-to-head confirmation is required; that paired result decides whether the crown moves."
+            : "Raw #1 " + agentName(rawLeaderEntry.agent_name) + " leads by " + fx(decision.challenger_lead) +
+              " but must lead by more than " + fx(decision.required_lead) + " to dethrone the older incumbent. " +
+              "The fold uses the larger of the 2% protection margin and the " + method + "." + contestNote;
         } else {
           document.getElementById("emissions-reason").textContent =
             "The raw score leader also wins the first-seen KOTH fold after the 2% protection margin and statistical band are applied.";

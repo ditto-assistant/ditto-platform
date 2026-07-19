@@ -149,6 +149,41 @@ class JobRequest(BaseModel):
         return value
 
 
+class ConfirmationJobRequest(BaseModel):
+    """Signed request for one uncertainty-band challenger confirmation.
+
+    The platform independently verifies that ``challenger_agent_id`` is the
+    current raw leader, ``champion_agent_id`` is the KOTH incumbent, and the
+    pair clears the flat margin but remains undecided only because its evidence
+    is unpaired.  Binding both ids into the signature prevents a captured claim
+    from being redirected to another scored submission.
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Claiming validator hotkey.")
+    ]
+    champion_agent_id: Annotated[UUID, Field(description="Current KOTH incumbent.")]
+    challenger_agent_id: Annotated[UUID, Field(description="Current raw leader.")]
+    nonce: Annotated[UUID, Field(description="One-time claim nonce.")]
+    requested_at: Annotated[
+        datetime, Field(description="UTC time at which the claim was signed.")
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            pattern=_SIGNATURE_HEX_PATTERN,
+            description="sr25519 signature over the canonical confirmation claim.",
+        ),
+    ]
+
+    @field_validator("requested_at")
+    @classmethod
+    def requested_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("requested_at must include a timezone")
+        return value
+
+
 class JobResponse(BaseModel):
     """Returned by ``POST /validator/job`` when a ticket is issued.
 

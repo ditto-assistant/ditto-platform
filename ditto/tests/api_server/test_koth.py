@@ -7,7 +7,7 @@ from uuid import UUID
 
 import pytest
 
-from ditto.api_server.koth import KothEntry, project_koth
+from ditto.api_server.koth import KothEntry, confirmation_pair, project_koth
 
 _T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -109,3 +109,42 @@ def test_confirmation_median_and_paired_seed_band_match_validator_fold() -> None
 def test_empty_or_non_positive_pool_has_no_projection() -> None:
     assert project_koth([]) is None
     assert project_koth([_entry(1, 0.0, minutes=0)]) is None
+
+
+def test_confirmation_pair_requires_flat_win_inside_unpaired_band() -> None:
+    incumbent = _entry(
+        2,
+        0.88,
+        minutes=0,
+        stderr=0.03,
+        confirmations=(0.87, 0.88, 0.89),
+        seeds=(7, 8, 9),
+    )
+    challenger = _entry(1, 0.93, minutes=1, stderr=0.03)
+
+    projection = project_koth([incumbent, challenger])
+
+    assert projection is not None
+    assert projection.champion == incumbent
+    assert confirmation_pair(projection) == (incumbent, challenger)
+
+
+def test_confirmation_pair_stops_after_shared_seed_evidence() -> None:
+    incumbent = _entry(
+        2,
+        0.88,
+        minutes=0,
+        stderr=0.03,
+        confirmations=(0.87, 0.88, 0.89),
+        seeds=(7, 8, 9),
+    )
+    challenger = _entry(
+        1,
+        0.93,
+        minutes=1,
+        stderr=0.03,
+        confirmations=(0.92, 0.93, 0.94),
+        seeds=(7, 8, 9),
+    )
+
+    assert confirmation_pair(project_koth([incumbent, challenger])) is None
