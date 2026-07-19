@@ -24,9 +24,14 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
   hotkey registers again.
 - **Submission pipeline** — screening and validator-ticket history, including a
   compact accessible benchmark progress bar for each validator currently
-  evaluating the submission. Accepted numeric scores appear immediately as
-  provisional feedback; the final median remains authoritative only after the
-  three-validator quorum. Each score includes its post-commit seed and a
+  evaluating the submission. Active benchmark work takes precedence over a
+  submission's previously completed stage, so version-rollout rescoring stays
+  aligned with the validator fleet. Running work carries its ticket-bound bench
+  version, and top-five qualification rows state that the prior score remains
+  authoritative while the next-version quorum is collected. Accepted numeric scores appear immediately
+  in the current-version summary as provisional feedback; the prior final
+  median remains authoritative until the new three-validator quorum. Each score
+  includes its post-commit seed and a
   version-pinned `dittobench-datagen` reproduction command, without exposing
   ticket signatures or associating the number with a validator identity.
 - **Validator fleet** — signed worker availability, coarse system health, and

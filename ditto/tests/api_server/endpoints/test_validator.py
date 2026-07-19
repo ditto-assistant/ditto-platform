@@ -1118,6 +1118,7 @@ class TestHeartbeat:
         assert active_benchmark == {
             "agent_id": str(agent_id),
             "agent_name": "alpha-agent",
+            "bench_version": 2,
             "stage": None,
             "completed_checks": None,
             "total_checks": None,
@@ -1149,6 +1150,9 @@ class TestHeartbeat:
         assert response.status_code == 200
         assert response.headers["Cache-Control"] == "public, max-age=10"
         snapshot = response.json()
+        assert snapshot["active_bench_version"] == 2
+        assert snapshot["desired_bench_version"] == 2
+        assert snapshot["benchmark_rollout_status"] == "inactive"
         assert snapshot["generated_at"] == snapshot["activity"]["generated_at"]
         assert snapshot["generated_at"] == snapshot["validators"]["generated_at"]
         validator = snapshot["validators"]["validators"][0]
@@ -1159,6 +1163,23 @@ class TestHeartbeat:
         activity = snapshot["activity"]["entries"][0]
         assert activity["status"] == "evaluating"
         assert activity["active_benchmarks"][0]["agent_id"] == str(agent_id)
+
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="collecting",
+                    cohort_size=5,
+                    created_at=now,
+                )
+            )
+        rollout_snapshot = (await client.get("/api/v1/public/operations")).json()
+        assert rollout_snapshot["active_bench_version"] == 2
+        assert rollout_snapshot["desired_bench_version"] == 3
+        assert rollout_snapshot["benchmark_rollout_status"] == "collecting"
 
     async def test_operations_snapshot_surfaces_different_reported_agent(
         self,
@@ -1366,6 +1387,7 @@ class TestHeartbeat:
         assert active_benchmark == {
             "agent_id": str(agent_id),
             "agent_name": "alpha-agent",
+            "bench_version": 2,
             "stage": None,
             "completed_checks": None,
             "total_checks": None,
@@ -1568,6 +1590,7 @@ class TestHeartbeat:
         validator = fleet["validators"][0]
         assert validator["active_agent_id"] == str(agent_id)
         assert validator["active_benchmark"]["stage"] == "running_benchmark"
+        assert validator["active_benchmark"]["bench_version"] == 3
 
         pipeline = (
             await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
