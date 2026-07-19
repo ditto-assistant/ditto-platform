@@ -207,6 +207,9 @@ class TestDashboard:
         assert "scores received" in body
         assert "renderAcceptedScores" in body
         assert "Accepted scores" in body
+        assert '"Bench v" + score.bench_version' in body
+        assert '"Bench v" + a.bench_version' in body
+        assert 'class="bench-version-badge"' in body
         assert "Per-question results" in body
         assert "casesSection(score)" in body
         assert "casesSection(s)" in body
