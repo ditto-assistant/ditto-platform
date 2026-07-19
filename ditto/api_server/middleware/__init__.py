@@ -11,6 +11,7 @@ from ditto.api_server.middleware.request_id import (
     RequestIDMiddleware,
     request_id_var,
 )
+from ditto.api_server.middleware.sized_gzip import SizedGZipMiddleware
 
 __all__ = [
     "AuthPassThroughMiddleware",
@@ -18,6 +19,7 @@ __all__ = [
     "REQUEST_ID_HEADER",
     "RequestIdFilter",
     "RequestIDMiddleware",
+    "SizedGZipMiddleware",
     "register_exception_handlers",
     "request_id_var",
 ]

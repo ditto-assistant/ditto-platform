@@ -117,7 +117,6 @@
       --on-accent: oklch(16% 0.03 260);    /* text on a gold/teal fill */
       --focus: oklch(84% 0.13 210);        /* high-visibility keyboard focus ring */
       --radius: 12px;
-      --shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
       --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
       --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", "Roboto", "Oxygen", "Ubuntu", "Cantarell", "Fira Sans", "Helvetica Neue", sans-serif;
     }
@@ -283,7 +282,7 @@
     thead th[aria-sort="ascending"] .sarrow, thead th[aria-sort="descending"] .sarrow { opacity: 1; color: var(--accent); }
     table { width: 100%; border-collapse: collapse; }
     /* A term with a hover explanation, dotted underline + help cursor cue it. */
-    .tip { border-bottom: 1px dotted rgba(148,163,184,0.5); cursor: help; }
+    .tip { position: relative; border-bottom: 1px dotted rgba(148,163,184,0.5); cursor: help; }
     thead th {
       text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px;
       color: var(--text-faint); font-weight: 600; padding: 10px 16px;
@@ -309,25 +308,32 @@
     .winner-name .badge, .winner-name .prov, .winner-name .quorum-badge { flex: none; margin-left: 0; }
     .submission-version { display: inline-flex; align-items: center; width: fit-content; border: 1px solid var(--border); border-radius: 999px; padding: 1px 6px; color: var(--text-dim); background: var(--bg-elev-2); font: 650 9.5px/1.4 var(--mono); letter-spacing: .15px; white-space: nowrap; }
     .winner-miner { display: flex; min-width: 0; max-width: 100%; align-items: center; color: var(--text-faint); }
-    .winner-miner::before { content: "Miner"; margin-right: 6px; color: var(--text-dim); font-family: var(--sans); font-size: 11px; font-weight: 650; }
+    .winner-miner-label { margin-right: 6px; color: var(--text-dim); font-family: var(--sans); font-size: 11px; font-weight: 650; }
     .miner-uid { flex: none; margin-right: 7px; padding-right: 7px; border-right: 1px solid var(--border); color: var(--text-dim); font-family: var(--mono); font-size: 11.5px; font-weight: 650; }
     .hotkey { overflow: hidden; font-family: var(--mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
     .winner-name .badge { font-family: var(--sans); font-size: 11.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--gold); border: 1px solid color-mix(in oklab, var(--gold) 42%, transparent); border-radius: 6px; padding: 1px 6px; vertical-align: middle; }
     /* Model column cell: harness model + bench-version chip. */
     .modelcell { display: flex; flex-direction: column; gap: 5px; align-items: flex-start; }
     .modelcell .mname { font-family: var(--mono); font-size: 12px; color: var(--text); display: inline-flex; align-items: center; gap: 6px; }
-    .modelcell .mname::before { content: "🧠"; font-size: 11px; }
+    .modelcell .mname-icon { font-size: 11px; }
     .modelcell .none { color: var(--text-faint); font-size: 12px; }
     .bv { font-family: var(--sans); font-size: 11px; font-weight: 700; letter-spacing: 0.3px; color: var(--accent-2); border: 1px solid color-mix(in oklab, var(--accent-2) 38%, transparent); border-radius: 5px; padding: 1px 5px; text-transform: uppercase; }
     /* A run scored on a previous benchmark version, muted amber so it reads as
        "not on the current benchmark / not directly comparable". */
-    .bv.prev { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 48%, transparent); background: color-mix(in oklab, var(--warn) 14%, transparent); }
+    /* Shared amber chip skin: a muted-warn fill + border for the three
+       near-identical "not on the current benchmark / not comparable" chips.
+       Each keeps its own class name and layout; only the colour recipe is shared. */
+    .prov, .quorum-badge, .bv.prev {
+      color: var(--warn);
+      border: 1px solid color-mix(in oklab, var(--warn) 48%, transparent);
+      background: color-mix(in oklab, var(--warn) 14%, transparent);
+    }
     /* A provisional run: scored on a smaller run-size profile (not the full
        benchmark), so it is shown but not ranked / not emission-eligible. Muted
        amber like a previous-version run, and the rank cell is dimmed. */
-    .prov { margin-left: 8px; font-family: var(--sans); font-size: 11px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn) 48%, transparent); background: color-mix(in oklab, var(--warn) 14%, transparent); border-radius: 5px; padding: 1px 6px; vertical-align: middle; }
+    .prov { margin-left: 8px; font-family: var(--sans); font-size: 11px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; border-radius: 5px; padding: 1px 6px; vertical-align: middle; }
     .rank.prov-rank { background: transparent; color: var(--text-faint); font-weight: 600; }
-    .quorum-badge { margin-left: 8px; font-family: var(--sans); font-size: 11px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn) 48%, transparent); background: color-mix(in oklab, var(--warn) 11%, transparent); border-radius: 5px; padding: 1px 6px; vertical-align: middle; white-space: nowrap; }
+    .quorum-badge { margin-left: 8px; font-family: var(--sans); font-size: 11px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; border-radius: 5px; padding: 1px 6px; vertical-align: middle; white-space: nowrap; }
     /* Board-wide benchmark-version badge in the header subtitle. */
     .bench-badge { display: none; margin-left: 10px; font-family: var(--sans); font-size: 11.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--accent-2); background: color-mix(in oklab, var(--accent-2) 12%, transparent); border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent); border-radius: 6px; padding: 2px 8px; vertical-align: middle; text-transform: uppercase; }
     .bench-badge.show { display: inline-block; }
@@ -396,7 +402,7 @@
     .muted { color: var(--text-dim); }
 
     /* Composite uncertainty: a ±SE band overlaid on the bar track, with end ticks. */
-    .err { position: absolute; top: -2px; height: 11px; z-index: 2; background: rgba(231,236,243,0.14); border-left: 1px solid rgba(231,236,243,0.55); border-right: 1px solid rgba(231,236,243,0.55); border-radius: 1px; pointer-events: none; }
+    .err { position: absolute; top: -2px; height: 11px; z-index: 2; background: color-mix(in oklch, var(--text) 16%, transparent); border-left: 1px solid color-mix(in oklch, var(--text) 48%, transparent); border-right: 1px solid color-mix(in oklch, var(--text) 48%, transparent); border-radius: 1px; pointer-events: none; }
     /* Composite cell = bar row + optional sparkline stacked. */
     .cwrap { display: flex; flex-direction: column; gap: 5px; }
     .spark { display: block; }
@@ -474,20 +480,20 @@
       background: var(--bg-elev); border: 1px solid var(--border);
       border-radius: var(--radius); box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6);
       padding: 26px 28px; overflow-y: auto;
-      opacity: 0; pointer-events: none;
+      opacity: 0; pointer-events: none; visibility: hidden;
       transform: translate(-50%, -46%) scale(0.98);
-      transition: transform .2s cubic-bezier(.4,0,.2,1), opacity .18s;
+      transition: transform .2s cubic-bezier(.4,0,.2,1), opacity .18s, visibility 0s linear .2s;
     }
-    .modal.open { opacity: 1; pointer-events: auto; transform: translate(-50%, -50%) scale(1); }
+    .modal.open { opacity: 1; pointer-events: auto; visibility: visible; transform: translate(-50%, -50%) scale(1); transition: transform .2s cubic-bezier(.4,0,.2,1), opacity .18s, visibility 0s; }
     .modal-actions { position: absolute; top: 14px; right: 14px; display: flex; align-items: center; gap: 8px; }
     .modal-actions .open-full { min-height: 44px; padding-inline: 13px; }
     .modal-actions .close { position: static; }
-    body.entity-page .wrap { display: none; }
+    body.entity-page .layout { display: none; }
     body.entity-page .modal {
       position: relative; top: auto; left: auto;
       width: min(1040px, calc(100vw - 32px)); max-height: none;
       margin: 32px auto; overflow: visible;
-      opacity: 1; pointer-events: auto;
+      opacity: 1; pointer-events: auto; visibility: visible;
       transform: none;
     }
     body.entity-page .modal.open { transform: none; }
@@ -504,13 +510,12 @@
     /* Benchmark-version chip in the modal header (larger than the row chip). */
     #d-bench { font-family: var(--sans); font-size: 11.5px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; border-radius: 6px; padding: 2px 8px; color: var(--accent-2); border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent); background: color-mix(in oklab, var(--accent-2) 12%, transparent); }
     #d-bench.prev { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 48%, transparent); background: color-mix(in oklab, var(--warn) 14%, transparent); }
-    .stat-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
-    .stat-row .k { color: var(--text-dim); font-size: 13px; }
-    .stat-row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .stat-row { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); align-items: baseline; gap: 6px 14px; padding: 8px 0; border-bottom: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
+    .stat-row .k { min-width: 0; color: var(--text-dim); font-size: 13px; }
+    .stat-row .v { min-width: 0; font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere; }
     .vdetail .cgsum { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .vdetail .cgsum .stage { margin-left: auto; }
     .vdetail .cgsum .probe-time { color: var(--text-dim); font-size: 12px; }
-    .vdetail .stat-row .v { max-width: 62%; text-align: right; overflow-wrap: anywhere; }
     .vdetail .stat-row .v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 500; }
     .vdetail .subhead { margin: 10px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); }
     .vdetail .identity-note { display: block; margin: 6px 0 2px; font-size: 12px; }
@@ -544,6 +549,17 @@
     .foot-links { display: flex; gap: 18px; flex-wrap: wrap; }
 
     .empty { padding: 40px; text-align: center; color: var(--text-dim); }
+    /* A full-colspan message ("No miners scored yet…") lives inside a min-width
+       table, so on a narrow screen its centered text is pushed off the right edge
+       by the horizontal scroll. The sticky sits on an inner .empty-msg wrapper:
+       the colspan cell spans the table's full min-width, so the narrower inner
+       div has slack to stick and pins to the visible left edge at 375px.
+       (Sticky directly on the full-width td has no room to move, so it would
+       scroll away with the table.) */
+    @media (max-width: 720px) {
+      td.empty { padding: 0; }
+      td.empty .empty-msg { position: sticky; left: 0; box-sizing: border-box; width: calc(100vw - 32px); padding: 32px 20px; white-space: normal; }
+    }
 
     /* ── Submission pipeline ───────────────────────────────── */
     .activity tbody tr { cursor: pointer; }
@@ -588,6 +604,7 @@
     .validation-progress { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--text); white-space: nowrap; }
     .validation-progress.pending { color: var(--text-faint); font-weight: 500; }
     .pager { display: flex; justify-content: center; align-items: center; gap: 10px; padding: 10px 14px; background: color-mix(in oklab, var(--bg-elev-2) 38%, var(--bg-elev)); }
+    .pager[hidden] { display: none; }
     .pager.top { border-bottom: 1px solid var(--border); }
     .pager.bottom { border-top: 1px solid var(--border); }
     .pager .btn { min-width: 94px; min-height: 38px; padding: 7px 12px; }
@@ -838,12 +855,18 @@
       font: 750 10px/1 var(--sans);
       cursor: help;
     }
-    .retry-info::after {
+    /* Shared CSS tooltip bubble: keyboard- and touch-accessible (reveals on
+       :focus-visible), used by the circular .retry-info marker and the
+       dotted-underline .tip terms on stat cards and table headers. */
+    .retry-info::after,
+    .tip::after {
       content: attr(data-tooltip);
+      /* display:none until revealed (not just opacity:0): a hidden absolutely
+         positioned box still contributes to its scroll container's scrollable
+         overflow, which added ~250px of blank horizontal scroll to the board. */
+      display: none;
       position: absolute;
       z-index: 70;
-      left: -88px;
-      bottom: calc(100% + 8px);
       width: min(270px, calc(100vw - 72px));
       padding: 8px 10px;
       border-radius: 4px;
@@ -852,20 +875,23 @@
       color: var(--bg-elev);
       font: 500 11.5px/1.45 var(--sans);
       letter-spacing: 0;
-      opacity: 0;
       pointer-events: none;
       text-align: left;
       text-transform: none;
-      transform: translateY(3px);
-      transition: opacity 160ms ease-out, transform 160ms ease-out;
       white-space: normal;
     }
+    /* The marker's bubble sits above it; the .tip bubble drops below the term so
+       it is never clipped by the table's horizontal-scroll container. */
+    .retry-info::after { left: -88px; bottom: calc(100% + 8px); }
+    .tip::after { left: 0; top: calc(100% + 8px); }
     .retry-info:hover::after,
-    .retry-info:focus-visible::after {
-      opacity: 1;
-      transform: translateY(0);
+    .retry-info:focus-visible::after,
+    .tip:hover::after,
+    .tip:focus-visible::after {
+      display: block;
     }
-    .retry-info:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+    .retry-info:focus-visible,
+    .tip:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
     .old-screeners { margin-top: 10px; border-top: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
     .old-screeners summary { padding: 12px 0; color: var(--text-dim); font-size: 12.5px; font-weight: 700; cursor: pointer; }
     .old-screeners summary:hover { color: var(--text); }
@@ -888,7 +914,14 @@
       .attempt-time { grid-column: 2; }
       .accepted-score { grid-template-columns: 1fr; gap: var(--detail-space-sm); }
       .screening-dispute-wallets { grid-template-columns: 1fr; }
-      .retry-info::after { width: min(240px, calc(100vw - 72px)); }
+      .retry-info::after,
+      .tip::after { width: min(240px, calc(100vw - 72px)); }
+      /* In the 2-col mobile stat grid the hidden "Subnet snapshot" h2 is child 1
+         and the primary card (child 2) owns its full row, so right-column cards
+         are the even children >= 4. Left-anchored bubbles on those cards run off
+         the right viewport edge; anchor them right so the whole bubble stays on
+         screen. */
+      .cards > .card:nth-child(2n+4) .tip::after { left: auto; right: 0; }
     }
 
     @media (max-width: 960px) {
@@ -937,7 +970,6 @@
       --rank-one-text: #754b18;
       --rank-three-text: #814626;
       --radius: 8px;
-      --shadow: 0 4px 12px color-mix(in oklch, var(--text) 10%, transparent);
       --display: Georgia, "Times New Roman", serif;
       --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
       --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
@@ -990,7 +1022,7 @@
       --tool: var(--accent);
       --memory: var(--accent-2);
       --good: oklch(75% .11 145);
-      --warn: oklch(78% .12 75);
+      --warn: oklch(76% .15 52);
       --danger: oklch(72% .13 28);
       --on-accent: oklch(19% .025 255);
       --focus: oklch(80% .115 75);
@@ -1246,10 +1278,19 @@
     .section-head { align-items: flex-end; margin: 34px 0 10px; }
     .section-head h2 { font-family: var(--display); font-size: 21px; font-weight: 400; line-height: 1.1; letter-spacing: -0.01em; }
     .section-head .hint { color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; }
-    .view-all { color: var(--accent); font-family: var(--mono); font-size: 11px; }
-    .view-all:hover { text-decoration: none; border-bottom: 1px solid var(--accent); }
 
-    .board { border-color: var(--border); border-radius: 4px; background: var(--bg-elev); overflow-x: auto; }
+    /* Right-edge scroll hint: a subtle shadow at the container's right edge that
+       fades out once the table is scrolled to the end. The cover layer scrolls
+       with the content (background-attachment: local) and masks the shadow at
+       the end; the shadow layer is pinned to the visible right edge. */
+    .board {
+      border-color: var(--border); border-radius: 4px; overflow-x: auto;
+      background:
+        linear-gradient(to right, transparent, var(--bg-elev) 80%) 100% 0 / 34px 100% no-repeat local,
+        radial-gradient(farthest-side at 100% 50%, color-mix(in oklch, var(--text) 14%, transparent), transparent) 100% 0 / 16px 100% no-repeat;
+      background-color: var(--bg-elev);
+    }
+    .board:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
     table { min-width: 850px; }
     thead th { padding: 11px 14px; border-color: var(--border); background: var(--bg-elev-2); color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em; }
     tbody td { padding: 11px 14px; border-color: color-mix(in oklch, var(--border) 72%, transparent); font-size: 13px; }
@@ -1298,12 +1339,6 @@
     #d-bench { border-radius: 3px; }
     .bar { background: var(--bg-elev-2); border-color: var(--border); }
 
-    .toolbar { padding: 10px; border: 1px solid var(--border); border-bottom: 0; background: color-mix(in oklch, var(--bg-elev-2) 45%, var(--bg-elev)); }
-    .filter-input { min-height: 34px; padding: 7px 10px; border-radius: 4px; border-color: var(--border); background: var(--bg-elev); }
-    .filter-input::placeholder { color: var(--text-dim); }
-    .chip { border-radius: 999px; background: var(--bg-elev); }
-    .chip.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-    .chip.on .n { color: var(--on-accent); }
     .stage { background: var(--bg-elev-2); }
 
     .about { margin-top: 30px; }
@@ -1343,10 +1378,7 @@
       .search-popover { right: auto; left: 0; width: 100%; }
       header.top .brand .sub { max-width: 28ch; }
       header.top .bench-badge.show { display: block; width: fit-content; margin: 6px 0 0; }
-      .theme-switch { order: 1; }
       header.top #status { order: 2; }
-      header.top #wandb-link { order: 3; }
-      header.top #refresh { order: 4; }
       .cards { grid-template-columns: repeat(2, 1fr); }
       .card.primary { grid-column: 1 / -1; grid-row: auto; min-height: 152px; }
       .card.primary .value { font-size: 44px; }
@@ -1355,7 +1387,6 @@
       .emissions-strip.show { display: block; }
       .emissions-recipients { margin-top: 8px; text-align: left; }
       .chain-observation { margin-top: 10px; }
-      .view-all { display: inline-block; margin: 8px 0 0; }
       .pager { gap: 6px; padding-inline: 8px; }
       .pager .btn { min-width: 84px; padding-inline: 9px; }
       .page-status { min-width: 94px; }
@@ -1580,6 +1611,7 @@
     .fleet-ledger-row > span:last-child { color: var(--text-dim); font: 650 10px/1.2 var(--mono); text-transform: uppercase; }
     .fleet-ledger-row.healthy .fleet-ledger-dot { background: var(--good); }
     .fleet-ledger-row.warning .fleet-ledger-dot { background: var(--warn); }
+    .fleet-ledger-row.stale .fleet-ledger-dot { background: var(--warn); }
     .fleet-ledger-row.offline .fleet-ledger-dot { background: var(--danger); }
     .fleet-ledger-row.paused .fleet-ledger-dot { background: var(--accent-2); }
     .fleet-ledger-row.unknown .fleet-ledger-dot { background: var(--text-faint); }
@@ -1637,7 +1669,7 @@
       .fleet-atlas { grid-template-columns: 1fr; }
       .pipeline-map { overflow-x: auto; }
       .pipeline-overview { min-width: 860px; }
-      .fleet-ledger { display: grid; grid-template-columns: repeat(5, minmax(100px, 1fr)); gap: 10px; padding: 14px 18px; border-top: 1px solid var(--border); border-left: 0; }
+      .fleet-ledger { display: grid; grid-template-columns: repeat(6, minmax(92px, 1fr)); gap: 10px; padding: 14px 18px; border-top: 1px solid var(--border); border-left: 0; }
       .fleet-ledger-row { grid-template-columns: 9px 24px 1fr; }
       .fleet-ledger p { grid-column: 1 / -1; margin: 2px 0 0; }
     }
@@ -1708,28 +1740,35 @@
     .ath-state { padding: 34px 20px; border: 1px dashed var(--border-strong); text-align: center; color: var(--text-dim); }
     .ath-state strong { display: block; margin-bottom: 4px; color: var(--text); }
     .ath-state.error { border-color: color-mix(in oklch, var(--danger) 55%, var(--border)); }
-    /* Narrow viewports: the rail becomes a top bar. Brand + theme switch on the
-       first row; sections as a horizontal, scrollable navbar strip. */
+    /* Narrow viewports: the rail becomes a top bar. Row 1 is the brand plus the
+       compact Refresh/telemetry footer; the nav is a horizontal scroll strip;
+       the theme switch sits after the nav (never above it) as a compact row. */
     @media (max-width: 960px) {
       .layout { display: block; overflow-x: clip; }
       .board { overflow-x: auto; }
       /* Keep the sticky shell above page content and search results, but below
          the modal backdrop (40) and dialog (50). */
-      .sidebar { position: sticky; top: 0; z-index: 30; height: auto; flex: none; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 12px; border-right: none; border-bottom: 1px solid var(--border); }
-      .sidebar .brand { flex: 1 1 auto; min-width: 0; order: 0; }
-      .side-theme { order: 1; min-width: 0; margin-top: 0; }
-      .side-theme .theme-switch { display: inline-flex; width: auto; }
+      .sidebar { position: sticky; top: 0; z-index: 30; height: auto; flex: none; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 12px 16px; border-right: none; border-bottom: 1px solid var(--border); }
+      .sidebar .brand { flex: 1 1 auto; min-width: 0; order: 0; padding: 0; }
+      .sidebar .brand .mark { width: 34px; height: 34px; }
+      /* Footer moves onto row 1, right of the brand: a compact Refresh button and
+         an icon-only telemetry link so mobile users can still refresh. */
+      .side-foot { order: 1; display: flex; flex-direction: row; align-items: center; gap: 8px; margin-top: 0; }
+      .side-foot .btn { min-height: 34px; }
+      #wandb-link { padding-inline: 9px; }
+      #wandb-link .btn-label { display: none; }
       .nav { order: 2; flex-basis: 100%; width: 100%; flex-direction: row; flex-wrap: nowrap; overflow-x: auto; gap: 4px; margin-top: 2px; }
       .nav-item { flex: 0 0 auto; padding: 7px 11px; border-radius: 8px; }
       .nav-item .ni-desc { display: none; }
-      .side-foot { display: none; }
+      /* After the nav, full-width, so its buttons sit on their own compact row. */
+      .side-theme { order: 3; flex: 1 0 100%; width: 100%; min-width: 0; margin-top: 0; }
+      .side-theme .theme-switch { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); width: 100%; }
     }
     @media (max-width: 720px) {
-      /* Give every choice a full touch target without letting the four labels
-         compete for one narrow row. */
-      .side-theme { flex: 1 0 100%; width: 100%; }
-      .side-theme .theme-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
-      .side-theme .theme-option { min-height: 44px; padding: 8px; }
+      /* Keep the four theme options in one compact row (36px targets) rather than
+         a tall full-width 2x2 grid, and drop the long brand subtitle. */
+      .side-theme .theme-option { min-height: 36px; padding: 6px; }
+      .sidebar .brand .sub { display: none; }
       .ath-intro, .ath-review-main { grid-template-columns: 1fr; }
       .ath-metrics { grid-template-columns: 1fr; }
       .ath-metric { min-height: 68px; }
@@ -1755,7 +1794,7 @@
         <a class="nav-item" href="#/operations" data-page="operations"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/></svg></span><span class="ni-text"><span class="ni-label">Network ops</span><span class="ni-desc">Pipeline &amp; fleet health</span></span></a>
         <a class="nav-item" href="#/submissions" data-page="submissions"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg></span><span class="ni-text"><span class="ni-label">Submissions</span><span class="ni-desc">Recent uploads</span></span></a>
         <a class="nav-item" href="#/reviews" data-page="reviews"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3 3.6 7.2v5.6c0 4.7 3.6 7.2 8.4 8.2 4.8-1 8.4-3.5 8.4-8.2V7.2Z"/><path d="M9 12h6M12 9v6"/></svg></span><span class="ni-text"><span class="ni-label">ATH reviews</span><span class="ni-desc">Active public holds</span></span></a>
-        <a class="nav-item" href="#/benchmark" data-page="benchmark"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M21.3 15.3a2.4 2.4 0 0 1 0 3.4l-2.6 2.6a2.4 2.4 0 0 1-3.4 0L2.7 8.7a2.41 2.41 0 0 1 0-3.4l2.6-2.6a2.41 2.41 0 0 1 3.4 0Z"/><path d="m14.5 12.5 2-2"/><path d="m11.5 9.5 2-2"/><path d="m8.5 6.5 2-2"/><path d="m17.5 15.5 2-2"/></svg></span><span class="ni-text"><span class="ni-label">Benchmark</span><span class="ni-desc">What v3 measures</span></span></a>
+        <a class="nav-item" href="#/benchmark" data-page="benchmark"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M21.3 15.3a2.4 2.4 0 0 1 0 3.4l-2.6 2.6a2.4 2.4 0 0 1-3.4 0L2.7 8.7a2.41 2.41 0 0 1 0-3.4l2.6-2.6a2.41 2.41 0 0 1 3.4 0Z"/><path d="m14.5 12.5 2-2"/><path d="m11.5 9.5 2-2"/><path d="m8.5 6.5 2-2"/><path d="m17.5 15.5 2-2"/></svg></span><span class="ni-text"><span class="ni-label">Benchmark</span><span class="ni-desc">Scoring benchmark</span></span></a>
       </nav>
       <div class="side-theme">
       <div class="theme-switch" role="group" aria-label="Color theme">
@@ -1778,7 +1817,7 @@
       </div>
       </div>
       <div class="side-foot">
-        <a id="wandb-link" class="btn ghost" href="#" target="_blank" rel="noopener"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg> Full telemetry <svg class="ic ext" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6"/></svg></a>
+        <a id="wandb-link" class="btn ghost" href="#" target="_blank" rel="noopener" aria-label="Full telemetry (wandb)" title="Full telemetry (wandb)"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg><span class="btn-label"> Full telemetry <svg class="ic ext" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6"/></svg></span></a>
         <button id="refresh" class="btn" title="Refresh now"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg> Refresh</button>
       </div>
     </aside>
@@ -1815,13 +1854,13 @@
     <section class="cards" id="cards" aria-labelledby="snapshot-title">
       <h2 class="visually-hidden" id="snapshot-title">Subnet snapshot</h2>
       <div class="card primary"><div class="label">Miners total</div><div class="value" id="h-miners">–</div><div class="context">Distinct miners who have submitted to Subnet 118.</div></div>
-      <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label"><span class="tip" title="Distinct miners with at least one scored run on the board (provisional runs included).">Miners Scored</span></div><div class="value" id="c-miners">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="The highest composite among ranked (full-benchmark) runs. Composite = (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates (efficiency, consistency, and canary integrity: a canary leak ×0.5, an honest miss ×0.85). Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" title="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 25 seeds at run_size=full. The score a submission must beat. Source: dittobench-api docs/BASELINES.md (bench_version 3).">Reference Baseline</span></div><div class="value" id="c-baseline">–</div></div>
-      <div class="card"><div class="label"><span class="tip" title="All validator score records stored by the platform, including the independent scores that make up each finalized result.">Total scores</span></div><div class="value" id="h-scores">–</div></div>
-      <div class="card"><div class="label"><span class="tip" title="Validators currently reporting heartbeat-capable software to the platform.">Validators</span></div><div class="value" id="h-validators">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
+      <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="Distinct miners with at least one scored run on the board (provisional runs included).">Miners Scored</span></div><div class="value" id="c-miners">–</div></div>
+      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="The highest composite among ranked (full-benchmark) runs. Composite = (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates (efficiency, consistency, and canary integrity: a canary leak ×0.5, an honest miss ×0.85). Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
+      <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
+      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 25 seeds at run_size=full. The score a submission must beat. Source: dittobench-api docs/BASELINES.md (bench_version 3).">Reference Baseline</span></div><div class="value" id="c-baseline">–</div></div>
+      <div class="card"><div class="label"><span class="tip" tabindex="0" data-tooltip="All validator score records stored by the platform, including the independent scores that make up each finalized result.">Total scores</span></div><div class="value" id="h-scores">–</div></div>
+      <div class="card"><div class="label"><span class="tip" tabindex="0" data-tooltip="Validators currently reporting heartbeat-capable software to the platform.">Validators</span></div><div class="value" id="h-validators">–</div></div>
+      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
       <div class="card"><div class="label">Scored agents</div><div class="value" id="h-agents">–</div></div>
       <div class="card"><div class="label">Last scored</div><div class="value" id="h-last">–</div></div>
     </section>
@@ -1842,7 +1881,7 @@
       </div>
     </div>
     <div class="leaderboard-notice" id="leaderboard-notice" role="status" aria-live="polite"></div>
-    <div class="board">
+    <div class="board" tabindex="0" role="region" aria-label="Leaderboard table, horizontally scrollable on small screens">
       <div class="board-tabs activity-filter-list" role="group" aria-label="Leaderboard view">
         <button class="activity-filter" type="button" data-board-tab="all" aria-pressed="false">All <span class="activity-filter-count" data-board-count="all">–</span></button>
         <button class="activity-filter" type="button" data-board-tab="scored" aria-pressed="true">Scored <span class="activity-filter-count" data-board-count="scored">–</span></button>
@@ -1851,19 +1890,19 @@
       <table id="board" tabindex="-1" aria-label="Subnet 118 leaderboard: best score per miner">
         <thead>
           <tr>
-            <th scope="col" style="width:72px" class="sortable" data-sort="rank" aria-sort="ascending"><span class="tip" title="Raw rank by finalized composite among full-benchmark runs. This is independent of KOTH emissions; provisional runs are unranked (–).">Score rank</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" class="sortable" data-sort="name"><span class="tip" title="The miner's best-scoring agent, with its current SN118 UID and on-chain hotkey below. Open either identity for details, or copy the hotkey.">Best-scoring agent</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" style="width:128px"><span class="tip" title="Current KOTH role. The incumbent receives 90% of the miner pool; up to four participation-tail recipients split the remaining 10%.">Emissions</span></th>
-            <th scope="col" class="hide-md sortable" data-sort="bench" style="width:180px"><span class="tip" title="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under. Sort to group runs by benchmark version.">Model</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" style="width:190px" class="sortable" data-sort="composite"><span class="tip" title="Headline score in [0,1]: (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates. The band on the bar is ±1 standard error. The second line shows the score trend.">Composite</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" class="hide-sm sortable" data-sort="tool" style="width:140px"><span class="tip" title="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" class="hide-sm sortable" data-sort="memory" style="width:140px"><span class="tip" title="Mean score across the memory cases. Did the agent recall and reason over stored facts across sessions, over time, and while resisting injected instructions?">Memory</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" class="num hide-sm sortable" data-sort="latency" style="width:96px"><span class="tip" title="Median per-case response time for the run, and how many cases were scored (a full benchmark is ~114 cases).">Latency</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" class="num hide-sm sortable" data-sort="first_seen" style="width:92px"><span class="tip" title="When this miner's winning agent was first uploaded to the platform.">First seen</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" style="width:72px" class="sortable" data-sort="rank" aria-sort="ascending"><span class="tip" tabindex="0" data-tooltip="Raw rank by finalized composite among full-benchmark runs. This is independent of KOTH emissions; provisional runs are unranked (–).">Score rank</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" class="sortable" data-sort="name"><span class="tip" tabindex="0" data-tooltip="The miner's best-scoring agent, with its current SN118 UID and on-chain hotkey below. Open either identity for details, or copy the hotkey.">Best-scoring agent</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" style="width:128px"><span class="tip" tabindex="0" data-tooltip="Current KOTH role. The incumbent receives 90% of the miner pool; up to four participation-tail recipients split the remaining 10%.">Emissions</span></th>
+            <th scope="col" class="hide-md sortable" data-sort="bench" style="width:180px"><span class="tip" tabindex="0" data-tooltip="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under. Sort to group runs by benchmark version.">Model</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" style="width:190px" class="sortable" data-sort="composite"><span class="tip" tabindex="0" data-tooltip="Headline score in [0,1]: (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates. The band on the bar is ±1 standard error. The second line shows the score trend.">Composite</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" class="hide-sm sortable" data-sort="tool" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" class="hide-sm sortable" data-sort="memory" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Mean score across the memory cases. Did the agent recall and reason over stored facts across sessions, over time, and while resisting injected instructions?">Memory</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" class="num hide-sm sortable" data-sort="latency" style="width:96px"><span class="tip" tabindex="0" data-tooltip="Median per-case response time for the run, and how many cases were scored (a full benchmark is ~114 cases).">Latency</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" class="num hide-sm sortable" data-sort="first_seen" style="width:92px"><span class="tip" tabindex="0" data-tooltip="When this miner's winning agent was first uploaded to the platform.">First seen</span><span class="sarrow" aria-hidden="true">▲</span></th>
           </tr>
         </thead>
         <tbody id="rows">
-          <tr><td colspan="9" class="empty">Loading leaderboard…</td></tr>
+          <tr><td colspan="9" class="empty"><div class="empty-msg">Loading leaderboard…</div></td></tr>
         </tbody>
       </table>
       <nav class="pager bottom" aria-label="Leaderboard pages">
@@ -1939,6 +1978,7 @@
         <aside class="fleet-ledger" aria-label="Fleet status summary">
           <div class="fleet-ledger-row healthy"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-healthy">–</strong><span>Healthy</span></div>
           <div class="fleet-ledger-row warning"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-warning">–</strong><span>Warning</span></div>
+          <div class="fleet-ledger-row stale"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-stale">–</strong><span>Stale</span></div>
           <div class="fleet-ledger-row offline"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-offline">–</strong><span>Offline</span></div>
           <div class="fleet-ledger-row paused"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-paused">–</strong><span>Paused</span></div>
           <div class="fleet-ledger-row unknown"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-unknown">–</strong><span>Not reported</span></div>
@@ -1952,7 +1992,7 @@
           <span class="hint" id="fleet-summary" aria-live="polite">Loading validator status…</span>
         </div>
       </div>
-      <div class="board validators" tabindex="0" aria-label="Fleet health table, horizontally scrollable on small screens">
+      <div class="board validators" tabindex="0" role="region" aria-label="Fleet health table, horizontally scrollable on small screens">
         <table class="fleet-table" aria-label="Validator fleet health" id="fleet-table">
           <thead>
             <tr>
@@ -1969,14 +2009,14 @@
             </tr>
           </thead>
           <tbody id="fleet-rows">
-            <tr><td colspan="10" class="empty">Loading validators…</td></tr>
+            <tr><td colspan="10" class="empty"><div class="empty-msg">Loading validators…</div></td></tr>
           </tbody>
         </table>
       </div>
       <details class="fleet-retired" id="fleet-retired" hidden>
         <summary><strong>Recently offline</strong><span id="fleet-retired-summary"></span></summary>
         <p class="fleet-retired-note">Heartbeat history remains visible for 24 hours, then expires automatically.</p>
-        <div class="board validators" tabindex="0" aria-label="Recently offline screeners, horizontally scrollable on small screens">
+        <div class="board validators" tabindex="0" role="region" aria-label="Recently offline screeners, horizontally scrollable on small screens">
           <table class="fleet-table fleet-retired-table" aria-label="Recently offline screeners">
             <thead>
               <tr>
@@ -1995,7 +2035,7 @@
     </section>
 
     <section class="page" data-page="submissions">
-    <div class="board activity" aria-busy="true">
+    <div class="board activity" aria-busy="true" tabindex="0" role="region" aria-label="Recent submissions, horizontally scrollable on small screens">
       <div class="activity-filters" aria-labelledby="activity-filter-label">
         <span class="visually-hidden" id="activity-filter-label">Filter recent submissions by public pipeline state</span>
         <div class="activity-filter-list" role="group" aria-label="Quick submission filters">
@@ -2027,7 +2067,7 @@
           </tr>
         </thead>
         <tbody id="activity-rows">
-          <tr><td colspan="5" class="empty">Loading submissions…</td></tr>
+          <tr><td colspan="5" class="empty"><div class="empty-msg">Loading submissions…</div></td></tr>
         </tbody>
       </table>
       </div>
@@ -2063,7 +2103,6 @@
           <h2>Agents awaiting review</h2>
           <div class="ath-review-tools">
             <span class="ath-snapshot" id="ath-snapshot" role="status" aria-live="polite">Loading public snapshot…</span>
-            <button class="btn ghost" id="ath-refresh" type="button"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg> Refresh</button>
           </div>
         </div>
         <div id="ath-review-state" class="ath-state"><strong>Loading active reviews…</strong>Reading the public submission snapshot.</div>
@@ -2214,6 +2253,7 @@
     var pipelineEntries = [];
     var pipelineLoaded = false;
     var pipelineUnavailable = false;
+    var activityUnavailable = false;
     var athReviewCache = null;
     var athReviewLoading = false;
     var athReviewRequestId = 0;
@@ -2222,6 +2262,14 @@
     var ACTIVITY_PAGE_SIZE = 10;
     var activityFrame = document.querySelector(".activity-table-frame");
     var activityRequestId = 0;
+    // Polling/render efficiency (Batch 2): the boot load seeds every section
+    // (search corpus needs it); later ticks are page-aware. bench/config is
+    // effectively static (max-age 300) so it is refetched at most every 5 min.
+    var bootComplete = false;
+    var benchConfigAt = 0;
+    // Set true whenever elapsed-time nodes are on the page so the 1s updater can
+    // early-return when there are none (operations page only).
+    var hasElapsedNodes = false;
     var activitySearchTimer = null;
     var activityStatusCounts = {};
     var ACTIVITY_FILTERS = {
@@ -2363,10 +2411,10 @@
       history[push ? "pushState" : "replaceState"]({}, "", url.pathname + url.search + url.hash);
     }
 
-    function navigateActivityPage(page, anchor, push) {
+    function navigateActivityPage(page, anchor, push, userInitiated) {
       activityPage = page;
       writeActivityUrl(push !== false);
-      loadActivity(page, anchor);
+      loadActivity(page, anchor, userInitiated === true);
     }
 
     function filterCount(name) {
@@ -2419,7 +2467,7 @@
       activityPage = 1;
       writeActivityUrl(true);
       renderActivityFilterControls();
-      loadActivity(1);
+      loadActivity(1, null, true);
     }
 
     var activityUrlWasSanitized = restoreActivityUrl();
@@ -2443,7 +2491,9 @@
     });
     // The latest DittoBench benchmark version (from the leaderboard API). Runs
     // below this were scored on a previous benchmark and are marked as such.
-    var currentBench = 2;
+    // Starts null so nothing renders a hardcoded (and possibly wrong) version
+    // before live data arrives; the leaderboard response fills it in.
+    var currentBench = null;
     // Stock reference-harness baseline (dittobench-api docs/BASELINES.md): the
     // composite a submission must beat, from 24 seeds at run_size=full on the
     // locked model. Tied to the bench_version it was measured on; refresh from a
@@ -2453,6 +2503,10 @@
     // controls what is DISPLAYED. Scored is the default tab because a
     // provisional run is pre-quorum feedback, not a standing.
     var boardView = { tab: "scored", sort: "rank", dir: 1, page: 1, pageSize: 25 };
+    // Chain unreachable for the whole snapshot (set by render(), read by
+    // renderBoardRows()): suppresses the identical per-row "registration
+    // unknown" badge that the notice above the board already explains once.
+    var chainRegistrationUnknown = false;
 
     // Sort accessors. Null/undefined always sorts last regardless of direction,
     // so an unranked or legacy row never displaces real data at the top.
@@ -2505,7 +2559,6 @@
     // ── Formatting helpers ───────────────────────────────────
     function pct(x) { return (x * 100).toFixed(1) + "%"; }
     function fx(x) { return x.toFixed(3); }
-    function shortKey(k) { return k.length > 14 ? k.slice(0, 6) + "…" + k.slice(-6) : k; }
     function agentLabel(name, version) {
       var label = name || "Unnamed agent";
       return label + ", " + agentVersionLabel(version);
@@ -2620,6 +2673,46 @@
       return "Validator support · " + chainWeight.weighted + "/" + chainWeight.vectors;
     }
 
+    // ── Render efficiency ────────────────────────────────────
+    // Skip an innerHTML rebuild when a section's data is byte-identical to what
+    // is already on screen — this preserves keyboard focus and expanded state
+    // that a blind rebuild would destroy every 30 s. A coarse minute bucket is
+    // folded into the signature so relative timestamps ("5m ago") never drift
+    // more than a minute stale; a manual Refresh calls forceRender() to rebuild
+    // everything immediately.
+    var renderSignatures = {};
+    function sectionChanged(key, payload) {
+      var sig = JSON.stringify(payload) + "|" + Math.floor(Date.now() / 60000);
+      if (renderSignatures[key] === sig) return false;
+      renderSignatures[key] = sig;
+      return true;
+    }
+    function forceRender() { renderSignatures = {}; }
+    // Run `worker` over `items` with at most `limit` promises in flight;
+    // results preserve input order.
+    function poolMap(items, limit, worker) {
+      var results = new Array(items.length);
+      var cursor = 0;
+      function step() {
+        if (cursor >= items.length) return Promise.resolve();
+        var i = cursor++;
+        return worker(items[i]).then(function (value) { results[i] = value; return step(); });
+      }
+      var runners = [];
+      for (var k = 0; k < Math.min(limit, items.length); k++) runners.push(step());
+      return Promise.all(runners).then(function () { return results; });
+    }
+    function activePageName() {
+      var el = document.querySelector(".page.active");
+      return el ? el.getAttribute("data-page") : "overview";
+    }
+    // A single querySelector at render time is far cheaper than a
+    // querySelectorAll every second forever (the 1s updater early-returns when
+    // this is false).
+    function refreshElapsedFlag() {
+      hasElapsedNodes = !!document.querySelector(".screener-progress-time[data-started-at], .benchmark-progress-time[data-started-at]");
+    }
+
     // ── Render ───────────────────────────────────────────────
     function render(data) {
       // Finalized submissions always rank ahead of pre-quorum feedback. Within
@@ -2675,9 +2768,15 @@
         return isFinalized(e) && (e.bench_version == null || e.bench_version < currentBench);
       });
       var badge = document.getElementById("bench-badge");
-      badge.className = "bench-badge show";
-      badge.textContent = "DittoBench v" + currentBench +
-        (hasOld ? " · older runs marked" : "");
+      if (currentBench) {
+        badge.className = "bench-badge show";
+        badge.textContent = "DittoBench v" + currentBench +
+          (hasOld ? " · older runs marked" : "");
+      } else {
+        badge.className = "bench-badge";
+        badge.textContent = "";
+      }
+      applyBenchVersion(currentBench);
       // Freshness lives on the status pill (no separate card), keeping the
       // headline cards to distinct leaderboard metrics.
       var when = data.generated_at ? relTime(data.generated_at) : "–";
@@ -2688,6 +2787,11 @@
       var notice = document.getElementById("leaderboard-notice");
       var inactive = entries.filter(function (e) { return e.registered === false; });
       var registrationUnknown = entries.filter(function (e) { return e.registered == null; });
+      // Chain unreachable for the whole snapshot: the notice above already
+      // explains it once, so we suppress the identical per-row "registration
+      // unknown" badge. Per-row badges still show when registration data exists
+      // but a specific row is unregistered/dereg.
+      chainRegistrationUnknown = entries.length > 0 && registrationUnknown.length === entries.length;
       title.textContent = finalizedEntries.length ? "Leaderboard" : (provisional.length ? "Provisional leaderboard" : "Leaderboard");
       hint.textContent = finalizedEntries.length
         ? "raw composite rank · KOTH champion and recipients shown separately"
@@ -2812,9 +2916,20 @@
       if (next) next.disabled = boardView.page >= pageCount;
 
       if (!pageRows.length) {
-        tb.innerHTML = '<tr><td colspan="9" class="empty">' + (boardView.tab === "provisional"
-          ? "No provisional runs right now. Pre-quorum scores appear here as validators report them."
-          : "No miners have been scored yet. As soon as a submission clears scoring it appears here.") + '</td></tr>';
+        if (sectionChanged("leaderboard", { empty: true, tab: boardView.tab, page: boardView.page })) {
+          tb.innerHTML = '<tr><td colspan="9" class="empty"><div class="empty-msg">' + (boardView.tab === "provisional"
+            ? "No provisional runs right now. Pre-quorum scores appear here as validators report them."
+            : "No miners have been scored yet. As soon as a submission clears scoring it appears here.") + '</div></td></tr>';
+        }
+        return;
+      }
+      // Skip the innerHTML rebuild when the visible slice and view are unchanged
+      // (a background refresh with identical data must not wipe focus).
+      if (!sectionChanged("leaderboard", {
+        rows: pageRows,
+        block: lastChainWeights ? lastChainWeights.block : null,
+        tab: boardView.tab, sort: boardView.sort, dir: boardView.dir, page: boardView.page,
+      })) {
         return;
       }
       tb.innerHTML = pageRows.map(function (e, i) {
@@ -2849,14 +2964,16 @@
           ? ""
           : e.registered === false
           ? '<span class="prov" title="This hotkey is not currently registered on SN118. Its score is retained, but it is excluded from active weights and emissions until the same hotkey registers again.">registration inactive</span>'
+          : chainRegistrationUnknown
+          ? ""
           : '<span class="prov" title="Current SN118 registration could not be confirmed. The score is retained, but active weight and emission eligibility are unknown.">registration unknown</span>';
         return '' +
           '<tr data-i="' + i + '"' + (isChamp ? ' class="champion"' : '') +
-            ' role="button" tabindex="0" aria-label="' + esc(rowLabel) + '">' +
+            ' tabindex="0" aria-label="' + esc(rowLabel) + '">' +
             '<td>' + rankCell + '</td>' +
             '<td><span class="winner-identity"><span class="winner-name">' + entityAnchor("agent", e.agent_id, displayAgentName) + prov + quorumBadge + registrationBadge + '</span>' +
               agentVersionBadge(e.agent_version) +
-              '<span class="winner-miner" title="' + esc(e.miner_hotkey) + '"><span class="miner-uid" title="Current SN118 UID">UID ' + (e.miner_uid == null ? "–" : esc(e.miner_uid)) + '</span><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' +
+              '<span class="winner-miner" title="' + esc(e.miner_hotkey) + '"><span class="winner-miner-label" aria-hidden="true">Miner</span><span class="miner-uid" title="Current SN118 UID">UID ' + (e.miner_uid == null ? "–" : esc(e.miner_uid)) + '</span><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' +
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></span></span></td>' +
             '<td>' + (emission ? '<span class="emission-badge ' + esc(emission.role) + '"><span aria-hidden="true">●</span> ' +
               (emission.role === "champion" ? "Champion" : "Tail") + ' · ' + pct(emission.share_of_miner_pool) + '</span>' : '<span class="muted">—</span>') +
@@ -2909,6 +3026,7 @@
 
     function renderLeaderboardUnavailable() {
       lastEntries = [];
+      renderSignatures.leaderboard = null;
       ["c-miners", "c-top", "c-median", "c-baseline", "c-spread"].forEach(function (id) {
         document.getElementById(id).textContent = "–";
       });
@@ -2923,7 +3041,7 @@
       notice.classList.remove("show");
       notice.textContent = "";
       document.getElementById("rows").innerHTML =
-        '<tr><td colspan="9" class="empty">Could not load live leaderboard data. Try refreshing in a moment.</td></tr>';
+        '<tr><td colspan="9" class="empty"><div class="empty-msg">Could not load live leaderboard data. Try refreshing in a moment.</div></td></tr>';
       updateSearch();
     }
 
@@ -3045,7 +3163,7 @@
         } else {
         // No version recorded → a run from before benchmark versioning. Flag it as
         // legacy so it reads as "not on the current benchmark", same as an older v.
-          bv = '<span class="bv prev" title="' + esc("Scored before benchmark versioning. A legacy run, not comparable to the current DittoBench v" + currentBench + ".") + '">legacy</span>';
+          bv = '<span class="bv prev" title="' + esc("Scored before benchmark versioning. A legacy run, not comparable to " + (currentBench ? "the current DittoBench v" + currentBench : "the current benchmark") + ".") + '">legacy</span>';
         }
       } else {
         var old = e.bench_version < currentBench;
@@ -3057,7 +3175,7 @@
       }
       if (!name && !bv) return '<td class="hide-md"><span class="none">–</span></td>';
       var label = name
-        ? '<span class="mname" title="' + esc(name) + '">' + esc(shortModel(name)) + '</span>'
+        ? '<span class="mname" title="' + esc(name) + '"><span class="mname-icon" aria-hidden="true">🧠</span>' + esc(shortModel(name)) + '</span>'
         : "";
       return '<td class="hide-md"><div class="modelcell">' + label + bv + '</div></td>';
     }
@@ -3072,7 +3190,7 @@
         el.className = isFinalized(e) ? "prev" : "";
         el.textContent = isFinalized(e) ? "legacy" : "pending quorum";
         el.title = isFinalized(e)
-          ? "Scored before benchmark versioning. A legacy run, not comparable to the current DittoBench v" + currentBench + "."
+          ? "Scored before benchmark versioning. A legacy run, not comparable to " + (currentBench ? "the current DittoBench v" + currentBench : "the current benchmark") + "."
           : "Run provenance appears after the three-validator aggregate is final.";
         return;
       }
@@ -3125,7 +3243,7 @@
       if (e.bench_version == null && !isFinalized(e)) {
         det += stat("Benchmark version", "Pending final quorum");
       } else if (e.bench_version == null) {
-        det += stat("Benchmark version", "legacy (pre-versioning, not comparable to v" + currentBench + ")");
+        det += stat("Benchmark version", "legacy (pre-versioning, not comparable to " + (currentBench ? "v" + currentBench : "the current benchmark") + ")");
       } else {
         det += stat("Benchmark version", "v" + e.bench_version +
           (e.bench_version < currentBench ? " (previous, not comparable to v" + currentBench + ")" : " (current)"));
@@ -3227,6 +3345,10 @@
       // is open (the modal is a sibling of .wrap, so it stays reachable).
       var wrap = document.querySelector(".wrap");
       if (wrap) wrap.inert = !fullPage;
+      // Full-page entity mode hides the layout and renders the article in flow;
+      // reset the window scroll so the article (and any not-found error) is at the
+      // top and visible without scrolling.
+      if (fullPage) window.scrollTo(0, 0);
       modal.scrollTop = 0;
       // Move focus into the dialog (the close button) for keyboard/AT users.
       (fullPage ? document.getElementById("d-back-dashboard") : document.getElementById("modal-close")).focus();
@@ -3667,9 +3789,10 @@
       var tr = ev.target.closest("tr[data-i]");
       if (tr) openModal(+tr.getAttribute("data-i"));
     });
-    // Keyboard activation of a focused row (Enter or Space), matching its
-    // role="button". Space is prevented from scrolling the page. Copy buttons
-    // inside the row activate natively and are skipped here.
+    // Keyboard activation of a focused row (Enter or Space). The row is a plain
+    // tabbable row (no role="button", which would forbid the nested links/copy
+    // buttons); those nested controls stay independently focusable and activate
+    // natively, so they are skipped here. Space is prevented from scrolling.
     rowsEl.addEventListener("keydown", function (ev) {
       if (ev.target.closest(".copy") || ev.target.closest("[data-entity-link]")) return;
       var tr = ev.target.closest("tr[data-i]");
@@ -3707,8 +3830,8 @@
       var control = ev.target.closest("[data-activity-page]");
       if (!control) return;
       var direction = control.getAttribute("data-activity-page");
-      if (direction === "prev" && activityPage > 1) navigateActivityPage(activityPage - 1, control);
-      if (direction === "next" && activityPage < activityTotalPages) navigateActivityPage(activityPage + 1, control);
+      if (direction === "prev" && activityPage > 1) navigateActivityPage(activityPage - 1, control, true, true);
+      if (direction === "next" && activityPage < activityTotalPages) navigateActivityPage(activityPage + 1, control, true, true);
     });
     document.getElementById("activity-clear").addEventListener("click", function () {
       activityStatuses = [];
@@ -3718,7 +3841,7 @@
       activityPage = 1;
       writeActivityUrl(true);
       renderActivityFilterControls();
-      loadActivity(1, this);
+      loadActivity(1, this, true);
     });
     document.getElementById("modal-close").addEventListener("click", function () { closeModal(false); });
     document.getElementById("modal-back").addEventListener("click", function () { closeModal(false); });
@@ -3745,6 +3868,7 @@
         return {
           type: "miner",
           index: index,
+          hotkey: entry.miner_hotkey,
           entry: entry,
           title: shortKey(entry.miner_hotkey),
           detail: (entry.rank ? "Rank #" + entry.rank : "Unranked") + " · composite " + fx(entry.composite),
@@ -3833,9 +3957,20 @@
       if (!result) return;
       closeSearch();
       if (result.type === "miner") {
-        history.pushState({}, "", dashboardHref("overview"));
-        route(false);
-        requestAnimationFrame(function () { openModal(result.index); });
+        // Resolve the CURRENT board position by hotkey — a background refresh may
+        // have re-sorted lastEntries since the corpus was built, so the captured
+        // index could point at a different miner. If the miner has since dropped
+        // off the board, fall back to its canonical entity route.
+        var idx = lastEntries.findIndex(function (entry) { return entry.miner_hotkey === result.hotkey; });
+        if (idx >= 0) {
+          history.pushState({}, "", dashboardHref("overview"));
+          route(false);
+          requestAnimationFrame(function () { openModal(idx); });
+        } else {
+          history.pushState({ entity: true }, "", entityHref("miner", result.hotkey));
+          route(false);
+          resolveEntityRoute();
+        }
       } else {
         history.pushState({}, "", dashboardHref("submissions"));
         route(false);
@@ -3856,7 +3991,7 @@
         activityPage = 1;
         writeActivityUrl(false);
         renderActivityFilterControls();
-        loadActivity(1);
+        loadActivity(1, null, true);
       }, 250);
     });
     searchInput.addEventListener("keydown", function (event) {
@@ -3887,11 +4022,27 @@
         activityPage = 1;
         writeActivityUrl(false);
         renderActivityFilterControls();
-        loadActivity(1);
+        loadActivity(1, null, true);
       }
     });
     document.addEventListener("pointerdown", function (event) {
       if (!searchRoot.contains(event.target)) closeSearch();
+    });
+    // Close when focus leaves the combobox + popover entirely (e.g. Tab away).
+    // relatedTarget is the element gaining focus; a result button is inside
+    // searchRoot, so on most browsers choosing a result never trips this before
+    // its click lands. Safari/iOS, however, blur the input on a result tap
+    // WITHOUT focusing the button (relatedTarget null), so a pointerdown inside
+    // the combobox suppresses the close until that tap's click has landed.
+    var searchPointerDownInside = false;
+    searchRoot.addEventListener("pointerdown", function () {
+      searchPointerDownInside = true;
+      setTimeout(function () { searchPointerDownInside = false; }, 0);
+    });
+    searchRoot.addEventListener("focusout", function (event) {
+      if (searchPointerDownInside) return;
+      var next = event.relatedTarget;
+      if (!next || !searchRoot.contains(next)) closeSearch();
     });
     document.addEventListener("keydown", function (event) {
       var tag = event.target && event.target.tagName;
@@ -3939,7 +4090,7 @@
     function validationProgress(e) {
       var count = Math.max(0, Number(e.score_count) || 0);
       var quorum = Math.max(1, Number(e.quorum) || 3);
-      if (e.status === "below_score_floor") return "Stopped after " + count + " score";
+      if (e.status === "below_score_floor") return "Stopped after " + count + (count === 1 ? " score" : " scores");
       var hasStarted = count > 0 || ["waiting_validator", "evaluating", "scored", "live", "under_review"].indexOf(e.status) >= 0;
       return hasStarted ? count + " of " + quorum : "Not started";
     }
@@ -4412,6 +4563,10 @@
       showModal();
     }
 
+    // Guards against a slow pipeline fetch for one agent landing after the drawer
+    // has reopened for another (mirrors consensusToken). Both the success and
+    // error paths bail when the token no longer matches the agent in view.
+    var pipelineToken = null;
     function openActivityEntry(e, preserveUrl) {
       if (!e) return;
       if (!preserveUrl) pushEntityRoute("agent", e.agent_id);
@@ -4437,13 +4592,20 @@
         e, null, evidence, "Loading screening and validation history…", "loading"
       );
       showModal();
+      pipelineToken = e.agent_id;
       getJSON("/public/agent/" + encodeURIComponent(e.agent_id) + "/pipeline")
         .then(function (pipeline) {
+          if (pipelineToken !== e.agent_id) return;
           document.getElementById("d-stats").innerHTML =
             renderPipelineSummary(e, pipeline, evidence) + renderPipelineDetail(e, pipeline);
           bindScreeningDispute(e);
+          // The detail can inject .benchmark-progress-time nodes (a third
+          // emitter besides the pipeline board and the fleet table); refresh
+          // the flag so the 1s updater keeps them ticking.
+          refreshElapsedFlag();
         })
         .catch(function () {
+          if (pipelineToken !== e.agent_id) return;
           var el = document.getElementById("d-stats");
           var state = el.querySelector(".pipeline-detail-state");
           if (state) {
@@ -4475,6 +4637,12 @@
       pipelineUnavailable = unavailable;
       pipelineEntries = unavailable ? [] : entries;
       renderPolicyRescreenNotice(entries, unavailable);
+      // Skip the board rebuild when nothing that affects it changed (entries,
+      // availability, or the screener overlay), preserving any expanded state.
+      if (!sectionChanged("pipeline", { entries: pipelineEntries, unavailable: unavailable, screeners: fleetReports.screeners })) {
+        updateSearch();
+        return;
+      }
       columns.forEach(function (column) {
         var body = document.getElementById(column.body);
         var count = document.getElementById(column.count);
@@ -4534,7 +4702,14 @@
         }).join("");
         body.innerHTML = visible;
       });
+      refreshElapsedFlag();
       updateSearch();
+    }
+
+    // The two pager rows are noise around a single unpaginated page: hide them
+    // unless paging is actually meaningful (or an error left the controls up).
+    function setActivityPagerVisible(visible) {
+      document.querySelectorAll(".activity .pager").forEach(function (nav) { nav.hidden = !visible; });
     }
 
     function renderActivity(data, unavailable) {
@@ -4544,9 +4719,12 @@
       var next = document.querySelectorAll('[data-activity-page="next"]');
       var statuses = document.querySelectorAll(".activity .page-status");
       document.querySelector(".activity").setAttribute("aria-busy", "false");
+      activityUnavailable = unavailable;
       if (unavailable) {
         lastActivityEntries = [];
-        rows.innerHTML = '<tr><td colspan="5" class="empty">Submission activity is temporarily unavailable.</td></tr>';
+        renderSignatures.activity = null;
+        setActivityPagerVisible(true);
+        rows.innerHTML = '<tr><td colspan="5" class="empty"><div class="empty-msg">Submission activity is temporarily unavailable.</div></td></tr>';
         document.getElementById("activity-filter-summary").textContent = "Could not load submissions. Try again.";
         prev.forEach(function (button) { button.disabled = true; });
         next.forEach(function (button) { button.disabled = true; });
@@ -4565,10 +4743,15 @@
       });
       prev.forEach(function (button) { button.disabled = activityPage <= 1; });
       next.forEach(function (button) { button.disabled = activityPage >= activityTotalPages; });
+      setActivityPagerVisible(activityTotalPages > 1);
+      var filtered = activityStatuses.length > 0 || !!activityQuery;
+      if (!sectionChanged("activity", { entries: entries, page: activityPage, pages: activityTotalPages, filtered: filtered })) {
+        return;
+      }
       if (!entries.length) {
-        rows.innerHTML = activityStatuses.length || activityQuery
-          ? '<tr><td colspan="5" class="empty">No submissions match these filters. Clear filters or try a different search.</td></tr>'
-          : '<tr><td colspan="5" class="empty">No submissions yet. New uploads will appear here before screening begins.</td></tr>';
+        rows.innerHTML = filtered
+          ? '<tr><td colspan="5" class="empty"><div class="empty-msg">No submissions match these filters. Clear filters or try a different search.</div></td></tr>'
+          : '<tr><td colspan="5" class="empty"><div class="empty-msg">No submissions yet. New uploads will appear here before screening begins.</div></td></tr>';
         return;
       }
       rows.innerHTML = entries.map(function (e, i) {
@@ -4586,7 +4769,7 @@
             entityAnchor("agent", e.duplicate_of, duplicateLabel(e)) + '</span>';
         }
         var accessibleName = agentLabel(e.name, e.version);
-        return '<tr role="button" tabindex="0" data-activity-i="' + i + '" aria-label="' +
+        return '<tr tabindex="0" data-activity-i="' + i + '" aria-label="' +
           esc("View details for " + accessibleName + ", " + stage[0] + ", " + progress) + '">' +
           '<td><span class="agent-name">' + esc(agentName(e.name)) + '</span>' + agentVersionBadge(e.version) +
           '<span class="agent-id copyable" title="' + esc(id) + '"><span>' + esc(id.slice(0, 8)) + '</span>' + copyButton(id, "agent ID") + '</span></td>' +
@@ -4692,6 +4875,9 @@
     }
 
     function updateElapsedTimes() {
+      // The interval runs forever; skip the DOM scan entirely when the last
+      // render produced no elapsed-time nodes (they only exist on operations).
+      if (!hasElapsedNodes) return;
       document.querySelectorAll(".screener-progress-time[data-started-at], .benchmark-progress-time[data-started-at]").forEach(function (node) {
         node.textContent = elapsedDuration(node.getAttribute("data-started-at"));
       });
@@ -4990,10 +5176,10 @@
     }
 
     function updateFleetLedger(entries) {
-      var counts = { healthy: 0, warning: 0, offline: 0, paused: 0, unknown: 0 };
+      var counts = { healthy: 0, warning: 0, stale: 0, offline: 0, paused: 0, unknown: 0 };
       entries.forEach(function (entry) {
         if (entry.assignment_state === "heartbeat_mismatch") counts.warning++;
-        else if (entry.availability === "stale") counts.warning++;
+        else if (entry.availability === "stale") counts.stale++;
         else if (entry.availability === "offline") counts.offline++;
         else if (entry.availability === "paused") counts.paused++;
         else if (entry.health === "warning") counts.warning++;
@@ -5006,7 +5192,7 @@
     }
 
     function resetFleetLedger() {
-      ["healthy", "warning", "offline", "paused", "unknown"].forEach(function (key) {
+      ["healthy", "warning", "stale", "offline", "paused", "unknown"].forEach(function (key) {
         document.getElementById("fleet-count-" + key).textContent = "–";
       });
     }
@@ -5027,15 +5213,17 @@
       table.setAttribute("aria-label", (showScreeners ? "Screener" : "Validator") + " fleet health");
       if (unavailable) {
         resetFleetLedger();
+        renderSignatures.fleet = null;
         summary.textContent = (showScreeners ? "Screener" : "Validator") + " status unavailable";
-        rows.innerHTML = '<tr><td colspan="10" class="empty">' + (showScreeners ? "Screener" : "Validator") + ' status is temporarily unavailable.</td></tr>';
+        rows.innerHTML = '<tr><td colspan="10" class="empty"><div class="empty-msg">' + (showScreeners ? "Screener" : "Validator") + ' status is temporarily unavailable.</div></td></tr>';
         retired.hidden = true;
         return;
       }
       if (data === null) {
         resetFleetLedger();
+        renderSignatures.fleet = null;
         summary.textContent = "Loading " + singular + " status…";
-        rows.innerHTML = '<tr><td colspan="10" class="empty">Loading ' + kind + '…</td></tr>';
+        rows.innerHTML = '<tr><td colspan="10" class="empty"><div class="empty-msg">Loading ' + kind + '…</div></td></tr>';
         retired.hidden = true;
         return;
       }
@@ -5056,6 +5244,9 @@
         : "No active " + kind + " reporting") +
         (retiredEntries.length ? " · " + retiredEntries.length + " recently offline" : "") + snapshot;
       retired.hidden = !showScreeners || !retiredEntries.length;
+      // Preserve focus/expanded state: rebuild rows only when the fleet data,
+      // display names, or stake ordering actually changed.
+      if (sectionChanged("fleet", { kind: kind, entries: entries, retired: retiredEntries, names: validatorNames, stakes: validatorStakeWeights })) {
       if (retiredEntries.length) {
         retiredSummary.textContent = retiredEntries.length + (retiredEntries.length === 1 ? " screener" : " screeners");
         retiredRows.innerHTML = retiredEntries.map(function (entry) {
@@ -5070,16 +5261,15 @@
             '<td><span class="fleet-node-wrap">' + identity + '</span></td>' +
             '<td><span class="fleet-time" title="' + esc(reportedAt) + '">' + relTime(reportedAt) + '</span></td>' +
             '<td><span class="stage unknown">' + esc(work[0]) + '</span></td>' +
-            '<td><span class="fleet-version">' + esc(version) + '</span><span class="fleet-protocol">Health ' + esc(entry.protocol_version) + ' · Policy ' + esc(entry.policy_version) + '</span></td>' +
+            '<td><span class="fleet-version">' + esc(version) + '</span><span class="fleet-protocol">Protocol ' + esc(entry.protocol_version) + ' · Policy ' + esc(entry.policy_version) + '</span></td>' +
             '</tr>';
         }).join("");
       } else {
         retiredRows.innerHTML = "";
       }
       if (!entries.length) {
-        rows.innerHTML = '<tr><td colspan="10" class="empty">No active ' + singular + ' software reports.</td></tr>';
-        return;
-      }
+        rows.innerHTML = '<tr><td colspan="10" class="empty"><div class="empty-msg">No active ' + singular + ' software reports.</div></td></tr>';
+      } else {
       rows.innerHTML = entries.map(function (entry) {
         var hotkey = entry[singular + "_hotkey"] || "Unknown";
         var status = fleetStatus(entry);
@@ -5104,7 +5294,7 @@
           ? ""
           : '<span class="stage ' + work[1] + '">' + esc(work[0]) + '</span>';
         var protocol = singular === "screener"
-          ? "Health " + entry.protocol_version + " · Policy " + entry.policy_version
+          ? "Protocol " + entry.protocol_version + " · Policy " + entry.policy_version
           : "Protocol " + entry.protocol_version;
         // Validators are keyed by a distinct hotkey; the screener fleet shares
         // one hotkey, so each worker is distinguished by its instance_id.
@@ -5123,6 +5313,9 @@
           renderFleetMetricCells(entry.system_metrics) +
           '</tr>';
       }).join("");
+      }
+      refreshElapsedFlag();
+      }
       resolveEntityRoute();
     }
 
@@ -5164,11 +5357,12 @@
       return getJSON(path).then(function (first) {
         var pages = Number(first.total_pages) || 1;
         if (pages <= 1) return first;
-        var requests = [];
-        for (var page = 2; page <= pages; page++) {
-          requests.push(getJSON(path.replace("page=1", "page=" + page)));
-        }
-        return Promise.all(requests).then(function (rest) {
+        var pageNumbers = [];
+        for (var page = 2; page <= pages; page++) pageNumbers.push(page);
+        // Cap the fan-out so a deep queue can't open dozens of sockets at once.
+        return poolMap(pageNumbers, 4, function (pageNumber) {
+          return getJSON(path.replace("page=1", "page=" + pageNumber));
+        }).then(function (rest) {
           var entries = (first.entries || []).slice();
           rest.forEach(function (snapshot) {
             entries = entries.concat(snapshot.entries || []);
@@ -5248,10 +5442,8 @@
       if (athReviewLoading) return;
       athReviewLoading = true;
       var requestId = ++athReviewRequestId;
-      var refresh = document.getElementById("ath-refresh");
       var state = document.getElementById("ath-review-state");
       var snapshot = document.getElementById("ath-snapshot");
-      refresh.disabled = true;
       if (!athReviewCache) {
         state.hidden = false;
         state.classList.remove("error");
@@ -5279,12 +5471,10 @@
       }).finally(function () {
         if (requestId === athReviewRequestId) {
           athReviewLoading = false;
-          refresh.disabled = false;
         }
       });
     }
 
-    document.getElementById("ath-refresh").addEventListener("click", function () { loadAthReviews(true); });
     setInterval(function () {
       if (athReviewCache) updateAthSnapshotLabel(athReviewCache, false);
     }, 15000);
@@ -5396,19 +5586,22 @@
       }
     }
 
-    function loadActivity(page, anchor) {
+    function loadActivity(page, anchor, userInitiated) {
       // Keep the clicked control at the same viewport position. Submission rows
       // have variable-height evidence, so replacing a page would otherwise move
       // the bottom pager out from under the pointer.
       var anchorTop = anchor ? anchor.getBoundingClientRect().top : null;
       var requestId = ++activityRequestId;
       lockActivityFrameHeight();
-      setActivityLoading();
+      // The aria-busy "Updating submissions…" flash is only appropriate for an
+      // action the user just took (filter/page/search/manual refresh); a silent
+      // 30 s background tick must not announce or flicker.
+      if (userInitiated) setActivityLoading();
       getJSON(activityRequestPath(page))
         .then(function (data) {
           if (requestId !== activityRequestId) return;
           if (!data.entries.length && page > 1 && data.total_pages < page) {
-            navigateActivityPage(Math.max(1, data.total_pages), anchor, false);
+            navigateActivityPage(Math.max(1, data.total_pages), anchor, false, userInitiated === true);
             return;
           }
           renderActivity(data, false);
@@ -5447,27 +5640,7 @@
         });
     }
 
-    function load(manual) {
-      if (manual) setStatus("", "Refreshing…");
-      getJSON("/public/leaderboard")
-        .then(function (data) { lastLeaderboardData = data; setStatus("live", "Live"); render(data); resolveEntityRoute(); })
-        .catch(function () { lastLeaderboardData = null; setStatus("error", "Data unavailable"); renderLeaderboardUnavailable(); });
-      getJSON("/public/weights")
-        .then(function (data) {
-          lastChainWeights = data;
-          if (lastLeaderboardData) render(lastLeaderboardData);
-        })
-        .catch(function () {
-          lastChainWeights = null;
-          if (lastLeaderboardData) render(lastLeaderboardData);
-        });
-      // Health is independent: a failure here must not flip the whole page to
-      // unavailable mode or blank the leaderboard.
-      getJSON("/public/health")
-        .then(function (h) { renderHealth(h); })
-        .catch(function () { renderHealthUnavailable(); });
-      loadActivity(activityPage);
-      loadOperations();
+    function loadValidatorNames() {
       getJSON("/public/validator-names")
         .then(function (data) {
           validatorNames = {};
@@ -5487,6 +5660,9 @@
           validatorStakeWeights = {};
           renderFleet();
         });
+    }
+
+    function loadScreeners() {
       getJSON("/public/screeners")
         .then(function (data) {
           fleetReports.screeners = data;
@@ -5500,9 +5676,22 @@
           fleetUnavailable.screeners = true;
           renderFleet();
         });
+    }
+
+    function loadBenchConfig() {
       // Frozen-setup panel; static markup doubles as the fallback.
       getJSON("/public/bench/config").then(function (c) {
+        // Stamp on success only: a failed fetch must be retried on the next
+        // 30s tick instead of being locked out for the 5-minute window.
+        benchConfigAt = Date.now();
         document.getElementById("bs-version").textContent = "v" + c.bench_version;
+        // When the leaderboard could not resolve a current version (older API,
+        // all-legacy board), adopt the config's so bench-version copy never
+        // renders a null version.
+        if (!currentBench && c.bench_version) currentBench = c.bench_version;
+        // Prefer the leaderboard's version for nav/subtitle copy; fall back to the
+        // frozen-setup config version if the leaderboard hasn't resolved one yet.
+        applyBenchVersion(currentBench || c.bench_version);
         document.getElementById("bs-model").textContent = c.harness.canonical_id;
         document.getElementById("bs-serving").textContent = c.harness.serving;
         document.getElementById("bs-thinking").textContent = c.harness.thinking ? "on" : "off";
@@ -5515,7 +5704,79 @@
         }
         TRANSCRIPT_URL_TEMPLATE = c.public_transcript_url_template || null;
       }).catch(function () {});
-      if (document.querySelector('.page[data-page="reviews"].active')) loadAthReviews(manual);
+    }
+
+    // Immediately (re)fetch just the sections a page needs, on page switch, so
+    // freshly shown data is never up to a full poll interval stale.
+    function loadPageSections(page) {
+      if (page === "operations") {
+        loadOperations();
+        loadValidatorNames();
+        loadScreeners();
+      } else if (page === "submissions") {
+        loadActivity(activityPage, null, false);
+      } else if (page === "reviews") {
+        loadAthReviews(false);
+      }
+    }
+
+    function load(manual) {
+      // A manual refresh forces every section to rebuild (fresh relative
+      // timestamps) even where the data is byte-identical.
+      if (manual) { setStatus("", "Refreshing…"); forceRender(); }
+      var entity = readEntityRoute();
+      var page = activePageName();
+      // The first load seeds every section so the global-search corpus (miners
+      // from the leaderboard + submissions from operations) is complete; later
+      // ticks fetch only what the active page (or an open drilldown) needs.
+      var all = !bootComplete;
+      // Operations data also backs the fleet-row highlight a validator/screener
+      // deep link needs; activity also backs the agent drilldown. A section
+      // whose last fetch failed (or that never loaded) stays in the fetch set
+      // even when its page is inactive, so a failed boot seed keeps retrying
+      // each tick until the search corpus is complete.
+      var wantOps = all || page === "operations" ||
+        !pipelineLoaded || pipelineUnavailable ||
+        fleetUnavailable.validators || fleetUnavailable.screeners ||
+        (entity && (entity.kind === "validators" || entity.kind === "screeners"));
+      var wantActivity = all || page === "submissions" || activityUnavailable ||
+        (entity && entity.kind === "agents");
+
+      // Leaderboard + weights settle together so the board renders exactly once
+      // per tick; a weights failure still renders (with lastChainWeights = null).
+      Promise.allSettled([getJSON("/public/leaderboard"), getJSON("/public/weights")])
+        .then(function (results) {
+          var lb = results[0], weights = results[1];
+          lastChainWeights = weights.status === "fulfilled" ? weights.value : null;
+          if (lb.status === "fulfilled") {
+            lastLeaderboardData = lb.value;
+            setStatus("live", "Live");
+            render(lb.value);
+            resolveEntityRoute();
+          } else {
+            lastLeaderboardData = null;
+            setStatus("error", "Data unavailable");
+            renderLeaderboardUnavailable();
+          }
+        });
+      // Health is independent: a failure here must not flip the whole page to
+      // unavailable mode or blank the leaderboard.
+      getJSON("/public/health")
+        .then(function (h) { renderHealth(h); })
+        .catch(function () { renderHealthUnavailable(); });
+      // A manual refresh is user-initiated (busy state OK); a background tick is
+      // not (no aria-busy flicker).
+      if (wantActivity) loadActivity(activityPage, null, manual === true);
+      if (wantOps) {
+        loadOperations();
+        loadValidatorNames();
+        loadScreeners();
+      }
+      // bench/config is effectively static (max-age 300); refresh at most every
+      // 5 minutes, but always on boot and on a manual refresh.
+      if (manual || all || Date.now() - benchConfigAt >= 300000) loadBenchConfig();
+      if (page === "reviews") loadAthReviews(manual);
+      bootComplete = true;
     }
 
     // ── Go ───────────────────────────────────────────────────
@@ -5525,13 +5786,39 @@
       operations:  ["Network operations", "Live submission pipeline and validator / screener fleet health"],
       submissions: ["Recent submissions", "Screening evidence and validator quorum progress · select a row for history"],
       reviews:     ["ATH reviews", "Public queue of held high-score submissions · scores preserved, emissions paused"],
-      benchmark:   ["Benchmark", "What DittoBench v3 measures and the frozen scoring setup"]
+      benchmark:   ["Benchmark", "What the scoring benchmark measures and the frozen scoring setup"]
     };
+    // Once the live benchmark version is known, replace the neutral placeholders
+    // in the nav description and the Benchmark page subtitle so a stale, hardcoded
+    // version is never shown. Prefers the leaderboard's current_bench_version.
+    function applyBenchVersion(version) {
+      var v = Number(version);
+      if (!isFinite(v) || v <= 0) return;
+      var desc = document.querySelector('.nav-item[data-page="benchmark"] .ni-desc');
+      if (desc) desc.textContent = "What v" + v + " measures";
+      PAGES.benchmark[1] = "What DittoBench v" + v + " measures and the frozen scoring setup";
+      var active = document.querySelector(".page.active");
+      if (active && active.getAttribute("data-page") === "benchmark") {
+        document.getElementById("page-sub").textContent = PAGES.benchmark[1];
+      }
+    }
     function route(initial) {
-      var m = /^#\/([a-z]+)/.exec(location.hash || "");
-      if (!m && location.hash && !initial) return;
+      var hash = location.hash || "";
+      var m = /^#\/([a-z]+)/.exec(hash);
       var entity = readEntityRoute();
+      // A "#/…"-shaped hash is a page route; leave any other non-empty fragment
+      // (e.g. the skip link's "#main-content") alone so it isn't hijacked. The
+      // initial call must still run so nav/title/page state get initialized
+      // (the replaceState below requires routeHash, so the fragment survives).
+      var routeHash = hash.indexOf("#/") === 0;
+      if (!entity && !m && hash && !routeHash && !initial) return;
       var page = entity ? ENTITY_PAGES[entity.kind] : ((m && PAGES[m[1]]) ? m[1] : "overview");
+      // An unknown "#/…" route (e.g. "#/bogus", "#/") resolves to overview both at
+      // boot and after; normalize the URL so it doesn't advertise a route that
+      // doesn't exist. Entity routes own their hash and are left untouched.
+      if (!entity && hash && routeHash && (!m || !PAGES[m[1]])) {
+        history.replaceState(history.state || {}, "", location.pathname + location.search + "#/" + page);
+      }
       var els = document.querySelectorAll(".page");
       for (var i = 0; i < els.length; i++) els[i].classList.toggle("active", els[i].getAttribute("data-page") === page);
       var items = document.querySelectorAll(".nav-item");
@@ -5543,8 +5830,13 @@
       document.getElementById("page-title").textContent = PAGES[page][0];
       document.getElementById("page-sub").textContent = PAGES[page][1];
       document.title = "Ditto SN118 · " + PAGES[page][0];
-      window.scrollTo(0, 0);
-      if (page === "reviews") loadAthReviews(false);
+      // A non-route fragment (skip link's "#main-content") keeps the browser's
+      // native scroll-to-fragment; only real routes reset to the top.
+      if (entity || routeHash || !hash) window.scrollTo(0, 0);
+      // On a page switch (not the boot resolve — the boot load() covers that),
+      // immediately fetch that page's sections so nothing looks stale while the
+      // 30 s poll waits.
+      if (!initial) loadPageSections(page);
     }
     document.querySelectorAll(".nav-item[data-page]").forEach(function (item) {
       item.addEventListener("click", function (event) {
@@ -5563,7 +5855,7 @@
       searchInput.value = activityQuery;
       updateSearch();
       renderActivityFilterControls();
-      if (/^#\/submissions/.test(location.hash || "")) loadActivity(activityPage);
+      if (/^#\/submissions/.test(location.hash || "")) loadActivity(activityPage, null, true);
       resolveEntityRoute();
     });
     route(true);

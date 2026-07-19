@@ -218,7 +218,10 @@ def main(argv: list[str] | None = None) -> int:
             port=config.port,
             log_config=None,
             server_header=False,
-            date_header=False,
+            # Keep the Date header: responses carry Cache-Control max-age, and a
+            # browser needs Date to compute the response's current age and honor
+            # freshness. Only the Server banner is suppressed.
+            date_header=True,
             timeout_graceful_shutdown=30,
         )
     except Exception:

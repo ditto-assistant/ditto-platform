@@ -13,8 +13,8 @@ from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
 import ditto
 from ditto.api_server.config import (
@@ -42,8 +42,10 @@ from ditto.api_server.middleware import (
     AuthPassThroughMiddleware,
     PublicCacheMiddleware,
     RequestIDMiddleware,
+    SizedGZipMiddleware,
     register_exception_handlers,
 )
+from ditto.api_server.middleware.public_cache import compute_etag, if_none_match
 from ditto.api_server.payment_verifier import create_payment_verifier
 from ditto.api_server.pricing import create_price_oracle
 from ditto.api_server.storage import create_storage_client
@@ -169,6 +171,15 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     # PublicCacheMiddleware is innermost: cache hits skip the endpoint (and
     # its database work) while request-id logging still records every hit.
     app.add_middleware(PublicCacheMiddleware)
+    # Gzip sits OUTSIDE the public cache (added after it, so it wraps it on
+    # the wire): the cache stores and compares uncompressed bodies (so ETags
+    # are stable), and compression happens outward on every response,
+    # including cache HITs and the 368KB dashboard HTML. SizedGZipMiddleware
+    # (not stock GZipMiddleware) enforces the sub-1KB "leave it uncompressed"
+    # floor from the declared Content-Length, which survives the cache
+    # middleware's BaseHTTPMiddleware re-chunking; stock gzip only applies the
+    # floor to single-message bodies and would compress everything here.
+    app.add_middleware(SizedGZipMiddleware, minimum_size=1000, compresslevel=6)
     app.add_middleware(AuthPassThroughMiddleware)
     app.add_middleware(RequestIDMiddleware)
 
@@ -198,16 +209,32 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
                 "dashboard SPA not found at %s; serving API only", _DASHBOARD_FILE
             )
         else:
+            # The HTML is rendered once at boot, so hash it once for a strong
+            # ETag. With max-age=60 the SPA revalidates often, but a matching
+            # If-None-Match returns an empty 304 — cheap for the VM and the
+            # main win of the polling dashboard. must-revalidate + the short
+            # TTL keeps deploys visible within a minute.
+            dashboard_etag = compute_etag(dashboard_html.encode("utf-8"))
+            dashboard_headers = {
+                "Cache-Control": "public, max-age=60, must-revalidate",
+                "ETag": dashboard_etag,
+            }
 
-            async def dashboard_response() -> HTMLResponse:
-                return HTMLResponse(
-                    content=dashboard_html,
-                    headers={"Cache-Control": "public, max-age=300"},
-                )
+            async def dashboard_response(request: Request) -> Response:
+                if if_none_match(request.headers.get("if-none-match"), dashboard_etag):
+                    # The 200 this revalidates carries "Vary: Accept-Encoding"
+                    # (added by the gzip layer); RFC 9110 §15.4.5 says the 304
+                    # must repeat it. Set here only — on the shared 200 headers
+                    # gzip's add_vary_header would append a duplicate.
+                    return Response(
+                        status_code=304,
+                        headers={**dashboard_headers, "Vary": "Accept-Encoding"},
+                    )
+                return HTMLResponse(content=dashboard_html, headers=dashboard_headers)
 
             @app.get("/", include_in_schema=False, response_class=HTMLResponse)
-            async def dashboard() -> HTMLResponse:
-                return await dashboard_response()
+            async def dashboard(request: Request) -> Response:
+                return await dashboard_response(request)
 
             # Backward-compatible plural URLs serve the SPA shell and normalize to
             # query-param popovers. Singular agent/miner URLs are dedicated views.

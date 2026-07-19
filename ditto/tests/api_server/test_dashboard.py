@@ -33,7 +33,7 @@ class TestDashboard:
         resp = await _get(app, "/")
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/html")
-        assert resp.headers["Cache-Control"] == "public, max-age=300"
+        assert resp.headers["Cache-Control"] == "public, max-age=60, must-revalidate"
         body = resp.text
         # The wandb link is injected into the meta tag the SPA reads.
         assert f'content="{url}"' in body
@@ -57,7 +57,7 @@ class TestDashboard:
         resp = await _get(app, path)
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/html")
-        assert resp.headers["Cache-Control"] == "public, max-age=300"
+        assert resp.headers["Cache-Control"] == "public, max-age=60, must-revalidate"
         assert '<h1 id="page-title">Overview</h1>' in resp.text
 
     async def test_includes_social_preview_metadata(self) -> None:
@@ -99,6 +99,55 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=False))
         resp = await _get(app, "/")
         assert resp.status_code == 404
+
+    async def test_dashboard_html_is_gzip_encoded(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            resp = await client.get("/", headers={"Accept-Encoding": "gzip"})
+        assert resp.status_code == 200
+        assert resp.headers["content-encoding"] == "gzip"
+        # httpx transparently decodes; the decoded HTML is still the SPA shell.
+        assert '<h1 id="page-title">Overview</h1>' in resp.text
+
+    async def test_dashboard_serves_strong_etag(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        resp = await _get(app, "/")
+        etag = resp.headers.get("etag")
+        assert etag is not None
+        assert etag.startswith('"') and etag.endswith('"')
+
+    async def test_dashboard_if_none_match_returns_304_empty_body(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            first = await client.get("/")
+            etag = first.headers["etag"]
+            second = await client.get("/", headers={"If-None-Match": etag})
+        assert second.status_code == 304
+        assert second.content == b""
+        assert second.headers["etag"] == etag
+        assert second.headers["Cache-Control"] == "public, max-age=60, must-revalidate"
+        # RFC 9110 §15.4.5: the 304 repeats the 200's Vary: Accept-Encoding.
+        assert second.headers["Vary"] == "Accept-Encoding"
+
+    async def test_dashboard_entity_path_if_none_match_returns_304(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        path = "/agent/6c10d0df-fc93-4903-a939-147d51cea1cc"
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            first = await client.get(path)
+            etag = first.headers["etag"]
+            second = await client.get(path, headers={"If-None-Match": etag})
+        assert first.status_code == 200
+        assert second.status_code == 304
+        assert second.content == b""
 
     @pytest.mark.parametrize(
         "path",
@@ -295,10 +344,12 @@ class TestDashboard:
         assert "<b>Live data unavailable.</b>" in body
         assert "No example data is shown." in body
         assert (
-            ".catch(function () { lastLeaderboardData = null; "
-            'setStatus("error", "Data unavailable"); '
-            "renderLeaderboardUnavailable(); });" in body
+            'Promise.allSettled([getJSON("/public/leaderboard"), '
+            'getJSON("/public/weights")])' in body
         )
+        assert "lastLeaderboardData = null;" in body
+        assert 'setStatus("error", "Data unavailable");' in body
+        assert "renderLeaderboardUnavailable();" in body
         assert ".catch(function () { renderHealthUnavailable(); });" in body
 
     async def test_includes_public_miner_facing_ath_review_queue(self) -> None:
@@ -320,7 +371,8 @@ class TestDashboard:
         assert "Refresh failed · showing last public snapshot" in body
         assert 'var path = "/public/activity?review=ath&status=' in body
         assert 'under_review&limit=200&page=1"' in body
-        assert 'requests.push(getJSON(path.replace("page=1", "page=" + page)))' in body
+        assert "return poolMap(pageNumbers, 4, function (pageNumber) {" in body
+        assert 'return getJSON(path.replace("page=1", "page=" + pageNumber));' in body
         assert "entry.review_opened_at" in body
         assert "entry.preserved_composite" in body
         assert 'copyButton(hotkey, "miner hotkey")' in body
@@ -380,17 +432,20 @@ class TestDashboard:
         assert "Number.isSafeInteger(parsedPage)" in body
         assert 'url.searchParams.set("page", String(activityPage))' in body
         assert 'url.searchParams.delete("page")' in body
-        assert "function navigateActivityPage(page, anchor, push)" in body
-        assert "navigateActivityPage(activityPage - 1, control)" in body
-        assert "navigateActivityPage(activityPage + 1, control)" in body
         assert (
-            "navigateActivityPage(Math.max(1, data.total_pages), anchor, false)" in body
+            "function navigateActivityPage(page, anchor, push, userInitiated)" in body
+        )
+        assert "navigateActivityPage(activityPage - 1, control, true, true)" in body
+        assert "navigateActivityPage(activityPage + 1, control, true, true)" in body
+        assert (
+            "navigateActivityPage(Math.max(1, data.total_pages), anchor, false, "
+            "userInitiated === true)" in body
         )
         assert 'history[push ? "pushState" : "replaceState"]' in body
         assert 'window.addEventListener("popstate"' in body
         assert "if (activityUrlWasSanitized) writeActivityUrl(false)" in body
         assert "searchInput.value = activityQuery" in body
-        assert "loadActivity(activityPage)" in body
+        assert "loadActivity(activityPage, null, true)" in body
 
     async def test_submission_filters_are_mobile_and_keyboard_accessible(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
@@ -600,9 +655,15 @@ class TestDashboard:
         assert "root.dataset.systemTheme" in body
         assert "root.dataset.timePhase = fromHour(new Date().getHours())" in body
         assert 'if (hour >= 5 && hour < 8) return "dawn"' in body
-        assert ".side-theme { flex: 1 0 100%; width: 100%; }" in body
-        assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in body
-        assert ".side-theme .theme-option { min-height: 44px;" in body
+        assert (
+            ".side-theme { order: 3; flex: 1 0 100%; width: 100%; min-width: 0; "
+            "margin-top: 0; }" in body
+        )
+        assert (
+            ".side-theme .theme-switch { display: grid; "
+            "grid-template-columns: repeat(4, minmax(0, 1fr)); width: 100%; }" in body
+        )
+        assert ".side-theme .theme-option { min-height: 36px;" in body
 
     async def test_sidebar_shell_routes_every_section(self) -> None:
         # The dashboard is a sidebar shell with hash-routed pages; the theme
