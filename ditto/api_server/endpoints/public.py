@@ -1810,7 +1810,14 @@ async def agent_pipeline(
         )
         if work.agent.agent_id == agent_id
     ]
-    active_by_hotkey = {work.heartbeat.validator_hotkey: work for work in active_work}
+    # Keyed by the *ticket* the work belongs to, not just the hotkey. A validator
+    # holds one ticket per (agent, bench_version), so keying on the hotkey alone
+    # painted its already-finished v2/v3 rows as "Scoring now" — with the live v4
+    # progress bar attached — the moment it picked up the v4 ticket.
+    active_by_ticket = {
+        (work.ticket.validator_hotkey, work.ticket.bench_version): work
+        for work in active_work
+    }
     accepted_scores = list(
         await session.scalars(
             select(Score)
@@ -1946,12 +1953,16 @@ async def agent_pipeline(
                 issued_at=ticket.issued_at,
                 deadline=ticket.deadline,
                 bench_version=ticket.bench_version,
-                actively_running=ticket.validator_hotkey in active_by_hotkey,
+                actively_running=(ticket.validator_hotkey, ticket.bench_version)
+                in active_by_ticket,
                 benchmark_progress=(
                     _public_benchmark_progress(
-                        active_by_hotkey[ticket.validator_hotkey]
+                        active_by_ticket[
+                            (ticket.validator_hotkey, ticket.bench_version)
+                        ]
                     )
-                    if ticket.validator_hotkey in active_by_hotkey
+                    if (ticket.validator_hotkey, ticket.bench_version)
+                    in active_by_ticket
                     else None
                 ),
             )

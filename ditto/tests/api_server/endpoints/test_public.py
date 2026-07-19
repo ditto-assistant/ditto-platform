@@ -1989,6 +1989,78 @@ class TestPublicActivity:
         for response in responses:
             assert_redacted(response.json())
 
+    async def test_live_work_marks_only_its_own_bench_version_attempt(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        now = datetime.now(UTC)
+        deadline = now + timedelta(minutes=30)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_MINER_A,
+                    software_version="1.2.3",
+                    protocol_version=4,
+                    code_digest="ab" * 32,
+                    state="running_benchmark",
+                    active_agent_id=agent_id,
+                    benchmark_progress={
+                        "stage": "running_benchmark",
+                        "completed": 8,
+                        "total": 119,
+                        "ticket_deadline": deadline.isoformat(),
+                    },
+                    benchmark_progress_reported=True,
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                )
+            )
+            # The same validator already finished this agent on v2 and v3; only
+            # the v4 ticket is live.
+            for bench_version, status in (
+                (2, TicketStatus.SCORED),
+                (3, TicketStatus.SCORED),
+                (4, TicketStatus.ISSUED),
+            ):
+                session.add(
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        validator_hotkey=_MINER_A,
+                        bench_version=bench_version,
+                        status=status,
+                        issued_at=now - timedelta(seconds=1),
+                        deadline=deadline,
+                    )
+                )
+        _install_db(app, session_maker)
+
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()
+        running = [
+            attempt
+            for attempt in pipeline["validation_attempts"]
+            if attempt["actively_running"]
+        ]
+        assert [attempt["bench_version"] for attempt in running] == [4]
+        assert running[0]["benchmark_progress"]["bench_version"] == 4
+        assert all(
+            attempt["benchmark_progress"] is None
+            for attempt in pipeline["validation_attempts"]
+            if attempt["bench_version"] != 4
+        )
+
     async def test_delayed_legacy_or_omitted_progress_cannot_revive_reissued_work(
         self,
         app: FastAPI,
