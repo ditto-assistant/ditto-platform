@@ -67,15 +67,20 @@ opt-in). No secrets or keys are ever logged.
 New router `endpoints/public.py`, mounted at `/api/v1/public`, **no auth**,
 rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
 
-- `GET /api/v1/public/leaderboard` → `{ generated_at, count, entries: [
+- `GET /api/v1/public/leaderboard` → `{ generated_at, count,
+  active_bench_version, desired_bench_version, selection_mode, entries: [
   { rank, agent_id, agent_name, miner_hotkey, registered, emission_eligible,
     composite, tool_mean, memory_mean, first_seen, n,
     median_ms, bench_version, dataset_sha256, models, per_category,
     integrity, tokens } ], emissions: { champion_agent_id, recipients,
     raw_leader_decision, margin, dethrone_z, champion_share, tail_size } }`.
-  Entries are best-per-miner and ranked by raw finalized composite. `emissions`
-  is a public-safe, read-only projection of the validator's frozen first-seen
-  KOTH fold over finalized current-benchmark entries: the 2% incumbent margin, the
+  Entries are best-per-miner and ranked by raw finalized composite. During a
+  benchmark rollout the default response is the exact authoritative hybrid pool
+  validators fold: v3 for an agent at 3/3, otherwise that agent's active-version
+  fallback. `?bench_version=2` provides a historical single-version view and
+  intentionally returns `emissions: null`. In the default view, `emissions` is a
+  public-safe, read-only projection of the validator's frozen first-seen KOTH
+  fold over finalized authoritative entries: the 2% incumbent margin, the
   statistical band, the 90% champion share, and the participation tail. It is
   `null` when no eligible entry exists. Validators still compute and submit their
   own authoritative weight vectors. The provenance block (`models` =

@@ -248,7 +248,11 @@ async def scores(
         rows = await list_eligible_ledger(session, include_fingerprints=False)
         # The k=3 quorum spread per agent -> composite_stderr when the run itself
         # did not stash one, so the KOTH z-band is noise-aware with no re-score.
-        quorum = await quorum_composites(session, [r.agent_id for r in rows])
+        quorum = await quorum_composites(
+            session,
+            [r.agent_id for r in rows],
+            bench_versions={r.agent_id: r.bench_version for r in rows},
+        )
     except SQLAlchemyError as e:
         return _serve_last_known(request, x_validator_hotkey, e)
 
@@ -265,6 +269,7 @@ async def scores(
             run_id=r.run_id,
             seed=r.seed,
             validator_hotkey=r.validator_hotkey,
+            bench_version=r.bench_version,
             signature=r.signature,
             composite_stderr=_ledger_stderr(r.details, quorum.get(r.agent_id, [])),
             confirmation_composites=_confirmation_composites(r.details),

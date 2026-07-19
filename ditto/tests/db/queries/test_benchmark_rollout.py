@@ -269,10 +269,12 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
         assert state["v3_capable_validator_count"] == 3
         assert [member["score_count"] for member in state["members"]] == [2] * 5
         assert await active_bench_version(session) == 2
-        assert {row.agent_id for row in await list_eligible_ledger(session)} == {
+        collecting_ledger = await list_eligible_ledger(session)
+        assert {row.agent_id for row in collecting_ledger} == {
             *agent_ids,
             v2_only_id,
         }
+        assert all(row.bench_version == 2 for row in collecting_ledger)
 
         activations = []
         for agent_index in range(5):
@@ -304,6 +306,15 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
             ticket.status = TicketStatus.SCORED
             await session.flush()
             activations.append(await maybe_activate_rollout(session, rollout, now=now))
+            if agent_index == 0:
+                hybrid = await list_eligible_ledger(session)
+                by_agent = {row.agent_id: row for row in hybrid}
+                assert by_agent[agent_ids[0]].bench_version == 3
+                assert by_agent[agent_ids[0]].composite == pytest.approx(0.7)
+                assert all(
+                    by_agent[agent_id].bench_version == 2 for agent_id in agent_ids[1:]
+                )
+                assert by_agent[v2_only_id].bench_version == 2
 
         assert activations == [False, False, False, False, True]
         assert await active_bench_version(session) == 3
@@ -314,7 +325,9 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
         assert len(v3_ledger) == 5
         assert v2_only_id not in {row.agent_id for row in v3_ledger}
         assert all(
-            row.details is not None and row.details["bench_version"] == 3
+            row.bench_version == 3
+            and row.details is not None
+            and row.details["bench_version"] == 3
             for row in v3_ledger
         )
     await engine.dispose()

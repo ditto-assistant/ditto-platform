@@ -501,6 +501,28 @@ class PublicLeaderboardResponse(BaseModel):
             )
         ),
     ]
+    active_bench_version: Annotated[
+        int,
+        Field(description="Globally activated benchmark version."),
+    ]
+    desired_bench_version: Annotated[
+        int,
+        Field(
+            description=(
+                "Version currently being collected, or the active version when "
+                "there is no open rollout."
+            )
+        ),
+    ]
+    selection_mode: Annotated[
+        Literal["authoritative", "historical"],
+        Field(
+            description=(
+                "authoritative selects v3 per agent at quorum and otherwise its "
+                "active-version fallback; historical is a requested single version."
+            )
+        ),
+    ]
     entries: Annotated[
         list[PublicLeaderboardEntry],
         Field(default_factory=list, description="Ranked miners, best composite first."),
