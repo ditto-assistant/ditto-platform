@@ -36,6 +36,31 @@ if TYPE_CHECKING:
 # every in-flight agent.
 MAX_SCREENING_EXPIRIES = 5
 
+# Duplicate-owner statuses. A later cross-miner submission of the SAME bytes is
+# flagged against the earliest owner in either set.
+#
+# "Usable" owners are live work being copied. "Adjudicated-negative" owners were
+# refused, and only count when the refusal was for cause (see refused_for_cause
+# in claim_screening_attempts) -- a build failure or an infrastructure reject
+# says nothing about the artifact's provenance, so it must not condemn a later
+# identical submission.
+#
+# In-flight statuses (UPLOADED / SCREENING / SCREENING_FAILED) belong to neither
+# set: an owner still being screened is handled by deferring the claim
+# (earlier_pending), not by flagging, so the race resolves before either is
+# judged.
+_USABLE_OWNER_STATUSES = (
+    AgentStatus.EVALUATING,
+    AgentStatus.SCORED,
+    AgentStatus.LIVE,
+    AgentStatus.ATH_PENDING_REVIEW,
+)
+_ADJUDICATED_NEGATIVE_OWNER_STATUSES = (
+    AgentStatus.REJECTED,
+    AgentStatus.QUARANTINED,
+    AgentStatus.BANNED,
+)
+
 # A platform-raised quarantine has no screener finding, but the row's
 # manifest_digest is NOT NULL and shown verbatim in the operator console. This
 # stable sentinel marks the origin as "platform, attempts exhausted".
@@ -262,6 +287,12 @@ async def claim_screening_attempts(
     bind = session.get_bind()
     if bind.dialect.name == "postgresql":
         await session.execute(select(func.pg_advisory_xact_lock(0x445554544F534352)))
+    # A REJECTED agent is deliberately absent above. It re-enters screening only
+    # through the operator appeal (POST /screening-submissions/{id}/rescreen),
+    # which moves it to SCREENING_FAILED. Re-queueing it on a policy bump instead
+    # resurrected every past rejection fleet-wide and cleared the operator's
+    # stated reason, so a refused artifact could return under a newer policy that
+    # never re-derived the original finding.
     await expire_screening_attempts(session, now=now)
     has_running = exists(
         select(ScreeningAttempt.attempt_id).where(
@@ -293,12 +324,7 @@ async def claim_screening_attempts(
         Agent.status == AgentStatus.UPLOADED,
         Agent.status == AgentStatus.SCREENING_FAILED,
         (
-            Agent.status.in_(
-                (
-                    AgentStatus.EVALUATING,
-                    AgentStatus.REJECTED,
-                )
-            )
+            (Agent.status == AgentStatus.EVALUATING)
             & (Agent.screening_policy_version < SCREENING_POLICY_VERSION)
         ),
         (
@@ -350,6 +376,35 @@ async def claim_screening_attempts(
             )
             continue
         owner = aliased(Agent)
+        # An artifact refused FOR CAUSE stays a valid duplicate owner. Scoping
+        # owners to live statuses alone meant banning an original disarmed this
+        # check for its clones: the very act of refusing the first copy removed
+        # the row that would flag the next one.
+        #
+        # "For cause" is read from quarantine history rather than the agent row,
+        # because a re-screen clears screening_reason_code. An active hold counts
+        # (a finding is outstanding); a hold an operator resolved as release or
+        # rescreen does not -- they cleared it deliberately.
+        #
+        # A platform-raised _EXHAUSTED_REASON_CODE park is the exception: it is an
+        # infrastructure outcome (the screen never concluded), not a finding about
+        # the artifact, so a screener outage must not turn every parked original
+        # into grounds for condemning a later identical submission. Once an
+        # operator reviews that park and resolves it "reject", the rejection
+        # branch below picks it up -- that IS a human judgement for cause.
+        refused_for_cause = or_(
+            owner.status == AgentStatus.BANNED,
+            exists(
+                select(ScreeningQuarantine.quarantine_id).where(
+                    ScreeningQuarantine.agent_id == owner.agent_id,
+                    or_(
+                        (ScreeningQuarantine.status == "active")
+                        & (ScreeningQuarantine.reason_code != _EXHAUSTED_REASON_CODE),
+                        ScreeningQuarantine.resolution == "reject",
+                    ),
+                )
+            ),
+        )
         duplicate_of = await session.scalar(
             select(owner.agent_id)
             .where(
@@ -361,13 +416,10 @@ async def claim_screening_attempts(
                     (owner.created_at == agent.created_at)
                     & (owner.agent_id < agent.agent_id)
                 ),
-                owner.status.in_(
-                    (
-                        AgentStatus.EVALUATING,
-                        AgentStatus.SCORED,
-                        AgentStatus.LIVE,
-                        AgentStatus.ATH_PENDING_REVIEW,
-                    )
+                or_(
+                    owner.status.in_(_USABLE_OWNER_STATUSES),
+                    owner.status.in_(_ADJUDICATED_NEGATIVE_OWNER_STATUSES)
+                    & refused_for_cause,
                 ),
             )
             .order_by(owner.created_at.asc(), owner.agent_id.asc())
