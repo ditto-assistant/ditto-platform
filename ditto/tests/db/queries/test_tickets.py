@@ -97,6 +97,45 @@ async def _seed_finalized_top_five(
                 )
 
 
+async def _seed_two_scores_below_floor(
+    session: AsyncSession, *, bench_version: int = 2
+) -> UUID:
+    """An ``evaluating`` agent whose best-case median cannot reach the floor."""
+    aid = await _seed_evaluating(session)
+    async with session.begin():
+        for index, composite in enumerate((0.10, 0.20)):
+            validator = f"5Scored-{index}"
+            session.add(
+                ValidatorTicket(
+                    agent_id=aid,
+                    validator_hotkey=validator,
+                    status=TicketStatus.SCORED,
+                    issued_at=_NOW,
+                    deadline=_NOW + _TTL,
+                    bench_version=bench_version,
+                    attempt_count=1,
+                )
+            )
+            session.add(
+                Score(
+                    agent_id=aid,
+                    validator_hotkey=validator,
+                    run_id=f"below-top-five-{index}",
+                    signature=None,
+                    seed=123,
+                    composite=composite,
+                    tool_mean=composite,
+                    memory_mean=composite,
+                    median_ms=100,
+                    n=114,
+                    details=None,
+                    bench_version=bench_version,
+                    generated_at=_NOW,
+                )
+            )
+    return aid
+
+
 class TestIssueTicket:
     async def test_screened_only_skips_source_only_agent(
         self, session: AsyncSession
@@ -287,14 +326,66 @@ class TestIssueTicket:
         assert ticket is not None
         assert ticket.agent_id == aid
 
-    async def test_two_scores_below_top_five_bound_skip_the_third_ticket(
+    async def test_two_scores_below_top_five_bound_defer_behind_other_work(
         self, session: AsyncSession
     ) -> None:
+        """An eliminated 2-of-3 submission yields to every other candidate."""
         await _seed_finalized_top_five(session, fifth_place=0.80)
-        aid = await _seed_evaluating(session)
+        below_floor = await _seed_two_scores_below_floor(session)
+        # Newer than the eliminated submission, so arrival order alone would
+        # still hand the eliminated one out first.
+        fresh = await _seed_evaluating(
+            session, created_at=_NOW + timedelta(minutes=5), name="fresh"
+        )
+
         async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Next", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == fresh
+        assert ticket.agent_id != below_floor
+
+    async def test_two_scores_below_top_five_bound_finalize_once_queue_drains(
+        self, session: AsyncSession
+    ) -> None:
+        """Deferred, not withheld: the third score still lands eventually."""
+        await _seed_finalized_top_five(session, fifth_place=0.80)
+        below_floor = await _seed_two_scores_below_floor(session)
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Next", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == below_floor
+
+    async def test_score_floor_does_not_cross_benchmark_eras(
+        self, session: AsyncSession
+    ) -> None:
+        """A v2 fifth place must not eliminate a v4 two-score submission.
+
+        Composites only compare within one benchmark version, so a new era with
+        fewer than five ranked agents has no floor at all and nothing in it can
+        be pre-emptively eliminated.
+        """
+        await _seed_finalized_top_five(session, fifth_place=0.80)
+        aid = await _seed_evaluating(session, screened=True)
+        async with session.begin():
+            session.add(
+                BenchmarkDataset(
+                    agent_id=aid,
+                    bench_version=4,
+                    seed=42,
+                    sha256="cd" * 32,
+                    run_size="full",
+                )
+            )
+            # Two v4 scores that would sit below the v2-era floor of 0.80.
             for index, composite in enumerate((0.10, 0.20)):
-                validator = f"5Scored-{index}"
+                validator = f"5V4-{index}"
                 session.add(
                     ValidatorTicket(
                         agent_id=aid,
@@ -302,7 +393,7 @@ class TestIssueTicket:
                         status=TicketStatus.SCORED,
                         issued_at=_NOW,
                         deadline=_NOW + _TTL,
-                        bench_version=2,
+                        bench_version=4,
                         attempt_count=1,
                     )
                 )
@@ -310,25 +401,32 @@ class TestIssueTicket:
                     Score(
                         agent_id=aid,
                         validator_hotkey=validator,
-                        run_id=f"below-top-five-{index}",
+                        run_id=f"v4-below-v2-floor-{index}",
                         signature=None,
-                        seed=123,
+                        seed=42,
                         composite=composite,
                         tool_mean=composite,
                         memory_mean=composite,
                         median_ms=100,
-                        n=114,
+                        n=119,
                         details=None,
+                        bench_version=4,
                         generated_at=_NOW,
                     )
                 )
 
         async with session.begin():
             ticket = await issue_ticket(
-                session, validator_hotkey="5Next", now=_NOW, ttl=_TTL
+                session,
+                validator_hotkey="5NextV4",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=4,
             )
 
-        assert ticket is None
+        assert ticket is not None
+        assert ticket.agent_id == aid
+        assert ticket.bench_version == 4
 
     async def test_high_variance_two_score_candidate_can_still_reach_top_five(
         self, session: AsyncSession
