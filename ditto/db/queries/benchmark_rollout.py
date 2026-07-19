@@ -838,12 +838,23 @@ async def rollout_state(
         heartbeat_supports_version(heartbeat, now=now, version=version)
         for heartbeat in heartbeats
     )
+    # The authority switch is gated on this count, not on the cohort's raw score
+    # counts: the whole ledger flips to the desired version only once at least
+    # MIN_DESIRED_AUTHORITY_AGENTS agents hold a complete RANKED quorum there, so
+    # the emission set (champion + tail) is never short. Exposing it is the only
+    # way a reader can answer "when do weights switch?" without re-deriving it.
+    from ditto.db.queries.scores import count_ranked_quorum_agents
+
     if rollout is None:
         return {
             "active_version": active_version,
             "desired_version": active_version,
             "status": "inactive",
             "capability_bench_version": version,
+            "ranked_quorum_agents": await count_ranked_quorum_agents(
+                session, bench_version=DEFAULT_BENCH_VERSION
+            ),
+            "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
             "canary_capable_validator_count": capable_count,
             # DEPRECATED alias of canary_capable_validator_count. It counts
             # validators capable of capability_bench_version, which is no longer
@@ -888,6 +899,10 @@ async def rollout_state(
         "status": rollout.status,
         "blocked_reason": rollout.blocked_reason,
         "capability_bench_version": version,
+        "ranked_quorum_agents": await count_ranked_quorum_agents(
+            session, bench_version=rollout.desired_version
+        ),
+        "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
         "canary_capable_validator_count": capable_count,
         # DEPRECATED alias of canary_capable_validator_count; see above.
         "v3_capable_validator_count": capable_count,

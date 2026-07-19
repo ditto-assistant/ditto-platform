@@ -76,6 +76,8 @@ async def test_admin_status_read_does_not_start_rollout() -> None:
             "desired_version": 2,
             "status": "inactive",
             "capability_bench_version": 3,
+            "ranked_quorum_agents": 0,
+            "min_ranked_quorum_agents": 5,
             "canary_capable_validator_count": 0,
             "v3_capable_validator_count": 0,
             "current_hybrid_top_five": [],
@@ -296,6 +298,11 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
         assert state["active_version"] == 2
         assert state["v3_capable_validator_count"] == 3
         assert [member["score_count"] for member in state["members"]] == [2] * 5
+        # The authority-switch threshold is public: at 2/3 scores per member no
+        # agent holds a ranked quorum yet, and the client reads the bar rather
+        # than hardcoding it.
+        assert state["ranked_quorum_agents"] == 0
+        assert state["min_ranked_quorum_agents"] == MIN_DESIRED_AUTHORITY_AGENTS
         assert await active_bench_version(session) == 2
         collecting_ledger = await list_eligible_ledger(session)
         assert {row.agent_id for row in collecting_ledger} == {
