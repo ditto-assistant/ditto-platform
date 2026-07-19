@@ -605,9 +605,7 @@ async def test_first_capable_validator_automatically_seeds_v3_work() -> None:
 
     generator = AsyncMock()
     generator.generate.return_value = "e" * 64
-    assert await ensure_rolling_qualification(
-        session, generator=generator, now=now
-    )
+    assert await ensure_rolling_qualification(session, generator=generator, now=now)
     assert generator.generate.await_count == 5
     async with session.begin():
         rollout = await open_rollout(session)
