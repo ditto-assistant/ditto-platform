@@ -13,7 +13,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.agent_status import SCOREABLE_AGENT_STATUSES
 from ditto.api_models.benchmark_progress import (
     BenchmarkProgress,
     BenchmarkProgressStage,
@@ -277,7 +277,7 @@ async def list_active_validator_work(
                 ValidatorHeartbeat.seen_at >= cutoff,
                 ValidatorTicket.status == TicketStatus.ISSUED,
                 ValidatorTicket.deadline > now,
-                Agent.status == AgentStatus.EVALUATING,
+                Agent.status.in_(SCOREABLE_AGENT_STATUSES),
             )
             .order_by(ValidatorHeartbeat.validator_hotkey)
         )
