@@ -586,6 +586,7 @@ async def _seed_validator_heartbeat(
     seen_at: datetime | None = None,
     capabilities: dict[str, object] | None = None,
     stack: dict[str, object] | None = None,
+    state: str = "polling",
 ) -> None:
     now = seen_at or datetime.now(UTC)
     async with maker() as s, s.begin():
@@ -595,7 +596,7 @@ async def _seed_validator_heartbeat(
                 software_version=software_version,
                 protocol_version=protocol_version,
                 code_digest="ab" * 32,
-                state="polling",
+                state=state,
                 active_agent_id=None,
                 first_seen_at=now,
                 system_metrics=None,
@@ -2021,6 +2022,63 @@ class TestRequestJob:
         )
 
         assert response.status_code == 204
+
+    @pytest.mark.parametrize(
+        ("state", "expected_status"),
+        [
+            ("polling", TicketStatus.EXPIRED),
+            ("running_benchmark", TicketStatus.ISSUED),
+        ],
+    )
+    async def test_v7_screened_only_does_not_resume_source_only_live_ticket(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        state: str,
+        expected_status: TicketStatus,
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        capabilities = {
+            **_V7_CAPABILITIES,
+            "require_screened_image": True,
+            "source_build_fallback": False,
+        }
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=7,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+            state=state,
+        )
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    bench_version=2,
+                    validator_hotkey=_VALIDATOR_HOTKEY,
+                    status=TicketStatus.ISSUED,
+                    issued_at=now,
+                    deadline=now + timedelta(minutes=90),
+                    attempt_count=1,
+                    manual_retry_grants=0,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert response.status_code == 204
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+            )
+            assert ticket is not None
+            assert ticket.status == expected_status
 
     async def test_stale_heartbeat_cannot_claim_work(
         self,

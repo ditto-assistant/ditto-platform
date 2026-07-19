@@ -913,6 +913,12 @@ class BenchmarkRollout(Base):
             postgresql_where=text("status IN ('collecting', 'blocked_ineligible')"),
             sqlite_where=text("status IN ('collecting', 'blocked_ineligible')"),
         ),
+        Index(
+            "benchmark_rollouts_transition_idx",
+            "from_version",
+            "desired_version",
+            unique=True,
+        ),
     )
 
 

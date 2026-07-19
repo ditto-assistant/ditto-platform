@@ -2473,6 +2473,28 @@ class TestPublicBenchCorpus:
         # ...and the live answer key is not in the refusal body.
         assert '"expected"' not in resp.text
 
+    async def test_v2_corpus_remains_private_before_v3_activation(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+            details={
+                "bench_version": 2,
+                "per_case": [{"expected": ["still-live"]}],
+            },
+        )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/bench/2/corpus")
+
+        assert response.status_code == 409
+        assert '"expected"' not in response.text
+
     async def test_retired_version_paginates(
         self,
         app: FastAPI,

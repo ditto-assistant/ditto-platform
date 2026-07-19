@@ -921,6 +921,44 @@ class TestExpiry:
         assert reset.attempt_count == 1
         assert reset.retry_after is None
 
+    async def test_prior_scored_version_does_not_block_new_version(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            prior = await issue_ticket(
+                session,
+                validator_hotkey="5V1",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=2,
+            )
+            assert prior is not None
+            prior.status = TicketStatus.SCORED
+            session.add(
+                BenchmarkDataset(
+                    agent_id=aid,
+                    bench_version=3,
+                    seed=42,
+                    sha256="cd" * 32,
+                    run_size="full",
+                )
+            )
+
+        async with session.begin():
+            current = await issue_ticket(
+                session,
+                validator_hotkey="5V1",
+                now=_LATER,
+                ttl=_TTL,
+                bench_version=3,
+            )
+
+        assert current is not None
+        assert current.agent_id == aid
+        assert current.bench_version == 3
+        assert current.attempt_count == 1
+
     async def test_expire_overdue_returns_count(self, session: AsyncSession) -> None:
         await _seed_evaluating(session)
         async with session.begin():

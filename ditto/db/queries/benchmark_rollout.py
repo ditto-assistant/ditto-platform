@@ -6,11 +6,11 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.ticket_status import TicketStatus
@@ -78,6 +78,27 @@ async def open_rollout(
     return await session.scalar(statement)
 
 
+async def rollout_for_transition(
+    session: AsyncSession,
+    *,
+    from_version: int,
+    desired_version: int,
+    for_update: bool = False,
+) -> BenchmarkRollout | None:
+    """Return the durable row for one transition, including after activation."""
+    statement = (
+        select(BenchmarkRollout)
+        .where(
+            BenchmarkRollout.from_version == from_version,
+            BenchmarkRollout.desired_version == desired_version,
+        )
+        .limit(1)
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    return await session.scalar(statement)
+
+
 async def _audit(
     session: AsyncSession,
     rollout: BenchmarkRollout,
@@ -113,7 +134,12 @@ async def create_rollout_snapshot(
                 )
             )
         )
-    existing = await open_rollout(session, for_update=True)
+    existing = await rollout_for_transition(
+        session,
+        from_version=DEFAULT_BENCH_VERSION,
+        desired_version=CANARY_BENCH_VERSION,
+        for_update=True,
+    )
     if existing is not None:
         return existing
     if len(members) != COHORT_SIZE:
@@ -246,6 +272,8 @@ async def issue_rollout_ticket(
     validator_hotkey: str,
     now: datetime,
     ttl: timedelta,
+    artifact_mode: Literal["legacy", "prefer_screened", "screened_only"] = "legacy",
+    validator_running_benchmark: bool = False,
 ) -> ValidatorTicket | None:
     """Issue one v3 cohort lease, balanced one score per agent per coverage round."""
     heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
@@ -254,12 +282,21 @@ async def issue_rollout_ticket(
     rollout = await open_rollout(session, for_update=True)
     if rollout is None or not await _validate_frozen_members(session, rollout, now=now):
         return None
-    existing = await session.scalar(
+    complete_screened_image = (
+        Agent.screened_image_sha256.is_not(None)
+        & Agent.screened_image_size_bytes.is_not(None)
+        & Agent.screened_image_id.is_not(None)
+        & Agent.screened_image_ref.is_not(None)
+        & Agent.screened_image_upload_id.is_not(None)
+        & Agent.screened_image_verified_at.is_not(None)
+    )
+    existing_statement = (
         select(ValidatorTicket)
         .join(
             BenchmarkRolloutMember,
             BenchmarkRolloutMember.agent_id == ValidatorTicket.agent_id,
         )
+        .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
         .where(
             BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
             ValidatorTicket.validator_hotkey == validator_hotkey,
@@ -270,8 +307,35 @@ async def issue_rollout_ticket(
         .limit(1)
         .with_for_update()
     )
+    if artifact_mode == "screened_only":
+        existing_statement = existing_statement.where(complete_screened_image)
+    existing = await session.scalar(existing_statement)
     if existing is not None:
         return existing
+    if artifact_mode == "screened_only":
+        incompatible_existing = await session.scalar(
+            select(ValidatorTicket)
+            .join(
+                BenchmarkRolloutMember,
+                BenchmarkRolloutMember.agent_id == ValidatorTicket.agent_id,
+            )
+            .where(
+                BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                ValidatorTicket.validator_hotkey == validator_hotkey,
+                ValidatorTicket.bench_version == rollout.desired_version,
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.deadline > now,
+            )
+            .limit(1)
+            .with_for_update()
+        )
+        if incompatible_existing is not None:
+            if validator_running_benchmark:
+                return None
+            incompatible_existing.status = TicketStatus.EXPIRED
+            incompatible_existing.deadline = now
+            incompatible_existing.retry_after = now
+            await session.flush()
 
     score_count = (
         select(func.count(Score.validator_hotkey))
@@ -302,14 +366,25 @@ async def issue_rollout_ticket(
         )
         .exists()
     )
-    member = await session.scalar(
+    member_statement = (
         select(BenchmarkRolloutMember)
+        .join(Agent, Agent.agent_id == BenchmarkRolloutMember.agent_id)
         .where(
             BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
             ~already_scored,
             score_count + occupied_count < SCORING_QUORUM,
         )
-        .order_by((score_count + occupied_count).asc(), BenchmarkRolloutMember.position)
+    )
+    if artifact_mode == "screened_only":
+        member_statement = member_statement.where(complete_screened_image)
+    if artifact_mode == "prefer_screened":
+        member_statement = member_statement.order_by(
+            case((complete_screened_image, 0), else_=1)
+        )
+    member = await session.scalar(
+        member_statement.order_by(
+            (score_count + occupied_count).asc(), BenchmarkRolloutMember.position
+        )
         .limit(1)
         .with_for_update(skip_locked=True)
     )

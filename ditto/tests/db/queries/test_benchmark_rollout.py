@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -12,8 +13,16 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     _require_v3_start_capacity,
+    start_v3_rollout,
 )
-from ditto.db.models import Agent, Base, BenchmarkRollout, Score, ValidatorHeartbeat
+from ditto.db.models import (
+    Agent,
+    Base,
+    BenchmarkRollout,
+    Score,
+    ValidatorHeartbeat,
+    ValidatorTicket,
+)
 from ditto.db.queries.benchmark_rollout import (
     DatasetPin,
     RolloutSnapshotMember,
@@ -314,6 +323,83 @@ async def test_ineligible_frozen_member_blocks_without_reshuffle() -> None:
     await engine.dispose()
 
 
+async def test_rollout_screened_only_skips_and_releases_source_only_work() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        agent_ids, rollout = await _seed_rollout(session, now)
+        screened = await session.get(Agent, agent_ids[1])
+        assert screened is not None
+        screened.screened_image_sha256 = "12" * 32
+        screened.screened_image_size_bytes = 123
+        screened.screened_image_id = "sha256:" + "34" * 32
+        screened.screened_image_ref = f"ditto-screen/{screened.agent_id}:latest"
+        screened.screened_image_upload_id = uuid4()
+        screened.screened_image_verified_at = now
+
+        first = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+            artifact_mode="screened_only",
+        )
+        assert first is not None
+        assert first.agent_id == screened.agent_id
+
+        incompatible = ValidatorTicket(
+            agent_id=agent_ids[0],
+            bench_version=rollout.desired_version,
+            validator_hotkey="validator-b",
+            status=TicketStatus.ISSUED,
+            issued_at=now,
+            deadline=now + timedelta(minutes=90),
+            attempt_count=1,
+            manual_retry_grants=0,
+        )
+        session.add(incompatible)
+        await session.flush()
+        replacement = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-b",
+            now=now,
+            ttl=timedelta(minutes=90),
+            artifact_mode="screened_only",
+        )
+        assert replacement is not None
+        assert replacement.agent_id == screened.agent_id
+        assert incompatible.status == TicketStatus.EXPIRED
+
+        running = ValidatorTicket(
+            agent_id=agent_ids[0],
+            bench_version=rollout.desired_version,
+            validator_hotkey="validator-c",
+            status=TicketStatus.ISSUED,
+            issued_at=now,
+            deadline=now + timedelta(minutes=90),
+            attempt_count=1,
+            manual_retry_grants=0,
+        )
+        session.add(running)
+        await session.flush()
+        assert (
+            await issue_rollout_ticket(
+                session,
+                validator_hotkey="validator-c",
+                now=now,
+                ttl=timedelta(minutes=90),
+                artifact_mode="screened_only",
+                validator_running_benchmark=True,
+            )
+            is None
+        )
+        assert running.status == TicketStatus.ISSUED
+    await engine.dispose()
+
+
 async def test_only_one_open_rollout_across_collecting_and_blocked_states() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
@@ -337,6 +423,49 @@ async def test_only_one_open_rollout_across_collecting_and_blocked_states() -> N
                     cohort_size=5,
                 ),
             ]
+        )
+        with pytest.raises(IntegrityError):
+            await session.flush()
+        await session.rollback()
+    await engine.dispose()
+
+
+async def test_admin_start_is_idempotent_after_unique_transition_activation() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    rollout_id = uuid4()
+    async with maker() as session, session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=rollout_id,
+                from_version=2,
+                desired_version=3,
+                status="activated",
+                cohort_size=5,
+                created_at=now,
+                activated_at=now,
+            )
+        )
+    async with maker() as session:
+        state = await start_v3_rollout(None, session, object())  # type: ignore[arg-type]
+        assert state["active_version"] == 3
+        assert state["desired_version"] == 3
+        assert state["status"] == "activated"
+        count = await session.scalar(select(func.count(BenchmarkRollout.rollout_id)))
+        assert count == 1
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=2,
+                desired_version=3,
+                status="activated",
+                cohort_size=5,
+                created_at=now + timedelta(seconds=1),
+                activated_at=now + timedelta(seconds=1),
+            )
         )
         with pytest.raises(IntegrityError):
             await session.flush()

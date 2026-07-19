@@ -201,11 +201,11 @@ async def issue_ticket(
     # resets the budget so repaired scoring software can revisit the artifact.
     already_mine = select(ValidatorTicket.agent_id).where(
         ValidatorTicket.validator_hotkey == validator_hotkey,
+        ValidatorTicket.bench_version == bench_version,
         (
             ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES)
             | (
                 (ValidatorTicket.status == TicketStatus.EXPIRED)
-                & (ValidatorTicket.bench_version == bench_version)
                 & (
                     (ValidatorTicket.retry_after > now)
                     | (

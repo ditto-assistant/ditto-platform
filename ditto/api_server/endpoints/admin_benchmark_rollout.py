@@ -14,10 +14,12 @@ from ditto.api_server.endpoints.admin_quarantine import require_admin
 from ditto.db.models import Agent
 from ditto.db.queries.benchmark_rollout import (
     CANARY_BENCH_VERSION,
+    DEFAULT_BENCH_VERSION,
     DatasetPin,
     RolloutSnapshotMember,
+    active_bench_version,
     create_rollout_snapshot,
-    open_rollout,
+    rollout_for_transition,
     rollout_state,
 )
 from ditto.db.queries.scores import list_eligible_ledger
@@ -53,9 +55,22 @@ async def start_v3_rollout(
     generator: GeneratorDep,
 ) -> dict[str, object]:
     """Freeze the current top five and explicitly render their v3 datasets."""
-    existing = await open_rollout(session)
+    existing = await rollout_for_transition(
+        session,
+        from_version=DEFAULT_BENCH_VERSION,
+        desired_version=CANARY_BENCH_VERSION,
+    )
     if existing is not None:
         return await rollout_state(session)
+    active_version = await active_bench_version(session)
+    if active_version != DEFAULT_BENCH_VERSION:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"cannot start benchmark {CANARY_BENCH_VERSION} rollout while "
+                f"active benchmark is {active_version}"
+            ),
+        )
     now = datetime.now(UTC)
     await _require_v3_start_capacity(session, now=now)
     ledger = [row for row in await list_eligible_ledger(session) if row.eligible][:5]
