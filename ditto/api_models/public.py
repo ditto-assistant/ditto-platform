@@ -1129,6 +1129,7 @@ class PublicSubmissionPipeline(BaseModel):
     generated_at: datetime
     agent_id: UUID
     status: str
+    active_bench_version: Annotated[int, Field(ge=1)]
     score_count: Annotated[int, Field(ge=0)]
     quorum: Annotated[int, Field(ge=1)]
     score_floor: Annotated[

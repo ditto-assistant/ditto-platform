@@ -1832,6 +1832,10 @@ async def agent_pipeline(
             .order_by(Score.created_at, Score.validator_hotkey)
         )
     )
+    canonical_version = await active_bench_version(session)
+    canonical_scores = [
+        score for score in accepted_scores if score.bench_version == canonical_version
+    ]
     running_attempt = next(
         (attempt for attempt in attempts if attempt.status == "running"), None
     )
@@ -1852,15 +1856,16 @@ async def agent_pipeline(
                 and cast(datetime, _aware(ticket.deadline)) > now
                 for ticket in tickets
             ),
-            score_count=len(accepted_scores),
+            score_count=len(canonical_scores),
             highest_composite=(
-                max(score.composite for score in accepted_scores)
-                if accepted_scores
+                max(score.composite for score in canonical_scores)
+                if canonical_scores
                 else None
             ),
             score_continuation_floor=score_continuation_floor,
         ),
-        score_count=len(accepted_scores),
+        active_bench_version=canonical_version,
+        score_count=len(canonical_scores),
         quorum=SCORING_QUORUM,
         score_floor=score_continuation_floor or 0.0,
         provisional_scores=[
@@ -1905,8 +1910,8 @@ async def agent_pipeline(
             for score in accepted_scores
         ],
         final_composite=(
-            statistics.median(score.composite for score in accepted_scores)
-            if len(accepted_scores) >= SCORING_QUORUM
+            statistics.median(score.composite for score in canonical_scores)
+            if len(canonical_scores) >= SCORING_QUORUM
             and agent.status in (AgentStatus.SCORED, AgentStatus.LIVE)
             else None
         ),
