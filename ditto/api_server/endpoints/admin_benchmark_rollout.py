@@ -49,6 +49,15 @@ async def _require_v3_start_capacity(
     return state
 
 
+@router.get("/v3")
+async def get_v3_rollout(
+    _: AdminDep,
+    session: SessionDep,
+) -> dict[str, object]:
+    """Return rollout telemetry without starting or refreshing qualification."""
+    return await rollout_state(session)
+
+
 @router.post("/v3")
 async def start_v3_rollout(
     _: AdminDep,
