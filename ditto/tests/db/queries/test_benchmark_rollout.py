@@ -580,7 +580,7 @@ async def test_admin_start_is_idempotent_after_unique_transition_activation() ->
 
 
 @pytest.mark.parametrize("capable_count", [0, 1, 2])
-async def test_v3_start_requires_two_capable_validators_and_matches_telemetry(
+async def test_v3_start_requires_one_capable_validator_and_matches_telemetry(
     capable_count: int,
 ) -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -610,11 +610,11 @@ async def test_v3_start_requires_two_capable_validators_and_matches_telemetry(
 
         telemetry = await rollout_state(session, now=now)
         assert telemetry["v3_capable_validator_count"] == capable_count
-        if capable_count < 2:
+        if capable_count < 1:
             with pytest.raises(HTTPException) as exc_info:
                 await _require_v3_start_capacity(session, now=now)
             assert exc_info.value.status_code == 409
-            assert "at least two" in str(exc_info.value.detail)
+            assert "at least one" in str(exc_info.value.detail)
             assert await open_rollout(session) is None
         else:
             guarded = await _require_v3_start_capacity(session, now=now)
