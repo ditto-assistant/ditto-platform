@@ -379,7 +379,14 @@ async def get_submission_scores(
     agent = await get_agent_by_id(session, agent_id=agent_id)
     if agent is None or agent.status not in _PUBLIC_SUBMISSION_STATUSES:
         return None
-    scores = await list_scores_for_agent(session, agent_id=agent_id)
+    # Every version's rows, not just the active bench version: the public record
+    # covers older + current runs (each row is version-labeled downstream), and
+    # the submissions index batch-fetch is unfiltered the same way.
+    scores = list(
+        (await session.execute(select(Score).where(Score.agent_id == agent_id)))
+        .scalars()
+        .all()
+    )
     last_scored_at = _as_utc(max(s.generated_at for s in scores)) if scores else None
     return SubmissionRow(
         agent_id=agent.agent_id,

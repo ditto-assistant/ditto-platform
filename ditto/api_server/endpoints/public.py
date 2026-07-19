@@ -1272,6 +1272,7 @@ def _public_validator_score(s) -> PublicValidatorScore:
         memory_mean=s.memory_mean,
         median_ms=s.median_ms,
         n=s.n,
+        bench_version=_score_bench_version(s),
         seed=s.seed,
         run_id=s.run_id,
         ticket_deadline=_ticket_deadline(s),
