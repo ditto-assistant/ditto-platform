@@ -87,5 +87,5 @@ enforces all four; Python checks run on 3.11 and 3.12.
 
 ## Branching
 
-`main` (release) ← `dev` (integration) ← `name/topic` feature branches. PRs into
-`dev`. Do not commit directly to `main`.
+`main` (release) ← `name/topic` feature branches. Open PRs into `main`. Do not
+commit directly to `main`; branch, push, and PR.
