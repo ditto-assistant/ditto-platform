@@ -8,7 +8,90 @@ the Go scorer's null/absent list fields.
 
 from __future__ import annotations
 
-from ditto.api_models.validator import CaseScore, ScoreReport
+from datetime import UTC, datetime
+from uuid import uuid4
+
+import pytest
+from pydantic import ValidationError
+
+from ditto.api_models.validator import ArtifactResponse, CaseScore, ScoreReport
+
+
+def _artifact_response(**overrides: object) -> ArtifactResponse:
+    values = {
+        "agent_id": uuid4(),
+        "sha256": "ab" * 32,
+        "download_url": "https://objects.example/agent.tar.gz",
+        "expires_at": datetime.now(UTC),
+        **overrides,
+    }
+    return ArtifactResponse.model_validate(values)
+
+
+def test_artifact_response_accepts_legacy_all_none_image_metadata() -> None:
+    response = _artifact_response()
+
+    assert response.screened_image_url is None
+    assert response.screened_image_sha256 is None
+    assert response.screened_image_size_bytes is None
+    assert response.screened_image_id is None
+    assert response.screened_image_ref is None
+
+
+def test_artifact_response_accepts_complete_screened_image_metadata() -> None:
+    response = _artifact_response(
+        screened_image_url="https://objects.example/screened-image.tar",
+        screened_image_sha256="12" * 32,
+        screened_image_size_bytes=123,
+        screened_image_id="sha256:" + "34" * 32,
+        screened_image_ref="ditto-screen/agent:latest",
+    )
+
+    assert response.screened_image_size_bytes == 123
+
+
+@pytest.mark.parametrize(
+    "only_field",
+    [
+        {"screened_image_url": "https://objects.example/screened-image.tar"},
+        {"screened_image_sha256": "12" * 32},
+        {"screened_image_size_bytes": 123},
+        {"screened_image_id": "sha256:" + "34" * 32},
+        {"screened_image_ref": "ditto-screen/agent:latest"},
+    ],
+)
+def test_artifact_response_rejects_partial_screened_image_metadata(
+    only_field: dict[str, object],
+) -> None:
+    with pytest.raises(
+        ValidationError, match="screened image metadata must be complete"
+    ):
+        _artifact_response(**only_field)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("screened_image_url", ""),
+        ("screened_image_sha256", ""),
+        ("screened_image_id", ""),
+        ("screened_image_ref", ""),
+    ],
+)
+def test_artifact_response_rejects_empty_screened_image_strings(
+    field: str, value: str
+) -> None:
+    complete = {
+        "screened_image_url": "https://objects.example/screened-image.tar",
+        "screened_image_sha256": "12" * 32,
+        "screened_image_size_bytes": 123,
+        "screened_image_id": "sha256:" + "34" * 32,
+        "screened_image_ref": "ditto-screen/agent:latest",
+    }
+    complete[field] = value
+
+    with pytest.raises(ValidationError):
+        _artifact_response(**complete)
 
 
 def test_tool_case_round_trips() -> None:
