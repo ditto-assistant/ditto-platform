@@ -2063,6 +2063,66 @@ class TestPublicActivity:
         assert body["validation_attempts"][0]["status"] == "expired"
         assert body["validation_attempts"][0]["bench_version"] == 2
 
+    async def test_pipeline_keeps_mixed_benchmark_quorums_separate(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.41, 0.58, 0.73],
+                status=AgentStatus.SCORED,
+                details={"bench_version": 2},
+            )
+        )
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            await upsert_score(
+                session,
+                agent_id=agent_id,
+                validator_hotkey=_VALIDATOR_C,
+                run_id="v3-run",
+                seed=123,
+                composite=0.91,
+                tool_mean=0.91,
+                memory_mean=0.91,
+                median_ms=400,
+                n=114,
+                generated_at=now,
+                signature="ab" * 64,
+                details={"bench_version": 3},
+                bench_version=3,
+            )
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=_MINER_A,
+                    status=TicketStatus.ISSUED,
+                    issued_at=now,
+                    deadline=now + timedelta(hours=1),
+                    bench_version=3,
+                )
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["active_bench_version"] == 2
+        assert body["score_count"] == 3
+        assert body["final_composite"] == pytest.approx(0.58)
+        assert [score["bench_version"] for score in body["provisional_scores"]].count(
+            2
+        ) == 3
+        assert [score["bench_version"] for score in body["provisional_scores"]].count(
+            3
+        ) == 1
+        assert body["validation_attempts"][0]["bench_version"] == 3
+
     @pytest.mark.parametrize(
         "status",
         [AgentStatus.SCREENING, AgentStatus.QUARANTINED, AgentStatus.REJECTED],
