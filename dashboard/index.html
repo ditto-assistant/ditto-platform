@@ -2429,11 +2429,19 @@
       }
     }
 
+    // Per-page view state (submissions filters + either pager's "page"). It is
+    // scoped to the page that owns it, so it must not ride along to another page.
+    var PAGE_SCOPED_PARAMS = ["status", "q", "page"];
+
     function dashboardHref(page) {
-      // Keep the hash state (activity filters) minus any entity overlay, so
-      // switching pages or closing an overlay never resets the filters.
       var query = parseHashRoute().query;
       clearEntityParams(query);
+      // Same page (e.g. closing an overlay) keeps that page's view state; moving
+      // to a different page drops it so it never reappears as stale filters or a
+      // stale page number — and so both pagers can safely share the "page" key.
+      if (page !== currentPageName()) {
+        PAGE_SCOPED_PARAMS.forEach(function (key) { query.delete(key); });
+      }
       return spaHref(page, query);
     }
 
@@ -2475,7 +2483,9 @@
       });
       activityStatuses = ACTIVITY_STATUSES.filter(function (value) { return valid.indexOf(value) >= 0; });
       activityQuery = (source.get("q") || "").trim().slice(0, 200);
-      var requestedPage = source.get("page");
+      // "page" is shared with the leaderboard pager; interpret it as the
+      // submissions page only when the submissions view actually owns it.
+      var requestedPage = currentPageName() === "submissions" ? source.get("page") : null;
       var parsedPage = Number(requestedPage);
       activityPage = requestedPage !== null && /^[1-9][0-9]*$/.test(requestedPage) &&
           Number.isSafeInteger(parsedPage)
@@ -2494,7 +2504,11 @@
       query.delete("status");
       activityStatuses.forEach(function (status) { query.append("status", status); });
       if (activityQuery) query.set("q", activityQuery); else query.delete("q");
-      if (activityPage > 1) query.set("page", String(activityPage)); else query.delete("page");
+      // "page" is owned by whichever pager is on the active page; only manage the
+      // submissions pager's value here so it never clobbers the leaderboard's.
+      if (currentPageName() === "submissions") {
+        if (activityPage > 1) query.set("page", String(activityPage)); else query.delete("page");
+      }
       // Keep an open overlay in the URL — including a legacy real-query entity
       // that resolveEntityRoute has not normalized into the hash yet.
       var entity = readEntityRoute();
@@ -2649,6 +2663,58 @@
       // Composite breaks ties so equal sort keys stay in a stable, meaningful
       // order rather than whatever the source array happened to hold.
       return (b.composite || 0) - (a.composite || 0);
+    }
+
+    // The leaderboard pager, like the submissions pager, is query-param state:
+    // the hash query is the source of truth, boardView.page is its mirror. Both
+    // pagers use the same "page" key; they never collide because it is read and
+    // written only on the page that owns it (overview here, submissions there)
+    // and navigation between pages clears the page-scoped params (dashboardHref).
+    function restoreBoardPage() {
+      var requested = currentPageName() === "overview"
+        ? parseHashRoute().query.get("page")
+        : null;
+      var parsed = Number(requested);
+      boardView.page = requested !== null && /^[1-9][0-9]*$/.test(requested) &&
+          Number.isSafeInteger(parsed)
+        ? parsed
+        : 1;
+      // A "page" that resolved to 1 or wasn't an exact canonical integer is junk
+      // to be rewritten out of the URL.
+      return requested !== null &&
+        (boardView.page === 1 || String(boardView.page) !== requested);
+    }
+
+    function writeBoardPage(push) {
+      // Only the overview page owns "page"; dedicated entity pages have no
+      // leaderboard to page through.
+      if (currentPageName() !== "overview") return;
+      if (/^\/(agent|miner)s?\//.test(location.pathname)) return;
+      var query = parseHashRoute().query;
+      if (boardView.page > 1) query.set("page", String(boardView.page));
+      else query.delete("page");
+      history[push ? "pushState" : "replaceState"]({}, "", spaHref("overview", query));
+    }
+
+    function navigateBoardPage(page) {
+      boardView.page = page;
+      writeBoardPage(true);
+      renderBoardRows();
+    }
+
+    if (restoreBoardPage()) writeBoardPage(false);
+
+    // Reset the per-page view state (filters + both pagers) that dashboardHref
+    // strips from the URL on a cross-page navigation, so the cleared URL and the
+    // in-memory mirrors that the loaders read never disagree on the page.
+    function resetPageScopedView() {
+      activityStatuses = [];
+      activityQuery = "";
+      activityPage = 1;
+      boardView.page = 1;
+      searchInput.value = "";
+      renderActivityFilterControls();
+      renderBoardRows();
     }
 
     var REFERENCE_BASELINE = { bench_version: 3, composite: 0.445 };
@@ -3009,7 +3075,9 @@
         : boardView.tab === "provisional" ? provisional
         : scored).slice().sort(boardCompare);
       var pageCount = Math.max(1, Math.ceil(rows.length / boardView.pageSize));
-      if (boardView.page > pageCount) boardView.page = pageCount;
+      // A deep-linked bpage past the end (or a page emptied by newly-loaded data)
+      // clamps to the last real page; keep the URL honest about where we landed.
+      if (boardView.page > pageCount) { boardView.page = pageCount; writeBoardPage(false); }
       var start = (boardView.page - 1) * boardView.pageSize;
       var pageRows = rows.slice(start, start + boardView.pageSize);
 
@@ -3104,7 +3172,10 @@
         var tab = btn.getAttribute("data-board-tab");
         if (tab === boardView.tab) return;
         boardView.tab = tab;
+        // Tab/sort aren't URL state, so a reset-to-1 only drops the pager param
+        // (replaceState, not push — there is no meaningful entry to go back to).
         boardView.page = 1;
+        writeBoardPage(false);
         renderBoardRows();
       });
     });
@@ -3120,6 +3191,7 @@
           boardView.dir = (key === "rank" || key === "name") ? 1 : -1;
         }
         boardView.page = 1;
+        writeBoardPage(false);
         renderBoardRows();
       });
     });
@@ -3127,10 +3199,11 @@
       var prev = document.getElementById("board-prev");
       var next = document.getElementById("board-next");
       if (prev) prev.addEventListener("click", function () {
-        if (boardView.page > 1) { boardView.page--; renderBoardRows(); }
+        if (boardView.page > 1) navigateBoardPage(boardView.page - 1);
       });
       if (next) next.addEventListener("click", function () {
-        boardView.page++; renderBoardRows();
+        // "next" is disabled at the last page, so this never overshoots.
+        navigateBoardPage(boardView.page + 1);
       });
     })();
 
@@ -4075,6 +4148,7 @@
         // off the board, fall back to its canonical entity route.
         var idx = lastEntries.findIndex(function (entry) { return entry.miner_hotkey === result.hotkey; });
         if (idx >= 0) {
+          if (currentPageName() !== "overview") resetPageScopedView();
           history.pushState({}, "", dashboardHref("overview"));
           route(false);
           requestAnimationFrame(function () { openModal(idx); });
@@ -4084,6 +4158,7 @@
           resolveEntityRoute();
         }
       } else {
+        if (currentPageName() !== "submissions") resetPageScopedView();
         history.pushState({}, "", dashboardHref("submissions"));
         route(false);
         requestAnimationFrame(function () { openActivityEntry(result.entry); });
@@ -6103,13 +6178,17 @@
     }
     document.querySelectorAll(".nav-item[data-page]").forEach(function (item) {
       item.addEventListener("click", function (event) {
-        // Route through dashboardHref rather than the static "#/page" href so
-        // the hash query (activity filters) survives page switches and any
-        // open overlay is dropped cleanly.
+        // Route through dashboardHref so an open overlay is dropped cleanly and
+        // the page-scoped view state is reset on a move to a different page
+        // (dashboardHref strips it from the URL; keep the in-memory mirrors in
+        // step so a cleared URL and the loaders never disagree on the page).
         var entity = readEntityRoute();
-        var target = dashboardHref(item.getAttribute("data-page"));
+        var targetPage = item.getAttribute("data-page");
+        var crossPage = targetPage !== currentPageName();
+        var target = dashboardHref(targetPage);
         if (location.pathname + location.search + location.hash === target) { event.preventDefault(); return; }
         event.preventDefault();
+        if (crossPage) resetPageScopedView();
         history.pushState({}, "", target);
         entityReturnUrl = "";
         if (entity) resolveEntityRoute();
@@ -6124,6 +6203,10 @@
       updateSearch();
       renderActivityFilterControls();
       if (/^#\/submissions/.test(location.hash || "")) loadActivity(activityPage, null, true);
+      // Restore the leaderboard page from the URL and reflect it against the
+      // already-loaded rows (no refetch needed for a client-side slice).
+      restoreBoardPage();
+      renderBoardRows();
       resolveEntityRoute();
     });
     route(true);

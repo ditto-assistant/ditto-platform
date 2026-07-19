@@ -37,10 +37,15 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 - **Validator fleet** — signed worker availability, coarse system health, and
   the public active agent with the same stage/progress shown in the pipeline.
   Old clients render as progress not reported; expired or stale work disappears.
-- **Stable object links** — all SPA state (popup/selected-row params and the
-  submissions filters) lives in a query string inside the hash, on whatever page
-  it was opened from (`#/submissions?agent={id}`, `#/overview?miner={hotkey}`,
-  `#/operations?validator={hotkey}`, `#/submissions?status=rejected&page=2`).
+- **Stable object links** — all SPA state (popup/selected-row params, the
+  submissions filters, and both pagers) lives in a query string inside the hash,
+  on whatever page it was opened from (`#/submissions?agent={id}`,
+  `#/overview?miner={hotkey}`, `#/operations?validator={hotkey}`,
+  `#/submissions?status=rejected&page=2`, `#/overview?page=2` for the
+  leaderboard page). Page-scoped view state (the filters and either pager's
+  `page`) is cleared when you navigate to a different page, so it never trails
+  along as stale state — which is also why both pagers can share the `page` key
+  without colliding.
   The real query string carries only deploy/config knobs (`?api=`, `?wandb=`),
   so the document URL — and its HTTP cache entry — stays stable while the SPA
   navigates. Agent and miner popovers link to dedicated `/agent/{id}` and
