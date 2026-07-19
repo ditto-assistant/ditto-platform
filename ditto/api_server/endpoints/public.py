@@ -569,6 +569,9 @@ def _public_entry(
     registered: bool | None = None,
     miner_uid: int | None = None,
     fold_stderr: float | None = None,
+    settled_composite: float | None = None,
+    rollout_composite: float | None = None,
+    rollout_score_count: int | None = None,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -613,6 +616,9 @@ def _public_entry(
         n=r.n,
         eligible=r.eligible,
         bench_version=bench_version,
+        settled_composite=settled_composite,
+        rollout_composite=rollout_composite,
+        rollout_score_count=rollout_score_count,
         dataset_sha256=dataset_sha256 if isinstance(dataset_sha256, str) else None,
         models=_safe_models(details),
         per_category=_safe_categories(details),
@@ -774,6 +780,35 @@ async def leaderboard(
             provisional_by_miner.setdefault(candidate[0].miner_hotkey, candidate)
     provisional_rows = list(provisional_by_miner.values())
     rows = finalized_rows + [row for row, _count in provisional_rows]
+    # During an open rollout the board is a mixed-version pool (v3 at quorum,
+    # otherwise v2), which makes composite ordering jump between incomparable
+    # scales. Expose each agent's settled active-version median (the comparable
+    # ranking baseline) plus its desired-version settlement state (median so far
+    # + accepted-score count) so the dashboard can rank by settled and show
+    # rollout progress per row.
+    rollout_states: dict[UUID, tuple[float | None, float | None, int | None]] = {}
+    if rollout is not None and bench_version is None:
+        board_ids = [row.agent_id for row in rows]
+        settled_pools = await quorum_composites(
+            session,
+            board_ids,
+            bench_versions=dict.fromkeys(board_ids, active_version),
+        )
+        desired_pools = await quorum_composites(
+            session,
+            board_ids,
+            bench_versions=dict.fromkeys(board_ids, desired_version),
+        )
+        for board_agent_id in board_ids:
+            settled_pool = settled_pools.get(board_agent_id, [])
+            desired_pool = desired_pools.get(board_agent_id, [])
+            rollout_states[board_agent_id] = (
+                float(statistics.median(settled_pool))
+                if len(settled_pool) >= SCORING_QUORUM
+                else None,
+                float(statistics.median(desired_pool)) if desired_pool else None,
+                len(desired_pool),
+            )
     agent_metadata = {
         agent_id: (name, version)
         for agent_id, name, version in (
@@ -793,6 +828,9 @@ async def leaderboard(
     )
     entries = []
     for i, row in enumerate(finalized_rows, start=1):
+        settled, rolling, rolling_count = rollout_states.get(
+            row.agent_id, (None, None, None)
+        )
         entries.append(
             _public_entry(
                 i,
@@ -801,6 +839,9 @@ async def leaderboard(
                 histories.get(row.miner_hotkey),
                 finalized=True,
                 score_count=score_counts.get(row.agent_id, SCORING_QUORUM),
+                settled_composite=settled,
+                rollout_composite=rolling,
+                rollout_score_count=rolling_count,
                 registered=(
                     row.miner_hotkey in registered_uids
                     if registered_uids is not None
@@ -815,6 +856,9 @@ async def leaderboard(
             )
         )
     for row, count in provisional_rows:
+        settled, rolling, rolling_count = rollout_states.get(
+            row.agent_id, (None, None, None)
+        )
         entries.append(
             _public_entry(
                 len(entries) + 1,
@@ -823,6 +867,9 @@ async def leaderboard(
                 histories.get(row.miner_hotkey),
                 finalized=False,
                 score_count=count,
+                settled_composite=settled,
+                rollout_composite=rolling,
+                rollout_score_count=rolling_count,
                 registered=(
                     row.miner_hotkey in registered_uids
                     if registered_uids is not None
