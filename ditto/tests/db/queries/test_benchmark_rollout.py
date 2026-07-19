@@ -15,6 +15,7 @@ from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     _require_v3_start_capacity,
+    get_v3_rollout,
     start_v3_rollout,
 )
 from ditto.db.models import (
@@ -41,6 +42,27 @@ from ditto.db.queries.scores import list_eligible_ledger
 from ditto.db.queries.screening import claim_screening_attempts
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_admin_status_read_does_not_start_rollout() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        state = await get_v3_rollout(None, session)
+        assert state == {
+            "active_version": 2,
+            "desired_version": 2,
+            "status": "inactive",
+            "v3_capable_validator_count": 0,
+            "current_hybrid_top_five": [],
+            "qualification_converged": False,
+            "members": [],
+        }
+        count = await session.scalar(select(func.count(BenchmarkRollout.rollout_id)))
+        assert count == 0
+    await engine.dispose()
 
 
 def _capabilities(now: datetime) -> tuple[dict, dict]:
