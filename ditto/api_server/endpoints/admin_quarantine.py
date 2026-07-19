@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.admin_quarantine import (
     AdminArtifactDuplicate,
+    AdminBenchmarkContractRefreshDetail,
     AdminBenchmarkContractRefreshRequest,
     AdminBenchmarkContractRefreshResponse,
     AdminDuplicateSummary,
@@ -1534,6 +1535,66 @@ async def refresh_benchmark_contract(
         agent_status=AgentStatus.SCREENING_FAILED,
         bench_version=bench_version,
         expired_ticket_count=len(tickets),
+    )
+
+
+@router.get(
+    "/screening-submissions/{agent_id}/refresh-benchmark-contract",
+    response_model=AdminBenchmarkContractRefreshDetail,
+)
+async def inspect_benchmark_contract_refresh(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+) -> AdminBenchmarkContractRefreshDetail:
+    """Return the exact guarded inputs Backroom must confirm before repair."""
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+
+    bench_version = await active_bench_version(session)
+    dataset = await session.get(BenchmarkDataset, (agent_id, bench_version))
+    score_count = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Score)
+            .where(
+                Score.agent_id == agent_id,
+                Score.bench_version == bench_version,
+            )
+        )
+        or 0
+    )
+    screening_attempt_active = (
+        await session.scalar(
+            select(ScreeningAttempt.attempt_id).where(
+                ScreeningAttempt.agent_id == agent_id,
+                ScreeningAttempt.status == "running",
+            )
+        )
+        is not None
+    )
+    blocking_reason: str | None = None
+    if bench_version <= 2:
+        blocking_reason = "active benchmark does not support contract refresh"
+    elif dataset is None:
+        blocking_reason = "benchmark dataset is missing"
+    elif score_count != 0:
+        blocking_reason = "submission already has an accepted active-version score"
+    elif screening_attempt_active:
+        blocking_reason = "screening attempt is active"
+
+    return AdminBenchmarkContractRefreshDetail(
+        agent_id=agent_id,
+        agent_name=agent.name,
+        agent_status=agent.status,
+        artifact_sha256=agent.sha256,
+        bench_version=bench_version,
+        dataset_sha256=dataset.sha256 if dataset is not None else None,
+        score_count=score_count,
+        screening_attempt_active=screening_attempt_active,
+        refresh_allowed=blocking_reason is None,
+        blocking_reason=blocking_reason,
     )
 
 

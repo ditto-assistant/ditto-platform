@@ -2413,6 +2413,24 @@ class TestQuarantineAdmin:
             "Authorization": "Bearer test-admin-token-at-least-32-characters",
             "X-Admin-Actor": "backroom:test-user",
         }
+        inspected = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/"
+            "refresh-benchmark-contract",
+            headers=headers,
+        )
+        assert inspected.status_code == 200, inspected.text
+        assert inspected.json() == {
+            "agent_id": str(agent_id),
+            "agent_name": "alpha-agent",
+            "agent_status": AgentStatus.EVALUATING,
+            "artifact_sha256": _SHA256,
+            "bench_version": 3,
+            "dataset_sha256": "aa" * 32,
+            "score_count": 0,
+            "screening_attempt_active": False,
+            "refresh_allowed": True,
+            "blocking_reason": None,
+        }
         refreshed = await client.post(
             f"/api/v1/admin/screening-submissions/{agent_id}/"
             "refresh-benchmark-contract",

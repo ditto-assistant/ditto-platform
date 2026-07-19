@@ -161,6 +161,21 @@ class AdminBenchmarkContractRefreshRequest(BaseModel):
     expected_score_count: Annotated[int, Field(ge=0)]
 
 
+class AdminBenchmarkContractRefreshDetail(BaseModel):
+    """Current compare-and-swap inputs for one guarded contract repair."""
+
+    agent_id: UUID
+    agent_name: str
+    agent_status: str
+    artifact_sha256: str
+    bench_version: int
+    dataset_sha256: str | None
+    score_count: int
+    screening_attempt_active: bool
+    refresh_allowed: bool
+    blocking_reason: str | None
+
+
 class AdminBenchmarkContractRefreshResponse(BaseModel):
     agent_id: UUID
     agent_status: str
