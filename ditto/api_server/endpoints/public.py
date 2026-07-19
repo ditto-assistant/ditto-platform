@@ -334,6 +334,7 @@ def _public_benchmark_progress(work: ActiveValidatorWork) -> PublicBenchmarkProg
         return PublicBenchmarkProgress(
             agent_id=work.agent.agent_id,
             agent_name=work.agent.name,
+            bench_version=work.ticket.bench_version,
             started_at=cast(datetime, _aware(work.ticket.issued_at)),
         )
     percent: int | None = None
@@ -356,6 +357,7 @@ def _public_benchmark_progress(work: ActiveValidatorWork) -> PublicBenchmarkProg
     return PublicBenchmarkProgress(
         agent_id=work.agent.agent_id,
         agent_name=work.agent.name,
+        bench_version=work.ticket.bench_version,
         started_at=cast(datetime, _aware(work.ticket.issued_at)),
         stage=progress.stage,
         completed_checks=completed_checks,
@@ -1602,8 +1604,15 @@ async def operations(
         active_work=active_work,
         now=now,
     )
+    benchmark_rollout = await rollout_state(session, now=now)
     return PublicOperationsResponse(
         generated_at=now,
+        active_bench_version=cast(int, benchmark_rollout["active_version"]),
+        desired_bench_version=cast(int, benchmark_rollout["desired_version"]),
+        benchmark_rollout_status=cast(
+            Literal["inactive", "collecting", "blocked_ineligible", "activated"],
+            benchmark_rollout["status"],
+        ),
         activity=activity_snapshot,
         validators=validator_snapshot,
     )

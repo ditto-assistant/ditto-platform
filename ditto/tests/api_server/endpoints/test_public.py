@@ -1726,6 +1726,7 @@ class TestPublicActivity:
         public_progress_keys = {
             "agent_id",
             "agent_name",
+            "bench_version",
             "started_at",
             "stage",
             "completed_checks",
@@ -1744,6 +1745,7 @@ class TestPublicActivity:
             progress for progress in shown if progress["completed_checks"] == 51
         )
         assert first["percent"] == 45
+        assert first["bench_version"] == 2
         assert first["total_checks"] == 114
         assert datetime.fromisoformat(first["started_at"].replace("Z", "+00:00")) == (
             now - timedelta(seconds=1)

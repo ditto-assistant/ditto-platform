@@ -791,6 +791,9 @@ class PublicBenchmarkProgress(BaseModel):
 
     agent_id: UUID
     agent_name: str
+    bench_version: Annotated[
+        int, Field(ge=1, description="DittoBench contract bound to this ticket.")
+    ]
     started_at: Annotated[
         datetime, Field(description="When the validator ticket was issued (UTC).")
     ]
@@ -1438,6 +1441,11 @@ class PublicOperationsResponse(BaseModel):
     """One cacheable operations snapshot shared by pipeline and fleet views."""
 
     generated_at: datetime
+    active_bench_version: Annotated[int, Field(ge=1)]
+    desired_bench_version: Annotated[int, Field(ge=1)]
+    benchmark_rollout_status: Literal[
+        "inactive", "collecting", "blocked_ineligible", "activated"
+    ]
     activity: PublicActivityResponse
     validators: PublicValidatorHeartbeatsResponse
 

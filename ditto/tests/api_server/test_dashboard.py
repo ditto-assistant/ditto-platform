@@ -232,6 +232,13 @@ class TestDashboard:
         assert "Waiting for scores" in body
         assert "function validatorQueueCompare(a, b)" in body
         assert "indexed.sort(validatorQueueCompare)" in body
+        assert "function pipelineBoardStage(entry)" in body
+        assert (
+            'return (entry.active_benchmarks || []).length ? "evaluating" : '
+            "entry.status;"
+        ) in body
+        assert "column.statuses.indexOf(pipelineBoardStage(entry))" in body
+        assert '"Bench v" + rescore.targetVersion + " rescore"' in body
         assert "validator_queue_rank" in body
         assert "entry.provisional_composite" in body
         assert '"Provisional " + fx(Number(entry.provisional_composite))' in body
@@ -260,6 +267,10 @@ class TestDashboard:
         assert '"Bench v" + a.bench_version' in body
         assert 'class="bench-version-badge"' in body
         assert "function benchmarkCohorts(pipeline)" in body
+        assert "function pipelineDisplayState(entry, pipeline)" in body
+        assert "function renderPreliminaryFact(cohort, quorum)" in body
+        assert " preliminary</dt><dd>" in body
+        assert 'class="pipeline-preliminary-value"' in body
         assert "function cohortProgressSummary(cohort, quorum)" in body
         assert '" · " + running + " running"' in body
         assert '" · " + pending + " pending"' in body
@@ -542,6 +553,11 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert body.count('getJSON("/public/operations")') == 1
+        assert "data.active_bench_version" in body
+        assert "data.desired_bench_version" in body
+        assert "data.benchmark_rollout_status" in body
+        assert "function renderBenchBadge()" in body
+        assert '" → v" + desired + " rollout"' in body
         assert 'getJSON("/public/validators")' not in body
         assert 'getJSON("/public/activity?page=1&limit=200")' not in body
         assert 'id="operations-snapshot" aria-live="polite"' in body
@@ -561,6 +577,12 @@ class TestDashboard:
         assert "benchmarkStageLabel" in body
         assert "active_benchmarks" in body
         assert "active_benchmark" in body
+        assert "progress.bench_version" in body
+        assert 'class="benchmark-version-chip"' in body
+        assert "function pipelineRescoreState(entry)" in body
+        assert " score stays live until v" in body
+        assert 'class="pipeline-qualification-badge"' in body
+        assert "Top 5 → v" in body
         assert '<progress max="100" value="' in body
         assert "aria-label" in body
         assert "Benchmark progress not reported" in body
@@ -760,10 +782,11 @@ class TestDashboard:
         assert 'event.key === "ArrowDown"' in body
         assert 'event.key === "Escape"' in body
 
-    async def test_benchmark_badge_omits_latest_suffix(self) -> None:
+    async def test_benchmark_badge_communicates_rollout_transition(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
-        assert 'badge.textContent = "DittoBench v" + currentBench +' in body
+        assert '"DittoBench v" + active + " → v" + desired + " rollout"' in body
+        assert '"DittoBench v" + active + (benchHasOlderRuns' in body
         assert 'currentBench + " · latest"' not in body
 
     async def test_leaderboard_omits_tie_labels(self) -> None:
