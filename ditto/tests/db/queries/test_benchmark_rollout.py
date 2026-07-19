@@ -10,21 +10,29 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from ditto.api_models.admin_quarantine import AdminBenchmarkQualificationRequest
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.benchmark_rollout import (
     ensure_rolling_qualification,
     refresh_rolling_qualification,
+    rolling_qualification_blockers,
 )
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     _require_v3_start_capacity,
     get_v3_rollout,
     start_v3_rollout,
 )
+from ditto.api_server.endpoints.admin_quarantine import (
+    inspect_benchmark_qualification,
+    qualify_benchmark_rollout,
+)
 from ditto.db.models import (
     Agent,
     Base,
+    BenchmarkDataset,
     BenchmarkRollout,
+    BenchmarkRolloutAudit,
     BenchmarkRolloutMember,
     Score,
     ValidatorHeartbeat,
@@ -544,6 +552,396 @@ async def test_v3_score_drop_qualifies_and_rescreens_new_top_five_agent() -> Non
             rising = await session.get(Agent, rising_id)
             assert rising is not None
             assert rising.status == AgentStatus.SCORED
+    await engine.dispose()
+
+
+async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently() -> (
+    None
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    rising_id = uuid4()
+    async with maker() as session:
+        async with session.begin():
+            initial_ids, rollout = await _seed_rollout(session, now)
+            session.add(
+                Agent(
+                    agent_id=rising_id,
+                    miner_hotkey="miner-legacy",
+                    name="legacy-riser",
+                    sha256="f" * 64,
+                    status=AgentStatus.SCORED,
+                    screening_policy_version=8,
+                    created_at=now + timedelta(minutes=1),
+                )
+            )
+            for validator in range(3):
+                session.add(
+                    Score(
+                        agent_id=rising_id,
+                        bench_version=2,
+                        validator_hotkey=f"legacy-riser-{validator}",
+                        run_id=f"legacy-riser-{validator}",
+                        signature="aa",
+                        seed=8675309,
+                        composite=0.505,
+                        tool_mean=0.5,
+                        memory_mean=0.5,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": 2},
+                        generated_at=now,
+                    )
+                )
+                session.add(
+                    Score(
+                        agent_id=initial_ids[0],
+                        bench_version=3,
+                        validator_hotkey=f"drop-{validator}",
+                        run_id=f"drop-{validator}",
+                        signature="bb",
+                        seed=1,
+                        composite=0.1,
+                        tool_mean=0.1,
+                        memory_mean=0.1,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": 3},
+                        generated_at=now,
+                    )
+                )
+
+        async def generate(seed: int, *, bench_version: int) -> str:
+            assert not session.in_transaction()
+            assert seed == 8675309
+            assert bench_version == 3
+            return "e" * 64
+
+        generator = AsyncMock()
+        generator.run_size = "full"
+        generator.generate.side_effect = generate
+        assert (
+            await refresh_rolling_qualification(
+                session, generator=generator, now=now + timedelta(seconds=1)
+            )
+            == 1
+        )
+        assert (
+            await refresh_rolling_qualification(
+                session, generator=generator, now=now + timedelta(seconds=2)
+            )
+            == 0
+        )
+        assert generator.generate.await_count == 1
+        async with session.begin():
+            member = await session.get(
+                BenchmarkRolloutMember, (rollout.rollout_id, rising_id)
+            )
+            dataset = await session.get(BenchmarkDataset, (rising_id, 3))
+            legacy = await session.get(Agent, rising_id)
+            assert member is not None
+            assert dataset is not None
+            assert dataset.seed == 8675309
+            assert dataset.sha256 == "e" * 64
+            assert dataset.run_size == "full"
+            assert dataset.seed_block is None
+            assert legacy is not None
+            assert legacy.dataset_seed is None
+            assert legacy.dataset_sha256 is None
+            claimed = await claim_screening_attempts(
+                session,
+                screener_hotkey="screener-legacy",
+                now=now + timedelta(seconds=3),
+                ttl=timedelta(minutes=70),
+                limit=20,
+            )
+            assert rising_id in {agent.agent_id for agent, _attempt, _dup in claimed}
+            assert legacy.status == AgentStatus.SCORED
+            rising_attempt = next(
+                attempt
+                for agent, attempt, _dup in claimed
+                if agent.agent_id == rising_id
+            )
+            rising_attempt.status = "passed"
+            rising_attempt.finished_at = now + timedelta(seconds=4)
+            legacy.screening_policy_version = 9
+            legacy.screened_image_sha256 = "1" * 64
+            legacy.screened_image_size_bytes = 1024
+            legacy.screened_image_id = "sha256:" + "2" * 64
+            legacy.screened_image_ref = f"ditto-screen/{rising_id}:latest"
+            legacy.screened_image_upload_id = uuid4()
+            legacy.screened_image_verified_at = now + timedelta(seconds=4)
+            for initial_id in initial_ids[1:]:
+                for validator in range(3):
+                    session.add(
+                        Score(
+                            agent_id=initial_id,
+                            bench_version=3,
+                            validator_hotkey=f"filled-{initial_id}-{validator}",
+                            run_id=f"filled-{initial_id}-{validator}",
+                            signature="cc",
+                            seed=1,
+                            composite=0.1,
+                            tool_mean=0.1,
+                            memory_mean=0.1,
+                            median_ms=1,
+                            n=114,
+                            details={"bench_version": 3},
+                            generated_at=now,
+                        )
+                    )
+            await session.flush()
+            ticket = await issue_rollout_ticket(
+                session,
+                validator_hotkey="validator-a",
+                now=now + timedelta(seconds=5),
+                ttl=timedelta(minutes=90),
+            )
+            assert ticket is not None
+            assert ticket.agent_id == rising_id
+            assert ticket.bench_version == 3
+    await engine.dispose()
+
+
+async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    rising_id = uuid4()
+    async with maker() as session:
+        async with session.begin():
+            initial_ids, rollout = await _seed_rollout(session, now)
+            session.add(
+                Agent(
+                    agent_id=rising_id,
+                    miner_hotkey="miner-admin-riser",
+                    name="admin-riser",
+                    sha256="f" * 64,
+                    status=AgentStatus.SCORED,
+                    screening_policy_version=8,
+                    created_at=now + timedelta(minutes=1),
+                )
+            )
+            for validator in range(3):
+                session.add(
+                    Score(
+                        agent_id=rising_id,
+                        bench_version=2,
+                        validator_hotkey=f"admin-riser-{validator}",
+                        run_id=f"admin-riser-{validator}",
+                        signature="aa",
+                        seed=42,
+                        composite=0.505,
+                        tool_mean=0.5,
+                        memory_mean=0.5,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": 2},
+                        generated_at=now,
+                    )
+                )
+                session.add(
+                    Score(
+                        agent_id=initial_ids[0],
+                        bench_version=3,
+                        validator_hotkey=f"admin-drop-{validator}",
+                        run_id=f"admin-drop-{validator}",
+                        signature="bb",
+                        seed=1,
+                        composite=0.1,
+                        tool_mean=0.1,
+                        memory_mean=0.1,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": 3},
+                        generated_at=now,
+                    )
+                )
+
+        rollout_id = rollout.rollout_id
+        generator = AsyncMock()
+        generator.run_size = "full"
+        generator.generate.return_value = "e" * 64
+        detail = await inspect_benchmark_qualification(
+            rising_id, None, session, generator
+        )
+        assert detail.qualification_allowed
+        assert detail.currently_top_five
+        assert not detail.rollout_member
+        assert detail.total_score_count == 3
+        assert detail.source_score_count == 3
+        assert detail.target_score_count == 0
+
+        await session.rollback()
+        async with session.begin():
+            issued = ValidatorTicket(
+                agent_id=rising_id,
+                bench_version=2,
+                validator_hotkey="validator-issued-before-heartbeat",
+                status=TicketStatus.ISSUED,
+                issued_at=now,
+                deadline=now + timedelta(minutes=30),
+                attempt_count=1,
+                manual_retry_grants=0,
+            )
+            session.add(issued)
+        blocked = await inspect_benchmark_qualification(
+            rising_id, None, session, generator
+        )
+        assert blocked.validator_run_active
+        assert blocked.blocking_reason == "validator benchmark is active"
+        await session.rollback()
+        async with session.begin():
+            locked_issued = await session.get(
+                ValidatorTicket,
+                (rising_id, 2, "validator-issued-before-heartbeat"),
+            )
+            assert locked_issued is not None
+            locked_issued.deadline = now - timedelta(seconds=1)
+
+        with pytest.raises(HTTPException, match="score count changed"):
+            await qualify_benchmark_rollout(
+                rising_id,
+                AdminBenchmarkQualificationRequest(
+                    reason="recover legacy top-five qualification",
+                    expected_sha256="f" * 64,
+                    expected_rollout_id=rollout_id,
+                    expected_total_score_count=4,
+                    expected_source_score_count=3,
+                    expected_target_score_count=0,
+                ),
+                None,
+                session,
+                generator,
+                "backroom:test",
+            )
+
+        response = await qualify_benchmark_rollout(
+            rising_id,
+            AdminBenchmarkQualificationRequest(
+                reason="recover legacy top-five qualification",
+                expected_sha256="f" * 64,
+                expected_rollout_id=rollout_id,
+                expected_total_score_count=3,
+                expected_source_score_count=3,
+                expected_target_score_count=0,
+            ),
+            None,
+            session,
+            generator,
+            "backroom:test",
+        )
+        assert response.agent_status == AgentStatus.SCORED
+        assert response.rollout_member
+        assert response.screening_queued
+        assert response.target_dataset_sha256 == "e" * 64
+        async with session.begin():
+            scores = list(
+                await session.scalars(select(Score).where(Score.agent_id == rising_id))
+            )
+            agent = await session.get(Agent, rising_id)
+            dataset = await session.get(BenchmarkDataset, (rising_id, 3))
+            audit = await session.scalar(
+                select(BenchmarkRolloutAudit).where(
+                    BenchmarkRolloutAudit.rollout_id == rollout_id,
+                    BenchmarkRolloutAudit.event == "member_qualified",
+                )
+            )
+            assert len(scores) == 3
+            assert agent is not None and agent.status == AgentStatus.SCORED
+            assert dataset is not None and dataset.seed == 42
+            assert audit is not None
+            assert audit.payload["origin"] == "manual"
+            assert audit.payload["actor"] == "backroom:test"
+            assert audit.payload["reason"] == ("recover legacy top-five qualification")
+    await engine.dispose()
+
+
+async def test_ambiguous_legacy_seeds_are_visible_and_fail_closed() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    rising_id = uuid4()
+    async with maker() as session:
+        async with session.begin():
+            initial_ids, rollout = await _seed_rollout(session, now)
+            session.add(
+                Agent(
+                    agent_id=rising_id,
+                    miner_hotkey="miner-ambiguous",
+                    name="ambiguous-riser",
+                    sha256="f" * 64,
+                    status=AgentStatus.SCORED,
+                    screening_policy_version=8,
+                    created_at=now + timedelta(minutes=1),
+                )
+            )
+            for validator, seed in enumerate((41, 42, 42)):
+                session.add(
+                    Score(
+                        agent_id=rising_id,
+                        bench_version=2,
+                        validator_hotkey=f"ambiguous-{validator}",
+                        run_id=f"ambiguous-{validator}",
+                        signature="aa",
+                        seed=seed,
+                        composite=0.505,
+                        tool_mean=0.5,
+                        memory_mean=0.5,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": 2},
+                        generated_at=now,
+                    )
+                )
+                session.add(
+                    Score(
+                        agent_id=initial_ids[0],
+                        bench_version=3,
+                        validator_hotkey=f"ambiguous-drop-{validator}",
+                        run_id=f"ambiguous-drop-{validator}",
+                        signature="bb",
+                        seed=1,
+                        composite=0.1,
+                        tool_mean=0.1,
+                        memory_mean=0.1,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": 3},
+                        generated_at=now,
+                    )
+                )
+
+        generator = AsyncMock()
+        generator.run_size = "full"
+        generator.generate.return_value = "e" * 64
+        assert (
+            await refresh_rolling_qualification(
+                session, generator=generator, now=now + timedelta(seconds=1)
+            )
+            == 0
+        )
+        assert generator.generate.await_count == 0
+        blockers = await rolling_qualification_blockers(
+            session, generator_run_size="full"
+        )
+        assert blockers == [
+            {
+                "agent_id": str(rising_id),
+                "reason": "ambiguous_source_score_seeds",
+            }
+        ]
+        assert (
+            await session.get(BenchmarkRolloutMember, (rollout.rollout_id, rising_id))
+            is None
+        )
     await engine.dispose()
 
 

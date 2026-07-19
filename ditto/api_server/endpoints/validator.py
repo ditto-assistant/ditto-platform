@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import statistics
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, Literal
@@ -258,6 +259,8 @@ _TICKET_TTL = timedelta(minutes=90)
 # the database for the same window, making replay rejection consistent across
 # every API replica without introducing another secret.
 _JOB_REQUEST_MAX_AGE = timedelta(minutes=2)
+_QUALIFICATION_REFRESH_INTERVAL_SECONDS = 30.0
+_qualification_refresh_due = 0.0
 
 # Reject captured heartbeats outside a short clock-skew/retry window. Workers
 # report every two minutes, so five minutes tolerates normal transient outages.
@@ -281,6 +284,24 @@ def _screened_image_key(agent_id: UUID, image_upload_id: UUID) -> str:
 # ``ath_pending_review`` is included so a re-score of a held agent updates its
 # score row (feeding the eventual review) without un-holding it.
 _SCOREABLE_STATUSES = SCOREABLE_AGENT_STATUSES
+
+
+async def _refresh_qualification_if_due(
+    session: AsyncSession, *, generator: DatasetGenerator, now: datetime
+) -> None:
+    """Single-flight best-effort convergence for authenticated idle pollers."""
+    global _qualification_refresh_due
+    monotonic_now = time.monotonic()
+    if monotonic_now < _qualification_refresh_due:
+        return
+    # Set before the first await so concurrent requests in this process collapse
+    # into one refresh. Score/verdict triggers remain the immediate primary path.
+    _qualification_refresh_due = monotonic_now + _QUALIFICATION_REFRESH_INTERVAL_SECONDS
+    try:
+        await ensure_rolling_qualification(session, generator=generator, now=now)
+        await refresh_rolling_qualification(session, generator=generator, now=now)
+    except Exception:
+        logger.exception("automatic benchmark-v3 qualification refresh failed")
 
 
 class ValidatorAuthError(Exception):
@@ -794,13 +815,7 @@ async def request_job(
         chain, netuid, payload.validator_hotkey, network=network
     )
 
-    try:
-        await ensure_rolling_qualification(session, generator=generator, now=now)
-    except Exception:
-        # Qualification bootstrap is convergent and must not strand ordinary
-        # v2 work if dataset rendering is temporarily unavailable.
-        logger.exception("automatic benchmark-v3 qualification bootstrap failed")
-
+    job: JobResponse | None = None
     async with session.begin():
         await _assert_validator_compatible(
             session,
@@ -885,8 +900,8 @@ async def request_job(
             if canonical_version >= CANARY_BENCH_VERSION and (
                 heartbeat is None or not heartbeat_supports_v3(heartbeat, now=now)
             ):
-                return Response(status_code=204, headers={"Cache-Control": "no-store"})
-            if ticket is None:
+                ticket = None
+            elif ticket is None:
                 ticket = await issue_ticket(
                     session,
                     validator_hotkey=payload.validator_hotkey,
@@ -896,41 +911,47 @@ async def request_job(
                     artifact_mode=artifact_mode,
                     validator_running_benchmark=validator_state == "running_benchmark",
                 )
-        if ticket is None:
-            return Response(status_code=204, headers={"Cache-Control": "no-store"})
-        agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
-        # issue_ticket selected this agent from ``agents``, so it exists.
-        assert agent is not None
-        dataset = await session.get(
-            BenchmarkDataset, (agent.agent_id, ticket.bench_version)
-        )
-        contract = benchmark_contract(ticket.bench_version)
-        job = JobResponse(
-            agent_id=agent.agent_id,
-            miner_hotkey=agent.miner_hotkey,
-            sha256=agent.sha256,
-            deadline=ticket.deadline,
-            seed=dataset.seed if dataset is not None else agent.dataset_seed,
-            dataset_sha256=(
-                dataset.sha256 if dataset is not None else agent.dataset_sha256
-            ),
-            run_size=dataset.run_size
-            if dataset is not None
-            else agent.dataset_run_size,
-            dataset_seed_block=(
-                dataset.seed_block if dataset is not None else agent.dataset_seed_block
-            ),
-            dataset_seed_block_hash=(
-                dataset.seed_block_hash
-                if dataset is not None
-                else agent.dataset_seed_block_hash
-            ),
-            bench_version=ticket.bench_version,
-            minimum_screening_policy_version=(
-                contract.minimum_screening_policy_version
-            ),
-            requires_screened_image=contract.requires_screened_image,
-        )
+        if ticket is not None:
+            agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
+            # issue_ticket selected this agent from ``agents``, so it exists.
+            assert agent is not None
+            dataset = await session.get(
+                BenchmarkDataset, (agent.agent_id, ticket.bench_version)
+            )
+            contract = benchmark_contract(ticket.bench_version)
+            job = JobResponse(
+                agent_id=agent.agent_id,
+                miner_hotkey=agent.miner_hotkey,
+                sha256=agent.sha256,
+                deadline=ticket.deadline,
+                seed=dataset.seed if dataset is not None else agent.dataset_seed,
+                dataset_sha256=(
+                    dataset.sha256 if dataset is not None else agent.dataset_sha256
+                ),
+                run_size=(
+                    dataset.run_size if dataset is not None else agent.dataset_run_size
+                ),
+                dataset_seed_block=(
+                    dataset.seed_block
+                    if dataset is not None
+                    else agent.dataset_seed_block
+                ),
+                dataset_seed_block_hash=(
+                    dataset.seed_block_hash
+                    if dataset is not None
+                    else agent.dataset_seed_block_hash
+                ),
+                bench_version=ticket.bench_version,
+                minimum_screening_policy_version=(
+                    contract.minimum_screening_policy_version
+                ),
+                requires_screened_image=contract.requires_screened_image,
+            )
+    if job is None:
+        # Only a fully authenticated, compatible, replay-checked idle poll can
+        # trigger bounded convergence. The next poll sees any newly queued work.
+        await _refresh_qualification_if_due(session, generator=generator, now=now)
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
     response.headers["Cache-Control"] = "no-store"
     logger.info(
         "issued job agent=%s validator=%s deadline=%s",

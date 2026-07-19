@@ -25,6 +25,9 @@ from ditto.api_models.admin_quarantine import (
     AdminBenchmarkContractRefreshDetail,
     AdminBenchmarkContractRefreshRequest,
     AdminBenchmarkContractRefreshResponse,
+    AdminBenchmarkQualificationDetail,
+    AdminBenchmarkQualificationRequest,
+    AdminBenchmarkQualificationResponse,
     AdminDuplicateSummary,
     AdminMinerContext,
     AdminMinerQuarantineSummary,
@@ -62,9 +65,14 @@ from ditto.api_models.admin_quarantine import (
     AdminValidatorAssignmentReleaseResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator import ArtifactResponse
+from ditto.api_server.benchmark_rollout import (
+    PendingQualification,
+    qualification_candidate,
+)
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_dataset_generator,
@@ -84,6 +92,7 @@ from ditto.db.models import (
     Agent,
     BenchmarkDataset,
     BenchmarkRollout,
+    BenchmarkRolloutMember,
     Score,
     ScreeningAttempt,
     ScreeningDispute,
@@ -92,7 +101,16 @@ from ditto.db.models import (
     ValidatorHeartbeat,
     ValidatorTicket,
 )
-from ditto.db.queries.benchmark_rollout import active_bench_version, open_rollout
+from ditto.db.queries.benchmark_rollout import (
+    DatasetPin as RolloutDatasetPin,
+)
+from ditto.db.queries.benchmark_rollout import (
+    active_bench_version,
+    append_rollout_member,
+    maybe_activate_rollout,
+    open_rollout,
+    rolling_top_five,
+)
 from ditto.db.queries.tickets import RETRY_COOLDOWN
 
 logger = logging.getLogger(__name__)
@@ -1673,6 +1691,301 @@ async def _benchmark_contract_migration_state(
         target_scores,
         screening_active,
         validator_active,
+    )
+
+
+async def _benchmark_qualification_state(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    generator_run_size: str | None,
+    for_update: bool = False,
+) -> tuple[
+    AdminBenchmarkQualificationDetail,
+    PendingQualification | None,
+]:
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    rollout = await open_rollout(session)
+    source_version = rollout.from_version if rollout is not None else None
+    target_version = rollout.desired_version if rollout is not None else None
+    total_scores = int(
+        await session.scalar(
+            select(func.count()).select_from(Score).where(Score.agent_id == agent_id)
+        )
+        or 0
+    )
+    source_scores = (
+        int(
+            await session.scalar(
+                select(func.count())
+                .select_from(Score)
+                .where(
+                    Score.agent_id == agent_id,
+                    Score.bench_version == source_version,
+                )
+            )
+            or 0
+        )
+        if source_version is not None
+        else 0
+    )
+    target_scores = (
+        int(
+            await session.scalar(
+                select(func.count())
+                .select_from(Score)
+                .where(
+                    Score.agent_id == agent_id,
+                    Score.bench_version == target_version,
+                )
+            )
+            or 0
+        )
+        if target_version is not None
+        else 0
+    )
+    screening_active = (
+        await session.scalar(
+            select(ScreeningAttempt.attempt_id).where(
+                ScreeningAttempt.agent_id == agent_id,
+                ScreeningAttempt.status == "running",
+            )
+        )
+        is not None
+    )
+    now = datetime.now(UTC)
+    issued_ticket_statement = select(ValidatorTicket.agent_id).where(
+        ValidatorTicket.agent_id == agent_id,
+        ValidatorTicket.status == TicketStatus.ISSUED,
+        ValidatorTicket.deadline > now,
+    )
+    if for_update:
+        issued_ticket_statement = issued_ticket_statement.with_for_update()
+    issued_ticket_active = (
+        await session.scalar(issued_ticket_statement.limit(1)) is not None
+    )
+    heartbeat_active = (
+        await session.scalar(
+            select(ValidatorHeartbeat.validator_hotkey).where(
+                ValidatorHeartbeat.active_agent_id == agent_id,
+                ValidatorHeartbeat.state == "running_benchmark",
+                ValidatorHeartbeat.seen_at >= now - timedelta(minutes=5),
+            )
+        )
+        is not None
+    )
+    validator_active = issued_ticket_active or heartbeat_active
+    top_five = await rolling_top_five(session) if rollout is not None else []
+    top_member = next(
+        (member for member in top_five if member.agent_id == agent_id), None
+    )
+    member = (
+        await session.get(BenchmarkRolloutMember, (rollout.rollout_id, agent_id))
+        if rollout is not None
+        else None
+    )
+    target_dataset = (
+        await session.get(BenchmarkDataset, (agent_id, target_version))
+        if target_version is not None
+        else None
+    )
+    candidate = None
+    candidate_reason = None
+    if rollout is not None and top_member is not None:
+        candidate, candidate_reason = await qualification_candidate(
+            session,
+            source_bench_version=rollout.from_version,
+            target_bench_version=rollout.desired_version,
+            member=top_member,
+            generator_run_size=generator_run_size,
+        )
+    blocking_reason: str | None = None
+    if rollout is None:
+        blocking_reason = "an open benchmark rollout is required"
+    elif agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
+        blocking_reason = "submission must be scored or live"
+    elif top_member is None:
+        blocking_reason = "submission is not in the current hybrid top five"
+    elif member is not None:
+        blocking_reason = "submission is already a rollout member"
+    elif screening_active:
+        blocking_reason = "screening attempt is active"
+    elif validator_active:
+        blocking_reason = "validator benchmark is active"
+    elif candidate is None:
+        blocking_reason = candidate_reason or "dataset input is unavailable"
+    detail = AdminBenchmarkQualificationDetail(
+        agent_id=agent_id,
+        agent_name=agent.name,
+        agent_status=agent.status,
+        artifact_sha256=agent.sha256,
+        rollout_id=rollout.rollout_id if rollout is not None else None,
+        source_bench_version=source_version,
+        target_bench_version=target_version,
+        currently_top_five=top_member is not None,
+        rollout_member=member is not None,
+        target_dataset_sha256=(
+            target_dataset.sha256 if target_dataset is not None else None
+        ),
+        total_score_count=total_scores,
+        source_score_count=source_scores,
+        target_score_count=target_scores,
+        screening_attempt_active=screening_active,
+        validator_run_active=validator_active,
+        qualification_allowed=blocking_reason is None,
+        blocking_reason=blocking_reason,
+    )
+    return detail, candidate
+
+
+@router.get(
+    "/screening-submissions/{agent_id}/qualify-benchmark-rollout",
+    response_model=AdminBenchmarkQualificationDetail,
+)
+async def inspect_benchmark_qualification(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+    generator: GeneratorDep,
+) -> AdminBenchmarkQualificationDetail:
+    """Inspect the guarded scored/live rolling-qualification inputs."""
+    detail, _candidate = await _benchmark_qualification_state(
+        session,
+        agent_id=agent_id,
+        generator_run_size=generator.run_size,
+    )
+    return detail
+
+
+@router.post(
+    "/screening-submissions/{agent_id}/qualify-benchmark-rollout",
+    response_model=AdminBenchmarkQualificationResponse,
+)
+async def qualify_benchmark_rollout(
+    agent_id: UUID,
+    payload: AdminBenchmarkQualificationRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    generator: GeneratorDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminBenchmarkQualificationResponse:
+    """Append a guarded top-five contender without touching its accepted scores."""
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+
+    detail, candidate = await _benchmark_qualification_state(
+        session,
+        agent_id=agent_id,
+        generator_run_size=generator.run_size,
+    )
+    if detail.rollout_id != payload.expected_rollout_id:
+        raise HTTPException(status_code=409, detail="open benchmark rollout changed")
+    if detail.artifact_sha256 != payload.expected_sha256:
+        raise HTTPException(status_code=409, detail="artifact identity changed")
+    if (
+        detail.total_score_count != payload.expected_total_score_count
+        or detail.source_score_count != payload.expected_source_score_count
+        or detail.target_score_count != payload.expected_target_score_count
+    ):
+        raise HTTPException(status_code=409, detail="score count changed")
+    if not detail.qualification_allowed or candidate is None:
+        raise HTTPException(
+            status_code=409,
+            detail=detail.blocking_reason or "qualification is not allowed",
+        )
+    await session.rollback()
+    target_version = detail.target_bench_version
+    assert target_version is not None
+    target_sha256 = candidate.existing_sha256 or await generator.generate(
+        candidate.seed, bench_version=target_version
+    )
+
+    async with session.begin():
+        locked_agent = await session.scalar(
+            select(Agent).where(Agent.agent_id == agent_id).with_for_update()
+        )
+        if locked_agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        locked_rollout = await open_rollout(session, for_update=True)
+        if (
+            locked_rollout is None
+            or locked_rollout.rollout_id != payload.expected_rollout_id
+        ):
+            raise HTTPException(
+                status_code=409, detail="open benchmark rollout changed"
+            )
+        current, current_candidate = await _benchmark_qualification_state(
+            session,
+            agent_id=agent_id,
+            generator_run_size=generator.run_size,
+            for_update=True,
+        )
+        if current.artifact_sha256 != payload.expected_sha256:
+            raise HTTPException(status_code=409, detail="artifact identity changed")
+        if (
+            current.total_score_count != payload.expected_total_score_count
+            or current.source_score_count != payload.expected_source_score_count
+            or current.target_score_count != payload.expected_target_score_count
+        ):
+            raise HTTPException(status_code=409, detail="score count changed")
+        if not current.qualification_allowed or current_candidate is None:
+            raise HTTPException(
+                status_code=409,
+                detail=current.blocking_reason or "qualification is not allowed",
+            )
+        if current_candidate != candidate:
+            raise HTTPException(status_code=409, detail="dataset input changed")
+        appended = await append_rollout_member(
+            session,
+            rollout=locked_rollout,
+            member=current_candidate.member,
+            dataset=RolloutDatasetPin(
+                seed=current_candidate.seed,
+                sha256=target_sha256,
+                run_size=current_candidate.run_size,
+                seed_block=current_candidate.seed_block,
+                seed_block_hash=current_candidate.seed_block_hash,
+            ),
+            now=datetime.now(UTC),
+            audit_context={
+                "origin": "manual",
+                "actor": x_admin_actor,
+                "reason": payload.reason,
+            },
+        )
+        if not appended:
+            raise HTTPException(status_code=409, detail="qualification changed")
+        await maybe_activate_rollout(session, locked_rollout, now=datetime.now(UTC))
+        screening_queued = (
+            locked_agent.screening_policy_version
+            < benchmark_contract(target_version).minimum_screening_policy_version
+            or locked_agent.screened_image_sha256 is None
+            or locked_agent.screened_image_size_bytes is None
+            or locked_agent.screened_image_id is None
+            or locked_agent.screened_image_ref is None
+            or locked_agent.screened_image_upload_id is None
+            or locked_agent.screened_image_verified_at is None
+        )
+
+    logger.warning(
+        "admin_actor=%s qualified rolling contender agent_id=%s rollout_id=%s "
+        "target_version=%s screening_queued=%s reason=%s",
+        x_admin_actor,
+        agent_id,
+        payload.expected_rollout_id,
+        target_version,
+        screening_queued,
+        payload.reason,
+    )
+    return AdminBenchmarkQualificationResponse(
+        agent_id=agent_id,
+        agent_status=locked_agent.status,
+        rollout_id=payload.expected_rollout_id,
+        target_bench_version=target_version,
+        target_dataset_sha256=target_sha256,
+        screening_queued=screening_queued,
     )
 
 

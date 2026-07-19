@@ -115,6 +115,7 @@ from ditto.api_models.validator_capabilities import (
     ValidatorStackIdentity,
 )
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
+from ditto.api_server.benchmark_rollout import rolling_qualification_blockers
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.endpoints.scoring import (
     _confirmation_composites,
@@ -2204,8 +2205,12 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
 
 @router.get("/bench/rollout")
 async def benchmark_rollout_state(
-    response: Response, session: SessionDep
+    response: Response, session: SessionDep, generator: GeneratorDep
 ) -> dict[str, object]:
     """Expose desired/active versions and the frozen cohort's exact progress."""
     response.headers["Cache-Control"] = "public, max-age=30"
-    return await rollout_state(session)
+    state = await rollout_state(session)
+    state["qualification_blockers"] = await rolling_qualification_blockers(
+        session, generator_run_size=generator.run_size
+    )
+    return state
