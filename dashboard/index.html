@@ -273,6 +273,33 @@
 
     /* ── Leaderboard ────────────────────────────────────────── */
     .board { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+
+    /* Leaderboard tabs / sorting / pagination. Scored runs are the canonical
+       three-validator result and are the default view; provisional runs are
+       useful feedback but must never be mistaken for a final standing, so they
+       live behind their own tab rather than mixed into the same list. */
+    .board-tabs { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 0 0 10px; }
+    .board-tab {
+      appearance: none; background: var(--bg-elev-2); color: var(--text-dim);
+      border: 1px solid var(--border); border-radius: 9px; padding: 6px 12px;
+      font-size: 12.5px; font-weight: 700; cursor: pointer; font-family: inherit;
+    }
+    .board-tab[aria-selected="true"] { background: color-mix(in oklab, var(--accent) 18%, transparent); color: var(--text); border-color: color-mix(in oklab, var(--accent) 45%, var(--border)); }
+    .board-tab .cnt { color: var(--text-dim); font-weight: 600; margin-left: 6px; font-variant-numeric: tabular-nums; }
+    .board-tab[aria-selected="true"] .cnt { color: var(--text); }
+    thead th.sortable { cursor: pointer; user-select: none; }
+    thead th.sortable:hover { color: var(--text); }
+    thead th.sortable .sarrow { opacity: .35; margin-left: 4px; font-size: 10px; }
+    thead th[aria-sort="ascending"] .sarrow, thead th[aria-sort="descending"] .sarrow { opacity: 1; color: var(--accent); }
+    .board-pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+    .board-pager .pinfo { color: var(--text-dim); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+    .board-pager .pbtns { display: flex; gap: 6px; }
+    .board-pager button {
+      appearance: none; background: var(--bg-elev-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px;
+      font-size: 12.5px; font-weight: 700; cursor: pointer; font-family: inherit;
+    }
+    .board-pager button[disabled] { opacity: .4; cursor: default; }
     table { width: 100%; border-collapse: collapse; }
     /* A term with a hover explanation, dotted underline + help cursor cue it. */
     .tip { border-bottom: 1px dotted rgba(148,163,184,0.5); cursor: help; }
@@ -1737,7 +1764,7 @@
         <a class="nav-item" href="#/operations" data-page="operations"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/></svg></span><span class="ni-text"><span class="ni-label">Network ops</span><span class="ni-desc">Pipeline &amp; fleet health</span></span></a>
         <a class="nav-item" href="#/submissions" data-page="submissions"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg></span><span class="ni-text"><span class="ni-label">Submissions</span><span class="ni-desc">Recent uploads</span></span></a>
         <a class="nav-item" href="#/reviews" data-page="reviews"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3 3.6 7.2v5.6c0 4.7 3.6 7.2 8.4 8.2 4.8-1 8.4-3.5 8.4-8.2V7.2Z"/><path d="M9 12h6M12 9v6"/></svg></span><span class="ni-text"><span class="ni-label">ATH reviews</span><span class="ni-desc">Active public holds</span></span></a>
-        <a class="nav-item" href="#/benchmark" data-page="benchmark"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M21.3 15.3a2.4 2.4 0 0 1 0 3.4l-2.6 2.6a2.4 2.4 0 0 1-3.4 0L2.7 8.7a2.41 2.41 0 0 1 0-3.4l2.6-2.6a2.41 2.41 0 0 1 3.4 0Z"/><path d="m14.5 12.5 2-2"/><path d="m11.5 9.5 2-2"/><path d="m8.5 6.5 2-2"/><path d="m17.5 15.5 2-2"/></svg></span><span class="ni-text"><span class="ni-label">Benchmark</span><span class="ni-desc">What v2 measures</span></span></a>
+        <a class="nav-item" href="#/benchmark" data-page="benchmark"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M21.3 15.3a2.4 2.4 0 0 1 0 3.4l-2.6 2.6a2.4 2.4 0 0 1-3.4 0L2.7 8.7a2.41 2.41 0 0 1 0-3.4l2.6-2.6a2.41 2.41 0 0 1 3.4 0Z"/><path d="m14.5 12.5 2-2"/><path d="m11.5 9.5 2-2"/><path d="m8.5 6.5 2-2"/><path d="m17.5 15.5 2-2"/></svg></span><span class="ni-text"><span class="ni-label">Benchmark</span><span class="ni-desc">What v3 measures</span></span></a>
       </nav>
       <div class="side-theme">
       <div class="theme-switch" role="group" aria-label="Color theme">
@@ -1800,7 +1827,7 @@
       <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label"><span class="tip" title="Distinct miners with at least one scored run on the board (provisional runs included).">Miners Scored</span></div><div class="value" id="c-miners">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="The highest composite among ranked (full-benchmark) runs. Composite = (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates (efficiency, consistency, and canary integrity: a canary leak ×0.5, an honest miss ×0.85). Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
       <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" title="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 24 seeds at run_size=full. The score a submission must beat. Source: dittobench-api docs/BASELINES.md (bench_version 2).">Reference Baseline</span></div><div class="value" id="c-baseline">–</div></div>
+      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 25 seeds at run_size=full. The score a submission must beat. Source: dittobench-api docs/BASELINES.md (bench_version 3).">Reference Baseline</span></div><div class="value" id="c-baseline">–</div></div>
       <div class="card"><div class="label"><span class="tip" title="All validator score records stored by the platform, including the independent scores that make up each finalized result.">Total scores</span></div><div class="value" id="h-scores">–</div></div>
       <div class="card"><div class="label"><span class="tip" title="Validators currently reporting heartbeat-capable software to the platform.">Validators</span></div><div class="value" id="h-validators">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" title="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
@@ -1825,24 +1852,35 @@
     </div>
     <div class="leaderboard-notice" id="leaderboard-notice" role="status" aria-live="polite"></div>
     <div class="board">
+      <div class="board-tabs" role="tablist" aria-label="Leaderboard view">
+        <button class="board-tab" type="button" role="tab" data-board-tab="scored" aria-selected="true">Scored<span class="cnt" data-board-count="scored">0</span></button>
+        <button class="board-tab" type="button" role="tab" data-board-tab="provisional" aria-selected="false">Provisional<span class="cnt" data-board-count="provisional">0</span></button>
+      </div>
       <table id="board" tabindex="-1" aria-label="Subnet 118 leaderboard: best score per miner">
         <thead>
           <tr>
-            <th scope="col" style="width:72px"><span class="tip" title="Raw rank by finalized composite among full-benchmark runs. This is independent of KOTH emissions; provisional runs are unranked (–).">Score rank</span></th>
-            <th scope="col"><span class="tip" title="The miner's best-scoring agent, with its current SN118 UID and on-chain hotkey below. Open either identity for details, or copy the hotkey.">Best-scoring agent</span></th>
+            <th scope="col" style="width:72px" class="sortable" data-sort="rank" aria-sort="ascending"><span class="tip" title="Raw rank by finalized composite among full-benchmark runs. This is independent of KOTH emissions; provisional runs are unranked (–).">Score rank</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" class="sortable" data-sort="name"><span class="tip" title="The miner's best-scoring agent, with its current SN118 UID and on-chain hotkey below. Open either identity for details, or copy the hotkey.">Best-scoring agent</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" style="width:128px"><span class="tip" title="Current KOTH role. The incumbent receives 90% of the miner pool; up to four participation-tail recipients split the remaining 10%.">Emissions</span></th>
-            <th scope="col" class="hide-md" style="width:180px"><span class="tip" title="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under.">Model</span></th>
-            <th scope="col" style="width:190px"><span class="tip" title="Headline score in [0,1]: (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates. The band on the bar is ±1 standard error. The second line shows the score trend.">Composite</span></th>
-            <th scope="col" class="hide-sm" style="width:140px"><span class="tip" title="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span></th>
-            <th scope="col" class="hide-sm" style="width:140px"><span class="tip" title="Mean score across the memory cases. Did the agent recall and reason over stored facts across sessions, over time, and while resisting injected instructions?">Memory</span></th>
-            <th scope="col" class="num hide-sm" style="width:96px"><span class="tip" title="Median per-case response time for the run, and how many cases were scored (a full benchmark is ~114 cases).">Latency</span></th>
-            <th scope="col" class="num hide-sm" style="width:92px"><span class="tip" title="When this miner's winning agent was first uploaded to the platform.">First seen</span></th>
+            <th scope="col" class="hide-md sortable" data-sort="bench" style="width:180px"><span class="tip" title="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under. Sort to group runs by benchmark version.">Model</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" style="width:190px" class="sortable" data-sort="composite"><span class="tip" title="Headline score in [0,1]: (0.5 × tool mean + 0.5 × memory mean) scaled by integrity gates. The band on the bar is ±1 standard error. The second line shows the score trend.">Composite</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" class="hide-sm sortable" data-sort="tool" style="width:140px"><span class="tip" title="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" class="hide-sm sortable" data-sort="memory" style="width:140px"><span class="tip" title="Mean score across the memory cases. Did the agent recall and reason over stored facts across sessions, over time, and while resisting injected instructions?">Memory</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" class="num hide-sm sortable" data-sort="latency" style="width:96px"><span class="tip" title="Median per-case response time for the run, and how many cases were scored (a full benchmark is ~114 cases).">Latency</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" class="num hide-sm sortable" data-sort="first_seen" style="width:92px"><span class="tip" title="When this miner's winning agent was first uploaded to the platform.">First seen</span><span class="sarrow" aria-hidden="true">▲</span></th>
           </tr>
         </thead>
         <tbody id="rows">
           <tr><td colspan="9" class="empty">Loading leaderboard…</td></tr>
         </tbody>
       </table>
+      <div class="board-pager">
+        <span class="pinfo" id="board-pinfo"></span>
+        <span class="pbtns">
+          <button type="button" id="board-prev" aria-label="Previous page">Prev</button>
+          <button type="button" id="board-next" aria-label="Next page">Next</button>
+        </span>
+      </div>
     </div>
 
     </section>
@@ -2417,7 +2455,39 @@
     // composite a submission must beat, from 24 seeds at run_size=full on the
     // locked model. Tied to the bench_version it was measured on; refresh from a
     // new calibration run when the benchmark version bumps.
-    var REFERENCE_BASELINE = { bench_version: 2, composite: 0.492 };
+    // Leaderboard view state. The board keeps every entry (ranks, search and the
+    // rank-movement snapshot are computed over the whole field); this only
+    // controls what is DISPLAYED. Scored is the default tab because a
+    // provisional run is pre-quorum feedback, not a standing.
+    var boardView = { tab: "scored", sort: "rank", dir: 1, page: 1, pageSize: 25 };
+
+    // Sort accessors. Null/undefined always sorts last regardless of direction,
+    // so an unranked or legacy row never displaces real data at the top.
+    var BOARD_SORTS = {
+      rank:       function (e) { return e.rank; },
+      name:       function (e) { return (e.agent_name || e.miner_hotkey || "").toLowerCase(); },
+      bench:      function (e) { return e.bench_version; },
+      composite:  function (e) { return e.composite; },
+      tool:       function (e) { return e.tool_mean; },
+      memory:     function (e) { return e.memory_mean; },
+      latency:    function (e) { return e.median_ms; },
+      first_seen: function (e) { return e.first_seen ? Date.parse(e.first_seen) : null; }
+    };
+
+    function boardCompare(a, b) {
+      var get = BOARD_SORTS[boardView.sort] || BOARD_SORTS.rank;
+      var av = get(a), bv = get(b);
+      var an = av === null || av === undefined || av !== av;
+      var bn = bv === null || bv === undefined || bv !== bv;
+      if (an || bn) return an && bn ? 0 : (an ? 1 : -1);
+      if (av < bv) return -1 * boardView.dir;
+      if (av > bv) return 1 * boardView.dir;
+      // Composite breaks ties so equal sort keys stay in a stable, meaningful
+      // order rather than whatever the source array happened to hold.
+      return (b.composite || 0) - (a.composite || 0);
+    }
+
+    var REFERENCE_BASELINE = { bench_version: 3, composite: 0.445 };
 
     // Rank-movement baseline: the ranks from the viewer's last visit. Every
     // render compares against this snapshot (kept for the session) and then
@@ -2698,14 +2768,61 @@
       }
 
       // Rows
+      renderBoardRows();
+      persistRanks();
+      updateSearch();
+    }
+
+    // The visible slice: current tab, current sort, current page. Split out of
+    // render() so a tab/sort/page change re-renders the table without refetching
+    // or recomputing ranks.
+    function renderBoardRows() {
       var tb = document.getElementById("rows");
-      if (!entries.length) {
-        tb.innerHTML = '<tr><td colspan="9" class="empty">No miners have been scored yet. As soon as a submission clears scoring it appears here.</td></tr>';
-        persistRanks();
-        updateSearch();
+      var all = lastEntries || [];
+      var scored = all.filter(isFinalized);
+      var provisional = all.filter(function (e) { return !isFinalized(e); });
+      document.querySelectorAll("[data-board-count]").forEach(function (el) {
+        el.textContent = el.getAttribute("data-board-count") === "scored"
+          ? String(scored.length) : String(provisional.length);
+      });
+      document.querySelectorAll("[data-board-tab]").forEach(function (btn) {
+        btn.setAttribute("aria-selected", btn.getAttribute("data-board-tab") === boardView.tab ? "true" : "false");
+      });
+      document.querySelectorAll("thead th[data-sort]").forEach(function (th) {
+        if (th.getAttribute("data-sort") === boardView.sort) {
+          th.setAttribute("aria-sort", boardView.dir === 1 ? "ascending" : "descending");
+          var ar = th.querySelector(".sarrow");
+          if (ar) ar.textContent = boardView.dir === 1 ? "\u25B2" : "\u25BC";
+        } else {
+          th.removeAttribute("aria-sort");
+        }
+      });
+
+      var rows = (boardView.tab === "provisional" ? provisional : scored).slice().sort(boardCompare);
+      var pageCount = Math.max(1, Math.ceil(rows.length / boardView.pageSize));
+      if (boardView.page > pageCount) boardView.page = pageCount;
+      var start = (boardView.page - 1) * boardView.pageSize;
+      var pageRows = rows.slice(start, start + boardView.pageSize);
+
+      var pinfo = document.getElementById("board-pinfo");
+      var prev = document.getElementById("board-prev");
+      var next = document.getElementById("board-next");
+      if (pinfo) {
+        pinfo.textContent = rows.length
+          ? "Showing " + (start + 1) + "\u2013" + (start + pageRows.length) + " of " + rows.length +
+            (boardView.tab === "provisional" ? " provisional" : " scored") + " \u00b7 page " + boardView.page + " of " + pageCount
+          : "";
+      }
+      if (prev) prev.disabled = boardView.page <= 1;
+      if (next) next.disabled = boardView.page >= pageCount;
+
+      if (!pageRows.length) {
+        tb.innerHTML = '<tr><td colspan="9" class="empty">' + (boardView.tab === "provisional"
+          ? "No provisional runs right now. Pre-quorum scores appear here as validators report them."
+          : "No miners have been scored yet. As soon as a submission clears scoring it appears here.") + '</td></tr>';
         return;
       }
-      tb.innerHTML = entries.map(function (e, i) {
+      tb.innerHTML = pageRows.map(function (e, i) {
         var elig = isEligible(e);
         var finalizedEntry = isFinalized(e);
         var registered = isRegistered(e);
@@ -2757,9 +2874,43 @@
             '<td class="num hide-sm muted">' + relTime(e.first_seen) + '</td>' +
           '</tr>';
       }).join("");
-      persistRanks();
-      updateSearch();
     }
+
+    // Tab / sort / page controls. Each only re-renders the visible slice.
+    document.querySelectorAll("[data-board-tab]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var tab = btn.getAttribute("data-board-tab");
+        if (tab === boardView.tab) return;
+        boardView.tab = tab;
+        boardView.page = 1;
+        renderBoardRows();
+      });
+    });
+    document.querySelectorAll("thead th[data-sort]").forEach(function (th) {
+      th.addEventListener("click", function () {
+        var key = th.getAttribute("data-sort");
+        if (boardView.sort === key) {
+          boardView.dir = boardView.dir === 1 ? -1 : 1;
+        } else {
+          boardView.sort = key;
+          // Rank and name read naturally ascending; every score-like column is
+          // most useful highest-first.
+          boardView.dir = (key === "rank" || key === "name") ? 1 : -1;
+        }
+        boardView.page = 1;
+        renderBoardRows();
+      });
+    });
+    (function () {
+      var prev = document.getElementById("board-prev");
+      var next = document.getElementById("board-next");
+      if (prev) prev.addEventListener("click", function () {
+        if (boardView.page > 1) { boardView.page--; renderBoardRows(); }
+      });
+      if (next) next.addEventListener("click", function () {
+        boardView.page++; renderBoardRows();
+      });
+    })();
 
     function renderLeaderboardUnavailable() {
       lastEntries = [];
@@ -5106,7 +5257,7 @@
       operations:  ["Network operations", "Live submission pipeline and validator / screener fleet health"],
       submissions: ["Recent submissions", "Screening evidence and validator quorum progress · select a row for history"],
       reviews:     ["ATH reviews", "Public queue of held high-score submissions · scores preserved, emissions paused"],
-      benchmark:   ["Benchmark", "What DittoBench v2 measures and the frozen scoring setup"]
+      benchmark:   ["Benchmark", "What DittoBench v3 measures and the frozen scoring setup"]
     };
     function route(initial) {
       var m = /^#\/([a-z]+)/.exec(location.hash || "");
