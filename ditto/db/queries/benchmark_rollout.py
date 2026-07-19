@@ -358,8 +358,12 @@ async def maybe_activate_rollout(
         )
     ).all()
     counts: dict[UUID, int] = {agent_id: int(count) for agent_id, count in count_rows}
+    # Fewer than quorum is "not ready yet"; MORE than quorum is still ready. An
+    # equality test deadlocks the rollout permanently the first time any member
+    # picks up a 4th score (a retry grant, an admin recovery, or a lost race),
+    # with no operator escape hatch.
     if len(counts) != COHORT_SIZE or any(
-        count != SCORING_QUORUM for count in counts.values()
+        count < SCORING_QUORUM for count in counts.values()
     ):
         return False
     if not await _validate_frozen_members(session, rollout, now=now):

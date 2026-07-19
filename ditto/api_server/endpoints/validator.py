@@ -78,7 +78,6 @@ from ditto.api_models.validator_capabilities import (
     validator_identity_signing_token,
 )
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
-from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.config import ValidatorCompatibilityConfig
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -106,6 +105,7 @@ from ditto.db.queries.audit import (
 )
 from ditto.db.queries.benchmark_rollout import (
     CANARY_BENCH_VERSION,
+    DEFAULT_BENCH_VERSION,
     active_bench_version,
     heartbeat_supports_v3,
     issue_rollout_ticket,
@@ -312,13 +312,39 @@ def _score_signing_message(
     expired attempt cannot be replayed after the ticket is reissued.
     """
     lease = _lease_token(ticket_deadline) if ticket_deadline is not None else ""
-    legacy = (
+    # CANONICAL FIELD ORDER, mirrored byte-for-byte by ditto-subnet
+    # ditto/validator/signing.py. Two independent changes each append a
+    # conditional suffix here, so the order is fixed deliberately rather than
+    # left to whichever merged first:
+    #
+    #   base : bench_version? : transcript_sha256?
+    #
+    # bench_version sits next to seed because it QUALIFIES the seed -- the same
+    # seed is a different dataset under a different contract -- so the "what was
+    # scored" tuple stays contiguous. transcript_sha256 binds the artifact the
+    # run PRODUCED, so it is outermost. A validator that sends neither produces
+    # the pre-existing bytes, which is what keeps old validators verifiable.
+    msg = (
         f"{validator_hotkey}:{agent_id}:{lease}:{report.run_id}:"
         f"{report.composite!r}:{report.seed}"
     )
     if report.bench_version is not None:
-        legacy += f":{report.bench_version}"
-    return legacy.encode()
+        msg += f":{report.bench_version}"
+    transcript = _reported_transcript_sha256(report)
+    if transcript:
+        msg += f":{transcript}"
+    return msg.encode()
+
+
+def _reported_transcript_sha256(report: ScoreReport) -> str | None:
+    """The transcript digest a report declares, or None.
+
+    Both sides derive presence from the same report field, so a validator that
+    publishes no transcript signs the shorter payload and still verifies.
+    """
+    details = report.details if isinstance(report.details, dict) else {}
+    raw = details.get("transcript_sha256")
+    return raw if isinstance(raw, str) and raw else None
 
 
 def _job_signing_message(
@@ -1035,7 +1061,11 @@ async def submit_score(
             validator_hotkey=payload.validator_hotkey,
             now=datetime.now(UTC),
             deadline=payload.ticket_deadline,
-            bench_version=(report.bench_version or CURRENT_BENCH_VERSION),
+            # A validator on the old protocol omits bench_version. Falling back
+            # to CURRENT would send every legacy submission hunting a ticket for
+            # whatever version is current (3 once the bump lands), find none, and
+            # 409. Legacy means v2 by definition, so pin the default.
+            bench_version=(report.bench_version or DEFAULT_BENCH_VERSION),
             for_update=True,
         )
         if ticket is None:
