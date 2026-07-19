@@ -29,21 +29,21 @@ router = APIRouter(prefix="/admin/benchmark-rollout", tags=["admin"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 GeneratorDep = Annotated[DatasetGenerator, Depends(get_dataset_generator)]
 AdminDep = Annotated[None, Depends(require_admin)]
-MINIMUM_V3_START_VALIDATORS = 1
+MINIMUM_V3_START_VALIDATORS = 2
 
 
 async def _require_v3_start_capacity(
     session: AsyncSession, *, now: datetime
 ) -> dict[str, object]:
-    """Fail closed until one independently verified v3 scorer is online."""
+    """Fail closed until two independently verified v3 scorers are online."""
     state = await rollout_state(session, now=now)
     capable = int(state["v3_capable_validator_count"])
     if capable < MINIMUM_V3_START_VALIDATORS:
         raise HTTPException(
             status_code=409,
             detail=(
-                "benchmark v3 rollout requires at least one fresh, "
-                "identity-matched v8 scorer validator"
+                "benchmark v3 rollout requires at least two fresh, "
+                "identity-matched v8 scorer validators"
             ),
         )
     return state

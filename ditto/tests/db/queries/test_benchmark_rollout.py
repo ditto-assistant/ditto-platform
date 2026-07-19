@@ -12,7 +12,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.ticket_status import TicketStatus
-from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
+from ditto.api_server.benchmark_rollout import (
+    ensure_rolling_qualification,
+    refresh_rolling_qualification,
+)
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     _require_v3_start_capacity,
     start_v3_rollout,
@@ -536,6 +539,94 @@ async def test_only_one_open_rollout_across_collecting_and_blocked_states() -> N
     await engine.dispose()
 
 
+async def test_first_capable_validator_automatically_seeds_v3_work() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        for position in range(1, 6):
+            agent_id = uuid4()
+            session.add(
+                Agent(
+                    agent_id=agent_id,
+                    miner_hotkey=f"miner-auto-{position}",
+                    name=f"auto-{position}",
+                    sha256=f"{position:x}" * 64,
+                    status=AgentStatus.SCORED,
+                    screening_policy_version=9,
+                    screened_image_sha256=f"{position:x}" * 64,
+                    screened_image_size_bytes=1024,
+                    screened_image_id="sha256:" + f"{position:x}" * 64,
+                    screened_image_ref=f"ditto-screen/{agent_id}:latest",
+                    screened_image_upload_id=uuid4(),
+                    screened_image_verified_at=now,
+                    dataset_seed=position,
+                    dataset_sha256="c" * 64,
+                    dataset_run_size="full",
+                    created_at=now + timedelta(seconds=position),
+                )
+            )
+            for validator in range(3):
+                session.add(
+                    Score(
+                        agent_id=agent_id,
+                        bench_version=2,
+                        validator_hotkey=f"legacy-{validator}",
+                        run_id=f"auto-v2-{position}-{validator}",
+                        signature="aa",
+                        seed=position,
+                        composite=0.5 + position / 100,
+                        tool_mean=0.5,
+                        memory_mean=0.5,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": 2},
+                        generated_at=now,
+                    )
+                )
+        capabilities, stack = _capabilities(now)
+        session.add(
+            ValidatorHeartbeat(
+                validator_hotkey="validator-auto",
+                software_version="1.0.0",
+                protocol_version=8,
+                code_digest="d" * 64,
+                state="polling",
+                first_seen_at=now,
+                reported_at=now,
+                seen_at=now,
+                signature="ab" * 64,
+                capabilities=capabilities,
+                stack=stack,
+            )
+        )
+
+    generator = AsyncMock()
+    generator.generate.return_value = "e" * 64
+    assert await ensure_rolling_qualification(
+        session, generator=generator, now=now
+    )
+    assert generator.generate.await_count == 5
+    async with session.begin():
+        rollout = await open_rollout(session)
+        assert rollout is not None
+        ticket = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-auto",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert ticket is not None
+        assert ticket.bench_version == 3
+
+    # Repeated job polls are idempotent and do not render another dataset set.
+    assert not await ensure_rolling_qualification(session, generator=generator, now=now)
+    assert generator.generate.await_count == 5
+    await engine.dispose()
+
+
 async def test_admin_start_is_idempotent_after_unique_transition_activation() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
@@ -580,7 +671,7 @@ async def test_admin_start_is_idempotent_after_unique_transition_activation() ->
 
 
 @pytest.mark.parametrize("capable_count", [0, 1, 2])
-async def test_v3_start_requires_one_capable_validator_and_matches_telemetry(
+async def test_v3_start_requires_two_capable_validators_and_matches_telemetry(
     capable_count: int,
 ) -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -610,11 +701,11 @@ async def test_v3_start_requires_one_capable_validator_and_matches_telemetry(
 
         telemetry = await rollout_state(session, now=now)
         assert telemetry["v3_capable_validator_count"] == capable_count
-        if capable_count < 1:
+        if capable_count < 2:
             with pytest.raises(HTTPException) as exc_info:
                 await _require_v3_start_capacity(session, now=now)
             assert exc_info.value.status_code == 409
-            assert "at least one" in str(exc_info.value.detail)
+            assert "at least two" in str(exc_info.value.detail)
             assert await open_rollout(session) is None
         else:
             guarded = await _require_v3_start_capacity(session, now=now)

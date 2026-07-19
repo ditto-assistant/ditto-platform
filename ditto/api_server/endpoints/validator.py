@@ -85,7 +85,10 @@ from ditto.api_models.validator_capabilities import (
     validator_identity_signing_token,
 )
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
-from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
+from ditto.api_server.benchmark_rollout import (
+    ensure_rolling_qualification,
+    refresh_rolling_qualification,
+)
 from ditto.api_server.config import ValidatorCompatibilityConfig
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
@@ -761,6 +764,7 @@ async def request_job(
     response: Response,
     chain: ChainDep,
     session: SessionDep,
+    generator: GeneratorDep,
     x_validator_hotkey: Annotated[str | None, Header()] = None,
 ) -> JobResponse | Response:
     """Issue this validator a scoring ticket for the next eligible agent.
@@ -793,6 +797,13 @@ async def request_job(
     await _assert_validator_permitted(
         chain, netuid, payload.validator_hotkey, network=network
     )
+
+    try:
+        await ensure_rolling_qualification(session, generator=generator, now=now)
+    except Exception:
+        # Qualification bootstrap is convergent and must not strand ordinary
+        # v2 work if dataset rendering is temporarily unavailable.
+        logger.exception("automatic benchmark-v3 qualification bootstrap failed")
 
     async with session.begin():
         await _assert_validator_compatible(
