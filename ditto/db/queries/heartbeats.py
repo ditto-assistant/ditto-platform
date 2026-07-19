@@ -128,6 +128,7 @@ async def upsert_validator_heartbeat(
     signature: str,
     capabilities: dict | None = None,
     stack: dict | None = None,
+    stack_health: dict | None = None,
 ) -> tuple[ValidatorHeartbeat, bool]:
     """Persist only a strictly newer heartbeat; return ``(row, accepted)``."""
     row = await session.scalar(
@@ -153,6 +154,7 @@ async def upsert_validator_heartbeat(
             ),
             "capabilities": capabilities,
             "stack": stack,
+            "stack_health": stack_health,
             "reported_at": reported_at,
             "seen_at": seen_at,
             "signature": signature,
@@ -216,6 +218,7 @@ async def upsert_validator_heartbeat(
     row.system_metrics = system_metrics
     row.capabilities = capabilities
     row.stack = stack
+    row.stack_health = stack_health
     if benchmark_progress is not None:
         row.benchmark_progress = benchmark_progress
         row.benchmark_progress_reported = True

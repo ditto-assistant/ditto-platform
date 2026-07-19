@@ -29,6 +29,7 @@ the authority that independently computes and submits the real weight vector.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import math
@@ -105,6 +106,7 @@ from ditto.api_models.screener import (
     ScreenerProgress,
     ScreenerRuntimeState,
 )
+from ditto.api_models.stack_health import ValidatorStackHealth
 from ditto.api_models.system_health import SystemMetrics
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator import ValidatorRuntimeState
@@ -927,6 +929,12 @@ def _validator_heartbeats_response(
                 # Stored telemetry is not trusted merely because it is JSON.
                 # Malformed v7 data is omitted publicly and rejected for routing.
                 pass
+        stack_health = None
+        if row.protocol_version >= 9:
+            # Same posture as v7 identity: publish only what re-validates
+            # against the closed schema, never raw stored JSON.
+            with contextlib.suppress(ValidationError):
+                stack_health = ValidatorStackHealth.model_validate(row.stack_health)
         assignment_state: ValidatorAssignmentState
         if assignment is None:
             assignment_state = (
@@ -973,6 +981,7 @@ def _validator_heartbeats_response(
                 system_metrics=metrics,
                 capabilities=capabilities,
                 stack=stack,
+                stack_health=stack_health,
             )
         )
     return PublicValidatorHeartbeatsResponse(

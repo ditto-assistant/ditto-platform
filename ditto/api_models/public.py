@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.screener import ScreenerProgressStage, ScreenerRuntimeState
+from ditto.api_models.stack_health import ValidatorStackHealth
 from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
@@ -1417,6 +1418,7 @@ class PublicValidatorHeartbeat(BaseModel):
     system_metrics: PublicSystemMetrics | None = None
     capabilities: ValidatorCapabilities | None = None
     stack: ValidatorStackIdentity | None = None
+    stack_health: ValidatorStackHealth | None = None
 
 
 class PublicValidatorHeartbeatsResponse(BaseModel):

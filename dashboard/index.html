@@ -507,6 +507,15 @@
     .stat-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
     .stat-row .k { color: var(--text-dim); font-size: 13px; }
     .stat-row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .vdetail .cgsum { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .vdetail .cgsum .stage { margin-left: auto; }
+    .vdetail .cgsum .probe-time { color: var(--text-dim); font-size: 12px; }
+    .vdetail .stat-row .v { max-width: 62%; text-align: right; overflow-wrap: anywhere; }
+    .vdetail .stat-row .v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 500; }
+    .vdetail .subhead { margin: 10px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); }
+    .vdetail .identity-note { display: block; margin: 6px 0 2px; font-size: 12px; }
+    .vdetail .identity-note.good { color: var(--good); }
+    .vdetail .identity-note.warn { color: var(--warn, #b58900); }
     .split { margin: 18px 0 0; }
     #d-stats { margin-top: 22px; }
     .split .seg { display: flex; height: 34px; border-radius: 9px; overflow: hidden; border: 1px solid var(--border); }
@@ -2307,7 +2316,10 @@
 
     function configureEntityActions(kind, identifier) {
       var plural = ENTITY_PATHS[kind] || kind;
-      document.getElementById("d-open-full").href = fullEntityHref(kind, identifier);
+      var openFull = document.getElementById("d-open-full");
+      // Full-page routes exist only for agents and miners.
+      openFull.style.display = kind === "agent" || kind === "miner" ? "" : "none";
+      openFull.href = fullEntityHref(kind, identifier);
       document.getElementById("d-back-dashboard").href = dashboardHref(ENTITY_PAGES[plural]);
     }
 
@@ -3083,6 +3095,7 @@
         ? "Raw score rank #" + e.rank + (e._emission && e._emission.role === "champion" ? " · KOTH champion" : "")
         : "Provisional rank P" + e.rank + " · " + (e.score_count || 0) + " of " + (e.score_quorum || 3) + " scores";
       benchChip(e);
+      document.querySelector("#modal .dk-label").textContent = "Miner";
       document.getElementById("d-hotkey").innerHTML = entityAnchor("miner", e.miner_hotkey, e.miner_hotkey);
       document.getElementById("d-hotkey-copy").setAttribute("data-key", e.miner_hotkey || "");
 
@@ -3548,7 +3561,7 @@
       if (!modal.classList.contains("open")) return;
       var entity = readEntityRoute();
       if (!preserveUrl && entity && entity.full) return;
-      if (!preserveUrl && entity && (entity.kind === "agents" || entity.kind === "miners")) {
+      if (!preserveUrl && entity && (entity.kind === "agents" || entity.kind === "miners" || entity.kind === "validators")) {
         if (entityReturnUrl && history.state && history.state.entity) {
           history.back();
           return;
@@ -4414,6 +4427,7 @@
       chip.className = stage[1];
       chip.textContent = stage[0];
       chip.title = "Current submission stage";
+      document.querySelector("#modal .dk-label").textContent = "Miner";
       document.getElementById("d-hotkey").innerHTML = entityAnchor("miner", e.miner_hotkey, e.miner_hotkey);
       document.getElementById("d-hotkey-copy").setAttribute("data-key", e.miner_hotkey || "");
       document.getElementById("d-stats").innerHTML = renderPipelineSummary(
@@ -4734,6 +4748,244 @@
       return "";
     }
 
+
+    // ── Validator detail (signed heartbeat, capabilities, per-component stack health) ──
+    var STACK_COMPONENT_LABELS = {
+      ditto_subnet: "Validator worker",
+      dittobench_api: "Scorer · dittobench-api",
+      sandbox_docker: "Sandbox Docker",
+      model_relay: "Model relay",
+      pylon: "Pylon",
+      ollama: "Ollama"
+    };
+    var STACK_COMPONENT_ORDER = ["ditto_subnet", "dittobench_api", "sandbox_docker", "model_relay", "pylon", "ollama"];
+    var COMPONENT_HEALTH_CHIPS = {
+      healthy: ["Healthy", "good"],
+      degraded: ["Degraded", "warn"],
+      unreachable: ["Unreachable", "bad"],
+      identity_mismatch: ["Identity mismatch", "bad"],
+      unknown: ["Not observed", "unknown"]
+    };
+
+    function componentHealthChip(state) {
+      var chip = COMPONENT_HEALTH_CHIPS[state] || ["Unknown", "unknown"];
+      return '<span class="stage ' + chip[1] + '">' + esc(chip[0]) + '</span>';
+    }
+
+    function vstat(label, valueHtml, mono) {
+      return '<div class="stat-row"><span class="k">' + esc(label) + '</span><span class="v' +
+        (mono ? " mono" : "") + '">' + valueHtml + '</span></div>';
+    }
+
+    function monoValue(value, copyLabel) {
+      if (!value) return "";
+      var shown = String(value);
+      var display = shown.length > 26 ? shown.slice(0, 12) + "…" + shown.slice(-10) : shown;
+      return '<span class="copyable" title="' + esc(shown) + '"><span>' + esc(display) + '</span>' +
+        copyButton(shown, copyLabel || "value") + '</span>';
+    }
+
+    function unixTimeHtml(seconds) {
+      if (seconds == null) return "";
+      var iso = new Date(seconds * 1000).toISOString();
+      return '<span class="fleet-time" title="' + esc(iso) + '">' + relTime(iso) + '</span>';
+    }
+
+    function isoTimeHtml(iso) {
+      if (!iso) return esc("–");
+      return '<span class="fleet-time" title="' + esc(iso) + '">' + relTime(iso) + '</span>';
+    }
+
+    function yesNo(value) {
+      if (value === true) return "Yes";
+      if (value === false) return "No";
+      return "Not reported";
+    }
+
+    function identityRows(identity, copyPrefix) {
+      if (!identity) return "";
+      var rows = "";
+      if (identity.image_digest) rows += vstat("Image digest", monoValue(identity.image_digest, copyPrefix + " image digest"), true);
+      if (identity.source_revision) rows += vstat("Source revision", monoValue(identity.source_revision, copyPrefix + " source revision"), true);
+      if (identity.version) rows += vstat("Version", esc(identity.version));
+      return rows;
+    }
+
+    function identityComparisonNote(configured, observed) {
+      if (!configured || !observed) return "";
+      var checks = [
+        ["image_digest", "image digest"],
+        ["source_revision", "source revision"]
+      ];
+      for (var i = 0; i < checks.length; i++) {
+        var key = checks[i][0];
+        if (configured[key] && observed[key]) {
+          return configured[key] === observed[key]
+            ? '<span class="identity-note good">Observed ' + checks[i][1] + " matches the configured pin.</span>"
+            : '<span class="identity-note warn">Observed ' + checks[i][1] + " differs from the configured pin.</span>";
+        }
+      }
+      return "";
+    }
+
+    function renderStackComponent(name, configured, observed) {
+      var label = STACK_COMPONENT_LABELS[name] || name;
+      var summaryBits = '<span>' + esc(label) + '</span>';
+      if (observed && observed.observed_at != null) {
+        summaryBits += '<span class="probe-time">probed ' + unixTimeHtml(observed.observed_at) + '</span>';
+      }
+      summaryBits += componentHealthChip(observed ? observed.health : null);
+      var body = "";
+      if (observed) {
+        body += vstat("Health", componentHealthChip(observed.health));
+        body += vstat("Required component", yesNo(observed.required));
+        if (observed.ready != null) body += vstat("Endpoint ready", yesNo(observed.ready));
+        if (observed.model_ready != null) {
+          body += vstat(name === "ollama" ? "Embedding model ready" : "Model route ready", yesNo(observed.model_ready));
+        }
+        if (observed.observed_at != null) body += vstat("Last probe", unixTimeHtml(observed.observed_at));
+        body += '<div class="subhead">Observed identity</div>';
+        body += observed.observed_identity
+          ? identityRows(observed.observed_identity, label + " observed")
+          : vstat("Observed identity", '<span class="muted">Not independently observed</span>');
+      } else {
+        body += vstat("Health", '<span class="muted">Not reported (requires heartbeat protocol 9)</span>');
+      }
+      if (configured) {
+        body += '<div class="subhead">Configured identity</div>';
+        body += vstat("Provenance", esc(configured.provenance || "unknown"));
+        body += identityRows(configured, label + " configured") || vstat("Identity", '<span class="muted">None pinned</span>');
+      }
+      var note = identityComparisonNote(configured, observed && observed.observed_identity);
+      return '<details class="cgroup"><summary class="cgsum">' + summaryBits + '</summary>' +
+        '<div class="crow-body" style="padding:2px 0 10px 22px">' + body + note + '</div></details>';
+    }
+
+    function renderScorerBenchmarks(scorer) {
+      if (!scorer) return vstat("Scorer benchmarks", '<span class="muted">Not reported (requires heartbeat protocol 8)</span>');
+      var statusChips = {
+        fresh_verified: ["Fresh, identity-verified", "good"],
+        legacy_v2: ["Legacy scorer (v2 only)", "warn"],
+        unreachable: ["Scorer unreachable", "bad"],
+        identity_mismatch: ["Scorer identity mismatch", "bad"]
+      };
+      var chip = statusChips[scorer.status] || [scorer.status, "unknown"];
+      var out = vstat("Scorer status", '<span class="stage ' + chip[1] + '">' + esc(chip[0]) + '</span>');
+      out += vstat("Supported benchmarks", esc((scorer.supported_bench_versions || []).map(function (v) { return "v" + v; }).join(", ") || "–"));
+      if (scorer.observed_at != null) out += vstat("Capability observed", unixTimeHtml(scorer.observed_at));
+      if (scorer.software_version) out += vstat("Scorer version", esc(scorer.software_version));
+      if (scorer.source_revision) out += vstat("Scorer revision", monoValue(scorer.source_revision, "scorer source revision"), true);
+      return out;
+    }
+
+    function renderValidatorDetail(entry) {
+      var status = fleetStatus(entry);
+      var report = "";
+      report += vstat("Fleet status", '<span class="stage ' + status[1] + '">' + esc(status[0]) + '</span>');
+      report += vstat("Worker state", esc(entry.state || "unknown"));
+      report += vstat("Software version", esc(entry.software_version || "Unknown"));
+      report += vstat("Heartbeat protocol", esc(String(entry.protocol_version)));
+      report += vstat("First seen", isoTimeHtml(entry.first_seen_at));
+      report += vstat("Validator reported", isoTimeHtml(entry.reported_at));
+      report += vstat("Platform received", isoTimeHtml(entry.seen_at));
+      var assignment = renderValidatorAssignment(entry);
+      if (assignment) report += vstat("Assignment", assignment);
+      else if (entry.active_benchmark) report += vstat("Active benchmark", renderBenchmarkProgress(entry.active_benchmark, true));
+
+      var caps = "";
+      var c = entry.capabilities;
+      if (c) {
+        caps += vstat("Screened images", yesNo(c.screened_images));
+        caps += vstat("Requires screened image", yesNo(c.require_screened_image));
+        caps += vstat("Source-build fallback", yesNo(c.source_build_fallback));
+        caps += vstat("Managed full stack", yesNo(c.full_stack_managed));
+        caps += vstat("Stack auto-updater", yesNo(c.stack_updater));
+        caps += vstat("Sandbox egress restricted", yesNo(c.sandbox_egress_restricted));
+        caps += vstat("Executor isolation", esc(c.executor_isolation || "unknown"));
+        caps += renderScorerBenchmarks(c.scorer_benchmarks);
+      } else {
+        caps += vstat("Capabilities", '<span class="muted">Not reported (requires heartbeat protocol 7)</span>');
+      }
+
+      var stackRows = "";
+      var stack = entry.stack;
+      if (stack) {
+        stackRows += vstat("Stack mode", esc(stack.mode === "managed" ? "Managed (signed GHCR release)" : "Source build"));
+        stackRows += vstat("Compose schema", esc(String(stack.compose_schema)));
+        if (stack.release_descriptor_digest) {
+          stackRows += vstat("Release descriptor", monoValue(stack.release_descriptor_digest, "release descriptor digest"), true);
+        }
+      } else {
+        stackRows += vstat("Stack identity", '<span class="muted">Not reported (requires heartbeat protocol 7)</span>');
+      }
+
+      var health = entry.stack_health;
+      var components = "";
+      STACK_COMPONENT_ORDER.forEach(function (name) {
+        components += renderStackComponent(
+          name,
+          stack && stack.components ? stack.components[name] : null,
+          health ? health[name] : null
+        );
+      });
+      var healthIntro = health
+        ? '<p class="muted" style="margin:4px 0 8px;font-size:12px">Configured identity is what Compose intends to run; observed identity is what a live probe independently verified; readiness is a real request answered just now. Per-component probe times are independent of heartbeat freshness.</p>'
+        : '<p class="muted" style="margin:4px 0 8px;font-size:12px">This validator reports heartbeat protocol ' + esc(String(entry.protocol_version)) + '. Per-component runtime health arrives with protocol 9.</p>';
+
+      var host = "";
+      var m = entry.system_metrics;
+      if (m) {
+        host += vstat("CPU", esc(m.cpu_percent + "%"));
+        host += vstat("Memory", esc(m.memory_percent + "%"));
+        host += vstat("Disk", esc(m.disk_percent + "%"));
+        host += vstat("Docker", esc(m.docker_status + " · " + m.running_containers + " running, " + m.unhealthy_containers + " unhealthy"));
+      } else {
+        host += vstat("Host metrics", '<span class="muted">Not reported</span>');
+      }
+
+      function section(title, inner, open) {
+        return '<details class="cgroup"' + (open ? " open" : "") + '><summary class="cgsum">' + esc(title) +
+          '</summary><div style="padding:2px 0 10px 22px">' + inner + '</div></details>';
+      }
+      return '<div class="vdetail">' +
+        section("Signed report", report, true) +
+        section("Capabilities", caps, false) +
+        section("Stack identity", stackRows, false) +
+        '<details class="cgroup" open><summary class="cgsum">Component health</summary>' +
+        '<div style="padding:2px 0 10px 22px">' + healthIntro + components + '</div></details>' +
+        section("Host metrics", host, false) +
+        '</div>';
+    }
+
+    function openValidatorEntry(entry, preserveUrl) {
+      if (!entry) return;
+      var hotkey = entry.validator_hotkey;
+      if (!preserveUrl) pushEntityRoute("validator", hotkey);
+      activeEntityKey = "validators:" + hotkey;
+      configureEntityActions("validator", hotkey);
+      document.getElementById("d-stats").classList.add("pipeline-mode");
+      document.querySelector("#modal .split").style.display = "none";
+      document.querySelector("#modal .dk-label").textContent = "Validator";
+      document.getElementById("d-title").textContent = validatorNames[hotkey] || "Validator";
+      var chip = document.getElementById("d-bench");
+      var status = fleetStatus(entry);
+      chip.className = status[1];
+      chip.textContent = status[0];
+      chip.title = "Current fleet status";
+      document.getElementById("d-hotkey").innerHTML = entityAnchor("validator", hotkey, hotkey);
+      document.getElementById("d-hotkey-copy").setAttribute("data-key", hotkey || "");
+      document.getElementById("d-stats").innerHTML = renderValidatorDetail(entry);
+      showModal();
+    }
+
+    function findValidatorEntry(hotkey) {
+      var report = fleetReports.validators;
+      if (!report) return null;
+      return (report.validators || []).find(function (item) {
+        return item.validator_hotkey === hotkey;
+      }) || null;
+    }
+
     function updateFleetLedger(entries) {
       var counts = { healthy: 0, warning: 0, offline: 0, paused: 0, unknown: 0 };
       entries.forEach(function (entry) {
@@ -4870,6 +5122,27 @@
       }).join("");
       resolveEntityRoute();
     }
+
+    var fleetRowsEl = document.getElementById("fleet-rows");
+    function activateFleetRow(tr) {
+      if (tr.getAttribute("data-entity-kind") !== "validator") return;
+      var entry = findValidatorEntry(tr.getAttribute("data-entity-id"));
+      if (entry) openValidatorEntry(entry);
+    }
+    fleetRowsEl.addEventListener("click", function (ev) {
+      if (ev.target.closest(".copy") || ev.target.closest("[data-entity-link]")) return;
+      var tr = ev.target.closest("tr[data-entity-kind]");
+      if (tr) activateFleetRow(tr);
+    });
+    fleetRowsEl.addEventListener("keydown", function (ev) {
+      if (ev.target.closest(".copy") || ev.target.closest("[data-entity-link]")) return;
+      var tr = ev.target.closest("tr[data-entity-kind]");
+      if (!tr) return;
+      if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
+        ev.preventDefault();
+        activateFleetRow(tr);
+      }
+    });
 
     document.getElementById("show-screeners").addEventListener("change", renderFleet);
     setInterval(updateElapsedTimes, 1000);
@@ -5094,6 +5367,16 @@
         toggle.checked = showScreeners;
         renderFleet();
         return;
+      }
+      if (entity.kind === "validators") {
+        var validatorEntry = findValidatorEntry(entity.id);
+        if (
+          validatorEntry &&
+          (activeEntityKey !== entity.key ||
+            !document.getElementById("modal").classList.contains("open"))
+        ) {
+          openValidatorEntry(validatorEntry, true);
+        }
       }
       var target = Array.prototype.find.call(document.querySelectorAll("#fleet-rows tr[data-entity-id]"), function (row) {
         return row.getAttribute("data-entity-id") === entity.id;
