@@ -525,6 +525,51 @@ class TestIssueTicket:
         assert t2.agent_id == t1.agent_id
         assert t2.deadline == t1.deadline
 
+    async def test_new_benchmark_era_expires_idle_legacy_ticket(
+        self, session: AsyncSession
+    ) -> None:
+        legacy_agent = await _seed_evaluating(
+            session, name="legacy", created_at=_NOW - timedelta(minutes=1)
+        )
+        current_agent = await _seed_evaluating(
+            session, name="current", created_at=_NOW, screened=True
+        )
+        async with session.begin():
+            session.add(
+                BenchmarkDataset(
+                    agent_id=current_agent,
+                    bench_version=3,
+                    seed=42,
+                    sha256="cd" * 32,
+                    run_size="full",
+                )
+            )
+            legacy = await issue_ticket(
+                session,
+                validator_hotkey="5V1",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=2,
+            )
+            assert legacy is not None
+            assert legacy.agent_id == legacy_agent
+
+        async with session.begin():
+            current = await issue_ticket(
+                session,
+                validator_hotkey="5V1",
+                now=_NOW + timedelta(minutes=1),
+                ttl=_TTL,
+                bench_version=3,
+                artifact_mode="screened_only",
+            )
+
+        assert current is not None
+        assert current.agent_id == current_agent
+        assert current.bench_version == 3
+        await session.refresh(legacy)
+        assert legacy.status == TicketStatus.EXPIRED
+
     async def test_validator_cannot_hold_live_tickets_for_distinct_agents(
         self, session: AsyncSession
     ) -> None:

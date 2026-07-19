@@ -849,15 +849,19 @@ async def request_job(
             artifact_mode=artifact_mode,
             validator_running_benchmark=validator_state == "running_benchmark",
         )
+        canonical_version = await active_bench_version(session)
+        rollout = await open_rollout(session)
         if ticket is None:
-            # A version transition never strands an already-issued lease. This
-            # also lets a restarted v2-only validator finish its pre-activation
-            # work, without granting it any new v3 assignment.
+            # During an open rollout, a source-version validator may resume a
+            # source-version lease. Once activation completes, only the active
+            # benchmark era is resumable; retired tickets must never leak back
+            # into the queue ahead of the capability gate below.
             live_ticket_statement = (
                 select(ValidatorTicket)
                 .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
                 .where(
                     ValidatorTicket.validator_hotkey == payload.validator_hotkey,
+                    ValidatorTicket.bench_version == canonical_version,
                     ValidatorTicket.status == TicketStatus.ISSUED,
                     ValidatorTicket.deadline > now,
                 )
@@ -874,10 +878,30 @@ async def request_job(
                     Agent.screened_image_upload_id.is_not(None),
                     Agent.screened_image_verified_at.is_not(None),
                 )
-            ticket = await session.scalar(live_ticket_statement)
+            if rollout is not None:
+                ticket = await session.scalar(live_ticket_statement)
         if ticket is None:
-            canonical_version = await active_bench_version(session)
-            rollout = await open_rollout(session)
+            if rollout is None:
+                stale_ticket = await session.scalar(
+                    select(ValidatorTicket)
+                    .where(
+                        ValidatorTicket.validator_hotkey == payload.validator_hotkey,
+                        ValidatorTicket.bench_version != canonical_version,
+                        ValidatorTicket.status == TicketStatus.ISSUED,
+                        ValidatorTicket.deadline > now,
+                    )
+                    .limit(1)
+                    .with_for_update()
+                )
+                if stale_ticket is not None:
+                    if validator_state == "running_benchmark":
+                        # The signed heartbeat says this exact worker is still
+                        # occupied; let it finish, but issue nothing else.
+                        return Response(status_code=204)
+                    stale_ticket.status = TicketStatus.EXPIRED
+                    stale_ticket.deadline = now
+                    stale_ticket.retry_after = now
+                    await session.flush()
             heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
             if (
                 rollout is not None

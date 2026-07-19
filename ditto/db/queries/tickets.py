@@ -183,6 +183,7 @@ async def issue_ticket(
         .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
         .where(
             ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.bench_version == bench_version,
             ValidatorTicket.status == TicketStatus.ISSUED,
             ValidatorTicket.deadline > now,
         )
@@ -195,28 +196,27 @@ async def issue_ticket(
     existing = await session.scalar(existing_statement)
     if existing is not None:
         return existing
-    if requires_screened:
-        incompatible_existing = await session.scalar(
-            select(ValidatorTicket)
-            .where(
-                ValidatorTicket.validator_hotkey == validator_hotkey,
-                ValidatorTicket.status == TicketStatus.ISSUED,
-                ValidatorTicket.deadline > now,
-            )
-            .limit(1)
-            .with_for_update()
+    incompatible_existing = await session.scalar(
+        select(ValidatorTicket)
+        .where(
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
         )
-        if incompatible_existing is not None:
-            if validator_running_benchmark:
-                # Never revoke work a fresh signed heartbeat says is active.
-                return None
-            # A validator can become image-only after receiving a legacy lease.
-            # Release that unstarted assignment immediately so fallback-capable
-            # fleet members can claim it instead of stranding it for 90 minutes.
-            incompatible_existing.status = TicketStatus.EXPIRED
-            incompatible_existing.deadline = now
-            incompatible_existing.retry_after = now
-            await session.flush()
+        .limit(1)
+        .with_for_update()
+    )
+    if incompatible_existing is not None:
+        if validator_running_benchmark:
+            # Never revoke work a fresh signed heartbeat says is active.
+            return None
+        # A validator may only resume a lease from the requested benchmark era
+        # and artifact contract. Release an idle incompatible assignment so a
+        # retired benchmark cannot leak into the active queue after activation.
+        incompatible_existing.status = TicketStatus.EXPIRED
+        incompatible_existing.deadline = now
+        incompatible_existing.retry_after = now
+        await session.flush()
 
     # Scoped to the era this ticket is for: a v2 fifth place says nothing about
     # whether a v4 two-score maximum is still in contention.
