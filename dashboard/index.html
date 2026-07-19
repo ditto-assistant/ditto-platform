@@ -715,7 +715,10 @@
       .benchmark-stage-label, .benchmark-agent, .benchmark-progress-text,
       .benchmark-progress.unknown .benchmark-progress-text { color: CanvasText; }
     }
-    #d-stats.pipeline-mode,
+    /* Spacing scale for the drawer's detail sections. Defined on #d-stats (not
+       just pipeline mode) because the leaderboard drawer's consensus block also
+       renders .benchmark-cohort groups. */
+    #d-stats,
     .pipeline-detail {
       --detail-space-xs: 4px;
       --detail-space-sm: 8px;
@@ -3698,20 +3701,49 @@
       consensusToken = agentId;
       getJSON("/public/agent/" + agentId + "/scores").then(function (r) {
         if (consensusToken !== agentId || !r || !r.scores || !r.scores.length) return;
-        var rows = r.scores.slice()
-          .sort(function (a, b) { return b.composite - a.composite; })
-          .map(function (s) {
-            return '<div class="consensus-score"><div class="stat-row"><span class="k copyable" title="' + esc(s.validator_hotkey) +
-              '"><span>' + esc(shortKey(s.validator_hotkey)) + '</span>' + copyButton(s.validator_hotkey, "validator hotkey") + '</span><span class="v">' +
-              fx(s.composite) + '</span></div>' + casesSection(s) + '</div>';
-          }).join("");
-        var med = r.median_composite != null
+        var quorum = Math.max(1, Number(r.quorum) || 3);
+        // A re-scored agent carries score rows from more than one benchmark
+        // version, and composites compare only within a version — so the rows
+        // group under a per-version heading (newest first) instead of one flat
+        // list where a v2 and a v3 number would read as comparable.
+        var byVersion = {};
+        r.scores.forEach(function (s) {
+          var key = benchmarkVersionKey(s.bench_version);
+          (byVersion[key] = byVersion[key] || []).push(s);
+        });
+        var keys = Object.keys(byVersion).sort(function (a, b) {
+          if (a === "unknown") return 1;
+          if (b === "unknown") return -1;
+          return Number(b) - Number(a);
+        });
+        var multi = keys.length > 1;
+        var groups = keys.map(function (key) {
+          var scores = byVersion[key];
+          var rows = scores.slice()
+            .sort(function (a, b) { return b.composite - a.composite; })
+            .map(function (s) {
+              return '<div class="consensus-score"><div class="stat-row"><span class="k copyable" title="' + esc(s.validator_hotkey) +
+                '"><span>' + esc(shortKey(s.validator_hotkey)) + '</span>' + copyButton(s.validator_hotkey, "validator hotkey") + '</span><span class="v">' +
+                fx(s.composite) + '</span></div>' + casesSection(s) + '</div>';
+            }).join("");
+          var summary = scores.length + " of " + quorum + " scores · " +
+            (scores.length >= quorum ? "median " : "preliminary median ") + fx(cohortMedian(scores));
+          return '<div class="benchmark-cohort">' +
+            '<div class="benchmark-cohort-heading"><h5>' + esc(benchmarkVersionLabel(key)) + '</h5>' +
+              '<span class="benchmark-cohort-summary">' + esc(summary) + '</span></div>' +
+            rows + '</div>';
+        }).join("");
+        // With one version the endpoint's median is that version's median; with
+        // several it would mix incomparable composites, so the per-version
+        // medians in the headings above are the meaningful aggregates.
+        var med = !multi && r.median_composite != null
           ? stat("Median (canonical)", fx(r.median_composite))
           : "";
         box.innerHTML = '<div class="stat-group"><div class="stat-head">Consensus (k=' +
-          (r.quorum || r.score_count) + ')</div>' +
-          '<div class="muted" style="margin:0 0 6px">Independent validators that scored this agent; the platform finalizes on the median, so no single validator decides the score.</div>' +
-          rows + med + '</div>';
+          quorum + ')</div>' +
+          '<div class="muted" style="margin:0 0 6px">Independent validators that scored this agent; the platform finalizes on the median, so no single validator decides the score.' +
+          (multi ? ' This agent was scored under more than one benchmark version — scores compare only within a version, never across.' : '') + '</div>' +
+          groups + med + '</div>';
       }).catch(function () { /* held / still-evaluating: leave empty */ });
     }
 

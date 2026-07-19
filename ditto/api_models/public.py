@@ -592,6 +592,19 @@ class PublicValidatorScore(BaseModel):
     ]
     median_ms: Annotated[int, Field(ge=0, description="Median per-case latency (ms).")]
     n: Annotated[int, Field(ge=0, description="Number of cases scored.")]
+    bench_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description=(
+                "DittoBench version this validator's run was scored under. A "
+                "re-scored agent carries rows from more than one version, and "
+                "composites compare only within a version. Null for a legacy "
+                "score recorded before benchmark versioning."
+            ),
+        ),
+    ]
     seed: Annotated[
         int,
         Field(

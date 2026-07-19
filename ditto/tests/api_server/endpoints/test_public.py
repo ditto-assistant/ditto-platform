@@ -2207,6 +2207,48 @@ class TestPublicSubmissionScores:
             # Scores recorded before lease-bound signing remain public and
             # continue counting; null identifies their legacy signature format.
             assert s["ticket_deadline"] is None
+            # No bench_version in details → published as null (legacy), never
+            # guessed from the column default.
+            assert s["bench_version"] is None
+
+    async def test_detail_labels_each_score_with_its_bench_version(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A re-scored agent carries rows from more than one benchmark version;
+        # each published row names the version it was scored under so its
+        # incomparable composites cannot be read as one pool.
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.40, 0.70, 0.55],
+            details={"bench_version": 2},
+        )
+        async with session_maker() as s, s.begin():
+            await upsert_score(
+                s,
+                agent_id=UUID(agent_id),
+                validator_hotkey="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+                run_id="run_v3",
+                seed=987654321,
+                composite=0.61,
+                tool_mean=0.61,
+                memory_mean=0.61,
+                median_ms=500,
+                n=110,
+                generated_at=datetime(2026, 6, 9, 12, 0, 0, tzinfo=UTC),
+                signature="ab" * 64,
+                details={"bench_version": 3},
+                bench_version=3,
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get(f"/api/v1/public/agent/{agent_id}/scores")).json()
+
+        assert body["score_count"] == 4
+        assert sorted(s["bench_version"] for s in body["scores"]) == [2, 2, 2, 3]
 
     async def test_detail_exposes_redacted_per_case_breakdown(
         self,
