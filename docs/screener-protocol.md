@@ -44,6 +44,10 @@ Backroom and other operator clients use the bearer-protected endpoints below:
 - `GET /api/v1/admin/screening-quarantines`
 - `GET /api/v1/admin/screening-quarantines/{quarantine_id}`
 - `POST /api/v1/admin/screening-quarantines/{quarantine_id}/resolve`
+- `GET /api/v1/admin/screening-submissions/{agent_id}` returns the exact
+  submission metadata and complete screening-attempt history for an agent UUID.
+  It does not return source, artifact URLs, or artifact contents; those remain
+  behind the separately audited artifact endpoints.
 
 Resolution actions are append-only in `resolution_history`. A resolved rejection may
 be corrected to `release` while the agent is still rejected; other second resolutions
