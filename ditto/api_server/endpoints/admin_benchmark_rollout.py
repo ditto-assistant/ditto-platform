@@ -17,7 +17,7 @@ from ditto.api_server.benchmark_rollout import (
     qualification_candidate,
     refresh_rolling_qualification,
 )
-from ditto.api_server.datapipeline import DatasetGenerator
+from ditto.api_server.datapipeline import DataPipelineError, DatasetGenerator
 from ditto.api_server.dependencies import get_dataset_generator, get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
 from ditto.db.queries.benchmark_rollout import (
@@ -80,6 +80,24 @@ def _parse_desired_version(desired_version: str) -> int:
             detail=f"benchmark version {version} has no shipped contract",
         ) from exc
     return version
+
+
+def _generator_unavailable(target: int, exc: DataPipelineError) -> HTTPException:
+    """502 for a generate-service that cannot render the target benchmark.
+
+    The generator is deployed separately and pinned to a datagen release, so it
+    lags this API whenever a new benchmark ships. Left unhandled this reached the
+    operator as a bare 500 naming nothing -- not the dependency, not the version,
+    not the fix.
+    """
+    return HTTPException(
+        status_code=502,
+        detail=(
+            f"dataset generator could not render benchmark v{target} ({exc}). "
+            f"Deploy the generate-service at a datagen release that ships "
+            f"v{target} before starting this rollout."
+        ),
+    )
 
 
 async def _require_rollout_start_capacity(
@@ -229,9 +247,20 @@ async def start_rollout(
         )
     if existing is not None:
         await session.rollback()  # close the read-only autobegin before the service
-        await refresh_rolling_qualification(
-            session, generator=generator, now=datetime.now(UTC)
-        )
+        # This refresh renders datasets too, so a lagging generate-service fails
+        # here exactly as it does on the fresh-start path below. Re-POSTing a
+        # version whose rollout already exists is the natural operator retry, so
+        # it must not be the one route that still answers with an opaque 500.
+        #
+        # Unlike validator/screener ingest -- which deliberately swallow this so a
+        # renderer outage cannot fail an already-committed score or verdict -- an
+        # admin POST exists to report whether the action succeeded, so it surfaces.
+        try:
+            await refresh_rolling_qualification(
+                session, generator=generator, now=datetime.now(UTC)
+            )
+        except DataPipelineError as exc:
+            raise _generator_unavailable(target, exc) from exc
         return await rollout_state(session, capability_version=target)
     now = datetime.now(UTC)
     await _require_rollout_start_capacity(session, now=now, desired_version=target)
@@ -261,9 +290,12 @@ async def start_rollout(
                     f"v{target}: {blocker}"
                 ),
             )
-        sha256 = candidate.existing_sha256 or await generator.generate(
-            candidate.seed, bench_version=target
-        )
+        try:
+            sha256 = candidate.existing_sha256 or await generator.generate(
+                candidate.seed, bench_version=target
+            )
+        except DataPipelineError as exc:
+            raise _generator_unavailable(target, exc) from exc
         pins[member.agent_id] = DatasetPin(
             seed=candidate.seed,
             sha256=sha256,
