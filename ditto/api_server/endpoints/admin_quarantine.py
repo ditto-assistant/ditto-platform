@@ -1953,6 +1953,7 @@ async def qualify_benchmark_rollout(
                 "origin": "manual",
                 "actor": x_admin_actor,
                 "reason": payload.reason,
+                "seed_source": current_candidate.seed_source,
             },
         )
         if not appended:

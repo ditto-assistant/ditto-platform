@@ -13,7 +13,10 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.benchmark_contract import benchmark_contract
+from ditto.api_models.benchmark_contract import (
+    benchmark_contract,
+    latest_benchmark_contract,
+)
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
@@ -42,9 +45,9 @@ DEFAULT_BENCH_VERSION = 2
 # follow DEFAULT_BENCH_VERSION, or a future rollout-from bump would silently
 # reinterpret every legacy submission as a newer benchmark.
 LEGACY_BENCH_VERSION = 2
-# The version a rollout is currently driving TOWARD. Flipping this is the
-# one-line change that opens the next rollout; everything else reads it.
-CANARY_BENCH_VERSION = 4
+# Compatibility name for callers/tests that need the newest *shipped* contract.
+# This is discovery metadata only: it no longer opens or selects a rollout.
+CANARY_BENCH_VERSION = latest_benchmark_contract().version
 COHORT_SIZE = 5
 SCORING_QUORUM = 3
 # How many agents must hold a COMPLETE, ranked desired-version quorum before
@@ -94,14 +97,19 @@ class DatasetPin:
 
 
 async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]:
-    """Return the hybrid top five used while v3 is collecting.
+    """Return the hybrid top five for the durable rollout transition.
 
-    An agent remains ranked by its v2 median until it has a complete v3 quorum.
-    At quorum its v3 median atomically replaces v2 for this ranking. Recomputing
-    this after every accepted score/verdict is what lets ranks 6-10 rise and
-    become newly qualified without making one- or two-validator samples churn
-    the cohort.
+    While a rollout is open, an agent remains ranked by the rollout's source
+    median until it has a complete target-version quorum. At quorum its target
+    median atomically replaces the source median for this ranking. With no open
+    rollout, only the active version is authoritative. No compiled "canary"
+    constant is allowed to select or open a benchmark transition.
     """
+    rollout = await open_rollout(session)
+    source_version = rollout.from_version if rollout is not None else None
+    if source_version is None:
+        source_version = await active_bench_version(session)
+    target_version = rollout.desired_version if rollout is not None else None
     agents = list(
         await session.scalars(select(Agent).where(Agent.status == AgentStatus.SCORED))
     )
@@ -111,7 +119,11 @@ async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]
         await session.scalars(
             select(Score).where(
                 Score.agent_id.in_([agent.agent_id for agent in agents]),
-                Score.bench_version.in_((DEFAULT_BENCH_VERSION, CANARY_BENCH_VERSION)),
+                Score.bench_version.in_(
+                    (source_version, target_version)
+                    if target_version is not None
+                    else (source_version,)
+                ),
             )
         )
     )
@@ -124,9 +136,11 @@ async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]
     candidates: list[tuple[Agent, float]] = []
     for agent in agents:
         versions = by_agent.get(agent.agent_id, {})
-        selected = versions.get(CANARY_BENCH_VERSION, [])
-        if len(selected) < SCORING_QUORUM:
-            selected = versions.get(DEFAULT_BENCH_VERSION, [])
+        selected = (
+            versions.get(target_version, []) if target_version is not None else []
+        )
+        if target_version is None or len(selected) < SCORING_QUORUM:
+            selected = versions.get(source_version, [])
         if not selected:
             continue
         middle = sorted(
@@ -230,6 +244,8 @@ async def append_rollout_member(
         "agent_id": str(member.agent_id),
         "position": position,
         "hybrid_composite": member.composite,
+        "dataset_seed": dataset.seed,
+        "dataset_sha256": dataset.sha256,
         "origin": "automatic",
     }
     if audit_context is not None:
@@ -272,7 +288,7 @@ async def rollout_for_transition(
     session: AsyncSession,
     *,
     from_version: int,
-    desired_version: int,
+    desired_version: int = CANARY_BENCH_VERSION,
     for_update: bool = False,
 ) -> BenchmarkRollout | None:
     """Return the durable row for one transition, including after activation."""
@@ -376,6 +392,7 @@ async def create_rollout_snapshot(
     now: datetime,
     from_version: int = DEFAULT_BENCH_VERSION,
     desired_version: int = CANARY_BENCH_VERSION,
+    audit_context: dict[str, Any] | None = None,
 ) -> BenchmarkRollout:
     """Freeze exactly five ranked agents and their target dataset pins, idempotently."""
     if desired_version <= from_version:
@@ -466,13 +483,12 @@ async def create_rollout_snapshot(
             pin.seed_block_hash,
         ):
             raise ValueError("existing benchmark dataset does not match snapshot")
-    await _audit(
-        session,
-        rollout,
-        "cohort_frozen",
-        {"agent_ids": [str(member.agent_id) for member in members]},
-        now=now,
-    )
+    audit_payload: dict[str, Any] = {
+        "agent_ids": [str(member.agent_id) for member in members]
+    }
+    if audit_context:
+        audit_payload.update(audit_context)
+    await _audit(session, rollout, "cohort_frozen", audit_payload, now=now)
     await session.flush()
     return rollout
 
@@ -806,19 +822,28 @@ async def rollout_state(
     capability_version: int | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
-    version = CANARY_BENCH_VERSION if capability_version is None else capability_version
+    rollout = await session.scalar(
+        select(BenchmarkRollout).order_by(BenchmarkRollout.created_at.desc()).limit(1)
+    )
+    active_version = (
+        DEFAULT_BENCH_VERSION
+        if rollout is None
+        else rollout.desired_version
+        if rollout.status == "activated"
+        else rollout.from_version
+    )
+    version = capability_version or (
+        rollout.desired_version if rollout is not None else active_version
+    )
     heartbeats = (await session.execute(select(ValidatorHeartbeat))).scalars().all()
     capable_count = sum(
         heartbeat_supports_version(heartbeat, now=now, version=version)
         for heartbeat in heartbeats
     )
-    rollout = await session.scalar(
-        select(BenchmarkRollout).order_by(BenchmarkRollout.created_at.desc()).limit(1)
-    )
     if rollout is None:
         return {
-            "active_version": DEFAULT_BENCH_VERSION,
-            "desired_version": DEFAULT_BENCH_VERSION,
+            "active_version": active_version,
+            "desired_version": active_version,
             "status": "inactive",
             "capability_bench_version": version,
             "canary_capable_validator_count": capable_count,

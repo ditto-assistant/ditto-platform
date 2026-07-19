@@ -3580,9 +3580,7 @@ async def test_idle_qualification_refresh_is_single_flight_and_throttled(
 ) -> None:
     from ditto.api_server.endpoints import validator
 
-    ensure = AsyncMock(return_value=False)
     refresh = AsyncMock(return_value=0)
-    monkeypatch.setattr(validator, "ensure_rolling_qualification", ensure)
     monkeypatch.setattr(validator, "refresh_rolling_qualification", refresh)
     monkeypatch.setattr(validator, "_qualification_refresh_due", 0.0)
     monkeypatch.setattr(validator.time, "monotonic", lambda: 100.0)
@@ -3593,5 +3591,4 @@ async def test_idle_qualification_refresh_is_single_flight_and_throttled(
     await validator._refresh_qualification_if_due(session, generator=generator, now=now)
     await validator._refresh_qualification_if_due(session, generator=generator, now=now)
 
-    ensure.assert_awaited_once_with(session, generator=generator, now=now)
     refresh.assert_awaited_once_with(session, generator=generator, now=now)
