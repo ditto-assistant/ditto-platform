@@ -35,6 +35,10 @@ from ditto.api_models.benchmark_progress import (
     benchmark_progress_signing_token,
 )
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.stack_health import (
+    ValidatorStackHealth,
+    validator_stack_health_signing_token,
+)
 from ditto.api_models.system_health import (
     SystemMetrics,
     system_metrics_signing_token,
@@ -176,6 +180,43 @@ def test_v7_heartbeat_matches_shared_cross_repo_vector() -> None:
     assert actual.hex() == fixture["expected_message_hex"]
 
 
+def test_v9_heartbeat_matches_shared_cross_repo_vectors() -> None:
+    """Both the managed-GHCR and source-Compose v9 vectors verify byte-for-byte."""
+    fixtures = json.loads(
+        (
+            Path(__file__).parents[2] / "contract" / "validator_heartbeat_v9.json"
+        ).read_text()
+    )
+    for name in ("managed", "source"):
+        request = fixtures[name]["request"]
+        capabilities = ValidatorCapabilities.model_validate_json(
+            json.dumps(request["capabilities"])
+        )
+        stack = ValidatorStackIdentity.model_validate_json(json.dumps(request["stack"]))
+        stack_health = ValidatorStackHealth.model_validate_json(
+            json.dumps(request["stack_health"])
+        )
+        actual = _heartbeat_signing_message(
+            validator_hotkey=request["validator_hotkey"],
+            software_version=request["software_version"],
+            protocol_version=request["protocol_version"],
+            code_digest=request["code_digest"],
+            state=request["state"],
+            active_agent_id=request["active_agent_id"],
+            system_metrics=request["system_metrics"],
+            benchmark_progress=request["benchmark_progress"],
+            capabilities=capabilities,
+            stack=stack,
+            stack_health=stack_health,
+            timestamp=request["timestamp"],
+        )
+        assert actual == fixtures[name]["expected_message_utf8"].encode(), name
+        assert (
+            hashlib.sha256(actual).hexdigest()
+            == fixtures[name]["expected_message_sha256"]
+        ), name
+
+
 def test_optional_scorer_capability_preserves_legacy_v7_token() -> None:
     fixture = json.loads(
         (
@@ -315,6 +356,7 @@ def _heartbeat_payload(
     benchmark_progress: dict[str, object] | None = None,
     capabilities: dict[str, object] | None = None,
     stack: dict[str, object] | None = None,
+    stack_health: dict[str, object] | None = None,
 ) -> dict[str, object]:
     ts = timestamp if timestamp is not None else int(datetime.now(UTC).timestamp())
     hotkey = keypair.ss58_address
@@ -333,14 +375,31 @@ def _heartbeat_payload(
             json.dumps(capabilities)
         )
         typed_stack = ValidatorStackIdentity.model_validate_json(json.dumps(stack))
-        domain = "v8" if protocol_version >= 8 else "v7"
-        message = (
-            f"ditto-validator-heartbeat:{domain}:{hotkey}:0.1.0:{protocol_version}:"
-            f"{code_digest}:{state}:{active_agent_id or ''}:"
-            f"{system_metrics_signing_token(metrics)}:"
-            f"{benchmark_progress_signing_token(progress)}:"
-            f"{validator_identity_signing_token(typed_capabilities, typed_stack)}:{ts}"
+        identity_token = validator_identity_signing_token(
+            typed_capabilities, typed_stack
         )
+        if protocol_version >= 9:
+            typed_health = ValidatorStackHealth.model_validate_json(
+                json.dumps(stack_health)
+            )
+            message = (
+                f"ditto-validator-heartbeat:v9:{hotkey}:0.1.0:{protocol_version}:"
+                f"{code_digest}:{state}:{active_agent_id or ''}:"
+                f"{system_metrics_signing_token(metrics)}:"
+                f"{benchmark_progress_signing_token(progress)}:"
+                f"{identity_token}:"
+                f"{validator_stack_health_signing_token(typed_health)}:{ts}"
+            )
+        else:
+            domain = "v8" if protocol_version >= 8 else "v7"
+            message = (
+                f"ditto-validator-heartbeat:{domain}:{hotkey}:0.1.0:"
+                f"{protocol_version}:"
+                f"{code_digest}:{state}:{active_agent_id or ''}:"
+                f"{system_metrics_signing_token(metrics)}:"
+                f"{benchmark_progress_signing_token(progress)}:"
+                f"{identity_token}:{ts}"
+            )
     elif protocol_version >= 4:
         metrics = (
             SystemMetrics.model_validate(system_metrics)
@@ -397,6 +456,8 @@ def _heartbeat_payload(
         payload["capabilities"] = capabilities
     if stack is not None:
         payload["stack"] = stack
+    if stack_health is not None:
+        payload["stack_health"] = stack_health
     return payload
 
 
@@ -660,6 +721,58 @@ _V7_STACK: dict[str, object] = {
 }
 
 
+_V9_SCORER: dict[str, object] = {
+    "status": "fresh_verified",
+    "supported_bench_versions": [2, 3],
+    "observed_at": 1_784_020_800,
+    "software_version": "1.2.2",
+    "source_revision": "2" * 40,
+}
+_V9_CAPABILITIES: dict[str, object] = {
+    **_V7_CAPABILITIES,
+    "scorer_benchmarks": _V9_SCORER,
+}
+_V9_STACK_HEALTH: dict[str, object] = {
+    "ditto_subnet": {
+        "health": "healthy",
+        "required": True,
+        "observed_at": 1_784_020_800,
+        "ready": True,
+        "observed_identity": {"version": "1.2.3"},
+    },
+    "dittobench_api": {
+        "health": "healthy",
+        "required": True,
+        "observed_at": 1_784_020_800,
+        "ready": True,
+        "observed_identity": {"source_revision": "2" * 40, "version": "1.2.2"},
+    },
+    "sandbox_docker": {
+        "health": "unknown",
+        "required": True,
+    },
+    "model_relay": {
+        "health": "identity_mismatch",
+        "required": True,
+        "observed_at": 1_784_020_700,
+        "ready": True,
+        "model_ready": True,
+        "observed_identity": {"source_revision": "c" * 40},
+    },
+    "pylon": {
+        "health": "degraded",
+        "required": True,
+        "observed_at": 1_784_020_700,
+        "ready": False,
+    },
+    "ollama": {
+        "health": "unreachable",
+        "required": True,
+        "observed_at": 1_784_017_200,
+    },
+}
+
+
 def _screener_heartbeat_payload(
     *, timestamp: int, system_metrics: dict[str, object]
 ) -> dict[str, object]:
@@ -731,6 +844,131 @@ class TestHeartbeat:
             assert row.capabilities["scorer_benchmarks"][
                 "supported_bench_versions"
             ] == [2, 3]
+
+    async def test_v9_persists_and_publishes_component_stack_health(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        accepted = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=9,
+                capabilities=_V9_CAPABILITIES,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+            ),
+        )
+        assert accepted.status_code == 200, accepted.text
+
+        expected_health = ValidatorStackHealth.model_validate_json(
+            json.dumps(_V9_STACK_HEALTH)
+        ).model_dump(mode="json", exclude_none=True)
+        async with session_maker() as session:
+            row = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert row is not None
+            assert row.protocol_version == 9
+            assert row.stack_health == expected_health
+
+        public = (await client.get("/api/v1/public/validators")).json()["validators"][0]
+        health = public["stack_health"]
+        assert health is not None
+        assert health["ditto_subnet"]["health"] == "healthy"
+        assert health["sandbox_docker"]["health"] == "unknown"
+        assert health["model_relay"]["health"] == "identity_mismatch"
+        assert health["model_relay"]["observed_identity"]["source_revision"] == "c" * 40
+        assert health["pylon"]["health"] == "degraded"
+        assert health["ollama"]["health"] == "unreachable"
+        # Probe URLs and host identity have no schema slot; belt-and-braces
+        # regression that nothing network-shaped leaked into the public view.
+        assert "://" not in json.dumps(health)
+
+    async def test_v9_requires_stack_health_and_v8_rejects_it(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        missing = _heartbeat_payload(
+            protocol_version=9,
+            capabilities=_V9_CAPABILITIES,
+            stack=_V7_STACK,
+            stack_health=_V9_STACK_HEALTH,
+        )
+        missing.pop("stack_health")
+        assert (
+            await client.post(
+                "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=missing
+            )
+        ).status_code == 422
+
+        downgraded = _heartbeat_payload(
+            protocol_version=8,
+            capabilities=_V9_CAPABILITIES,
+            stack=_V7_STACK,
+        )
+        downgraded["stack_health"] = _V9_STACK_HEALTH
+        assert (
+            await client.post(
+                "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=downgraded
+            )
+        ).status_code == 422
+
+        tampered = _heartbeat_payload(
+            protocol_version=9,
+            capabilities=_V9_CAPABILITIES,
+            stack=_V7_STACK,
+            stack_health=_V9_STACK_HEALTH,
+        )
+        upgraded_health = json.loads(json.dumps(_V9_STACK_HEALTH))
+        upgraded_health["ollama"] = {
+            "health": "healthy",
+            "required": True,
+            "observed_at": 1_784_017_200,
+            "ready": True,
+            "model_ready": True,
+        }
+        tampered["stack_health"] = upgraded_health
+        assert (
+            await client.post(
+                "/api/v1/validator/heartbeat", headers=_AUTH_HEADER, json=tampered
+            )
+        ).status_code == 401
+
+    async def test_malformed_stored_stack_health_is_omitted_publicly(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        accepted = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=9,
+                capabilities=_V9_CAPABILITIES,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+            ),
+        )
+        assert accepted.status_code == 200, accepted.text
+        async with session_maker() as session, session.begin():
+            row = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert row is not None
+            row.stack_health = {"hostname": "validator-vm", "logs": ["leak"]}
+
+        public = (await client.get("/api/v1/public/validators")).json()["validators"][0]
+        assert public["stack_health"] is None
 
     async def test_v7_persists_and_publishes_typed_capabilities(
         self,

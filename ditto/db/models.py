@@ -993,6 +993,7 @@ class ValidatorHeartbeat(Base):
     )
     capabilities: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     stack: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    stack_health: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )

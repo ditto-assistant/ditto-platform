@@ -67,6 +67,10 @@ from ditto.api_models import (
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_progress import benchmark_progress_signing_token
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.stack_health import (
+    ValidatorStackHealth,
+    validator_stack_health_signing_token,
+)
 from ditto.api_models.system_health import (
     SystemMetrics,
     system_metrics_signing_token,
@@ -488,8 +492,26 @@ def _heartbeat_signing_message(
     benchmark_progress: BenchmarkProgress | None = None,
     capabilities: ValidatorCapabilities | None = None,
     stack: ValidatorStackIdentity | None = None,
+    stack_health: ValidatorStackHealth | None = None,
 ) -> bytes:
     """Canonical heartbeat payload, mirrored by ``ditto-subnet``."""
+    if stack_health is not None and protocol_version < 9:
+        raise ValueError("per-component stack health requires heartbeat protocol v9")
+    if protocol_version >= 9:
+        if capabilities is None or stack is None:
+            raise ValueError("heartbeat protocol v9 requires capabilities and stack")
+        if stack_health is None:
+            raise ValueError("heartbeat protocol v9 requires stack health")
+        active = str(active_agent_id) if active_agent_id is not None else ""
+        return (
+            "ditto-validator-heartbeat:v9:"
+            f"{validator_hotkey}:{software_version}:{protocol_version}:"
+            f"{code_digest}:{state}:{active}:"
+            f"{system_metrics_signing_token(system_metrics)}:"
+            f"{benchmark_progress_signing_token(benchmark_progress)}:"
+            f"{validator_identity_signing_token(capabilities, stack)}:"
+            f"{validator_stack_health_signing_token(stack_health)}:{timestamp}"
+        ).encode()
     if protocol_version >= 8:
         if capabilities is None or stack is None:
             raise ValueError("heartbeat protocol v8 requires capabilities and stack")
@@ -633,6 +655,7 @@ async def heartbeat(
         benchmark_progress=request_body.benchmark_progress,
         capabilities=request_body.capabilities,
         stack=request_body.stack,
+        stack_health=request_body.stack_health,
     )
     if not _verify_signature(validator_hotkey, payload, request_body.signature):
         raise ValidatorAuthError("heartbeat signature verification failed")
@@ -698,6 +721,11 @@ async def heartbeat(
                 stack=(
                     request_body.stack.model_dump(mode="json")
                     if request_body.stack is not None
+                    else None
+                ),
+                stack_health=(
+                    request_body.stack_health.model_dump(mode="json", exclude_none=True)
+                    if request_body.stack_health is not None
                     else None
                 ),
                 reported_at=reported_at,
