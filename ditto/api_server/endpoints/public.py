@@ -63,6 +63,7 @@ from ditto.api_models import (
     PublicBenchCorpusResponse,
     PublicBenchIntegrity,
     PublicBenchmarkProgress,
+    PublicBenchRolloutResponse,
     PublicCaseResult,
     PublicCategoryStat,
     PublicChainWeight,
@@ -2245,11 +2246,17 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
 @router.get("/bench/rollout")
 async def benchmark_rollout_state(
     response: Response, session: SessionDep, generator: GeneratorDep
-) -> dict[str, object]:
-    """Expose desired/active versions and the frozen cohort's exact progress."""
+) -> PublicBenchRolloutResponse:
+    """Expose desired/active versions and the frozen cohort's exact progress.
+
+    ``ranked_quorum_agents`` / ``min_ranked_quorum_agents`` answer the question
+    the rest of this payload only implies: how close the desired version is to
+    taking over weight-setting. Weights stay on ``active_version`` until the
+    former reaches the latter.
+    """
     response.headers["Cache-Control"] = "public, max-age=30"
     state = await rollout_state(session)
     state["qualification_blockers"] = await rolling_qualification_blockers(
         session, generator_run_size=generator.run_size
     )
-    return state
+    return PublicBenchRolloutResponse.model_validate(state)

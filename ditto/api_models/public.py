@@ -574,9 +574,9 @@ class PublicLeaderboardResponse(BaseModel):
         Field(
             description=(
                 "authoritative is the pool that drives validator weights — "
-                "currently pinned to the active version while the v3 rollout "
-                "stabilizes (a v3 quorum takes over only at rollout "
-                "activation); historical is a requested single version."
+                "pinned to active_bench_version while a rollout is collecting "
+                "(the desired version takes over only at rollout activation); "
+                "historical is a requested single version."
             )
         ),
     ]
@@ -1671,3 +1671,70 @@ class PublicBenchConfigResponse(BaseModel):
     )
     ledger_path: str = Field(description="The self-verifying signed score ledger.")
     generated_at: datetime
+
+
+class PublicBenchRolloutMember(BaseModel):
+    """One frozen-cohort agent's progress toward the desired ``bench_version``."""
+
+    agent_id: str
+    position: int
+    score_count: int = Field(
+        description="Accepted scores on the desired version, out of the quorum."
+    )
+    currently_top_five: bool
+
+
+class PublicBenchRolloutResponse(BaseModel):
+    """Benchmark-version rollout state (``GET /public/bench/rollout``).
+
+    Two versions matter here and they are not the same number:
+    ``active_version`` is the one that currently drives on-chain weights, and
+    ``desired_version`` is the one being rolled out. The whole ledger switches
+    at once, and only once ``ranked_quorum_agents`` reaches
+    ``min_ranked_quorum_agents`` — that gate is what guarantees the emission set
+    (champion plus tail) is never short at the moment authority moves.
+
+    Extra keys are preserved rather than dropped: this model documents the shape
+    without becoming a filter on it.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    active_version: int = Field(
+        description="The bench_version that currently determines chain weights."
+    )
+    desired_version: int = Field(
+        description="The bench_version being rolled out (equal to active when idle)."
+    )
+    status: str = Field(
+        description="inactive | collecting | superseded | activated | blocked."
+    )
+    blocked_reason: str | None = None
+    capability_bench_version: int
+    ranked_quorum_agents: int | None = Field(
+        default=None,
+        description=(
+            "How many eligible agents hold a complete RANKED quorum at "
+            "desired_version — a full-benchmark median row with a positive "
+            "composite, not merely a row count. The authority switch is gated "
+            "on this reaching min_ranked_quorum_agents."
+        ),
+    )
+    min_ranked_quorum_agents: int | None = Field(
+        default=None,
+        description=(
+            "The threshold ranked_quorum_agents must reach before weights move "
+            "to desired_version. Read this rather than hardcoding it."
+        ),
+    )
+    canary_capable_validator_count: int
+    v3_capable_validator_count: int = Field(
+        description=(
+            "DEPRECATED alias of canary_capable_validator_count. Kept because it "
+            "is public API; read the new key."
+        )
+    )
+    current_hybrid_top_five: list[str] = Field(default_factory=list)
+    qualification_converged: bool = False
+    members: list[PublicBenchRolloutMember] = Field(default_factory=list)
+    qualification_blockers: list[dict[str, str]] = Field(default_factory=list)

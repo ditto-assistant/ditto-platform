@@ -221,7 +221,8 @@ class TestDashboard:
         assert "Raw score rank #" in body
         assert 'emission.role === "champion"' in body
         assert "must lead by more than" in body
-        assert "2% protection margin" in body
+        # The margin is read from emissions.margin, not written into the copy.
+        assert '" protection margin and the " + method' in body
         assert 'class="winner-identity"' in body
         assert 'entityAnchor("agent", e.agent_id, displayAgentName)' in body
         assert "agentVersionBadge(e.agent_version)" in body
@@ -371,7 +372,7 @@ class TestDashboard:
         assert "No example data is shown." in body
         assert (
             "Promise.allSettled([getJSON(leaderboardPath), "
-            'getJSON("/public/weights")])' in body
+            'getJSON("/public/weights"), getJSON("/public/bench/rollout")])' in body
         )
         assert "lastLeaderboardData = null;" in body
         assert 'setStatus("error", "Data unavailable");' in body
@@ -801,3 +802,84 @@ class TestDashboard:
         body = (await _get(app, "/")).text
         assert "≈ tie" not in body
         assert "function tieChip(" not in body
+
+
+class TestDashboardScoringTransparency:
+    """The SPA must not restate consensus parameters as literals.
+
+    Every number here (the incumbent margin, the champion share, the tail size,
+    the authority-switch threshold, the benchmark version) is served by the API
+    and can change without touching this file. A literal in the markup is a
+    claim that silently stops being true, which is worse than no claim at all:
+    a miner reads it as the rule they are being judged by.
+    """
+
+    async def _body(self) -> str:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        return (await _get(app, "/")).text
+
+    async def test_no_hardcoded_fold_constants(self) -> None:
+        body = await self._body()
+        for literal in (
+            "2% protection margin",
+            "2% incumbent margin",
+            "receives 90% of the miner pool",
+            "up to four participation-tail recipients",
+        ):
+            assert literal not in body, f"hardcoded fold constant: {literal}"
+
+    async def test_renders_the_dethrone_floor_and_rollout_state(self) -> None:
+        body = await self._body()
+        # The score to beat is its own element, so it can be shown whether or
+        # not there is an active contest.
+        assert 'id="emissions-threshold"' in body
+        assert "Beat this to contend" in body
+        # And it is published as a floor, never as a sufficient score.
+        assert "this is a floor, not a guarantee" in body
+        # Rollout / authority state, with the threshold read from the API.
+        assert 'id="rollout-strip"' in body
+        assert "/public/bench/rollout" in body
+        assert "ranked_quorum_agents" in body
+        assert "min_ranked_quorum_agents" in body
+
+    async def test_explainer_covers_scoring_emissions_and_koth(self) -> None:
+        body = await self._body()
+        assert 'id="scoring-explainer"' in body
+        for heading in (
+            "What a score is.",
+            "Which runs rank.",
+            "Scores compare only within one benchmark version.",
+            "How emissions work.",
+            "How the crown changes hands.",
+            "When weights move to a new version.",
+        ):
+            assert heading in body, f"explainer is missing: {heading}"
+        assert "0.5 × tool mean + 0.5 × memory mean" in body
+
+    async def test_benchmark_version_is_never_a_literal(self) -> None:
+        body = await self._body()
+        # The frozen-setup tag and the version-specific copy are both filled
+        # from the API; the static markup carries only a placeholder.
+        assert '<span class="tag" id="bs-version">v–</span>' in body
+        assert 'class="bv-desired"' in body
+
+    async def test_reference_baseline_is_keyed_by_benchmark_version(self) -> None:
+        """Every measured version keeps its baseline; unmeasured ones say so.
+
+        A baseline is a real run of the stock harness on the locked model, so it
+        cannot be carried across versions -- composites only compare within one.
+        Holding a single constant meant the card went blank the moment the board
+        moved to a version it was not measured on, which reads as a broken widget
+        rather than as the honest "we have not run this yet" it actually is.
+        """
+        body = await self._body()
+        assert "var REFERENCE_BASELINES = {" in body
+        # The published runs, both from dittobench-api docs/BASELINES.md.
+        assert "2: { composite: 0.492" in body
+        assert "3: { composite: 0.445" in body
+        assert "4: { composite: 0.429" in body
+        # Unmeasured versions must be stated, not rendered as a bare dash.
+        assert "not yet measured" in body
+        assert "No reference baseline has been measured on bench_version" in body
+        # And the card must not claim a baseline is the winning score.
+        assert "it is not the score that wins" in body
