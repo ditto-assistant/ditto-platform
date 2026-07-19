@@ -2,52 +2,23 @@
 
 from collections.abc import AsyncIterator
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
-from typing import Any
-from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
 
-from ditto.api_models.agent_status import AgentStatus
-from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import get_session
-from ditto.api_server.endpoints.admin_benchmark_rollout import (
-    MINIMUM_ROLLOUT_START_VALIDATORS,
-)
-from ditto.api_server.middleware.error_envelope import (
-    ERROR_CODE_HTTP_EXCEPTION,
-    ERROR_CODE_UNHANDLED,
-)
-from ditto.db.models import (
-    Agent,
-    Base,
-    BenchmarkRollout,
-    Score,
-    ValidatorHeartbeat,
-)
-from ditto.db.queries.benchmark_rollout import (
-    DatasetPin,
-    RolloutSnapshotMember,
-    create_rollout_snapshot,
-)
+from ditto.db.models import Base
 
 pytestmark = pytest.mark.asyncio
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}"}
-_TARGET = 4
-# The message the deployed generate-service actually returned when the v4
-# rollout was started from the operator console against a datagen release
-# that only ships v2 and v3.
-_LAGGING = "bench_version query param required (supported: 2, 3)"
 
 
 @pytest.fixture

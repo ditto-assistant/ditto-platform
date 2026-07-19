@@ -877,6 +877,7 @@ class TestDashboardScoringTransparency:
         # The published runs, both from dittobench-api docs/BASELINES.md.
         assert "2: { composite: 0.492" in body
         assert "3: { composite: 0.445" in body
+        assert "4: { composite: 0.429" in body
         # Unmeasured versions must be stated, not rendered as a bare dash.
         assert "not yet measured" in body
         assert "No reference baseline has been measured on bench_version" in body
