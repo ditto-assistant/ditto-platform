@@ -795,13 +795,16 @@ async def request_job(
             validator_hotkey=payload.validator_hotkey,
             now=now,
             ttl=_TICKET_TTL,
+            artifact_mode=artifact_mode,
+            validator_running_benchmark=validator_state == "running_benchmark",
         )
         if ticket is None:
             # A version transition never strands an already-issued lease. This
             # also lets a restarted v2-only validator finish its pre-activation
             # work, without granting it any new v3 assignment.
-            ticket = await session.scalar(
+            live_ticket_statement = (
                 select(ValidatorTicket)
+                .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
                 .where(
                     ValidatorTicket.validator_hotkey == payload.validator_hotkey,
                     ValidatorTicket.status == TicketStatus.ISSUED,
@@ -811,6 +814,16 @@ async def request_job(
                 .limit(1)
                 .with_for_update()
             )
+            if artifact_mode == "screened_only":
+                live_ticket_statement = live_ticket_statement.where(
+                    Agent.screened_image_sha256.is_not(None),
+                    Agent.screened_image_size_bytes.is_not(None),
+                    Agent.screened_image_id.is_not(None),
+                    Agent.screened_image_ref.is_not(None),
+                    Agent.screened_image_upload_id.is_not(None),
+                    Agent.screened_image_verified_at.is_not(None),
+                )
+            ticket = await session.scalar(live_ticket_statement)
         if ticket is None:
             canonical_version = await active_bench_version(session)
             if canonical_version >= CANARY_BENCH_VERSION:
