@@ -469,6 +469,297 @@ class TestListScoresForBenchVersion:
         assert score.details["per_case"][0]["expected"] == ["x"]
 
 
+_ROLLOUT_FROM = 2
+_ROLLOUT_DESIRED = 4
+_QUORUM_VALIDATORS = ("5Va", "5Vb", "5Vc")
+
+
+async def _open_rollout(session: AsyncSession) -> None:
+    """A collecting v2 -> v4 rollout, the state the threshold rule governs."""
+    from ditto.db.models import BenchmarkRollout
+
+    async with session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=_ROLLOUT_FROM,
+                desired_version=_ROLLOUT_DESIRED,
+                status="collecting",
+                cohort_size=5,
+                created_at=datetime.now(UTC),
+            )
+        )
+
+
+async def _seed_versioned_agent(
+    session: AsyncSession,
+    *,
+    miner: str,
+    created_at: datetime,
+    v2_composite: float,
+    desired_composite: float | None = None,
+    desired_samples: int = 3,
+    desired_n: int = MIN_ELIGIBLE_CASES,
+    status: AgentStatus = AgentStatus.SCORED,
+) -> Agent:
+    """One agent with a full v2 quorum and an optional partial/full v4 quorum."""
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey=miner,
+        name="agent",
+        sha256="ab" * 32,
+        size_bytes=524288,
+        status=status,
+        created_at=created_at,
+    )
+    async with session.begin():
+        session.add(agent)
+        await session.flush()
+        for index, validator in enumerate(_QUORUM_VALIDATORS):
+            await upsert_score(
+                session,
+                agent_id=agent.agent_id,
+                validator_hotkey=validator,
+                bench_version=_ROLLOUT_FROM,
+                run_id=f"v2-{miner}-{index}",
+                seed=index,
+                composite=v2_composite,
+                tool_mean=v2_composite,
+                memory_mean=v2_composite,
+                median_ms=500,
+                n=MIN_ELIGIBLE_CASES,
+                generated_at=_GEN_AT,
+                signature="ab" * 64,
+            )
+        if desired_composite is not None:
+            for index, validator in enumerate(_QUORUM_VALIDATORS[:desired_samples]):
+                await upsert_score(
+                    session,
+                    agent_id=agent.agent_id,
+                    validator_hotkey=validator,
+                    bench_version=_ROLLOUT_DESIRED,
+                    run_id=f"v4-{miner}-{index}",
+                    seed=index,
+                    composite=desired_composite,
+                    tool_mean=desired_composite,
+                    memory_mean=desired_composite,
+                    median_ms=500,
+                    n=desired_n,
+                    generated_at=_GEN_AT,
+                    signature="cd" * 64,
+                )
+    return agent
+
+
+def _miner(index: int) -> str:
+    return f"5Miner{index:048d}"
+
+
+class TestThresholdGatedAuthority:
+    """Ledger authority flips to the desired version only past the threshold.
+
+    The whole ledger is on ONE version at a time; the flip point is
+    ``MIN_DESIRED_AUTHORITY_AGENTS`` (the KOTH champion + tail), so the emission
+    set never loses recipients mid-rollout.
+    """
+
+    def test_min_desired_authority_matches_koth_recipients(self) -> None:
+        # Drift guard: the threshold IS the KOTH recipient count. The constant is
+        # spelled out in benchmark_rollout (importing api_server there is a
+        # cycle), so this asserts the derivation it documents.
+        from ditto.api_server.koth import KOTH_TAIL_SIZE
+        from ditto.db.queries.benchmark_rollout import MIN_DESIRED_AUTHORITY_AGENTS
+
+        assert MIN_DESIRED_AUTHORITY_AGENTS == 1 + KOTH_TAIL_SIZE
+
+    @staticmethod
+    def _assert_single_version(ledger: list, expected: int) -> None:
+        versions = {row.bench_version for row in ledger}
+        assert versions == {expected}, f"mixed authority versions: {versions}"
+
+    async def test_below_threshold_keeps_active_version_for_every_agent(
+        self, session: AsyncSession
+    ) -> None:
+        from ditto.db.queries.benchmark_rollout import MIN_DESIRED_AUTHORITY_AGENTS
+
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        await _open_rollout(session)
+        # Five agents; only four hold a full v4 quorum — one short of the flip.
+        for index in range(MIN_DESIRED_AUTHORITY_AGENTS):
+            await _seed_versioned_agent(
+                session,
+                miner=_miner(index),
+                created_at=t0,
+                v2_composite=0.50 + index / 100,
+                desired_composite=(
+                    0.80 if index < MIN_DESIRED_AUTHORITY_AGENTS - 1 else None
+                ),
+            )
+        ledger = await list_eligible_ledger(session)
+        # Every agent still ranked on v2, and the emission set is still full.
+        self._assert_single_version(ledger, _ROLLOUT_FROM)
+        assert len(ledger) == MIN_DESIRED_AUTHORITY_AGENTS
+        assert all(row.eligible for row in ledger)
+        assert sorted(row.composite for row in ledger) == pytest.approx(
+            [0.50 + index / 100 for index in range(MIN_DESIRED_AUTHORITY_AGENTS)]
+        )
+
+    async def test_at_threshold_flips_whole_ledger_to_desired_version(
+        self, session: AsyncSession
+    ) -> None:
+        from ditto.db.queries.benchmark_rollout import MIN_DESIRED_AUTHORITY_AGENTS
+
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        await _open_rollout(session)
+        for index in range(MIN_DESIRED_AUTHORITY_AGENTS):
+            await _seed_versioned_agent(
+                session,
+                miner=_miner(index),
+                created_at=t0,
+                v2_composite=0.50 + index / 100,
+                desired_composite=0.70 + index / 100,
+            )
+        ledger = await list_eligible_ledger(session)
+        self._assert_single_version(ledger, _ROLLOUT_DESIRED)
+        assert len(ledger) == MIN_DESIRED_AUTHORITY_AGENTS
+        assert all(row.eligible for row in ledger)
+        assert ledger[0].composite == pytest.approx(
+            0.70 + (MIN_DESIRED_AUTHORITY_AGENTS - 1) / 100
+        )
+
+    async def test_agent_without_desired_quorum_drops_out_after_flip(
+        self, session: AsyncSession
+    ) -> None:
+        from ditto.db.queries.benchmark_rollout import MIN_DESIRED_AUTHORITY_AGENTS
+
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        await _open_rollout(session)
+        for index in range(MIN_DESIRED_AUTHORITY_AGENTS):
+            await _seed_versioned_agent(
+                session,
+                miner=_miner(index),
+                created_at=t0,
+                v2_composite=0.50,
+                desired_composite=0.70,
+            )
+        laggard = await _seed_versioned_agent(
+            session,
+            miner=_miner(99),
+            created_at=t0,
+            v2_composite=0.99,
+            desired_composite=None,
+        )
+        ledger = await list_eligible_ledger(session)
+        # Intended: a v2-only agent has no authoritative row once the pool is on
+        # v4, however high its v2 composite was. That is why the threshold waits
+        # for a full emission set first.
+        self._assert_single_version(ledger, _ROLLOUT_DESIRED)
+        assert laggard.agent_id not in {row.agent_id for row in ledger}
+        assert len(ledger) == MIN_DESIRED_AUTHORITY_AGENTS
+
+    @pytest.mark.parametrize("samples", [1, 2])
+    async def test_partial_desired_samples_never_count_toward_threshold(
+        self, session: AsyncSession, samples: int
+    ) -> None:
+        from ditto.db.queries.benchmark_rollout import MIN_DESIRED_AUTHORITY_AGENTS
+
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        await _open_rollout(session)
+        # Every agent has an incomplete v4 sample: 1/3 or 2/3 is not a quorum.
+        for index in range(MIN_DESIRED_AUTHORITY_AGENTS + 2):
+            await _seed_versioned_agent(
+                session,
+                miner=_miner(index),
+                created_at=t0,
+                v2_composite=0.50,
+                desired_composite=0.90,
+                desired_samples=samples,
+            )
+        ledger = await list_eligible_ledger(session)
+        self._assert_single_version(ledger, _ROLLOUT_FROM)
+        assert all(row.composite == pytest.approx(0.50) for row in ledger)
+
+    async def test_ineligible_desired_run_does_not_count_toward_threshold(
+        self, session: AsyncSession
+    ) -> None:
+        from ditto.db.queries.benchmark_rollout import MIN_DESIRED_AUTHORITY_AGENTS
+
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        await _open_rollout(session)
+        for index in range(MIN_DESIRED_AUTHORITY_AGENTS - 1):
+            await _seed_versioned_agent(
+                session,
+                miner=_miner(index),
+                created_at=t0,
+                v2_composite=0.50,
+                desired_composite=0.70,
+            )
+        # A full 3/3 v4 quorum on a SMOKE run (below the full-benchmark floor).
+        # It is unranked, so it must not be the agent that tips the ledger over.
+        await _seed_versioned_agent(
+            session,
+            miner=_miner(50),
+            created_at=t0,
+            v2_composite=0.50,
+            desired_composite=0.95,
+            desired_n=MIN_ELIGIBLE_CASES - 1,
+        )
+        # Same for a held agent: it is outside the eligible pool entirely.
+        await _seed_versioned_agent(
+            session,
+            miner=_miner(51),
+            created_at=t0,
+            v2_composite=0.50,
+            desired_composite=0.95,
+            status=AgentStatus.ATH_PENDING_REVIEW,
+        )
+        ledger = await list_eligible_ledger(session)
+        self._assert_single_version(ledger, _ROLLOUT_FROM)
+        assert len(ledger) == MIN_DESIRED_AUTHORITY_AGENTS
+
+    async def test_explicit_bench_version_request_is_unaffected(
+        self, session: AsyncSession
+    ) -> None:
+        from ditto.db.queries.benchmark_rollout import MIN_DESIRED_AUTHORITY_AGENTS
+
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        await _open_rollout(session)
+        # Below the threshold, so the default read is pinned to v2 — but an
+        # explicit historical view must still return exactly what it asked for.
+        for index in range(MIN_DESIRED_AUTHORITY_AGENTS - 1):
+            await _seed_versioned_agent(
+                session,
+                miner=_miner(index),
+                created_at=t0,
+                v2_composite=0.50,
+                desired_composite=0.70,
+            )
+        default_ledger = await list_eligible_ledger(session)
+        self._assert_single_version(default_ledger, _ROLLOUT_FROM)
+
+        desired_view = await list_eligible_ledger(
+            session, bench_version=_ROLLOUT_DESIRED
+        )
+        self._assert_single_version(desired_view, _ROLLOUT_DESIRED)
+        assert len(desired_view) == MIN_DESIRED_AUTHORITY_AGENTS - 1
+        assert all(row.composite == pytest.approx(0.70) for row in desired_view)
+
+        active_view = await list_eligible_ledger(session, bench_version=_ROLLOUT_FROM)
+        self._assert_single_version(active_view, _ROLLOUT_FROM)
+
+    async def test_no_open_rollout_keeps_plain_highest_version_behaviour(
+        self, session: AsyncSession
+    ) -> None:
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        # No rollout row at all: desired_version is None and nothing changes.
+        await _seed_versioned_agent(
+            session, miner=_miner(0), created_at=t0, v2_composite=0.50
+        )
+        ledger = await list_eligible_ledger(session)
+        self._assert_single_version(ledger, _ROLLOUT_FROM)
+        assert ledger[0].composite == pytest.approx(0.50)
+
+
 class TestQuorumComposites:
     async def test_returns_every_composite_per_agent(
         self, session: AsyncSession

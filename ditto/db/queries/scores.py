@@ -530,6 +530,65 @@ async def list_miner_composite_history(
     return {hotkey: series[-limit_per:] for hotkey, series in out.items()}
 
 
+async def count_ranked_quorum_agents(
+    session: AsyncSession, *, bench_version: int
+) -> int:
+    """How many eligible agents hold a complete, RANKED quorum at ``bench_version``.
+
+    One definition, two consumers — they must agree or the guarantee they
+    implement has a hole:
+
+    * :func:`list_eligible_ledger` gates the whole-pool authority switch on this
+      count (:data:`~ditto.db.queries.benchmark_rollout.MIN_DESIRED_AUTHORITY_AGENTS`).
+    * :func:`~ditto.db.queries.benchmark_rollout.maybe_activate_rollout` gates
+      activation on it.
+
+    "Eligible" and "ranked" mean exactly what they mean on the ledger: the agent
+    is in ``scored`` (so a ``banned`` / ``ath_pending_review`` agent never
+    counts), it has at least :data:`SCORING_QUORUM` score rows at this version,
+    and its **median** row at this version passes :func:`_is_ranked` — the full
+    benchmark (``n >= MIN_ELIGIBLE_CASES``) with a positive composite. A raw
+    ``count(scores)`` is NOT a substitute: three smoke-profile rows are a quorum
+    by row count but can never rank or earn emissions.
+
+    Deterministic and derived only from committed rows, because it feeds a
+    consensus-critical decision: the same DB state must give every reader the
+    same answer.
+    """
+    per_version = (
+        select(
+            Score.agent_id.label("agent_id"),
+            _is_ranked().label("eligible"),
+            func.count(Score.agent_id).over(partition_by=Score.agent_id).label("cnt"),
+            func.row_number()
+            .over(
+                partition_by=Score.agent_id,
+                order_by=(Score.composite.asc(), Score.validator_hotkey.asc()),
+            )
+            .label("srn"),
+        )
+        .where(Score.bench_version == bench_version)
+        .subquery()
+    )
+    # Same median arithmetic as the ledger (see list_eligible_ledger): the
+    # lower-middle row by ascending composite represents the agent.
+    qualifying = (
+        select(per_version.c.agent_id)
+        .join(Agent, Agent.agent_id == per_version.c.agent_id)
+        .where(
+            Agent.status == AgentStatus.SCORED,
+            per_version.c.cnt >= SCORING_QUORUM,
+            per_version.c.eligible,
+            or_(
+                per_version.c.srn * 2 == per_version.c.cnt,
+                per_version.c.srn * 2 == per_version.c.cnt + 1,
+            ),
+        )
+        .subquery()
+    )
+    return int(await session.scalar(select(func.count()).select_from(qualifying)) or 0)
+
+
 async def list_eligible_ledger(
     session: AsyncSession,
     *,
@@ -578,13 +637,18 @@ async def list_eligible_ledger(
 
     Ordering (``eligible DESC, composite DESC, first_seen ASC, agent_id ASC``)
     matches the validator fold's eligibility gate + champion/tail tie-breaks.
+    During an open rollout the whole ledger sits on ONE benchmark version,
+    chosen by the threshold rule below
+    (:data:`~ditto.db.queries.benchmark_rollout.MIN_DESIRED_AUTHORITY_AGENTS`);
+    a single read never returns a mix of authoritative versions.
+
     The per-agent selection is median-of-quorum (:data:`SCORING_QUORUM`); the
     per-agent ``n`` is uniform across the pool because all validators score the
     same platform-generated dataset, so the median row's ``eligible`` flag
     represents the agent.
     """
     from ditto.db.queries.benchmark_rollout import (
-        DESIRED_AUTHORITY_AT_QUORUM,
+        MIN_DESIRED_AUTHORITY_AGENTS,
         SCORING_QUORUM,
         active_bench_version,
         open_rollout,
@@ -687,15 +751,34 @@ async def list_eligible_ledger(
         )
         .subquery()
     )
-    # During a collecting rollout, per-agent authority is governed by
-    # DESIRED_AUTHORITY_AT_QUORUM. When True, each agent atomically switches
-    # from the active-version median to the desired-version median at 3/3
-    # quorum (the same hybrid authority used to maintain the rolling top-five).
-    # While the pin is on (False), the active-version median stays
-    # authoritative for every agent that has one — desired-version quorums are
-    # collected and visible but take over only at rollout activation. Either
-    # way partial desired-version samples never affect ranks or weights, and an
-    # explicit ``bench_version`` request is a historical single-version view.
+    # During a collecting rollout the ledger is on exactly ONE benchmark version
+    # at a time, chosen by a threshold rule evaluated on each read:
+    #
+    #   fewer than MIN_DESIRED_AUTHORITY_AGENTS agents hold a complete, ranked
+    #   desired-version quorum  ->  the ACTIVE version stays authoritative for
+    #   every agent (desired-version medians are collected and visible as
+    #   rollout progress only);
+    #   at or above that count  ->  the DESIRED version becomes authoritative
+    #   for the whole pool, and an agent without a desired-version quorum has no
+    #   authoritative row at all and drops out. That drop-out is the point of the
+    #   threshold: it only happens once enough agents have crossed to still fill
+    #   the KOTH emission set (see MIN_DESIRED_AUTHORITY_AGENTS).
+    #
+    # Deliberately NOT a per-agent switch. Ranking a v_next composite against a
+    # v_active composite inside one KOTH fold compares incomparable scales — a
+    # newer benchmark applies gates the older one does not, so an already-
+    # migrated agent would be systematically penalised against a not-yet-migrated
+    # peer. Keeping the whole ledger on one version avoids that entirely.
+    #
+    # The threshold is computed here, inside the read, from committed rows only:
+    # every validator folds the ledger this query serves, so a given DB state
+    # must yield the same authority decision for every reader. It must never
+    # become time-based or config-drifty.
+    #
+    # Either way partial desired-version samples never affect ranks or weights,
+    # and an explicit ``bench_version`` request stays a historical single-version
+    # view (``desired_version`` is None for those, so this whole block is skipped).
+    authority_filter: ColumnElement[bool] | None = None
     if desired_version is None:
         version_priority: ColumnElement[Any] = per_agent.c.bench_version
     else:
@@ -704,12 +787,22 @@ async def list_eligible_ledger(
             per_agent.c.cnt >= SCORING_QUORUM,
         )
         on_canonical = per_agent.c.bench_version == canonical_version
-        version_priority = (
-            case((desired_at_quorum, 0), (on_canonical, 1), else_=2)
-            if DESIRED_AUTHORITY_AT_QUORUM
-            else case((on_canonical, 0), (desired_at_quorum, 1), else_=2)
+        # Only genuine, ranked 3/3 desired-version agents count toward the
+        # threshold, so a smoke/practice run or a zero-scoring full run cannot
+        # push the ledger over. Shared with the rollout activation gate, which
+        # must apply the identical definition — see
+        # :func:`count_ranked_quorum_agents`.
+        desired_ready_agents = await count_ranked_quorum_agents(
+            session, bench_version=desired_version
         )
-    selected_version = select(
+        if desired_ready_agents >= MIN_DESIRED_AUTHORITY_AGENTS:
+            # Whole-pool flip: drop every row that is not a desired-version
+            # quorum, so the read cannot return a mix of versions.
+            authority_filter = desired_at_quorum
+            version_priority = per_agent.c.bench_version
+        else:
+            version_priority = case((on_canonical, 0), (desired_at_quorum, 1), else_=2)
+    selected_version_stmt = select(
         per_agent,
         func.row_number()
         .over(
@@ -717,7 +810,12 @@ async def list_eligible_ledger(
             order_by=(version_priority, per_agent.c.bench_version.desc()),
         )
         .label("version_rn"),
-    ).subquery()
+    )
+    if authority_filter is not None:
+        # WHERE is applied before the window function, so the surviving rows are
+        # exactly the desired-version medians.
+        selected_version_stmt = selected_version_stmt.where(authority_filter)
+    selected_version = selected_version_stmt.subquery()
     authoritative = (
         select(selected_version).where(selected_version.c.version_rn == 1).subquery()
     )

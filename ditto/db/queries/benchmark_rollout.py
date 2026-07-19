@@ -47,14 +47,26 @@ LEGACY_BENCH_VERSION = 2
 CANARY_BENCH_VERSION = 4
 COHORT_SIZE = 5
 SCORING_QUORUM = 3
-# TEMPORARY authority pin (2026-07-19): the v3 benchmark still has scoring
-# issues under investigation, so a complete desired-version (v3) quorum does
-# NOT take over an agent's ledger authority mid-rollout. Every agent with an
-# active-version (v2) median keeps it as its authoritative score — for the
-# public leaderboard, the validator weight fold, and KOTH — until the rollout
-# activates; v3 medians stay visible as per-row rollout progress only. Flip
-# back to True to restore per-agent authority at quorum.
-DESIRED_AUTHORITY_AT_QUORUM = False
+# How many agents must hold a COMPLETE, ranked desired-version quorum before
+# the desired version may take over. Two gates enforce it against the same count
+# (``ditto.db.queries.scores.count_ranked_quorum_agents``): the ledger's
+# authority switch (``list_eligible_ledger``) and rollout activation
+# (``maybe_activate_rollout``), which is where the ledger gate stops applying.
+#
+# Derived, not guessed: it is exactly the size of the KOTH emission set — the
+# champion plus the participation tail. Below that count, flipping the ledger to
+# the desired version would drop agents that have no desired-version quorum yet,
+# and the fold would have fewer recipients than the emission split expects, so
+# emissions would go sparse mid-rollout. Deriving it from KOTH_TAIL_SIZE keeps
+# the two from drifting apart if the tail is ever resized.
+#
+# The value is ``1 (champion) + KOTH_TAIL_SIZE`` from ``ditto.api_server.koth``
+# (which mirrors the frozen consensus constants of ditto-subnet's
+# ``ditto/validator/weights.py`` / ``config.py``). It is spelled out rather than
+# imported because ``ditto.api_server`` imports this module, so importing back
+# from it here is a cycle; ``test_min_desired_authority_matches_koth_recipients``
+# asserts the equality, so resizing the tail without resizing this fails CI.
+MIN_DESIRED_AUTHORITY_AGENTS = 5
 
 
 class RolloutConflictError(RuntimeError):
@@ -748,6 +760,27 @@ async def maybe_activate_rollout(
     }
     if any(counts.get(agent_id, 0) < SCORING_QUORUM for agent_id in eligible_ids):
         return False
+    # Activation is the LAST point at which the full-emission-set guarantee can
+    # be enforced. Before activation, list_eligible_ledger's own threshold holds
+    # the ledger on the active version until MIN_DESIRED_AUTHORITY_AGENTS agents
+    # hold a ranked desired-version quorum. After activation open_rollout()
+    # returns None, so desired_version is None, the ledger reads the desired
+    # version unconditionally, and that threshold is bypassed entirely — an agent
+    # without desired-version scores simply drops out.
+    #
+    # The checks above do not imply the threshold. ``eligible_ids`` skips cohort
+    # members that went banned / ath_pending_review, so it can be satisfied by
+    # fewer than five agents; and ``counts`` is a raw count(scores) that a
+    # smoke-profile 3/3 satisfies without ever being rankable. Either path would
+    # activate into a pool too small to fill the champion + tail. Re-check with
+    # the ledger's own definition.
+    from ditto.db.queries.scores import count_ranked_quorum_agents
+
+    ranked_quorum_agents = await count_ranked_quorum_agents(
+        session, bench_version=rollout.desired_version
+    )
+    if ranked_quorum_agents < MIN_DESIRED_AUTHORITY_AGENTS:
+        return False
     rollout.status = "activated"
     rollout.activated_at = now
     rollout.blocked_reason = None
@@ -758,6 +791,7 @@ async def maybe_activate_rollout(
         {
             "bench_version": rollout.desired_version,
             "score_counts": {str(k): v for k, v in counts.items()},
+            "ranked_quorum_agents": ranked_quorum_agents,
         },
         now=now,
     )

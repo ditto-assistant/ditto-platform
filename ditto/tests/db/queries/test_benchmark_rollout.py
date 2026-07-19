@@ -42,6 +42,7 @@ from ditto.db.models import (
 )
 from ditto.db.queries.benchmark_rollout import (
     CANARY_BENCH_VERSION,
+    MIN_DESIRED_AUTHORITY_AGENTS,
     DatasetPin,
     RolloutConflictError,
     RolloutSnapshotMember,
@@ -51,10 +52,11 @@ from ditto.db.queries.benchmark_rollout import (
     issue_rollout_ticket,
     maybe_activate_rollout,
     open_rollout,
+    rolling_top_five,
     rollout_state,
     supersede_open_rollout,
 )
-from ditto.db.queries.scores import list_eligible_ledger
+from ditto.db.queries.scores import count_ranked_quorum_agents, list_eligible_ledger
 from ditto.db.queries.screening import claim_screening_attempts
 
 pytestmark = pytest.mark.asyncio
@@ -322,9 +324,9 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
             await session.flush()
             activations.append(await maybe_activate_rollout(session, rollout, now=now))
             if agent_index == 0:
-                # Agent 0 has a complete v3 quorum, but the temporary authority
-                # pin (DESIRED_AUTHORITY_AT_QUORUM = False) keeps every agent on
-                # its settled v2 median until the rollout activates.
+                # Agent 0 has a complete desired-version quorum, but it is one
+                # of MIN_DESIRED_AUTHORITY_AGENTS, so the threshold gate keeps
+                # the whole ledger on its settled v2 medians.
                 pinned = await list_eligible_ledger(session)
                 by_agent = {row.agent_id: row for row in pinned}
                 assert by_agent[agent_ids[0]].bench_version == 2
@@ -1438,4 +1440,156 @@ async def test_admin_start_route_is_parameterised_by_version() -> None:
         with pytest.raises(HTTPException) as not_found:
             await get_rollout(None, session, "banana")
         assert not_found.value.status_code == 404
+    await engine.dispose()
+
+
+async def _seed_desired_quorum_cohort(
+    session,
+    now: datetime,
+    *,
+    smoke_indices: tuple[int, ...] = (),
+    held_indices: tuple[int, ...] = (),
+) -> tuple[list[UUID], BenchmarkRollout]:
+    """The five-agent cohort, each member carrying a full raw desired quorum.
+
+    ``smoke_indices`` gives those members a 3/3 quorum of sub-floor (smoke
+    profile) runs — a quorum by row count that can never rank. ``held_indices``
+    moves members out of the eligible pool.
+    """
+    agent_ids, rollout = await _seed_rollout(session, now)
+    for position, agent_id in enumerate(agent_ids, start=1):
+        smoke = (position - 1) in smoke_indices
+        for validator in range(3):
+            session.add(
+                Score(
+                    agent_id=agent_id,
+                    bench_version=CANARY_BENCH_VERSION,
+                    validator_hotkey=f"validator-{validator}",
+                    run_id=f"v4-{position}-{validator}",
+                    signature="bb",
+                    seed=position,
+                    composite=0.7 + position / 100,
+                    tool_mean=0.7,
+                    memory_mean=0.7,
+                    median_ms=1,
+                    n=50 if smoke else 114,
+                    details={"bench_version": CANARY_BENCH_VERSION},
+                    generated_at=now,
+                )
+            )
+    for index in held_indices:
+        agent = await session.get(Agent, agent_ids[index])
+        assert agent is not None
+        agent.status = AgentStatus.ATH_PENDING_REVIEW
+    await session.flush()
+    return agent_ids, rollout
+
+
+async def test_activation_requires_five_ranked_desired_quorum_agents() -> None:
+    # Activation is the last point the full-emission-set guarantee can be
+    # enforced: afterwards open_rollout() is None, so list_eligible_ledger reads
+    # the desired version unconditionally and its own threshold no longer
+    # applies. rolling_top_five happens to refuse both degraded cohorts below on
+    # its own today (COHORT_SIZE == MIN_DESIRED_AUTHORITY_AGENTS), so these
+    # assert the guarantee, not which gate fired; the isolating case is
+    # test_activation_refused_when_only_ranked_quorum_count_is_short.
+    for smoke_indices, held_indices in (((0,), ()), ((), (0,))):
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        now = datetime.now(UTC).replace(microsecond=0)
+        async with maker() as session, session.begin():
+            _agent_ids, rollout = await _seed_desired_quorum_cohort(
+                session,
+                now,
+                smoke_indices=smoke_indices,
+                held_indices=held_indices,
+            )
+            # Raw row counts look like a complete cohort quorum.
+            raw_counts = (
+                await session.execute(
+                    select(Score.agent_id, func.count(Score.validator_hotkey))
+                    .where(Score.bench_version == CANARY_BENCH_VERSION)
+                    .group_by(Score.agent_id)
+                )
+            ).all()
+            assert [count for _agent_id, count in raw_counts] == [3] * 5
+            # Ranked, eligible quorums are what actually matter, and are short.
+            assert (
+                await count_ranked_quorum_agents(
+                    session, bench_version=CANARY_BENCH_VERSION
+                )
+                == MIN_DESIRED_AUTHORITY_AGENTS - 1
+            )
+            assert await maybe_activate_rollout(session, rollout, now=now) is False
+            assert rollout.status == "collecting"
+            assert await active_bench_version(session) == 2
+        await engine.dispose()
+
+
+async def test_activation_refused_when_only_ranked_quorum_count_is_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Isolates the new precondition: every legacy activation check is satisfied
+    # (a converged five-member top five, a full raw quorum for every eligible
+    # member) and only the ranked-quorum count is short. Without the
+    # precondition this cohort would activate into a four-agent pool and the
+    # KOTH tail would go short.
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        agent_ids, rollout = await _seed_desired_quorum_cohort(
+            session, now, smoke_indices=(0,)
+        )
+        converged = [
+            RolloutSnapshotMember(
+                agent_id=agent_id, miner_hotkey=f"miner-{index + 1}", composite=0.9
+            )
+            for index, agent_id in enumerate(agent_ids)
+        ]
+
+        async def _converged_top_five(_session: object) -> list[RolloutSnapshotMember]:
+            return converged
+
+        monkeypatch.setattr(
+            "ditto.db.queries.benchmark_rollout.rolling_top_five",
+            _converged_top_five,
+        )
+        assert len(await rolling_top_five(session)) == MIN_DESIRED_AUTHORITY_AGENTS - 1
+        assert await maybe_activate_rollout(session, rollout, now=now) is False
+        assert rollout.status == "collecting"
+    await engine.dispose()
+
+
+async def test_activation_at_five_ranked_quorums_keeps_a_full_emission_set() -> None:
+    # The invariant that actually matters: it holds ACROSS the activation
+    # boundary. Before, the ledger is pinned to v2 with five entries; after, it
+    # is wholly on v4 and still has five.
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
+        assert (
+            await count_ranked_quorum_agents(
+                session, bench_version=CANARY_BENCH_VERSION
+            )
+            == MIN_DESIRED_AUTHORITY_AGENTS
+        )
+        assert await maybe_activate_rollout(session, rollout, now=now) is True
+        assert rollout.status == "activated"
+        assert await active_bench_version(session) == CANARY_BENCH_VERSION
+        assert await open_rollout(session) is None
+
+        ledger = await list_eligible_ledger(session)
+        assert len(ledger) == MIN_DESIRED_AUTHORITY_AGENTS
+        assert {row.agent_id for row in ledger} == set(agent_ids)
+        assert {row.bench_version for row in ledger} == {CANARY_BENCH_VERSION}
+        assert all(row.eligible for row in ledger)
     await engine.dispose()
