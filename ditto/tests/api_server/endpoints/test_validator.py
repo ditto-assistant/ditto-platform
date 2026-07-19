@@ -1533,6 +1533,73 @@ class TestHeartbeat:
         )
         assert restarted.status_code == 200, restarted.text
 
+    @pytest.mark.parametrize("status", [AgentStatus.SCORED, AgentStatus.LIVE])
+    async def test_v4_preserves_rollout_progress_for_scored_and_live_agents(
+        self,
+        status: AgentStatus,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=status)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+                benchmark_progress=_progress(
+                    "running_benchmark", completed=51, total=114
+                ),
+            ),
+        )
+
+        assert response.status_code == 200, response.text
+        fleet = (await client.get("/api/v1/public/validators")).json()
+        validator = fleet["validators"][0]
+        assert validator["active_agent_id"] == str(agent_id)
+        assert validator["active_benchmark"]["stage"] == "running_benchmark"
+
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()
+        attempt = pipeline["validation_attempts"][0]
+        assert attempt["actively_running"] is True
+        assert attempt["benchmark_progress"]["completed_checks"] == 51
+
+    async def test_v4_drops_progress_for_non_scoreable_agent_with_live_ticket(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+                benchmark_progress=_progress("preparing"),
+            ),
+        )
+
+        assert response.status_code == 200, response.text
+        fleet = (await client.get("/api/v1/public/validators")).json()
+        validator = fleet["validators"][0]
+        assert validator["active_agent_id"] is None
+        assert validator["active_benchmark"] is None
+
     async def test_v4_drops_progress_without_matching_live_ticket_but_stays_live(
         self,
         app: FastAPI,

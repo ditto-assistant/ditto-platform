@@ -64,7 +64,7 @@ from ditto.api_models import (
     ValidatorHeartbeatRequest,
     ValidatorHeartbeatResponse,
 )
-from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.agent_status import SCOREABLE_AGENT_STATUSES, AgentStatus
 from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.benchmark_progress import benchmark_progress_signing_token
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
@@ -280,12 +280,7 @@ def _screened_image_key(agent_id: UUID, image_upload_id: UUID) -> str:
 # so a validator can re-score across epochs without a 409;
 # ``ath_pending_review`` is included so a re-score of a held agent updates its
 # score row (feeding the eventual review) without un-holding it.
-_SCOREABLE_STATUSES = (
-    AgentStatus.EVALUATING,
-    AgentStatus.SCORED,
-    AgentStatus.LIVE,
-    AgentStatus.ATH_PENDING_REVIEW,
-)
+_SCOREABLE_STATUSES = SCOREABLE_AGENT_STATUSES
 
 
 class ValidatorAuthError(Exception):
@@ -690,7 +685,7 @@ async def heartbeat(
             if (
                 ticket is None
                 or agent is None
-                or agent.status != AgentStatus.EVALUATING
+                or agent.status not in _SCOREABLE_STATUSES
             ):
                 # Ticket-bound progress is optional decoration. A benchmark can
                 # outlive or lose its lease, but that must not discard an
