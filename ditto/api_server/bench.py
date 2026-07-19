@@ -18,14 +18,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from ditto.api_models.benchmark_contract import latest_benchmark_contract
+
 # The current DittoBench benchmark version. See module docstring.
 #
 # Tracks the version being rolled OUT, not the one currently authoritative for
 # weights -- it was 3 throughout the 2->3 rollout while active_version was still
-# 2. Leaving it behind would have GET /bench/config publish "current benchmark is
-# v3" to miners while the rollout targets v4, and would break this module's own
-# stated invariant that it mirrors the scorer's protocol.BenchVersion (now 4).
-CURRENT_BENCH_VERSION = 4
+# 2. The newest shipped immutable contract is discovery metadata; it does not
+# open a rollout or change the active weight authority. Rollout selection is a
+# separate authenticated operator action backed by the durable rollout row.
+CURRENT_BENCH_VERSION = latest_benchmark_contract().version
 
 
 def is_bench_version_retired(version: int, active_version: int) -> bool:

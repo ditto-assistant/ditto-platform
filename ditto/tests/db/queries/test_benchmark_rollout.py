@@ -19,9 +19,11 @@ from ditto.api_server.benchmark_rollout import (
     rolling_qualification_blockers,
 )
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
+    AdminRolloutStartRequest,
     AdminRolloutSupersedeRequest,
     _require_rollout_start_capacity,
     get_rollout,
+    get_rollout_control,
     start_rollout,
     supersede_rollout,
 )
@@ -80,6 +82,15 @@ async def test_admin_status_read_does_not_start_rollout() -> None:
             "qualification_converged": False,
             "members": [],
         }
+        count = await session.scalar(select(func.count(BenchmarkRollout.rollout_id)))
+        assert count == 0
+
+        control = await get_rollout_control(None, session)
+        assert control["available_target_versions"] == [3, 4]
+        contracts = control["contracts"]
+        assert isinstance(contracts, list)
+        assert [item["version"] for item in contracts] == [2, 3, 4]
+        assert control["status"] == "inactive"
         count = await session.scalar(select(func.count(BenchmarkRollout.rollout_id)))
         assert count == 0
     await engine.dispose()
@@ -738,7 +749,7 @@ async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards() ->
                     created_at=now + timedelta(minutes=1),
                 )
             )
-            for validator in range(3):
+            for validator, seed in enumerate((43, 41, 42)):
                 session.add(
                     Score(
                         agent_id=rising_id,
@@ -746,7 +757,7 @@ async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards() ->
                         validator_hotkey=f"admin-riser-{validator}",
                         run_id=f"admin-riser-{validator}",
                         signature="aa",
-                        seed=42,
+                        seed=seed,
                         composite=0.505,
                         tool_mean=0.5,
                         memory_mean=0.5,
@@ -867,15 +878,18 @@ async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards() ->
             )
             assert len(scores) == 3
             assert agent is not None and agent.status == AgentStatus.SCORED
-            assert dataset is not None and dataset.seed == 42
+            assert dataset is not None and dataset.seed == 41
             assert audit is not None
             assert audit.payload["origin"] == "manual"
             assert audit.payload["actor"] == "backroom:test"
             assert audit.payload["reason"] == ("recover legacy top-five qualification")
+            assert audit.payload["seed_source"] == "source_scores_canonical_min"
+            assert audit.payload["dataset_seed"] == 41
+            assert audit.payload["dataset_sha256"] == "e" * 64
     await engine.dispose()
 
 
-async def test_ambiguous_legacy_seeds_are_visible_and_fail_closed() -> None:
+async def test_multiple_legacy_score_seeds_use_canonical_minimum() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -939,22 +953,33 @@ async def test_ambiguous_legacy_seeds_are_visible_and_fail_closed() -> None:
             await refresh_rolling_qualification(
                 session, generator=generator, now=now + timedelta(seconds=1)
             )
-            == 0
+            == 1
         )
-        assert generator.generate.await_count == 0
+        generator.generate.assert_awaited_once_with(
+            41, bench_version=CANARY_BENCH_VERSION
+        )
         blockers = await rolling_qualification_blockers(
             session, generator_run_size="full"
         )
-        assert blockers == [
-            {
-                "agent_id": str(rising_id),
-                "reason": "ambiguous_source_score_seeds",
-            }
-        ]
-        assert (
-            await session.get(BenchmarkRolloutMember, (rollout.rollout_id, rising_id))
-            is None
+        assert blockers == []
+        member = await session.get(
+            BenchmarkRolloutMember, (rollout.rollout_id, rising_id)
         )
+        dataset = await session.get(BenchmarkDataset, (rising_id, CANARY_BENCH_VERSION))
+        audit = await session.scalar(
+            select(BenchmarkRolloutAudit).where(
+                BenchmarkRolloutAudit.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutAudit.event == "member_qualified",
+                BenchmarkRolloutAudit.payload["agent_id"].as_string() == str(rising_id),
+            )
+        )
+        assert member is not None
+        assert dataset is not None and dataset.seed == 41
+        assert audit is not None
+        assert audit.payload["origin"] == "automatic"
+        assert audit.payload["seed_source"] == "source_scores_canonical_min"
+        assert audit.payload["dataset_seed"] == 41
+        assert audit.payload["dataset_sha256"] == "e" * 64
     await engine.dispose()
 
 
@@ -988,7 +1013,7 @@ async def test_only_one_open_rollout_across_collecting_and_blocked_states() -> N
     await engine.dispose()
 
 
-async def test_first_capable_validator_automatically_seeds_v3_work() -> None:
+async def test_capable_validator_cannot_automatically_seed_rollout_work() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -1054,23 +1079,53 @@ async def test_first_capable_validator_automatically_seeds_v3_work() -> None:
 
     generator = AsyncMock()
     generator.generate.return_value = "e" * 64
-    assert await ensure_rolling_qualification(session, generator=generator, now=now)
-    assert generator.generate.await_count == 5
+    assert not await ensure_rolling_qualification(session, generator=generator, now=now)
+    generator.generate.assert_not_awaited()
     async with session.begin():
         rollout = await open_rollout(session)
-        assert rollout is not None
+        assert rollout is None
         ticket = await issue_rollout_ticket(
             session,
             validator_hotkey="validator-auto",
             now=now,
             ttl=timedelta(minutes=90),
         )
-        assert ticket is not None
-        assert ticket.bench_version == CANARY_BENCH_VERSION
+        assert ticket is None
 
-    # Repeated job polls are idempotent and do not render another dataset set.
+    # Repeated job polls remain fail-closed and cannot render or open a rollout.
     assert not await ensure_rolling_qualification(session, generator=generator, now=now)
+    generator.generate.assert_not_awaited()
+
+    state = await start_rollout(
+        None,
+        session,
+        generator,
+        str(CANARY_BENCH_VERSION),
+        AdminRolloutStartRequest(
+            reason="operator opens shipped benchmark",
+            actor="backroom:test",
+            confirmation=f"START BENCHMARK V{CANARY_BENCH_VERSION}",
+            expected_active_version=2,
+        ),
+    )
+    assert state["status"] == "collecting"
+    assert state["active_version"] == 2
+    assert state["desired_version"] == CANARY_BENCH_VERSION
     assert generator.generate.await_count == 5
+    await session.rollback()
+    async with session.begin():
+        rollout = await open_rollout(session)
+        assert rollout is not None
+        audit = await session.scalar(
+            select(BenchmarkRolloutAudit).where(
+                BenchmarkRolloutAudit.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutAudit.event == "cohort_frozen",
+            )
+        )
+        assert audit is not None
+        assert audit.payload["actor"] == "backroom:test"
+        assert audit.payload["reason"] == "operator opens shipped benchmark"
+        assert set(audit.payload["seed_sources"].values()) == {"legacy_pin"}
     await engine.dispose()
 
 
@@ -1094,11 +1149,30 @@ async def test_admin_start_is_idempotent_after_unique_transition_activation() ->
             )
         )
     async with maker() as session:
+        with pytest.raises(HTTPException, match="type .* exactly"):
+            await start_rollout(
+                None,
+                session,
+                object(),  # type: ignore[arg-type]
+                str(CANARY_BENCH_VERSION),
+                AdminRolloutStartRequest(
+                    reason="confirmation guard",
+                    actor="test",
+                    confirmation="START BENCHMARK V3",
+                    expected_active_version=CANARY_BENCH_VERSION,
+                ),
+            )
         state = await start_rollout(
             None,
             session,
             object(),  # type: ignore[arg-type]
             str(CANARY_BENCH_VERSION),
+            AdminRolloutStartRequest(
+                reason="idempotence check",
+                actor="test",
+                confirmation=f"START BENCHMARK V{CANARY_BENCH_VERSION}",
+                expected_active_version=CANARY_BENCH_VERSION,
+            ),
         )
         assert state["active_version"] == CANARY_BENCH_VERSION
         assert state["desired_version"] == CANARY_BENCH_VERSION
@@ -1123,7 +1197,7 @@ async def test_admin_start_is_idempotent_after_unique_transition_activation() ->
 
 
 @pytest.mark.parametrize("capable_count", [0, 1, 2])
-async def test_v3_start_requires_two_capable_validators_and_matches_telemetry(
+async def test_rollout_start_requires_one_capable_validator_and_matches_telemetry(
     capable_count: int,
 ) -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -1153,13 +1227,13 @@ async def test_v3_start_requires_two_capable_validators_and_matches_telemetry(
 
         telemetry = await rollout_state(session, now=now)
         assert telemetry["v3_capable_validator_count"] == capable_count
-        if capable_count < 2:
+        if capable_count < 1:
             with pytest.raises(HTTPException) as exc_info:
                 await _require_rollout_start_capacity(
                     session, now=now, desired_version=CANARY_BENCH_VERSION
                 )
             assert exc_info.value.status_code == 409
-            assert "requires at least 2" in str(exc_info.value.detail)
+            assert "requires at least 1" in str(exc_info.value.detail)
             assert await open_rollout(session) is None
         else:
             guarded = await _require_rollout_start_capacity(
@@ -1397,7 +1471,11 @@ async def test_admin_supersede_endpoint_audits_and_refuses_activated() -> None:
             None,
             session,
             "v3",
-            AdminRolloutSupersedeRequest(reason="false positives", actor="nick"),
+            AdminRolloutSupersedeRequest(
+                reason="false positives",
+                actor="nick",
+                confirmation="SUPERSEDE BENCHMARK V3",
+            ),
         )
         assert state["status"] == "superseded"
         assert await open_rollout(session) is None
@@ -1408,7 +1486,11 @@ async def test_admin_supersede_endpoint_audits_and_refuses_activated() -> None:
                 None,
                 session,
                 "v3",
-                AdminRolloutSupersedeRequest(reason="again", actor="nick"),
+                AdminRolloutSupersedeRequest(
+                    reason="again",
+                    actor="nick",
+                    confirmation="SUPERSEDE BENCHMARK V3",
+                ),
             )
         assert exc_info.value.status_code == 409
     await engine.dispose()

@@ -87,7 +87,6 @@ from ditto.api_models.validator_capabilities import (
 )
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
 from ditto.api_server.benchmark_rollout import (
-    ensure_rolling_qualification,
     refresh_rolling_qualification,
 )
 from ditto.api_server.config import ValidatorCompatibilityConfig
@@ -119,11 +118,11 @@ from ditto.db.queries.audit import (
     append_audit_entry,
 )
 from ditto.db.queries.benchmark_rollout import (
-    CANARY_BENCH_VERSION,
     LEGACY_BENCH_VERSION,
     active_bench_version,
     heartbeat_supports_version,
     issue_rollout_ticket,
+    open_rollout,
 )
 from ditto.db.queries.heartbeats import (
     HeartbeatProgressRegressionError,
@@ -298,10 +297,9 @@ async def _refresh_qualification_if_due(
     # into one refresh. Score/verdict triggers remain the immediate primary path.
     _qualification_refresh_due = monotonic_now + _QUALIFICATION_REFRESH_INTERVAL_SECONDS
     try:
-        await ensure_rolling_qualification(session, generator=generator, now=now)
         await refresh_rolling_qualification(session, generator=generator, now=now)
     except Exception:
-        logger.exception("automatic benchmark-v3 qualification refresh failed")
+        logger.exception("automatic benchmark qualification refresh failed")
 
 
 class ValidatorAuthError(Exception):
@@ -879,12 +877,13 @@ async def request_job(
             ticket = await session.scalar(live_ticket_statement)
         if ticket is None:
             canonical_version = await active_bench_version(session)
+            rollout = await open_rollout(session)
             heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
             if (
-                canonical_version < CANARY_BENCH_VERSION
+                rollout is not None
                 and heartbeat is not None
                 and heartbeat_supports_version(
-                    heartbeat, now=now, version=CANARY_BENCH_VERSION
+                    heartbeat, now=now, version=rollout.desired_version
                 )
             ):
                 # Guarded admin migrations pin a canary dataset without adding
@@ -895,7 +894,7 @@ async def request_job(
                     validator_hotkey=payload.validator_hotkey,
                     now=now,
                     ttl=_TICKET_TTL,
-                    bench_version=CANARY_BENCH_VERSION,
+                    bench_version=rollout.desired_version,
                     artifact_mode="screened_only",
                     validator_running_benchmark=validator_state == "running_benchmark",
                 )

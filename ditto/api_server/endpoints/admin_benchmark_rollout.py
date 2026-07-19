@@ -9,29 +9,33 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, StringConstraints
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ditto.api_models.benchmark_contract import benchmark_contract
-from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
+from ditto.api_models.benchmark_contract import (
+    benchmark_contract,
+    benchmark_contracts,
+)
+from ditto.api_server.benchmark_rollout import (
+    qualification_candidate,
+    refresh_rolling_qualification,
+)
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import get_dataset_generator, get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
-from ditto.db.models import Agent
 from ditto.db.queries.benchmark_rollout import (
     DatasetPin,
     RolloutConflictError,
-    RolloutSnapshotMember,
     active_bench_version,
     create_rollout_snapshot,
+    rolling_top_five,
     rollout_for_desired_version,
     rollout_state,
     supersede_open_rollout,
 )
-from ditto.db.queries.scores import list_eligible_ledger
 
 router = APIRouter(prefix="/admin/benchmark-rollout", tags=["admin"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 GeneratorDep = Annotated[DatasetGenerator, Depends(get_dataset_generator)]
 AdminDep = Annotated[None, Depends(require_admin)]
-MINIMUM_ROLLOUT_START_VALIDATORS = 2
+MINIMUM_ROLLOUT_START_VALIDATORS = 1
 
 _Reason = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=3, max_length=500)
@@ -45,6 +49,15 @@ class AdminRolloutSupersedeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     reason: _Reason
     actor: _Actor = "admin_api"
+    confirmation: str
+
+
+class AdminRolloutStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: _Reason
+    actor: _Actor = "admin_api"
+    confirmation: str
+    expected_active_version: int
 
 
 def _parse_desired_version(desired_version: str) -> int:
@@ -72,7 +85,7 @@ def _parse_desired_version(desired_version: str) -> int:
 async def _require_rollout_start_capacity(
     session: AsyncSession, *, now: datetime, desired_version: int
 ) -> dict[str, object]:
-    """Fail closed until two independently verified target scorers are online."""
+    """Fail closed until one independently verified target scorer is online."""
     state = await rollout_state(session, now=now, capability_version=desired_version)
     capable = int(state["canary_capable_validator_count"])
     if capable < MINIMUM_ROLLOUT_START_VALIDATORS:
@@ -85,6 +98,51 @@ async def _require_rollout_start_capacity(
             ),
         )
     return state
+
+
+def _require_confirmation(actual: str, *, action: str, version: int) -> None:
+    expected = f"{action} BENCHMARK V{version}"
+    if actual != expected:
+        raise HTTPException(
+            status_code=409,
+            detail=f'type "{expected}" exactly to confirm this operation',
+        )
+
+
+@router.get("")
+async def get_rollout_control(
+    _: AdminDep,
+    session: SessionDep,
+) -> dict[str, object]:
+    """Advertise shipped targets and durable state without changing either."""
+    state = await rollout_state(session)
+    active = int(state["active_version"])
+    contracts = benchmark_contracts()
+    capability_counts = {
+        contract.version: int(
+            (await rollout_state(session, capability_version=contract.version))[
+                "canary_capable_validator_count"
+            ]
+        )
+        for contract in contracts
+    }
+    return {
+        **state,
+        "contracts": [
+            {
+                "version": contract.version,
+                "minimum_screening_policy_version": (
+                    contract.minimum_screening_policy_version
+                ),
+                "requires_screened_image": contract.requires_screened_image,
+                "capable_validator_count": capability_counts[contract.version],
+            }
+            for contract in contracts
+        ],
+        "available_target_versions": [
+            contract.version for contract in contracts if contract.version > active
+        ],
+    }
 
 
 @router.get("/{desired_version}")
@@ -111,6 +169,7 @@ async def supersede_rollout(
     released the superseded corpus, so it is history, not state.
     """
     target = _parse_desired_version(desired_version)
+    _require_confirmation(payload.confirmation, action="SUPERSEDE", version=target)
     now = datetime.now(UTC)
     try:
         rollout = await supersede_open_rollout(
@@ -142,10 +201,20 @@ async def start_rollout(
     session: SessionDep,
     generator: GeneratorDep,
     desired_version: str,
+    payload: AdminRolloutStartRequest,
 ) -> dict[str, object]:
     """Seed rolling qualification with the current top five and target datasets."""
     target = _parse_desired_version(desired_version)
+    _require_confirmation(payload.confirmation, action="START", version=target)
     from_version = await active_bench_version(session)
+    if payload.expected_active_version != from_version:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "active benchmark changed: expected "
+                f"v{payload.expected_active_version}, found v{from_version}"
+            ),
+        )
     # Idempotence first: a rollout already targeting this version is returned
     # as-is, whatever it started from. Only then does the forward-only guard
     # apply, so re-POSTing an already-activated version is not a 409.
@@ -166,46 +235,43 @@ async def start_rollout(
         return await rollout_state(session, capability_version=target)
     now = datetime.now(UTC)
     await _require_rollout_start_capacity(session, now=now, desired_version=target)
-    ledger = [row for row in await list_eligible_ledger(session) if row.eligible][:5]
-    if len(ledger) != 5:
+    members = await rolling_top_five(session)
+    if len(members) != 5:
         raise HTTPException(
             status_code=409,
             detail=(
                 f"benchmark v{target} rollout requires five eligible distinct miners"
             ),
         )
-    members: list[RolloutSnapshotMember] = []
     pins: dict = {}
-    for row in ledger:
-        agent = await session.get(Agent, row.agent_id)
-        assert agent is not None
-        if (
-            agent.dataset_seed is None
-            or agent.dataset_sha256 is None
-            or agent.dataset_run_size is None
-        ):
+    seed_sources: dict[str, str] = {}
+    for member in members:
+        candidate, blocker = await qualification_candidate(
+            session,
+            source_bench_version=from_version,
+            target_bench_version=target,
+            member=member,
+            generator_run_size=generator.run_size,
+        )
+        if candidate is None:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"cohort agent {agent.agent_id} has no pinned "
-                    f"v{from_version} dataset"
+                    f"cohort agent {member.agent_id} cannot qualify for "
+                    f"v{target}: {blocker}"
                 ),
             )
-        sha256 = await generator.generate(agent.dataset_seed, bench_version=target)
-        members.append(
-            RolloutSnapshotMember(
-                agent_id=agent.agent_id,
-                miner_hotkey=agent.miner_hotkey,
-                composite=row.composite,
-            )
+        sha256 = candidate.existing_sha256 or await generator.generate(
+            candidate.seed, bench_version=target
         )
-        pins[agent.agent_id] = DatasetPin(
-            seed=agent.dataset_seed,
+        pins[member.agent_id] = DatasetPin(
+            seed=candidate.seed,
             sha256=sha256,
-            run_size=agent.dataset_run_size,
-            seed_block=agent.dataset_seed_block,
-            seed_block_hash=agent.dataset_seed_block_hash,
+            run_size=candidate.run_size,
+            seed_block=candidate.seed_block,
+            seed_block_hash=candidate.seed_block_hash,
         )
+        seed_sources[str(member.agent_id)] = candidate.seed_source
     try:
         await create_rollout_snapshot(
             session,
@@ -214,6 +280,14 @@ async def start_rollout(
             now=now,
             from_version=from_version,
             desired_version=target,
+            audit_context={
+                "origin": "admin",
+                "actor": payload.actor,
+                "reason": payload.reason,
+                "from_version": from_version,
+                "desired_version": target,
+                "seed_sources": seed_sources,
+            },
         )
     except RolloutConflictError as exc:
         await session.rollback()

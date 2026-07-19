@@ -31,3 +31,18 @@ def benchmark_contract(version: int) -> BenchmarkContract:
         return _CONTRACTS[version]
     except KeyError as exc:
         raise ValueError(f"unsupported benchmark version: {version}") from exc
+
+
+def benchmark_contracts() -> tuple[BenchmarkContract, ...]:
+    """Return every shipped contract in stable version order.
+
+    Shipping code makes a contract *available*; it does not activate or open a
+    rollout. The authenticated operator control uses this registry for target
+    discovery so future benchmark bumps do not require another API hardcode.
+    """
+    return tuple(_CONTRACTS[version] for version in sorted(_CONTRACTS))
+
+
+def latest_benchmark_contract() -> BenchmarkContract:
+    """Return the newest contract shipped by this platform release."""
+    return _CONTRACTS[max(_CONTRACTS)]

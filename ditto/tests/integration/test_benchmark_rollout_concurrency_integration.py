@@ -12,7 +12,6 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_server import benchmark_rollout as rollout_service
 from ditto.api_server.benchmark_rollout import (
     ensure_rolling_qualification,
     refresh_rolling_qualification,
@@ -26,6 +25,7 @@ from ditto.db.models import (
     ValidatorHeartbeat,
 )
 from ditto.db.queries.benchmark_rollout import (
+    CANARY_BENCH_VERSION,
     DatasetPin,
     RolloutSnapshotMember,
     create_rollout_snapshot,
@@ -38,8 +38,8 @@ class _Generator:
     run_size = "full"
 
     async def generate(self, seed: int, bench_version: int = 2) -> str:
-        assert seed == 8675309
-        assert bench_version == 3
+        assert seed == 41
+        assert bench_version == CANARY_BENCH_VERSION
         await asyncio.sleep(0)
         return "e" * 64
 
@@ -116,7 +116,7 @@ async def test_concurrent_legacy_qualification_has_one_winner() -> None:
                 created_at=now + timedelta(minutes=1),
             )
         )
-        for validator in range(3):
+        for validator, seed in enumerate((43, 41, 42)):
             session.add_all(
                 [
                     Score(
@@ -125,7 +125,7 @@ async def test_concurrent_legacy_qualification_has_one_winner() -> None:
                         validator_hotkey=f"rising-{validator}",
                         run_id=f"rising-{validator}",
                         signature="aa",
-                        seed=8675309,
+                        seed=seed,
                         composite=0.555,
                         tool_mean=0.5,
                         memory_mean=0.5,
@@ -136,7 +136,7 @@ async def test_concurrent_legacy_qualification_has_one_winner() -> None:
                     ),
                     Score(
                         agent_id=initial_ids[0],
-                        bench_version=3,
+                        bench_version=CANARY_BENCH_VERSION,
                         validator_hotkey=f"drop-{validator}",
                         run_id=f"drop-{validator}",
                         signature="bb",
@@ -169,7 +169,7 @@ async def test_concurrent_legacy_qualification_has_one_winner() -> None:
             await session.scalar(
                 select(func.count())
                 .select_from(BenchmarkDataset)
-                .where(BenchmarkDataset.bench_version == 3)
+                .where(BenchmarkDataset.bench_version == CANARY_BENCH_VERSION)
             )
             == 5
         )
@@ -195,17 +195,17 @@ async def test_concurrent_legacy_qualification_has_one_winner() -> None:
             .select_from(BenchmarkDataset)
             .where(
                 BenchmarkDataset.agent_id == rising_id,
-                BenchmarkDataset.bench_version == 3,
+                BenchmarkDataset.bench_version == CANARY_BENCH_VERSION,
             )
         )
+        dataset = await session.get(BenchmarkDataset, (rising_id, CANARY_BENCH_VERSION))
     assert member_count == 1
     assert dataset_count == 1
+    assert dataset is not None and dataset.seed == 41
     await engine.dispose()
 
 
-async def test_bootstrap_rechecks_cohort_after_render(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_validator_bootstrap_is_disabled() -> None:
     engine = create_db_engine()
     maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC).replace(microsecond=0)
@@ -261,36 +261,9 @@ async def test_bootstrap_rechecks_cohort_after_render(
             )
         )
 
-    def supports_v3(_heartbeat: object, *, now: datetime) -> bool:
-        del _heartbeat, now
-        return True
-
-    monkeypatch.setattr(rollout_service, "heartbeat_supports_v3", supports_v3)
-
-    class _RacingGenerator(_Generator):
-        calls = 0
-
-        async def generate(self, seed: int, bench_version: int = 2) -> str:
-            del seed
-            self.calls += 1
-            if self.calls == 1:
-                async with maker() as session, session.begin():
-                    scores = list(
-                        await session.scalars(
-                            select(Score)
-                            .where(Score.agent_id == agent_ids[0])
-                            .with_for_update()
-                        )
-                    )
-                    assert scores
-                    for score in scores:
-                        score.composite = 0.99
-            assert bench_version == 3
-            return "e" * 64
-
     async with maker() as session:
         assert not await ensure_rolling_qualification(
-            session, generator=_RacingGenerator(), now=now
+            session, generator=_Generator(), now=now
         )
         assert (
             await session.scalar(

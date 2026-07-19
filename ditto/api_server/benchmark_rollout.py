@@ -18,21 +18,14 @@ from ditto.db.models import (
     BenchmarkRollout,
     BenchmarkRolloutMember,
     Score,
-    ValidatorHeartbeat,
 )
 from ditto.db.queries.benchmark_rollout import (
-    CANARY_BENCH_VERSION,
-    COHORT_SIZE,
-    DEFAULT_BENCH_VERSION,
     DatasetPin,
     RolloutSnapshotMember,
     append_rollout_member,
-    create_rollout_snapshot,
-    heartbeat_supports_version,
     maybe_activate_rollout,
     open_rollout,
     rolling_top_five,
-    rollout_for_transition,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,7 +38,7 @@ class PendingQualification:
     run_size: str
     seed_block: int | None
     seed_block_hash: str | None
-    seed_source: Literal["legacy_pin", "v2_scores", "versioned_pin"]
+    seed_source: Literal["legacy_pin", "source_scores_canonical_min", "versioned_pin"]
     existing_sha256: str | None = None
 
 
@@ -57,12 +50,13 @@ async def qualification_candidate(
     member: RolloutSnapshotMember,
     generator_run_size: str | None,
 ) -> tuple[PendingQualification | None, str | None]:
-    """Resolve a v3 input without rewriting an older agent-level dataset pin.
+    """Resolve a target-version input without rewriting an older dataset pin.
 
-    Pre-pin agents may have null compatibility columns even though every
-    accepted v2 score binds the same signed seed. One consistent score seed is
-    safe to reuse for the separately versioned v3 dataset; ambiguity fails
-    closed and is surfaced to operators.
+    Pre-pin agents may have null compatibility columns and multiple accepted
+    source-version score seeds. Choosing the numerically smallest distinct seed
+    is deterministic across validators, retries, and operators, so no caller
+    can cherry-pick the target dataset. The separately versioned pin preserves every
+    historical score and never rewrites the legacy compatibility columns.
     """
     agent = await session.get(Agent, member.agent_id)
     assert agent is not None
@@ -109,11 +103,11 @@ async def qualification_candidate(
             .distinct()
         )
     )
-    if len(score_seeds) > 1:
-        return None, "ambiguous_source_score_seeds"
     if score_seeds:
-        seed = score_seeds.pop()
-        seed_source: Literal["legacy_pin", "v2_scores"] = "v2_scores"
+        seed = min(score_seeds)
+        seed_source: Literal["legacy_pin", "source_scores_canonical_min"] = (
+            "source_scores_canonical_min"
+        )
         seed_block = None
         seed_block_hash = None
     elif agent.dataset_seed is not None:
@@ -171,87 +165,14 @@ async def rolling_qualification_blockers(
 async def ensure_rolling_qualification(
     session: AsyncSession, *, generator: DatasetGenerator, now: datetime
 ) -> bool:
-    """Lazily seed canary qualification once a verified validator requests work.
+    """Compatibility no-op: rollout creation is an authenticated admin action.
 
-    The canary benchmark is a shipped contract, not an operator feature flag.
-    Rendering happens outside a transaction and snapshot creation remains
-    idempotent under the query layer's advisory lock.
+    Older internal callers may still import this helper during an asynchronous
+    deploy. Keeping it as a fail-closed no-op avoids an import failure without
+    allowing a heartbeat or validator job poll to activate a shipped contract.
     """
-    async with session.begin():
-        existing = await rollout_for_transition(
-            session,
-            from_version=DEFAULT_BENCH_VERSION,
-            desired_version=CANARY_BENCH_VERSION,
-        )
-        if existing is not None:
-            return False
-        # A different transition still holding the single open slot must not be
-        # auto-superseded here; abandoning a rollout is an operator decision.
-        if await open_rollout(session) is not None:
-            return False
-        heartbeats = list(await session.scalars(select(ValidatorHeartbeat)))
-        if not any(
-            heartbeat_supports_version(item, now=now, version=CANARY_BENCH_VERSION)
-            for item in heartbeats
-        ):
-            return False
-        members = await rolling_top_five(session)
-        if len(members) != COHORT_SIZE:
-            return False
-        pending: list[PendingQualification] = []
-        for member in members:
-            candidate, reason = await qualification_candidate(
-                session,
-                source_bench_version=DEFAULT_BENCH_VERSION,
-                target_bench_version=CANARY_BENCH_VERSION,
-                member=member,
-                generator_run_size=generator.run_size,
-            )
-            if candidate is None:
-                logger.warning(
-                    "benchmark qualification bootstrap blocked agent_id=%s reason=%s",
-                    member.agent_id,
-                    reason,
-                )
-                return False
-            pending.append(candidate)
-
-    datasets: dict[UUID, DatasetPin] = {}
-    for candidate in pending:
-        datasets[candidate.member.agent_id] = DatasetPin(
-            seed=candidate.seed,
-            sha256=await generator.generate(
-                candidate.seed, bench_version=CANARY_BENCH_VERSION
-            )
-            if candidate.existing_sha256 is None
-            else candidate.existing_sha256,
-            run_size=candidate.run_size,
-            seed_block=candidate.seed_block,
-            seed_block_hash=candidate.seed_block_hash,
-        )
-    async with session.begin():
-        current_members = await rolling_top_five(session)
-        if current_members != members:
-            return False
-        for expected, current_member in zip(pending, current_members, strict=True):
-            current, _reason = await qualification_candidate(
-                session,
-                source_bench_version=DEFAULT_BENCH_VERSION,
-                target_bench_version=CANARY_BENCH_VERSION,
-                member=current_member,
-                generator_run_size=generator.run_size,
-            )
-            if current != expected:
-                return False
-        await create_rollout_snapshot(
-            session,
-            members=members,
-            datasets=datasets,
-            now=now,
-            from_version=DEFAULT_BENCH_VERSION,
-            desired_version=CANARY_BENCH_VERSION,
-        )
-    return True
+    del session, generator, now
+    return False
 
 
 async def refresh_rolling_qualification(
@@ -346,6 +267,7 @@ async def refresh_rolling_qualification(
                     seed_block_hash=candidate.seed_block_hash,
                 ),
                 now=now,
+                audit_context={"seed_source": candidate.seed_source},
             )
         await maybe_activate_rollout(session, rollout, now=now)
     return appended
