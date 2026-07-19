@@ -571,6 +571,7 @@ class TestPublicLeaderboard:
 
         assert body["active_bench_version"] == 2
         assert body["desired_bench_version"] == 3
+        assert body["available_bench_versions"] == [3, 2]
         by_agent = {e["agent_id"]: e for e in body["entries"]}
         flipped = by_agent[flipped_id]
         assert flipped["bench_version"] == DEFAULT_BENCH_VERSION
@@ -667,6 +668,7 @@ class TestPublicLeaderboard:
         assert body["active_bench_version"] == DEFAULT_BENCH_VERSION
         assert body["desired_bench_version"] == DEFAULT_BENCH_VERSION
         assert body["current_bench_version"] == DEFAULT_BENCH_VERSION
+        assert body["available_bench_versions"] == [DEFAULT_BENCH_VERSION]
         assert body["count"] == 2
         assert [e["rank"] for e in body["entries"]] == [1, 2]
         assert [e["miner_hotkey"] for e in body["entries"]] == [_MINER_B, _MINER_A]
@@ -687,6 +689,7 @@ class TestPublicLeaderboard:
         assert historical["selection_mode"] == "historical"
         assert historical["entries"] == body["entries"]
         assert historical["emissions"] is None
+        assert historical["available_bench_versions"] == [DEFAULT_BENCH_VERSION]
 
     async def test_exposes_advisory_calibration(
         self,

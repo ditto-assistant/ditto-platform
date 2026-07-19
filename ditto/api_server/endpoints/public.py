@@ -165,6 +165,7 @@ from ditto.db.queries.scores import (
     list_miner_composite_history,
     list_provisional_ledger,
     list_public_submissions,
+    list_scored_bench_versions,
     list_scores_for_bench_version,
     quorum_composites,
 )
@@ -891,6 +892,7 @@ async def leaderboard(
         current_bench_version=display_version,
         active_bench_version=active_version,
         desired_bench_version=desired_version,
+        available_bench_versions=await list_scored_bench_versions(session),
         selection_mode="historical" if bench_version is not None else "authoritative",
         entries=entries,
         emissions=(

@@ -1957,9 +1957,9 @@
     </div>
     <div class="leaderboard-version-switch">
       <span class="context" id="leaderboard-version-context">Current rollout drives validator weights.</span>
-      <div class="activity-filter-list" role="group" aria-label="Leaderboard benchmark view">
+      <div class="activity-filter-list" id="leaderboard-version-pills" role="group" aria-label="Leaderboard benchmark view">
         <button class="activity-filter" type="button" data-leaderboard-version="current" aria-pressed="true">Current rollout</button>
-        <button class="activity-filter" type="button" data-leaderboard-version="2" aria-pressed="false">Bench v2 history</button>
+        <button class="activity-filter" type="button" data-leaderboard-version="2" aria-pressed="false">Bench v2</button>
       </div>
     </div>
     <div class="emissions-strip" id="emissions-strip" role="status" aria-live="polite">
@@ -3004,6 +3004,22 @@
     // ── Render ───────────────────────────────────────────────
     function render(data) {
       activeBench = data.active_bench_version || activeBench;
+      // History pills track every version that has ever been scored. Fall back
+      // to the versions visible in this payload for an older API that does not
+      // list them, so the pills never regress below what the board shows.
+      var versions = (data.available_bench_versions || []).slice();
+      if (!versions.length) {
+        (data.entries || []).forEach(function (e) {
+          if (e.bench_version != null && versions.indexOf(e.bench_version) < 0) versions.push(e.bench_version);
+        });
+        [data.active_bench_version, data.desired_bench_version].forEach(function (v) {
+          if (v && versions.indexOf(v) < 0) versions.push(v);
+        });
+      }
+      if (versions.length) {
+        availableBenchVersions = versions.sort(function (a, b) { return b - a; });
+        renderVersionPills();
+      }
       rolloutSettledView = data.selection_mode !== "historical" &&
         Number(data.active_bench_version) > 0 &&
         Number(data.desired_bench_version) > Number(data.active_bench_version);
@@ -3331,18 +3347,41 @@
       });
     })();
 
-    document.querySelectorAll("[data-leaderboard-version]").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        var view = btn.getAttribute("data-leaderboard-version");
-        if (!view || view === leaderboardVersionView) return;
-        leaderboardVersionView = view;
-        boardView.page = 1;
-        document.querySelectorAll("[data-leaderboard-version]").forEach(function (candidate) {
-          candidate.setAttribute("aria-pressed", candidate === btn ? "true" : "false");
-        });
-        load(true);
-      });
+    // Every benchmark version with at least one accepted score (newest first,
+    // from the leaderboard API). Each gets a history pill next to "Current
+    // rollout", so a new version (e.g. the next one Nick ships) grows a pill
+    // the moment its first score lands — no dashboard change needed.
+    var availableBenchVersions = [2];
+
+    // The pills are data-driven, so clicks are delegated to the group container
+    // rather than bound per button (rebuilt buttons keep working).
+    document.getElementById("leaderboard-version-pills").addEventListener("click", function (event) {
+      var btn = event.target.closest("[data-leaderboard-version]");
+      if (!btn) return;
+      var view = btn.getAttribute("data-leaderboard-version");
+      if (!view || view === leaderboardVersionView) return;
+      leaderboardVersionView = view;
+      boardView.page = 1;
+      renderVersionPills();
+      load(true);
     });
+
+    // One pill per scored benchmark version, plus the authoritative rollout
+    // view. Rebuilt only when the version list or selection changes, so a
+    // background refresh never steals focus from a pill mid-click.
+    function renderVersionPills() {
+      var group = document.getElementById("leaderboard-version-pills");
+      var sig = leaderboardVersionView + "|" + availableBenchVersions.join(",");
+      if (group.getAttribute("data-sig") === sig) return;
+      group.setAttribute("data-sig", sig);
+      var html = '<button class="activity-filter" type="button" data-leaderboard-version="current" aria-pressed="' +
+        (leaderboardVersionView === "current") + '">Current rollout</button>';
+      availableBenchVersions.forEach(function (version) {
+        html += '<button class="activity-filter" type="button" data-leaderboard-version="' + version +
+          '" aria-pressed="' + (String(version) === leaderboardVersionView) + '">Bench v' + version + '</button>';
+      });
+      group.innerHTML = html;
+    }
 
     function renderLeaderboardUnavailable() {
       lastEntries = [];

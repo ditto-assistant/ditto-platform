@@ -908,6 +908,23 @@ async def list_provisional_ledger(
     return list(best_by_miner.values())
 
 
+async def list_scored_bench_versions(session: AsyncSession) -> list[int]:
+    """Every benchmark version with at least one accepted score, newest first.
+
+    Backs the dashboard's per-version history pills: a version earns a pill as
+    soon as its first score lands and keeps it as a historical view forever.
+    ``NULL`` (pre-versioning legacy) rows carry no version to browse by and are
+    excluded.
+    """
+    rows = await session.scalars(
+        select(Score.bench_version)
+        .where(Score.bench_version.is_not(None))
+        .distinct()
+        .order_by(Score.bench_version.desc())
+    )
+    return [int(version) for version in rows]
+
+
 async def get_score_counts(
     session: AsyncSession,
     agent_ids: list[UUID],
