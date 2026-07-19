@@ -183,6 +183,48 @@ class AdminBenchmarkContractRefreshResponse(BaseModel):
     expired_ticket_count: int
 
 
+class AdminBenchmarkContractMigrationRequest(BaseModel):
+    """Compare-and-swap guard for moving one zero-score v2 artifact to v3."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_source_bench_version: Literal[2]
+    expected_target_bench_version: Literal[3]
+    expected_source_dataset_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_source_score_count: Literal[0]
+    expected_target_score_count: Literal[0]
+
+
+class AdminBenchmarkContractMigrationDetail(BaseModel):
+    """Current guarded inputs for one zero-score v2-to-v3 migration."""
+
+    agent_id: UUID
+    agent_name: str
+    agent_status: str
+    artifact_sha256: str
+    source_bench_version: int
+    target_bench_version: int | None
+    source_dataset_sha256: str | None
+    target_dataset_sha256: str | None
+    source_score_count: int
+    target_score_count: int
+    screening_attempt_active: bool
+    validator_run_active: bool
+    migration_allowed: bool
+    blocking_reason: str | None
+
+
+class AdminBenchmarkContractMigrationResponse(BaseModel):
+    agent_id: UUID
+    agent_status: str
+    source_bench_version: int
+    target_bench_version: int
+    target_dataset_sha256: str
+    expired_ticket_count: int
+
+
 class AdminQuarantineAgentContext(BaseModel):
     """Submission metadata an operator needs while judging a quarantine."""
 

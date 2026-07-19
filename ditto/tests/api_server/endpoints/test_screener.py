@@ -2489,6 +2489,136 @@ class TestQuarantineAdmin:
             assert fresh_ticket.bench_version == 3
             assert fresh_ticket.status == TicketStatus.ISSUED
 
+    async def test_zero_score_v2_migration_preserves_history_and_issues_v3(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        now = datetime.now(UTC)
+        validator_hotkey = "5ValidatorWithLegacyV2Contract"
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="collecting",
+                    cohort_size=5,
+                    created_at=now,
+                )
+            )
+            session.add(
+                BenchmarkDataset(
+                    agent_id=agent_id,
+                    bench_version=2,
+                    seed=42,
+                    sha256="aa" * 32,
+                    run_size="full",
+                    seed_block=4321,
+                    seed_block_hash="0x" + "9f" * 32,
+                )
+            )
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=validator_hotkey,
+                    status=TicketStatus.EXPIRED,
+                    issued_at=now - timedelta(hours=2),
+                    deadline=now - timedelta(hours=1),
+                    bench_version=2,
+                    attempt_count=2,
+                )
+            )
+
+        _install_db(app, session_maker)
+        _install_chain(app)
+        generator = _FakeGenerator(run_size="full", sha="cd" * 32)
+        _install_generator(app, generator)
+        headers = {
+            "Authorization": "Bearer test-admin-token-at-least-32-characters",
+            "X-Admin-Actor": "backroom:test-user",
+        }
+        inspected = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/"
+            "migrate-benchmark-contract",
+            headers=headers,
+        )
+        assert inspected.status_code == 200, inspected.text
+        assert inspected.json()["migration_allowed"] is True
+        assert inspected.json()["source_bench_version"] == 2
+        assert inspected.json()["target_bench_version"] == 3
+        assert inspected.json()["source_score_count"] == 0
+        assert inspected.json()["target_score_count"] == 0
+
+        migrated = await client.post(
+            f"/api/v1/admin/screening-submissions/{agent_id}/"
+            "migrate-benchmark-contract",
+            headers=headers,
+            json={
+                "reason": "Legacy zero-score submission needs the active v3 contract",
+                "expected_sha256": _SHA256,
+                "expected_source_bench_version": 2,
+                "expected_target_bench_version": 3,
+                "expected_source_dataset_sha256": "aa" * 32,
+                "expected_source_score_count": 0,
+                "expected_target_score_count": 0,
+            },
+        )
+        assert migrated.status_code == 200, migrated.text
+        assert migrated.json()["target_dataset_sha256"] == "cd" * 32
+        assert generator.bench_versions == [3]
+        assert generator.seeds == [42]
+
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            source = await session.get(BenchmarkDataset, (agent_id, 2))
+            target = await session.get(BenchmarkDataset, (agent_id, 3))
+            legacy_ticket = await session.get(
+                ValidatorTicket, (agent_id, 2, validator_hotkey)
+            )
+            assert agent is not None
+            assert agent.status == AgentStatus.SCREENING_FAILED
+            assert source is not None and source.sha256 == "aa" * 32
+            assert target is not None and target.sha256 == "cd" * 32
+            assert target.seed_block == source.seed_block
+            assert target.seed_block_hash == source.seed_block_hash
+            assert legacy_ticket is not None
+            assert legacy_ticket.status == TicketStatus.EXPIRED
+
+        claim = await client.post(_CLAIM_URL)
+        fresh_attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=fresh_attempt_id
+        )
+        verdict = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, passed=True, attempt_id=fresh_attempt_id),
+        )
+        assert verdict.status_code == 200, verdict.text
+
+        async with session_maker() as session, session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5FreshV3Validator",
+                now=now + timedelta(minutes=1),
+                ttl=timedelta(minutes=90),
+                bench_version=3,
+                artifact_mode="screened_only",
+            )
+            assert ticket is not None
+            assert ticket.agent_id == agent_id
+            assert ticket.bench_version == 3
+
 
 # --- Artifact --------------------------------------------------------------
 

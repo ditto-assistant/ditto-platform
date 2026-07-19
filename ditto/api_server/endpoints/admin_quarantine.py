@@ -19,6 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.admin_quarantine import (
     AdminArtifactDuplicate,
+    AdminBenchmarkContractMigrationDetail,
+    AdminBenchmarkContractMigrationRequest,
+    AdminBenchmarkContractMigrationResponse,
     AdminBenchmarkContractRefreshDetail,
     AdminBenchmarkContractRefreshRequest,
     AdminBenchmarkContractRefreshResponse,
@@ -80,14 +83,16 @@ from ditto.api_server.storage import ObjectDownloadFailedError, S3StorageClient
 from ditto.db.models import (
     Agent,
     BenchmarkDataset,
+    BenchmarkRollout,
     Score,
     ScreeningAttempt,
     ScreeningDispute,
     ScreeningQuarantine,
     ScreeningQuarantineResolution,
+    ValidatorHeartbeat,
     ValidatorTicket,
 )
-from ditto.db.queries.benchmark_rollout import active_bench_version
+from ditto.db.queries.benchmark_rollout import active_bench_version, open_rollout
 from ditto.db.queries.tickets import RETRY_COOLDOWN
 
 logger = logging.getLogger(__name__)
@@ -1595,6 +1600,301 @@ async def inspect_benchmark_contract_refresh(
         screening_attempt_active=screening_attempt_active,
         refresh_allowed=blocking_reason is None,
         blocking_reason=blocking_reason,
+    )
+
+
+async def _benchmark_contract_migration_state(
+    session: AsyncSession, *, agent_id: UUID
+) -> tuple[
+    Agent,
+    BenchmarkRollout | None,
+    BenchmarkDataset | None,
+    BenchmarkDataset | None,
+    int,
+    int,
+    bool,
+    bool,
+]:
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    rollout = await open_rollout(session)
+    target_version = rollout.desired_version if rollout is not None else None
+    source = await session.get(BenchmarkDataset, (agent_id, 2))
+    target = (
+        await session.get(BenchmarkDataset, (agent_id, target_version))
+        if target_version is not None
+        else None
+    )
+    source_scores = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Score)
+            .where(Score.agent_id == agent_id, Score.bench_version == 2)
+        )
+        or 0
+    )
+    target_scores = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Score)
+            .where(
+                Score.agent_id == agent_id,
+                Score.bench_version == (target_version or -1),
+            )
+        )
+        or 0
+    )
+    screening_active = (
+        await session.scalar(
+            select(ScreeningAttempt.attempt_id).where(
+                ScreeningAttempt.agent_id == agent_id,
+                ScreeningAttempt.status == "running",
+            )
+        )
+        is not None
+    )
+    validator_active = (
+        await session.scalar(
+            select(ValidatorHeartbeat.validator_hotkey).where(
+                ValidatorHeartbeat.active_agent_id == agent_id,
+                ValidatorHeartbeat.state == "running_benchmark",
+                ValidatorHeartbeat.seen_at >= datetime.now(UTC) - timedelta(minutes=5),
+            )
+        )
+        is not None
+    )
+    return (
+        agent,
+        rollout,
+        source,
+        target,
+        source_scores,
+        target_scores,
+        screening_active,
+        validator_active,
+    )
+
+
+@router.get(
+    "/screening-submissions/{agent_id}/migrate-benchmark-contract",
+    response_model=AdminBenchmarkContractMigrationDetail,
+)
+async def inspect_benchmark_contract_migration(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+) -> AdminBenchmarkContractMigrationDetail:
+    """Inspect the guarded zero-score v2-to-v3 migration inputs."""
+    (
+        agent,
+        rollout,
+        source,
+        target,
+        source_scores,
+        target_scores,
+        screening_active,
+        validator_active,
+    ) = await _benchmark_contract_migration_state(session, agent_id=agent_id)
+    blocking_reason: str | None = None
+    if rollout is None or rollout.from_version != 2 or rollout.desired_version != 3:
+        blocking_reason = "an open v2-to-v3 rollout is required"
+    elif source is None:
+        blocking_reason = "source v2 dataset is missing"
+    elif target is not None:
+        blocking_reason = "target v3 dataset already exists"
+    elif source_scores != 0 or target_scores != 0:
+        blocking_reason = "migration requires zero accepted v2 and v3 scores"
+    elif screening_active:
+        blocking_reason = "screening attempt is active"
+    elif validator_active:
+        blocking_reason = "validator benchmark is active"
+    return AdminBenchmarkContractMigrationDetail(
+        agent_id=agent_id,
+        agent_name=agent.name,
+        agent_status=agent.status,
+        artifact_sha256=agent.sha256,
+        source_bench_version=2,
+        target_bench_version=rollout.desired_version if rollout is not None else None,
+        source_dataset_sha256=source.sha256 if source is not None else None,
+        target_dataset_sha256=target.sha256 if target is not None else None,
+        source_score_count=source_scores,
+        target_score_count=target_scores,
+        screening_attempt_active=screening_active,
+        validator_run_active=validator_active,
+        migration_allowed=blocking_reason is None,
+        blocking_reason=blocking_reason,
+    )
+
+
+@router.post(
+    "/screening-submissions/{agent_id}/migrate-benchmark-contract",
+    response_model=AdminBenchmarkContractMigrationResponse,
+)
+async def migrate_benchmark_contract(
+    agent_id: UUID,
+    payload: AdminBenchmarkContractMigrationRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    generator: GeneratorDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminBenchmarkContractMigrationResponse:
+    """Preserve a zero-score v2 submission while rebuilding it for v3."""
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+
+    async with session.begin():
+        state = await _benchmark_contract_migration_state(session, agent_id=agent_id)
+        (
+            agent,
+            rollout,
+            source,
+            target,
+            source_scores,
+            target_scores,
+            screening_active,
+            validator_active,
+        ) = state
+        if rollout is None or rollout.from_version != 2 or rollout.desired_version != 3:
+            raise HTTPException(status_code=409, detail="open v2-to-v3 rollout changed")
+        if source is None:
+            raise HTTPException(status_code=409, detail="source v2 dataset is missing")
+        if source.sha256 != payload.expected_source_dataset_sha256:
+            raise HTTPException(status_code=409, detail="source v2 dataset changed")
+        if agent.sha256 != payload.expected_sha256:
+            raise HTTPException(status_code=409, detail="artifact identity changed")
+        if target is not None:
+            raise HTTPException(
+                status_code=409, detail="target v3 dataset already exists"
+            )
+        if source_scores != 0 or target_scores != 0:
+            raise HTTPException(status_code=409, detail="score count changed")
+        if screening_active:
+            raise HTTPException(status_code=409, detail="screening attempt is active")
+        if validator_active:
+            raise HTTPException(status_code=409, detail="validator benchmark is active")
+        source_pin = (
+            source.seed,
+            source.run_size,
+            source.seed_block,
+            source.seed_block_hash,
+        )
+
+    target_sha256 = await generator.generate(source_pin[0], bench_version=3)
+    now = datetime.now(UTC)
+    async with session.begin():
+        agent = await session.scalar(
+            select(Agent).where(Agent.agent_id == agent_id).with_for_update()
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        if agent.sha256 != payload.expected_sha256:
+            raise HTTPException(status_code=409, detail="artifact identity changed")
+        rollout = await open_rollout(session, for_update=True)
+        if rollout is None or rollout.from_version != 2 or rollout.desired_version != 3:
+            raise HTTPException(status_code=409, detail="open v2-to-v3 rollout changed")
+        source = await session.get(
+            BenchmarkDataset, (agent_id, 2), with_for_update=True
+        )
+        if source is None or source.sha256 != payload.expected_source_dataset_sha256:
+            raise HTTPException(status_code=409, detail="source v2 dataset changed")
+        if source_pin != (
+            source.seed,
+            source.run_size,
+            source.seed_block,
+            source.seed_block_hash,
+        ):
+            raise HTTPException(status_code=409, detail="source v2 dataset changed")
+        if await session.get(BenchmarkDataset, (agent_id, 3)) is not None:
+            raise HTTPException(
+                status_code=409, detail="target v3 dataset already exists"
+            )
+        score_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(Score)
+                .where(Score.agent_id == agent_id, Score.bench_version.in_((2, 3)))
+            )
+            or 0
+        )
+        if score_count != 0:
+            raise HTTPException(status_code=409, detail="score count changed")
+        if (
+            await session.scalar(
+                select(ScreeningAttempt.attempt_id).where(
+                    ScreeningAttempt.agent_id == agent_id,
+                    ScreeningAttempt.status == "running",
+                )
+            )
+            is not None
+        ):
+            raise HTTPException(status_code=409, detail="screening attempt is active")
+        if (
+            await session.scalar(
+                select(ValidatorHeartbeat.validator_hotkey).where(
+                    ValidatorHeartbeat.active_agent_id == agent_id,
+                    ValidatorHeartbeat.state == "running_benchmark",
+                    ValidatorHeartbeat.seen_at >= now - timedelta(minutes=5),
+                )
+            )
+            is not None
+        ):
+            raise HTTPException(status_code=409, detail="validator benchmark is active")
+
+        tickets = list(
+            await session.scalars(
+                select(ValidatorTicket)
+                .where(
+                    ValidatorTicket.agent_id == agent_id,
+                    ValidatorTicket.bench_version.in_((2, 3)),
+                    ValidatorTicket.status != TicketStatus.SCORED,
+                )
+                .with_for_update()
+            )
+        )
+        for ticket in tickets:
+            ticket.status = TicketStatus.EXPIRED
+            ticket.deadline = now
+            ticket.retry_after = now
+        session.add(
+            BenchmarkDataset(
+                agent_id=agent_id,
+                bench_version=3,
+                seed=source.seed,
+                sha256=target_sha256,
+                run_size=source.run_size,
+                seed_block=source.seed_block,
+                seed_block_hash=source.seed_block_hash,
+                created_at=now,
+            )
+        )
+        agent.screened_image_sha256 = None
+        agent.screened_image_size_bytes = None
+        agent.screened_image_id = None
+        agent.screened_image_ref = None
+        agent.screened_image_upload_id = None
+        agent.screened_image_verified_at = None
+        agent.status = AgentStatus.SCREENING_FAILED
+        agent.screening_reason = (
+            "Operator migrated zero-score benchmark contract from v2 to v3"
+        )
+        agent.screening_reason_code = None
+
+    logger.warning(
+        "admin_actor=%s migrated zero-score benchmark contract agent_id=%s "
+        "source_version=2 target_version=3 expired_tickets=%s reason=%s",
+        x_admin_actor,
+        agent_id,
+        len(tickets),
+        payload.reason,
+    )
+    return AdminBenchmarkContractMigrationResponse(
+        agent_id=agent_id,
+        agent_status=AgentStatus.SCREENING_FAILED,
+        source_bench_version=2,
+        target_bench_version=3,
+        target_dataset_sha256=target_sha256,
+        expired_ticket_count=len(tickets),
     )
 
 
