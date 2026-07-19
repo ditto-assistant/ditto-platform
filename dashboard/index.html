@@ -768,6 +768,63 @@
       text-wrap: pretty;
     }
     .pipeline-meta-list code { color: var(--text); font-family: var(--mono); font-size: 11.5px; }
+    .score-headline {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: stretch;
+      gap: var(--detail-space-lg);
+      margin: 0 0 var(--detail-space-xl);
+      padding-bottom: var(--detail-space-xl);
+      border-bottom: 1px solid color-mix(in oklab, var(--border) 72%, transparent);
+    }
+    .score-headline-item {
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      gap: var(--detail-space-xs);
+      min-width: 132px;
+      padding: var(--detail-space-md) var(--detail-space-lg);
+      border-radius: 10px;
+      border: 1px solid color-mix(in oklab, var(--border) 60%, transparent);
+      background: color-mix(in oklab, var(--border) 20%, transparent);
+    }
+    .score-headline-item.primary {
+      border-color: color-mix(in oklab, var(--accent) 40%, var(--border));
+      background: color-mix(in oklab, var(--accent) 11%, transparent);
+    }
+    .score-headline-bench {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      border-radius: 5px;
+      padding: 2px 6px;
+      background: color-mix(in oklab, var(--accent) 13%, transparent);
+      color: color-mix(in oklab, var(--accent) 76%, var(--text));
+      font: 700 10.5px/1.25 var(--mono);
+      white-space: nowrap;
+    }
+    .score-headline-value {
+      color: var(--text);
+      font: 700 26px/1 var(--mono);
+      font-variant-numeric: tabular-nums;
+    }
+    .score-headline-item.primary .score-headline-value { font-size: 42px; }
+    .score-headline-item:not(.primary) .score-headline-value { color: var(--text-dim); }
+    .score-headline-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--good);
+      font-family: var(--sans);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+    }
+    .score-headline-item.provisional .score-headline-state { color: var(--warn); }
+    @media (max-width: 640px) {
+      .score-headline-item { flex: 1 1 132px; min-width: 0; }
+    }
     .pipeline-history { display: grid; gap: var(--detail-space-xl); padding-top: var(--detail-space-xl); }
     .pipeline-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: var(--detail-space-lg); margin-bottom: var(--detail-space-sm); }
     .pipeline-section-count { color: var(--text-faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
@@ -4666,11 +4723,48 @@
       '</div>';
     }
 
+    // A glance-level band at the very top of the drawer: the median composite for
+    // each benchmark version, newest (active) rendered large and older versions
+    // smaller so the difference reads at once. Below quorum the median is still
+    // shown, flagged "Preliminary"; at quorum it is the official median. Empty
+    // until the pipeline loads (null) or before any score is accepted.
+    function renderScoreHeadline(pipeline) {
+      if (!pipeline) return "";
+      var quorum = Math.max(1, Number(pipeline.quorum) || 3);
+      var cohorts = benchmarkCohorts(pipeline).filter(function (cohort) { return cohort.scores.length; });
+      if (!cohorts.length) return "";
+      // Newest benchmark version first (rendered as the primary), unknown last.
+      cohorts = cohorts.slice().sort(function (a, b) {
+        if (a.key === "unknown") return 1;
+        if (b.key === "unknown") return -1;
+        return Number(b.key) - Number(a.key);
+      });
+      function card(cohort, primary) {
+        var complete = cohort.scores.length >= quorum;
+        var median = cohortMedian(cohort.scores);
+        var stateLabel = complete
+          ? "Official median"
+          : "Preliminary · " + cohort.scores.length + " of " + quorum;
+        var stateTip = complete
+          ? "Quorum reached. The median of " + quorum + " independent accepted scores is final for " + benchmarkVersionLabel(cohort.key) + "."
+          : "Preliminary: only " + cohort.scores.length + " of " + quorum + " scores are in. This median can change until quorum.";
+        return '<div class="score-headline-item' + (primary ? " primary" : "") + (complete ? "" : " provisional") + '">' +
+          '<span class="score-headline-bench">' + esc(benchmarkVersionLabel(cohort.key)) + '</span>' +
+          '<span class="score-headline-value">' + fx(median) + '</span>' +
+          '<span class="score-headline-state" title="' + esc(stateTip) + '">' + esc(stateLabel) + '</span>' +
+        '</div>';
+      }
+      return '<section class="score-headline" aria-label="Benchmark medians">' +
+        cohorts.map(function (cohort, index) { return card(cohort, index === 0); }).join("") +
+      '</section>';
+    }
+
     function renderPipelineSummary(e, pipeline, evidence, stateMessage, stateClass) {
       var current = Object.assign({}, e, pipeline || {});
       var scoreCount = current.score_count == null ? 0 : current.score_count;
       var quorum = current.quorum == null ? 3 : current.quorum;
       return '<div class="pipeline-detail">' +
+        renderScoreHeadline(pipeline) +
         '<div class="pipeline-summary">' +
           '<section class="pipeline-current" aria-labelledby="pipeline-current-title">' +
             '<h4 id="pipeline-current-title">Current progress</h4>' +
