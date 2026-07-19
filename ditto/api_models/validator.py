@@ -73,7 +73,8 @@ class ArtifactResponse(BaseModel):
     screened_image_url: Annotated[
         str | None,
         Field(
-            description="Pre-signed Docker image archive URL when screening built one."
+            min_length=1,
+            description="Pre-signed Docker image archive URL when screening built one.",
         ),
     ] = None
     screened_image_sha256: Annotated[str | None, Field(pattern=r"^[0-9a-f]{64}$")] = (
@@ -85,6 +86,21 @@ class ArtifactResponse(BaseModel):
     ] = None
     screened_image_ref: Annotated[str | None, Field(min_length=1)] = None
     bench_version: Annotated[int | None, Field(default=None, ge=1)] = None
+
+    @model_validator(mode="after")
+    def screened_image_fields_are_atomic(self) -> ArtifactResponse:
+        fields = (
+            self.screened_image_url,
+            self.screened_image_sha256,
+            self.screened_image_size_bytes,
+            self.screened_image_id,
+            self.screened_image_ref,
+        )
+        if any(value is not None for value in fields) and any(
+            value is None for value in fields
+        ):
+            raise ValueError("screened image metadata must be complete")
+        return self
 
     model_config = ConfigDict(
         json_schema_extra={
