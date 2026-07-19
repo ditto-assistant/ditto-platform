@@ -46,6 +46,7 @@ from ditto.db.models import (
     Agent,
     AthReview,
     Base,
+    BenchmarkDataset,
     BenchmarkRollout,
     Score,
     ScreeningAttempt,
@@ -1479,6 +1480,76 @@ class TestPublicActivity:
             "running",
             "rejected",
         ]
+
+    async def test_each_score_carries_its_own_bench_versions_dataset_digest(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A v3 score must not be published with the v2 dataset digest.
+
+        Dataset provenance is per bench version, but the agent row carries only
+        the version it was first pinned at. Pairing every score with that column
+        advertised the v2 digest next to a verification_command naming v3, so a
+        verifier would render v3 and get a mismatch on a perfectly good score.
+        """
+        agent_id = uuid4()
+        v2_sha, v3_sha = "a1" * 32, "b2" * 32
+        async with session_maker() as session, session.begin():
+            session.add(
+                Agent(
+                    agent_id=agent_id,
+                    miner_hotkey=_MINER_A,
+                    name="agent",
+                    sha256="ab" * 32,
+                    size_bytes=524288,
+                    status=AgentStatus.SCORED,
+                    dataset_seed=42,
+                    dataset_sha256=v2_sha,
+                    dataset_run_size="full",
+                    created_at=datetime.now(UTC),
+                )
+            )
+            await session.flush()
+            # Only v3 is pinned; v2 predates versioned pins and falls back to the
+            # agent column, which is exactly the mixed state production is in.
+            session.add(
+                BenchmarkDataset(
+                    agent_id=agent_id,
+                    bench_version=3,
+                    seed=42,
+                    sha256=v3_sha,
+                    run_size="full",
+                )
+            )
+            for bench_version, hotkey in ((2, _VALIDATOR_C), (3, _MINER_B)):
+                await upsert_score(
+                    session,
+                    agent_id=agent_id,
+                    validator_hotkey=hotkey,
+                    bench_version=bench_version,
+                    run_id=f"run_{bench_version}",
+                    seed=42,
+                    composite=0.9,
+                    tool_mean=0.9,
+                    memory_mean=0.9,
+                    median_ms=500,
+                    n=20,
+                    generated_at=datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
+                    signature="ab" * 64,
+                    details={"bench_version": bench_version},
+                )
+        _install_db(app, session_maker)
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+
+        assert response.status_code == 200
+        by_version = {
+            score["bench_version"]: score["dataset_sha256"]
+            for score in response.json()["provisional_scores"]
+        }
+        assert by_version == {2: v2_sha, 3: v3_sha}
 
     async def test_stale_rejection_projects_as_waiting_for_rescreen(
         self,
