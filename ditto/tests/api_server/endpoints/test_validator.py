@@ -2258,7 +2258,14 @@ class TestRequestConfirmationJob:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        from ditto.api_server.bench import CURRENT_BENCH_VERSION
+        # The KOTH ledger and the confirmation pair are keyed to the ACTIVE
+        # benchmark (the activated rollout's), which is still v2 until an
+        # operator starts the v3 epoch. CURRENT_BENCH_VERSION advances the
+        # moment the code ships, so a fixture pinned to it seeds rows the
+        # ledger does not consider current and the pair reads as stale.
+        from ditto.db.queries.benchmark_rollout import (
+            DEFAULT_BENCH_VERSION as ACTIVE_BENCH_VERSION,
+        )
 
         champion = await _seed_agent(
             session_maker,
@@ -2278,7 +2285,7 @@ class TestRequestConfirmationJob:
                     champion,
                     0.88,
                     {
-                        "bench_version": CURRENT_BENCH_VERSION,
+                        "bench_version": ACTIVE_BENCH_VERSION,
                         "composite_stderr": 0.03,
                         "confirmation_composites": [0.87, 0.88, 0.89],
                         "confirmation_seeds": [7, 8, 9],
@@ -2288,7 +2295,7 @@ class TestRequestConfirmationJob:
                     challenger,
                     0.93,
                     {
-                        "bench_version": CURRENT_BENCH_VERSION,
+                        "bench_version": ACTIVE_BENCH_VERSION,
                         "composite_stderr": 0.03,
                     },
                 ),
@@ -2324,7 +2331,7 @@ class TestRequestConfirmationJob:
         async with session_maker() as session:
             ticket = await session.get(
                 ValidatorTicket,
-                (challenger, CURRENT_BENCH_VERSION, _VALIDATOR_HOTKEY),
+                (challenger, ACTIVE_BENCH_VERSION, _VALIDATOR_HOTKEY),
             )
         assert ticket is not None
         assert ticket.status == TicketStatus.ISSUED
