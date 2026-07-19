@@ -248,8 +248,13 @@ def _score_payload(
     signed = (
         f"{hotkey}:{agent_id}:{lease}:{run_id}:{report['composite']!r}:{report['seed']}"
     )
+    # CANONICAL ORDER, mirroring _score_signing_message and ditto-subnet:
+    #   base : bench_version? : transcript_sha256?
     if report.get("bench_version") is not None:
         signed += f":{report['bench_version']}"
+    transcript = (report.get("details") or {}).get("transcript_sha256")
+    if isinstance(transcript, str) and transcript:
+        signed += f":{transcript}"
     return {
         "validator_hotkey": hotkey,
         "ticket_deadline": ticket_deadline.isoformat(),
@@ -2275,7 +2280,6 @@ class TestSubmitScore:
     ) -> None:
         # A report that omits bench_version (as the default payload does) must be
         # stamped with the current version so it is never recorded as legacy.
-        from ditto.api_server.bench import CURRENT_BENCH_VERSION
 
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         _install_db(app, session_maker)
@@ -2292,7 +2296,11 @@ class TestSubmitScore:
             score = await s.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
             assert score is not None
             assert score.details is not None
-            assert score.details["bench_version"] == CURRENT_BENCH_VERSION
+            # The payload now declares bench_version explicitly, so stamping
+            # preserves it rather than overwriting with CURRENT: a report that
+            # genuinely ran an older contract stays honestly labelled, and the
+            # label matches the row's key.
+            assert score.details["bench_version"] == 2
             assert score.details["ticket_deadline"] == (
                 _TICKET_DEADLINE.isoformat(timespec="microseconds")
             )

@@ -57,6 +57,7 @@ from ditto.db.queries.audit import (
     GENESIS_HASH,
     append_audit_entry,
 )
+from ditto.db.queries.benchmark_rollout import DEFAULT_BENCH_VERSION
 from ditto.db.queries.scores import upsert_score
 
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
@@ -324,7 +325,7 @@ class TestPublicLeaderboard:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        details = {"bench_version": CURRENT_BENCH_VERSION, "composite_stderr": 0.03}
+        details = {"bench_version": DEFAULT_BENCH_VERSION, "composite_stderr": 0.03}
         incumbent_id = await _seed_k3(
             session_maker,
             miner=_MINER_A,
@@ -391,13 +392,13 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.7, 0.8, 0.9],
-            details={"bench_version": CURRENT_BENCH_VERSION},
+            details={"bench_version": DEFAULT_BENCH_VERSION},
         )
         await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.6, 0.7, 0.8],
-            details={"bench_version": CURRENT_BENCH_VERSION},
+            details={"bench_version": DEFAULT_BENCH_VERSION},
         )
         _install_db(app, session_maker)
         app.state.chain = SimpleNamespace(

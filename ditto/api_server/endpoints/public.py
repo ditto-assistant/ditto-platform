@@ -565,7 +565,7 @@ def _public_entry(
     registered: bool | None = None,
     miner_uid: int | None = None,
     fold_stderr: float | None = None,
-    active_version: int = CURRENT_BENCH_VERSION,
+    active_version: int,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -626,7 +626,7 @@ def _public_koth_emissions(
     rows: list[LedgerRow],
     *,
     stderrs: dict[UUID, float | None],
-    active_version: int = CURRENT_BENCH_VERSION,
+    active_version: int,
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
     candidates: list[LedgerRow] = []
@@ -2021,12 +2021,15 @@ async def bench_corpus(
     any unknown future version, so no live answer key is ever exposed here.
     Paginate with ``limit`` / ``offset`` up to ``total``.
     """
-    if not is_bench_version_retired(version):
+    # Retirement follows the ACTIVATED epoch, not the shipped constant: releasing
+    # answer keys is irreversible and must not happen before miners are notified.
+    active = await active_bench_version(session)
+    if not is_bench_version_retired(version, active):
         raise HTTPException(
             status_code=409,
             detail=(
-                f"bench_version {version} is not retired (current is "
-                f"{CURRENT_BENCH_VERSION}); its answer keys are not released"
+                f"bench_version {version} is not retired (active is "
+                f"{active}); its answer keys are not released"
             ),
         )
     response.headers["Cache-Control"] = "public, max-age=3600, immutable"
