@@ -557,6 +557,18 @@ class PublicLeaderboardResponse(BaseModel):
             )
         ),
     ]
+    available_bench_versions: Annotated[
+        list[int],
+        Field(
+            default_factory=list,
+            description=(
+                "Every benchmark version with at least one accepted score, "
+                "newest first. Drives the dashboard's per-version history "
+                "pills; a new version appears here as soon as its first score "
+                "lands."
+            ),
+        ),
+    ]
     selection_mode: Annotated[
         Literal["authoritative", "historical"],
         Field(
