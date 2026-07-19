@@ -137,6 +137,7 @@ from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
     AthReview,
+    BenchmarkDataset,
     Score,
     ScreeningDispute,
     ScreeningQuarantine,
@@ -1813,6 +1814,25 @@ async def agent_pipeline(
     canonical_scores = [
         score for score in accepted_scores if score.bench_version == canonical_version
     ]
+    # Dataset provenance is PER BENCH VERSION. The agent row carries only the
+    # version it was first pinned at, so pairing every score with it published the
+    # v2 digest alongside a v3 score -- next to a verification_command that
+    # correctly names v3, so the two contradicted each other and anyone verifying
+    # a v3 score would render v3 and get a mismatch.
+    dataset_sha_by_version = {
+        pin.bench_version: pin.sha256
+        for pin in await session.scalars(
+            select(BenchmarkDataset).where(BenchmarkDataset.agent_id == agent_id)
+        )
+    }
+
+    def _score_dataset_sha(score: Score) -> str | None:
+        """The digest of the dataset THIS score was graded against."""
+        version = _score_bench_version(score)
+        if version is None:
+            return agent.dataset_sha256
+        return dataset_sha_by_version.get(version, agent.dataset_sha256)
+
     running_attempt = next(
         (attempt for attempt in attempts if attempt.status == "running"), None
     )
@@ -1863,7 +1883,7 @@ async def agent_pipeline(
                     and agent.dataset_seed_block_hash is not None
                     else "random_fallback"
                 ),
-                dataset_sha256=agent.dataset_sha256,
+                dataset_sha256=_score_dataset_sha(score),
                 accepted_at=score.created_at,
                 reproduction_command=_dataset_command(
                     seed=score.seed,
