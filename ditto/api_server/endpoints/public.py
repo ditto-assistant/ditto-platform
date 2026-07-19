@@ -1088,6 +1088,7 @@ async def _latest_wandb_logs_url(
 async def validator_wandb_logs(
     validator_hotkey: str,
     request: Request,
+    embed: bool = False,
 ) -> RedirectResponse:
     """Resolve the validator's newest telemetry run and open its Logs tab."""
     if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{40,64}", validator_hotkey):
@@ -1098,6 +1099,8 @@ async def validator_wandb_logs(
     )
     if url is None:
         raise HTTPException(status_code=404, detail="Validator telemetry not found")
+    if embed:
+        url += "?jupyter=true"
     return RedirectResponse(url, status_code=307, headers={"Cache-Control": "no-store"})
 
 

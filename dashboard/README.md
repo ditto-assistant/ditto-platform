@@ -60,7 +60,8 @@ Resolved in priority order:
 | wandb link | `?wandb=https://wandb.ai/org/ditto-sn118` | `<meta name="ditto:wandb-url">` | `https://wandb.ai/` |
 
 Validator detail views use this project URL to resolve the validator's newest
-run by its full hotkey, then open that run's W&B Logs tab in a new window.
+run by its full hotkey. The public W&B Logs tab is embedded inline using W&B's
+iframe mode, with a separate action to open the full view in a new window.
 
 For a deployed dashboard, edit the two `<meta>` tags in `index.html` so the
 defaults are correct and the query string is only needed for testing.

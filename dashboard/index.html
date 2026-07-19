@@ -489,6 +489,11 @@
     .modal-actions .open-full { min-height: 44px; padding-inline: 13px; }
     .modal-actions #d-wandb-logs[hidden] { display: none; }
     .modal-actions .close { position: static; }
+    .wandb-embed { margin-top: 18px; }
+    .wandb-embed-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+    .wandb-embed-head h4 { margin: 0; font-size: 14px; }
+    .wandb-embed-head span { color: var(--text-faint); font-size: 11px; }
+    .wandb-embed iframe { display: block; width: 100%; height: 520px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-elev); }
     body.entity-page .layout { display: none; }
     body.entity-page .modal {
       position: relative; top: auto; left: auto;
@@ -5143,6 +5148,11 @@
         return '<details class="cgroup"' + (open ? " open" : "") + '><summary class="cgsum">' + esc(title) +
           '</summary><div style="padding:2px 0 10px 22px">' + inner + '</div></details>';
       }
+      var logsUrl = API + "/public/validators/" + encodeURIComponent(entry.validator_hotkey) + "/wandb-logs";
+      var wandbEmbed = '<section class="wandb-embed" aria-labelledby="wandb-embed-title">' +
+        '<div class="wandb-embed-head"><h4 id="wandb-embed-title">Live W&amp;B logs</h4><span>Newest validator run</span></div>' +
+        '<iframe title="W&amp;B logs for validator ' + esc(shortKey(entry.validator_hotkey)) + '" src="' + esc(logsUrl + "?embed=true") + '" loading="lazy"></iframe>' +
+        '</section>';
       return '<div class="vdetail">' +
         section("Signed report", report, true) +
         section("Capabilities", caps, false) +
@@ -5150,6 +5160,7 @@
         '<details class="cgroup" open><summary class="cgsum">Component health</summary>' +
         '<div style="padding:2px 0 10px 22px">' + healthIntro + components + '</div></details>' +
         section("Host metrics", host, false) +
+        wandbEmbed +
         '</div>';
     }
 

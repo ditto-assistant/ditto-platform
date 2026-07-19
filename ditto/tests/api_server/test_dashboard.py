@@ -48,6 +48,9 @@ class TestDashboard:
         assert 'target="_blank" rel="noopener" hidden' in body
         assert 'wandbLogs.hidden = kind !== "validator"' in body
         assert '"/public/validators/" + encodeURIComponent(identifier)' in body
+        assert 'class="wandb-embed"' in body
+        assert 'logsUrl + "?embed=true"' in body
+        assert 'loading="lazy"' in body
         # api-base stays empty so the SPA uses its same-origin /api/v1 default.
         assert 'name="ditto:api-base" content=""' in body
 

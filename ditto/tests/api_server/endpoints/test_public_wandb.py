@@ -56,6 +56,25 @@ async def test_validator_wandb_logs_redirects_to_latest_run(
     assert response.headers["cache-control"] == "no-store"
 
 
+async def test_validator_wandb_logs_uses_supported_embed_mode(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def lookup(project_url: str, validator_hotkey: str) -> str:
+        assert project_url == "https://wandb.ai/"
+        assert validator_hotkey == _VALIDATOR
+        return "https://wandb.ai/heyditto/ditto-sn118/runs/h0j4iiss/logs"
+
+    monkeypatch.setattr(public, "_latest_wandb_logs_url", lookup)
+    response = await client.get(
+        f"/api/v1/public/validators/{_VALIDATOR}/wandb-logs?embed=true",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 307
+    assert response.headers["location"].endswith("/runs/h0j4iiss/logs?jupyter=true")
+
+
 async def test_validator_wandb_logs_rejects_invalid_hotkey(
     client: httpx.AsyncClient,
 ) -> None:
