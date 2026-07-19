@@ -2255,7 +2255,7 @@ class TestRequestJob:
         assert response.json()["agent_id"] == str(agent_id)
         refresh.assert_not_awaited()
 
-    async def test_after_activation_v2_only_gets_no_new_v3_but_resumes_v2(
+    async def test_after_activation_v2_only_expires_v2_and_stays_idle(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -2282,9 +2282,46 @@ class TestRequestJob:
         resumed = await client.post(
             "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
         )
-        assert resumed.status_code == 200, resumed.text
-        assert resumed.json()["agent_id"] == str(legacy_agent)
-        assert resumed.json()["bench_version"] == 2
+        assert resumed.status_code == 204, resumed.text
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket, (legacy_agent, 2, _VALIDATOR_HOTKEY)
+            )
+            assert ticket is not None
+            assert ticket.status == TicketStatus.EXPIRED
+
+    async def test_after_activation_capable_validator_replaces_v2_with_v3(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        active_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await self._activate_v3(session_maker, active_agent)
+        legacy_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, legacy_agent)
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=8,
+            capabilities=self._v8_capabilities(),
+            stack=_V7_STACK,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(active_agent)
+        assert response.json()["bench_version"] == 3
+        async with session_maker() as session:
+            legacy_ticket = await session.get(
+                ValidatorTicket, (legacy_agent, 2, _VALIDATOR_HOTKEY)
+            )
+            assert legacy_ticket is not None
+            assert legacy_ticket.status == TicketStatus.EXPIRED
 
     async def test_after_activation_new_submission_finalizes_on_three_v3_scores(
         self,
