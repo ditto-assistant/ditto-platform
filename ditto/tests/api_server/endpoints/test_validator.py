@@ -252,7 +252,8 @@ def _score_payload(
     #   base : bench_version? : transcript_sha256?
     if report.get("bench_version") is not None:
         signed += f":{report['bench_version']}"
-    transcript = (report.get("details") or {}).get("transcript_sha256")
+    details = report.get("details")
+    transcript = details.get("transcript_sha256") if isinstance(details, dict) else None
     if isinstance(transcript, str) and transcript:
         signed += f":{transcript}"
     return {
