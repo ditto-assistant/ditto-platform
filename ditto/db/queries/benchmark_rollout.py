@@ -122,6 +122,7 @@ async def append_rollout_member(
     member: RolloutSnapshotMember,
     dataset: DatasetPin,
     now: datetime,
+    audit_context: dict[str, Any] | None = None,
 ) -> bool:
     """Permanently qualify one newly risen hybrid-top-five agent."""
     locked = await session.get(
@@ -158,27 +159,49 @@ async def append_rollout_member(
             frozen_composite=member.composite,
         )
     )
-    session.add(
-        BenchmarkDataset(
-            agent_id=member.agent_id,
-            bench_version=locked.desired_version,
-            seed=dataset.seed,
-            sha256=dataset.sha256,
-            run_size=dataset.run_size,
-            seed_block=dataset.seed_block,
-            seed_block_hash=dataset.seed_block_hash,
-            created_at=now,
-        )
+    existing_dataset = await session.get(
+        BenchmarkDataset, (member.agent_id, locked.desired_version)
     )
+    if existing_dataset is None:
+        session.add(
+            BenchmarkDataset(
+                agent_id=member.agent_id,
+                bench_version=locked.desired_version,
+                seed=dataset.seed,
+                sha256=dataset.sha256,
+                run_size=dataset.run_size,
+                seed_block=dataset.seed_block,
+                seed_block_hash=dataset.seed_block_hash,
+                created_at=now,
+            )
+        )
+    elif (
+        existing_dataset.seed,
+        existing_dataset.sha256,
+        existing_dataset.run_size,
+        existing_dataset.seed_block,
+        existing_dataset.seed_block_hash,
+    ) != (
+        dataset.seed,
+        dataset.sha256,
+        dataset.run_size,
+        dataset.seed_block,
+        dataset.seed_block_hash,
+    ):
+        raise ValueError("existing benchmark dataset does not match qualification")
+    audit_payload: dict[str, Any] = {
+        "agent_id": str(member.agent_id),
+        "position": position,
+        "hybrid_composite": member.composite,
+        "origin": "automatic",
+    }
+    if audit_context is not None:
+        audit_payload.update(audit_context)
     await _audit(
         session,
         locked,
         "member_qualified",
-        {
-            "agent_id": str(member.agent_id),
-            "position": position,
-            "hybrid_composite": member.composite,
-        },
+        audit_payload,
         now=now,
     )
     await session.flush()
@@ -301,18 +324,36 @@ async def create_rollout_snapshot(
             )
         )
         pin = datasets[member.agent_id]
-        session.add(
-            BenchmarkDataset(
-                agent_id=member.agent_id,
-                bench_version=CANARY_BENCH_VERSION,
-                seed=pin.seed,
-                sha256=pin.sha256,
-                run_size=pin.run_size,
-                seed_block=pin.seed_block,
-                seed_block_hash=pin.seed_block_hash,
-                created_at=now,
-            )
+        existing_dataset = await session.get(
+            BenchmarkDataset, (member.agent_id, CANARY_BENCH_VERSION)
         )
+        if existing_dataset is None:
+            session.add(
+                BenchmarkDataset(
+                    agent_id=member.agent_id,
+                    bench_version=CANARY_BENCH_VERSION,
+                    seed=pin.seed,
+                    sha256=pin.sha256,
+                    run_size=pin.run_size,
+                    seed_block=pin.seed_block,
+                    seed_block_hash=pin.seed_block_hash,
+                    created_at=now,
+                )
+            )
+        elif (
+            existing_dataset.seed,
+            existing_dataset.sha256,
+            existing_dataset.run_size,
+            existing_dataset.seed_block,
+            existing_dataset.seed_block_hash,
+        ) != (
+            pin.seed,
+            pin.sha256,
+            pin.run_size,
+            pin.seed_block,
+            pin.seed_block_hash,
+        ):
+            raise ValueError("existing benchmark dataset does not match snapshot")
     await _audit(
         session,
         rollout,

@@ -2234,12 +2234,18 @@ class TestRequestJob:
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         await _seed_validator_heartbeat(session_maker)
         _install_db(app, session_maker)
         _install_chain(app)
         self._enable_compatibility_gate(app)
+        refresh = AsyncMock(return_value=0)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.refresh_rolling_qualification",
+            refresh,
+        )
 
         response = await client.post(
             "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
@@ -2247,6 +2253,7 @@ class TestRequestJob:
 
         assert response.status_code == 200
         assert response.json()["agent_id"] == str(agent_id)
+        refresh.assert_not_awaited()
 
     async def test_after_activation_v2_only_gets_no_new_v3_but_resumes_v2(
         self,
@@ -3513,3 +3520,25 @@ def test_dev_bypass_permit_refused_on_mainnet(monkeypatch) -> None:
     assert _dev_bypass_permit("finney") is False
     assert _dev_bypass_permit("Finney") is False
     assert _dev_bypass_permit("mainnet") is False
+
+
+async def test_idle_qualification_refresh_is_single_flight_and_throttled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ditto.api_server.endpoints import validator
+
+    ensure = AsyncMock(return_value=False)
+    refresh = AsyncMock(return_value=0)
+    monkeypatch.setattr(validator, "ensure_rolling_qualification", ensure)
+    monkeypatch.setattr(validator, "refresh_rolling_qualification", refresh)
+    monkeypatch.setattr(validator, "_qualification_refresh_due", 0.0)
+    monkeypatch.setattr(validator.time, "monotonic", lambda: 100.0)
+    session = AsyncMock()
+    generator = AsyncMock()
+    now = datetime.now(UTC)
+
+    await validator._refresh_qualification_if_due(session, generator=generator, now=now)
+    await validator._refresh_qualification_if_due(session, generator=generator, now=now)
+
+    ensure.assert_awaited_once_with(session, generator=generator, now=now)
+    refresh.assert_awaited_once_with(session, generator=generator, now=now)

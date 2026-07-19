@@ -225,6 +225,49 @@ class AdminBenchmarkContractMigrationResponse(BaseModel):
     expired_ticket_count: int
 
 
+class AdminBenchmarkQualificationRequest(BaseModel):
+    """Compare-and-swap guard for qualifying a scored rolling contender."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_rollout_id: UUID
+    expected_total_score_count: Annotated[int, Field(ge=0)]
+    expected_source_score_count: Annotated[int, Field(ge=0)]
+    expected_target_score_count: Annotated[int, Field(ge=0)]
+
+
+class AdminBenchmarkQualificationDetail(BaseModel):
+    agent_id: UUID
+    agent_name: str
+    agent_status: str
+    artifact_sha256: str
+    rollout_id: UUID | None
+    source_bench_version: int | None
+    target_bench_version: int | None
+    currently_top_five: bool
+    rollout_member: bool
+    target_dataset_sha256: str | None
+    total_score_count: int
+    source_score_count: int
+    target_score_count: int
+    screening_attempt_active: bool
+    validator_run_active: bool
+    qualification_allowed: bool
+    blocking_reason: str | None
+
+
+class AdminBenchmarkQualificationResponse(BaseModel):
+    agent_id: UUID
+    agent_status: str
+    rollout_id: UUID
+    target_bench_version: int
+    target_dataset_sha256: str
+    rollout_member: Literal[True] = True
+    screening_queued: bool
+
+
 class AdminQuarantineAgentContext(BaseModel):
     """Submission metadata an operator needs while judging a quarantine."""
 
@@ -450,6 +493,9 @@ class AdminValidatorAssignmentReleaseResponse(BaseModel):
 
 __all__ = [
     "AdminArtifactDuplicate",
+    "AdminBenchmarkQualificationDetail",
+    "AdminBenchmarkQualificationRequest",
+    "AdminBenchmarkQualificationResponse",
     "AdminDuplicateSummary",
     "AdminMinerContext",
     "AdminMinerQuarantineSummary",
