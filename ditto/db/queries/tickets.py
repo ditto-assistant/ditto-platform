@@ -23,6 +23,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import aliased
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.db.models import Agent, BenchmarkDataset, Score, ValidatorTicket
@@ -141,6 +142,12 @@ async def issue_ticket(
             )
         )
     await expire_overdue_tickets(session, now=now)
+    if bench_version is None:
+        raise ValueError("benchmark version is required for ticket issuance")
+    contract = benchmark_contract(bench_version)
+    requires_screened = (
+        contract.requires_screened_image or artifact_mode == "screened_only"
+    )
 
     # A validator executes one benchmark at a time. Polling again (including
     # after a process restart) must resume that still-live lease instead of
@@ -152,6 +159,9 @@ async def issue_ticket(
         & Agent.screened_image_ref.is_not(None)
         & Agent.screened_image_upload_id.is_not(None)
         & Agent.screened_image_verified_at.is_not(None)
+    )
+    eligible_screened_image = complete_screened_image & (
+        Agent.screening_policy_version >= contract.minimum_screening_policy_version
     )
     existing_statement = (
         select(ValidatorTicket)
@@ -165,12 +175,12 @@ async def issue_ticket(
         .limit(1)
         .with_for_update()
     )
-    if artifact_mode == "screened_only":
-        existing_statement = existing_statement.where(complete_screened_image)
+    if requires_screened:
+        existing_statement = existing_statement.where(eligible_screened_image)
     existing = await session.scalar(existing_statement)
     if existing is not None:
         return existing
-    if artifact_mode == "screened_only":
+    if requires_screened:
         incompatible_existing = await session.scalar(
             select(ValidatorTicket)
             .where(
@@ -378,8 +388,8 @@ async def issue_ticket(
                 .exists()
             )
             candidate = candidate.where(versioned_dataset)
-        if artifact_mode == "screened_only":
-            candidate = candidate.where(complete_screened_image)
+        if requires_screened:
+            candidate = candidate.where(eligible_screened_image)
         if score_continuation_floor is not None:
             # A median-of-three cannot be bounded safely after one score. Once
             # two scores exist, their maximum is the best final median the

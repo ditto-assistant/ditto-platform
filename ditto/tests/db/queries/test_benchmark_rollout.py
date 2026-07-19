@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     _require_v3_start_capacity,
     start_v3_rollout,
@@ -19,6 +21,7 @@ from ditto.db.models import (
     Agent,
     Base,
     BenchmarkRollout,
+    BenchmarkRolloutMember,
     Score,
     ValidatorHeartbeat,
     ValidatorTicket,
@@ -35,6 +38,7 @@ from ditto.db.queries.benchmark_rollout import (
     rollout_state,
 )
 from ditto.db.queries.scores import list_eligible_ledger
+from ditto.db.queries.screening import claim_screening_attempts
 
 pytestmark = pytest.mark.asyncio
 
@@ -95,6 +99,12 @@ async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRo
                 sha256=f"{position:x}" * 64,
                 status=AgentStatus.SCORED,
                 screening_policy_version=9,
+                screened_image_sha256=f"{position:x}" * 64,
+                screened_image_size_bytes=1024,
+                screened_image_id="sha256:" + f"{position:x}" * 64,
+                screened_image_ref=f"ditto-screen/{agent_id}:latest",
+                screened_image_upload_id=uuid4(),
+                screened_image_verified_at=now,
                 created_at=now + timedelta(seconds=position),
             )
         )
@@ -285,7 +295,7 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
     await engine.dispose()
 
 
-async def test_ineligible_frozen_member_blocks_without_reshuffle() -> None:
+async def test_ineligible_qualified_member_does_not_block_remaining_work() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -296,17 +306,16 @@ async def test_ineligible_frozen_member_blocks_without_reshuffle() -> None:
         agent = await session.get(Agent, agent_ids[2])
         assert agent is not None
         agent.status = AgentStatus.BANNED
-        assert (
-            await issue_rollout_ticket(
-                session,
-                validator_hotkey="validator-a",
-                now=now,
-                ttl=timedelta(minutes=90),
-            )
-            is None
+        ticket = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
         )
+        assert ticket is not None
+        assert ticket.agent_id != agent_ids[2]
         state = await rollout_state(session)
-        assert state["status"] == "blocked_ineligible"
+        assert state["status"] == "collecting"
         assert [UUID(member["agent_id"]) for member in state["members"]] == agent_ids
         agent.status = AgentStatus.SCORED
         ticket = await issue_rollout_ticket(
@@ -331,6 +340,15 @@ async def test_rollout_screened_only_skips_and_releases_source_only_work() -> No
     now = datetime.now(UTC).replace(microsecond=0)
     async with maker() as session, session.begin():
         agent_ids, rollout = await _seed_rollout(session, now)
+        for agent_id in agent_ids:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.screened_image_sha256 = None
+            agent.screened_image_size_bytes = None
+            agent.screened_image_id = None
+            agent.screened_image_ref = None
+            agent.screened_image_upload_id = None
+            agent.screened_image_verified_at = None
         screened = await session.get(Agent, agent_ids[1])
         assert screened is not None
         screened.screened_image_sha256 = "12" * 32
@@ -397,6 +415,94 @@ async def test_rollout_screened_only_skips_and_releases_source_only_work() -> No
             is None
         )
         assert running.status == TicketStatus.ISSUED
+    await engine.dispose()
+
+
+async def test_v3_score_drop_qualifies_and_rescreens_new_top_five_agent() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    rising_id = uuid4()
+    async with maker() as session:
+        async with session.begin():
+            initial_ids, rollout = await _seed_rollout(session, now)
+            session.add(
+                Agent(
+                    agent_id=rising_id,
+                    miner_hotkey="miner-6",
+                    name="rising-sixth",
+                    sha256="f" * 64,
+                    status=AgentStatus.SCORED,
+                    screening_policy_version=8,
+                    dataset_seed=66,
+                    dataset_sha256="d" * 64,
+                    dataset_run_size="full",
+                    created_at=now + timedelta(minutes=1),
+                )
+            )
+            for validator in range(3):
+                session.add(
+                    Score(
+                        agent_id=rising_id,
+                        bench_version=2,
+                        validator_hotkey=f"legacy-{validator}",
+                        run_id=f"v2-rising-{validator}",
+                        signature="aa",
+                        seed=66,
+                        composite=0.505,
+                        tool_mean=0.5,
+                        memory_mean=0.5,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": 2},
+                        generated_at=now,
+                    )
+                )
+                session.add(
+                    Score(
+                        agent_id=initial_ids[0],
+                        bench_version=3,
+                        validator_hotkey=f"v3-{validator}",
+                        run_id=f"v3-drop-{validator}",
+                        signature="bb",
+                        seed=1,
+                        composite=0.1,
+                        tool_mean=0.1,
+                        memory_mean=0.1,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": 3},
+                        generated_at=now,
+                    )
+                )
+
+        generator = AsyncMock()
+        generator.generate.return_value = "e" * 64
+        assert (
+            await refresh_rolling_qualification(
+                session, generator=generator, now=now + timedelta(seconds=1)
+            )
+            == 1
+        )
+        async with session.begin():
+            member = await session.get(
+                BenchmarkRolloutMember, (rollout.rollout_id, rising_id)
+            )
+            assert member is not None
+            assert member.position == 6
+            claimed = await claim_screening_attempts(
+                session,
+                screener_hotkey="screener-1",
+                now=now + timedelta(seconds=2),
+                ttl=timedelta(minutes=70),
+                limit=20,
+            )
+            assert rising_id in {agent.agent_id for agent, _attempt, _dup in claimed}
+            rising = await session.get(Agent, rising_id)
+            assert rising is not None
+            assert rising.status == AgentStatus.SCORED
     await engine.dispose()
 
 

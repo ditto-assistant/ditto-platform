@@ -2041,6 +2041,15 @@ class TestRequestJob:
     ) -> None:
         now = datetime.now(UTC)
         async with session_maker() as session, session.begin():
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.screening_policy_version = 9
+            agent.screened_image_sha256 = "12" * 32
+            agent.screened_image_size_bytes = 123
+            agent.screened_image_id = "sha256:" + "34" * 32
+            agent.screened_image_ref = f"ditto-screen/{agent_id}:latest"
+            agent.screened_image_upload_id = uuid4()
+            agent.screened_image_verified_at = now
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
@@ -2203,6 +2212,8 @@ class TestRequestJob:
             )
             assert job.status_code == 200, job.text
             assert job.json()["bench_version"] == 3
+            assert job.json()["minimum_screening_policy_version"] == 9
+            assert job.json()["requires_screened_image"] is True
             deadline = datetime.fromisoformat(job.json()["deadline"])
             score = await client.post(
                 f"/api/v1/validator/agent/{agent_id}/score",

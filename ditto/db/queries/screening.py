@@ -13,7 +13,15 @@ from sqlalchemy.sql.selectable import ScalarSelect
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
-from ditto.db.models import Agent, Score, ScreeningAttempt, ScreeningQuarantine
+from ditto.db.models import (
+    Agent,
+    BenchmarkDataset,
+    BenchmarkRollout,
+    BenchmarkRolloutMember,
+    Score,
+    ScreeningAttempt,
+    ScreeningQuarantine,
+)
 from ditto.db.queries.scores import SCORING_QUORUM
 
 if TYPE_CHECKING:
@@ -107,6 +115,29 @@ def screening_priority_order() -> tuple[ColumnElement[Any], ...]:
         Agent.created_at.asc(),
         Agent.agent_id.asc(),
     )
+
+
+def missing_active_benchmark_dataset() -> ColumnElement[bool]:
+    """Whether the current agent lacks the activated benchmark-version pin."""
+    active_version = (
+        select(BenchmarkRollout.desired_version)
+        .where(BenchmarkRollout.status == "activated")
+        .order_by(BenchmarkRollout.activated_at.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    activation_exists = exists(
+        select(BenchmarkRollout.rollout_id).where(
+            BenchmarkRollout.status == "activated"
+        )
+    )
+    versioned_dataset_exists = exists(
+        select(BenchmarkDataset.agent_id).where(
+            BenchmarkDataset.agent_id == Agent.agent_id,
+            BenchmarkDataset.bench_version == active_version,
+        )
+    )
+    return activation_exists & ~versioned_dataset_exists
 
 
 async def expire_screening_attempts(session: AsyncSession, *, now: datetime) -> int:
@@ -238,6 +269,26 @@ async def claim_screening_attempts(
             ScreeningAttempt.status == "running",
         )
     )
+    rolling_qualified = exists(
+        select(BenchmarkRolloutMember.agent_id)
+        .join(
+            BenchmarkRollout,
+            BenchmarkRollout.rollout_id == BenchmarkRolloutMember.rollout_id,
+        )
+        .where(
+            BenchmarkRolloutMember.agent_id == Agent.agent_id,
+            BenchmarkRollout.status.in_(("collecting", "blocked_ineligible")),
+        )
+    )
+    missing_v3_screen = (
+        (Agent.screening_policy_version < SCREENING_POLICY_VERSION)
+        | Agent.screened_image_sha256.is_(None)
+        | Agent.screened_image_size_bytes.is_(None)
+        | Agent.screened_image_id.is_(None)
+        | Agent.screened_image_ref.is_(None)
+        | Agent.screened_image_upload_id.is_(None)
+        | Agent.screened_image_verified_at.is_(None)
+    )
     eligible = or_(
         Agent.status == AgentStatus.UPLOADED,
         Agent.status == AgentStatus.SCREENING_FAILED,
@@ -250,6 +301,12 @@ async def claim_screening_attempts(
             )
             & (Agent.screening_policy_version < SCREENING_POLICY_VERSION)
         ),
+        (
+            Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE))
+            & rolling_qualified
+            & missing_v3_screen
+        ),
+        ((Agent.status == AgentStatus.EVALUATING) & missing_active_benchmark_dataset()),
     )
     earlier = aliased(Agent)
     earlier_pending = exists(
@@ -353,7 +410,8 @@ async def claim_screening_attempts(
             duplicate_of=duplicate_of,
         )
         session.add(attempt)
-        agent.status = AgentStatus.SCREENING
+        if agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
+            agent.status = AgentStatus.SCREENING
         agent.screening_reason = None
         agent.screening_reason_code = None
         claimed.append((agent, attempt, duplicate_of))

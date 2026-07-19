@@ -87,6 +87,7 @@ class ArtifactResponse(BaseModel):
     ] = None
     screened_image_ref: Annotated[str | None, Field(min_length=1)] = None
     bench_version: Annotated[int | None, Field(default=None, ge=1)] = None
+    screening_policy_version: Annotated[int | None, Field(default=None, ge=0)] = None
 
     @model_validator(mode="after")
     def screened_image_fields_are_atomic(self) -> ArtifactResponse:
@@ -222,6 +223,10 @@ class JobResponse(BaseModel):
             description="Version-bound benchmark semantics for this lease.",
         ),
     ] = None
+    minimum_screening_policy_version: Annotated[
+        int | None, Field(default=None, ge=0)
+    ] = None
+    requires_screened_image: bool | None = None
 
     model_config = ConfigDict(
         json_schema_extra={
