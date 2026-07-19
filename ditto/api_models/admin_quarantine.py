@@ -149,6 +149,40 @@ class AdminScreeningRescreenResponse(BaseModel):
     agent_status: str
 
 
+class AdminBenchmarkContractRefreshRequest(BaseModel):
+    """Compare-and-swap guard for rebuilding one stale benchmark contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_bench_version: Annotated[int, Field(gt=2)]
+    expected_dataset_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_score_count: Annotated[int, Field(ge=0)]
+
+
+class AdminBenchmarkContractRefreshDetail(BaseModel):
+    """Current compare-and-swap inputs for one guarded contract repair."""
+
+    agent_id: UUID
+    agent_name: str
+    agent_status: str
+    artifact_sha256: str
+    bench_version: int
+    dataset_sha256: str | None
+    score_count: int
+    screening_attempt_active: bool
+    refresh_allowed: bool
+    blocking_reason: str | None
+
+
+class AdminBenchmarkContractRefreshResponse(BaseModel):
+    agent_id: UUID
+    agent_status: str
+    bench_version: int
+    expired_ticket_count: int
+
+
 class AdminQuarantineAgentContext(BaseModel):
     """Submission metadata an operator needs while judging a quarantine."""
 

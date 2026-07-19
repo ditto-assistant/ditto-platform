@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
-from sqlalchemy import or_, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
@@ -57,6 +57,7 @@ from ditto.api_models import (
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.system_health import system_metrics_signing_token
+from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_dataset_generator,
@@ -79,6 +80,8 @@ from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
     BenchmarkDataset,
+    BenchmarkRollout,
+    BenchmarkRolloutMember,
     ScreenedImageUpload,
     ScreeningAttempt,
     ScreeningQuarantine,
@@ -92,6 +95,7 @@ from ditto.db.queries.heartbeats import (
 from ditto.db.queries.screening import (
     claim_screening_attempts,
     get_screening_attempt,
+    missing_active_benchmark_dataset,
     screening_priority_order,
 )
 from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
@@ -367,6 +371,23 @@ async def queue(
 ) -> ScreenerQueueResponse:
     """List completion-lane contenders, then least-scored pending agents."""
     response.headers["Cache-Control"] = "no-store"
+    rolling_qualified = exists(
+        select(BenchmarkRolloutMember.agent_id)
+        .join(BenchmarkRollout)
+        .where(
+            BenchmarkRolloutMember.agent_id == Agent.agent_id,
+            BenchmarkRollout.status.in_(("collecting", "blocked_ineligible")),
+        )
+    )
+    missing_v3_screen = (
+        (Agent.screening_policy_version < SCREENING_POLICY_VERSION)
+        | Agent.screened_image_sha256.is_(None)
+        | Agent.screened_image_size_bytes.is_(None)
+        | Agent.screened_image_id.is_(None)
+        | Agent.screened_image_ref.is_(None)
+        | Agent.screened_image_upload_id.is_(None)
+        | Agent.screened_image_verified_at.is_(None)
+    )
     agents = (
         await session.scalars(
             select(Agent)
@@ -382,6 +403,15 @@ async def queue(
                             )
                         )
                         & (Agent.screening_policy_version < SCREENING_POLICY_VERSION)
+                    ),
+                    (
+                        Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE))
+                        & rolling_qualified
+                        & missing_v3_screen
+                    ),
+                    (
+                        (Agent.status == AgentStatus.EVALUATING)
+                        & missing_active_benchmark_dataset()
                     ),
                 )
             )
@@ -1100,9 +1130,11 @@ async def submit_result(
             else _public_screening_reason(payload.detail, payload.reason_code)
         )
 
-    # 3. Generate the per-submission dataset (outside the row lock). Only on a pass,
-    #    when generation is enabled, and when the agent is not already pinned (a
-    #    cheap pre-read guards a re-reported verdict from regenerating).
+    # 3. Generate the active-version dataset (outside the row lock). The legacy
+    #    agent-level columns hold the original/v2 pin, so their presence does not
+    #    prove a v3 BenchmarkDataset exists. A policy rescreen after activation
+    #    must backfill that missing row from the same immutable seed or the agent
+    #    is left evaluating forever with no ticket candidate.
     new_dataset: tuple[int, int, str, str, int | None, str | None] | None = None
     if payload.passed and generator.run_size is not None:
         # Own transaction so the read commits/closes before the write txn below
@@ -1111,10 +1143,23 @@ async def submit_result(
             existing = await get_agent_by_id(session, agent_id=agent_id)
             if existing is None:
                 raise AgentNotFoundError(f"no agent with id={agent_id}")
-            needs_dataset = existing.dataset_seed is None
             bench_version = await active_bench_version(session)
+            versioned_dataset = await session.get(
+                BenchmarkDataset, (agent_id, bench_version)
+            )
+            needs_dataset = versioned_dataset is None
+            existing_seed = existing.dataset_seed
+            existing_seed_block = existing.dataset_seed_block
+            existing_seed_block_hash = existing.dataset_seed_block_hash
         if needs_dataset:
-            seed, block_number, block_hash = await _derive_dataset_seed(chain, agent_id)
+            if existing_seed is None:
+                seed, block_number, block_hash = await _derive_dataset_seed(
+                    chain, agent_id
+                )
+            else:
+                seed = existing_seed
+                block_number = existing_seed_block
+                block_hash = existing_seed_block_hash
             dataset_sha256 = await generator.generate(seed, bench_version=bench_version)
             new_dataset = (
                 bench_version,
@@ -1161,7 +1206,13 @@ async def submit_result(
             deadline = attempt.deadline
             if deadline.tzinfo is None:
                 deadline = deadline.replace(tzinfo=UTC)
-            if attempt.status == attempt_status and agent.status == target:
+            if attempt.status == attempt_status and (
+                agent.status == target
+                or (
+                    attempt_status == "passed"
+                    and agent.status in (AgentStatus.SCORED, AgentStatus.LIVE)
+                )
+            ):
                 # Idempotent re-report: nothing transitions, but a retry may
                 # carry review payloads that an earlier report (or an older
                 # platform build) did not persist. Backfill them before
@@ -1187,8 +1238,24 @@ async def submit_result(
             )
             and agent.screening_policy_version < SCREENING_POLICY_VERSION
         )
+        rolling_rescreen = bool(
+            await session.scalar(
+                select(
+                    exists().where(
+                        BenchmarkRolloutMember.agent_id == agent.agent_id,
+                        BenchmarkRolloutMember.rollout_id
+                        == BenchmarkRollout.rollout_id,
+                        BenchmarkRollout.status.in_(
+                            ("collecting", "blocked_ineligible")
+                        ),
+                    )
+                )
+            )
+        ) and agent.status in (AgentStatus.SCORED, AgentStatus.LIVE)
         idempotent = agent.status == target
-        if agent.status in _SCREENABLE_STATUSES or rescreening:
+        if rolling_rescreen and payload.passed:
+            pass
+        elif rolling_rescreen or agent.status in _SCREENABLE_STATUSES or rescreening:
             agent.status = target
         elif agent.status == target:
             pass  # idempotent re-report of the same verdict
@@ -1277,33 +1344,56 @@ async def submit_result(
                 await _backfill_quarantine_payloads(
                     session, attempt_id=attempt.attempt_id, payload=payload
                 )
-        # Pin the generated dataset once, when evaluating and not yet set (the
-        # `is None` guard keeps a concurrent/duplicate verdict from overwriting).
-        if (
-            new_dataset is not None
-            and agent.status == AgentStatus.EVALUATING
-            and agent.dataset_seed is None
+        # Pin the generated version row once. Locking the agent serializes two
+        # verdicts; the second lookup prevents a duplicate insert if another
+        # path backfilled the row while generation was in flight.
+        if new_dataset is not None and agent.status in (
+            AgentStatus.EVALUATING,
+            AgentStatus.SCORED,
+            AgentStatus.LIVE,
         ):
             (
                 bench_version,
-                agent.dataset_seed,
-                agent.dataset_sha256,
-                agent.dataset_run_size,
-                agent.dataset_seed_block,
-                agent.dataset_seed_block_hash,
+                seed,
+                dataset_sha256,
+                dataset_run_size,
+                seed_block,
+                seed_block_hash,
             ) = new_dataset
-            session.add(
-                BenchmarkDataset(
-                    agent_id=agent.agent_id,
-                    bench_version=bench_version,
-                    seed=agent.dataset_seed,
-                    sha256=agent.dataset_sha256,
-                    run_size=agent.dataset_run_size,
-                    seed_block=agent.dataset_seed_block,
-                    seed_block_hash=agent.dataset_seed_block_hash,
-                )
+            existing_versioned = await session.get(
+                BenchmarkDataset, (agent.agent_id, bench_version)
             )
+            if existing_versioned is None:
+                session.add(
+                    BenchmarkDataset(
+                        agent_id=agent.agent_id,
+                        bench_version=bench_version,
+                        seed=seed,
+                        sha256=dataset_sha256,
+                        run_size=dataset_run_size,
+                        seed_block=seed_block,
+                        seed_block_hash=seed_block_hash,
+                    )
+                )
+            # First-time submissions still mirror their initial pin into the
+            # compatibility columns. Never overwrite an older/v2 pin during a
+            # v3 backfill.
+            if agent.dataset_seed is None:
+                agent.dataset_seed = seed
+                agent.dataset_sha256 = dataset_sha256
+                agent.dataset_run_size = dataset_run_size
+                agent.dataset_seed_block = seed_block
+                agent.dataset_seed_block_hash = seed_block_hash
         result_status = agent.status
+
+    try:
+        await refresh_rolling_qualification(
+            session, generator=generator, now=datetime.now(UTC)
+        )
+    except Exception:
+        # The signed verdict and image binding are already committed. A dataset
+        # renderer outage must not make the screener retry an accepted verdict.
+        logger.exception("rolling benchmark qualification refresh failed")
 
     logger.info(
         "screen verdict agent_id=%s screener=%s passed=%s status=%s dataset=%s "

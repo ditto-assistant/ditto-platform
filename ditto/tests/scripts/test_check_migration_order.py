@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from scripts.check_migration_order import (
@@ -62,3 +64,12 @@ down_revision: tuple[str, str] = ("one", "one")
 
     with pytest.raises(MigrationError, match="down_revision contains duplicates"):
         parse_migration("merge.py", source)
+
+
+def test_repository_migration_history_has_one_head() -> None:
+    migrations = [
+        parse_migration(str(path), path.read_text())
+        for path in sorted(Path("alembic/versions").glob("*.py"))
+    ]
+
+    assert validate_linear_history(migrations, "repository")

@@ -923,7 +923,7 @@ class BenchmarkRollout(Base):
 
 
 class BenchmarkRolloutMember(Base):
-    """Frozen member of a benchmark activation cohort."""
+    """An agent qualified during a rolling benchmark activation."""
 
     __tablename__ = "benchmark_rollout_members"
 
@@ -940,7 +940,7 @@ class BenchmarkRolloutMember(Base):
             ["rollout_id"], ["benchmark_rollouts.rollout_id"], ondelete="CASCADE"
         ),
         ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="RESTRICT"),
-        CheckConstraint("position BETWEEN 1 AND 5", name="benchmark_member_position"),
+        CheckConstraint("position > 0", name="benchmark_member_position"),
     )
 
 
@@ -993,6 +993,7 @@ class ValidatorHeartbeat(Base):
     )
     capabilities: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     stack: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    stack_health: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )

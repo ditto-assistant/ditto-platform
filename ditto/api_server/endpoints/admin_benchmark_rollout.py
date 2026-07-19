@@ -1,4 +1,4 @@
-"""Audited operator start for the benchmark-v3 five-agent activation cohort."""
+"""Audited operator start for rolling benchmark-v3 top-five qualification."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import get_dataset_generator, get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
@@ -54,13 +55,17 @@ async def start_v3_rollout(
     session: SessionDep,
     generator: GeneratorDep,
 ) -> dict[str, object]:
-    """Freeze the current top five and explicitly render their v3 datasets."""
+    """Seed rolling qualification with the current top five and v3 datasets."""
     existing = await rollout_for_transition(
         session,
         from_version=DEFAULT_BENCH_VERSION,
         desired_version=CANARY_BENCH_VERSION,
     )
     if existing is not None:
+        await session.rollback()  # close the read-only autobegin before the service
+        await refresh_rolling_qualification(
+            session, generator=generator, now=datetime.now(UTC)
+        )
         return await rollout_state(session)
     active_version = await active_bench_version(session)
     if active_version != DEFAULT_BENCH_VERSION:

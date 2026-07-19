@@ -65,8 +65,13 @@ from ditto.api_models import (
     ValidatorHeartbeatResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.benchmark_progress import benchmark_progress_signing_token
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.stack_health import (
+    ValidatorStackHealth,
+    validator_stack_health_signing_token,
+)
 from ditto.api_models.system_health import (
     SystemMetrics,
     system_metrics_signing_token,
@@ -80,9 +85,15 @@ from ditto.api_models.validator_capabilities import (
     validator_identity_signing_token,
 )
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
+from ditto.api_server.benchmark_rollout import (
+    ensure_rolling_qualification,
+    refresh_rolling_qualification,
+)
 from ditto.api_server.config import ValidatorCompatibilityConfig
+from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
+    get_dataset_generator,
     get_session,
     get_storage_client,
 )
@@ -112,8 +123,6 @@ from ditto.db.queries.benchmark_rollout import (
     active_bench_version,
     heartbeat_supports_v3,
     issue_rollout_ticket,
-    maybe_activate_rollout,
-    open_rollout,
 )
 from ditto.db.queries.heartbeats import (
     HeartbeatProgressRegressionError,
@@ -302,6 +311,7 @@ class AgentNotEvaluatableError(Exception):
 ChainDep = Annotated["ChainClient", Depends(get_chain_client)]
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
+GeneratorDep = Annotated[DatasetGenerator, Depends(get_dataset_generator)]
 
 
 def _dev_bypass_permit(network: str) -> bool:
@@ -488,8 +498,26 @@ def _heartbeat_signing_message(
     benchmark_progress: BenchmarkProgress | None = None,
     capabilities: ValidatorCapabilities | None = None,
     stack: ValidatorStackIdentity | None = None,
+    stack_health: ValidatorStackHealth | None = None,
 ) -> bytes:
     """Canonical heartbeat payload, mirrored by ``ditto-subnet``."""
+    if stack_health is not None and protocol_version < 9:
+        raise ValueError("per-component stack health requires heartbeat protocol v9")
+    if protocol_version >= 9:
+        if capabilities is None or stack is None:
+            raise ValueError("heartbeat protocol v9 requires capabilities and stack")
+        if stack_health is None:
+            raise ValueError("heartbeat protocol v9 requires stack health")
+        active = str(active_agent_id) if active_agent_id is not None else ""
+        return (
+            "ditto-validator-heartbeat:v9:"
+            f"{validator_hotkey}:{software_version}:{protocol_version}:"
+            f"{code_digest}:{state}:{active}:"
+            f"{system_metrics_signing_token(system_metrics)}:"
+            f"{benchmark_progress_signing_token(benchmark_progress)}:"
+            f"{validator_identity_signing_token(capabilities, stack)}:"
+            f"{validator_stack_health_signing_token(stack_health)}:{timestamp}"
+        ).encode()
     if protocol_version >= 8:
         if capabilities is None or stack is None:
             raise ValueError("heartbeat protocol v8 requires capabilities and stack")
@@ -633,6 +661,7 @@ async def heartbeat(
         benchmark_progress=request_body.benchmark_progress,
         capabilities=request_body.capabilities,
         stack=request_body.stack,
+        stack_health=request_body.stack_health,
     )
     if not _verify_signature(validator_hotkey, payload, request_body.signature):
         raise ValidatorAuthError("heartbeat signature verification failed")
@@ -700,6 +729,11 @@ async def heartbeat(
                     if request_body.stack is not None
                     else None
                 ),
+                stack_health=(
+                    request_body.stack_health.model_dump(mode="json", exclude_none=True)
+                    if request_body.stack_health is not None
+                    else None
+                ),
                 reported_at=reported_at,
                 seen_at=now,
                 signature=request_body.signature,
@@ -730,6 +764,7 @@ async def request_job(
     response: Response,
     chain: ChainDep,
     session: SessionDep,
+    generator: GeneratorDep,
     x_validator_hotkey: Annotated[str | None, Header()] = None,
 ) -> JobResponse | Response:
     """Issue this validator a scoring ticket for the next eligible agent.
@@ -762,6 +797,13 @@ async def request_job(
     await _assert_validator_permitted(
         chain, netuid, payload.validator_hotkey, network=network
     )
+
+    try:
+        await ensure_rolling_qualification(session, generator=generator, now=now)
+    except Exception:
+        # Qualification bootstrap is convergent and must not strand ordinary
+        # v2 work if dataset rendering is temporarily unavailable.
+        logger.exception("automatic benchmark-v3 qualification bootstrap failed")
 
     async with session.begin():
         await _assert_validator_compatible(
@@ -851,6 +893,7 @@ async def request_job(
         dataset = await session.get(
             BenchmarkDataset, (agent.agent_id, ticket.bench_version)
         )
+        contract = benchmark_contract(ticket.bench_version)
         job = JobResponse(
             agent_id=agent.agent_id,
             miner_hotkey=agent.miner_hotkey,
@@ -872,6 +915,10 @@ async def request_job(
                 else agent.dataset_seed_block_hash
             ),
             bench_version=ticket.bench_version,
+            minimum_screening_policy_version=(
+                contract.minimum_screening_policy_version
+            ),
+            requires_screened_image=contract.requires_screened_image,
         )
     response.headers["Cache-Control"] = "no-store"
     logger.info(
@@ -1095,6 +1142,7 @@ async def agent_artifact(
         screened_image_id=agent.screened_image_id,
         screened_image_ref=agent.screened_image_ref,
         bench_version=ticket.bench_version if ticket is not None else None,
+        screening_policy_version=agent.screening_policy_version,
     )
 
 
@@ -1117,6 +1165,7 @@ async def submit_score(
     chain: ChainDep,
     session: SessionDep,
     storage: StorageDep,
+    generator: GeneratorDep,
 ) -> SubmitScoreResponse:
     """Record a DittoBench score report and advance the agent's lifecycle.
 
@@ -1506,11 +1555,17 @@ async def submit_score(
             validator_hotkey=payload.validator_hotkey,
             bench_version=ticket.bench_version,
         )
-        if ticket.bench_version == CANARY_BENCH_VERSION:
-            rollout = await open_rollout(session, for_update=True)
-            if rollout is not None:
-                await maybe_activate_rollout(session, rollout, now=audit_now)
         result_status = agent.status
+
+    # Both a completed v3 quorum and a newly finalized v2 contender can change
+    # the hybrid top five. This is a cheap no-op when no rollout is open.
+    try:
+        await refresh_rolling_qualification(session, generator=generator, now=audit_now)
+    except Exception:
+        # The score is already committed and remains canonical. Do not report a
+        # false score failure because the independent v3 dataset renderer is
+        # temporarily unavailable; the next score/verdict/admin retry converges.
+        logger.exception("rolling benchmark qualification refresh failed")
 
     logger.info(
         "score recorded agent_id=%s validator=%s run_id=%s composite=%.3f status=%s",

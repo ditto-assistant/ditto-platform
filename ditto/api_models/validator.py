@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_progress import BenchmarkProgress
+from ditto.api_models.stack_health import ValidatorStackHealth
 from ditto.api_models.system_health import SystemMetrics
 from ditto.api_models.upload import (
     _SIGNATURE_HEX_PATTERN,
@@ -86,6 +87,7 @@ class ArtifactResponse(BaseModel):
     ] = None
     screened_image_ref: Annotated[str | None, Field(min_length=1)] = None
     bench_version: Annotated[int | None, Field(default=None, ge=1)] = None
+    screening_policy_version: Annotated[int | None, Field(default=None, ge=0)] = None
 
     @model_validator(mode="after")
     def screened_image_fields_are_atomic(self) -> ArtifactResponse:
@@ -221,6 +223,10 @@ class JobResponse(BaseModel):
             description="Version-bound benchmark semantics for this lease.",
         ),
     ] = None
+    minimum_screening_policy_version: Annotated[
+        int | None, Field(default=None, ge=0)
+    ] = None
+    requires_screened_image: bool | None = None
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -306,6 +312,13 @@ class ValidatorHeartbeatRequest(BaseModel):
             default=None, description="Signed complete stack identity (protocol v7)."
         ),
     ] = None
+    stack_health: Annotated[
+        ValidatorStackHealth | None,
+        Field(
+            default=None,
+            description="Signed per-component runtime health under v9.",
+        ),
+    ] = None
     timestamp: Annotated[
         int, Field(ge=0, description="Validator-reported Unix timestamp (UTC).")
     ]
@@ -338,6 +351,12 @@ class ValidatorHeartbeatRequest(BaseModel):
                 raise ValueError("heartbeat v8 requires scorer benchmark capability")
         elif self.capabilities is not None or self.stack is not None:
             raise ValueError("capabilities and stack require heartbeat protocol v7")
+        if self.protocol_version >= 9 and self.stack_health is None:
+            raise ValueError("heartbeat protocol v9 requires stack health")
+        if self.stack_health is not None and self.protocol_version < 9:
+            raise ValueError(
+                "per-component stack health requires heartbeat protocol v9"
+            )
         return self
 
 

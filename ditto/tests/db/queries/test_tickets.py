@@ -898,6 +898,14 @@ class TestExpiry:
             ticket.status = TicketStatus.EXPIRED
             ticket.attempt_count = 2
             ticket.retry_after = _NOW + timedelta(days=1)
+            agent = await session.get(Agent, aid)
+            assert agent is not None
+            agent.screened_image_sha256 = "12" * 32
+            agent.screened_image_size_bytes = 123
+            agent.screened_image_id = "sha256:" + "34" * 32
+            agent.screened_image_ref = f"ditto-screen/{aid}:latest"
+            agent.screened_image_upload_id = uuid4()
+            agent.screened_image_verified_at = _NOW
             session.add(
                 BenchmarkDataset(
                     agent_id=aid,
@@ -921,6 +929,41 @@ class TestExpiry:
         assert reset.attempt_count == 1
         assert reset.retry_after is None
 
+    async def test_v3_requires_image_while_v2_keeps_source_fallback(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            session.add(
+                BenchmarkDataset(
+                    agent_id=aid,
+                    bench_version=3,
+                    seed=42,
+                    sha256="cd" * 32,
+                    run_size="full",
+                )
+            )
+        async with session.begin():
+            assert (
+                await issue_ticket(
+                    session,
+                    validator_hotkey="5V3NoImage",
+                    now=_NOW,
+                    ttl=_TTL,
+                    bench_version=3,
+                )
+                is None
+            )
+            v2 = await issue_ticket(
+                session,
+                validator_hotkey="5V2Fallback",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=2,
+            )
+            assert v2 is not None
+            assert v2.agent_id == aid
+
     async def test_prior_scored_version_does_not_block_new_version(
         self, session: AsyncSession
     ) -> None:
@@ -935,6 +978,14 @@ class TestExpiry:
             )
             assert prior is not None
             prior.status = TicketStatus.SCORED
+            agent = await session.get(Agent, aid)
+            assert agent is not None
+            agent.screened_image_sha256 = "12" * 32
+            agent.screened_image_size_bytes = 123
+            agent.screened_image_id = "sha256:" + "34" * 32
+            agent.screened_image_ref = f"ditto-screen/{aid}:latest"
+            agent.screened_image_upload_id = uuid4()
+            agent.screened_image_verified_at = _NOW
             session.add(
                 BenchmarkDataset(
                     agent_id=aid,
