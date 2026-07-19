@@ -282,6 +282,32 @@ def _job_payload(
     }
 
 
+def _confirmation_job_payload(
+    champion_agent_id: UUID,
+    challenger_agent_id: UUID,
+    keypair: bittensor.Keypair = _KEYPAIR,
+    *,
+    nonce: UUID | None = None,
+    requested_at: datetime | None = None,
+) -> dict:
+    nonce = nonce or uuid4()
+    requested_at = requested_at or datetime.now(UTC)
+    requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
+    signed = (
+        "validator-confirmation-job:v1:"
+        f"{keypair.ss58_address}:{champion_agent_id}:{challenger_agent_id}:"
+        f"{nonce}:{requested}"
+    ).encode()
+    return {
+        "validator_hotkey": keypair.ss58_address,
+        "champion_agent_id": str(champion_agent_id),
+        "challenger_agent_id": str(challenger_agent_id),
+        "nonce": str(nonce),
+        "requested_at": requested_at.isoformat(),
+        "signature": keypair.sign(signed).hex(),
+    }
+
+
 def _artifact_headers(
     agent_id: UUID,
     keypair: bittensor.Keypair = _KEYPAIR,
@@ -2223,6 +2249,113 @@ class TestRequestJob:
             "/api/v1/validator/job", headers=_AUTH_HEADER, json=stale
         )
         assert resp.status_code == 409
+
+
+class TestRequestConfirmationJob:
+    async def test_issues_only_current_uncertainty_band_challenger(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The KOTH ledger and the confirmation pair are keyed to the ACTIVE
+        # benchmark (the activated rollout's), which is still v2 until an
+        # operator starts the v3 epoch. CURRENT_BENCH_VERSION advances the
+        # moment the code ships, so a fixture pinned to it seeds rows the
+        # ledger does not consider current and the pair reads as stale.
+        from ditto.db.queries.benchmark_rollout import (
+            DEFAULT_BENCH_VERSION as ACTIVE_BENCH_VERSION,
+        )
+
+        champion = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCORED,
+            created_at=datetime.now(UTC) - timedelta(days=1),
+            miner_hotkey="5Champion",
+        )
+        challenger = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCORED,
+            miner_hotkey="5Challenger",
+            sha256="cd" * 32,
+        )
+        async with session_maker() as session, session.begin():
+            for agent_id, composite, details in (
+                (
+                    champion,
+                    0.88,
+                    {
+                        "bench_version": ACTIVE_BENCH_VERSION,
+                        "composite_stderr": 0.03,
+                        "confirmation_composites": [0.87, 0.88, 0.89],
+                        "confirmation_seeds": [7, 8, 9],
+                    },
+                ),
+                (
+                    challenger,
+                    0.93,
+                    {
+                        "bench_version": ACTIVE_BENCH_VERSION,
+                        "composite_stderr": 0.03,
+                    },
+                ),
+            ):
+                for index, keypair in enumerate(_KEYPAIRS):
+                    session.add(
+                        Score(
+                            agent_id=agent_id,
+                            validator_hotkey=keypair.ss58_address,
+                            run_id=f"run-{agent_id}-{index}",
+                            signature=None,
+                            seed=index,
+                            composite=composite,
+                            tool_mean=composite,
+                            memory_mean=composite,
+                            median_ms=100,
+                            n=114,
+                            details=details,
+                            generated_at=datetime.now(UTC),
+                        )
+                    )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_confirmation_job_payload(champion, challenger),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(challenger)
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket,
+                (challenger, ACTIVE_BENCH_VERSION, _VALIDATOR_HOTKEY),
+            )
+        assert ticket is not None
+        assert ticket.status == TicketStatus.ISSUED
+
+    async def test_rejects_pair_direction_tampering(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion = uuid4()
+        challenger = uuid4()
+        payload = _confirmation_job_payload(champion, challenger)
+        payload["champion_agent_id"] = str(challenger)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/confirmation-job",
+            headers=_AUTH_HEADER,
+            json=payload,
+        )
+
+        assert response.status_code == 401
 
 
 class TestSubmitScore:

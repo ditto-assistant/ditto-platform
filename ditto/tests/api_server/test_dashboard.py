@@ -684,3 +684,9 @@ class TestDashboard:
         body = (await _get(app, "/")).text
         assert "≈ tie" not in body
         assert "function tieChip(" not in body
+
+    async def test_explains_shared_seed_confirmation(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert "clears the 2% incumbent margin" in body
+        assert "shared-seed head-to-head confirmation is required" in body

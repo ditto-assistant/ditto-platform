@@ -57,6 +57,37 @@ class KothProjection:
     raw_leader_decision: DethroneDecision | None
 
 
+def confirmation_pair(
+    projection: KothProjection | None,
+) -> tuple[KothEntry, KothEntry] | None:
+    """Return ``(champion, raw leader)`` when paired confirmation is warranted.
+
+    This is deliberately narrower than "scores are close": the challenger must
+    already clear the frozen 2% incumbent margin, fail only the unpaired
+    statistical band, and the incumbent must carry at least two common-seed
+    confirmation results that the challenger has not yet matched.  Therefore a
+    confirmation needs to benchmark only the challenger on the incumbent's
+    existing seeds; benchmark-version sweeps remain responsible for creating
+    or refreshing the incumbent baseline.
+    """
+    if projection is None or projection.raw_leader_decision is None:
+        return None
+    decision = projection.raw_leader_decision
+    champion = projection.champion
+    challenger = projection.raw_leader
+    champion_seeds = _seed_composites(champion)
+    if (
+        decision.method != "unpaired"
+        or decision.dethrones
+        or decision.challenger_lead <= decision.margin_lead
+        or champion_seeds is None
+        or len(champion_seeds) < 2
+        or _paired_statistic(challenger, champion) is not None
+    ):
+        return None
+    return champion, challenger
+
+
 def project_koth(entries: Sequence[KothEntry]) -> KothProjection | None:
     """Return the champion and participation tail for an eligible score pool."""
     scored = [entry for entry in entries if entry.composite > 0.0]
