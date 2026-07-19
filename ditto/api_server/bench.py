@@ -19,10 +19,10 @@ from __future__ import annotations
 from typing import Any
 
 # The current DittoBench benchmark version. See module docstring.
-CURRENT_BENCH_VERSION = 2
+CURRENT_BENCH_VERSION = 3
 
 
-def is_bench_version_retired(version: int) -> bool:
+def is_bench_version_retired(version: int, active_version: int) -> bool:
     """Whether ``version`` is a superseded (retired) benchmark.
 
     A version is retired once a newer one ships (``version < CURRENT``). Its
@@ -30,7 +30,7 @@ def is_bench_version_retired(version: int) -> bool:
     included) is safe to release publicly with zero anti-overfit cost. The current
     (live) version and any unknown future version are NOT retired.
     """
-    return 0 < version < CURRENT_BENCH_VERSION
+    return 0 < version < active_version
 
 
 def stamp_bench_version(details: dict[str, Any]) -> dict[str, Any]:

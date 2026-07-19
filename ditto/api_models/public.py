@@ -607,6 +607,40 @@ class PublicValidatorScore(BaseModel):
     generated_at: Annotated[
         datetime, Field(description="When the scoring engine produced the score (UTC).")
     ]
+    transform_robustness: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Reproduce-under-transform audit result: the fraction of audit "
+                "pairs this run answered consistently. A share of every run's "
+                "cases is re-asked under a rephrasing (or a shift that moves the "
+                "answer) derived from the block-hash-seeded dataset seed, which "
+                "postdates the submission's commit -- so the miner could not have "
+                "pre-handled it. What a low value measures is SURFACE "
+                "BRITTLENESS (right on the phrasing the harness was built for, "
+                "wrong on one it was not) or MEMORIZATION; it is not evidence "
+                "about a harness that genuinely recomputes the answer, which "
+                "scores the same under the transform. Both the selection and the "
+                "transforms are pure functions of the published seed, so anyone "
+                "can regenerate the audit set and recheck this number. Null for "
+                "a run that carried no audit pairs or predates the audit."
+            ),
+        ),
+    ]
+    audit_case_count: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            description=(
+                "How many audit pairs backed ``transform_robustness``, so a value "
+                "backed by many pairs is distinguishable from one backed by two."
+            ),
+        ),
+    ]
     case_results: Annotated[
         list[PublicCaseResult] | None,
         Field(
@@ -617,6 +651,21 @@ class PublicValidatorScore(BaseModel):
                 "observer can audit exactly where the agent gained or lost points. "
                 "Never the answer key (expected / called / case_id). None when the "
                 "run carries no per-case data."
+            ),
+        ),
+    ]
+    transcript_sha256: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "SHA-256 of this validator's published transcript artifact (the "
+                "graded per-case inputs), bound into the score signature. The "
+                "bytes live content-addressed in the public bucket at "
+                "``transcripts/{sha256}.json``; regenerating the dataset from "
+                "the seed and re-running the public grader over the transcript "
+                "reproduces this score offline. Null for scores whose validator "
+                "published no transcript."
             ),
         ),
     ]
@@ -1054,6 +1103,22 @@ class PublicProvisionalScore(BaseModel):
             ),
         ),
     ]
+    transcript_sha256: Annotated[
+        str | None,
+        Field(
+            default=None,
+            pattern=r"^[0-9a-f]{64}$",
+            description=(
+                "SHA-256 of this run's published transcript artifact (the "
+                "graded per-case inputs), bound into the validator's score "
+                "signature. The bytes live content-addressed in the public "
+                "bucket at ``transcripts/{sha256}.json``; regenerating the "
+                "dataset from the seed and re-running the public grader over "
+                "the transcript reproduces this composite offline. Null when "
+                "the validator published no transcript."
+            ),
+        ),
+    ] = None
 
 
 class PublicSubmissionPipeline(BaseModel):
@@ -1491,6 +1556,14 @@ class PublicBenchConfigResponse(BaseModel):
             "Anonymous-read URL template for finalized run records "
             "(dataset pin + k=3 signed scores), or null when mirroring is off."
         )
+    )
+    public_transcript_url_template: str | None = Field(
+        default=None,
+        description=(
+            "Anonymous-read URL template for content-addressed run transcripts "
+            "(``{sha256}`` = a score's signature-bound ``transcript_sha256``), "
+            "or null when mirroring is off."
+        ),
     )
     ledger_path: str = Field(description="The self-verifying signed score ledger.")
     generated_at: datetime

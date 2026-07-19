@@ -33,6 +33,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 import statistics
 import time
 from dataclasses import dataclass
@@ -186,7 +187,11 @@ _CHAIN_WEIGHTS_TIMEOUT_SECONDS = 4.0
 # Historical reproduction must fail closed: only benchmark epochs whose exact
 # generator release is known get a copyable command. Add a mapping deliberately
 # when a future epoch pins its generator; never point an old score at ``latest``.
-_DATAGEN_VERSION_BY_BENCH_VERSION = {2: "v0.7.0"}
+
+# The exact generator release each benchmark version's reproduction commands
+# pin. v0.8.0 is the tag cut from dittobench-datagen's anti-gaming branch at
+# the v3 release (see dittobench-api docs/v3-release.md for the merge order).
+_DATAGEN_VERSION_BY_BENCH_VERSION = {2: "v0.7.0", 3: "v0.8.0"}
 _DATAGEN_RUN_SIZES = frozenset({"small", "medium", "full"})
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 _VALIDATOR_STALE_WINDOW = timedelta(minutes=15)
@@ -401,6 +406,35 @@ def _safe_models(details: dict) -> PublicRunModels | None:
         return None
 
 
+_TRANSCRIPT_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _safe_transcript_sha256(details: dict) -> str | None:
+    """Pull the score's declared transcript digest, tolerating malformed blobs."""
+    raw = details.get("transcript_sha256")
+    if isinstance(raw, str) and _TRANSCRIPT_SHA256_HEX.fullmatch(raw):
+        return raw
+    return None
+
+
+def _safe_transform_robustness(details: dict) -> tuple[float | None, int | None]:
+    """Pull the reproduce-under-transform audit result, tolerating bad blobs.
+
+    Returns ``(None, None)`` for a run that carried no audit pairs or predates
+    the audit, so an absent metric is never published as a failing one.
+    """
+    raw = details.get("transform_robustness")
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return None, None
+    value = float(raw)
+    if not 0.0 <= value <= 1.0:
+        return None, None
+    pairs = details.get("audit_case_count")
+    if not isinstance(pairs, int) or isinstance(pairs, bool) or pairs < 0:
+        pairs = None
+    return value, pairs
+
+
 def _safe_categories(details: dict) -> list[PublicCategoryStat] | None:
     """Pull the per-category breakdown, dropping any malformed entries."""
     raw = details.get("per_category")
@@ -531,7 +565,7 @@ def _public_entry(
     registered: bool | None = None,
     miner_uid: int | None = None,
     fold_stderr: float | None = None,
-    active_version: int = CURRENT_BENCH_VERSION,
+    active_version: int,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -592,7 +626,7 @@ def _public_koth_emissions(
     rows: list[LedgerRow],
     *,
     stderrs: dict[UUID, float | None],
-    active_version: int = CURRENT_BENCH_VERSION,
+    active_version: int,
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
     candidates: list[LedgerRow] = []
@@ -1153,26 +1187,31 @@ def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
         dataset_run_size=row.dataset_run_size,
         dataset_seed_block=row.dataset_seed_block,
         dataset_seed_block_hash=row.dataset_seed_block_hash,
-        scores=[
-            PublicValidatorScore(
-                validator_hotkey=s.validator_hotkey,
-                composite=s.composite,
-                tool_mean=s.tool_mean,
-                memory_mean=s.memory_mean,
-                median_ms=s.median_ms,
-                n=s.n,
-                seed=s.seed,
-                run_id=s.run_id,
-                ticket_deadline=_ticket_deadline(s),
-                signature=s.signature,
-                generated_at=s.generated_at,
-                case_results=_safe_case_results(
-                    s.details if isinstance(s.details, dict) else {}
-                ),
-            )
-            for s in row.scores
-        ],
+        scores=[_public_validator_score(s) for s in row.scores],
         generated_at=datetime.now(UTC),
+    )
+
+
+def _public_validator_score(s) -> PublicValidatorScore:
+    """Map one stored score row to its published, redacted form."""
+    details = s.details if isinstance(s.details, dict) else {}
+    robustness, audit_pairs = _safe_transform_robustness(details)
+    return PublicValidatorScore(
+        validator_hotkey=s.validator_hotkey,
+        composite=s.composite,
+        tool_mean=s.tool_mean,
+        memory_mean=s.memory_mean,
+        median_ms=s.median_ms,
+        n=s.n,
+        seed=s.seed,
+        run_id=s.run_id,
+        ticket_deadline=_ticket_deadline(s),
+        signature=s.signature,
+        generated_at=s.generated_at,
+        case_results=_safe_case_results(details),
+        transcript_sha256=_safe_transcript_sha256(details),
+        transform_robustness=robustness,
+        audit_case_count=audit_pairs,
     )
 
 
@@ -1758,6 +1797,9 @@ async def agent_pipeline(
                 case_results=_safe_case_results(
                     score.details if isinstance(score.details, dict) else {}
                 ),
+                transcript_sha256=_safe_transcript_sha256(
+                    score.details if isinstance(score.details, dict) else {}
+                ),
             )
             for score in accepted_scores
         ],
@@ -1979,12 +2021,15 @@ async def bench_corpus(
     any unknown future version, so no live answer key is ever exposed here.
     Paginate with ``limit`` / ``offset`` up to ``total``.
     """
-    if not is_bench_version_retired(version):
+    # Retirement follows the ACTIVATED epoch, not the shipped constant: releasing
+    # answer keys is irreversible and must not happen before miners are notified.
+    active = await active_bench_version(session)
+    if not is_bench_version_retired(version, active):
         raise HTTPException(
             status_code=409,
             detail=(
-                f"bench_version {version} is not retired (current is "
-                f"{CURRENT_BENCH_VERSION}); its answer keys are not released"
+                f"bench_version {version} is not retired (active is "
+                f"{active}); its answer keys are not released"
             ),
         )
     response.headers["Cache-Control"] = "public, max-age=3600, immutable"
@@ -2029,6 +2074,11 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
         if public_bucket
         else None
     )
+    transcript_template = (
+        f"https://storage.googleapis.com/{public_bucket}/transcripts/{{sha256}}.json"
+        if public_bucket
+        else None
+    )
     return PublicBenchConfigResponse(
         bench_version=CURRENT_BENCH_VERSION,
         harness=BenchHarnessConfig(
@@ -2063,6 +2113,7 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
             ),
         ),
         public_mirror_url_template=mirror,
+        public_transcript_url_template=transcript_template,
         ledger_path="/api/v1/scoring/scores",
         generated_at=datetime.now(UTC),
     )

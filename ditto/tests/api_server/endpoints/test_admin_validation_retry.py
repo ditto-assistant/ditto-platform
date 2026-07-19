@@ -21,6 +21,7 @@ from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.dependencies import get_session
 from ditto.db.models import Agent, Base, Score, ValidatorRetryRecovery, ValidatorTicket
+from ditto.db.queries.benchmark_rollout import DEFAULT_BENCH_VERSION
 from ditto.db.queries.tickets import issue_ticket
 
 _TOKEN = "test-admin-token-at-least-32-characters"
@@ -65,7 +66,7 @@ async def _seed(
     maker: async_sessionmaker[AsyncSession],
     *,
     score_count: int = 0,
-    bench_version: int = 2,
+    bench_version: int = DEFAULT_BENCH_VERSION,
 ) -> UUID:
     agent_id = uuid4()
     async with maker() as session, session.begin():
@@ -310,7 +311,7 @@ async def test_manual_grant_allows_exactly_one_more_same_version_issue(
             validator_hotkey="validator-0",
             now=datetime.now(UTC) + timedelta(seconds=1),
             ttl=timedelta(minutes=90),
-            bench_version=2,
+            bench_version=DEFAULT_BENCH_VERSION,
         )
     assert ticket is not None and ticket.agent_id == agent_id
     assert ticket.attempt_count == 3

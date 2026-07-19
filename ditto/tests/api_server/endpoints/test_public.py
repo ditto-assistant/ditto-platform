@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import (
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import get_dataset_generator, get_session
 from ditto.api_server.endpoints import public as public_endpoint
@@ -56,6 +57,7 @@ from ditto.db.queries.audit import (
     GENESIS_HASH,
     append_audit_entry,
 )
+from ditto.db.queries.benchmark_rollout import DEFAULT_BENCH_VERSION
 from ditto.db.queries.scores import upsert_score
 
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
@@ -323,7 +325,7 @@ class TestPublicLeaderboard:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        details = {"bench_version": 2, "composite_stderr": 0.03}
+        details = {"bench_version": DEFAULT_BENCH_VERSION, "composite_stderr": 0.03}
         incumbent_id = await _seed_k3(
             session_maker,
             miner=_MINER_A,
@@ -390,13 +392,13 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.7, 0.8, 0.9],
-            details={"bench_version": 2},
+            details={"bench_version": DEFAULT_BENCH_VERSION},
         )
         await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.6, 0.7, 0.8],
-            details={"bench_version": 2},
+            details={"bench_version": DEFAULT_BENCH_VERSION},
         )
         _install_db(app, session_maker)
         app.state.chain = SimpleNamespace(
@@ -1916,6 +1918,7 @@ class TestPublicActivity:
         score_count: int,
     ) -> None:
         composites = [0.41, 0.58, 0.73][:score_count]
+        transcript_sha256 = "ef" * 32
         if score_count:
             agent_id = await _seed_k3(
                 session_maker,
@@ -1924,7 +1927,10 @@ class TestPublicActivity:
                 status=(
                     AgentStatus.SCORED if score_count == 3 else AgentStatus.EVALUATING
                 ),
-                details={"bench_version": 2},
+                details={
+                    "bench_version": 2,
+                    "transcript_sha256": transcript_sha256,
+                },
             )
         else:
             agent_id = await _seed_agent(
@@ -1962,6 +1968,9 @@ class TestPublicActivity:
             assert score["verification_command"].endswith(
                 "-seed 987654321 -run-size full -sha"
             )
+            # The signature-bound transcript digest is public; the offline
+            # verification path depends on it.
+            assert score["transcript_sha256"] == transcript_sha256
             assert "validator_hotkey" not in score
             assert "signature" not in score
             assert "ticket_deadline" not in score
@@ -2448,15 +2457,18 @@ class TestPublicBenchCorpus:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        # v2 is the current (live) version: its answer keys must never be released.
+        # The current (live) version: its answer keys must never be released.
         await _seed_k3(
             session_maker,
             miner=_MINER_A,
             composites=[0.4, 0.5, 0.6],
-            details={"bench_version": 2, "per_case": [{"expected": ["x"]}]},
+            details={
+                "bench_version": CURRENT_BENCH_VERSION,
+                "per_case": [{"expected": ["x"]}],
+            },
         )
         _install_db(app, session_maker)
-        resp = await client.get("/api/v1/public/bench/2/corpus")
+        resp = await client.get(f"/api/v1/public/bench/{CURRENT_BENCH_VERSION}/corpus")
         assert resp.status_code == 409
         # ...and the live answer key is not in the refusal body.
         assert '"expected"' not in resp.text
@@ -2574,6 +2586,7 @@ class TestBenchConfig:
         assert "dittobench-datagen" in body["grading"]["grader"]
         assert "dataset_sha256" in body["dataset"]["reproduce"]
         assert body["public_mirror_url_template"] is None
+        assert body["public_transcript_url_template"] is None
         assert body["ledger_path"] == "/api/v1/scoring/scores"
 
     async def test_mirror_template_from_env(
@@ -2583,4 +2596,7 @@ class TestBenchConfig:
         body = (await client.get("/api/v1/public/bench/config")).json()
         assert body["public_mirror_url_template"] == (
             "https://storage.googleapis.com/ditto-platform-public-dev/scored/{agent_id}.json"
+        )
+        assert body["public_transcript_url_template"] == (
+            "https://storage.googleapis.com/ditto-platform-public-dev/transcripts/{sha256}.json"
         )

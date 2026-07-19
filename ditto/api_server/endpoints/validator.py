@@ -35,6 +35,7 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -59,6 +60,7 @@ from ditto.api_models import (
     ScoreReport,
     SubmitScoreRequest,
     SubmitScoreResponse,
+    SubmitTranscriptResponse,
     ValidatorHeartbeatRequest,
     ValidatorHeartbeatResponse,
 )
@@ -99,6 +101,7 @@ from ditto.db.models import (
 )
 from ditto.db.queries.agents import get_agent_by_id
 from ditto.db.queries.audit import (
+    EVENT_AUDIT,
     EVENT_FINALIZED,
     EVENT_SCORE,
     append_audit_entry,
@@ -118,6 +121,7 @@ from ditto.db.queries.heartbeats import (
 )
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
+    get_score_for_validator,
     list_eligible_ledger,
     list_scores_for_agent,
     upsert_score,
@@ -136,6 +140,98 @@ if TYPE_CHECKING:
     from ditto.chain import ChainClient
 
 logger = logging.getLogger(__name__)
+
+# Reproduce-under-transform audit (v3 Part A). These mirror the validator's
+# constants in ditto-subnet ``ditto/validator/transform_audit.py``, which in turn
+# mirror dittobench-datagen ``persona/transform.go``. They are part of a PUBLIC
+# derivation contract, not tunables: the whole point is that any third party can
+# recompute a verdict from the published seed and get the same answer.
+AUDIT_BPS = 2500
+
+# The brittleness verdict is a one-sided exact BINOMIAL TEST on discordant audit
+# pairs, mirroring ditto-subnet ``ditto/validator/transform_audit.py``.
+#
+# A pair answered correctly in the base phrasing and incorrectly under the
+# post-commit transform is the brittleness event; the mirror image is not. The
+# null is that discordant pairs fall either way equally, which is what an honest
+# nondeterministic model does. The 2026-07-18 calibration measured honest at 5
+# base-only vs 6 transform-only (symmetric) and a surface-gated harness at 6 vs
+# 0; the previous ratio threshold could not tell those apart.
+#
+# ALPHA *is* the false-positive rate on honest miners, by construction. The
+# ratio floor it replaces had an unknown error rate, measured at 16% of honest
+# runs.
+AUDIT_ALPHA = 0.01
+# Fewest discordant pairs that can produce a verdict: below this the exact test
+# cannot reach ALPHA even on a perfect one-directional run.
+AUDIT_MIN_DISCORDANT = 6
+TRANSFORM_AUDIT_REVIEW_REASON = "transform_audit_brittleness"
+
+# Enforcement stays OFF by default. The metric now discriminates in principle
+# (see the calibration in dittobench-api docs/BASELINES.md Run 3), but the floor
+# has not been re-validated end to end against the population it judges --
+# champion/tail agents, which are more accurate than the stock reference harness
+# every number above came from. Turn this on only with that evidence.
+TRANSFORM_AUDIT_ENFORCE = os.environ.get(
+    "DITTO_TRANSFORM_AUDIT_ENFORCE", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _binomial_tail(k: int, n: int, p: float = 0.5) -> float:
+    """P(X >= k) for X ~ Binomial(n, p). Exact, no dependencies."""
+    if n <= 0:
+        return 1.0
+    k = max(0, k)
+    total = 0.0
+    coeff = 1.0
+    for i in range(0, n + 1):
+        if i >= k:
+            total += coeff * (p**i) * ((1 - p) ** (n - i))
+        coeff = coeff * (n - i) / (i + 1)
+    return min(1.0, total)
+
+
+def _pool_audit_pairs(agent_scores: Sequence[Any]) -> dict[str, int]:
+    """Sum the audit 2x2 counts across an agent's finalized scores.
+
+    Each validator already pooled its own confirmation runs; this pools across
+    the k=3 validators, so the verdict rests on all the evidence rather than on
+    any one validator's handful of pairs. Same reasoning as finalizing the
+    composite on the median: no single validator decides an agent's fate.
+    """
+    pooled = {"both_correct": 0, "base_only": 0, "transform_only": 0, "both_wrong": 0}
+    for score in agent_scores:
+        details = score.details if isinstance(score.details, dict) else {}
+        raw = details.get("audit_pairs_pooled") or details.get("audit_pairs")
+        if not isinstance(raw, dict):
+            continue
+        for key in pooled:
+            v = raw.get(key, 0)
+            if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                pooled[key] += v
+    return pooled
+
+
+def _transform_audit_verdict(
+    agent_scores: Sequence[Any],
+) -> tuple[float | None, dict[str, int], bool]:
+    """Pooled brittleness verdict across an agent's finalized scores.
+
+    Returns ``(p_value, pooled_counts, failed)``. ``failed`` is False whenever
+    the evidence is thin -- no score carried the counts (an older scoring
+    engine), or too few discordant pairs to reach ALPHA. Absence of evidence is
+    not a failed audit, and the cost of getting that backwards is paid by a
+    legitimate miner.
+    """
+    pooled = _pool_audit_pairs(agent_scores)
+    discordant = pooled["base_only"] + pooled["transform_only"]
+    if sum(pooled.values()) == 0:
+        return None, pooled, False
+    if discordant < AUDIT_MIN_DISCORDANT:
+        return None, pooled, False
+    pvalue = _binomial_tail(pooled["base_only"], discordant)
+    return pvalue, pooled, pvalue <= AUDIT_ALPHA
+
 
 router = APIRouter(prefix="/validator", tags=["validator"])
 
@@ -298,6 +394,23 @@ def _lease_token(deadline: datetime) -> str:
     return deadline.astimezone(UTC).isoformat(timespec="microseconds")
 
 
+def _reported_transcript_sha256(report: ScoreReport) -> str | None:
+    """The transcript digest a report declares, or ``None``.
+
+    The scoring engine content-addresses the run's transcript artifact (the
+    graded per-case inputs) and the validator forwards the digest under
+    ``details["transcript_sha256"]``. ``details`` is otherwise opaque; this is
+    the one key the platform reads back out of it at ingest, because the digest
+    is bound into the signed payload (offline reproducibility, v3 review
+    finding 3).
+    """
+    details = report.details if isinstance(report.details, dict) else {}
+    value = details.get("transcript_sha256")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
 def _score_signing_message(
     validator_hotkey: str,
     agent_id: UUID,
@@ -308,8 +421,13 @@ def _score_signing_message(
 
     Must match the validator's ``sign_score`` byte-for-byte:
     ``{validator_hotkey}:{agent_id}:{ticket_deadline}:{run_id}:``
-    ``{composite!r}:{seed}``. Binding the exact lease means a response from an
-    expired attempt cannot be replayed after the ticket is reissued.
+    ``{composite!r}:{seed}`` — and, when the report declares a transcript
+    digest, ``:{transcript_sha256}`` is appended (both sides derive presence
+    from the same report field, so old validators that publish no transcript
+    keep the previous format). Binding the exact lease means a response from an
+    expired attempt cannot be replayed after the ticket is reissued; binding
+    the transcript digest means the published artifact cannot be swapped after
+    the fact without breaking the signature.
     """
     lease = _lease_token(ticket_deadline) if ticket_deadline is not None else ""
     # CANONICAL FIELD ORDER, mirrored byte-for-byte by ditto-subnet
@@ -334,17 +452,6 @@ def _score_signing_message(
     if transcript:
         msg += f":{transcript}"
     return msg.encode()
-
-
-def _reported_transcript_sha256(report: ScoreReport) -> str | None:
-    """The transcript digest a report declares, or None.
-
-    Both sides derive presence from the same report field, so a validator that
-    publishes no transcript signs the shorter payload and still verifies.
-    """
-    details = report.details if isinstance(report.details, dict) else {}
-    raw = details.get("transcript_sha256")
-    return raw if isinstance(raw, str) and raw else None
 
 
 def _job_signing_message(
@@ -1244,6 +1351,107 @@ async def submit_score(
                     )
                 else:
                     agent.status = AgentStatus.SCORED
+                # Reproduce-under-transform audit (v3 Part A). A share of every
+                # run's cases is re-asked under a transform derived from the
+                # block-hash-seeded dataset seed, which postdates the commit; the
+                # validator reports the median robustness over its confirmation
+                # runs. Below the public floor, the agent goes to review instead
+                # of scored, so it is excluded from emissions until an operator
+                # resolves it -- exactly like the copy-review hold.
+                #
+                # Quarantine-then-review, never an auto-ban: a low value is the
+                # surface-brittleness or memorization signature, and it is NOT
+                # evidence about a harness that genuinely recomputes its answers
+                # (that one scores the same under the transform). It reuses
+                # ATH_PENDING_REVIEW with a distinct review_reason rather than
+                # adding a sibling status, which would force a
+                # ditto-screening-protocol pin bump across every consumer for a
+                # distinction the reason string already carries.
+                audit_pvalue, audit_pairs, audit_failed = _transform_audit_verdict(
+                    agent_scores
+                )
+                if audit_failed and not TRANSFORM_AUDIT_ENFORCE:
+                    # Observational mode: record what the verdict WOULD have been
+                    # (the EVENT_AUDIT entry below carries `failed`) without
+                    # touching the agent's status. This is what accumulates the
+                    # real-world distribution a future threshold can be set from.
+                    logger.info(
+                        "agent %s: transform-audit brittleness signature "
+                        "(%d base-only vs %d transform-only, p=%.4f <= %.3f) "
+                        "— NOT enforced pending champion-population validation",
+                        agent_id,
+                        audit_pairs["base_only"],
+                        audit_pairs["transform_only"],
+                        audit_pvalue if audit_pvalue is not None else 1.0,
+                        AUDIT_ALPHA,
+                    )
+                if (
+                    audit_failed
+                    and TRANSFORM_AUDIT_ENFORCE
+                    and agent.status == AgentStatus.SCORED
+                ):
+                    agent.status = AgentStatus.ATH_PENDING_REVIEW
+                    agent.review_reason = TRANSFORM_AUDIT_REVIEW_REASON
+                    session.add(
+                        AthReview(
+                            review_id=uuid4(),
+                            agent_id=agent.agent_id,
+                            status="pending",
+                            opened_at=audit_now,
+                            original_reason=TRANSFORM_AUDIT_REVIEW_REASON,
+                            original_policy_version=agent.screening_policy_version,
+                            original_evidence={
+                                "audit_pairs": audit_pairs,
+                                "transform_audit_pvalue": audit_pvalue,
+                                "audit_alpha": AUDIT_ALPHA,
+                            },
+                            algorithm_provenance={
+                                "snapshot": "score-finalization",
+                                "opened_at_source": "transform_audit",
+                            },
+                        )
+                    )
+                    logger.warning(
+                        "agent %s held for transform-audit review: %d base-only "
+                        "vs %d transform-only discordant pairs, p=%.4f <= %.3f",
+                        agent_id,
+                        audit_pairs["base_only"],
+                        audit_pairs["transform_only"],
+                        audit_pvalue if audit_pvalue is not None else 1.0,
+                        AUDIT_ALPHA,
+                    )
+                if sum(audit_pairs.values()) > 0:
+                    # Recorded whether or not it held, so the public feed shows
+                    # the audit ran and what it found -- not only its failures.
+                    # PUBLIC INPUTS ONLY: never a transformed expected answer or
+                    # any other answer-key material, the same redaction rule the
+                    # score entry follows. Everything here is either already
+                    # published or re-derivable from the published seed, so a
+                    # third party can recompute this verdict independently.
+                    await append_audit_entry(
+                        session,
+                        agent_id=agent_id,
+                        validator_hotkey=None,
+                        event=EVENT_AUDIT,
+                        payload={
+                            "miner_hotkey": agent.miner_hotkey,
+                            "audit_pairs": audit_pairs,
+                            "transform_audit_pvalue": audit_pvalue,
+                            "audit_alpha": AUDIT_ALPHA,
+                            "audit_bps": AUDIT_BPS,
+                            "failed": audit_failed,
+                            # Whether the verdict was allowed to affect status.
+                            # Published so the feed is unambiguous about which
+                            # entries were observational.
+                            "enforced": TRANSFORM_AUDIT_ENFORCE,
+                            "dataset_seed": agent.dataset_seed,
+                            "dataset_sha256": agent.dataset_sha256,
+                            "dataset_seed_block": agent.dataset_seed_block,
+                            "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+                            "score_count": len(agent_scores),
+                        },
+                        recorded_at=audit_now,
+                    )
                 # Append the finalize audit entry: quorum reached, the median the
                 # platform finalized on, and which validators scored it. The
                 # moderation detail (why held / duplicate_of) is deliberately kept
@@ -1352,9 +1560,18 @@ async def _publish_finalized_run(
                 if sc.generated_at
                 else None,
                 "signature": sc.signature,
+                # Where the validator's transcript artifact lives (finding 3):
+                # the digest is inside the signed payload; the key is derived
+                # from it, so the record always names immutable bytes. Null for
+                # scores whose validator published no transcript.
+                "transcript_sha256": digest,
+                "transcript_key": transcript_object_key(digest) if digest else None,
                 "details": sc.details,
             }
-            for sc in sorted(scores, key=lambda sc: sc.validator_hotkey)
+            for sc, digest in (
+                (sc, _score_transcript_sha256(sc))
+                for sc in sorted(scores, key=lambda sc: sc.validator_hotkey)
+            )
         ],
     }
     body = json.dumps(record, sort_keys=True, default=str).encode()
@@ -1367,3 +1584,121 @@ async def _publish_finalized_run(
         )
     except Exception:  # noqa: BLE001 - additive mirror, never fail the write
         logger.exception("public mirror publish failed for agent %s", agent.agent_id)
+
+
+# Transcript artifacts are content-addressed in the public bucket so a record
+# referencing a digest always names immutable bytes.
+_TRANSCRIPT_KEY_TEMPLATE = "transcripts/{sha256}.json"
+
+# A transcript carries every graded final_text for a full run; cap well above
+# any legitimate size while bounding a hostile body.
+_TRANSCRIPT_MAX_BYTES = 32 << 20
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def transcript_object_key(sha256_hex: str) -> str:
+    """Public-bucket key for a transcript digest."""
+    return _TRANSCRIPT_KEY_TEMPLATE.format(sha256=sha256_hex)
+
+
+def _score_transcript_sha256(score: Score) -> str | None:
+    """The well-formed transcript digest a stored score declares, or ``None``."""
+    details = score.details if isinstance(score.details, dict) else {}
+    value = details.get("transcript_sha256")
+    if isinstance(value, str) and _SHA256_HEX.fullmatch(value):
+        return value
+    return None
+
+
+@router.put(
+    "/agent/{agent_id}/transcript/{run_id}",
+    response_model=SubmitTranscriptResponse,
+)
+async def submit_transcript(
+    agent_id: UUID,
+    run_id: str,
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    validator: ValidatorDep,
+    storage: StorageDep,
+) -> SubmitTranscriptResponse:
+    """Publish the transcript artifact behind a signed score (finding 3).
+
+    The body is the scoring engine's canonical transcript for ``run_id`` — the
+    graded per-case inputs whose digest the validator declared under
+    ``details["transcript_sha256"]`` and bound into its score signature. The
+    platform accepts the bytes only when their SHA-256 equals that declared
+    digest, then stores them content-addressed in the public bucket. Because
+    the binding is *content* equality against an already-signed digest, a
+    caller spoofing another validator's hotkey can only ever upload the exact
+    bytes that validator attested — so the header + permit check is sufficient
+    auth here. Idempotent: re-uploading an existing digest is a no-op.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    body = await request.body()
+    if len(body) > _TRANSCRIPT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="transcript exceeds size cap")
+    if not body:
+        raise HTTPException(status_code=400, detail="empty transcript body")
+    digest = hashlib.sha256(body).hexdigest()
+
+    score = await get_score_for_validator(
+        session, agent_id=agent_id, validator_hotkey=validator
+    )
+    if score is None or score.run_id != run_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "no recorded score by this validator for this agent and run; "
+                "submit the score (with details.transcript_sha256) first"
+            ),
+        )
+    declared = (
+        score.details.get("transcript_sha256")
+        if isinstance(score.details, dict)
+        else None
+    )
+    if not isinstance(declared, str) or not _SHA256_HEX.fullmatch(declared):
+        raise HTTPException(
+            status_code=409,
+            detail="the recorded score declares no transcript_sha256",
+        )
+    if digest != declared:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"transcript bytes hash to {digest} but the signed score "
+                f"declared {declared}"
+            ),
+        )
+
+    if storage.public_bucket is None:
+        logger.warning(
+            "transcript %s for agent %s accepted but STORAGE_PUBLIC_BUCKET is "
+            "unset; nothing published",
+            digest,
+            agent_id,
+        )
+        return SubmitTranscriptResponse(
+            agent_id=agent_id, run_id=run_id, transcript_sha256=digest, stored=False
+        )
+    key = transcript_object_key(digest)
+    if not await storage.object_exists(key=key, bucket=storage.public_bucket):
+        await storage.put_object(
+            key=key,
+            body=body,
+            content_type="application/json",
+            bucket=storage.public_bucket,
+        )
+        logger.info(
+            "transcript published agent_id=%s run_id=%s sha256=%s bytes=%d",
+            agent_id,
+            run_id,
+            digest,
+            len(body),
+        )
+    return SubmitTranscriptResponse(
+        agent_id=agent_id, run_id=run_id, transcript_sha256=digest, stored=True
+    )

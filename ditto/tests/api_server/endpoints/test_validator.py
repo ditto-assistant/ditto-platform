@@ -8,6 +8,7 @@ keypair so the signature-verification path runs for real.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -247,8 +248,14 @@ def _score_payload(
     signed = (
         f"{hotkey}:{agent_id}:{lease}:{run_id}:{report['composite']!r}:{report['seed']}"
     )
+    # CANONICAL ORDER, mirroring _score_signing_message and ditto-subnet:
+    #   base : bench_version? : transcript_sha256?
     if report.get("bench_version") is not None:
         signed += f":{report['bench_version']}"
+    details = report.get("details")
+    transcript = details.get("transcript_sha256") if isinstance(details, dict) else None
+    if isinstance(transcript, str) and transcript:
+        signed += f":{transcript}"
     return {
         "validator_hotkey": hotkey,
         "ticket_deadline": ticket_deadline.isoformat(),
@@ -2274,7 +2281,6 @@ class TestSubmitScore:
     ) -> None:
         # A report that omits bench_version (as the default payload does) must be
         # stamped with the current version so it is never recorded as legacy.
-        from ditto.api_server.bench import CURRENT_BENCH_VERSION
 
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         _install_db(app, session_maker)
@@ -2291,7 +2297,11 @@ class TestSubmitScore:
             score = await s.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
             assert score is not None
             assert score.details is not None
-            assert score.details["bench_version"] == CURRENT_BENCH_VERSION
+            # The payload now declares bench_version explicitly, so stamping
+            # preserves it rather than overwriting with CURRENT: a report that
+            # genuinely ran an older contract stays honestly labelled, and the
+            # label matches the row's key.
+            assert score.details["bench_version"] == 2
             assert score.details["ticket_deadline"] == (
                 _TICKET_DEADLINE.isoformat(timespec="microseconds")
             )
@@ -2769,6 +2779,183 @@ class TestPublicMirror:
             client, agent_id, maker=session_maker, run_id="run_nopub", composite=0.5
         )
         storage.put_object.assert_not_awaited()
+
+
+class TestTranscriptPublication:
+    """Offline-reproducibility hardening (v3 review finding 3): the transcript
+    digest is bound into the score signature, and the transcript upload path
+    only ever stores bytes that hash to a digest a signed score declared."""
+
+    _TRANSCRIPT = b'{"run_id":"run_t_0","cases":[{"case_id":"a","response":{}}]}'
+    _digest = hashlib.sha256(_TRANSCRIPT).hexdigest()
+
+    async def test_score_signature_binds_transcript_digest(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        _install_storage(app)
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(
+                agent_id,
+                run_id="run_t_0",
+                details={"transcript_sha256": self._digest},
+            ),
+        )
+        assert response.status_code == 200, response.text
+
+    async def test_transcript_digest_outside_signature_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A report that declares a digest the signature does not cover must be
+        # rejected: otherwise the artifact binding would be spoofable.
+        _install_db(app, session_maker)
+        _install_chain(app)
+        _install_storage(app)
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        payload = _score_payload(agent_id, run_id="run_t_0")
+        payload["report"]["details"] = {"transcript_sha256": self._digest}
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score", json=payload
+        )
+        assert response.status_code == 401
+
+    async def _record_score_with_transcript(
+        self,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        agent_id: UUID,
+    ) -> None:
+        await _seed_ticket(session_maker, agent_id)
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(
+                agent_id,
+                run_id="run_t_0",
+                details={"transcript_sha256": self._digest},
+            ),
+        )
+        assert response.status_code == 200, response.text
+
+    async def test_submit_transcript_stores_content_addressed(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+        storage.public_bucket = "ditto-public"
+        storage.put_object = AsyncMock()
+        storage.object_exists = AsyncMock(return_value=False)
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await self._record_score_with_transcript(client, session_maker, agent_id)
+
+        response = await client.put(
+            f"/api/v1/validator/agent/{agent_id}/transcript/run_t_0",
+            content=self._TRANSCRIPT,
+            headers={"X-Validator-Hotkey": _VALIDATOR_HOTKEY},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["stored"] is True
+        assert body["transcript_sha256"] == self._digest
+        storage.put_object.assert_awaited_once()
+        kwargs = storage.put_object.await_args.kwargs
+        assert kwargs["bucket"] == "ditto-public"
+        assert kwargs["key"] == f"transcripts/{self._digest}.json"
+        assert kwargs["body"] == self._TRANSCRIPT
+
+        # Idempotent: a re-upload of an existing object writes nothing new.
+        storage.object_exists = AsyncMock(return_value=True)
+        response = await client.put(
+            f"/api/v1/validator/agent/{agent_id}/transcript/run_t_0",
+            content=self._TRANSCRIPT,
+            headers={"X-Validator-Hotkey": _VALIDATOR_HOTKEY},
+        )
+        assert response.status_code == 200
+        storage.put_object.assert_awaited_once()  # still exactly one write
+
+    async def test_submit_transcript_digest_mismatch_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+        storage.public_bucket = "ditto-public"
+        storage.put_object = AsyncMock()
+        storage.object_exists = AsyncMock(return_value=False)
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await self._record_score_with_transcript(client, session_maker, agent_id)
+
+        response = await client.put(
+            f"/api/v1/validator/agent/{agent_id}/transcript/run_t_0",
+            content=b'{"tampered": true}',
+            headers={"X-Validator-Hotkey": _VALIDATOR_HOTKEY},
+        )
+        assert response.status_code == 409
+        storage.put_object.assert_not_awaited()
+
+    async def test_submit_transcript_without_score_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+        storage.public_bucket = "ditto-public"
+        storage.put_object = AsyncMock()
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+
+        response = await client.put(
+            f"/api/v1/validator/agent/{agent_id}/transcript/run_t_0",
+            content=self._TRANSCRIPT,
+            headers={"X-Validator-Hotkey": _VALIDATOR_HOTKEY},
+        )
+        assert response.status_code == 409
+        storage.put_object.assert_not_awaited()
+
+    async def test_publish_record_carries_transcript_refs(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+        storage.public_bucket = "ditto-public"
+        storage.put_object = AsyncMock()
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _score_to_quorum(
+            client,
+            agent_id,
+            maker=session_maker,
+            run_id="run_t",
+            composite=0.5,
+            details={"transcript_sha256": self._digest},
+        )
+        kwargs = storage.put_object.await_args.kwargs
+        record = json.loads(kwargs["body"])
+        for sc in record["scores"]:
+            assert sc["transcript_sha256"] == self._digest
+            assert sc["transcript_key"] == f"transcripts/{self._digest}.json"
 
 
 class TestMultiValidatorConsensus:

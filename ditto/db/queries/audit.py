@@ -40,6 +40,14 @@ GENESIS_HASH = "0" * 64
 # Event kinds recorded in the log.
 EVENT_SCORE = "score"
 EVENT_FINALIZED = "agent_finalized"
+# The reproduce-under-transform audit verdict (v3 Part A). Recorded whenever a
+# finalized agent carried the metric, held or not, so the public feed shows the
+# audit ran and what it found -- not only the failures. Its payload carries the
+# PUBLIC inputs only (seed, block hash, robustness, pair counts) and never an
+# answer key or a transformed expected answer, the same redaction rule the score
+# entry follows: the verdict must be independently checkable from published data
+# without the chain itself leaking the dataset's answers.
+EVENT_AUDIT = "transform_audit"
 
 
 def _iso_utc(dt: datetime) -> str:
