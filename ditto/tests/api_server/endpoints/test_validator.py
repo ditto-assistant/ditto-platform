@@ -2131,8 +2131,11 @@ class TestRequestJob:
         }
 
     @staticmethod
-    async def _activate_v3(
-        session_maker: async_sessionmaker[AsyncSession], agent_id: UUID
+    async def _activate_benchmark(
+        session_maker: async_sessionmaker[AsyncSession],
+        agent_id: UUID,
+        *,
+        bench_version: int,
     ) -> None:
         now = datetime.now(UTC)
         async with session_maker() as session, session.begin():
@@ -2148,8 +2151,8 @@ class TestRequestJob:
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
+                    from_version=bench_version - 1,
+                    desired_version=bench_version,
                     status="activated",
                     cohort_size=5,
                     created_at=now,
@@ -2159,7 +2162,7 @@ class TestRequestJob:
             session.add(
                 BenchmarkDataset(
                     agent_id=agent_id,
-                    bench_version=3,
+                    bench_version=bench_version,
                     seed=8675309,
                     sha256="cd" * 32,
                     run_size="full",
@@ -2262,7 +2265,7 @@ class TestRequestJob:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         v3_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await self._activate_v3(session_maker, v3_agent)
+        await self._activate_benchmark(session_maker, v3_agent, bench_version=3)
         await _seed_validator_heartbeat(
             session_maker,
             protocol_version=7,
@@ -2290,20 +2293,29 @@ class TestRequestJob:
             assert ticket is not None
             assert ticket.status == TicketStatus.EXPIRED
 
-    async def test_after_activation_capable_validator_replaces_v2_with_v3(
+    @pytest.mark.parametrize("active_version", [3, 4])
+    async def test_after_activation_capable_validator_replaces_retired_ticket(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
+        active_version: int,
     ) -> None:
         active_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await self._activate_v3(session_maker, active_agent)
+        await self._activate_benchmark(
+            session_maker, active_agent, bench_version=active_version
+        )
         legacy_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         await _seed_ticket(session_maker, legacy_agent)
+        capabilities = self._v8_capabilities()
+        capabilities["scorer_benchmarks"] = {
+            **capabilities["scorer_benchmarks"],
+            "supported_bench_versions": list(range(2, active_version + 1)),
+        }
         await _seed_validator_heartbeat(
             session_maker,
             protocol_version=8,
-            capabilities=self._v8_capabilities(),
+            capabilities=capabilities,
             stack=_V7_STACK,
         )
         _install_db(app, session_maker)
@@ -2315,7 +2327,7 @@ class TestRequestJob:
 
         assert response.status_code == 200, response.text
         assert response.json()["agent_id"] == str(active_agent)
-        assert response.json()["bench_version"] == 3
+        assert response.json()["bench_version"] == active_version
         async with session_maker() as session:
             legacy_ticket = await session.get(
                 ValidatorTicket, (legacy_agent, 2, _VALIDATOR_HOTKEY)
@@ -2330,7 +2342,7 @@ class TestRequestJob:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await self._activate_v3(session_maker, agent_id)
+        await self._activate_benchmark(session_maker, agent_id, bench_version=3)
         capabilities = self._v8_capabilities()
         for keypair in _KEYPAIRS:
             await _seed_validator_heartbeat(
