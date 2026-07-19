@@ -808,7 +808,8 @@
     }
     .accepted-score:last-child { border-bottom: 0; }
     .accepted-score-value { display: block; color: var(--text); font: 700 22px/1 var(--mono); font-variant-numeric: tabular-nums; }
-    .accepted-score-label { display: block; margin-top: var(--detail-space-xs); color: var(--text-dim); font-size: 11.5px; }
+    .accepted-score-label { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-top: var(--detail-space-xs); color: var(--text-dim); font-size: 11.5px; }
+    .bench-version-badge { display: inline-flex; align-items: center; width: fit-content; border-radius: 5px; padding: 2px 6px; background: color-mix(in oklab, var(--accent) 13%, transparent); color: color-mix(in oklab, var(--accent) 76%, var(--text)); font: 700 10.5px/1.25 var(--mono); white-space: nowrap; }
     .accepted-score-meta { display: grid; gap: var(--detail-space-sm); min-width: 0; }
     .accepted-score-meta-row { color: var(--text-dim); font-size: 11.5px; line-height: 1.45; }
     .accepted-score-meta-row b { color: var(--text); }
@@ -4115,6 +4116,7 @@
         : "Each value is an accepted platform score, but remains provisional until " + quorum + " independent scores arrive. Provisional scores may change; the final median is authoritative.";
       var rows = scores.map(function (score, index) {
         var label = complete ? "Accepted score " + (index + 1) : "Provisional score " + (index + 1);
+        var benchLabel = score.bench_version == null ? "Bench version unknown" : "Bench v" + score.bench_version;
         var accepted = score.accepted_at ? relTime(score.accepted_at) : "Accepted";
         var seedSource = score.seed_source === "on_chain"
           ? "Derived from an on-chain block hash after submission commitment."
@@ -4142,7 +4144,7 @@
           : "";
         return '<div class="accepted-score">' +
           '<div><span class="accepted-score-value">' + fx(score.composite) + '</span>' +
-            '<span class="accepted-score-label">' + esc(label) + ' · ' + esc(accepted) + '</span></div>' +
+            '<span class="accepted-score-label"><span class="bench-version-badge">' + esc(benchLabel) + '</span>' + esc(label) + ' · ' + esc(accepted) + '</span></div>' +
           '<div class="accepted-score-meta">' +
             '<div class="accepted-score-meta-row"><b>Seed</b> <code>' + esc(score.seed) + '</code> ' + copyButton(score.seed, "benchmark seed") + '<br>' + esc(seedSource) + '</div>' +
             command + verify + transcript +
@@ -4338,7 +4340,8 @@
           meta += " before " + new Date(a.deadline).toLocaleString();
         }
         var benchmark = a.benchmark_progress ? renderBenchmarkProgress(a.benchmark_progress, false) : "";
-        return '<div class="attempt"><div><span class="attempt-version">Validator</span></div>' +
+        var benchLabel = a.bench_version == null ? "Bench unknown" : "Bench v" + a.bench_version;
+        return '<div class="attempt"><div><span class="bench-version-badge">' + esc(benchLabel) + '</span></div>' +
           '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(a.actively_running ? "Scoring now" : label[0]) + retryInfo + '</span></b>' +
           '<div class="attempt-meta">' + entityAnchor("validator", a.validator_hotkey, "Validator " + shortKey(a.validator_hotkey)) + esc(meta.slice(("Validator " + shortKey(a.validator_hotkey)).length)) + '</div>' + benchmark + '</div>' +
           '<div class="attempt-time" title="' + esc(a.issued_at) + '">' + relTime(a.issued_at) + '</div></div>';

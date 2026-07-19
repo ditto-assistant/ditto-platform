@@ -1756,6 +1756,7 @@ class TestPublicActivity:
         assert len(activity["active_benchmarks"]) == 2
         pipeline = responses[2].json()
         assert sum(a["actively_running"] for a in pipeline["validation_attempts"]) == 2
+        assert all(a["bench_version"] == 2 for a in pipeline["validation_attempts"])
 
         forbidden_keys = {
             "case_id",
@@ -2060,6 +2061,7 @@ class TestPublicActivity:
         assert body["score_count"] == 1
         assert body["provisional_scores"][0]["composite"] == pytest.approx(0.52)
         assert body["validation_attempts"][0]["status"] == "expired"
+        assert body["validation_attempts"][0]["bench_version"] == 2
 
     @pytest.mark.parametrize(
         "status",
