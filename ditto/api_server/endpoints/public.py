@@ -569,12 +569,11 @@ def _public_entry(
     registered: bool | None = None,
     miner_uid: int | None = None,
     fold_stderr: float | None = None,
-    active_version: int,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
     details = r.details if isinstance(r.details, dict) else {}
-    bench_version = details.get("bench_version")
+    bench_version = r.bench_version
     dataset_sha256 = details.get("dataset_sha256")
     raw_tokens = details.get("tokens")
     tokens = (
@@ -598,9 +597,7 @@ def _public_entry(
         miner_uid=miner_uid,
         registered=registered,
         emission_eligible=(
-            finalized and r.eligible and registered and bench_version == active_version
-            if registered is not None
-            else None
+            finalized and r.eligible and registered if registered is not None else None
         ),
         composite=r.composite,
         # Use the exact uncertainty value sent to validators: a stashed re-score
@@ -615,7 +612,7 @@ def _public_entry(
         median_ms=r.median_ms,
         n=r.n,
         eligible=r.eligible,
-        bench_version=bench_version if isinstance(bench_version, int) else None,
+        bench_version=bench_version,
         dataset_sha256=dataset_sha256 if isinstance(dataset_sha256, str) else None,
         models=_safe_models(details),
         per_category=_safe_categories(details),
@@ -630,17 +627,11 @@ def _public_koth_emissions(
     rows: list[LedgerRow],
     *,
     stderrs: dict[UUID, float | None],
-    active_version: int,
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
     candidates: list[LedgerRow] = []
     for row in rows:
-        details = row.details if isinstance(row.details, dict) else {}
-        if (
-            row.eligible
-            and row.composite > 0.0
-            and details.get("bench_version") == active_version
-        ):
+        if row.eligible and row.composite > 0.0:
             candidates.append(row)
     candidates.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
 
@@ -724,13 +715,28 @@ async def leaderboard(
     request: Request,
     response: Response,
     session: SessionDep,
+    bench_version: Annotated[int | None, Query(ge=1)] = None,
 ) -> PublicLeaderboardResponse:
     """Best score per miner, with quorum and current registration eligibility."""
     response.headers["Cache-Control"] = _CACHE_CONTROL
-    canonical_version = await active_bench_version(session)
-    ledger_rows = await list_eligible_ledger(session, include_fingerprints=False)
+    from ditto.db.queries.benchmark_rollout import open_rollout
+
+    active_version = await active_bench_version(session)
+    rollout = await open_rollout(session)
+    desired_version = rollout.desired_version if rollout is not None else active_version
+    display_version = bench_version or desired_version
+    ledger_rows = await list_eligible_ledger(
+        session,
+        include_fingerprints=False,
+        bench_version=bench_version,
+    )
+    selected_versions = {row.agent_id: row.bench_version for row in ledger_rows}
     registered_uids = await _current_registered_uids(request)
-    quorum = await quorum_composites(session, [row.agent_id for row in ledger_rows])
+    quorum = await quorum_composites(
+        session,
+        [row.agent_id for row in ledger_rows],
+        bench_versions=selected_versions,
+    )
     fold_stderrs = {
         row.agent_id: _ledger_stderr(
             row.details if isinstance(row.details, dict) else None,
@@ -739,7 +745,9 @@ async def leaderboard(
         for row in ledger_rows
     }
     score_counts = await get_score_counts(
-        session, [row.agent_id for row in ledger_rows]
+        session,
+        [row.agent_id for row in ledger_rows],
+        bench_versions=selected_versions,
     )
     finalized_rows = [
         row
@@ -751,7 +759,7 @@ async def leaderboard(
         (row, score_counts.get(row.agent_id, 0))
         for row in ledger_rows
         if score_counts.get(row.agent_id, 0) < SCORING_QUORUM
-    ] + list(await list_provisional_ledger(session))
+    ] + list(await list_provisional_ledger(session, bench_version=bench_version))
     provisional_candidates.sort(
         key=lambda candidate: (
             not candidate[0].eligible,
@@ -779,7 +787,9 @@ async def leaderboard(
         .all()
     }
     histories = await list_miner_composite_history(
-        session, [r.miner_hotkey for r in rows]
+        session,
+        [r.miner_hotkey for r in rows],
+        bench_versions={r.miner_hotkey: r.bench_version for r in rows},
     )
     entries = []
     for i, row in enumerate(finalized_rows, start=1):
@@ -802,7 +812,6 @@ async def leaderboard(
                     else None
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
-                active_version=canonical_version,
             )
         )
     for row, count in provisional_rows:
@@ -825,18 +834,20 @@ async def leaderboard(
                     else None
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
-                active_version=canonical_version,
             )
         )
     return PublicLeaderboardResponse(
         generated_at=datetime.now(UTC),
         count=len(entries),
-        current_bench_version=canonical_version,
+        current_bench_version=display_version,
+        active_bench_version=active_version,
+        desired_bench_version=desired_version,
+        selection_mode="historical" if bench_version is not None else "authoritative",
         entries=entries,
-        emissions=_public_koth_emissions(
-            finalized_rows,
-            stderrs=fold_stderrs,
-            active_version=canonical_version,
+        emissions=(
+            None
+            if bench_version is not None
+            else _public_koth_emissions(finalized_rows, stderrs=fold_stderrs)
         ),
     )
 

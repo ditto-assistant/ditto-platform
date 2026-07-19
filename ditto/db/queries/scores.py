@@ -18,7 +18,7 @@ from statistics import median
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, and_, func, null, or_, select
+from sqlalchemy import ColumnElement, and_, case, func, null, or_, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
@@ -89,6 +89,7 @@ class LedgerRow:
     validator_hotkey: str
     signature: str | None
     status: AgentStatus
+    bench_version: int = 1
     content_fingerprint: dict | None = None
     """Shingle MinHash sketch of the tarball source (see
     :mod:`ditto.api_server.fingerprint`); the gate's content-level anti-copy
@@ -488,6 +489,7 @@ async def list_miner_composite_history(
     hotkeys: list[str],
     *,
     limit_per: int = 12,
+    bench_versions: dict[str, int] | None = None,
 ) -> dict[str, list[float]]:
     """Per-miner composite trajectory (oldest→newest) for the trend sparkline.
 
@@ -502,7 +504,12 @@ async def list_miner_composite_history(
     if not hotkeys:
         return {}
     stmt = (
-        select(Agent.miner_hotkey, Score.composite, Score.generated_at)
+        select(
+            Agent.miner_hotkey,
+            Score.composite,
+            Score.generated_at,
+            Score.bench_version,
+        )
         .select_from(Score)
         .join(Agent, Agent.agent_id == Score.agent_id)
         .where(Agent.miner_hotkey.in_(hotkeys))
@@ -510,13 +517,17 @@ async def list_miner_composite_history(
     )
     rows = (await session.execute(stmt)).all()
     out: dict[str, list[float]] = {}
-    for hotkey, composite, _generated_at in rows:
-        out.setdefault(hotkey, []).append(float(composite))
+    for hotkey, composite, _generated_at, score_version in rows:
+        if bench_versions is None or bench_versions.get(hotkey) == score_version:
+            out.setdefault(hotkey, []).append(float(composite))
     return {hotkey: series[-limit_per:] for hotkey, series in out.items()}
 
 
 async def list_eligible_ledger(
-    session: AsyncSession, *, include_fingerprints: bool = True
+    session: AsyncSession,
+    *,
+    include_fingerprints: bool = True,
+    bench_version: int | None = None,
 ) -> list[LedgerRow]:
     """Return the best eligible score per miner, highest composite first.
 
@@ -565,12 +576,24 @@ async def list_eligible_ledger(
     same platform-generated dataset, so the median row's ``eligible`` flag
     represents the agent.
     """
-    from ditto.db.queries.benchmark_rollout import active_bench_version
+    from ditto.db.queries.benchmark_rollout import (
+        SCORING_QUORUM,
+        active_bench_version,
+        open_rollout,
+    )
 
     canonical_version = await active_bench_version(session)
+    rollout = None if bench_version is not None else await open_rollout(session)
+    desired_version = rollout.desired_version if rollout is not None else None
+    candidate_versions = (
+        (bench_version,)
+        if bench_version is not None
+        else tuple({canonical_version, desired_version} - {None})
+    )
     agent_best = (
         select(
             Score.agent_id.label("agent_id"),
+            Score.bench_version.label("bench_version"),
             Score.composite.label("composite"),
             Score.tool_mean.label("tool_mean"),
             Score.memory_mean.label("memory_mean"),
@@ -583,12 +606,14 @@ async def list_eligible_ledger(
             Score.validator_hotkey.label("validator_hotkey"),
             Score.signature.label("signature"),
             # Row count in the agent's pool, so the median position is (cnt+1)/2.
-            func.count(Score.agent_id).over(partition_by=Score.agent_id).label("cnt"),
+            func.count(Score.agent_id)
+            .over(partition_by=(Score.agent_id, Score.bench_version))
+            .label("cnt"),
             # Ascending composite so the middle row (by srn) is the median; the
             # validator_hotkey tie-break keeps the pick deterministic.
             func.row_number()
             .over(
-                partition_by=Score.agent_id,
+                partition_by=(Score.agent_id, Score.bench_version),
                 order_by=(
                     Score.composite.asc(),
                     Score.validator_hotkey.asc(),
@@ -596,7 +621,7 @@ async def list_eligible_ledger(
             )
             .label("srn"),
         )
-        .where(Score.bench_version == canonical_version)
+        .where(Score.bench_version.in_(candidate_versions))
         .subquery()
     )
     sketch_columns: tuple[ColumnElement[Any], ...]
@@ -636,6 +661,8 @@ async def list_eligible_ledger(
             agent_best.c.details,
             agent_best.c.validator_hotkey,
             agent_best.c.signature,
+            agent_best.c.bench_version,
+            agent_best.c.cnt,
         )
         .join(agent_best, agent_best.c.agent_id == Agent.agent_id)
         # The median row: the middle by ascending composite. Expressed as
@@ -652,22 +679,54 @@ async def list_eligible_ledger(
         )
         .subquery()
     )
+    # During a collecting rollout, each agent atomically switches from the
+    # active-version median to the desired-version median only at 3/3 quorum.
+    # This is the same hybrid authority used to maintain the rolling top-five:
+    # partial v3 samples never affect ranks or weights. An explicit
+    # ``bench_version`` request is a historical single-version view.
+    version_priority = (
+        case(
+            (
+                and_(
+                    per_agent.c.bench_version == desired_version,
+                    per_agent.c.cnt >= SCORING_QUORUM,
+                ),
+                0,
+            ),
+            (per_agent.c.bench_version == canonical_version, 1),
+            else_=2,
+        )
+        if desired_version is not None
+        else per_agent.c.bench_version
+    )
+    selected_version = select(
+        per_agent,
+        func.row_number()
+        .over(
+            partition_by=per_agent.c.agent_id,
+            order_by=(version_priority, per_agent.c.bench_version.desc()),
+        )
+        .label("version_rn"),
+    ).subquery()
+    authoritative = (
+        select(selected_version).where(selected_version.c.version_rn == 1).subquery()
+    )
     rn = (
         func.row_number()
         .over(
-            partition_by=per_agent.c.miner_hotkey,
+            partition_by=authoritative.c.miner_hotkey,
             # Eligible-first so a miner is represented by their best full-benchmark
             # agent, not an inflated smoke run; composite breaks ties within a tier.
             order_by=(
-                per_agent.c.eligible.desc(),
-                per_agent.c.composite.desc(),
-                per_agent.c.first_seen.asc(),
-                per_agent.c.agent_id.asc(),
+                authoritative.c.eligible.desc(),
+                authoritative.c.composite.desc(),
+                authoritative.c.first_seen.asc(),
+                authoritative.c.agent_id.asc(),
             ),
         )
         .label("rn")
     )
-    ranked = select(per_agent, rn).subquery()
+    ranked = select(authoritative, rn).subquery()
     stmt = (
         select(ranked)
         .where(ranked.c.rn == 1)
@@ -696,6 +755,7 @@ async def list_eligible_ledger(
             validator_hotkey=row.validator_hotkey,
             signature=row.signature,
             status=AgentStatus(row.status),
+            bench_version=row.bench_version,
             content_fingerprint=row.content_fingerprint,
             structural_fingerprint=row.structural_fingerprint,
             normalized_source_hash=row.normalized_source_hash,
@@ -712,7 +772,10 @@ async def list_eligible_ledger(
 
 
 async def quorum_composites(
-    session: AsyncSession, agent_ids: Sequence[UUID]
+    session: AsyncSession,
+    agent_ids: Sequence[UUID],
+    *,
+    bench_versions: dict[UUID, int] | None = None,
 ) -> dict[UUID, list[float]]:
     """Every accepted composite per agent for the given ids.
 
@@ -729,20 +792,24 @@ async def quorum_composites(
     from ditto.db.queries.benchmark_rollout import active_bench_version
 
     canonical_version = await active_bench_version(session)
+    versions = bench_versions or dict.fromkeys(agent_ids, canonical_version)
     result = await session.execute(
-        select(Score.agent_id, Score.composite).where(
+        select(Score.agent_id, Score.composite, Score.bench_version).where(
             Score.agent_id.in_(agent_ids),
-            Score.bench_version == canonical_version,
+            Score.bench_version.in_(set(versions.values())),
         )
     )
     out: dict[UUID, list[float]] = {}
-    for agent_id, composite in result:
-        out.setdefault(agent_id, []).append(composite)
+    for agent_id, composite, score_version in result:
+        if versions.get(agent_id) == score_version:
+            out.setdefault(agent_id, []).append(composite)
     return out
 
 
 async def list_provisional_ledger(
     session: AsyncSession,
+    *,
+    bench_version: int | None = None,
 ) -> list[tuple[LedgerRow, int]]:
     """Return each unfinalized miner's best partially scored submission.
 
@@ -755,7 +822,7 @@ async def list_provisional_ledger(
     """
     from ditto.db.queries.benchmark_rollout import active_bench_version
 
-    canonical_version = await active_bench_version(session)
+    canonical_version = bench_version or await active_bench_version(session)
     rows = (
         await session.execute(
             select(Agent, Score)
@@ -807,6 +874,7 @@ async def list_provisional_ledger(
                     validator_hotkey=representative.validator_hotkey,
                     signature=representative.signature,
                     status=AgentStatus.EVALUATING,
+                    bench_version=representative.bench_version,
                     median_ms=median_ms,
                     n=n,
                     eligible=n >= MIN_ELIGIBLE_CASES and composite > 0.0,
@@ -831,7 +899,10 @@ async def list_provisional_ledger(
 
 
 async def get_score_counts(
-    session: AsyncSession, agent_ids: list[UUID]
+    session: AsyncSession,
+    agent_ids: list[UUID],
+    *,
+    bench_versions: dict[UUID, int] | None = None,
 ) -> dict[UUID, int]:
     """Return accepted validator-score counts for the requested agents."""
     if not agent_ids:
@@ -839,14 +910,23 @@ async def get_score_counts(
     from ditto.db.queries.benchmark_rollout import active_bench_version
 
     canonical_version = await active_bench_version(session)
+    versions = bench_versions or dict.fromkeys(agent_ids, canonical_version)
     rows = (
         await session.execute(
-            select(Score.agent_id, func.count(Score.validator_hotkey))
+            select(
+                Score.agent_id,
+                Score.bench_version,
+                func.count(Score.validator_hotkey),
+            )
             .where(
                 Score.agent_id.in_(agent_ids),
-                Score.bench_version == canonical_version,
+                Score.bench_version.in_(set(versions.values())),
             )
-            .group_by(Score.agent_id)
+            .group_by(Score.agent_id, Score.bench_version)
         )
     ).all()
-    return {agent_id: int(count) for agent_id, count in rows}
+    return {
+        agent_id: int(count)
+        for agent_id, score_version, count in rows
+        if versions.get(agent_id) == score_version
+    }

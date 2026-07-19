@@ -210,7 +210,12 @@ class TestDashboard:
         assert "is the validator top choice in" in body
         assert "Revealed validator support" in body
         assert "Top choice means the miner received" in body
-        assert "KOTH champion and recipients shown separately" in body
+        assert (
+            "authoritative per-agent score · v3 at 3/3, otherwise v2 fallback" in body
+        )
+        assert 'data-leaderboard-version="current"' in body
+        assert 'data-leaderboard-version="2"' in body
+        assert '"?bench_version=" + encodeURIComponent(leaderboardVersionView)' in body
         assert "Raw score rank #" in body
         assert 'emission.role === "champion"' in body
         assert "must lead by more than" in body
@@ -363,7 +368,7 @@ class TestDashboard:
         assert "<b>Live data unavailable.</b>" in body
         assert "No example data is shown." in body
         assert (
-            'Promise.allSettled([getJSON("/public/leaderboard"), '
+            "Promise.allSettled([getJSON(leaderboardPath), "
             'getJSON("/public/weights")])' in body
         )
         assert "lastLeaderboardData = null;" in body

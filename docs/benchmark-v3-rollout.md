@@ -1,7 +1,8 @@
 # Benchmark v3 activation
 
-Benchmark v3 uses a durable five-agent barrier so mixed validator fleets never
-mix v2 and v3 scores or medians.
+Benchmark v3 uses a durable five-agent collection cohort plus per-agent quorum
+authority. A median never mixes score rows from different versions: each agent
+is represented by its v3 median after 3/3, otherwise by its v2 median.
 
 ## Compatibility
 
@@ -29,11 +30,19 @@ agent. The frozen membership and positions are never silently reshuffled.
 
 Only fresh, identity-matched v8 validators receive v3 cohort tickets. Scores,
 tickets, retry budgets, datasets, leases, and uniqueness are keyed by benchmark
-version. At two distinct validator scores for each member, all five remain
-provisional and canonical/emissions semantics remain v2. The third distinct
-score fills one member at a time. The same locked transaction that observes
-exactly 3/3 on all five changes the active version to v3 and appends an audit
-event. Canonical reads then exclude v2-only agents; no median combines versions.
+version. At one or two distinct v3 scores, that agent's v2 result remains
+authoritative. Its third v3 score atomically replaces only that agent's v2 median
+in the leaderboard and validator ledger. This hybrid pool lets work begin with
+one compatible validator while incomplete agents retain stable v2 scores. The
+same locked transaction that observes exactly 3/3 on all five changes the global
+active version to v3 and appends an audit event. Canonical reads then exclude
+v2-only agents; no median combines versions.
+
+The authenticated ledger adds optional `bench_version` provenance. Old
+validators ignore that additive field and fold the full platform-selected pool;
+new validators retain it for audit and re-score scheduling but deliberately fold
+the same full pool. This keeps on-chain weights identical during asynchronous
+validator upgrades.
 
 If a frozen member becomes banned, held, or otherwise ineligible, the rollout
 changes to `blocked_ineligible`. It neither replaces nor drops that member. It
@@ -48,5 +57,7 @@ agent and position, and its v3 score count. State is database-backed and
 idempotent across API restarts.
 
 Before activation, newly screened submissions and every non-cohort ticket remain
-v2. After activation, v3 is the canonical ledger version and v2-only results are
-excluded rather than compared with v3.
+v2. The public leaderboard defaults to the authoritative hybrid pool and offers
+`?bench_version=2` as a historical view that never projects current emissions.
+After activation, v3 is the canonical ledger version and v2-only results are
+excluded.

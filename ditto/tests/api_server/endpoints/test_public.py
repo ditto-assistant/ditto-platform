@@ -499,7 +499,7 @@ class TestPublicLeaderboard:
         assert entry["finalized"] is False
         assert entry["score_count"] == 2
         assert entry["score_quorum"] == 3
-        assert entry["bench_version"] is None
+        assert entry["bench_version"] == DEFAULT_BENCH_VERSION
 
     async def test_finalized_miner_supersedes_partial_submission(
         self,
@@ -559,6 +559,10 @@ class TestPublicLeaderboard:
         assert resp.status_code == 200
         assert resp.headers["Cache-Control"] == "public, max-age=30"
         body = resp.json()
+        assert body["selection_mode"] == "authoritative"
+        assert body["active_bench_version"] == DEFAULT_BENCH_VERSION
+        assert body["desired_bench_version"] == DEFAULT_BENCH_VERSION
+        assert body["current_bench_version"] == DEFAULT_BENCH_VERSION
         assert body["count"] == 2
         assert [e["rank"] for e in body["entries"]] == [1, 2]
         assert [e["miner_hotkey"] for e in body["entries"]] == [_MINER_B, _MINER_A]
@@ -570,6 +574,15 @@ class TestPublicLeaderboard:
         assert top["composite"] == pytest.approx(0.9)
         assert top["tool_mean"] == pytest.approx(0.95)
         assert top["memory_mean"] == pytest.approx(0.8)
+
+        historical = (
+            await client.get(
+                f"/api/v1/public/leaderboard?bench_version={DEFAULT_BENCH_VERSION}"
+            )
+        ).json()
+        assert historical["selection_mode"] == "historical"
+        assert historical["entries"] == body["entries"]
+        assert historical["emissions"] is None
 
     async def test_exposes_advisory_calibration(
         self,

@@ -756,6 +756,19 @@ class LedgerEntry(BaseModel):
     validator_hotkey: Annotated[
         str, Field(description="SS58 hotkey of the validator that produced the score.")
     ]
+    bench_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description=(
+                "Benchmark contract version of this platform-authoritative row. "
+                "During a rollout the ledger may contain a mix: an agent switches "
+                "to the desired version only after reaching quorum. Additive and "
+                "optional so older validators safely ignore it."
+            ),
+        ),
+    ] = None
     signature: Annotated[
         str | None,
         Field(

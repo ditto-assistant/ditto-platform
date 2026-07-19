@@ -276,6 +276,12 @@
     /* The board's filter row reuses the submissions pills (.activity-filter)
        and its band treatment, centered so it brackets the table with the pager. */
     .board-tabs { justify-content: center; padding: 12px 14px; border-bottom: 1px solid var(--border); background: color-mix(in oklab, var(--bg-elev-2) 38%, var(--bg-elev)); }
+    .leaderboard-version-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
+    .leaderboard-version-switch .context { color: var(--text-dim); font-size: 12px; }
+    .leaderboard-version-switch .activity-filter-list { flex: 0 0 auto; }
+    @media (max-width: 640px) {
+      .leaderboard-version-switch { align-items: flex-start; flex-direction: column; }
+    }
     thead th.sortable { cursor: pointer; user-select: none; }
     thead th.sortable:hover { color: var(--text); }
     thead th.sortable .sarrow { opacity: .35; margin-left: 4px; font-size: 11px; }
@@ -1939,6 +1945,13 @@
       <h2 id="leaderboard-title">Leaderboard</h2>
       <span class="hint" id="leaderboard-hint">raw score rank · KOTH emissions shown separately · click a row for detail</span>
     </div>
+    <div class="leaderboard-version-switch">
+      <span class="context" id="leaderboard-version-context">Current rollout drives validator weights.</span>
+      <div class="activity-filter-list" role="group" aria-label="Leaderboard benchmark view">
+        <button class="activity-filter" type="button" data-leaderboard-version="current" aria-pressed="true">Current rollout</button>
+        <button class="activity-filter" type="button" data-leaderboard-version="2" aria-pressed="false">Bench v2 history</button>
+      </div>
+    </div>
     <div class="emissions-strip" id="emissions-strip" role="status" aria-live="polite">
       <div class="emissions-summary">
         <div class="emissions-title" id="emissions-title"></div>
@@ -2691,6 +2704,7 @@
     // controls what is DISPLAYED. Scored is the default tab because a
     // provisional run is pre-quorum feedback, not a standing.
     var boardView = { tab: "scored", sort: "rank", dir: 1, page: 1, pageSize: 25 };
+    var leaderboardVersionView = "current";
     // Chain unreachable for the whole snapshot (set by render(), read by
     // renderBoardRows()): suppresses the identical per-row "registration
     // unknown" badge that the notice above the board already explains once.
@@ -2995,7 +3009,7 @@
         .map(function (e) { return e.bench_version; })
         .filter(function (v) { return v != null; })
         .reduce(function (a, b) { return Math.max(a, b); }, 0);
-      currentBench = data.current_bench_version || maxBv || currentBench;
+      currentBench = data.desired_bench_version || data.current_bench_version || maxBv || currentBench;
       // Reference-baseline card: only meaningful while the board runs the
       // bench_version the baseline was measured on; otherwise it would mislead.
       document.getElementById("c-baseline").innerHTML =
@@ -3025,10 +3039,18 @@
       // unknown" badge. Per-row badges still show when registration data exists
       // but a specific row is unregistered/dereg.
       chainRegistrationUnknown = entries.length > 0 && registrationUnknown.length === entries.length;
-      title.textContent = finalizedEntries.length ? "Leaderboard" : (provisional.length ? "Provisional leaderboard" : "Leaderboard");
-      hint.textContent = finalizedEntries.length
-        ? "raw composite rank · KOTH champion and recipients shown separately"
+      var historicalView = data.selection_mode === "historical";
+      title.textContent = historicalView
+        ? "Bench v" + data.current_bench_version + " history"
+        : finalizedEntries.length ? "Current rollout leaderboard" : (provisional.length ? "Provisional leaderboard" : "Current rollout leaderboard");
+      hint.textContent = historicalView
+        ? "historical scores only · does not drive current validator weights"
+        : finalizedEntries.length
+        ? "authoritative per-agent score · v3 at 3/3, otherwise v2 fallback"
         : "early accepted scores · ranked provisionally by composite";
+      document.getElementById("leaderboard-version-context").textContent = historicalView
+        ? "Historical Bench v" + data.current_bench_version + " standings. Current emissions remain on the rollout view."
+        : "This exact mixed-version pool drives validator weights: v3 at quorum, otherwise v2.";
       if (provisional.length || inactive.length || registrationUnknown.length) {
         notice.classList.add("show");
         var notices = [];
@@ -3263,6 +3285,19 @@
         navigateBoardPage(boardView.page + 1);
       });
     })();
+
+    document.querySelectorAll("[data-leaderboard-version]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var view = btn.getAttribute("data-leaderboard-version");
+        if (!view || view === leaderboardVersionView) return;
+        leaderboardVersionView = view;
+        boardView.page = 1;
+        document.querySelectorAll("[data-leaderboard-version]").forEach(function (candidate) {
+          candidate.setAttribute("aria-pressed", candidate === btn ? "true" : "false");
+        });
+        load(true);
+      });
+    });
 
     function renderLeaderboardUnavailable() {
       lastEntries = [];
@@ -6177,10 +6212,12 @@
 
       // Leaderboard + weights settle together so the board renders exactly once
       // per tick; a weights failure still renders (with lastChainWeights = null).
-      Promise.allSettled([getJSON("/public/leaderboard"), getJSON("/public/weights")])
+      var leaderboardPath = "/public/leaderboard" +
+        (leaderboardVersionView === "current" ? "" : "?bench_version=" + encodeURIComponent(leaderboardVersionView));
+      Promise.allSettled([getJSON(leaderboardPath), getJSON("/public/weights")])
         .then(function (results) {
           var lb = results[0], weights = results[1];
-          lastChainWeights = weights.status === "fulfilled" ? weights.value : null;
+          lastChainWeights = leaderboardVersionView === "current" && weights.status === "fulfilled" ? weights.value : null;
           if (lb.status === "fulfilled") {
             lastLeaderboardData = lb.value;
             setStatus("live", "Live");
