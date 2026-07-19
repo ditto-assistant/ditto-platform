@@ -326,9 +326,11 @@ class _FakeGenerator:
         self._fail = fail
         self.calls = 0
         self.bench_versions: list[int] = []
+        self.seeds: list[int] = []
 
-    async def generate(self, _seed: int, bench_version: int = 2) -> str:
+    async def generate(self, seed: int, bench_version: int = 2) -> str:
         self.calls += 1
+        self.seeds.append(seed)
         self.bench_versions.append(bench_version)
         if self._fail:
             raise DataPipelineError("generate service unavailable (test)")
@@ -3105,6 +3107,81 @@ class TestSubmitResult:
             assert dataset is not None
             assert dataset.sha256 == "cd" * 32
             assert dataset.run_size == "full"
+
+    async def test_rescreen_after_activation_backfills_missing_v3_dataset(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A legacy v2 pin must not strand an active-v3 waiting agent at 0/3."""
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            screening_policy_version=9,
+        )
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.dataset_seed = 42
+            agent.dataset_sha256 = "ab" * 32
+            agent.dataset_run_size = "full"
+            agent.dataset_seed_block = 123
+            agent.dataset_seed_block_hash = "0x" + "12" * 32
+            session.add(
+                BenchmarkDataset(
+                    agent_id=agent_id,
+                    bench_version=2,
+                    seed=42,
+                    sha256="ab" * 32,
+                    run_size="full",
+                    seed_block=123,
+                    seed_block_hash="0x" + "12" * 32,
+                )
+            )
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now,
+                    activated_at=now,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        generator = _FakeGenerator(run_size="full", sha="cd" * 32)
+        _install_generator(app, generator)
+        claim = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(agent_id, passed=True, attempt_id=attempt_id),
+        )
+
+        assert response.status_code == 200, response.text
+        assert generator.bench_versions == [3]
+        assert generator.seeds == [42]
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.dataset_seed == 42
+            assert agent.dataset_sha256 == "ab" * 32
+            v2 = await session.get(BenchmarkDataset, (agent_id, 2))
+            v3 = await session.get(BenchmarkDataset, (agent_id, 3))
+            assert v2 is not None and v2.sha256 == "ab" * 32
+            assert v3 is not None
+            assert v3.seed == 42
+            assert v3.sha256 == "cd" * 32
+            assert v3.seed_block == 123
+            assert v3.seed_block_hash == "0x" + "12" * 32
 
     async def test_seed_falls_back_when_chain_unavailable(
         self,
