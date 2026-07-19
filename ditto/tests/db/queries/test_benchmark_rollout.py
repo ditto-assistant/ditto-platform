@@ -19,9 +19,11 @@ from ditto.api_server.benchmark_rollout import (
     rolling_qualification_blockers,
 )
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
-    _require_v3_start_capacity,
-    get_v3_rollout,
-    start_v3_rollout,
+    AdminRolloutSupersedeRequest,
+    _require_rollout_start_capacity,
+    get_rollout,
+    start_rollout,
+    supersede_rollout,
 )
 from ditto.api_server.endpoints.admin_quarantine import (
     inspect_benchmark_qualification,
@@ -39,15 +41,18 @@ from ditto.db.models import (
     ValidatorTicket,
 )
 from ditto.db.queries.benchmark_rollout import (
+    CANARY_BENCH_VERSION,
     DatasetPin,
+    RolloutConflictError,
     RolloutSnapshotMember,
     active_bench_version,
     create_rollout_snapshot,
-    heartbeat_supports_v3,
+    heartbeat_supports_version,
     issue_rollout_ticket,
     maybe_activate_rollout,
     open_rollout,
     rollout_state,
+    supersede_open_rollout,
 )
 from ditto.db.queries.scores import list_eligible_ledger
 from ditto.db.queries.screening import claim_screening_attempts
@@ -61,11 +66,13 @@ async def test_admin_status_read_does_not_start_rollout() -> None:
         await connection.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as session:
-        state = await get_v3_rollout(None, session)
+        state = await get_rollout(None, session, "v3")
         assert state == {
             "active_version": 2,
             "desired_version": 2,
             "status": "inactive",
+            "capability_bench_version": 3,
+            "canary_capable_validator_count": 0,
             "v3_capable_validator_count": 0,
             "current_hybrid_top_five": [],
             "qualification_converged": False,
@@ -88,7 +95,7 @@ def _capabilities(now: datetime) -> tuple[dict, dict]:
         "executor_isolation": "privileged_dind",
         "scorer_benchmarks": {
             "status": "fresh_verified",
-            "supported_bench_versions": [2, 3],
+            "supported_bench_versions": [2, CANARY_BENCH_VERSION],
             "observed_at": int(now.timestamp()),
             "software_version": "1.3.0",
             "source_revision": revision,
@@ -237,9 +244,9 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
         await session.flush()
         heartbeat = await session.get(ValidatorHeartbeat, "validator-a")
         assert heartbeat is not None
-        assert heartbeat_supports_v3(heartbeat, now=now)
+        assert heartbeat_supports_version(heartbeat, now=now)
         heartbeat.protocol_version = 7
-        assert not heartbeat_supports_v3(heartbeat, now=now)
+        assert not heartbeat_supports_version(heartbeat, now=now)
         heartbeat.protocol_version = 8
 
         for validator_index, hotkey in enumerate(("validator-a", "validator-b")):
@@ -255,7 +262,7 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
                 session.add(
                     Score(
                         agent_id=ticket.agent_id,
-                        bench_version=3,
+                        bench_version=CANARY_BENCH_VERSION,
                         validator_hotkey=hotkey,
                         run_id=f"v3-{validator_index}-{agent_index}",
                         signature="bb",
@@ -265,7 +272,7 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
                         memory_mean=0.7,
                         median_ms=1,
                         n=114,
-                        details={"bench_version": 3},
+                        details={"bench_version": CANARY_BENCH_VERSION},
                         generated_at=now,
                     )
                 )
@@ -297,7 +304,7 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
             session.add(
                 Score(
                     agent_id=ticket.agent_id,
-                    bench_version=3,
+                    bench_version=CANARY_BENCH_VERSION,
                     validator_hotkey="validator-c",
                     run_id=f"v3-2-{agent_index}",
                     signature="cc",
@@ -307,7 +314,7 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
                     memory_mean=0.8,
                     median_ms=1,
                     n=114,
-                    details={"bench_version": 3},
+                    details={"bench_version": CANARY_BENCH_VERSION},
                     generated_at=now,
                 )
             )
@@ -328,7 +335,7 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
                 assert by_agent[v2_only_id].bench_version == 2
 
         assert activations == [False, False, False, False, True]
-        assert await active_bench_version(session) == 3
+        assert await active_bench_version(session) == CANARY_BENCH_VERSION
         state = await rollout_state(session)
         assert state["status"] == "activated"
         assert [member["score_count"] for member in state["members"]] == [3] * 5
@@ -336,9 +343,9 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
         assert len(v3_ledger) == 5
         assert v2_only_id not in {row.agent_id for row in v3_ledger}
         assert all(
-            row.bench_version == 3
+            row.bench_version == CANARY_BENCH_VERSION
             and row.details is not None
-            and row.details["bench_version"] == 3
+            and row.details["bench_version"] == CANARY_BENCH_VERSION
             for row in v3_ledger
         )
     await engine.dispose()
@@ -512,7 +519,7 @@ async def test_v3_score_drop_qualifies_and_rescreens_new_top_five_agent() -> Non
                 session.add(
                     Score(
                         agent_id=initial_ids[0],
-                        bench_version=3,
+                        bench_version=CANARY_BENCH_VERSION,
                         validator_hotkey=f"v3-{validator}",
                         run_id=f"v3-drop-{validator}",
                         signature="bb",
@@ -522,7 +529,7 @@ async def test_v3_score_drop_qualifies_and_rescreens_new_top_five_agent() -> Non
                         memory_mean=0.1,
                         median_ms=1,
                         n=114,
-                        details={"bench_version": 3},
+                        details={"bench_version": CANARY_BENCH_VERSION},
                         generated_at=now,
                     )
                 )
@@ -599,7 +606,7 @@ async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently()
                 session.add(
                     Score(
                         agent_id=initial_ids[0],
-                        bench_version=3,
+                        bench_version=CANARY_BENCH_VERSION,
                         validator_hotkey=f"drop-{validator}",
                         run_id=f"drop-{validator}",
                         signature="bb",
@@ -609,7 +616,7 @@ async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently()
                         memory_mean=0.1,
                         median_ms=1,
                         n=114,
-                        details={"bench_version": 3},
+                        details={"bench_version": CANARY_BENCH_VERSION},
                         generated_at=now,
                     )
                 )
@@ -617,7 +624,7 @@ async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently()
         async def generate(seed: int, *, bench_version: int) -> str:
             assert not session.in_transaction()
             assert seed == 8675309
-            assert bench_version == 3
+            assert bench_version == CANARY_BENCH_VERSION
             return "e" * 64
 
         generator = AsyncMock()
@@ -640,7 +647,9 @@ async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently()
             member = await session.get(
                 BenchmarkRolloutMember, (rollout.rollout_id, rising_id)
             )
-            dataset = await session.get(BenchmarkDataset, (rising_id, 3))
+            dataset = await session.get(
+                BenchmarkDataset, (rising_id, CANARY_BENCH_VERSION)
+            )
             legacy = await session.get(Agent, rising_id)
             assert member is not None
             assert dataset is not None
@@ -679,7 +688,7 @@ async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently()
                     session.add(
                         Score(
                             agent_id=initial_id,
-                            bench_version=3,
+                            bench_version=CANARY_BENCH_VERSION,
                             validator_hotkey=f"filled-{initial_id}-{validator}",
                             run_id=f"filled-{initial_id}-{validator}",
                             signature="cc",
@@ -689,7 +698,7 @@ async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently()
                             memory_mean=0.1,
                             median_ms=1,
                             n=114,
-                            details={"bench_version": 3},
+                            details={"bench_version": CANARY_BENCH_VERSION},
                             generated_at=now,
                         )
                     )
@@ -702,7 +711,7 @@ async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently()
             )
             assert ticket is not None
             assert ticket.agent_id == rising_id
-            assert ticket.bench_version == 3
+            assert ticket.bench_version == CANARY_BENCH_VERSION
     await engine.dispose()
 
 
@@ -748,7 +757,7 @@ async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards() ->
                 session.add(
                     Score(
                         agent_id=initial_ids[0],
-                        bench_version=3,
+                        bench_version=CANARY_BENCH_VERSION,
                         validator_hotkey=f"admin-drop-{validator}",
                         run_id=f"admin-drop-{validator}",
                         signature="bb",
@@ -758,7 +767,7 @@ async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards() ->
                         memory_mean=0.1,
                         median_ms=1,
                         n=114,
-                        details={"bench_version": 3},
+                        details={"bench_version": CANARY_BENCH_VERSION},
                         generated_at=now,
                     )
                 )
@@ -845,7 +854,9 @@ async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards() ->
                 await session.scalars(select(Score).where(Score.agent_id == rising_id))
             )
             agent = await session.get(Agent, rising_id)
-            dataset = await session.get(BenchmarkDataset, (rising_id, 3))
+            dataset = await session.get(
+                BenchmarkDataset, (rising_id, CANARY_BENCH_VERSION)
+            )
             audit = await session.scalar(
                 select(BenchmarkRolloutAudit).where(
                     BenchmarkRolloutAudit.rollout_id == rollout_id,
@@ -904,7 +915,7 @@ async def test_ambiguous_legacy_seeds_are_visible_and_fail_closed() -> None:
                 session.add(
                     Score(
                         agent_id=initial_ids[0],
-                        bench_version=3,
+                        bench_version=CANARY_BENCH_VERSION,
                         validator_hotkey=f"ambiguous-drop-{validator}",
                         run_id=f"ambiguous-drop-{validator}",
                         signature="bb",
@@ -914,7 +925,7 @@ async def test_ambiguous_legacy_seeds_are_visible_and_fail_closed() -> None:
                         memory_mean=0.1,
                         median_ms=1,
                         n=114,
-                        details={"bench_version": 3},
+                        details={"bench_version": CANARY_BENCH_VERSION},
                         generated_at=now,
                     )
                 )
@@ -956,14 +967,14 @@ async def test_only_one_open_rollout_across_collecting_and_blocked_states() -> N
                 BenchmarkRollout(
                     rollout_id=uuid4(),
                     from_version=2,
-                    desired_version=3,
+                    desired_version=CANARY_BENCH_VERSION,
                     status="collecting",
                     cohort_size=5,
                 ),
                 BenchmarkRollout(
                     rollout_id=uuid4(),
                     from_version=2,
-                    desired_version=3,
+                    desired_version=CANARY_BENCH_VERSION,
                     status="blocked_ineligible",
                     cohort_size=5,
                 ),
@@ -1053,7 +1064,7 @@ async def test_first_capable_validator_automatically_seeds_v3_work() -> None:
             ttl=timedelta(minutes=90),
         )
         assert ticket is not None
-        assert ticket.bench_version == 3
+        assert ticket.bench_version == CANARY_BENCH_VERSION
 
     # Repeated job polls are idempotent and do not render another dataset set.
     assert not await ensure_rolling_qualification(session, generator=generator, now=now)
@@ -1073,7 +1084,7 @@ async def test_admin_start_is_idempotent_after_unique_transition_activation() ->
             BenchmarkRollout(
                 rollout_id=rollout_id,
                 from_version=2,
-                desired_version=3,
+                desired_version=CANARY_BENCH_VERSION,
                 status="activated",
                 cohort_size=5,
                 created_at=now,
@@ -1081,9 +1092,14 @@ async def test_admin_start_is_idempotent_after_unique_transition_activation() ->
             )
         )
     async with maker() as session:
-        state = await start_v3_rollout(None, session, object())  # type: ignore[arg-type]
-        assert state["active_version"] == 3
-        assert state["desired_version"] == 3
+        state = await start_rollout(
+            None,
+            session,
+            object(),  # type: ignore[arg-type]
+            str(CANARY_BENCH_VERSION),
+        )
+        assert state["active_version"] == CANARY_BENCH_VERSION
+        assert state["desired_version"] == CANARY_BENCH_VERSION
         assert state["status"] == "activated"
         count = await session.scalar(select(func.count(BenchmarkRollout.rollout_id)))
         assert count == 1
@@ -1091,7 +1107,7 @@ async def test_admin_start_is_idempotent_after_unique_transition_activation() ->
             BenchmarkRollout(
                 rollout_id=uuid4(),
                 from_version=2,
-                desired_version=3,
+                desired_version=CANARY_BENCH_VERSION,
                 status="activated",
                 cohort_size=5,
                 created_at=now + timedelta(seconds=1),
@@ -1137,11 +1153,289 @@ async def test_v3_start_requires_two_capable_validators_and_matches_telemetry(
         assert telemetry["v3_capable_validator_count"] == capable_count
         if capable_count < 2:
             with pytest.raises(HTTPException) as exc_info:
-                await _require_v3_start_capacity(session, now=now)
+                await _require_rollout_start_capacity(
+                    session, now=now, desired_version=CANARY_BENCH_VERSION
+                )
             assert exc_info.value.status_code == 409
-            assert "at least two" in str(exc_info.value.detail)
+            assert "requires at least 2" in str(exc_info.value.detail)
             assert await open_rollout(session) is None
         else:
-            guarded = await _require_v3_start_capacity(session, now=now)
+            guarded = await _require_rollout_start_capacity(
+                session, now=now, desired_version=CANARY_BENCH_VERSION
+            )
             assert guarded["v3_capable_validator_count"] == capable_count
+    await engine.dispose()
+
+
+def _heartbeat(
+    hotkey: str, now: datetime, *, versions: list[int], protocol_version: int = 8
+) -> ValidatorHeartbeat:
+    capabilities, stack = _capabilities(now)
+    capabilities["scorer_benchmarks"]["supported_bench_versions"] = versions
+    return ValidatorHeartbeat(
+        validator_hotkey=hotkey,
+        software_version="1.0.0",
+        protocol_version=protocol_version,
+        code_digest="d" * 64,
+        state="polling",
+        first_seen_at=now,
+        reported_at=now,
+        seen_at=now,
+        signature="ab" * 64,
+        capabilities=capabilities,
+        stack=stack,
+    )
+
+
+async def test_capability_gate_is_parameterised_per_bench_version() -> None:
+    """A v4-capable heartbeat gates v4 in and v3 out, and vice versa."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    v4_only = _heartbeat("v4-only", now, versions=[2, 4])
+    v3_only = _heartbeat("v3-only", now, versions=[2, 3])
+
+    assert heartbeat_supports_version(v4_only, now=now, version=4)
+    assert not heartbeat_supports_version(v4_only, now=now, version=3)
+    assert heartbeat_supports_version(v3_only, now=now, version=3)
+    assert not heartbeat_supports_version(v3_only, now=now, version=4)
+    # Both are gated by the same fixed protocol-8 wire floor.
+    stale = _heartbeat("old", now, versions=[2, 4], protocol_version=7)
+    assert not heartbeat_supports_version(stale, now=now, version=4)
+
+
+async def test_second_rollout_while_one_is_open_raises_conflict_not_integrity() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        members, pins = await _seed_members(session, now)
+        await create_rollout_snapshot(
+            session,
+            members=members,
+            datasets=pins,
+            now=now,
+            from_version=2,
+            desired_version=3,
+        )
+        with pytest.raises(RolloutConflictError) as exc_info:
+            await create_rollout_snapshot(
+                session,
+                members=members,
+                datasets=pins,
+                now=now,
+                from_version=2,
+                desired_version=4,
+            )
+        assert "only one benchmark rollout may be open" in str(exc_info.value)
+    await engine.dispose()
+
+
+async def _seed_members(
+    session, now: datetime
+) -> tuple[list[RolloutSnapshotMember], dict[UUID, DatasetPin]]:
+    members: list[RolloutSnapshotMember] = []
+    pins: dict[UUID, DatasetPin] = {}
+    for position in range(1, 6):
+        agent_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=agent_id,
+                miner_hotkey=f"miner-{position}",
+                name=f"agent-{position}",
+                sha256=f"{position:x}" * 64,
+                status=AgentStatus.SCORED,
+                screening_policy_version=9,
+                screened_image_sha256=f"{position:x}" * 64,
+                screened_image_size_bytes=1024,
+                screened_image_id="sha256:" + f"{position:x}" * 64,
+                screened_image_ref=f"ditto-screen/{agent_id}:latest",
+                screened_image_upload_id=uuid4(),
+                screened_image_verified_at=now,
+                created_at=now + timedelta(seconds=position),
+            )
+        )
+        members.append(
+            RolloutSnapshotMember(
+                agent_id=agent_id,
+                miner_hotkey=f"miner-{position}",
+                composite=1 - position / 100,
+            )
+        )
+        pins[agent_id] = DatasetPin(seed=position, sha256="c" * 64, run_size="full")
+    await session.flush()
+    return members, pins
+
+
+async def test_supersede_frees_the_open_slot_for_the_next_rollout() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        members, pins = await _seed_members(session, now)
+        stale = await create_rollout_snapshot(
+            session,
+            members=members,
+            datasets=pins,
+            now=now,
+            from_version=2,
+            desired_version=3,
+        )
+        assert await open_rollout(session) is not None
+
+        superseded = await supersede_open_rollout(
+            session, actor="nick", reason="v3 gate had false positives", now=now
+        )
+        assert superseded is not None
+        assert superseded.rollout_id == stale.rollout_id
+        assert superseded.status == "superseded"
+        # The partial unique index excludes 'superseded', so the slot is free.
+        assert await open_rollout(session) is None
+
+        audit = (
+            await session.scalars(
+                select(BenchmarkRolloutAudit).where(
+                    BenchmarkRolloutAudit.event == "superseded"
+                )
+            )
+        ).all()
+        assert len(audit) == 1
+        assert audit[0].payload["actor"] == "nick"
+        assert audit[0].payload["reason"] == "v3 gate had false positives"
+        assert audit[0].payload["previous_status"] == "collecting"
+        assert audit[0].payload["desired_version"] == 3
+
+        # 2 -> 4 now inserts cleanly rather than tripping the unique index.
+        fresh = await create_rollout_snapshot(
+            session,
+            members=members,
+            datasets=pins,
+            now=now + timedelta(seconds=1),
+            from_version=2,
+            desired_version=4,
+        )
+        assert fresh.desired_version == 4
+        assert fresh.status == "collecting"
+        await session.flush()
+    await engine.dispose()
+
+
+async def test_superseded_rollout_issues_no_tickets_and_never_activates() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        _agent_ids, rollout = await _seed_rollout(session, now)
+        assert await supersede_open_rollout(
+            session, actor="nick", reason="abandoned", now=now
+        )
+        assert (
+            await issue_rollout_ticket(
+                session,
+                validator_hotkey="validator-a",
+                now=now,
+                ttl=timedelta(minutes=90),
+            )
+            is None
+        )
+        assert not await maybe_activate_rollout(session, rollout, now=now)
+        assert rollout.status == "superseded"
+        assert await active_bench_version(session) == 2
+    await engine.dispose()
+
+
+async def test_activated_rollout_cannot_be_superseded() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=2,
+                desired_version=3,
+                status="activated",
+                cohort_size=5,
+                created_at=now,
+                activated_at=now,
+            )
+        )
+        await session.flush()
+        with pytest.raises(RolloutConflictError) as exc_info:
+            await supersede_open_rollout(session, actor="nick", reason="oops", now=now)
+        assert "activated" in str(exc_info.value)
+    await engine.dispose()
+
+
+async def test_admin_supersede_endpoint_audits_and_refuses_activated() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session:
+        async with session.begin():
+            members, pins = await _seed_members(session, now)
+            await create_rollout_snapshot(
+                session,
+                members=members,
+                datasets=pins,
+                now=now,
+                from_version=2,
+                desired_version=3,
+            )
+        # The path accepts the legacy "v3" spelling as well as a bare "3".
+        state = await supersede_rollout(
+            None,
+            session,
+            "v3",
+            AdminRolloutSupersedeRequest(reason="false positives", actor="nick"),
+        )
+        assert state["status"] == "superseded"
+        assert await open_rollout(session) is None
+
+        # A second call has nothing open left to supersede.
+        with pytest.raises(HTTPException) as exc_info:
+            await supersede_rollout(
+                None,
+                session,
+                "v3",
+                AdminRolloutSupersedeRequest(reason="again", actor="nick"),
+            )
+        assert exc_info.value.status_code == 409
+    await engine.dispose()
+
+
+async def test_admin_start_route_is_parameterised_by_version() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session:
+        async with session.begin():
+            for index in range(2):
+                session.add(_heartbeat(f"validator-{index}", now, versions=[2, 4]))
+            await session.flush()
+        # Telemetry is counted against the REQUESTED version, not a constant.
+        assert (await get_rollout(None, session, "4"))[
+            "canary_capable_validator_count"
+        ] == 2
+        assert (await get_rollout(None, session, "3"))[
+            "canary_capable_validator_count"
+        ] == 0
+
+        # An unshipped version fails closed rather than opening a bad rollout.
+        with pytest.raises(HTTPException) as exc_info:
+            await get_rollout(None, session, "9")
+        assert exc_info.value.status_code == 409
+        with pytest.raises(HTTPException) as not_found:
+            await get_rollout(None, session, "banana")
+        assert not_found.value.status_code == 404
     await engine.dispose()

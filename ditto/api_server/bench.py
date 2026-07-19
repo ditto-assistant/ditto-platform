@@ -19,7 +19,13 @@ from __future__ import annotations
 from typing import Any
 
 # The current DittoBench benchmark version. See module docstring.
-CURRENT_BENCH_VERSION = 3
+#
+# Tracks the version being rolled OUT, not the one currently authoritative for
+# weights -- it was 3 throughout the 2->3 rollout while active_version was still
+# 2. Leaving it behind would have GET /bench/config publish "current benchmark is
+# v3" to miners while the rollout targets v4, and would break this module's own
+# stated invariant that it mirrors the scorer's protocol.BenchVersion (now 4).
+CURRENT_BENCH_VERSION = 4
 
 
 def is_bench_version_retired(version: int, active_version: int) -> bool:

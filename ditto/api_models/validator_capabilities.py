@@ -52,8 +52,14 @@ class ScorerBenchmarkCapability(BaseModel):
                 )
         elif versions != (2,):
             raise ValueError("unverified scorer states may advertise only benchmark v2")
-        if 3 in versions and self.status != "fresh_verified":
-            raise ValueError("benchmark v3 requires a fresh verified scorer identity")
+        # Any post-v2 benchmark requires a fresh verified identity. Keyed on the
+        # RANGE, not on a specific version: the old `3 in versions` form meant a
+        # scorer advertising a newer set that happened to omit 3 -- (2, 4), say --
+        # skipped the check entirely.
+        if any(version > 2 for version in versions) and self.status != "fresh_verified":
+            raise ValueError(
+                "benchmark versions above v2 require a fresh verified scorer identity"
+            )
         return self
 
 

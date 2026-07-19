@@ -903,7 +903,10 @@ class BenchmarkRollout(Base):
         ),
         CheckConstraint("cohort_size = 5", name="benchmark_rollout_five_members"),
         CheckConstraint(
-            "status IN ('collecting', 'blocked_ineligible', 'activated')",
+            # 'superseded' is terminal: an operator abandoned the rollout before
+            # activation. The partial open index below excludes it, so it frees
+            # the single open slot.
+            "status IN ('collecting', 'blocked_ineligible', 'activated', 'superseded')",
             name="benchmark_rollout_status",
         ),
         Index(
