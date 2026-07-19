@@ -487,6 +487,159 @@ async def test_rollout_screened_only_skips_and_releases_source_only_work() -> No
     await engine.dispose()
 
 
+async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists() -> (
+    None
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        agent_ids, rollout = await _seed_rollout(session, now)
+        ordinary_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=ordinary_id,
+                miner_hotkey="ordinary-miner",
+                name="ordinary-v2-work",
+                sha256="ab" * 32,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=9,
+                created_at=now + timedelta(minutes=1),
+            )
+        )
+        idle_source_ticket = ValidatorTicket(
+            agent_id=ordinary_id,
+            bench_version=2,
+            validator_hotkey="validator-a",
+            status=TicketStatus.ISSUED,
+            issued_at=now,
+            deadline=now + timedelta(minutes=90),
+            attempt_count=1,
+            manual_retry_grants=0,
+        )
+        running_source_ticket = ValidatorTicket(
+            agent_id=ordinary_id,
+            bench_version=2,
+            validator_hotkey="validator-b",
+            status=TicketStatus.ISSUED,
+            issued_at=now,
+            deadline=now + timedelta(minutes=90),
+            attempt_count=1,
+            manual_retry_grants=0,
+        )
+        no_target_source_ticket = ValidatorTicket(
+            agent_id=ordinary_id,
+            bench_version=2,
+            validator_hotkey="validator-c",
+            status=TicketStatus.ISSUED,
+            issued_at=now,
+            deadline=now + timedelta(minutes=90),
+            attempt_count=1,
+            manual_retry_grants=0,
+        )
+        session.add_all(
+            [idle_source_ticket, running_source_ticket, no_target_source_ticket]
+        )
+        await session.flush()
+
+        replacement = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert replacement is not None
+        assert replacement.agent_id == agent_ids[0]
+        assert replacement.bench_version == rollout.desired_version
+        assert idle_source_ticket.status == TicketStatus.EXPIRED
+
+        expired_deadline_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=expired_deadline_id,
+                miner_hotkey="expired-deadline-miner",
+                name="expired-deadline-v2-work",
+                sha256="bc" * 32,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=9,
+                created_at=now + timedelta(minutes=2),
+            )
+        )
+        stale_issued_ticket = ValidatorTicket(
+            agent_id=expired_deadline_id,
+            bench_version=2,
+            validator_hotkey="validator-d",
+            status=TicketStatus.ISSUED,
+            issued_at=now - timedelta(minutes=90),
+            deadline=now - timedelta(seconds=1),
+            attempt_count=1,
+            manual_retry_grants=0,
+        )
+        session.add(stale_issued_ticket)
+        capabilities, stack = _capabilities(now)
+        session.add(
+            ValidatorHeartbeat(
+                validator_hotkey="validator-d",
+                software_version="1.0.0",
+                protocol_version=8,
+                code_digest="d" * 64,
+                state="polling",
+                first_seen_at=now,
+                reported_at=now,
+                seen_at=now,
+                signature="ab" * 64,
+                capabilities=capabilities,
+                stack=stack,
+            )
+        )
+        await session.flush()
+        after_stale_deadline = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-d",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert after_stale_deadline is not None
+        assert after_stale_deadline.bench_version == rollout.desired_version
+        assert stale_issued_ticket.status == TicketStatus.EXPIRED
+
+        assert (
+            await issue_rollout_ticket(
+                session,
+                validator_hotkey="validator-b",
+                now=now,
+                ttl=timedelta(minutes=90),
+                validator_running_benchmark=True,
+            )
+            is None
+        )
+        assert running_source_ticket.status == TicketStatus.ISSUED
+
+        for agent_id in agent_ids:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.screened_image_sha256 = None
+            agent.screened_image_size_bytes = None
+            agent.screened_image_id = None
+            agent.screened_image_ref = None
+            agent.screened_image_upload_id = None
+            agent.screened_image_verified_at = None
+        await session.flush()
+        assert (
+            await issue_rollout_ticket(
+                session,
+                validator_hotkey="validator-c",
+                now=now,
+                ttl=timedelta(minutes=90),
+            )
+            is None
+        )
+        assert no_target_source_ticket.status == TicketStatus.ISSUED
+    await engine.dispose()
+
+
 async def test_v3_score_drop_qualifies_and_rescreens_new_top_five_agent() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:

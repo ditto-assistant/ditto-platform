@@ -631,30 +631,6 @@ async def issue_rollout_ticket(
     existing = await session.scalar(existing_statement)
     if existing is not None:
         return existing
-    incompatible_existing = await session.scalar(
-        select(ValidatorTicket)
-        .join(
-            BenchmarkRolloutMember,
-            BenchmarkRolloutMember.agent_id == ValidatorTicket.agent_id,
-        )
-        .where(
-            BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
-            ValidatorTicket.validator_hotkey == validator_hotkey,
-            ValidatorTicket.bench_version == rollout.desired_version,
-            ValidatorTicket.status == TicketStatus.ISSUED,
-            ValidatorTicket.deadline > now,
-        )
-        .limit(1)
-        .with_for_update()
-    )
-    if incompatible_existing is not None:
-        if validator_running_benchmark:
-            return None
-        incompatible_existing.status = TicketStatus.EXPIRED
-        incompatible_existing.deadline = now
-        incompatible_existing.retry_after = now
-        await session.flush()
-
     score_count = (
         select(func.count(Score.validator_hotkey))
         .where(
@@ -705,6 +681,28 @@ async def issue_rollout_ticket(
     )
     if member is None:
         return None
+    # A rollout can open while this validator still owns an ordinary source-
+    # version lease. Preserve genuinely running work, but an idle/polling
+    # validator must not keep resuming that lower-priority lease ahead of the
+    # target-version cohort. The database allows only one issued ticket per
+    # validator across all benchmark versions, so release any non-resumable
+    # lease only after proving that eligible rollout work exists.
+    competing_ticket = await session.scalar(
+        select(ValidatorTicket)
+        .where(
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    if competing_ticket is not None:
+        if validator_running_benchmark:
+            return None
+        competing_ticket.status = TicketStatus.EXPIRED
+        competing_ticket.deadline = now
+        competing_ticket.retry_after = now
+        await session.flush()
     ticket = await session.get(
         ValidatorTicket,
         (member.agent_id, rollout.desired_version, validator_hotkey),
