@@ -577,6 +577,7 @@ async def list_eligible_ledger(
     represents the agent.
     """
     from ditto.db.queries.benchmark_rollout import (
+        DESIRED_AUTHORITY_AT_QUORUM,
         SCORING_QUORUM,
         active_bench_version,
         open_rollout,
@@ -679,26 +680,28 @@ async def list_eligible_ledger(
         )
         .subquery()
     )
-    # During a collecting rollout, each agent atomically switches from the
-    # active-version median to the desired-version median only at 3/3 quorum.
-    # This is the same hybrid authority used to maintain the rolling top-five:
-    # partial v3 samples never affect ranks or weights. An explicit
-    # ``bench_version`` request is a historical single-version view.
-    version_priority = (
-        case(
-            (
-                and_(
-                    per_agent.c.bench_version == desired_version,
-                    per_agent.c.cnt >= SCORING_QUORUM,
-                ),
-                0,
-            ),
-            (per_agent.c.bench_version == canonical_version, 1),
-            else_=2,
+    # During a collecting rollout, per-agent authority is governed by
+    # DESIRED_AUTHORITY_AT_QUORUM. When True, each agent atomically switches
+    # from the active-version median to the desired-version median at 3/3
+    # quorum (the same hybrid authority used to maintain the rolling top-five).
+    # While the pin is on (False), the active-version median stays
+    # authoritative for every agent that has one — desired-version quorums are
+    # collected and visible but take over only at rollout activation. Either
+    # way partial desired-version samples never affect ranks or weights, and an
+    # explicit ``bench_version`` request is a historical single-version view.
+    if desired_version is None:
+        version_priority: ColumnElement[Any] = per_agent.c.bench_version
+    else:
+        desired_at_quorum = and_(
+            per_agent.c.bench_version == desired_version,
+            per_agent.c.cnt >= SCORING_QUORUM,
         )
-        if desired_version is not None
-        else per_agent.c.bench_version
-    )
+        on_canonical = per_agent.c.bench_version == canonical_version
+        version_priority = (
+            case((desired_at_quorum, 0), (on_canonical, 1), else_=2)
+            if DESIRED_AUTHORITY_AT_QUORUM
+            else case((on_canonical, 0), (desired_at_quorum, 1), else_=2)
+        )
     selected_version = select(
         per_agent,
         func.row_number()

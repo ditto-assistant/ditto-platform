@@ -561,8 +561,10 @@ class PublicLeaderboardResponse(BaseModel):
         Literal["authoritative", "historical"],
         Field(
             description=(
-                "authoritative selects v3 per agent at quorum and otherwise its "
-                "active-version fallback; historical is a requested single version."
+                "authoritative is the pool that drives validator weights — "
+                "currently pinned to the active version while the v3 rollout "
+                "stabilizes (a v3 quorum takes over only at rollout "
+                "activation); historical is a requested single version."
             )
         ),
     ]

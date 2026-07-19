@@ -3091,7 +3091,7 @@
         ? "Historical Bench v" + data.current_bench_version + " standings. Current emissions remain on the rollout view."
         : rolloutSettledView
         ? "Rows rank by their settled v" + activeBench + " score while v" + data.desired_bench_version +
-          " collects. Validator weights still switch per agent to v" + data.desired_bench_version + " at 3/3."
+          " collects. Validator weights stay on v" + activeBench + " until the v" + data.desired_bench_version + " rollout fully activates."
         : "This pool drives validator weights.";
       if (provisional.length || inactive.length || registrationUnknown.length) {
         notice.classList.add("show");
@@ -3419,7 +3419,7 @@
       }
       var settled = count >= quorum;
       var tip = settled
-        ? esc(vlabel) + " reached quorum: this median is final and now drives this agent's validator weight."
+        ? esc(vlabel) + " reached quorum: this median is locked in and takes over when the " + esc(vlabel) + " rollout fully activates."
         : "Preliminary " + esc(vlabel) + " median from " + count + " of " + quorum +
           " scores. It can change until quorum and does not affect rank or weights yet.";
       return '<span class="rollout-chip' + (settled ? " settled" : " partial") + '" title="' + tip + '">' +
@@ -3522,7 +3522,7 @@
         var tip = old
           ? "Scored on DittoBench v" + shownVersion + ", a previous benchmark. Not directly comparable to the settled v" + settledBenchVersion() + "."
           : rolloutSettledView
-          ? "Scored on DittoBench v" + shownVersion + ", the settled benchmark. A v" + desiredBench + " rollout is collecting; this row switches at 3/3."
+          ? "Scored on DittoBench v" + shownVersion + ", the settled benchmark. A v" + desiredBench + " rollout is collecting; this row switches when it fully activates."
           : "Scored on the current benchmark (DittoBench v" + shownVersion + ").";
         bv = '<span class="' + cls + '" title="' + esc(tip) + '">v' + shownVersion + (old ? " · old" : "") + '</span>';
       }
