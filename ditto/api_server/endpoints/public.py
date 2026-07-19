@@ -83,6 +83,9 @@ from ditto.api_models import (
     PublicScreenerProgress,
     PublicScreeningAttempt,
     PublicScreeningDispute,
+    PublicScreeningReviewEvidence,
+    PublicScreeningReviewFinding,
+    PublicScreeningReviewLocation,
     PublicSubmissionPipeline,
     PublicSubmissionScores,
     PublicSubmissionsResponse,
@@ -106,6 +109,8 @@ from ditto.api_models.screener import (
     SCREENING_POLICY_VERSION,
     ScreenerProgress,
     ScreenerRuntimeState,
+    ScreenEvidenceItem,
+    SourceReviewFinding,
 )
 from ditto.api_models.stack_health import ValidatorStackHealth
 from ditto.api_models.system_health import SystemMetrics
@@ -283,6 +288,71 @@ def _public_dispute(dispute: ScreeningDispute) -> PublicScreeningDispute:
         submitted_at=dispute.created_at,
         resolved_at=dispute.resolved_at,
         resolution=dispute.resolution,  # type: ignore[arg-type]
+    )
+
+
+def _public_terminal_screening_review(
+    quarantine: ScreeningQuarantine | None,
+    *,
+    artifact_sha256: str,
+) -> tuple[list[PublicScreeningReviewEvidence], PublicScreeningReviewFinding | None]:
+    """Project only verified review data from a terminal cheating rejection.
+
+    Active quarantines and release/rescreen resolutions retain their private source
+    layout. The public projection strips evidence digests and the artifact digest,
+    and never contains source snippets, prompts, transcripts, or challenge values.
+    """
+    if (
+        quarantine is None
+        or quarantine.status != "resolved"
+        or quarantine.resolution != "reject"
+    ):
+        return [], None
+
+    evidence: list[PublicScreeningReviewEvidence] = []
+    if isinstance(quarantine.evidence, list):
+        try:
+            parsed = [
+                ScreenEvidenceItem.model_validate(item)
+                for item in quarantine.evidence[:16]
+            ]
+        except ValueError:
+            parsed = []
+        evidence = [
+            PublicScreeningReviewEvidence(
+                module=item.module_id,
+                code=item.code,
+                summary=item.summary,
+            )
+            for item in parsed
+        ]
+
+    if not isinstance(quarantine.finding, dict):
+        return evidence, None
+    try:
+        finding = SourceReviewFinding.model_validate(quarantine.finding)
+    except ValueError:
+        return evidence, None
+    if (
+        quarantine.finding_digest is None
+        or finding.canonical_digest() != quarantine.finding_digest
+        or finding.artifact_sha256 != artifact_sha256
+    ):
+        return evidence, None
+    return evidence, PublicScreeningReviewFinding(
+        reviewer_revision=finding.prompt_revision,
+        risk_level=finding.risk_level,
+        confidence=finding.confidence,
+        categories=sorted(set(finding.categories)),
+        locations=[
+            PublicScreeningReviewLocation(
+                path=item.path,
+                line=item.line,
+                category=item.category,
+            )
+            for item in finding.evidence
+        ],
+        summary=finding.summary,
     )
 
 
@@ -1779,6 +1849,14 @@ async def agent_pipeline(
         raise HTTPException(status_code=404, detail="submission not found")
 
     attempts = await list_screening_attempts(session, agent_id=agent_id)
+    quarantines = list(
+        await session.scalars(
+            select(ScreeningQuarantine).where(ScreeningQuarantine.agent_id == agent_id)
+        )
+    )
+    quarantines_by_attempt = {
+        quarantine.attempt_id: quarantine for quarantine in quarantines
+    }
     resolved_quarantines_by_attempt: dict[
         UUID,
         tuple[Literal["release", "rescreen", "reject"] | None, datetime | None],
@@ -1787,11 +1865,16 @@ async def agent_pipeline(
             cast(Literal["release", "rescreen", "reject"], quarantine.resolution),
             quarantine.resolved_at,
         )
-        for quarantine in await session.scalars(
-            select(ScreeningQuarantine).where(ScreeningQuarantine.agent_id == agent_id)
-        )
+        for quarantine in quarantines
         if quarantine.status == "resolved"
         and quarantine.resolution in {"release", "rescreen", "reject"}
+    }
+    public_reviews_by_attempt = {
+        attempt.attempt_id: _public_terminal_screening_review(
+            quarantines_by_attempt.get(attempt.attempt_id),
+            artifact_sha256=agent.sha256,
+        )
+        for attempt in attempts
     }
     tickets = list(
         await session.scalars(
@@ -1944,6 +2027,8 @@ async def agent_pipeline(
                 quarantine_resolved_at=resolved_quarantines_by_attempt.get(
                     attempt.attempt_id, (None, None)
                 )[1],
+                review_evidence=public_reviews_by_attempt[attempt.attempt_id][0],
+                review_finding=public_reviews_by_attempt[attempt.attempt_id][1],
             )
             for attempt in attempts
         ],

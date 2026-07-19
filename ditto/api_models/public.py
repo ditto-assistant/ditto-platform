@@ -1052,6 +1052,38 @@ class PublicActivityResponse(BaseModel):
     ]
 
 
+class PublicScreeningReviewEvidence(BaseModel):
+    """One public-safe policy observation from a terminal cheating decision."""
+
+    module: Annotated[str, Field(min_length=1, max_length=64)]
+    code: Annotated[str, Field(min_length=1, max_length=64)]
+    summary: Annotated[str, Field(min_length=1, max_length=240)]
+
+
+class PublicScreeningReviewLocation(BaseModel):
+    """One source location published only after a terminal rejection."""
+
+    path: Annotated[str, Field(min_length=1, max_length=240)]
+    line: Annotated[int, Field(ge=1)]
+    category: Annotated[str, Field(min_length=1, max_length=64)]
+
+
+class PublicScreeningReviewFinding(BaseModel):
+    """Digest-verified final finding safe for public rejected-attempt feedback."""
+
+    reviewer_revision: Annotated[str, Field(min_length=1, max_length=64)]
+    risk_level: Literal["low", "medium", "high"]
+    confidence: Annotated[float, Field(ge=0, le=1)]
+    categories: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=64)]],
+        Field(min_length=1, max_length=8),
+    ]
+    locations: Annotated[
+        list[PublicScreeningReviewLocation], Field(default_factory=list, max_length=16)
+    ]
+    summary: Annotated[str, Field(min_length=1, max_length=240)]
+
+
 class PublicScreeningAttempt(BaseModel):
     """One append-only screening attempt shown in submission details."""
 
@@ -1068,6 +1100,8 @@ class PublicScreeningAttempt(BaseModel):
     reason: str | None = None
     quarantine_resolution: Literal["release", "rescreen", "reject"] | None = None
     quarantine_resolved_at: datetime | None = None
+    review_evidence: list[PublicScreeningReviewEvidence] = Field(default_factory=list)
+    review_finding: PublicScreeningReviewFinding | None = None
 
 
 class PublicScreeningDispute(BaseModel):
