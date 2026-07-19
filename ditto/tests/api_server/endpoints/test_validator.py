@@ -1295,6 +1295,7 @@ class TestHeartbeat:
                 assert shown == {
                     "agent_id": str(agent_id),
                     "agent_name": "alpha-agent",
+                    "bench_version": 2,
                     "stage": "running_benchmark",
                     "completed_checks": 51,
                     "total_checks": 114,
