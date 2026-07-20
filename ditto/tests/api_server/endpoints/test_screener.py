@@ -1919,6 +1919,37 @@ class TestQuarantineAdmin:
             admin_api_token="test-admin-token-at-least-32-characters",
         )
         agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.dataset_seed = 42
+            agent.dataset_sha256 = "ab" * 32
+            agent.dataset_run_size = "full"
+            agent.dataset_seed_block = 123
+            agent.dataset_seed_block_hash = "0x" + "12" * 32
+            session.add(
+                BenchmarkDataset(
+                    agent_id=agent_id,
+                    bench_version=2,
+                    seed=42,
+                    sha256="ab" * 32,
+                    run_size="full",
+                    seed_block=123,
+                    seed_block_hash="0x" + "12" * 32,
+                )
+            )
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now,
+                    activated_at=now,
+                )
+            )
         _install_db(app, session_maker)
         _install_chain(app)
         claimed = await client.post(_CLAIM_URL)
@@ -1959,12 +1990,25 @@ class TestQuarantineAdmin:
             for event in released.json()["quarantine"]["resolution_history"]
         ] == ["release"]
         assert generator.calls == 1
+        assert generator.seeds == [42]
+        assert generator.bench_versions == [3]
         async with session_maker() as session:
             agent = await session.get(Agent, agent_id)
+            v2 = await session.get(BenchmarkDataset, (agent_id, 2))
+            v3 = await session.get(BenchmarkDataset, (agent_id, 3))
             assert agent is not None
-            assert agent.dataset_seed is not None
-            assert agent.dataset_sha256 == "be" * 32
+            assert agent.dataset_seed == 42
+            assert agent.dataset_sha256 == "ab" * 32
             assert agent.dataset_run_size == "full"
+            assert v2 is not None and v2.sha256 == "ab" * 32
+            assert v3 is not None and v3.sha256 == "be" * 32
+
+        # The release adjudicates this exact current-policy artifact. Once its
+        # active benchmark dataset is pinned, it must not immediately re-enter
+        # screening through the missing-dataset eligibility branch.
+        next_claim = await client.post(_CLAIM_URL)
+        assert next_claim.status_code == 200
+        assert next_claim.json()["items"] == []
 
     async def test_admin_auth_is_required(
         self, app: FastAPI, client: httpx.AsyncClient
