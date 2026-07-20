@@ -27,10 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_server.payment_verifier import PaymentReplayedError, VerifiedPayment
 from ditto.db import IntegrityError as DbIntegrityError
-from ditto.db.models import EvaluationPayment
+from ditto.db.models import Agent, EvaluationPayment
 from ditto.db.queries.agents import insert_agent
 from ditto.db.queries.payments import (
     _PAYMENT_REPLAY_CONSTRAINT,
+    get_agent_for_payment_proof,
     insert_evaluation_payment,
 )
 
@@ -117,6 +118,24 @@ class TestInsertEvaluationPaymentHappyPath:
         assert row.amount_rao == verified.amount_rao
         assert row.dest_address == verified.dest_address
         assert row.miner_coldkey == verified.miner_coldkey
+
+        funded_agent = await get_agent_for_payment_proof(
+            session,
+            block_hash=verified.block_hash,
+            extrinsic_index=verified.extrinsic_index,
+        )
+        assert isinstance(funded_agent, Agent)
+        assert funded_agent.agent_id == agent_id
+
+    async def test_lookup_returns_none_for_unused_proof(self, session: AsyncSession):
+        assert (
+            await get_agent_for_payment_proof(
+                session,
+                block_hash="0xunused",
+                extrinsic_index=99,
+            )
+            is None
+        )
 
 
 class TestInsertEvaluationPaymentReplayDispatch:
