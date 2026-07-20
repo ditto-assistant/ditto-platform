@@ -1,7 +1,7 @@
 """allow benchmark-v5 efficiency-adjusted composites above one
 
 Revision ID: d9a4e7c21b60
-Revises: b7f2c8d41a95
+Revises: f8c2d6a04e71
 Create Date: 2026-07-20 16:45:00.000000
 
 Raw per-case and suite scores remain in [0, 1]. Only the finite aggregate
@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "d9a4e7c21b60"
-down_revision: str | Sequence[str] | None = "b7f2c8d41a95"
+down_revision: str | Sequence[str] | None = "f8c2d6a04e71"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
