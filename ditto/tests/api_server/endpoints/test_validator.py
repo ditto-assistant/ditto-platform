@@ -1600,6 +1600,44 @@ class TestHeartbeat:
         )
         assert restarted.status_code == 200, restarted.text
 
+    async def test_v4_next_confirmation_seed_restarts_at_preparing(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # Multi-seed confirmation runs several evaluations under ONE ticket lease.
+        # A completed run (finalizing) followed by the next seed (preparing) must
+        # rebaseline, not read as a regression — otherwise every heartbeat of the
+        # next seed is rejected and the validator freezes into heartbeat_stale
+        # while it is in fact scoring normally.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        timestamp = int(datetime.now(UTC).timestamp())
+
+        sequence = [
+            _progress("running_benchmark", completed=114, total=114),
+            _progress("finalizing", completed=114, total=114),
+            # Next confirmation seed in the same lease: fresh run, progress resets.
+            _progress("preparing"),
+            _progress("running_benchmark", completed=1, total=114),
+        ]
+        for offset, progress in enumerate(sequence):
+            response = await client.post(
+                "/api/v1/validator/heartbeat",
+                headers=_AUTH_HEADER,
+                json=_heartbeat_payload(
+                    protocol_version=4,
+                    timestamp=timestamp + offset,
+                    state="running_benchmark",
+                    active_agent_id=agent_id,
+                    benchmark_progress=progress,
+                ),
+            )
+            assert response.status_code == 200, response.text
+
     @pytest.mark.parametrize("status", [AgentStatus.SCORED, AgentStatus.LIVE])
     async def test_v4_preserves_rollout_progress_for_scored_and_live_agents(
         self,
