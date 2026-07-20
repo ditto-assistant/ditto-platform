@@ -120,7 +120,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 GeneratorDep = Annotated[DatasetGenerator, Depends(get_dataset_generator)]
 StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
-DatasetPin = tuple[int, str, str, int | None, str | None]
+DatasetPin = tuple[int, int, str, str, int | None, str | None]
 BATCH_PREVIEW_TTL = timedelta(minutes=10)
 
 
@@ -248,29 +248,85 @@ async def _prepare_release_dataset(
     if run_size is None:
         return None
     async with session.begin():
-        existing = (
-            await session.execute(
-                select(Agent.agent_id, Agent.dataset_seed)
-                .join(
-                    ScreeningQuarantine,
-                    ScreeningQuarantine.agent_id == Agent.agent_id,
-                )
-                .where(ScreeningQuarantine.quarantine_id == quarantine_id)
+        agent = await session.scalar(
+            select(Agent)
+            .join(
+                ScreeningQuarantine,
+                ScreeningQuarantine.agent_id == Agent.agent_id,
             )
-        ).one_or_none()
-    if existing is None:
-        raise HTTPException(status_code=404, detail="quarantine not found")
-    if existing.dataset_seed is not None:
+            .where(ScreeningQuarantine.quarantine_id == quarantine_id)
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="quarantine not found")
+        bench_version = await active_bench_version(session)
+        versioned_dataset = await session.get(
+            BenchmarkDataset, (agent.agent_id, bench_version)
+        )
+        existing_seed = agent.dataset_seed
+        existing_seed_block = agent.dataset_seed_block
+        existing_seed_block_hash = agent.dataset_seed_block_hash
+    if versioned_dataset is not None:
         return None
-    seed, block_number, block_hash = await _derive_dataset_seed(
-        chain, existing.agent_id
+    if existing_seed is None:
+        seed, block_number, block_hash = await _derive_dataset_seed(
+            chain, agent.agent_id
+        )
+    else:
+        seed = existing_seed
+        block_number = existing_seed_block
+        block_hash = existing_seed_block_hash
+    dataset_sha256 = await generator.generate(seed, bench_version=bench_version)
+    return (
+        bench_version,
+        seed,
+        dataset_sha256,
+        run_size,
+        block_number,
+        block_hash,
     )
-    dataset_sha256 = await generator.generate(seed)
-    return seed, dataset_sha256, run_size, block_number, block_hash
 
 
-def _apply_dataset(agent: Agent, dataset: DatasetPin | None) -> None:
-    if dataset is None or agent.dataset_seed is not None:
+async def _apply_dataset(
+    session: AsyncSession, agent: Agent, dataset: DatasetPin | None
+) -> None:
+    if dataset is None:
+        return
+    (
+        bench_version,
+        seed,
+        dataset_sha256,
+        run_size,
+        block_number,
+        block_hash,
+    ) = dataset
+    existing = await session.get(BenchmarkDataset, (agent.agent_id, bench_version))
+    if existing is None:
+        session.add(
+            BenchmarkDataset(
+                agent_id=agent.agent_id,
+                bench_version=bench_version,
+                seed=seed,
+                sha256=dataset_sha256,
+                run_size=run_size,
+                seed_block=block_number,
+                seed_block_hash=block_hash,
+            )
+        )
+    elif (
+        existing.seed,
+        existing.sha256,
+        existing.run_size,
+        existing.seed_block,
+        existing.seed_block_hash,
+    ) != (seed, dataset_sha256, run_size, block_number, block_hash):
+        raise HTTPException(
+            status_code=409,
+            detail="active benchmark dataset changed during quarantine release",
+        )
+    # Preserve the original/v2 compatibility pin. A current-version release may
+    # backfill a newer BenchmarkDataset row but must not rewrite older scores'
+    # dataset authority.
+    if agent.dataset_seed is not None:
         return
     (
         agent.dataset_seed,
@@ -278,7 +334,7 @@ def _apply_dataset(agent: Agent, dataset: DatasetPin | None) -> None:
         agent.dataset_run_size,
         agent.dataset_seed_block,
         agent.dataset_seed_block_hash,
-    ) = dataset
+    ) = (seed, dataset_sha256, run_size, block_number, block_hash)
 
 
 def _preview_signature_payload(
@@ -799,7 +855,7 @@ async def execute_quarantine_batch(
                 now = datetime.now(UTC)
                 agent.status = target
                 agent.screening_reason = decision.reason
-                _apply_dataset(agent, new_dataset)
+                await _apply_dataset(session, agent, new_dataset)
                 quarantine.status = "resolved"
                 quarantine.resolved_at = now
                 quarantine.resolved_by = x_admin_actor
@@ -1133,7 +1189,7 @@ async def resolve_quarantine(
         }[payload.resolution]
         agent.status = target
         agent.screening_reason = payload.reason
-        _apply_dataset(agent, new_dataset)
+        await _apply_dataset(session, agent, new_dataset)
         quarantine.status = "resolved"
         quarantine.resolved_at = datetime.now(UTC)
         quarantine.resolved_by = x_admin_actor
@@ -1259,7 +1315,7 @@ async def resolve_screening_dispute(
         if payload.resolution == "release":
             agent.status = AgentStatus.EVALUATING
             agent.screening_reason = payload.reason
-            _apply_dataset(agent, new_dataset)
+            await _apply_dataset(session, agent, new_dataset)
             quarantine.resolved_at = now
             quarantine.resolved_by = x_admin_actor
             quarantine.resolution = "release"
