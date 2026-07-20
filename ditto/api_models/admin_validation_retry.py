@@ -77,6 +77,10 @@ class AdminValidatorScoreReplacementDetail(BaseModel):
     composite: float | None
     ticket_status: Literal["issued", "scored", "expired"] | None
     ticket_deadline: datetime | None
+    replacement_pending: bool
+    replacement_request_id: UUID | None
+    replacement_reason: str | None
+    replacement_actor: str | None
     replacement_allowed: bool
     blocking_reason: str | None
 
@@ -99,8 +103,62 @@ class AdminValidatorScoreReplacementResponse(BaseModel):
     request_id: UUID
     agent_id: UUID
     validator_hotkey: str
-    invalidated_run_id: str
+    original_run_id: str
     bench_version: int
     replacement_deadline: datetime
-    remaining_score_count: int
+    preserved_score_count: int
     idempotent: bool
+
+
+class AdminValidatorScoreRetestReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: UUID
+    expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_deadline: datetime
+    reason: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+    ]
+
+
+class AdminValidatorScoreRetestReleaseResponse(BaseModel):
+    request_id: UUID
+    agent_id: UUID
+    validator_hotkey: str
+    status: Literal["scored"]
+    preserved_run_id: str
+    idempotent: bool
+
+
+class AdminScoreOutlierScore(BaseModel):
+    validator_hotkey: str
+    run_id: str
+    composite: float
+
+
+class AdminScoreOutlier(BaseModel):
+    agent_id: UUID
+    agent_name: str
+    miner_hotkey: str
+    agent_status: str
+    bench_version: int
+    snapshot: str
+    median_composite: float
+    direction: Literal["high", "low"]
+    outlier: AdminScoreOutlierScore
+    peers: list[AdminScoreOutlierScore]
+    deviation: float
+    peer_spread: float
+    ticket_status: Literal["issued", "scored", "expired"] | None
+    replacement_pending: bool
+    replacement_deadline: datetime | None
+    replacement_allowed: bool
+    blocking_reason: str | None
+
+
+class AdminScoreOutlierList(BaseModel):
+    items: list[AdminScoreOutlier]
+    count: int
+    limit: int
+    offset: int

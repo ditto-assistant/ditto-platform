@@ -28,7 +28,10 @@ from ditto.db.models import (
     ValidatorRetryRecovery,
     ValidatorTicket,
 )
-from ditto.db.queries.audit import EVENT_SCORE_INVALIDATED
+from ditto.db.queries.audit import (
+    EVENT_SCORE_RETEST_RELEASED,
+    EVENT_SCORE_RETEST_REQUESTED,
+)
 from ditto.db.queries.benchmark_rollout import DEFAULT_BENCH_VERSION
 from ditto.db.queries.tickets import issue_ticket
 
@@ -75,6 +78,7 @@ async def _seed(
     *,
     score_count: int = 0,
     bench_version: int = DEFAULT_BENCH_VERSION,
+    composites: list[float] | None = None,
 ) -> UUID:
     agent_id = uuid4()
     async with maker() as session, session.begin():
@@ -116,7 +120,7 @@ async def _seed(
                         validator_hotkey=hotkey,
                         run_id=f"run-{index}",
                         seed=7,
-                        composite=0.7,
+                        composite=(composites or [0.7] * score_count)[index],
                         tool_mean=0.7,
                         memory_mean=0.7,
                         median_ms=100,
@@ -357,8 +361,8 @@ async def test_replace_one_validators_score_and_reissue_same_ticket(
         json=payload,
     )
     assert response.status_code == 200, response.text
-    assert response.json()["remaining_score_count"] == 2
-    assert response.json()["invalidated_run_id"] == "run-1"
+    assert response.json()["preserved_score_count"] == 3
+    assert response.json()["original_run_id"] == "run-1"
 
     replay = await client.post(
         f"/api/v1/admin/validation-retries/{agent_id}/validators/validator-1/replace-score",
@@ -381,12 +385,13 @@ async def test_replace_one_validators_score_and_reissue_same_ticket(
         audit = await session.scalar(
             select(ScoreAuditEntry).where(
                 ScoreAuditEntry.agent_id == agent_id,
-                ScoreAuditEntry.event == EVENT_SCORE_INVALIDATED,
+                ScoreAuditEntry.event == EVENT_SCORE_RETEST_REQUESTED,
             )
         )
-    assert agent is not None and agent.status == AgentStatus.EVALUATING
+    assert agent is not None and agent.status == AgentStatus.SCORED
     assert {score.validator_hotkey for score in scores} == {
         "validator-0",
+        "validator-1",
         "validator-2",
     }
     assert ticket is not None and ticket.status == TicketStatus.ISSUED
@@ -395,10 +400,40 @@ async def test_replace_one_validators_score_and_reissue_same_ticket(
     assert audit.payload["actor"] == "operator"
     assert audit.payload["reason"] == payload["reason"]
     assert audit.payload["run_id"] == "run-1"
-    assert audit.payload["invalidated_score"]["composite"] == 0.7
-    assert audit.payload["invalidated_score"]["bench_version"] == (
-        DEFAULT_BENCH_VERSION
+    assert audit.payload["preserved_score"]["composite"] == 0.7
+    assert audit.payload["preserved_score"]["bench_version"] == (DEFAULT_BENCH_VERSION)
+
+    pending = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}/validators/validator-1",
+        headers=_HEADERS,
     )
+    assert pending.json()["replacement_pending"] is True
+    assert pending.json()["replacement_allowed"] is False
+
+    release = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/validators/validator-1/release-ticket",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": pending.json()["snapshot"],
+            "expected_deadline": pending.json()["ticket_deadline"],
+            "reason": "Operator released the re-test after validator evidence cleared",
+        },
+    )
+    assert release.status_code == 200, release.text
+    assert release.json()["status"] == "scored"
+    async with retry_maker() as session:
+        ticket = await session.get(
+            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-1")
+        )
+        released = await session.scalar(
+            select(ScoreAuditEntry).where(
+                ScoreAuditEntry.agent_id == agent_id,
+                ScoreAuditEntry.event == EVENT_SCORE_RETEST_RELEASED,
+            )
+        )
+    assert ticket is not None and ticket.status == TicketStatus.SCORED
+    assert released is not None
 
 
 async def test_replace_score_fails_closed_on_run_change_or_busy_validator(
@@ -442,3 +477,30 @@ async def test_replace_score_fails_closed_on_run_change_or_busy_validator(
     assert blocked.json()["blocking_reason"] == (
         "validator is currently assigned to another submission"
     )
+
+
+async def test_lists_only_unambiguous_finalized_score_outliers(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    low_id = await _seed(retry_maker, score_count=3, composites=[0.12, 0.81, 0.83])
+    high_id = await _seed(retry_maker, score_count=3, composites=[0.68, 0.70, 0.96])
+    broad_id = await _seed(retry_maker, score_count=3, composites=[0.20, 0.50, 0.80])
+    async with retry_maker() as session, session.begin():
+        for agent_id in (low_id, high_id, broad_id):
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.status = AgentStatus.SCORED
+    _install(app, retry_maker)
+
+    response = await client.get("/api/v1/admin/score-outliers", headers=_HEADERS)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["count"] == 2
+    by_agent = {item["agent_id"]: item for item in body["items"]}
+    assert by_agent[str(low_id)]["direction"] == "low"
+    assert by_agent[str(low_id)]["outlier"]["validator_hotkey"] == "validator-0"
+    assert by_agent[str(high_id)]["direction"] == "high"
+    assert by_agent[str(high_id)]["outlier"]["validator_hotkey"] == "validator-2"
+    assert str(broad_id) not in by_agent

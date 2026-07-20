@@ -1407,9 +1407,10 @@ class PublicAuditEntry(BaseModel):
     """One entry of the append-only, hash-chained public score audit log.
 
     Each entry records a scoring event verbatim: a validator's signed ``score``,
-    a ``score_invalidated`` operator decision that preserves the invalidated
-    signed tuple and reason, or an ``agent_finalized`` event (quorum reached,
-    the median + scoring validators).
+    a ``score_retest_requested`` operator decision that keeps the signed score
+    canonical while a replacement runs, a ``score_invalidated`` atomic swap,
+    a ``score_retest_released`` cancellation, or an ``agent_finalized`` event
+    (quorum reached, the median + scoring validators).
     ``entry_hash`` is the SHA-256 of the entry's canonical content (which embeds
     ``prev_hash``); ``prev_hash`` links to the previous entry's ``entry_hash``.
     A consumer replays the feed and recomputes each hash to prove the sequence
@@ -1426,7 +1427,8 @@ class PublicAuditEntry(BaseModel):
         str,
         Field(
             description=(
-                'Event kind such as "score", "score_invalidated", '
+                'Event kind such as "score", "score_retest_requested", '
+                '"score_invalidated", "score_retest_released", '
                 '"agent_finalized", or "transform_audit".'
             )
         ),
