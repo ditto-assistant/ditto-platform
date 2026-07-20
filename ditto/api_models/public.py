@@ -1395,8 +1395,10 @@ class PublicBenchCorpusResponse(BaseModel):
 class PublicAuditEntry(BaseModel):
     """One entry of the append-only, hash-chained public score audit log.
 
-    Each entry records a scoring event verbatim: a validator's signed ``score``
-    or an ``agent_finalized`` (quorum reached, the median + scoring validators).
+    Each entry records a scoring event verbatim: a validator's signed ``score``,
+    a ``score_invalidated`` operator decision that preserves the invalidated
+    signed tuple and reason, or an ``agent_finalized`` event (quorum reached,
+    the median + scoring validators).
     ``entry_hash`` is the SHA-256 of the entry's canonical content (which embeds
     ``prev_hash``); ``prev_hash`` links to the previous entry's ``entry_hash``.
     A consumer replays the feed and recomputes each hash to prove the sequence
@@ -1409,7 +1411,15 @@ class PublicAuditEntry(BaseModel):
         str | None,
         Field(default=None, description="Scoring validator (null on finalize)."),
     ]
-    event: Annotated[str, Field(description='"score" or "agent_finalized".')]
+    event: Annotated[
+        str,
+        Field(
+            description=(
+                'Event kind such as "score", "score_invalidated", '
+                '"agent_finalized", or "transform_audit".'
+            )
+        ),
+    ]
     payload: Annotated[
         dict[str, Any],
         Field(description="Event content (the hash preimage's payload field)."),
