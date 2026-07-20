@@ -12,17 +12,19 @@ import hashlib
 import json
 import statistics
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.admin_validation_retry import (
     AdminScoreOutlier,
     AdminScoreOutlierList,
     AdminScoreOutlierScore,
+    AdminStuckSubmission,
+    AdminStuckSubmissionsResponse,
     AdminValidationRecovery,
     AdminValidationRetryDetail,
     AdminValidationRetryRequest,
@@ -33,6 +35,7 @@ from ditto.api_models.admin_validation_retry import (
     AdminValidatorScoreReplacementResponse,
     AdminValidatorScoreRetestReleaseRequest,
     AdminValidatorScoreRetestReleaseResponse,
+    RetryState,
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
@@ -46,6 +49,7 @@ from ditto.db.models import (
     ValidatorRetryRecovery,
     ValidatorTicket,
 )
+from ditto.db.queries.agents import list_agents_by_status
 from ditto.db.queries.audit import (
     EVENT_SCORE_RETEST_RELEASED,
     EVENT_SCORE_RETEST_REQUESTED,
@@ -59,6 +63,10 @@ from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION
 router = APIRouter(prefix="/admin", tags=["admin"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 AdminDep = Annotated[None, Depends(require_admin)]
+
+# How many EVALUATING agents to classify in one fleet sweep. The evaluating
+# backlog is bounded (a few hundred at most); this caps a pathological scan.
+_STUCK_SCAN_LIMIT = 2000
 
 MAX_OPERATOR_RECOVERIES_PER_AGENT = 3
 _REPLACEMENT_TICKET_TTL = timedelta(minutes=90)
@@ -276,6 +284,88 @@ def _recovery_gate(
     return False, True, None, exhausted[:needed]
 
 
+def _resolve_bench_version(
+    *,
+    all_tickets: list[ValidatorTicket],
+    all_scores: list[Score],
+    canonical_version: int,
+) -> int:
+    """Pick the benchmark era an agent's retry state belongs to.
+
+    Live/expired work is the strongest signal (the era it is being scored on
+    right now); otherwise its newest recorded score; otherwise the canonical
+    active version for an agent with no ticket or score history yet.
+    """
+    work_tickets = [
+        ticket
+        for ticket in all_tickets
+        if ticket.status in (TicketStatus.ISSUED, TicketStatus.EXPIRED)
+    ]
+    if work_tickets:
+        return max(
+            work_tickets,
+            key=lambda ticket: (_aware(ticket.issued_at), ticket.bench_version),
+        ).bench_version
+    if all_scores:
+        return max(
+            all_scores,
+            key=lambda score: (_aware(score.generated_at), score.bench_version),
+        ).bench_version
+    return canonical_version
+
+
+def _is_exhausted(ticket: ValidatorTicket) -> bool:
+    """An expired ticket whose validator has spent its whole attempt budget."""
+    return (
+        ticket.status == TicketStatus.EXPIRED
+        and ticket.attempt_count
+        >= MAX_ATTEMPTS_PER_VERSION + ticket.manual_retry_grants
+    )
+
+
+def _classify_retry_state(
+    *,
+    automatic: bool,
+    allowed: bool,
+    reason: str | None,
+    scores: list[Score],
+    tickets: list[ValidatorTicket],
+) -> RetryState | None:
+    """Fold the recovery gate's verdict into a single triage label.
+
+    Returns ``None`` for a submission that is not actually below quorum and
+    therefore not stuck. ``exhausted`` is the only label that needs an operator:
+    every other state advances on its own once cooldowns lapse or a validator
+    picks the slot up.
+    """
+    score_hotkeys = {score.validator_hotkey for score in scores}
+    if len(scores) >= SCORING_QUORUM:
+        return None
+    if any(ticket.status == TicketStatus.ISSUED for ticket in tickets):
+        return "running"
+    if automatic:
+        return "retry_available"
+    if reason == "automatic validator retry is still cooling down":
+        return "cooling_down"
+    if allowed:
+        return "exhausted"
+    # No natural or operator-grantable retry is pending. Only call it exhausted
+    # (needs a human) when enough validators have burned their budget that the
+    # submission cannot reach quorum on its own — i.e. at least as many exhausted
+    # non-scored tickets as scores still needed. Fewer than that means the
+    # remaining slots were simply never leased and fresh validators will fill
+    # them, so it is still queued, not stuck.
+    needed = SCORING_QUORUM - len(scores)
+    exhausted_unscored = sum(
+        1
+        for ticket in tickets
+        if _is_exhausted(ticket) and ticket.validator_hotkey not in score_hotkeys
+    )
+    if exhausted_unscored >= needed:
+        return "exhausted"
+    return "queued"
+
+
 async def _load(
     session: AsyncSession, *, agent_id: UUID, for_update: bool
 ) -> tuple[
@@ -311,23 +401,11 @@ async def _load(
         ticket_query = ticket_query.with_for_update()
     all_tickets = list((await session.scalars(ticket_query)).all())
     canonical_version = await active_bench_version(session)
-    work_tickets = [
-        ticket
-        for ticket in all_tickets
-        if ticket.status in (TicketStatus.ISSUED, TicketStatus.EXPIRED)
-    ]
-    if work_tickets:
-        bench_version = max(
-            work_tickets,
-            key=lambda ticket: (_aware(ticket.issued_at), ticket.bench_version),
-        ).bench_version
-    elif all_scores:
-        bench_version = max(
-            all_scores,
-            key=lambda score: (_aware(score.generated_at), score.bench_version),
-        ).bench_version
-    else:
-        bench_version = canonical_version
+    bench_version = _resolve_bench_version(
+        all_tickets=all_tickets,
+        all_scores=all_scores,
+        canonical_version=canonical_version,
+    )
     scores = [score for score in all_scores if score.bench_version == bench_version]
     tickets = [
         ticket for ticket in all_tickets if ticket.bench_version == bench_version
@@ -348,6 +426,173 @@ async def _load(
         ).all()
     )
     return agent, bench_version, scores, tickets, recoveries
+
+
+_RETRY_STATE_ORDER: dict[str, int] = {
+    "exhausted": 0,
+    "cooling_down": 1,
+    "retry_available": 2,
+    "running": 3,
+    "queued": 4,
+}
+
+
+@router.get("/validation-retries", response_model=AdminStuckSubmissionsResponse)
+async def list_validation_retries(
+    _admin: AdminDep,
+    session: SessionDep,
+    state: Annotated[list[str] | None, Query()] = None,
+) -> AdminStuckSubmissionsResponse:
+    """Fleet-wide triage of every below-quorum submission and why it is stuck.
+
+    The single-agent detail route answers "why is *this* one stuck?"; this
+    answers "which ones need me?" without a per-agent sweep. Filter with one or
+    more ``state`` query params (e.g. ``?state=exhausted``); ``counts`` always
+    reflects the whole fleet so a filtered view still shows the totals.
+    """
+    now = datetime.now(UTC)
+    requested_states = set(state or [])
+    unknown = requested_states - set(_RETRY_STATE_ORDER)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail="unknown retry state: " + ", ".join(sorted(unknown)),
+        )
+
+    canonical_version = await active_bench_version(session)
+    agents = await list_agents_by_status(
+        session, statuses=[AgentStatus.EVALUATING], limit=_STUCK_SCAN_LIMIT
+    )
+    if not agents:
+        return AdminStuckSubmissionsResponse(
+            generated_at=now, quorum=SCORING_QUORUM, counts={}, submissions=[]
+        )
+
+    # Pull tickets, scores, and prior recoveries in three statements, scoped to
+    # exactly the agents we will classify — the same status/order/limit as
+    # list_agents_by_status above — so the I/O never exceeds _STUCK_SCAN_LIMIT.
+    # A subquery (not a bound id list) also keeps SQLite's host-parameter cap
+    # from ever truncating the sweep.
+    evaluating_ids = (
+        select(Agent.agent_id)
+        .where(Agent.status == AgentStatus.EVALUATING)
+        .order_by(Agent.created_at.asc())
+        .limit(_STUCK_SCAN_LIMIT)
+        .scalar_subquery()
+    )
+    tickets_by_agent: dict[UUID, list[ValidatorTicket]] = {}
+    for ticket in (
+        await session.scalars(
+            select(ValidatorTicket).where(ValidatorTicket.agent_id.in_(evaluating_ids))
+        )
+    ).all():
+        tickets_by_agent.setdefault(ticket.agent_id, []).append(ticket)
+    scores_by_agent: dict[UUID, list[Score]] = {}
+    for score in (
+        await session.scalars(select(Score).where(Score.agent_id.in_(evaluating_ids)))
+    ).all():
+        scores_by_agent.setdefault(score.agent_id, []).append(score)
+    recovery_counts: dict[tuple[UUID, int], int] = {
+        (agent_id, version): count
+        for agent_id, version, count in (
+            await session.execute(
+                select(
+                    ValidatorRetryRecovery.agent_id,
+                    ValidatorRetryRecovery.bench_version,
+                    func.count(),
+                )
+                .where(ValidatorRetryRecovery.agent_id.in_(evaluating_ids))
+                .group_by(
+                    ValidatorRetryRecovery.agent_id,
+                    ValidatorRetryRecovery.bench_version,
+                )
+            )
+        ).all()
+    }
+
+    submissions: list[AdminStuckSubmission] = []
+    counts: dict[RetryState, int] = {}
+    for agent in agents:
+        all_tickets = sorted(
+            tickets_by_agent.get(agent.agent_id, []),
+            key=lambda ticket: (_aware(ticket.deadline), ticket.validator_hotkey),
+        )
+        all_scores = scores_by_agent.get(agent.agent_id, [])
+        bench_version = _resolve_bench_version(
+            all_tickets=all_tickets,
+            all_scores=all_scores,
+            canonical_version=canonical_version,
+        )
+        v_scores = [s for s in all_scores if s.bench_version == bench_version]
+        v_tickets = [t for t in all_tickets if t.bench_version == bench_version]
+        automatic, allowed, reason, _ = _recovery_gate(
+            agent=agent,
+            scores=v_scores,
+            tickets=v_tickets,
+            recovery_count=recovery_counts.get((agent.agent_id, bench_version), 0),
+            now=now,
+            bench_version=bench_version,
+        )
+        retry_state = _classify_retry_state(
+            automatic=automatic,
+            allowed=allowed,
+            reason=reason,
+            scores=v_scores,
+            tickets=v_tickets,
+        )
+        if retry_state is None:
+            continue
+        counts[retry_state] = counts.get(retry_state, 0) + 1
+        if requested_states and retry_state not in requested_states:
+            continue
+        scored_hotkeys = {s.validator_hotkey for s in v_scores}
+        submissions.append(
+            AdminStuckSubmission(
+                agent_id=agent.agent_id,
+                miner_hotkey=agent.miner_hotkey,
+                agent_name=agent.name,
+                agent_version=agent.version,
+                bench_version=bench_version,
+                score_count=len(v_scores),
+                quorum=SCORING_QUORUM,
+                retry_state=cast(RetryState, retry_state),
+                automatic_retry_available=automatic,
+                recovery_allowed=allowed,
+                blocking_reason=reason,
+                earliest_retry_after=min(
+                    (
+                        _aware(t.retry_after)
+                        for t in v_tickets
+                        if t.status == TicketStatus.EXPIRED
+                        and t.retry_after is not None
+                        and t.validator_hotkey not in scored_hotkeys
+                    ),
+                    default=None,
+                ),
+                attempts_used=max((t.attempt_count for t in v_tickets), default=0),
+                exhausted_validator_count=sum(
+                    1
+                    for t in v_tickets
+                    if _is_exhausted(t) and t.validator_hotkey not in scored_hotkeys
+                ),
+                snapshot=_snapshot(agent=agent, scores=v_scores, tickets=v_tickets),
+                tickets=[_ticket_item(t) for t in v_tickets],
+            )
+        )
+
+    submissions.sort(
+        key=lambda item: (
+            _RETRY_STATE_ORDER[item.retry_state],
+            item.earliest_retry_after or datetime.max.replace(tzinfo=UTC),
+            item.agent_id,
+        )
+    )
+    return AdminStuckSubmissionsResponse(
+        generated_at=now,
+        quorum=SCORING_QUORUM,
+        counts=counts,
+        submissions=submissions,
+    )
 
 
 @router.get("/validation-retries/{agent_id}", response_model=AdminValidationRetryDetail)
