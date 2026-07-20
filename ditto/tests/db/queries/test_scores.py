@@ -84,6 +84,21 @@ class TestUpsertScore:
         with pytest.raises(DbIntegrityError):
             await _upsert(session, uuid4())
 
+    async def test_database_allows_only_v5_composite_above_one(
+        self, session: AsyncSession
+    ) -> None:
+        v5_agent = await _seed_agent(session)
+        await _upsert(session, v5_agent.agent_id, bench_version=5, composite=1.125)
+        scores = await list_scores_for_agent(
+            session, agent_id=v5_agent.agent_id, bench_version=5
+        )
+        assert scores[0].composite == pytest.approx(1.125)
+        await session.commit()
+
+        v4_agent = await _seed_agent(session)
+        with pytest.raises(DbIntegrityError):
+            await _upsert(session, v4_agent.agent_id, bench_version=4, composite=1.125)
+
     async def test_list_empty_when_unscored(self, session: AsyncSession) -> None:
         agent = await _seed_agent(session)
         assert await list_scores_for_agent(session, agent_id=agent.agent_id) == []

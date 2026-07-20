@@ -88,10 +88,10 @@ async def test_admin_status_read_does_not_start_rollout() -> None:
         assert count == 0
 
         control = await get_rollout_control(None, session)
-        assert control["available_target_versions"] == [3, 4]
+        assert control["available_target_versions"] == [3, 4, 5]
         contracts = control["contracts"]
         assert isinstance(contracts, list)
-        assert [item["version"] for item in contracts] == [2, 3, 4]
+        assert [item["version"] for item in contracts] == [2, 3, 4, 5]
         assert control["status"] == "inactive"
         count = await session.scalar(select(func.count(BenchmarkRollout.rollout_id)))
         assert count == 0

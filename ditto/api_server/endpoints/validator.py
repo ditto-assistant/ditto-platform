@@ -1350,6 +1350,8 @@ async def submit_score(
         # validator reads it back for the KOTH indifference band.
         if report.composite_stderr is not None:
             score_details["composite_stderr"] = report.composite_stderr
+        if report.raw_composite is not None:
+            score_details["raw_composite"] = report.raw_composite
         # Same for the P4 per-seed confirmation composites: the validator submits
         # one median-run score carrying the K per-seed composites, and the ledger
         # surfaces them so the KOTH fold dethrones on the median over seeds.

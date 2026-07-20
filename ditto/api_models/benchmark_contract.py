@@ -22,6 +22,10 @@ _CONTRACTS = {
     # v4 supersedes v3 without relaxing any prerequisite: same policy-9 screener
     # floor and the same verified-archive requirement.
     4: BenchmarkContract(4, 9, True),
+    # v5 adds chat-quality and trusted token-efficiency scoring. Shipping the
+    # contract makes it a rollout target but does not activate it; the scorer
+    # also withholds v5 capability until every provider baseline is calibrated.
+    5: BenchmarkContract(5, 9, True),
 }
 
 
