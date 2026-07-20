@@ -28,9 +28,9 @@ def test_provisional_score_accepts_reproducible_safe_fields() -> None:
     assert score.seed_source == "on_chain"
 
 
-def test_provisional_score_accepts_unbounded_finite_v5_composite() -> None:
+def test_provisional_score_keeps_v5_composite_bounded() -> None:
     score = PublicProvisionalScore(
-        composite=2.84605,
+        composite=0.855,
         seed="5585512758338063316",
         run_size="full",
         bench_version=5,
@@ -42,11 +42,11 @@ def test_provisional_score_accepts_unbounded_finite_v5_composite() -> None:
         verification_command="generate -seed 123456789 -run-size full -sha",
         case_results=None,
     )
-    assert score.composite == pytest.approx(2.84605)
+    assert score.composite == pytest.approx(0.855)
 
     with pytest.raises(ValidationError):
         PublicProvisionalScore.model_validate(
-            {**score.model_dump(), "composite": float("inf")}
+            {**score.model_dump(), "composite": 1.001}
         )
 
 
