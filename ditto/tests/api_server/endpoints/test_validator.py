@@ -2920,9 +2920,7 @@ class TestFailJob:
         forged = _job_fail_payload(agent_id)
         # Move the signed lease deadline without re-signing: the signature binds
         # (agent_id, ticket_deadline, nonce, requested_at), so it must not verify.
-        forged["ticket_deadline"] = (
-            (_TICKET_DEADLINE + timedelta(hours=1)).isoformat()
-        )
+        forged["ticket_deadline"] = (_TICKET_DEADLINE + timedelta(hours=1)).isoformat()
         resp = await client.post(
             "/api/v1/validator/job/fail", headers=_AUTH_HEADER, json=forged
         )
