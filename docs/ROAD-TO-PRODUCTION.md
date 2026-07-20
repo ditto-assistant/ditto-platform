@@ -1,6 +1,6 @@
 # Road to Production: SN118
 
-Snapshot: 2026-07-13. Handoff state for the team that owns infra, chain access,
+Snapshot: 2026-07-20. Handoff state for the team that owns infra, chain access,
 and repo visibility.
 
 Launch model: **independent validators run the scoring and weight-setting from day
@@ -31,7 +31,6 @@ repos. The app repos deploy themselves through GitHub Actions.
 | Secret values | `roles/secretmanager.admin` on the project | `gcloud secrets versions add` |
 | Platform deploy | GitHub env secrets `GCP_WIF_PROVIDER`, `GCP_PLATFORM_DEPLOY_SA`, `DITTO_UPLOAD_PAYMENT_ADDRESS` | `ditto-platform/.github/workflows/deploy.yml` |
 | dittobench-api deploy | none new; Actions pushes via WIF (`github-actions-deploy@ditto-app-dev`) on push to `main` | `dittobench-api/.github/workflows/ci.yml` |
-| Repo visibility flip | GitHub org admin on `dittobench-api` | C-OPEN |
 | Chain config | the subnet-owner (sudo) key for netuid 118; a funded coldkey for the registration burn | btcli sudo |
 
 Independent validators bring their own coldkey/hotkey, stake, model-gateway key,
@@ -62,7 +61,7 @@ and Pylon token on their own infra (see the last subsection).
 
 2. **Deploy the practice scorer (dittobench-api).** Push to `main` auto-deploys the keyless public practice validator to Cloud Run (the `harness_url` path) so miners can self-test before uploading. No manual step.
 
-3. **Open the scoring engine (C-OPEN).** Independent validators must run their own scorer, so the engine has to be public. The MIT LICENSE and validator-role README are already on `main`; the only action is flipping `dittobench-api` repo visibility to public (GitHub org admin). Tracked files and git history are secret-clean (verified); no keys in source.
+3. **Confirm the public scoring engine (C-OPEN, complete).** Independent validators run their own scorer from the public, MIT-licensed `dittobench-api` repository. Confirm an anonymous clone and the published validator instructions before launch. Tracked files and git history were verified secret-clean; no keys are stored in source.
 
 4. **Configure finney (netuid 118).** With the owner (sudo) key and a funded coldkey:
    - Confirm the subnet is registered on netuid 118.
@@ -130,10 +129,11 @@ Everything below ships after launch. None of it blocks launch.
 A trustless independent validator runs the whole evaluation itself, which fixes
 which repos are public and what is left to open.
 
-Repository visibility is separate from operational access. The platform and
-screener source are public, but both deployments remain centrally operated;
-private miner artifacts, review evidence, credentials, and protected admin
-operations are not made public with the source.
+Repository visibility is separate from operational access. The screener source
+is public, and the platform repository is being prepared for its visibility
+change. Both deployments remain centrally operated; private miner artifacts,
+review evidence, credentials, and protected admin operations are not made public
+with the source.
 
 | Repo | Role | Status | Action |
 |---|---|---|---|
@@ -142,22 +142,23 @@ operations are not made public with the source.
 | `dittobench-starter-kit` | miner harness kit | PUBLIC | none; miner-side |
 | `ditto-subnet` | the validator worker | PUBLIC | a validator runs this process |
 | `ditto-screener` | platform-operated v6 build/health gate; private artifacts and review evidence remain operational data | PUBLIC | MIT-licensed source; the team runs this process on the isolated screener VM |
-| `dittobench-api` | the scoring engine (build/run miner, model+egress lock, composite + gates) | PRIVATE | OPEN: flip visibility (pre-launch step 3) |
-| `ditto-platform` | central coordinator (dataset issuance, ticket lease, ledger, median) | PUBLIC | MIT-licensed source; the service remains centrally operated, and validators verify everything it returns (seed re-derivation, tarball sha256, signed scores, public audit log) |
+| `dittobench-api` | the scoring engine (build/run miner, model+egress lock, composite + gates) | PUBLIC | none; independently cloneable and MIT-licensed |
+| `ditto-platform` | central coordinator (dataset issuance, ticket lease, ledger, median) | PRIVATE | complete the open-source readiness checklist, then change visibility; the service remains centrally operated |
 | `ditto-data-pipeline` | upstream corpus extraction | PRIVATE | STAYS private: off the scoring path |
 
-So exactly one repo remains to open: **`dittobench-api`**. Open the whole repo in
-place, do not extract a subset: the scoring path pulls in nearly every internal
+The validator scoring path is public in place through `dittobench-api`; no
+subset extraction is required. The scoring path pulls in nearly every internal
 package (`internal/{scorer,sandbox,runner,netguard,astfp,store,llm,ratelimit}`
-plus `cmd/{model-relay,egress-proxy}`), so extraction would move ~90% of the repo
-for no benefit. Nothing to hide: no answer key is hardcoded (regenerated per seed
-via public datagen) and no keys are in source (env-only).
+plus `cmd/{model-relay,egress-proxy}`), so keeping it together preserves a usable,
+auditable validator implementation. No answer key is hardcoded (it is regenerated
+per seed via public datagen), and keys remain environment-only.
 
-Pre-open checklist status:
+Scoring-engine open checklist status:
 - Secrets scan: DONE. Tracked files and full git history are clean of key patterns (sk-or / cpk_ / private keys / AWS).
 - `cmd/model-relay` embeds no gateway secret: CONFIRMED. Key + model come from `RELAY_API_KEY` / `RELAY_MODEL` env.
 - `dittobench-datagen` pin: CURRENT (v0.7.0, the latest public tag).
-- LICENSE + README pointer: DONE and pushed. Only the visibility flip remains.
+- LICENSE + README pointer: DONE and pushed.
+- Public visibility and anonymous clone: DONE.
 
 ---
 
@@ -168,7 +169,7 @@ Pre-open checklist status:
 3. **B-TAIL**: participation-tail economics (tail size, min-score floor, or winner-take-all).
 4. **X-TRAJ** (post-launch): enrich the trajectory export, or ship name-only clone-matching.
 
-Resolved: open dittobench-api at launch with independent validators from day one
+Resolved: keep dittobench-api public with independent validators from day one
 (no self-hosted validator); verify `run_size=full` in prod rather than gating on it.
 
 ---
@@ -177,7 +178,7 @@ Resolved: open dittobench-api at launch with independent validators from day one
 
 - [ ] Coordinator deployed to prod: intake, screener, tickets, ledger, public API, `/health` green.
 - [ ] Practice scorer live on Cloud Run.
-- [ ] `dittobench-api` public (C-OPEN).
+- [x] `dittobench-api` public (C-OPEN).
 - [ ] finney netuid 118 hyperparameters + commit-reveal set; permit threshold live.
 - [x] Miner + validator onboarding published.
 - [ ] Enough independent validators registered to reach quorum, each setting weights via Pylon on finney.
