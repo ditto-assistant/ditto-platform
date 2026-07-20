@@ -504,6 +504,43 @@ class TestCheckExtrinsicSuccess:
             with pytest.raises(ChainTimeoutError):
                 await client.check_extrinsic_success("0xhash", 3)
 
+    async def test_historical_read_uses_authenticated_archive(
+        self, install_substrate_module: AsyncMock
+    ):
+        install_substrate_module.query.return_value = MagicMock(
+            value=[make_event_record(3, event_id="ExtrinsicSuccess")]
+        )
+        config = make_chain_config(
+            archive_rpc_url="wss://archive.example/rpc",
+            archive_rpc_api_key="key with spaces",
+        )
+
+        async with ChainClient(config) as client:
+            await client.check_extrinsic_success("0xhash", 3)
+
+        substrate_module = sys.modules["async_substrate_interface"]
+        substrate_module.AsyncSubstrateInterface.assert_called_once_with(
+            url="wss://archive.example/rpc?authorization=key%20with%20spaces"
+        )
+
+    async def test_archive_key_is_redacted_from_connection_error(
+        self, install_substrate_module: AsyncMock
+    ):
+        install_substrate_module.query.side_effect = RuntimeError(
+            "failed wss://archive.example?authorization=super-secret"
+        )
+        config = make_chain_config(
+            archive_rpc_url="wss://archive.example",
+            archive_rpc_api_key="super-secret",
+        )
+
+        async with ChainClient(config) as client:
+            with pytest.raises(ChainConnectionError) as exc_info:
+                await client.check_extrinsic_success("0xhash", 3)
+
+        assert "super-secret" not in str(exc_info.value)
+        assert "<redacted>" in str(exc_info.value)
+
 
 @pytest.mark.usefixtures("install_pylon_module")
 class TestGetColdkeyForHotkey:

@@ -62,6 +62,18 @@ class ChainConfig:
     automatically fall back to an archive node inside Pylon.
     """
 
+    archive_rpc_url: str | None = None
+    """Archive WebSocket URL for historical substrate storage reads.
+
+    Pylon already selects an archive node for its block-number APIs.  Ditto's
+    payment verifier also performs three block-hash storage reads directly via
+    ``async-substrate-interface``; those reads must use an archive endpoint or
+    finalized payment proofs stop working once the live node prunes the block.
+    """
+
+    archive_rpc_api_key: str | None = field(default=None, repr=False)
+    """Optional archive RPC API key, excluded from dataclass representations."""
+
     def __post_init__(self) -> None:
         """Validate that at least one Pylon auth mode is configured."""
         if bool(self.identity_name) != bool(self.identity_token):
@@ -92,14 +104,32 @@ def parse_chain_config_from_env() -> ChainConfig:
             (``PYLON_IDENTITY_NAME``, ``PYLON_IDENTITY_TOKEN``) is set.
             Surfaces from :meth:`ChainConfig.__post_init__`.
     """
+    subtensor_network = os.environ.get("SUBTENSOR_NETWORK", "finney")
+    archive_rpc_url = os.environ.get("SUBTENSOR_ARCHIVE_RPC_URL") or None
+    archive_rpc_api_key = os.environ.get("SUBTENSOR_ARCHIVE_RPC_API_KEY") or None
+    if (
+        archive_rpc_url == "wss://api.taostats.io/api/v1/rpc/ws/finney_archive"
+        and archive_rpc_api_key is None
+    ):
+        # Reuse the existing Taostats secret only for Taostats' exact hostname;
+        # never forward that credential to an arbitrary configured provider.
+        archive_rpc_api_key = os.environ.get("DITTO_TAOSTATS_API_KEY") or None
+    if archive_rpc_url is None and subtensor_network == "finney":
+        # OTF documents this public endpoint for occasional historical reads.
+        # An authenticated provider can be selected explicitly when higher
+        # request volume warrants it.
+        archive_rpc_url = "wss://archive.chain.opentensor.ai:443"
+
     return ChainConfig(
         pylon_url=os.environ.get("PYLON_URL", "http://localhost:8001"),
         netuid=int(os.environ.get("NETUID", "118")),
         open_access_token=os.environ.get("PYLON_OPEN_ACCESS_TOKEN") or None,
         identity_name=os.environ.get("PYLON_IDENTITY_NAME") or None,
         identity_token=os.environ.get("PYLON_IDENTITY_TOKEN") or None,
-        subtensor_network=os.environ.get("SUBTENSOR_NETWORK", "finney"),
+        subtensor_network=subtensor_network,
         archive_blocks_cutoff=int(os.environ.get("ARCHIVE_BLOCKS_CUTOFF", "300")),
+        archive_rpc_url=archive_rpc_url,
+        archive_rpc_api_key=archive_rpc_api_key,
     )
 
 
