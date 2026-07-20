@@ -28,7 +28,11 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.screener import (
+    SCREENING_POLICY_VERSION,
+    SourceReviewEvidenceItem,
+    SourceReviewFinding,
+)
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.datapipeline import DataPipelineError
@@ -1590,6 +1594,21 @@ class TestPublicActivity:
         )
         now = datetime.now(UTC)
         attempt_id = uuid4()
+        private_finding = SourceReviewFinding(
+            artifact_sha256="cd" * 32,
+            prompt_revision="private-pending-review-v1",
+            risk_level="high",
+            confidence=0.99,
+            categories=["answer_mutation"],
+            evidence=[
+                SourceReviewEvidenceItem(
+                    path="src/private_innovation.rs",
+                    line=41,
+                    category="answer_mutation",
+                )
+            ],
+            summary="Pending finding must remain private until a terminal rejection.",
+        )
         async with session_maker() as session, session.begin():
             session.add_all(
                 [
@@ -1611,7 +1630,17 @@ class TestPublicActivity:
                         screener_hotkey=_MINER_B,
                         policy_version=SCREENING_POLICY_VERSION,
                         manifest_digest="ab" * 32,
+                        finding_digest=private_finding.canonical_digest(),
                         reason_code="suspicious_source",
+                        evidence=[
+                            {
+                                "module_id": "agentic-source-review",
+                                "code": "pending-private-review",
+                                "summary": "Pending evidence remains private.",
+                                "digest": None,
+                            }
+                        ],
+                        finding=private_finding.model_dump(mode="json"),
                         status="active",
                     ),
                 ]
@@ -1625,6 +1654,8 @@ class TestPublicActivity:
         assert attempt["status"] == "quarantined"
         assert attempt["quarantine_resolution"] is None
         assert attempt["quarantine_resolved_at"] is None
+        assert attempt["review_evidence"] == []
+        assert attempt["review_finding"] is None
 
     async def test_released_quarantine_resolution_is_public_in_attempt_history(
         self,
@@ -1687,6 +1718,119 @@ class TestPublicActivity:
             tzinfo=None
         )
         assert "resolved_by" not in attempt
+        assert attempt["review_evidence"] == []
+        assert attempt["review_finding"] is None
+
+    async def test_rejected_quarantine_publishes_only_digest_verified_review(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.REJECTED,
+                screening_reason="Submission violated the anti-cheat policy",
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        now = datetime.now(UTC)
+        attempt_id = uuid4()
+        finding = SourceReviewFinding(
+            artifact_sha256="cd" * 32,
+            prompt_revision="public-safe-review-v1",
+            risk_level="high",
+            confidence=0.99,
+            categories=["answer_mutation"],
+            evidence=[
+                SourceReviewEvidenceItem(
+                    path="src/response.rs",
+                    line=73,
+                    category="answer_mutation",
+                )
+            ],
+            summary=(
+                "A reachable policy-controlled branch replaces the authoritative "
+                "model answer before the response is returned."
+            ),
+        )
+        async with session_maker() as session, session.begin():
+            session.add_all(
+                [
+                    ScreeningAttempt(
+                        attempt_id=attempt_id,
+                        agent_id=agent_id,
+                        screener_hotkey=_MINER_B,
+                        policy_version=SCREENING_POLICY_VERSION,
+                        status="quarantined",
+                        started_at=now - timedelta(minutes=12),
+                        deadline=now + timedelta(minutes=18),
+                        finished_at=now - timedelta(minutes=10),
+                        public_reason="Submission held for anti-cheat review",
+                    ),
+                    ScreeningQuarantine(
+                        quarantine_id=uuid4(),
+                        agent_id=agent_id,
+                        attempt_id=attempt_id,
+                        screener_hotkey=_MINER_B,
+                        policy_version=SCREENING_POLICY_VERSION,
+                        manifest_digest="ab" * 32,
+                        finding_digest=finding.canonical_digest(),
+                        reason_code="suspicious_source",
+                        evidence=[
+                            {
+                                "module_id": "agentic-source-review",
+                                "code": "answer-authority-violation",
+                                "summary": (
+                                    "The served response path replaces a model-"
+                                    "authored answer with policy-controlled output."
+                                ),
+                                "digest": "ef" * 32,
+                            }
+                        ],
+                        finding=finding.model_dump(mode="json"),
+                        status="resolved",
+                        resolved_at=now,
+                        resolved_by="automation:screening-policy-v9",
+                        resolution="reject",
+                        resolution_reason="Verified prohibited answer replacement",
+                    ),
+                ]
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+
+        assert response.status_code == 200
+        attempt = response.json()["screening_attempts"][0]
+        assert attempt["review_evidence"] == [
+            {
+                "module": "agentic-source-review",
+                "code": "answer-authority-violation",
+                "summary": (
+                    "The served response path replaces a model-authored answer with "
+                    "policy-controlled output."
+                ),
+            }
+        ]
+        assert attempt["review_finding"] == {
+            "reviewer_revision": "public-safe-review-v1",
+            "risk_level": "high",
+            "confidence": 0.99,
+            "categories": ["answer_mutation"],
+            "locations": [
+                {
+                    "path": "src/response.rs",
+                    "line": 73,
+                    "category": "answer_mutation",
+                }
+            ],
+            "summary": finding.summary,
+        }
+        assert "artifact_sha256" not in attempt["review_finding"]
+        assert "digest" not in attempt["review_evidence"][0]
 
     async def test_evaluation_projects_live_work_from_validator_heartbeat(
         self,

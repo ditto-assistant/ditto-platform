@@ -605,7 +605,8 @@ class TestDashboard:
         assert "screenerStageLabel" in body
         assert "screening_progress" in body
         assert "Building image" in body
-        assert "LLM review" in body
+        assert "L1 source review" in body
+        assert "L2/L3 deep review" in body
         assert "source_review_" in body
         assert "elapsedDuration" in body
         assert "benchmark-progress-time" in body
@@ -617,6 +618,20 @@ class TestDashboard:
         assert "data-started-at" in body
         assert "active_agent_name" in body
         assert "setInterval(updateElapsedTimes, 1000)" in body
+
+    async def test_includes_public_terminal_screening_review_cards(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert "function renderScreeningReview(attempt)" in body
+        assert "Why this submission was rejected" in body
+        assert "Source locations in the served path" in body
+        assert "Policy observations" in body
+        assert "Digest-verified public review" in body
+        assert "no source text or private challenge data" in body
+        assert "finding.reviewer_revision" in body
+        assert 'aria-label="Detailed screening rejection"' in body
+        assert ".screening-review-location code" in body
+        assert "grid-column: 1 / -1" in body
 
     async def test_includes_copy_controls_for_operational_identifiers(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
