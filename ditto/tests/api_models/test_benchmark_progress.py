@@ -80,3 +80,45 @@ def test_requires_timezone_and_canonicalizes_signing_token() -> None:
         "running_benchmark,51,114,2030-01-01T00:00:00.000000+00:00"
     )
     assert benchmark_progress_signing_token(None) == "-"
+
+
+def test_run_token_is_optional_and_backward_compatible() -> None:
+    """A None run_token must yield the exact pre-token signing bytes."""
+    without_token = BenchmarkProgress(
+        stage="running_benchmark",
+        completed=51,
+        total=114,
+        ticket_deadline=_DEADLINE,
+    )
+    assert without_token.run_token is None
+    # Byte-identical to the historical (pre-run_token) format so every existing
+    # v4+ heartbeat signature still verifies.
+    assert benchmark_progress_signing_token(without_token) == (
+        "running_benchmark,51,114,2030-01-01T00:00:00.000000+00:00"
+    )
+
+    with_token = BenchmarkProgress(
+        stage="running_benchmark",
+        completed=51,
+        total=114,
+        ticket_deadline=_DEADLINE,
+        run_token="0123456789abcdef",
+    )
+    assert benchmark_progress_signing_token(with_token) == (
+        "running_benchmark,51,114,2030-01-01T00:00:00.000000+00:00,0123456789abcdef"
+    )
+
+
+@pytest.mark.parametrize(
+    "run_token",
+    ["", "XYZ", "abc", "g" * 8, "a" * 65, "ABCDEF01"],
+)
+def test_rejects_malformed_run_token(run_token: str) -> None:
+    with pytest.raises(ValidationError):
+        BenchmarkProgress(
+            stage="running_benchmark",
+            completed=51,
+            total=114,
+            ticket_deadline=_DEADLINE,
+            run_token=run_token,
+        )

@@ -243,6 +243,78 @@ class JobResponse(BaseModel):
     )
 
 
+FailJobReason = Literal[
+    "infrastructure_error",
+    "benchmark_error",
+    "platform_error",
+]
+"""Coarse reason a validator hands a leased ticket back for reissue.
+
+Deliberately low-cardinality so no run-specific detail leaks: the platform only
+records the reason, it never branches on it. ``infrastructure_error`` maps to the
+validator's ``ValidatorInfrastructureError`` sweep-ending branch; the other two
+map to ``DittobenchError`` / ``PlatformError`` scoring failures respectively.
+"""
+
+
+class FailJobRequest(BaseModel):
+    """Signed request to hand a still-leased ticket back after a failed attempt.
+
+    A validator whose scoring attempt failed calls this so the platform closes
+    the live ticket immediately (status ``expired``, ``retry_after`` now) and the
+    slot re-opens for a fresh ticket, instead of the lease sitting idle until its
+    deadline. Mirrors :class:`JobRequest`'s proof-of-possession: the signature
+    proves the hotkey, ``nonce`` is one-time, and ``requested_at`` is
+    freshness-bounded. The ``(agent_id, ticket_deadline)`` pair identifies the
+    exact lease the caller must currently hold.
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Failing validator hotkey.")
+    ]
+    agent_id: Annotated[UUID, Field(description="Agent whose ticket failed.")]
+    ticket_deadline: Annotated[
+        datetime,
+        Field(description="Exact deadline from the JobResponse ticket lease."),
+    ]
+    reason: Annotated[
+        FailJobReason, Field(description="Coarse failure class (recorded only).")
+    ]
+    nonce: Annotated[UUID, Field(description="One-time claim nonce.")]
+    requested_at: Annotated[
+        datetime, Field(description="UTC time at which the request was signed.")
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            pattern=_SIGNATURE_HEX_PATTERN,
+            description="sr25519 signature over the canonical fail payload.",
+        ),
+    ]
+
+    @field_validator("requested_at", "ticket_deadline")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("timestamps must include a timezone")
+        return value
+
+
+class FailJobResponse(BaseModel):
+    """Returned by ``POST /validator/job/fail``.
+
+    ``reopened`` is ``True`` when a live ticket matching the signed lease was
+    found and closed for immediate reissue; ``False`` when the caller held no
+    such live ticket (already expired, scored, or never issued) — a no-op that
+    is safe to ignore, keeping the endpoint idempotent and best-effort.
+    """
+
+    agent_id: Annotated[UUID, Field(description="Echoes the failed agent id.")]
+    reopened: Annotated[
+        bool, Field(description="``True`` when a live ticket was closed for reissue.")
+    ]
+
+
 class ValidatorHeartbeatRequest(BaseModel):
     """Signed proof of the validator build currently serving a hotkey.
 
