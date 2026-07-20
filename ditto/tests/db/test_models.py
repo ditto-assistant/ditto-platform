@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError as SAIntegrityError
 from sqlalchemy.exc import StatementError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ditto.db.models import Agent, AgentStatus, EvaluationPayment
+from ditto.db.models import Agent, AgentStatus, EvaluationPayment, Score
 
 
 def make_agent(**overrides: Any) -> Agent:
@@ -71,6 +71,25 @@ class TestAgentStatusEnum:
             "rejected",
         }
         assert {s.value for s in AgentStatus} == expected
+
+
+class TestScoreIndexes:
+    """Keep the ORM schema aligned with dashboard query migrations."""
+
+    def test_benchmark_dashboard_index_shape(self):
+        index = next(
+            index
+            for index in Score.__table__.indexes
+            if index.name == "scores_bench_version_agent_composite_idx"
+        )
+
+        assert [column.name for column in index.columns] == [
+            "bench_version",
+            "agent_id",
+            "composite",
+            "validator_hotkey",
+        ]
+        assert index.dialect_options["postgresql"]["include"] == ["updated_at"]
 
 
 class TestAgentRoundTrip:

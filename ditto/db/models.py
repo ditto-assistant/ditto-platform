@@ -849,6 +849,18 @@ class Score(Base):
         CheckConstraint("median_ms >= 0", name="scores_median_ms_check"),
         CheckConstraint("bench_version > 0", name="scores_bench_version_positive"),
         Index("scores_agent_id_idx", "agent_id"),
+        # Dashboard/ledger reads select one benchmark era before grouping or
+        # ranking scores.  Keep the aggregate columns in the index so the
+        # frequently-polled activity snapshot can stay index-only as older
+        # benchmark eras accumulate.
+        Index(
+            "scores_bench_version_agent_composite_idx",
+            "bench_version",
+            "agent_id",
+            "composite",
+            "validator_hotkey",
+            postgresql_include=["updated_at"],
+        ),
     )
 
 
