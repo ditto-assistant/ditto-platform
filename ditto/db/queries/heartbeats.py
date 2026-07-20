@@ -83,10 +83,17 @@ def _validate_same_lease_progress(
 ) -> None:
     if previous.ticket_deadline != current.ticket_deadline:
         return
-    # The validator's retry loop explicitly emits preparing before restarting
-    # the same ticketed job. This one signed transition is the reset marker;
-    # failed_retrying -> any other earlier stage remains a regression.
-    if previous.stage == "failed_retrying" and current.stage == "preparing":
+    # `preparing` is the first stage of every run (the scorer's queued -> preparing),
+    # so a heartbeat that reports it marks a fresh run WITHIN the same lease and its
+    # progress legitimately resets. This covers both a failed_retrying retry and the
+    # next confirmation seed of a multi-seed evaluation (a completed run at
+    # finalizing/submitting_result followed by preparing for the next seed). Accept
+    # it and rebaseline; monotonicity is still enforced within a single run below.
+    # Without this, the reset heartbeat is rejected, the baseline stays pinned to the
+    # prior run's high completed count, and every subsequent heartbeat is refused
+    # ("completed count cannot regress") — freezing seen_at so a healthy, actively
+    # scoring validator reads as heartbeat_stale.
+    if current.stage == "preparing":
         return
     if _STAGE_ORDER[current.stage] < _STAGE_ORDER[previous.stage]:
         raise HeartbeatProgressRegressionError(
