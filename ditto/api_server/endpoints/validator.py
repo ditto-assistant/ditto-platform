@@ -115,7 +115,10 @@ from ditto.db.queries.audit import (
     EVENT_AUDIT,
     EVENT_FINALIZED,
     EVENT_SCORE,
+    EVENT_SCORE_INVALIDATED,
+    EVENT_SCORE_RETEST_REQUESTED,
     append_audit_entry,
+    get_latest_score_retest_event,
 )
 from ditto.db.queries.benchmark_rollout import (
     LEGACY_BENCH_VERSION,
@@ -1331,6 +1334,44 @@ async def submit_score(
                 status_code=409,
                 detail="score benchmark version does not match its ticket lease",
             )
+        existing_score = await session.get(
+            Score, (agent_id, ticket.bench_version, payload.validator_hotkey)
+        )
+        replacement_event = None
+        if existing_score is not None:
+            latest_retest = await get_latest_score_retest_event(
+                session,
+                agent_id=agent_id,
+                validator_hotkey=payload.validator_hotkey,
+            )
+            if (
+                latest_retest is None
+                or latest_retest.event != EVENT_SCORE_RETEST_REQUESTED
+            ):
+                if agent.status not in {AgentStatus.SCORED, AgentStatus.LIVE}:
+                    latest_retest = None
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="accepted score has no operator-authorized re-test",
+                    )
+            if latest_retest is None:
+                replacement_event = None
+            else:
+                if (
+                    int(latest_retest.payload.get("bench_version", -1))
+                    != ticket.bench_version
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="replacement request benchmark version changed",
+                    )
+                if latest_retest.payload.get("run_id") != existing_score.run_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="accepted score changed after replacement request",
+                    )
+                replacement_event = latest_retest
         # Persist the scoring engine's opaque telemetry (models used,
         # bench_version, dataset_sha256, per-category means, token spend, …) plus
         # the per-case breakdown, all under scores.details. The public leaderboard
@@ -1364,6 +1405,45 @@ async def submit_score(
             score_details["per_case"] = [
                 c.model_dump(mode="json") for c in report.per_case
             ]
+        audit_now = datetime.now(UTC)
+        if replacement_event is not None and agent.status in {
+            AgentStatus.SCORED,
+            AgentStatus.LIVE,
+        }:
+            assert existing_score is not None
+            await append_audit_entry(
+                session,
+                agent_id=agent_id,
+                validator_hotkey=payload.validator_hotkey,
+                event=EVENT_SCORE_INVALIDATED,
+                payload={
+                    "request_id": replacement_event.payload["request_id"],
+                    "actor": replacement_event.payload["actor"],
+                    "reason": replacement_event.payload["reason"],
+                    "bench_version": ticket.bench_version,
+                    "run_id": existing_score.run_id,
+                    "invalidated_score": {
+                        "run_id": existing_score.run_id,
+                        "seed": existing_score.seed,
+                        "composite": existing_score.composite,
+                        "tool_mean": existing_score.tool_mean,
+                        "memory_mean": existing_score.memory_mean,
+                        "median_ms": existing_score.median_ms,
+                        "n": existing_score.n,
+                        "bench_version": existing_score.bench_version,
+                        "ticket_deadline": (
+                            existing_score.details.get("ticket_deadline")
+                            if isinstance(existing_score.details, dict)
+                            else None
+                        ),
+                        "signature": existing_score.signature,
+                        "generated_at": existing_score.generated_at.isoformat(),
+                    },
+                    "replacement_run_id": report.run_id,
+                    "replacement_composite": report.composite,
+                },
+                recorded_at=audit_now,
+            )
         await upsert_score(
             session,
             agent_id=agent_id,
@@ -1384,7 +1464,6 @@ async def submit_score(
         # same transaction (durable iff the score is). Records the full signed
         # tuple + signature so the entry is independently verifiable off the
         # public audit feed, never any per-case answer-key content.
-        audit_now = datetime.now(UTC)
         await append_audit_entry(
             session,
             agent_id=agent_id,
@@ -1405,6 +1484,42 @@ async def submit_score(
             },
             recorded_at=audit_now,
         )
+        if replacement_event is not None:
+            replacement_scores = await list_scores_for_agent(
+                session, agent_id=agent_id, bench_version=ticket.bench_version
+            )
+            replacement_median = statistics.median(
+                score.composite for score in replacement_scores
+            )
+            await append_audit_entry(
+                session,
+                agent_id=agent_id,
+                validator_hotkey=None,
+                event=EVENT_FINALIZED,
+                payload={
+                    "miner_hotkey": agent.miner_hotkey,
+                    "median_composite": replacement_median,
+                    "quorum": SCORING_QUORUM,
+                    "score_count": len(replacement_scores),
+                    "validator_hotkeys": sorted(
+                        score.validator_hotkey for score in replacement_scores
+                    ),
+                    "dataset_seed": agent.dataset_seed,
+                    "dataset_sha256": agent.dataset_sha256,
+                    "dataset_seed_block": agent.dataset_seed_block,
+                    "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+                    "status": agent.status.value,
+                    "replacement_request_id": replacement_event.payload["request_id"],
+                    "replaced_run_id": replacement_event.payload["run_id"],
+                },
+                recorded_at=audit_now,
+            )
+            await _publish_finalized_run(
+                storage,
+                agent=agent,
+                scores=replacement_scores,
+                median=replacement_median,
+            )
         # Persist the crate's structural (AST) fingerprint from the report, so it
         # is available for the gate here and for future cross-miner comparison.
         # Advisory + unsigned: only overwrite when the report actually carries one,

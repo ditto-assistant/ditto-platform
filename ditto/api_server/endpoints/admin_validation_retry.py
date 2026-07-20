@@ -10,15 +10,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import statistics
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.admin_validation_retry import (
+    AdminScoreOutlier,
+    AdminScoreOutlierList,
+    AdminScoreOutlierScore,
     AdminValidationRecovery,
     AdminValidationRetryDetail,
     AdminValidationRetryRequest,
@@ -27,6 +31,8 @@ from ditto.api_models.admin_validation_retry import (
     AdminValidatorScoreReplacementDetail,
     AdminValidatorScoreReplacementRequest,
     AdminValidatorScoreReplacementResponse,
+    AdminValidatorScoreRetestReleaseRequest,
+    AdminValidatorScoreRetestReleaseResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
@@ -40,7 +46,12 @@ from ditto.db.models import (
     ValidatorRetryRecovery,
     ValidatorTicket,
 )
-from ditto.db.queries.audit import EVENT_SCORE_INVALIDATED, append_audit_entry
+from ditto.db.queries.audit import (
+    EVENT_SCORE_RETEST_RELEASED,
+    EVENT_SCORE_RETEST_REQUESTED,
+    append_audit_entry,
+    get_latest_score_retest_event,
+)
 from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION
@@ -56,6 +67,9 @@ _REPLACEABLE_STATUSES = {
     AgentStatus.SCORED,
     AgentStatus.LIVE,
 }
+_FINALIZED_STATUSES = {AgentStatus.SCORED, AgentStatus.LIVE}
+OUTLIER_MIN_DEVIATION = 0.15
+OUTLIER_GAP_RATIO = 2.0
 
 
 def _aware(value: datetime) -> datetime:
@@ -108,6 +122,63 @@ def _snapshot(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _score_evidence(score: Score) -> dict[str, object]:
+    return {
+        "run_id": score.run_id,
+        "seed": score.seed,
+        "composite": score.composite,
+        "tool_mean": score.tool_mean,
+        "memory_mean": score.memory_mean,
+        "median_ms": score.median_ms,
+        "n": score.n,
+        "bench_version": score.bench_version,
+        "ticket_deadline": (
+            score.details.get("ticket_deadline")
+            if isinstance(score.details, dict)
+            else None
+        ),
+        "signature": score.signature,
+        "generated_at": _aware(score.generated_at).isoformat(),
+    }
+
+
+def _detect_outlier(scores: list[Score]) -> tuple[Score, str, float, float] | None:
+    """Find one unambiguous extreme in a three-score median quorum.
+
+    The extreme-to-median gap must be at least 0.15 and at least twice the
+    other adjacent gap. This catches one validator far above or below a tight
+    peer pair while declining to guess when all three scores are simply broad.
+    """
+    if len(scores) != SCORING_QUORUM:
+        return None
+    ordered = sorted(
+        scores, key=lambda score: (score.composite, score.validator_hotkey)
+    )
+    low_gap = ordered[1].composite - ordered[0].composite
+    high_gap = ordered[2].composite - ordered[1].composite
+    if low_gap == high_gap:
+        return None
+    if low_gap > high_gap:
+        deviation, peer_spread = low_gap, high_gap
+        candidate, direction = ordered[0], "low"
+    else:
+        deviation, peer_spread = high_gap, low_gap
+        candidate, direction = ordered[2], "high"
+    if deviation < OUTLIER_MIN_DEVIATION:
+        return None
+    if deviation < OUTLIER_GAP_RATIO * peer_spread:
+        return None
+    return candidate, direction, deviation, peer_spread
+
+
+def _outlier_score(score: Score) -> AdminScoreOutlierScore:
+    return AdminScoreOutlierScore(
+        validator_hotkey=score.validator_hotkey,
+        run_id=score.run_id,
+        composite=score.composite,
+    )
 
 
 def _recovery_item(row: ValidatorRetryRecovery) -> AdminValidationRecovery:
@@ -428,16 +499,109 @@ def _replacement_gate(
     target: Score | None,
     ticket: ValidatorTicket | None,
     validator_busy: bool,
+    replacement_pending: bool = False,
 ) -> str | None:
     if agent.status not in _REPLACEABLE_STATUSES:
         return "submission is not in a scoreable state"
     if target is None:
         return "validator has no accepted score to replace"
+    if replacement_pending:
+        return "replacement score is already pending"
     if ticket is None or ticket.status != TicketStatus.SCORED:
         return "accepted score is not backed by a consumed validator ticket"
     if validator_busy:
         return "validator is currently assigned to another submission"
     return None
+
+
+@router.get("/score-outliers", response_model=AdminScoreOutlierList)
+async def list_score_outliers(
+    _admin: AdminDep,
+    session: SessionDep,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> AdminScoreOutlierList:
+    """List finalized three-score quorums with one unambiguous extreme."""
+    agents = list(
+        (
+            await session.scalars(
+                select(Agent)
+                .where(Agent.status.in_(_FINALIZED_STATUSES))
+                .order_by(Agent.agent_id.asc())
+            )
+        ).all()
+    )
+    detected: list[AdminScoreOutlier] = []
+    for listed_agent in agents:
+        agent, bench_version, scores, tickets, _ = await _load(
+            session, agent_id=listed_agent.agent_id, for_update=False
+        )
+        assert agent is not None
+        result = _detect_outlier(scores)
+        if result is None:
+            continue
+        target, direction, deviation, peer_spread = result
+        ticket = next(
+            (
+                item
+                for item in tickets
+                if item.validator_hotkey == target.validator_hotkey
+            ),
+            None,
+        )
+        latest = await get_latest_score_retest_event(
+            session,
+            agent_id=agent.agent_id,
+            validator_hotkey=target.validator_hotkey,
+        )
+        pending = latest is not None and latest.event == EVENT_SCORE_RETEST_REQUESTED
+        busy = await _validator_busy_elsewhere(
+            session,
+            agent_id=agent.agent_id,
+            validator_hotkey=target.validator_hotkey,
+        )
+        blocking = _replacement_gate(
+            agent=agent,
+            target=target,
+            ticket=ticket,
+            validator_busy=busy,
+            replacement_pending=pending,
+        )
+        detected.append(
+            AdminScoreOutlier(
+                agent_id=agent.agent_id,
+                agent_name=agent.name,
+                miner_hotkey=agent.miner_hotkey,
+                agent_status=agent.status.value,
+                bench_version=bench_version,
+                snapshot=_snapshot(agent=agent, scores=scores, tickets=tickets),
+                median_composite=float(
+                    statistics.median(score.composite for score in scores)
+                ),
+                direction=direction,  # type: ignore[arg-type]
+                outlier=_outlier_score(target),
+                peers=[
+                    _outlier_score(score) for score in scores if score is not target
+                ],
+                deviation=deviation,
+                peer_spread=peer_spread,
+                ticket_status=ticket.status.value if ticket is not None else None,
+                replacement_pending=pending,
+                replacement_deadline=(
+                    ticket.deadline if pending and ticket is not None else None
+                ),
+                replacement_allowed=blocking is None,
+                blocking_reason=blocking,
+            )
+        )
+
+    detected.sort(key=lambda item: (-item.deviation, str(item.agent_id)))
+    return AdminScoreOutlierList(
+        items=detected[offset : offset + limit],
+        count=len(detected),
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get(
@@ -467,6 +631,10 @@ async def inspect_validator_score_replacement(
         ),
         None,
     )
+    latest = await get_latest_score_retest_event(
+        session, agent_id=agent_id, validator_hotkey=validator_hotkey
+    )
+    pending = latest is not None and latest.event == EVENT_SCORE_RETEST_REQUESTED
     reason = _replacement_gate(
         agent=agent,
         target=target,
@@ -474,6 +642,7 @@ async def inspect_validator_score_replacement(
         validator_busy=await _validator_busy_elsewhere(
             session, agent_id=agent_id, validator_hotkey=validator_hotkey
         ),
+        replacement_pending=pending,
     )
     return AdminValidatorScoreReplacementDetail(
         agent_id=agent_id,
@@ -487,6 +656,18 @@ async def inspect_validator_score_replacement(
         composite=target.composite if target is not None else None,
         ticket_status=ticket.status.value if ticket is not None else None,
         ticket_deadline=ticket.deadline if ticket is not None else None,
+        replacement_pending=pending,
+        replacement_request_id=(
+            UUID(str(latest.payload["request_id"]))
+            if pending and latest is not None
+            else None
+        ),
+        replacement_reason=(
+            str(latest.payload["reason"]) if pending and latest is not None else None
+        ),
+        replacement_actor=(
+            str(latest.payload["actor"]) if pending and latest is not None else None
+        ),
         replacement_allowed=reason is None,
         blocking_reason=reason,
     )
@@ -514,7 +695,7 @@ async def replace_validator_score_after_infrastructure_failure(
                     select(ScoreAuditEntry).where(
                         ScoreAuditEntry.agent_id == agent_id,
                         ScoreAuditEntry.validator_hotkey == validator_hotkey,
-                        ScoreAuditEntry.event == EVENT_SCORE_INVALIDATED,
+                        ScoreAuditEntry.event == EVENT_SCORE_RETEST_REQUESTED,
                     )
                 )
             ).all()
@@ -539,12 +720,12 @@ async def replace_validator_score_after_infrastructure_failure(
                 request_id=payload.request_id,
                 agent_id=agent_id,
                 validator_hotkey=validator_hotkey,
-                invalidated_run_id=payload.expected_run_id,
+                original_run_id=payload.expected_run_id,
                 bench_version=int(prior.payload["bench_version"]),
                 replacement_deadline=datetime.fromisoformat(
                     str(prior.payload["replacement_deadline"])
                 ),
-                remaining_score_count=int(prior.payload["remaining_score_count"]),
+                preserved_score_count=int(prior.payload["preserved_score_count"]),
                 idempotent=True,
             )
 
@@ -577,43 +758,23 @@ async def replace_validator_score_after_infrastructure_failure(
             validator_busy=await _validator_busy_elsewhere(
                 session, agent_id=agent_id, validator_hotkey=validator_hotkey
             ),
+            replacement_pending=False,
         )
         if reason is not None:
             raise HTTPException(status_code=409, detail=reason)
         assert target is not None and ticket is not None
         now = datetime.now(UTC)
         deadline = now + _REPLACEMENT_TICKET_TTL
-        invalidated = {
-            "run_id": target.run_id,
-            "seed": target.seed,
-            "composite": target.composite,
-            "tool_mean": target.tool_mean,
-            "memory_mean": target.memory_mean,
-            "median_ms": target.median_ms,
-            "n": target.n,
-            "bench_version": target.bench_version,
-            "ticket_deadline": (
-                target.details.get("ticket_deadline")
-                if isinstance(target.details, dict)
-                else None
-            ),
-            "signature": target.signature,
-            "generated_at": _aware(target.generated_at).isoformat(),
-        }
-        await session.delete(target)
         ticket.status = TicketStatus.ISSUED
         ticket.issued_at = now
         ticket.deadline = deadline
         ticket.attempt_count += 1
         ticket.retry_after = None
-        if agent.status in {AgentStatus.SCORED, AgentStatus.LIVE}:
-            agent.status = AgentStatus.EVALUATING
-        remaining = len(scores) - 1
         await append_audit_entry(
             session,
             agent_id=agent_id,
             validator_hotkey=validator_hotkey,
-            event=EVENT_SCORE_INVALIDATED,
+            event=EVENT_SCORE_RETEST_REQUESTED,
             payload={
                 "request_id": str(payload.request_id),
                 "actor": actor,
@@ -621,9 +782,9 @@ async def replace_validator_score_after_infrastructure_failure(
                 "expected_snapshot": payload.expected_snapshot,
                 "bench_version": bench_version,
                 "run_id": payload.expected_run_id,
-                "invalidated_score": invalidated,
+                "preserved_score": _score_evidence(target),
                 "replacement_deadline": deadline.isoformat(),
-                "remaining_score_count": remaining,
+                "preserved_score_count": len(scores),
             },
             recorded_at=now,
         )
@@ -632,9 +793,130 @@ async def replace_validator_score_after_infrastructure_failure(
         request_id=payload.request_id,
         agent_id=agent_id,
         validator_hotkey=validator_hotkey,
-        invalidated_run_id=payload.expected_run_id,
+        original_run_id=payload.expected_run_id,
         bench_version=bench_version,
         replacement_deadline=deadline,
-        remaining_score_count=remaining,
+        preserved_score_count=len(scores),
+        idempotent=False,
+    )
+
+
+@router.post(
+    "/validation-retries/{agent_id}/validators/{validator_hotkey}/release-ticket",
+    response_model=AdminValidatorScoreRetestReleaseResponse,
+)
+async def release_validator_score_retest_ticket(
+    agent_id: UUID,
+    validator_hotkey: str,
+    payload: AdminValidatorScoreRetestReleaseRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminValidatorScoreRetestReleaseResponse:
+    actor = x_admin_actor.strip() if x_admin_actor is not None else ""
+    if not 1 <= len(actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    async with session.begin():
+        release_entries = list(
+            (
+                await session.scalars(
+                    select(ScoreAuditEntry).where(
+                        ScoreAuditEntry.agent_id == agent_id,
+                        ScoreAuditEntry.validator_hotkey == validator_hotkey,
+                        ScoreAuditEntry.event == EVENT_SCORE_RETEST_RELEASED,
+                    )
+                )
+            ).all()
+        )
+        prior = next(
+            (
+                entry
+                for entry in release_entries
+                if entry.payload.get("request_id") == str(payload.request_id)
+            ),
+            None,
+        )
+        if prior is not None:
+            if (
+                prior.payload.get("actor") != actor
+                or prior.payload.get("reason") != payload.reason
+                or prior.payload.get("expected_snapshot") != payload.expected_snapshot
+                or prior.payload.get("expected_deadline")
+                != _aware(payload.expected_deadline).isoformat()
+            ):
+                raise HTTPException(status_code=409, detail="request id already used")
+            return AdminValidatorScoreRetestReleaseResponse(
+                request_id=payload.request_id,
+                agent_id=agent_id,
+                validator_hotkey=validator_hotkey,
+                status="scored",
+                preserved_run_id=str(prior.payload["preserved_run_id"]),
+                idempotent=True,
+            )
+
+        agent, bench_version, scores, tickets, target = await _replacement_state(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=validator_hotkey,
+            for_update=True,
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
+        if current_snapshot != payload.expected_snapshot:
+            raise HTTPException(status_code=409, detail="validation state changed")
+        latest = await get_latest_score_retest_event(
+            session, agent_id=agent_id, validator_hotkey=validator_hotkey
+        )
+        if latest is None or latest.event != EVENT_SCORE_RETEST_REQUESTED:
+            raise HTTPException(
+                status_code=409, detail="no replacement ticket is pending"
+            )
+        ticket = next(
+            (
+                item
+                for item in tickets
+                if item.validator_hotkey == validator_hotkey
+                and item.bench_version == bench_version
+            ),
+            None,
+        )
+        if target is None or ticket is None:
+            raise HTTPException(
+                status_code=409, detail="replacement state is incomplete"
+            )
+        if _aware(ticket.deadline) != _aware(payload.expected_deadline):
+            raise HTTPException(status_code=409, detail="replacement ticket changed")
+        if ticket.status not in {TicketStatus.ISSUED, TicketStatus.EXPIRED}:
+            raise HTTPException(
+                status_code=409, detail="replacement ticket is not releasable"
+            )
+        ticket.status = TicketStatus.SCORED
+        ticket.retry_after = None
+        now = datetime.now(UTC)
+        await append_audit_entry(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=validator_hotkey,
+            event=EVENT_SCORE_RETEST_RELEASED,
+            payload={
+                "request_id": str(payload.request_id),
+                "retest_request_id": latest.payload.get("request_id"),
+                "actor": actor,
+                "reason": payload.reason,
+                "expected_snapshot": payload.expected_snapshot,
+                "expected_deadline": _aware(payload.expected_deadline).isoformat(),
+                "bench_version": bench_version,
+                "preserved_run_id": target.run_id,
+            },
+            recorded_at=now,
+        )
+        await session.flush()
+    return AdminValidatorScoreRetestReleaseResponse(
+        request_id=payload.request_id,
+        agent_id=agent_id,
+        validator_hotkey=validator_hotkey,
+        status="scored",
+        preserved_run_id=target.run_id,
         idempotent=False,
     )

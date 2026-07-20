@@ -2856,6 +2856,104 @@ class TestSubmitScore:
             assert agent is not None
             assert agent.status == AgentStatus.SCORED
 
+    async def test_finalized_score_retest_hot_swaps_without_leaving_finalized_state(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from ditto.db.queries.audit import (
+            EVENT_FINALIZED,
+            EVENT_SCORE,
+            EVENT_SCORE_INVALIDATED,
+            EVENT_SCORE_RETEST_REQUESTED,
+            list_audit_entries,
+        )
+
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        await _score_to_quorum(
+            client, agent_id, maker=session_maker, run_id="original", composite=0.82
+        )
+        token = "test-admin-token-at-least-32-characters"
+        app.state.config = replace(app.state.config, admin_api_token=token)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Admin-Actor": "operator",
+        }
+        inspect = await client.get(
+            f"/api/v1/admin/validation-retries/{agent_id}/validators/{_VALIDATOR_HOTKEY}",
+            headers=headers,
+        )
+        assert inspect.status_code == 200, inspect.text
+        request_id = uuid4()
+        requested = await client.post(
+            f"/api/v1/admin/validation-retries/{agent_id}/validators/{_VALIDATOR_HOTKEY}/replace-score",
+            headers=headers,
+            json={
+                "request_id": str(request_id),
+                "expected_snapshot": inspect.json()["snapshot"],
+                "expected_run_id": "original_0",
+                "reason": (
+                    "Outlying validator result requires an exact same-validator re-test"
+                ),
+            },
+        )
+        assert requested.status_code == 200, requested.text
+        async with session_maker() as session:
+            preserved = await session.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
+            agent = await session.get(Agent, agent_id)
+        assert preserved is not None and preserved.run_id == "original_0"
+        assert agent is not None and agent.status == AgentStatus.SCORED
+
+        deadline = datetime.fromisoformat(
+            requested.json()["replacement_deadline"].replace("Z", "+00:00")
+        )
+        replacement = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(
+                agent_id,
+                keypair=_KEYPAIRS[0],
+                run_id="replacement_0",
+                composite=0.91,
+                ticket_deadline=deadline,
+            ),
+        )
+        assert replacement.status_code == 200, replacement.text
+        assert replacement.json()["status"] == AgentStatus.SCORED
+        async with session_maker() as session:
+            swapped = await session.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
+            scores = list(
+                (
+                    await session.scalars(
+                        select(Score).where(Score.agent_id == agent_id)
+                    )
+                ).all()
+            )
+            entries = await list_audit_entries(session, limit=1000)
+        assert swapped is not None and swapped.run_id == "replacement_0"
+        assert swapped.composite == pytest.approx(0.91)
+        assert len(scores) == 3
+        lifecycle = [
+            entry.event
+            for entry in entries
+            if entry.agent_id == agent_id
+            and entry.event
+            in {
+                EVENT_SCORE_RETEST_REQUESTED,
+                EVENT_SCORE_INVALIDATED,
+                EVENT_SCORE,
+                EVENT_FINALIZED,
+            }
+        ]
+        assert lifecycle[-4:] == [
+            EVENT_SCORE_RETEST_REQUESTED,
+            EVENT_SCORE_INVALIDATED,
+            EVENT_SCORE,
+            EVENT_FINALIZED,
+        ]
+
     async def test_finalize_writes_verifiable_audit_chain(
         self,
         app: FastAPI,
