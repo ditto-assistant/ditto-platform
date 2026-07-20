@@ -64,7 +64,7 @@ async def apply(ctx: ScenarioContext) -> None:
 
         # A heartbeat claiming active work with NO matching platform ticket:
         # the only ticket validator-4 ever held for this agent has expired, so
-        # the reconciled assignment_state is heartbeat_mismatch.
+        # the reconciled assignment_state is assignment_mismatch.
         phantom = await f.evaluating_agent(session, index=7)
         session.add(
             ValidatorTicket(

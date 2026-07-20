@@ -1229,9 +1229,13 @@ class TestHeartbeat:
         reported_id = await _seed_agent(
             session_maker, status=AgentStatus.EVALUATING, name="reported-agent"
         )
-        await _seed_ticket(session_maker, assigned_id)
-        await _seed_validator_heartbeat(session_maker, protocol_version=2)
         now = datetime.now(UTC)
+        # Lease older than the hand-off grace: the validator has had ample time to
+        # pick this up and is instead reporting a different agent — a real mismatch.
+        await _seed_ticket(
+            session_maker, assigned_id, issued_at=now - timedelta(minutes=5)
+        )
+        await _seed_validator_heartbeat(session_maker, protocol_version=2)
         async with session_maker() as session, session.begin():
             heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
             assert heartbeat is not None
@@ -1243,7 +1247,7 @@ class TestHeartbeat:
 
         snapshot = (await client.get("/api/v1/public/operations")).json()
         validator = snapshot["validators"]["validators"][0]
-        assert validator["assignment_state"] == "heartbeat_mismatch"
+        assert validator["assignment_state"] == "assignment_mismatch"
         assert validator["assigned_agent_id"] == str(assigned_id)
         assert validator["assigned_agent_name"] == "alpha-agent"
         assert validator["reported_agent_id"] == str(reported_id)
@@ -1255,6 +1259,36 @@ class TestHeartbeat:
         )
         assert assigned["status"] == "waiting_validator"
         assert assigned["active_benchmarks"] == []
+
+    async def test_operations_snapshot_grace_window_reads_as_assigning(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A lease issued within the hand-off grace, before the validator has
+        # reported picking it up, must read as a transient "assigning" — not a
+        # mismatch — so the fleet view does not flap red between jobs.
+        assigned_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        now = datetime.now(UTC)
+        await _seed_ticket(
+            session_maker, assigned_id, issued_at=now - timedelta(seconds=5)
+        )
+        await _seed_validator_heartbeat(session_maker, protocol_version=2)
+        async with session_maker() as session, session.begin():
+            heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert heartbeat is not None
+            heartbeat.state = "polling"
+            heartbeat.active_agent_id = None
+            heartbeat.reported_at = now
+            heartbeat.seen_at = now
+        _install_db(app, session_maker)
+
+        snapshot = (await client.get("/api/v1/public/operations")).json()
+        validator = snapshot["validators"]["validators"][0]
+        assert validator["assignment_state"] == "assigning"
+        assert validator["assigned_agent_id"] == str(assigned_id)
+        assert validator["active_agent_id"] is None
 
     async def test_operations_snapshot_surfaces_stale_heartbeat_assignment(
         self,
