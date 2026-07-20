@@ -7,14 +7,17 @@ import io
 import tarfile
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
 
+from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.endpoints.upload import (
     ERROR_CODE_BAD_SIGNATURE,
     ERROR_CODE_HOTKEY_NOT_REGISTERED,
@@ -713,6 +716,68 @@ class TestUploadAgentPaymentVerifierBranches:
 
 
 class TestUploadAgentReplayHandling:
+    async def test_exact_retry_returns_original_without_reprocessing(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        deps = _wire_full_stack(app)
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        original_id = uuid4()
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_agent_for_payment_proof",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    agent_id=original_id,
+                    miner_hotkey=kp.ss58_address,
+                    name="alpha-agent",
+                    sha256=_GOOD_TAR_SHA,
+                    version=3,
+                    status=AgentStatus.SCREENING,
+                )
+            ),
+        )
+        data, files = _upload_agent_form(keypair=kp)
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "agent_id": str(original_id),
+            "version": 3,
+            "status": "screening",
+        }
+        deps["verifier"].verify_payment.assert_not_awaited()
+        deps["storage"].put_object.assert_not_awaited()
+
+    async def test_reused_proof_for_different_upload_stays_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        _wire_full_stack(app)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_agent_for_payment_proof",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    agent_id=uuid4(),
+                    miner_hotkey="5DifferentHotkey1111111111111111111111111111111",
+                    name="other-agent",
+                    sha256="ff" * 32,
+                    version=1,
+                    status=AgentStatus.UPLOADED,
+                )
+            ),
+        )
+        data, files = _upload_agent_form()
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 402
+        assert response.json()["error_code"] == ERROR_CODE_PAYMENT_REPLAYED
+
     async def test_payment_replay_returns_402_3207(
         self, app: FastAPI, client: httpx.AsyncClient
     ):
