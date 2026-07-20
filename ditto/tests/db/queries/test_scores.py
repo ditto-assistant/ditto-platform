@@ -88,11 +88,11 @@ class TestUpsertScore:
         self, session: AsyncSession
     ) -> None:
         v5_agent = await _seed_agent(session)
-        await _upsert(session, v5_agent.agent_id, bench_version=5, composite=1.125)
+        await _upsert(session, v5_agent.agent_id, bench_version=5, composite=2.84605)
         scores = await list_scores_for_agent(
             session, agent_id=v5_agent.agent_id, bench_version=5
         )
-        assert scores[0].composite == pytest.approx(1.125)
+        assert scores[0].composite == pytest.approx(2.84605)
         await session.commit()
 
         v4_agent = await _seed_agent(session)

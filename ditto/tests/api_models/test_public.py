@@ -28,6 +28,28 @@ def test_provisional_score_accepts_reproducible_safe_fields() -> None:
     assert score.seed_source == "on_chain"
 
 
+def test_provisional_score_accepts_unbounded_finite_v5_composite() -> None:
+    score = PublicProvisionalScore(
+        composite=2.84605,
+        seed="5585512758338063316",
+        run_size="full",
+        bench_version=5,
+        datagen_version="v0.10.0",
+        seed_source="on_chain",
+        dataset_sha256="ab" * 32,
+        accepted_at=datetime(2026, 7, 20, tzinfo=UTC),
+        reproduction_command="generate -seed 123456789 -run-size full",
+        verification_command="generate -seed 123456789 -run-size full -sha",
+        case_results=None,
+    )
+    assert score.composite == pytest.approx(2.84605)
+
+    with pytest.raises(ValidationError):
+        PublicProvisionalScore.model_validate(
+            {**score.model_dump(), "composite": float("inf")}
+        )
+
+
 @pytest.mark.parametrize(
     "seed_source", ["on_chain", "random_fallback", "validator_local"]
 )

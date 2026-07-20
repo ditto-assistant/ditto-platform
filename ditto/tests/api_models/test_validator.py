@@ -195,11 +195,11 @@ def test_scorereport_with_mixed_per_case() -> None:
     assert [c.kind for c in report.per_case] == ["tool", "memory"]
 
 
-def test_scorereport_allows_only_v5_adjusted_composite_above_one() -> None:
+def test_scorereport_allows_only_v5_finite_adjusted_composite_above_one() -> None:
     base = {
         "run_id": "r-v5",
         "seed": 42,
-        "composite": 1.125,
+        "composite": 2.84605,
         "tool_mean": 0.9,
         "memory_mean": 0.9,
         "median_ms": 30,
@@ -208,9 +208,11 @@ def test_scorereport_allows_only_v5_adjusted_composite_above_one() -> None:
         "per_case": [],
     }
     report = ScoreReport.model_validate({**base, "bench_version": 5})
-    assert report.composite == 1.125
+    assert report.composite == 2.84605
 
     with pytest.raises(ValidationError, match="composite must be <= 1.0"):
         ScoreReport.model_validate({**base, "bench_version": 4})
     with pytest.raises(ValidationError):
-        ScoreReport.model_validate({**base, "bench_version": 5, "composite": 1.251})
+        ScoreReport.model_validate(
+            {**base, "bench_version": 5, "composite": float("inf")}
+        )

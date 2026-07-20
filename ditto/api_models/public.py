@@ -169,19 +169,34 @@ class PublicTokenUsage(BaseModel):
 
 
 class PublicTokenEfficiency(BaseModel):
-    """Auditable v5 baseline lookup and bounded quality-score transform."""
+    """Auditable v5 prompt-dominant quality-score transform."""
 
     formula_version: str
     baseline_id: str | None = None
     baseline_prompt_tokens: Annotated[int | None, Field(default=None, ge=0)]
     baseline_completion_tokens: Annotated[int | None, Field(default=None, ge=0)]
     baseline_total_tokens: Annotated[int | None, Field(default=None, ge=0)]
+    baseline_weighted_tokens: Annotated[
+        float | None, Field(default=None, ge=0.0, allow_inf_nan=False)
+    ]
+    observed_prompt_tokens: Annotated[int, Field(ge=0)]
+    observed_completion_tokens: Annotated[int, Field(ge=0)]
     observed_total_tokens: Annotated[int, Field(ge=0)]
-    multiplier: Annotated[float, Field(ge=0.75, le=1.25)]
+    observed_weighted_tokens: Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
+    prompt_token_weight: Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+    completion_token_weight: Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+    reward_exponent: Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+    penalty_exponent: Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+    minimum_multiplier: Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+    multiplier: Annotated[float, Field(ge=0.75, allow_inf_nan=False)]
     raw_composite: Annotated[float, Field(ge=0.0, le=1.0)]
-    adjusted_composite: Annotated[float, Field(ge=0.0, le=1.25)]
+    adjusted_composite: Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
     quality_eligible: bool
     eligibility_reason: str
+    minimum_composite: Annotated[float, Field(ge=0.0, le=1.0)]
+    minimum_tool_mean: Annotated[float, Field(ge=0.0, le=1.0)]
+    minimum_memory_mean: Annotated[float, Field(ge=0.0, le=1.0)]
+    minimum_response_coverage: Annotated[float, Field(ge=0.0, le=1.0)]
     response_coverage: Annotated[float, Field(ge=0.0, le=1.0)]
 
 
@@ -282,7 +297,11 @@ class PublicLeaderboardEntry(BaseModel):
     ]
     composite: Annotated[
         float,
-        Field(ge=0.0, le=1.25, description="Best composite; v5 may reach 1.25."),
+        Field(
+            ge=0.0,
+            allow_inf_nan=False,
+            description="Best composite; v5 efficiency-adjusted scores may exceed 1.",
+        ),
     ]
     raw_composite: Annotated[
         float | None,
@@ -313,7 +332,7 @@ class PublicLeaderboardEntry(BaseModel):
         Field(
             default=None,
             ge=0.0,
-            le=1.25,
+            allow_inf_nan=False,
             description=(
                 "The agent's finalized median on the settled (active) benchmark "
                 "version. Only populated in authoritative mode while a rollout is "
@@ -330,7 +349,7 @@ class PublicLeaderboardEntry(BaseModel):
         Field(
             default=None,
             ge=0.0,
-            le=1.25,
+            allow_inf_nan=False,
             description=(
                 "Median of the agent's accepted scores on the desired (rolling "
                 "out) benchmark version so far. Preliminary until "
@@ -695,7 +714,12 @@ class PublicValidatorScore(BaseModel):
         str, Field(pattern=_SS58_PATTERN, description="Scoring validator's hotkey.")
     ]
     composite: Annotated[
-        float, Field(ge=0.0, le=1.0, description="Composite this validator reported.")
+        float,
+        Field(
+            ge=0.0,
+            allow_inf_nan=False,
+            description="Composite this validator reported; v5 may exceed 1.",
+        ),
     ]
     tool_mean: Annotated[
         float, Field(ge=0.0, le=1.0, description="Mean tool accuracy in [0,1].")
@@ -847,8 +871,8 @@ class PublicSubmissionScores(BaseModel):
         Field(
             default=None,
             ge=0.0,
-            le=1.0,
-            description="Median of the reported composites — the canonical score.",
+            allow_inf_nan=False,
+            description="Median canonical composite; v5 may exceed 1.",
         ),
     ]
     dataset_seed: Annotated[
@@ -904,7 +928,12 @@ class PublicSubmissionSummary(BaseModel):
     ]
     median_composite: Annotated[
         float | None,
-        Field(default=None, ge=0.0, le=1.25, description="Median canonical composite."),
+        Field(
+            default=None,
+            ge=0.0,
+            allow_inf_nan=False,
+            description="Median canonical composite; v5 may exceed 1.",
+        ),
     ]
     dataset_seed: Annotated[
         int | None, Field(default=None, description="Platform-pinned dataset seed.")
@@ -1040,7 +1069,7 @@ class PublicActivityEntry(BaseModel):
         Field(
             default=None,
             ge=0.0,
-            le=1.0,
+            allow_inf_nan=False,
             description=("Median composite preserved while an ATH review is active."),
         ),
     ]
@@ -1053,7 +1082,7 @@ class PublicActivityEntry(BaseModel):
         Field(
             default=None,
             ge=0.0,
-            le=1.0,
+            allow_inf_nan=False,
             description="Mean composite across accepted validator scores so far.",
         ),
     ]
@@ -1217,7 +1246,11 @@ class PublicProvisionalScore(BaseModel):
 
     composite: Annotated[
         float,
-        Field(ge=0.0, le=1.25, description="Accepted composite; v5 may reach 1.25."),
+        Field(
+            ge=0.0,
+            allow_inf_nan=False,
+            description="Accepted composite; v5 may exceed 1.",
+        ),
     ]
     raw_composite: Annotated[
         float | None,
@@ -1339,7 +1372,7 @@ class PublicSubmissionPipeline(BaseModel):
         float,
         Field(
             ge=0.0,
-            le=1.0,
+            allow_inf_nan=False,
             description=(
                 "Current finalized fifth-place score used for safe continuation "
                 "after two scores; 0 when fewer than five ranked miners exist."
@@ -1352,7 +1385,7 @@ class PublicSubmissionPipeline(BaseModel):
         Field(
             default=None,
             ge=0.0,
-            le=1.0,
+            allow_inf_nan=False,
             description=(
                 "Canonical median once quorum is reached; null while scores are "
                 "still provisional."
@@ -1430,7 +1463,12 @@ class PublicBenchCorpusEntry(BaseModel):
     seed: Annotated[int, Field(description="Dataset seed for the run.")]
     run_id: Annotated[str, Field(description="Scoring-engine run id.")]
     composite: Annotated[
-        float, Field(ge=0.0, le=1.0, description="Composite this validator reported.")
+        float,
+        Field(
+            ge=0.0,
+            allow_inf_nan=False,
+            description="Composite this validator reported; v5 may exceed 1.",
+        ),
     ]
     per_case: Annotated[
         list[dict[str, Any]],

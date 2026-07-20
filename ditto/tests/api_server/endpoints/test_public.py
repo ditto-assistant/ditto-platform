@@ -92,17 +92,30 @@ def test_v5_token_telemetry_public_parser_is_typed_and_fail_closed() -> None:
             "ttft_status": "unavailable_non_streaming",
         },
         "token_efficiency": {
-            "formula_version": "v5-sqrt-ratio-floor-v1",
+            "formula_version": "v5-prompt-dominant-asymmetric-power-v1",
             "baseline_id": "v5-baseline",
             "baseline_prompt_tokens": 1000,
             "baseline_completion_tokens": 100,
             "baseline_total_tokens": 1100,
+            "baseline_weighted_tokens": 1025,
+            "observed_prompt_tokens": 900,
+            "observed_completion_tokens": 100,
             "observed_total_tokens": 1000,
+            "observed_weighted_tokens": 925,
+            "prompt_token_weight": 1.0,
+            "completion_token_weight": 0.25,
+            "reward_exponent": 0.25,
+            "penalty_exponent": 0.5,
+            "minimum_multiplier": 0.75,
             "multiplier": 1.048809,
             "raw_composite": 0.9,
             "adjusted_composite": 0.943928,
             "quality_eligible": True,
             "eligibility_reason": "eligible",
+            "minimum_composite": 0.8,
+            "minimum_tool_mean": 0.7,
+            "minimum_memory_mean": 0.7,
+            "minimum_response_coverage": 0.95,
             "response_coverage": 1.0,
         },
     }
@@ -111,7 +124,13 @@ def test_v5_token_telemetry_public_parser_is_typed_and_fail_closed() -> None:
     assert usage is not None and usage.total_tokens == 1000
     assert decision is not None and decision.raw_composite == 0.9
 
-    details["token_efficiency"]["multiplier"] = 99
+    # Large but finite rewards remain public and auditable.
+    details["token_efficiency"]["multiplier"] = 3.162278
+    details["token_efficiency"]["adjusted_composite"] = 2.84605
+    decision = public_endpoint._safe_token_efficiency(details)
+    assert decision is not None and decision.adjusted_composite == 2.84605
+
+    details["token_efficiency"]["multiplier"] = float("inf")
     assert public_endpoint._safe_token_efficiency(details) is None
 
 

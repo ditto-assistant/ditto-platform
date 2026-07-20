@@ -788,7 +788,7 @@ class Score(Base):
     """Dataset seed used for the run (anti-overfit reproducibility)."""
 
     composite: Mapped[float] = mapped_column(Float, nullable=False)
-    """Aggregate score in [0, 1] for v1-v4 or [0, 1.25] for v5+ (not recomputed)."""
+    """Aggregate score in [0, 1] for v1-v4; finite v5 scores may exceed 1."""
 
     tool_mean: Mapped[float] = mapped_column(Float, nullable=False)
     """Mean tool accuracy in [0, 1]."""
@@ -836,8 +836,7 @@ class Score(Base):
             name="scores_agent_id_fkey",
         ),
         CheckConstraint(
-            "composite >= 0 AND ((bench_version < 5 AND composite <= 1) OR "
-            "(bench_version >= 5 AND composite <= 1.25))",
+            "composite >= 0 AND (bench_version >= 5 OR composite <= 1)",
             name="scores_composite_range_check",
         ),
         CheckConstraint(
