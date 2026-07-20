@@ -221,7 +221,10 @@ async def _seed_k3(
 
 
 async def _seed_top_five_floor(
-    maker: async_sessionmaker[AsyncSession], *, fifth_place: float = 0.80
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    fifth_place: float = 0.80,
+    bench_version: int = DEFAULT_BENCH_VERSION,
 ) -> None:
     for rank, marker in enumerate(("A", "B", "C", "D", "E")):
         composite = fifth_place + (4 - rank) * 0.01
@@ -229,6 +232,7 @@ async def _seed_top_five_floor(
             maker,
             miner="5" + marker * 47,
             composites=[composite, composite, composite],
+            details={"bench_version": bench_version},
         )
 
 
@@ -1233,6 +1237,7 @@ class TestPublicActivity:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
+        await _seed_top_five_floor(session_maker, fifth_place=0.60)
         zero_id = await _seed_agent(
             session_maker,
             miner=_MINER_A,
@@ -1275,10 +1280,11 @@ class TestPublicActivity:
         by_id = {entry["agent_id"]: entry for entry in response.json()["entries"]}
 
         assert by_id[high_id]["validator_queue_rank"] == 1
-        assert by_id[low_id]["validator_queue_rank"] == 2
-        assert by_id[zero_id]["validator_queue_rank"] == 3
-        assert by_id[one_high_id]["validator_queue_rank"] == 4
-        assert by_id[one_id]["validator_queue_rank"] == 5
+        assert by_id[zero_id]["validator_queue_rank"] == 2
+        assert by_id[one_high_id]["validator_queue_rank"] == 3
+        assert by_id[one_id]["validator_queue_rank"] == 4
+        assert by_id[low_id]["validator_queue_rank"] == 5
+        assert by_id[low_id]["status"] == "below_score_floor"
         assert by_id[zero_id]["provisional_composite"] is None
         assert by_id[one_id]["provisional_composite"] == pytest.approx(0.5)
         assert by_id[one_high_id]["provisional_composite"] == pytest.approx(0.7)
@@ -1879,7 +1885,7 @@ class TestPublicActivity:
         evaluating = (await client.get("/api/v1/public/activity")).json()["entries"][0]
         assert evaluating["status"] == "evaluating"
 
-    async def test_two_scores_below_top_five_bound_are_a_terminal_public_stage(
+    async def test_two_scores_below_top_five_bound_are_queued_for_completion(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -1936,6 +1942,7 @@ class TestPublicActivity:
         )
         assert activity["status"] == "below_score_floor"
         assert activity["score_count"] == 2
+        assert activity["validator_queue_rank"] == 1
 
         pipeline = (
             await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
@@ -1994,6 +2001,93 @@ class TestPublicActivity:
             await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
         ).json()
         assert pipeline["status"] == "waiting_validator"
+
+    async def test_public_progress_never_combines_benchmark_eras(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """love-v8's v3 and v4 scores are one score in each era, not two."""
+        await _seed_top_five_floor(session_maker, fifth_place=0.80, bench_version=4)
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                name="love-v8",
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=4,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now - timedelta(hours=1),
+                    activated_at=now,
+                )
+            )
+            for bench_version, validator, composite in (
+                (3, _VALIDATOR_C, 0.391235),
+                (4, _MINER_B, 0.391897),
+            ):
+                await upsert_score(
+                    session,
+                    agent_id=agent_id,
+                    validator_hotkey=validator,
+                    bench_version=bench_version,
+                    run_id=f"love-v8-v{bench_version}",
+                    seed=42,
+                    composite=composite,
+                    tool_mean=composite,
+                    memory_mean=composite,
+                    median_ms=500,
+                    n=119,
+                    generated_at=now,
+                    signature="ab" * 64,
+                    details={"bench_version": bench_version},
+                )
+        _install_db(app, session_maker)
+
+        activity_body = (await client.get("/api/v1/public/activity")).json()
+        activity = next(
+            entry
+            for entry in activity_body["entries"]
+            if entry["agent_id"] == str(agent_id)
+        )
+        assert activity["status"] == "waiting_validator"
+        assert activity["score_count"] == 1
+        assert activity["provisional_composite"] == pytest.approx(0.391897)
+
+        operations = (await client.get("/api/v1/public/operations")).json()
+        operations_entry = next(
+            entry
+            for entry in operations["activity"]["entries"]
+            if entry["agent_id"] == str(agent_id)
+        )
+        assert operations["active_bench_version"] == 4
+        assert operations_entry["status"] == "waiting_validator"
+        assert operations_entry["score_count"] == 1
+        assert operations_entry["provisional_composite"] == pytest.approx(0.391897)
+
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()
+        assert pipeline["active_bench_version"] == 4
+        assert pipeline["status"] == "waiting_validator"
+        assert pipeline["score_count"] == 1
+        assert pipeline["score_floor"] == pytest.approx(0.80)
+        scores_by_version = {
+            score["bench_version"]: score["composite"]
+            for score in pipeline["provisional_scores"]
+        }
+        assert scores_by_version[3] == pytest.approx(0.391235)
+        assert scores_by_version[4] == pytest.approx(0.391897)
 
     async def test_progress_is_multi_validator_allowlisted_and_recursively_redacted(
         self,

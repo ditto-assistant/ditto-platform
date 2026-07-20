@@ -244,13 +244,18 @@ class PublicActivityRow:
 async def list_public_activity(
     session: AsyncSession,
     *,
+    bench_version: int,
     limit: int | None = None,
     offset: int = 0,
 ) -> tuple[list[PublicActivityRow], int]:
-    """Return recent submissions and the total row count.
+    """Return recent submissions and active-benchmark score progress.
 
     ``limit=None`` lets callers that must filter on the derived public status
     inspect the complete dataset before applying their own pagination.
+
+    Scores from different benchmark eras are not comparable. Keep the public
+    count, provisional composite, continuation-floor projection, and queue
+    rank pinned to the same active version used by validator tickets.
     """
     total = int(await session.scalar(select(func.count(Agent.agent_id))) or 0)
     score_counts = (
@@ -261,6 +266,7 @@ async def list_public_activity(
             func.max(Score.composite).label("highest_composite"),
             func.max(Score.updated_at).label("last_scored_at"),
         )
+        .where(Score.bench_version == bench_version)
         .group_by(Score.agent_id)
         .subquery()
     )
