@@ -20,7 +20,15 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.dependencies import get_session
-from ditto.db.models import Agent, Base, Score, ValidatorRetryRecovery, ValidatorTicket
+from ditto.db.models import (
+    Agent,
+    Base,
+    Score,
+    ScoreAuditEntry,
+    ValidatorRetryRecovery,
+    ValidatorTicket,
+)
+from ditto.db.queries.audit import EVENT_SCORE_INVALIDATED
 from ditto.db.queries.benchmark_rollout import DEFAULT_BENCH_VERSION
 from ditto.db.queries.tickets import issue_ticket
 
@@ -316,3 +324,121 @@ async def test_manual_grant_allows_exactly_one_more_same_version_issue(
     assert ticket is not None and ticket.agent_id == agent_id
     assert ticket.attempt_count == 3
     assert ticket.manual_retry_grants == 1
+
+
+async def test_replace_one_validators_score_and_reissue_same_ticket(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker, score_count=3)
+    _install(app, retry_maker)
+    async with retry_maker() as session, session.begin():
+        agent = await session.get(Agent, agent_id)
+        assert agent is not None
+        agent.status = AgentStatus.SCORED
+
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}/validators/validator-1",
+        headers=_HEADERS,
+    )
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["replacement_allowed"] is True
+    request_id = uuid4()
+    payload = {
+        "request_id": str(request_id),
+        "expected_snapshot": detail.json()["snapshot"],
+        "expected_run_id": "run-1",
+        "reason": "Validator relay failure made this accepted score untrustworthy",
+    }
+    response = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/validators/validator-1/replace-score",
+        headers=_HEADERS,
+        json=payload,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["remaining_score_count"] == 2
+    assert response.json()["invalidated_run_id"] == "run-1"
+
+    replay = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/validators/validator-1/replace-score",
+        headers=_HEADERS,
+        json=payload,
+    )
+    assert replay.status_code == 200
+    assert replay.json()["idempotent"] is True
+
+    async with retry_maker() as session:
+        agent = await session.get(Agent, agent_id)
+        scores = list(
+            (
+                await session.scalars(select(Score).where(Score.agent_id == agent_id))
+            ).all()
+        )
+        ticket = await session.get(
+            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-1")
+        )
+        audit = await session.scalar(
+            select(ScoreAuditEntry).where(
+                ScoreAuditEntry.agent_id == agent_id,
+                ScoreAuditEntry.event == EVENT_SCORE_INVALIDATED,
+            )
+        )
+    assert agent is not None and agent.status == AgentStatus.EVALUATING
+    assert {score.validator_hotkey for score in scores} == {
+        "validator-0",
+        "validator-2",
+    }
+    assert ticket is not None and ticket.status == TicketStatus.ISSUED
+    assert ticket.attempt_count == 2
+    assert audit is not None
+    assert audit.payload["actor"] == "operator"
+    assert audit.payload["reason"] == payload["reason"]
+    assert audit.payload["run_id"] == "run-1"
+    assert audit.payload["invalidated_score"]["composite"] == 0.7
+    assert audit.payload["invalidated_score"]["bench_version"] == (
+        DEFAULT_BENCH_VERSION
+    )
+
+
+async def test_replace_score_fails_closed_on_run_change_or_busy_validator(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker, score_count=1)
+    other_agent_id = await _seed(retry_maker)
+    _install(app, retry_maker)
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}/validators/validator-0",
+        headers=_HEADERS,
+    )
+    wrong_run = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/validators/validator-0/replace-score",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": detail.json()["snapshot"],
+            "expected_run_id": "different-run",
+            "reason": "Verified validator infrastructure failure changed the result",
+        },
+    )
+    assert wrong_run.status_code == 409
+
+    async with retry_maker() as session, session.begin():
+        other = await session.get(
+            ValidatorTicket,
+            (other_agent_id, DEFAULT_BENCH_VERSION, "validator-0"),
+        )
+        assert other is not None
+        other.status = TicketStatus.ISSUED
+        other.deadline = datetime.now(UTC) + timedelta(minutes=30)
+    blocked = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}/validators/validator-0",
+        headers=_HEADERS,
+    )
+    assert blocked.status_code == 200
+    assert blocked.json()["replacement_allowed"] is False
+    assert blocked.json()["blocking_reason"] == (
+        "validator is currently assigned to another submission"
+    )

@@ -63,3 +63,44 @@ class AdminValidationRetryRequest(BaseModel):
 class AdminValidationRetryResponse(BaseModel):
     recovery: AdminValidationRecovery
     idempotent: bool
+
+
+class AdminValidatorScoreReplacementDetail(BaseModel):
+    agent_id: UUID
+    validator_hotkey: str
+    agent_status: str
+    bench_version: int
+    score_count: int
+    quorum: int
+    snapshot: str
+    run_id: str | None
+    composite: float | None
+    ticket_status: Literal["issued", "scored", "expired"] | None
+    ticket_deadline: datetime | None
+    replacement_allowed: bool
+    blocking_reason: str | None
+
+
+class AdminValidatorScoreReplacementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: UUID
+    expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_run_id: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
+    ]
+    reason: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+    ]
+
+
+class AdminValidatorScoreReplacementResponse(BaseModel):
+    request_id: UUID
+    agent_id: UUID
+    validator_hotkey: str
+    invalidated_run_id: str
+    bench_version: int
+    replacement_deadline: datetime
+    remaining_score_count: int
+    idempotent: bool

@@ -2,7 +2,8 @@
 
 The audit log is the tamper-evident public projection of the k=3 scoring record.
 Where ``scores`` is UPSERTed (only the current score survives a re-score), this
-log is insert-only and ordered: it captures every scoring *event* as it happened.
+log is insert-only and ordered: it captures every scoring *event* as it happened,
+including an explicit invalidation before an operator-authorized replacement.
 
 Tamper-evidence is a SHA-256 hash chain. Each entry's ``entry_hash`` is the
 digest of its canonical JSON, which embeds ``prev_hash`` (the previous entry's
@@ -48,6 +49,7 @@ EVENT_FINALIZED = "agent_finalized"
 # entry follows: the verdict must be independently checkable from published data
 # without the chain itself leaking the dataset's answers.
 EVENT_AUDIT = "transform_audit"
+EVENT_SCORE_INVALIDATED = "score_invalidated"
 
 
 def _iso_utc(dt: datetime) -> str:

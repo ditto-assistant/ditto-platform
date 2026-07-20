@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
 
@@ -24,13 +24,23 @@ from ditto.api_models.admin_validation_retry import (
     AdminValidationRetryRequest,
     AdminValidationRetryResponse,
     AdminValidationTicket,
+    AdminValidatorScoreReplacementDetail,
+    AdminValidatorScoreReplacementRequest,
+    AdminValidatorScoreReplacementResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
-from ditto.db.models import Agent, Score, ValidatorRetryRecovery, ValidatorTicket
+from ditto.db.models import (
+    Agent,
+    Score,
+    ScoreAuditEntry,
+    ValidatorRetryRecovery,
+    ValidatorTicket,
+)
+from ditto.db.queries.audit import EVENT_SCORE_INVALIDATED, append_audit_entry
 from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION
@@ -40,6 +50,12 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 AdminDep = Annotated[None, Depends(require_admin)]
 
 MAX_OPERATOR_RECOVERIES_PER_AGENT = 3
+_REPLACEMENT_TICKET_TTL = timedelta(minutes=90)
+_REPLACEABLE_STATUSES = {
+    AgentStatus.EVALUATING,
+    AgentStatus.SCORED,
+    AgentStatus.LIVE,
+}
 
 
 def _aware(value: datetime) -> datetime:
@@ -368,4 +384,257 @@ async def retry_validation_after_infrastructure_failure(
         await session.flush()
     return AdminValidationRetryResponse(
         recovery=_recovery_item(recovery), idempotent=False
+    )
+
+
+async def _replacement_state(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    validator_hotkey: str,
+    for_update: bool,
+) -> tuple[Agent | None, int, list[Score], list[ValidatorTicket], Score | None]:
+    agent, bench_version, scores, tickets, _ = await _load(
+        session, agent_id=agent_id, for_update=for_update
+    )
+    target = next(
+        (score for score in scores if score.validator_hotkey == validator_hotkey),
+        None,
+    )
+    return agent, bench_version, scores, tickets, target
+
+
+async def _validator_busy_elsewhere(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    validator_hotkey: str,
+) -> bool:
+    return (
+        await session.scalar(
+            select(ValidatorTicket.agent_id).where(
+                ValidatorTicket.validator_hotkey == validator_hotkey,
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.agent_id != agent_id,
+            )
+        )
+        is not None
+    )
+
+
+def _replacement_gate(
+    *,
+    agent: Agent,
+    target: Score | None,
+    ticket: ValidatorTicket | None,
+    validator_busy: bool,
+) -> str | None:
+    if agent.status not in _REPLACEABLE_STATUSES:
+        return "submission is not in a scoreable state"
+    if target is None:
+        return "validator has no accepted score to replace"
+    if ticket is None or ticket.status != TicketStatus.SCORED:
+        return "accepted score is not backed by a consumed validator ticket"
+    if validator_busy:
+        return "validator is currently assigned to another submission"
+    return None
+
+
+@router.get(
+    "/validation-retries/{agent_id}/validators/{validator_hotkey}",
+    response_model=AdminValidatorScoreReplacementDetail,
+)
+async def inspect_validator_score_replacement(
+    agent_id: UUID,
+    validator_hotkey: str,
+    _admin: AdminDep,
+    session: SessionDep,
+) -> AdminValidatorScoreReplacementDetail:
+    agent, bench_version, scores, tickets, target = await _replacement_state(
+        session,
+        agent_id=agent_id,
+        validator_hotkey=validator_hotkey,
+        for_update=False,
+    )
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    ticket = next(
+        (
+            item
+            for item in tickets
+            if item.validator_hotkey == validator_hotkey
+            and item.bench_version == bench_version
+        ),
+        None,
+    )
+    reason = _replacement_gate(
+        agent=agent,
+        target=target,
+        ticket=ticket,
+        validator_busy=await _validator_busy_elsewhere(
+            session, agent_id=agent_id, validator_hotkey=validator_hotkey
+        ),
+    )
+    return AdminValidatorScoreReplacementDetail(
+        agent_id=agent_id,
+        validator_hotkey=validator_hotkey,
+        agent_status=agent.status.value,
+        bench_version=bench_version,
+        score_count=len(scores),
+        quorum=SCORING_QUORUM,
+        snapshot=_snapshot(agent=agent, scores=scores, tickets=tickets),
+        run_id=target.run_id if target is not None else None,
+        composite=target.composite if target is not None else None,
+        ticket_status=ticket.status.value if ticket is not None else None,
+        ticket_deadline=ticket.deadline if ticket is not None else None,
+        replacement_allowed=reason is None,
+        blocking_reason=reason,
+    )
+
+
+@router.post(
+    "/validation-retries/{agent_id}/validators/{validator_hotkey}/replace-score",
+    response_model=AdminValidatorScoreReplacementResponse,
+)
+async def replace_validator_score_after_infrastructure_failure(
+    agent_id: UUID,
+    validator_hotkey: str,
+    payload: AdminValidatorScoreReplacementRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminValidatorScoreReplacementResponse:
+    actor = x_admin_actor.strip() if x_admin_actor is not None else ""
+    if not 1 <= len(actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    async with session.begin():
+        prior_entries = list(
+            (
+                await session.scalars(
+                    select(ScoreAuditEntry).where(
+                        ScoreAuditEntry.agent_id == agent_id,
+                        ScoreAuditEntry.validator_hotkey == validator_hotkey,
+                        ScoreAuditEntry.event == EVENT_SCORE_INVALIDATED,
+                    )
+                )
+            ).all()
+        )
+        prior = next(
+            (
+                entry
+                for entry in prior_entries
+                if entry.payload.get("request_id") == str(payload.request_id)
+            ),
+            None,
+        )
+        if prior is not None:
+            if (
+                prior.payload.get("actor") != actor
+                or prior.payload.get("reason") != payload.reason
+                or prior.payload.get("run_id") != payload.expected_run_id
+                or prior.payload.get("expected_snapshot") != payload.expected_snapshot
+            ):
+                raise HTTPException(status_code=409, detail="request id already used")
+            return AdminValidatorScoreReplacementResponse(
+                request_id=payload.request_id,
+                agent_id=agent_id,
+                validator_hotkey=validator_hotkey,
+                invalidated_run_id=payload.expected_run_id,
+                bench_version=int(prior.payload["bench_version"]),
+                replacement_deadline=datetime.fromisoformat(
+                    str(prior.payload["replacement_deadline"])
+                ),
+                remaining_score_count=int(prior.payload["remaining_score_count"]),
+                idempotent=True,
+            )
+
+        agent, bench_version, scores, tickets, target = await _replacement_state(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=validator_hotkey,
+            for_update=True,
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
+        if current_snapshot != payload.expected_snapshot:
+            raise HTTPException(status_code=409, detail="validation state changed")
+        if target is not None and target.run_id != payload.expected_run_id:
+            raise HTTPException(status_code=409, detail="accepted score run changed")
+        ticket = next(
+            (
+                item
+                for item in tickets
+                if item.validator_hotkey == validator_hotkey
+                and item.bench_version == bench_version
+            ),
+            None,
+        )
+        reason = _replacement_gate(
+            agent=agent,
+            target=target,
+            ticket=ticket,
+            validator_busy=await _validator_busy_elsewhere(
+                session, agent_id=agent_id, validator_hotkey=validator_hotkey
+            ),
+        )
+        if reason is not None:
+            raise HTTPException(status_code=409, detail=reason)
+        assert target is not None and ticket is not None
+        now = datetime.now(UTC)
+        deadline = now + _REPLACEMENT_TICKET_TTL
+        invalidated = {
+            "run_id": target.run_id,
+            "seed": target.seed,
+            "composite": target.composite,
+            "tool_mean": target.tool_mean,
+            "memory_mean": target.memory_mean,
+            "median_ms": target.median_ms,
+            "n": target.n,
+            "bench_version": target.bench_version,
+            "ticket_deadline": (
+                target.details.get("ticket_deadline")
+                if isinstance(target.details, dict)
+                else None
+            ),
+            "signature": target.signature,
+            "generated_at": _aware(target.generated_at).isoformat(),
+        }
+        await session.delete(target)
+        ticket.status = TicketStatus.ISSUED
+        ticket.issued_at = now
+        ticket.deadline = deadline
+        ticket.attempt_count += 1
+        ticket.retry_after = None
+        if agent.status in {AgentStatus.SCORED, AgentStatus.LIVE}:
+            agent.status = AgentStatus.EVALUATING
+        remaining = len(scores) - 1
+        await append_audit_entry(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=validator_hotkey,
+            event=EVENT_SCORE_INVALIDATED,
+            payload={
+                "request_id": str(payload.request_id),
+                "actor": actor,
+                "reason": payload.reason,
+                "expected_snapshot": payload.expected_snapshot,
+                "bench_version": bench_version,
+                "run_id": payload.expected_run_id,
+                "invalidated_score": invalidated,
+                "replacement_deadline": deadline.isoformat(),
+                "remaining_score_count": remaining,
+            },
+            recorded_at=now,
+        )
+        await session.flush()
+    return AdminValidatorScoreReplacementResponse(
+        request_id=payload.request_id,
+        agent_id=agent_id,
+        validator_hotkey=validator_hotkey,
+        invalidated_run_id=payload.expected_run_id,
+        bench_version=bench_version,
+        replacement_deadline=deadline,
+        remaining_score_count=remaining,
+        idempotent=False,
     )
