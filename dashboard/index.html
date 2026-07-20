@@ -4946,7 +4946,7 @@
       var labels = {
         running: ["Running", "progress"], passed: ["Passed", "good"],
         rejected: ["Rejected", "bad"], failed: ["Could not complete", "warn"],
-        expired: [role === "validator" ? "Retrying" : "Expired", "warn"], issued: ["Score pending", "progress"],
+        expired: [role === "validator" ? "Failed · reissued" : "Expired", "warn"], issued: ["Score pending", "progress"],
         scored: ["Score submitted", "good"]
       };
       return labels[status] || [String(status || "Unknown").replace(/_/g, " "), ""];

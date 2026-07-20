@@ -325,7 +325,7 @@ class TestDashboard:
         assert "a.quarantine_resolved_at || a.finished_at || a.started_at" in body
         assert "Lease expired" not in body
         assert "System failure" not in body
-        assert 'role === "validator" ? "Retrying" : "Expired"' in body
+        assert 'role === "validator" ? "Failed · reissued" : "Expired"' in body
         assert "Validator took too long to post a score." in body
         assert "Another validator will score you soon." in body
         assert 'class="retry-info" role="img" tabindex="0"' in body
