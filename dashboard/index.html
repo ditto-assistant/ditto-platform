@@ -2431,8 +2431,8 @@
     var ACTIVITY_FILTERS = {
       rejected: ["rejected"],
       under_review: ["under_review"],
-      waiting_validator: ["waiting_validator"],
-      queued: ["waiting_screening", "screening", "waiting_validator"]
+      waiting_validator: ["waiting_validator", "below_score_floor"],
+      queued: ["waiting_screening", "screening", "waiting_validator", "below_score_floor"]
     };
     var ACTIVITY_STATUSES = [
       "waiting_screening", "screening", "waiting_validator", "evaluating",
@@ -4754,7 +4754,7 @@
         screening_failed: ["Screening interrupted", "warn"],
         waiting_validator: ["Waiting for scores", "progress"],
         evaluating: ["Evaluating", "progress"],
-        below_score_floor: ["Below score floor", "warn"],
+        below_score_floor: ["Low-priority completion", "warn"],
         scored: ["Scored", "good"],
         live: ["Live", "good"],
         under_review: ["Operator review", "warn"],
@@ -4766,7 +4766,7 @@
     function validationProgress(e) {
       var count = Math.max(0, Number(e.score_count) || 0);
       var quorum = Math.max(1, Number(e.quorum) || 3);
-      if (e.status === "below_score_floor") return "Stopped after " + count + (count === 1 ? " score" : " scores");
+      if (e.status === "below_score_floor") return count + " of " + quorum + " · queued last";
       var hasStarted = count > 0 || ["waiting_validator", "evaluating", "scored", "live", "under_review"].indexOf(e.status) >= 0;
       return hasStarted ? count + " of " + quorum : "Not started";
     }
@@ -4817,15 +4817,15 @@
         var provisionalScores = e.provisional_scores || [];
         var scoreFloor = Number(e.score_floor);
         if (!provisionalScores.length || !Number.isFinite(scoreFloor)) {
-          return "Evaluation stopped after two accepted scores below the current score floor. " +
-            "No further validator tickets will be issued.";
+          return "Two accepted scores are below the current same-benchmark score floor. " +
+            "The final score is still queued, after other unfinished submissions.";
         }
         var bestPossible = provisionalScores.reduce(function (best, score) {
           return Math.max(best, Number(score.composite) || 0);
         }, 0);
-        return "Evaluation stopped after two accepted scores. Even a perfect third run could not raise the median above " +
+        return "Two accepted scores mean even a perfect third run could not raise the median above " +
           fx(bestPossible) + ", below the current fifth-place score of " + fx(scoreFloor) +
-          ". No further validator tickets will be issued.";
+          ". The third score is still queued at low priority so this benchmark record reaches 3 of 3.";
       }
       if (e.status === "waiting_screening") return "Queued for a screener to claim under the current policy.";
       if (e.status === "screening") return "A screener is currently checking this submission.";
@@ -5068,7 +5068,7 @@
 
     function renderAcceptedScores(pipeline) {
       var quorum = Math.max(1, Number(pipeline.quorum) || 3);
-      var stopped = pipeline.status === "below_score_floor";
+      var deprioritized = pipeline.status === "below_score_floor";
       var cohorts = benchmarkCohorts(pipeline).filter(function (cohort) { return cohort.scores.length; });
       function renderScore(score, index, complete) {
         var label = complete ? "Accepted score " + (index + 1) : "Provisional score " + (index + 1);
@@ -5110,8 +5110,8 @@
         var complete = cohort.scores.length >= quorum;
         var note = complete
           ? "This benchmark version has reached quorum. Its aggregate is the median of these independent accepted scores."
-          : stopped && cohort.key === benchmarkVersionKey(pipeline.active_bench_version)
-          ? "Evaluation stopped after two scores proved the best reachable median was below the current fifth-place score. This result is not eligible for emissions."
+          : deprioritized && cohort.key === benchmarkVersionKey(pipeline.active_bench_version)
+          ? "The third score remains queued at low priority because the best reachable median is below the current fifth-place score. This result remains provisional until quorum."
           : "Scores in this benchmark version remain provisional until " + quorum + " independent scores arrive. Provisional scores may change; the final median is authoritative within this benchmark version.";
         var rows = cohort.scores.map(function (score, index) {
           return renderScore(score, index, complete);
@@ -5513,9 +5513,9 @@
       var columns = [
         { status: "waiting_screening", statuses: ["waiting_screening"], body: "pipeline-wait-screen", count: "pipeline-wait-screen-count", empty: "No submissions waiting." },
         { status: "screening", statuses: ["screening"], body: "pipeline-screening", count: "pipeline-screening-count", empty: "No active screening job." },
-        { status: "waiting_validator", statuses: ["waiting_validator"], body: "pipeline-wait-validator", count: "pipeline-wait-validator-count", empty: "No submissions waiting." },
+        { status: "waiting_validator", statuses: ["waiting_validator", "below_score_floor"], body: "pipeline-wait-validator", count: "pipeline-wait-validator-count", empty: "No submissions waiting." },
         { status: "evaluating", statuses: ["evaluating"], body: "pipeline-evaluating", count: "pipeline-evaluating-count", empty: "No active evaluation." },
-        { status: "scored", statuses: ["scored", "live", "below_score_floor"], body: "pipeline-scored", count: "pipeline-scored-count", empty: "No scores yet. Finalized agents will appear here." }
+        { status: "scored", statuses: ["scored", "live"], body: "pipeline-scored", count: "pipeline-scored-count", empty: "No scores yet. Finalized agents will appear here." }
       ];
       pipelineLoaded = true;
       pipelineUnavailable = unavailable;

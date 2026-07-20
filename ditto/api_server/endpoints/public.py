@@ -1462,12 +1462,15 @@ def _public_activity_response(
     # Mirror the validator ticket queue's global ordering. The ticket query adds
     # validator-specific retry and eligibility checks that can still skip a row.
     waiting_candidates = [
-        row for row, row_status in projected if row_status == "waiting_validator"
+        (row, row_status)
+        for row, row_status in projected
+        if row_status in ("waiting_validator", "below_score_floor")
     ]
     provisional_candidates = sorted(
         (
             row
-            for row in waiting_candidates
+            for row, row_status in waiting_candidates
+            if row_status != "below_score_floor"
             if row.score_count == SCORING_QUORUM - 1
             and row.provisional_composite is not None
         ),
@@ -1488,16 +1491,17 @@ def _public_activity_response(
     }
     waiting_rows = sorted(
         waiting_candidates,
-        key=lambda row: (
-            0 if row.agent.agent_id in provisional_contender_ids else 1,
-            row.score_count,
-            -(row.provisional_composite or 0.0),
-            row.agent.created_at,
-            str(row.agent.agent_id),
+        key=lambda candidate: (
+            1 if candidate[1] == "below_score_floor" else 0,
+            0 if candidate[0].agent.agent_id in provisional_contender_ids else 1,
+            candidate[0].score_count,
+            -(candidate[0].provisional_composite or 0.0),
+            candidate[0].agent.created_at,
+            str(candidate[0].agent.agent_id),
         ),
     )
     validator_queue_ranks = {
-        row.agent.agent_id: rank for rank, row in enumerate(waiting_rows, start=1)
+        row.agent.agent_id: rank for rank, (row, _) in enumerate(waiting_rows, start=1)
     }
     normalized_query = query.strip().casefold() if query else ""
     if normalized_query:
@@ -1677,7 +1681,8 @@ async def activity(
         )
 
     now = datetime.now(UTC)
-    rows, _ = await list_public_activity(session)
+    active_version = await active_bench_version(session)
+    rows, _ = await list_public_activity(session, bench_version=active_version)
     ath_opened_at: dict[UUID, datetime] = {}
     ath_composite: dict[UUID, float] = {}
     if review == "ath":
@@ -1693,7 +1698,9 @@ async def activity(
         limit=limit,
         requested_statuses=requested_statuses,
         query=q,
-        score_continuation_floor=await get_score_continuation_floor(session),
+        score_continuation_floor=await get_score_continuation_floor(
+            session, bench_version=active_version
+        ),
         active_assignment_agent_ids={
             assignment.agent.agent_id for assignment in assignments
         },
@@ -1712,7 +1719,9 @@ async def operations(
     """Atomic dashboard snapshot for submission pipeline and validator fleet health."""
     response.headers["Cache-Control"] = "public, max-age=10"
     now = datetime.now(UTC)
-    activity_rows, _ = await list_public_activity(session)
+    benchmark_rollout = await rollout_state(session, now=now)
+    active_version = cast(int, benchmark_rollout["active_version"])
+    activity_rows, _ = await list_public_activity(session, bench_version=active_version)
     heartbeat_rows = await list_validator_heartbeats(session)
     assignments = await list_active_validator_assignments(session, now=now)
     active_work = await list_active_validator_work(
@@ -1726,7 +1735,9 @@ async def operations(
         limit=max(1, len(activity_rows)),
         requested_statuses=set(),
         query=None,
-        score_continuation_floor=await get_score_continuation_floor(session),
+        score_continuation_floor=await get_score_continuation_floor(
+            session, bench_version=active_version
+        ),
         active_assignment_agent_ids={
             assignment.agent.agent_id for assignment in assignments
         },
@@ -1738,7 +1749,6 @@ async def operations(
         active_work=active_work,
         now=now,
     )
-    benchmark_rollout = await rollout_state(session, now=now)
     return PublicOperationsResponse(
         generated_at=now,
         active_bench_version=cast(int, benchmark_rollout["active_version"]),
@@ -1935,7 +1945,9 @@ async def agent_pipeline(
     running_attempt = next(
         (attempt for attempt in attempts if attempt.status == "running"), None
     )
-    score_continuation_floor = await get_score_continuation_floor(session)
+    score_continuation_floor = await get_score_continuation_floor(
+        session, bench_version=canonical_version
+    )
     dispute = await session.scalar(
         select(ScreeningDispute).where(ScreeningDispute.agent_id == agent_id)
     )

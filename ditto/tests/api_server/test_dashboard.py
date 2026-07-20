@@ -256,7 +256,8 @@ class TestDashboard:
         assert 'id="pipeline-scored"' in body
         assert 'data-pipeline-stage="scored"' in body
         assert "Recent scores" in body
-        assert 'statuses: ["scored", "live", "below_score_floor"]' in body
+        assert 'statuses: ["waiting_validator", "below_score_floor"]' in body
+        assert 'statuses: ["scored", "live"]' in body
         assert 'getJSON("/public/operations")' in body
         assert "max-height: 390px" in body
         assert "indexed.slice(0, 5)" not in body
@@ -418,17 +419,21 @@ class TestDashboard:
         assert "Operator review" in body
         assert 'data-activity-filter="waiting_validator" aria-pressed="false"' in body
         assert 'data-activity-filter="queued" aria-pressed="false"' in body
-        assert 'waiting_screening", "screening", "waiting_validator' in body
-        assert 'below_score_floor: ["Below score floor", "warn"]' in body
+        assert (
+            'waiting_screening", "screening", "waiting_validator", "below_score_floor'
+            in body
+        )
+        assert 'below_score_floor: ["Low-priority completion", "warn"]' in body
         assert 'under_review: ["Operator review", "warn"]' in body
         assert '"below_score_floor", "under_review"' in body
         assert "var provisionalScores = e.provisional_scores || [];" in body
         assert "if (!provisionalScores.length || !Number.isFinite(scoreFloor))" in body
         assert (
-            "Evaluation stopped after two accepted scores below the current score "
-            "floor." in body
+            "Two accepted scores are below the current same-benchmark score floor."
+            in body
         )
-        assert "No further validator tickets will be issued." in body
+        assert "The final score is still queued" in body
+        assert "The third score is still queued at low priority" in body
         assert (
             "Automated processing is paused while an operator reviews this submission."
             in body
