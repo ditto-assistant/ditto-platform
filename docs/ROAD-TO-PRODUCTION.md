@@ -130,15 +130,20 @@ Everything below ships after launch. None of it blocks launch.
 A trustless independent validator runs the whole evaluation itself, which fixes
 which repos are public and what is left to open.
 
+Repository visibility is separate from operational access. The platform and
+screener source are public, but both deployments remain centrally operated;
+private miner artifacts, review evidence, credentials, and protected admin
+operations are not made public with the source.
+
 | Repo | Role | Status | Action |
 |---|---|---|---|
 | `dittobench-datagen` | dataset generator + judge-free grader | PUBLIC | none; the validator regenerates the dataset from the seed and grades per-case |
 | `ditto-harness` | miner agent/memory library | PUBLIC | none; fetched during the miner's Docker build inside the sandbox |
 | `dittobench-starter-kit` | miner harness kit | PUBLIC | none; miner-side |
 | `ditto-subnet` | the validator worker | PUBLIC | a validator runs this process |
-| `ditto-screener` | platform-operated v6 build/health gate and private review modules | PRIVATE | the team runs this process on the isolated screener VM |
+| `ditto-screener` | platform-operated v6 build/health gate; private artifacts and review evidence remain operational data | PUBLIC | MIT-licensed source; the team runs this process on the isolated screener VM |
 | `dittobench-api` | the scoring engine (build/run miner, model+egress lock, composite + gates) | PRIVATE | OPEN: flip visibility (pre-launch step 3) |
-| `ditto-platform` | central coordinator (dataset issuance, ticket lease, ledger, median) | PRIVATE | STAYS private: the validator talks to it but verifies everything it returns (seed re-derivation, tarball sha256, signed scores, public audit log) |
+| `ditto-platform` | central coordinator (dataset issuance, ticket lease, ledger, median) | PUBLIC | MIT-licensed source; the service remains centrally operated, and validators verify everything it returns (seed re-derivation, tarball sha256, signed scores, public audit log) |
 | `ditto-data-pipeline` | upstream corpus extraction | PRIVATE | STAYS private: off the scoring path |
 
 So exactly one repo remains to open: **`dittobench-api`**. Open the whole repo in

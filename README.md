@@ -8,6 +8,11 @@ weights on chain). It owns miner intake, on-chain payment verification, object
 storage for submissions, the evaluation job queue, the score ledger, and the
 operational state machine that moves a submission from `uploaded` to `live`.
 
+The source in this repository is open under the [MIT License](LICENSE). The
+production service remains centrally operated. Publishing the source does not
+publish private miner artifacts, operator review evidence, credentials, or
+protected operational data, and it does not grant access to admin endpoints.
+
 > The chain is the settlement layer (weights, stake, payments). This platform is
 > the **workflow** layer the chain can't hold — queues, leases, payment
 > replay-protection, submission status, and the public score ledger.
@@ -76,8 +81,9 @@ failures as `screening_failed` for another claim. A crate that does not compile
 never costs a full benchmark.
 It authenticates with a dedicated screener credential (an allowlisted
 hotkey plus a bearer token), not a validator permit, so the screener key holds no
-stake. The authoritative worker is deployed from the private `ditto-screener`
-repository; validators do not run it.
+stake. The authoritative worker is deployed from the public, MIT-licensed
+[`ditto-screener`](https://github.com/ditto-assistant/ditto-screener) repository;
+it remains platform-operated, and validators do not run it.
 
 | Method & path | Purpose |
 | --- | --- |
