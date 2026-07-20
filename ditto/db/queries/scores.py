@@ -1092,6 +1092,30 @@ async def quorum_composites(
     return out
 
 
+async def quorum_score_rows(
+    session: AsyncSession,
+    agent_ids: Sequence[UUID],
+    *,
+    bench_versions: dict[UUID, int],
+) -> dict[UUID, list[Score]]:
+    """Return every accepted score row backing each authoritative ledger row."""
+    if not agent_ids:
+        return {}
+    result = await session.execute(
+        select(Score)
+        .where(
+            Score.agent_id.in_(agent_ids),
+            Score.bench_version.in_(set(bench_versions.values())),
+        )
+        .order_by(Score.agent_id, Score.composite, Score.validator_hotkey)
+    )
+    out: dict[UUID, list[Score]] = {}
+    for score in result.scalars():
+        if bench_versions.get(score.agent_id) == score.bench_version:
+            out.setdefault(score.agent_id, []).append(score)
+    return out
+
+
 async def list_provisional_ledger(
     session: AsyncSession,
     *,

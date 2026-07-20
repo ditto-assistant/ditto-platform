@@ -145,6 +145,10 @@ async def _seed_scored(
             n=20,
             generated_at=datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
             signature="ab" * 64,
+            details={
+                "ticket_deadline": "2026-06-08T13:00:00+00:00",
+                "transcript_sha256": "cd" * 32,
+            },
         )
 
 
@@ -176,10 +180,23 @@ class TestScoringLedger:
         assert body["entries"][0]["composite"] == pytest.approx(0.9)
         assert body["entries"][0]["signature"] == "ab" * 64
         assert body["entries"][0]["bench_version"] == 2
-        # n rides the wire so the validator's eligibility floor can bite: a run
+        assert body["entries"][0]["score_proofs"] == [
+            {
+                "validator_hotkey": _VALIDATOR_HOTKEY,
+                "run_id": "run_1",
+                "composite": 0.9,
+                "seed": 42,
+                "bench_version": 2,
+                "ticket_deadline": "2026-06-08T13:00:00Z",
+                "transcript_sha256": "cd" * 32,
+                "signature": "ab" * 64,
+            }
+        ]
+        # n rides the wire so the validator's eligibility floor can bite (a run
         # below MIN_ELIGIBLE_CASES is dropped from the fold rather than shadowing
         # a real full run.
         assert body["entries"][0]["n"] == 20
+        assert len(body["entries"][0]["score_proofs"]) == 1
 
     async def test_empty_ledger(
         self,

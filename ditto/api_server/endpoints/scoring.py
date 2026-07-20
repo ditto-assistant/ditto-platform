@@ -33,6 +33,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ditto.api_models import ConfirmationScoreRecord, LedgerEntry, LedgerResponse
 from ditto.api_models.upload import _SS58_PATTERN
+from ditto.api_models.validator import LedgerScoreProof
 from ditto.api_server.endpoints.validator import (
     ChainDep,
     SessionDep,
@@ -42,7 +43,12 @@ from ditto.api_server.endpoints.validator import (
 )
 from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.confirmation_scores import confirmation_history_by_agent
-from ditto.db.queries.scores import list_eligible_ledger, quorum_composites
+from ditto.db.models import Score
+from ditto.db.queries.scores import (
+    list_eligible_ledger,
+    quorum_composites,
+    quorum_score_rows,
+)
 from ditto.db.queries.validator_auth import (
     ValidatorRequestReplayError,
     consume_validator_nonce,
@@ -91,6 +97,29 @@ def _composite_stderr(details: dict | None) -> float | None:
         if f >= 0.0 and f == f and f != float("inf"):
             return f
     return None
+
+
+def _score_proof(score: Score) -> LedgerScoreProof:
+    details = score.details
+    details = details if isinstance(details, dict) else {}
+    deadline = details.get("ticket_deadline")
+    try:
+        parsed_deadline = (
+            datetime.fromisoformat(deadline) if isinstance(deadline, str) else None
+        )
+    except ValueError:
+        parsed_deadline = None
+    transcript = details.get("transcript_sha256")
+    return LedgerScoreProof(
+        validator_hotkey=score.validator_hotkey,
+        run_id=score.run_id,
+        composite=score.composite,
+        seed=score.seed,
+        bench_version=score.bench_version,
+        ticket_deadline=parsed_deadline,
+        transcript_sha256=transcript if isinstance(transcript, str) else None,
+        signature=score.signature,
+    )
 
 
 def _confirmation_composites(details: dict | None) -> list[float] | None:
@@ -264,6 +293,11 @@ async def scores(
             agent_ids=[r.agent_id for r in rows],
             bench_version=canonical_version,
         )
+        proof_rows = await quorum_score_rows(
+            session,
+            [r.agent_id for r in rows],
+            bench_versions={r.agent_id: r.bench_version for r in rows},
+        )
     except SQLAlchemyError as e:
         return _serve_last_known(request, x_validator_hotkey, e)
 
@@ -282,6 +316,7 @@ async def scores(
             validator_hotkey=r.validator_hotkey,
             bench_version=r.bench_version,
             signature=r.signature,
+            score_proofs=[_score_proof(s) for s in proof_rows.get(r.agent_id, [])],
             composite_stderr=_ledger_stderr(r.details, quorum.get(r.agent_id, [])),
             confirmation_composites=_confirmation_composites(r.details),
             confirmation_seeds=_confirmation_seeds(r.details),
