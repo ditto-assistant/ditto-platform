@@ -100,6 +100,7 @@ from ditto.api_models import (
     PublicValidatorWeightVector,
 )
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.public import (
     FleetAvailability,
     FleetHealth,
@@ -206,6 +207,14 @@ _DATAGEN_VERSION_BY_BENCH_VERSION = {2: "v0.7.0", 3: "v0.8.0", 4: "v0.9.0"}
 _DATAGEN_RUN_SIZES = frozenset({"small", "medium", "full"})
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 _VALIDATOR_STALE_WINDOW = timedelta(minutes=15)
+# Pre-run stages that should complete in a couple of minutes (pull + start the
+# screener-built image, generate the dataset). Sitting in one of them past the
+# threshold means the run is wedged rather than progressing; running_benchmark is
+# excluded because it can legitimately run to the validator's 75-minute cap.
+_BENCHMARK_STALL_EARLY_STAGES: frozenset[BenchmarkProgressStage] = frozenset(
+    {"preparing", "building_harness", "generating_dataset", "starting_harness"}
+)
+_BENCHMARK_STALL_AFTER = timedelta(minutes=15)
 _PUBLIC_ACTIVITY_STATUSES = frozenset(
     {
         "waiting_screening",
@@ -401,15 +410,35 @@ def _stored_screener_progress(raw: dict | None) -> ScreenerProgress | None:
         return None
 
 
-def _public_benchmark_progress(work: ActiveValidatorWork) -> PublicBenchmarkProgress:
+def _benchmark_stalled(
+    stage: BenchmarkProgressStage | None, started_at: datetime, now: datetime
+) -> bool:
+    """Flag an early stage that has run far longer than it ever legitimately should.
+
+    Only the pre-run stages qualify: pulling and starting the screener-built
+    image plus generating the dataset take a couple of minutes, so a quarter hour
+    still in one of them means the run is wedged (e.g. the sandbox executor cannot
+    start the container). ``running_benchmark`` is deliberately excluded — it can
+    legitimately run up to the validator's 75-minute cap — so a genuinely
+    progressing benchmark is never mislabelled.
+    """
+    if stage not in _BENCHMARK_STALL_EARLY_STAGES:
+        return False
+    return now - started_at >= _BENCHMARK_STALL_AFTER
+
+
+def _public_benchmark_progress(
+    work: ActiveValidatorWork, now: datetime
+) -> PublicBenchmarkProgress:
     """Coarsen private signed counts into the fixed public allowlist."""
     progress = work.progress
+    started_at = cast(datetime, _aware(work.ticket.issued_at))
     if progress is None:
         return PublicBenchmarkProgress(
             agent_id=work.agent.agent_id,
             agent_name=work.agent.name,
             bench_version=work.ticket.bench_version,
-            started_at=cast(datetime, _aware(work.ticket.issued_at)),
+            started_at=started_at,
         )
     percent: int | None = None
     completed_checks: int | None = None
@@ -432,11 +461,12 @@ def _public_benchmark_progress(work: ActiveValidatorWork) -> PublicBenchmarkProg
         agent_id=work.agent.agent_id,
         agent_name=work.agent.name,
         bench_version=work.ticket.bench_version,
-        started_at=cast(datetime, _aware(work.ticket.issued_at)),
+        started_at=started_at,
         stage=progress.stage,
         completed_checks=completed_checks,
         total_checks=total_checks,
         percent=percent,
+        stalled=_benchmark_stalled(progress.stage, started_at, now),
     )
 
 
@@ -1083,6 +1113,11 @@ def _validator_heartbeats_response(
             assignment_state = "synchronized"
         else:
             assignment_state = "heartbeat_mismatch"
+        active_benchmark = (
+            _public_benchmark_progress(synchronized_work, now)
+            if synchronized_work is not None
+            else None
+        )
         entries.append(
             PublicValidatorHeartbeat(
                 validator_hotkey=row.validator_hotkey,
@@ -1102,17 +1137,20 @@ def _validator_heartbeats_response(
                     if synchronized_work is not None
                     else None
                 ),
-                active_benchmark=(
-                    _public_benchmark_progress(synchronized_work)
-                    if synchronized_work is not None
-                    else None
-                ),
+                active_benchmark=active_benchmark,
                 first_seen_at=_aware(row.first_seen_at),
                 reported_at=cast(datetime, _aware(row.reported_at)),
                 seen_at=seen_at,
                 online=online,
                 availability=availability,
-                health=health,
+                # A wedged benchmark is a real operational problem regardless of
+                # how the host metrics look (or whether they were reported), so
+                # surface it as a warning in the fleet health roll-up.
+                health=(
+                    "warning"
+                    if active_benchmark is not None and active_benchmark.stalled
+                    else health
+                ),
                 system_metrics=metrics,
                 capabilities=capabilities,
                 stack=stack,
@@ -1436,7 +1474,7 @@ def _public_activity_response(
     active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
     for work in active_work:
         active_by_agent.setdefault(work.agent.agent_id, []).append(
-            _public_benchmark_progress(work)
+            _public_benchmark_progress(work, now)
         )
     active_agent_ids = set(active_by_agent)
 
@@ -1717,7 +1755,9 @@ async def operations(
     session: SessionDep,
 ) -> PublicOperationsResponse:
     """Atomic dashboard snapshot for submission pipeline and validator fleet health."""
-    response.headers["Cache-Control"] = "public, max-age=10"
+    # Short cache so the fleet page can poll on an ~8s cadence and still see fresh
+    # stage transitions now that benchmarks run quickly.
+    response.headers["Cache-Control"] = "public, max-age=8"
     now = datetime.now(UTC)
     benchmark_rollout = await rollout_state(session, now=now)
     active_version = cast(int, benchmark_rollout["active_version"])
@@ -2057,7 +2097,8 @@ async def agent_pipeline(
                     _public_benchmark_progress(
                         active_by_ticket[
                             (ticket.validator_hotkey, ticket.bench_version)
-                        ]
+                        ],
+                        now,
                     )
                     if (ticket.validator_hotkey, ticket.bench_version)
                     in active_by_ticket
