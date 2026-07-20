@@ -575,7 +575,8 @@ class TestDashboard:
         assert 'getJSON("/public/activity?page=1&limit=200")' not in body
         assert 'id="operations-snapshot" aria-live="polite"' in body
         assert "Pipeline and fleet reconciled" in body
-        assert 'entry.assignment_state === "heartbeat_mismatch"' in body
+        assert 'entry.assignment_state === "assignment_mismatch"' in body
+        assert 'entry.assignment_state === "assigning"' in body
         assert 'entry.assignment_state === "heartbeat_stale"' in body
         assert 'return ["Mismatch", "bad"]' in body
         assert "counts.warning++" in body

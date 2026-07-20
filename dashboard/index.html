@@ -5823,7 +5823,10 @@
     }
 
     function fleetStatus(entry) {
-      if (entry.assignment_state === "heartbeat_mismatch") return ["Mismatch", "bad"];
+      // A live-but-off-assignment validator (bad) is distinct from a quiet one
+      // (warn); "assigning" is a normal hand-off and stays green via health below.
+      if (entry.assignment_state === "assignment_mismatch") return ["Mismatch", "bad"];
+      if (entry.assignment_state === "heartbeat_stale") return ["Heartbeat stale", "warn"];
       if (entry.availability === "stale") return ["Stale", "warn"];
       if (entry.availability === "offline") return ["Offline", "bad"];
       if (entry.availability === "paused") return ["Paused", "paused"];
@@ -5856,7 +5859,7 @@
     }
 
     function renderValidatorAssignment(entry) {
-      if (entry.assignment_state === "heartbeat_mismatch") {
+      if (entry.assignment_state === "assignment_mismatch") {
         var assigned = entry.assigned_agent_id
           ? entityAnchor("agent", entry.assigned_agent_id, (entry.assigned_agent_name || "Agent") + " · " + String(entry.assigned_agent_id).slice(0, 8))
           : "No active assignment";
@@ -5865,6 +5868,13 @@
           : "No active agent";
         return '<span class="stage bad">Assignment mismatch</span>' +
           '<span class="assignment-detail"><b>Platform</b> ' + assigned + '<br><b>Heartbeat</b> ' + reported + '</span>';
+      }
+      if (entry.assignment_state === "assigning") {
+        var assigning = entry.assigned_agent_id
+          ? entityAnchor("agent", entry.assigned_agent_id, (entry.assigned_agent_name || "Agent") + " · " + String(entry.assigned_agent_id).slice(0, 8))
+          : "Agent";
+        return '<span class="stage progress">Assigning</span>' +
+          '<span class="assignment-detail"><b>Platform assignment</b> ' + assigning + ' · handing off</span>';
       }
       if (entry.assignment_state === "heartbeat_stale") {
         var staleAssignment = entry.assigned_agent_id
@@ -6117,7 +6127,7 @@
     function updateFleetLedger(entries) {
       var counts = { healthy: 0, warning: 0, stale: 0, offline: 0, paused: 0, unknown: 0 };
       entries.forEach(function (entry) {
-        if (entry.assignment_state === "heartbeat_mismatch") counts.warning++;
+        if (entry.assignment_state === "assignment_mismatch") counts.warning++;
         else if (entry.availability === "stale") counts.stale++;
         else if (entry.availability === "offline") counts.offline++;
         else if (entry.availability === "paused") counts.paused++;

@@ -1629,9 +1629,20 @@ class PublicHealthResponse(BaseModel):
 FleetAvailability = Literal["available", "stale", "offline", "paused", "unknown"]
 FleetHealth = Literal["healthy", "warning", "unknown"]
 ValidatorAssignmentState = Literal[
+    # The validator is doing exactly the work the platform leased it.
     "synchronized",
+    # The lease was issued too recently for the validator to have reported it yet
+    # (a normal job hand-off). A transient, non-alarming state — kept separate so
+    # the fleet view does not flap red between jobs.
+    "assigning",
+    # The validator has gone quiet (no fresh heartbeat within the online window).
+    # A liveness problem, distinct from a job/assignment problem.
     "heartbeat_stale",
-    "heartbeat_mismatch",
+    # The validator is heartbeating but, past the hand-off grace, is not doing its
+    # assigned job (or is reporting work the platform never assigned). A real
+    # job/assignment mismatch. (Renamed from the misleading "heartbeat_mismatch".)
+    "assignment_mismatch",
+    # No live lease and no reported work.
     "unassigned",
 ]
 

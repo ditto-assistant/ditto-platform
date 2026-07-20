@@ -214,6 +214,12 @@ _DATAGEN_VERSION_BY_BENCH_VERSION = {
 _DATAGEN_RUN_SIZES = frozenset({"small", "medium", "full"})
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 _VALIDATOR_STALE_WINDOW = timedelta(minutes=15)
+# Grace after a lease is issued before the validator is expected to report (in a
+# heartbeat) that it has picked the agent up. Within this window an assigned-but-
+# not-yet-reported validator reads as "assigning" rather than a mismatch, so the
+# fleet view does not flap red during normal job hand-offs. A couple of heartbeat
+# cycles is plenty; the lease is created when the validator itself claims work.
+_ASSIGNMENT_HANDOFF_GRACE = timedelta(seconds=60)
 # Pre-run stages that should complete in a couple of minutes (pull + start the
 # screener-built image, generate the dataset). Sitting in one of them past the
 # threshold means the run is wedged rather than progressing; running_benchmark is
@@ -1137,17 +1143,36 @@ def _validator_heartbeats_response(
                 stack_health = ValidatorStackHealth.model_validate(row.stack_health)
         assignment_state: ValidatorAssignmentState
         if assignment is None:
+            # No live lease. Reporting an agent with no assignment is a genuine
+            # mismatch (e.g. a run outliving its reopened ticket, as with a slow
+            # legacy validator); otherwise the validator is simply idle.
             assignment_state = (
-                "heartbeat_mismatch"
+                "assignment_mismatch"
                 if row.active_agent_id is not None
                 else "unassigned"
             )
         elif seen_at < now - _VALIDATOR_ONLINE_WINDOW:
+            # A quiet validator is a liveness problem, deliberately kept distinct
+            # from a job/assignment problem below.
             assignment_state = "heartbeat_stale"
         elif synchronized_work is not None:
             assignment_state = "synchronized"
         else:
-            assignment_state = "heartbeat_mismatch"
+            issued_at = _aware(assignment.ticket.issued_at)
+            if (
+                issued_at is not None
+                and issued_at > seen_at - _ASSIGNMENT_HANDOFF_GRACE
+            ):
+                # The lease was issued within the hand-off grace of this heartbeat,
+                # so the validator has not yet had a chance to report picking it
+                # up. A transient hand-off — this is what stops the fleet view from
+                # flapping red during normal job transitions.
+                assignment_state = "assigning"
+            else:
+                # Fresh heartbeats, lease older than the grace (or an anomalous
+                # lease with no issue time), still not on the assigned agent: a
+                # real job/assignment mismatch.
+                assignment_state = "assignment_mismatch"
         active_benchmark = (
             _public_benchmark_progress(synchronized_work, now)
             if synchronized_work is not None
