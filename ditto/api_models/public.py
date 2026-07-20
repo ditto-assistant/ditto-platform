@@ -895,6 +895,17 @@ class PublicBenchmarkProgress(BaseModel):
     percent: Annotated[int | None, Field(default=None, ge=0, le=95, multiple_of=5)] = (
         None
     )
+    stalled: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "The run has sat in an early stage (preparing/building/starting "
+                "the harness) far longer than that stage should take, so it is "
+                "very likely stuck rather than progressing."
+            ),
+        ),
+    ] = False
 
 
 class PublicActivityEntry(BaseModel):

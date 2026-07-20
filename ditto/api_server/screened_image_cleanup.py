@@ -42,9 +42,13 @@ async def cleanup_screened_images(
 
     Evaluating agents and each miner's current best eligible scored agent are
     retained without an age limit for validator retries and future rescoring.
-    Older non-champion images are explicitly detached from the DB first, which
-    immediately restores the source-build fallback, and only then deleted.
-    Completed objects never accepted by a verdict are removed after one day.
+    Older non-champion images are explicitly detached from the DB first and only
+    then deleted, so a validator can never fetch a screened image whose archive
+    has already been removed. There is deliberately no source-build fallback for
+    the current benchmark era (v3+): a detached agent is simply not re-scorable
+    until it is re-screened, which is correct — a validator must never rebuild
+    untrusted miner source. Completed objects never accepted by a verdict are
+    removed after one day.
     """
     now = now or datetime.now(UTC)
     abandoned_before = now - _ABANDONED_AFTER

@@ -618,10 +618,14 @@ async def _seed_ticket(
     keypair: bittensor.Keypair = _KEYPAIR,
     deadline: datetime = _TICKET_DEADLINE,
     bench_version: int = 2,
+    issued_at: datetime | None = None,
 ) -> None:
     """Seat (or re-open) an issued ticket for a specific (agent, validator) so a
     score against that agent is accepted by the k=3 gate. Upserts so a test can
     simulate the platform re-issuing a ticket to the same validator."""
+    issued = (
+        issued_at if issued_at is not None else datetime.now(UTC) - timedelta(seconds=1)
+    )
     async with maker() as s, s.begin():
         existing = await s.get(
             ValidatorTicket, (agent_id, bench_version, keypair.ss58_address)
@@ -633,12 +637,13 @@ async def _seed_ticket(
                     bench_version=bench_version,
                     validator_hotkey=keypair.ss58_address,
                     status=TicketStatus.ISSUED,
-                    issued_at=datetime.now(UTC) - timedelta(seconds=1),
+                    issued_at=issued,
                     deadline=deadline,
                 )
             )
         else:
             existing.status = TicketStatus.ISSUED
+            existing.issued_at = issued
             existing.deadline = deadline
 
 
@@ -1088,6 +1093,38 @@ class TestHeartbeat:
         assert replay.json()["accepted"] is False
         assert replay.json()["seen_at"] == response.json()["seen_at"]
 
+    async def test_early_stage_past_threshold_flags_stalled_and_warns(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A benchmark wedged in building_harness far longer than that stage should
+        # take must be surfaced: stalled=True on the run and health downgraded to
+        # "warning" even though the host metrics are otherwise fine.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        issued = datetime.now(UTC) - timedelta(minutes=20)
+        await _seed_ticket(session_maker, agent_id, issued_at=issued)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=4,
+                state="running_benchmark",
+                active_agent_id=agent_id,
+                benchmark_progress=_progress("building_harness"),
+            ),
+        )
+        assert response.status_code == 200, response.text
+        validator = (await client.get("/api/v1/public/validators")).json()[
+            "validators"
+        ][0]
+        assert validator["active_benchmark"]["stage"] == "building_harness"
+        assert validator["active_benchmark"]["stalled"] is True
+        assert validator["health"] == "warning"
+
     async def test_v2_reports_current_agent_publicly(
         self,
         app: FastAPI,
@@ -1123,6 +1160,7 @@ class TestHeartbeat:
             "completed_checks": None,
             "total_checks": None,
             "percent": None,
+            "stalled": False,
         }
 
     async def test_operations_snapshot_is_atomic_and_synchronized(
@@ -1300,6 +1338,7 @@ class TestHeartbeat:
                     "completed_checks": 51,
                     "total_checks": 114,
                     "percent": 45,
+                    "stalled": False,
                 }
             if progress["stage"] in {"finalizing", "submitting_result"}:
                 assert shown["percent"] == 95
@@ -1393,6 +1432,7 @@ class TestHeartbeat:
             "completed_checks": None,
             "total_checks": None,
             "percent": None,
+            "stalled": False,
         }
 
         downgraded = await client.post(

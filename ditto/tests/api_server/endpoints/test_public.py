@@ -2160,6 +2160,7 @@ class TestPublicActivity:
             "completed_checks",
             "total_checks",
             "percent",
+            "stalled",
         }
         fleet = responses[0].json()
         shown = [
