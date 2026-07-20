@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 from ditto.chain.errors import (
     ChainAuthError,
@@ -368,7 +369,9 @@ class ChainClient:
         from async_substrate_interface import AsyncSubstrateInterface
 
         try:
-            async with AsyncSubstrateInterface(url=self._substrate_url()) as substrate:
+            async with AsyncSubstrateInterface(
+                url=self._historical_substrate_url()
+            ) as substrate:
                 events = await substrate.query(
                     module=_SYSTEM_MODULE,
                     storage_function="Events",
@@ -380,7 +383,8 @@ class ChainClient:
             ) from e
         except Exception as e:
             raise ChainConnectionError(
-                f"check_extrinsic_success({block_hash}, {extrinsic_index}) failed: {e}"
+                f"check_extrinsic_success({block_hash}, {extrinsic_index}) failed: "
+                f"{self._safe_rpc_error(e)}"
             ) from e
 
         for record in _iter_event_records(events):
@@ -430,7 +434,9 @@ class ChainClient:
         from async_substrate_interface import AsyncSubstrateInterface
 
         try:
-            async with AsyncSubstrateInterface(url=self._substrate_url()) as substrate:
+            async with AsyncSubstrateInterface(
+                url=self._historical_substrate_url()
+            ) as substrate:
                 result = await substrate.query(
                     module=_SUBTENSOR_MODULE,
                     storage_function=_OWNER_STORAGE,
@@ -443,7 +449,8 @@ class ChainClient:
             ) from e
         except Exception as e:
             raise ChainConnectionError(
-                f"get_coldkey_for_hotkey({hotkey}, {block_hash}) failed: {e}"
+                f"get_coldkey_for_hotkey({hotkey}, {block_hash}) failed: "
+                f"{self._safe_rpc_error(e)}"
             ) from e
 
         coldkey = _unwrap_substrate_value(result)
@@ -477,7 +484,9 @@ class ChainClient:
         from async_substrate_interface import AsyncSubstrateInterface
 
         try:
-            async with AsyncSubstrateInterface(url=self._substrate_url()) as substrate:
+            async with AsyncSubstrateInterface(
+                url=self._historical_substrate_url()
+            ) as substrate:
                 result = await substrate.query(
                     module=_TIMESTAMP_MODULE,
                     storage_function=_TIMESTAMP_NOW_STORAGE,
@@ -489,7 +498,7 @@ class ChainClient:
             ) from e
         except Exception as e:
             raise ChainConnectionError(
-                f"get_block_timestamp({block_hash}) failed: {e}"
+                f"get_block_timestamp({block_hash}) failed: {self._safe_rpc_error(e)}"
             ) from e
 
         raw = _unwrap_substrate_value(result)
@@ -511,6 +520,27 @@ class ChainClient:
         if network == "local":
             return _LOCAL_WS_URL
         return network
+
+    def _historical_substrate_url(self) -> str:
+        """Return the archive RPC URL without ever logging its credential."""
+        url = self._config.archive_rpc_url
+        if not url:
+            return self._substrate_url()
+        api_key = self._config.archive_rpc_api_key
+        if not api_key:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}authorization={quote(api_key, safe='')}"
+
+    def _safe_rpc_error(self, error: Exception) -> str:
+        """Render an RPC exception with configured credentials redacted."""
+        detail = str(error)
+        api_key = self._config.archive_rpc_api_key
+        if not api_key:
+            return detail
+        return detail.replace(api_key, "<redacted>").replace(
+            quote(api_key, safe=""), "<redacted>"
+        )
 
 
 def _translate_pylon_error(exc: Exception, op: str) -> Exception:
