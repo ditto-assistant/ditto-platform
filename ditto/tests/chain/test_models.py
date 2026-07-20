@@ -361,6 +361,7 @@ class TestParseChainConfigFromEnv:
         monkeypatch.delenv("SUBTENSOR_NETWORK", raising=False)
         monkeypatch.delenv("SUBTENSOR_ARCHIVE_RPC_URL", raising=False)
         monkeypatch.delenv("SUBTENSOR_ARCHIVE_RPC_API_KEY", raising=False)
+        monkeypatch.delenv("SUBTENSOR_ARCHIVE_RPC_AUTH_MODE", raising=False)
         monkeypatch.delenv("DITTO_TAOSTATS_API_KEY", raising=False)
 
         config = parse_chain_config_from_env()
@@ -369,8 +370,13 @@ class TestParseChainConfigFromEnv:
         assert config.pylon_url == "http://localhost:8001"
         assert config.netuid == 118
         assert config.subtensor_network == "finney"
-        assert config.archive_rpc_url == "wss://archive.chain.opentensor.ai:443"
+        assert config.archive_rpc_url is None
         assert config.archive_rpc_api_key is None
+        assert config.public_archive_rpc_urls == (
+            "wss://archive.chain.opentensor.ai:443",
+            "wss://bittensor-finney.api.onfinality.io/public-ws",
+        )
+        assert config.archive_rpc_timeout_seconds == 10.0
 
     def test_existing_taostats_key_does_not_override_default_archive(
         self, monkeypatch: pytest.MonkeyPatch
@@ -383,7 +389,7 @@ class TestParseChainConfigFromEnv:
 
         config = parse_chain_config_from_env()
 
-        assert config.archive_rpc_url == "wss://archive.chain.opentensor.ai:443"
+        assert config.archive_rpc_url is None
         assert config.archive_rpc_api_key is None
 
     def test_explicit_taostats_archive_reuses_existing_key(
@@ -418,6 +424,34 @@ class TestParseChainConfigFromEnv:
 
         assert config.archive_rpc_url == "wss://rpc.example/archive"
         assert config.archive_rpc_api_key == "provider-key"
+
+    def test_explicit_path_authenticated_archive(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("PYLON_OPEN_ACCESS_TOKEN", "tok")
+        monkeypatch.setenv("SUBTENSOR_NETWORK", "finney")
+        monkeypatch.setenv(
+            "SUBTENSOR_ARCHIVE_RPC_URL",
+            "wss://api-bittensor-mainnet.n.dwellir.com",
+        )
+        monkeypatch.setenv("SUBTENSOR_ARCHIVE_RPC_API_KEY", "provider-key")
+        monkeypatch.setenv("SUBTENSOR_ARCHIVE_RPC_AUTH_MODE", "path")
+
+        config = parse_chain_config_from_env()
+
+        assert config.archive_rpc_auth_mode == "path"
+
+    def test_invalid_archive_auth_mode_raises(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("PYLON_OPEN_ACCESS_TOKEN", "tok")
+        monkeypatch.setenv("SUBTENSOR_ARCHIVE_RPC_AUTH_MODE", "header")
+
+        with pytest.raises(ValueError, match="archive_rpc_auth_mode"):
+            parse_chain_config_from_env()
+
+    def test_archive_timeout_must_be_positive(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("PYLON_OPEN_ACCESS_TOKEN", "tok")
+        monkeypatch.setenv("SUBTENSOR_ARCHIVE_RPC_TIMEOUT_SECONDS", "0")
+
+        with pytest.raises(ValueError, match="archive_rpc_timeout_seconds"):
+            parse_chain_config_from_env()
 
     def test_no_auth_configured_raises(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("PYLON_OPEN_ACCESS_TOKEN", raising=False)

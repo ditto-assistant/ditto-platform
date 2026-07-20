@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -540,6 +541,109 @@ class TestCheckExtrinsicSuccess:
 
         assert "super-secret" not in str(exc_info.value)
         assert "<redacted>" in str(exc_info.value)
+
+    async def test_free_archives_fail_over_before_configured_provider(
+        self, install_substrate_module: AsyncMock
+    ):
+        install_substrate_module.query.side_effect = [
+            RuntimeError("State discarded"),
+            MagicMock(value=[make_event_record(3, event_id="ExtrinsicSuccess")]),
+        ]
+        config = make_chain_config(
+            public_archive_rpc_urls=(
+                "wss://archive.chain.opentensor.ai:443",
+                "wss://bittensor-finney.api.onfinality.io/public-ws",
+            ),
+            archive_rpc_url="wss://paid.example/archive",
+            archive_rpc_api_key="paid-key",
+        )
+
+        async with ChainClient(config) as client:
+            ok = await client.check_extrinsic_success("0xhash", 3)
+
+        assert ok is True
+        substrate_factory = sys.modules[
+            "async_substrate_interface"
+        ].AsyncSubstrateInterface
+        assert [call.kwargs["url"] for call in substrate_factory.call_args_list] == [
+            "wss://archive.chain.opentensor.ai:443",
+            "wss://bittensor-finney.api.onfinality.io/public-ws",
+        ]
+
+    async def test_configured_paid_provider_is_last_resort(
+        self, install_substrate_module: AsyncMock
+    ):
+        install_substrate_module.query.side_effect = [
+            RuntimeError("first unavailable"),
+            RuntimeError("second unavailable"),
+            MagicMock(value=[make_event_record(3, event_id="ExtrinsicSuccess")]),
+        ]
+        config = make_chain_config(
+            public_archive_rpc_urls=(
+                "wss://free-one.example",
+                "wss://free-two.example",
+            ),
+            archive_rpc_url="wss://paid.example/archive",
+            archive_rpc_api_key="paid-key",
+        )
+
+        async with ChainClient(config) as client:
+            ok = await client.check_extrinsic_success("0xhash", 3)
+
+        assert ok is True
+        substrate_factory = sys.modules[
+            "async_substrate_interface"
+        ].AsyncSubstrateInterface
+        assert [call.kwargs["url"] for call in substrate_factory.call_args_list] == [
+            "wss://free-one.example",
+            "wss://free-two.example",
+            "wss://paid.example/archive?authorization=paid-key",
+        ]
+
+    async def test_provider_timeout_falls_through_to_next_archive(
+        self, install_substrate_module: AsyncMock
+    ):
+        async def slow_then_succeed(**_kwargs: Any):
+            if install_substrate_module.query.await_count == 1:
+                await asyncio.sleep(1)
+            return MagicMock(value=[make_event_record(3, event_id="ExtrinsicSuccess")])
+
+        install_substrate_module.query.side_effect = slow_then_succeed
+        config = make_chain_config(
+            public_archive_rpc_urls=(
+                "wss://slow.example",
+                "wss://healthy.example",
+            ),
+            archive_rpc_timeout_seconds=0.01,
+        )
+
+        async with ChainClient(config) as client:
+            ok = await client.check_extrinsic_success("0xhash", 3)
+
+        assert ok is True
+        assert install_substrate_module.query.await_count == 2
+
+    async def test_path_authenticated_provider_is_supported(
+        self, install_substrate_module: AsyncMock
+    ):
+        install_substrate_module.query.return_value = MagicMock(
+            value=[make_event_record(3, event_id="ExtrinsicSuccess")]
+        )
+        config = make_chain_config(
+            archive_rpc_url="wss://api-bittensor-mainnet.n.dwellir.com",
+            archive_rpc_api_key="key with spaces",
+            archive_rpc_auth_mode="path",
+        )
+
+        async with ChainClient(config) as client:
+            await client.check_extrinsic_success("0xhash", 3)
+
+        substrate_factory = sys.modules[
+            "async_substrate_interface"
+        ].AsyncSubstrateInterface
+        substrate_factory.assert_called_once_with(
+            url="wss://api-bittensor-mainnet.n.dwellir.com/key%20with%20spaces"
+        )
 
 
 @pytest.mark.usefixtures("install_pylon_module")

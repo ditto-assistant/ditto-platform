@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, cast
+
+ArchiveRpcAuthMode = Literal["none", "query", "path"]
+
+_FINNEY_PUBLIC_ARCHIVE_RPC_URLS = (
+    "wss://archive.chain.opentensor.ai:443",
+    "wss://bittensor-finney.api.onfinality.io/public-ws",
+)
 
 
 @dataclass(frozen=True)
@@ -63,7 +70,7 @@ class ChainConfig:
     """
 
     archive_rpc_url: str | None = None
-    """Archive WebSocket URL for historical substrate storage reads.
+    """Optional configured archive WebSocket URL tried after public archives.
 
     Pylon already selects an archive node for its block-number APIs.  Ditto's
     payment verifier also performs three block-hash storage reads directly via
@@ -73,6 +80,15 @@ class ChainConfig:
 
     archive_rpc_api_key: str | None = field(default=None, repr=False)
     """Optional archive RPC API key, excluded from dataclass representations."""
+
+    archive_rpc_auth_mode: ArchiveRpcAuthMode = "query"
+    """How ``archive_rpc_api_key`` is attached to the configured endpoint."""
+
+    public_archive_rpc_urls: tuple[str, ...] = ()
+    """Credential-free archive endpoints tried before the configured provider."""
+
+    archive_rpc_timeout_seconds: float = 10.0
+    """Maximum connection-plus-query time allowed for each archive provider."""
 
     def __post_init__(self) -> None:
         """Validate that at least one Pylon auth mode is configured."""
@@ -87,6 +103,10 @@ class ChainConfig:
                 "ChainConfig requires either open_access_token or "
                 "(identity_name + identity_token); none provided"
             )
+        if self.archive_rpc_auth_mode not in {"none", "query", "path"}:
+            raise ValueError("archive_rpc_auth_mode must be one of: none, query, path")
+        if self.archive_rpc_timeout_seconds <= 0:
+            raise ValueError("archive_rpc_timeout_seconds must be positive")
 
 
 def parse_chain_config_from_env() -> ChainConfig:
@@ -107,6 +127,7 @@ def parse_chain_config_from_env() -> ChainConfig:
     subtensor_network = os.environ.get("SUBTENSOR_NETWORK", "finney")
     archive_rpc_url = os.environ.get("SUBTENSOR_ARCHIVE_RPC_URL") or None
     archive_rpc_api_key = os.environ.get("SUBTENSOR_ARCHIVE_RPC_API_KEY") or None
+    archive_rpc_auth_mode = os.environ.get("SUBTENSOR_ARCHIVE_RPC_AUTH_MODE", "query")
     if (
         archive_rpc_url == "wss://api.taostats.io/api/v1/rpc/ws/finney_archive"
         and archive_rpc_api_key is None
@@ -114,11 +135,9 @@ def parse_chain_config_from_env() -> ChainConfig:
         # Reuse the existing Taostats secret only for Taostats' exact hostname;
         # never forward that credential to an arbitrary configured provider.
         archive_rpc_api_key = os.environ.get("DITTO_TAOSTATS_API_KEY") or None
-    if archive_rpc_url is None and subtensor_network == "finney":
-        # OTF documents this public endpoint for occasional historical reads.
-        # An authenticated provider can be selected explicitly when higher
-        # request volume warrants it.
-        archive_rpc_url = "wss://archive.chain.opentensor.ai:443"
+    public_archive_rpc_urls = (
+        _FINNEY_PUBLIC_ARCHIVE_RPC_URLS if subtensor_network == "finney" else ()
+    )
 
     return ChainConfig(
         pylon_url=os.environ.get("PYLON_URL", "http://localhost:8001"),
@@ -130,6 +149,11 @@ def parse_chain_config_from_env() -> ChainConfig:
         archive_blocks_cutoff=int(os.environ.get("ARCHIVE_BLOCKS_CUTOFF", "300")),
         archive_rpc_url=archive_rpc_url,
         archive_rpc_api_key=archive_rpc_api_key,
+        archive_rpc_auth_mode=cast(ArchiveRpcAuthMode, archive_rpc_auth_mode),
+        public_archive_rpc_urls=public_archive_rpc_urls,
+        archive_rpc_timeout_seconds=float(
+            os.environ.get("SUBTENSOR_ARCHIVE_RPC_TIMEOUT_SECONDS", "10")
+        ),
     )
 
 
