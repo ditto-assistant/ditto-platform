@@ -244,16 +244,16 @@ class JobResponse(BaseModel):
 
 
 FailJobReason = Literal[
-    "infrastructure_error",
-    "benchmark_error",
-    "platform_error",
+    "infrastructure",
+    "scoring_error",
 ]
 """Coarse reason a validator hands a leased ticket back for reissue.
 
 Deliberately low-cardinality so no run-specific detail leaks: the platform only
-records the reason, it never branches on it. ``infrastructure_error`` maps to the
-validator's ``ValidatorInfrastructureError`` sweep-ending branch; the other two
-map to ``DittobenchError`` / ``PlatformError`` scoring failures respectively.
+records the reason, it never branches on it. ``infrastructure`` maps to the
+validator's ``ValidatorInfrastructureError`` sweep-ending branch; ``scoring_error``
+maps to its ``DittobenchError`` / ``PlatformError`` scoring-failure branch. These
+values are the wire contract shared verbatim with ditto-subnet (which emits them).
 """
 
 

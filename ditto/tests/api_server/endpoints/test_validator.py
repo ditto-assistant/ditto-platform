@@ -330,7 +330,7 @@ def _job_fail_payload(
     nonce: UUID | None = None,
     requested_at: datetime | None = None,
     ticket_deadline: datetime = _TICKET_DEADLINE,
-    reason: str = "infrastructure_error",
+    reason: str = "infrastructure",
 ) -> dict:
     nonce = nonce or uuid4()
     requested_at = requested_at or datetime.now(UTC)
