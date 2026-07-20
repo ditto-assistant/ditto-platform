@@ -735,10 +735,29 @@
     .benchmark-progress.failed progress { color: var(--warn); accent-color: var(--warn); }
     .benchmark-progress.failed progress::-webkit-progress-value,
     .benchmark-progress.failed progress::-moz-progress-bar { background: var(--warn); }
+    /* Custom track for the non-determinate stages: an animated sliver while a
+       quick pre-run stage is working, and a pinned warning fill when stalled or
+       failed (never animated — nothing is progressing). */
+    .benchmark-progress .bench-bar { display: block; width: 100%; height: 7px; margin-top: 5px; border-radius: 999px; overflow: hidden; background: var(--bg-elev-2); }
+    .benchmark-progress .bench-bar > i { display: block; height: 100%; width: 100%; border-radius: 999px; background: var(--accent-2); }
+    .benchmark-progress.indeterminate .bench-bar > i { width: 38%; animation: bench-indeterminate 1.15s ease-in-out infinite; }
+    .benchmark-progress.stalled .bench-bar > i,
+    .benchmark-progress.failed .bench-bar > i { background: var(--warn); }
+    .benchmark-progress.stalled .benchmark-stage-label { color: var(--warn); }
+    @keyframes bench-indeterminate {
+      0% { transform: translateX(-110%); }
+      100% { transform: translateX(285%); }
+    }
     .benchmark-progress-text { display: block; margin-top: 4px; color: var(--text-dim); font-size: 11.5px; line-height: 1.4; font-variant-numeric: tabular-nums; }
     .benchmark-progress.unknown .benchmark-progress-text { color: var(--text-faint); }
+    .benchmark-progress.stalled .benchmark-progress-text { color: var(--warn); }
+    @media (prefers-reduced-motion: reduce) {
+      .benchmark-progress.indeterminate .bench-bar > i { width: 100%; animation: none; opacity: .55; }
+    }
     @media (forced-colors: active) {
       .benchmark-progress progress { border: 1px solid CanvasText; forced-color-adjust: auto; }
+      .benchmark-progress .bench-bar { border: 1px solid CanvasText; }
+      .benchmark-progress .bench-bar > i { background: CanvasText; }
       .benchmark-stage-label, .benchmark-agent, .benchmark-progress-text,
       .benchmark-progress.unknown .benchmark-progress-text { color: CanvasText; }
     }
@@ -4854,7 +4873,8 @@
     function benchmarkStageLabel(stage) {
       var labels = {
         preparing: "Preparing artifact",
-        building_harness: "Building harness",
+        building_harness: "Loading harness image",
+        generating_dataset: "Generating dataset",
         starting_harness: "Starting harness",
         running_benchmark: "Running benchmark",
         finalizing: "Scoring and finalizing",
@@ -4866,7 +4886,12 @@
 
     function benchmarkProgressText(progress) {
       if (!progress || !progress.stage) return "Benchmark progress not reported";
-      if (progress.percent == null) return benchmarkStageLabel(progress.stage) + " · progress begins shortly";
+      if (progress.stage === "failed_retrying") return "Failed · a new attempt will start shortly";
+      if (progress.stalled) {
+        return benchmarkStageLabel(progress.stage) + " · stalled" +
+          (progress.started_at ? " — no progress for " + elapsedDuration(progress.started_at) : "");
+      }
+      if (progress.percent == null) return benchmarkStageLabel(progress.stage) + " · working…";
       var text = "Benchmark " + progress.percent + "%";
       if (progress.completed_checks != null && progress.total_checks != null) {
         text += " · " + progress.completed_checks + " of " + progress.total_checks + " checks";
@@ -4878,6 +4903,8 @@
       if (!progress) return "";
       var label = benchmarkStageLabel(progress.stage);
       var text = benchmarkProgressText(progress);
+      var stalled = !!progress.stalled;
+      var failed = progress.stage === "failed_retrying";
       var versionLabel = progress.bench_version ? "Bench v" + progress.bench_version : "";
       var version = versionLabel
         ? '<span class="benchmark-version-chip">' + esc(versionLabel) + '</span>'
@@ -4893,10 +4920,25 @@
         return '<span class="benchmark-progress unknown">' + agent +
           '<span class="benchmark-stage-label">' + version + esc(text) + '</span></span>';
       }
-      var value = progress.percent == null ? 0 : Math.max(0, Math.min(95, Number(progress.percent) || 0));
-      return '<span class="benchmark-progress' + (progress.stage === "failed_retrying" ? " failed" : "") + '">' +
+      // running_benchmark reports a real percentage; the quick pre-run stages
+      // (preparing / loading image / generating dataset / starting) report none,
+      // so show an animated indeterminate bar there so they read as live. A
+      // stalled or failed run is pinned to a static warning bar, never animated.
+      var determinate = progress.percent != null && !stalled;
+      var cls = "benchmark-progress" +
+        (failed ? " failed" : "") +
+        (stalled ? " stalled" : (determinate || failed ? "" : " indeterminate"));
+      var ariaText = (versionLabel ? versionLabel + ". " : "") + label + ". " + text;
+      var bar;
+      if (determinate) {
+        var value = Math.max(0, Math.min(95, Number(progress.percent) || 0));
+        bar = '<progress max="100" value="' + value + '" aria-label="' + esc(ariaText) + '"></progress>';
+      } else {
+        bar = '<span class="bench-bar" role="img" aria-label="' + esc(ariaText) + '"><i></i></span>';
+      }
+      return '<span class="' + cls + '">' +
         '<span class="benchmark-stage-label">' + version + '<span>' + esc(label) + elapsed + '</span></span>' + agent +
-        '<progress max="100" value="' + value + '" aria-label="' + esc((versionLabel ? versionLabel + ". " : "") + label + ". " + text) + '"></progress>' +
+        bar +
         '<span class="benchmark-progress-text">' + esc(text) + '</span></span>';
     }
 
@@ -6813,6 +6855,16 @@
       if (document.hidden) { refreshStale = true; return; }
       load(false);
     }, REFRESH_MS);
+    // The fleet page is the live one: benchmarks now move through their stages in
+    // seconds, so poll just the shared operations snapshot on a tighter cadence
+    // (the endpoint's cache is short enough to return fresh data) while a viewer
+    // is actually on that page. Every OPS_REFRESH_MS also coincides with a
+    // REFRESH_MS tick, which harmlessly refetches the same cached snapshot.
+    var OPS_REFRESH_MS = 8000;
+    setInterval(function () {
+      if (document.hidden) return;
+      if (currentPageName() === "operations") loadOperations();
+    }, OPS_REFRESH_MS);
     document.addEventListener("visibilitychange", function () {
       if (!document.hidden && refreshStale) {
         refreshStale = false;

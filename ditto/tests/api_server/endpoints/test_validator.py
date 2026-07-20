@@ -1186,7 +1186,7 @@ class TestHeartbeat:
 
         response = await client.get("/api/v1/public/operations")
         assert response.status_code == 200
-        assert response.headers["Cache-Control"] == "public, max-age=10"
+        assert response.headers["Cache-Control"] == "public, max-age=8"
         snapshot = response.json()
         assert snapshot["active_bench_version"] == 2
         assert snapshot["desired_bench_version"] == 2

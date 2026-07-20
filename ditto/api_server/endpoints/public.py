@@ -212,7 +212,7 @@ _VALIDATOR_STALE_WINDOW = timedelta(minutes=15)
 # threshold means the run is wedged rather than progressing; running_benchmark is
 # excluded because it can legitimately run to the validator's 75-minute cap.
 _BENCHMARK_STALL_EARLY_STAGES: frozenset[BenchmarkProgressStage] = frozenset(
-    {"preparing", "building_harness", "starting_harness"}
+    {"preparing", "building_harness", "generating_dataset", "starting_harness"}
 )
 _BENCHMARK_STALL_AFTER = timedelta(minutes=15)
 _PUBLIC_ACTIVITY_STATUSES = frozenset(
@@ -1755,7 +1755,9 @@ async def operations(
     session: SessionDep,
 ) -> PublicOperationsResponse:
     """Atomic dashboard snapshot for submission pipeline and validator fleet health."""
-    response.headers["Cache-Control"] = "public, max-age=10"
+    # Short cache so the fleet page can poll on an ~8s cadence and still see fresh
+    # stage transitions now that benchmarks run quickly.
+    response.headers["Cache-Control"] = "public, max-age=8"
     now = datetime.now(UTC)
     benchmark_rollout = await rollout_state(session, now=now)
     active_version = cast(int, benchmark_rollout["active_version"])
