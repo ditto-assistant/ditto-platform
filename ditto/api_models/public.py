@@ -1924,9 +1924,25 @@ class PublicMetricDoc(BaseModel):
     ]
 
 
+class PublicBenchVersionDoc(BaseModel):
+    """What one immutable bench_version is and what it changed vs the previous one."""
+
+    version: int
+    epoch: Annotated[str, Field(description="Dataset reference date (YYYY-MM-DD).")]
+    title: Annotated[str, Field(description="Short name of the release.")]
+    summary: Annotated[
+        str, Field(description="One-paragraph description of the version.")
+    ]
+    highlights: Annotated[
+        list[str],
+        Field(default_factory=list, description="The version's headline changes."),
+    ]
+
+
 class PublicBenchGlossaryResponse(BaseModel):
-    """Every scored category and every metric / gate factor explained, so miners
-    understand exactly what a score reflects (``GET /public/bench/glossary``).
+    """Every scored category and every metric / gate factor explained, plus the
+    bench_version changelog, so miners understand exactly what a score reflects and
+    what changed between benchmark versions (``GET /public/bench/glossary``).
 
     Purposes describe what each case probes and how each metric is computed; no
     answer keys or per-case content are ever exposed. This is the programmatic
@@ -1936,6 +1952,13 @@ class PublicBenchGlossaryResponse(BaseModel):
     bench_version: int
     categories: list[PublicCategoryDoc]
     metrics: list[PublicMetricDoc]
+    versions: Annotated[
+        list[PublicBenchVersionDoc],
+        Field(
+            default_factory=list,
+            description="The bench_version changelog, newest first.",
+        ),
+    ]
 
 
 class PublicBenchConfigResponse(BaseModel):

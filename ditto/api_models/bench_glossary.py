@@ -550,3 +550,93 @@ def metric_entries() -> list[dict]:
         {"key": key, "label": label, "description": desc}
         for key, (label, desc) in METRIC_GLOSSARY.items()
     ]
+
+
+# bench_version changelog: what each immutable generation contract is and what it
+# changed vs the previous one. A bench_version is an immutable (seed, version) ->
+# bytes + grading contract, so a scoring change ships as a NEW version rather than
+# editing an old one; this is the human-readable history of those versions.
+BENCH_VERSIONS: list[dict] = [
+    {
+        "version": 2,
+        "epoch": "2026-01-01",
+        "title": "Launch contract",
+        "summary": (
+            "The first on-chain scoring contract, frozen since scoring began. Its "
+            "bytes must keep regenerating identically so any already-scored run stays "
+            "auditable."
+        ),
+        "highlights": ["Frozen launch benchmark", "Judge-free deterministic grading"],
+    },
+    {
+        "version": 3,
+        "epoch": "2026-07-01",
+        "title": "Anti-gaming release",
+        "summary": (
+            "Hardens the suite against gaming: dump-guard grading, needle gating, "
+            "adversarial distractors, composed injection framings, the cross-user "
+            "lifecycle probe, and the reproduce-under-transform audit."
+        ),
+        "highlights": [
+            "Dump-guard grading (zero a whole-self-table answer dump)",
+            "Adversarial same-attribute distractors",
+            "Reproduce-under-transform audit",
+        ],
+    },
+    {
+        "version": 4,
+        "epoch": "2026-08-01",
+        "title": "False-positive corrections",
+        "summary": (
+            "Not a new benchmark — v3 with scoring false positives corrected, so "
+            "several ways of being correct no longer lose points. Same tests, same "
+            "shape, corrected grading."
+        ),
+        "highlights": [
+            "A leaking canary is charged once, not twice",
+            "Delete instructions graded as acknowledgements",
+            "Decimal durations parse; 'used to' is a temporal marker",
+        ],
+    },
+    {
+        "version": 5,
+        "epoch": "2026-09-01",
+        "title": "Conversational grounding, coverage & efficiency",
+        "summary": (
+            "Closes the 'Aurora-9' hole where a phrase-list router that dumps memory "
+            "on a greeting still scored near the top. Adds a conversational-sanity "
+            "gate and ordinary no-save-verb declarative writes, harder capability "
+            "dimensions, and a relay-measured token-efficiency waste penalty."
+        ),
+        "highlights": [
+            "Conversational-sanity gate (greeting non-leak, declarative capture, "
+            "preference application) — floors the composite at 0.5 when failed",
+            "No-save-verb declarative writes with persistence + behavior proofs",
+            "Multi-hop relational (KG-join) and temporal-depth memory",
+            "Accept-set grading (non-verbatim answers) and Code Mode tool coverage",
+            "Relay-measured token-efficiency waste penalty (max 10%)",
+        ],
+    },
+    {
+        "version": 6,
+        "epoch": "2026-10-01",
+        "title": "Memory-as-data & the complexity suite",
+        "summary": (
+            "Keeps the v5 suite and adds four complexity classes that reward the "
+            "aligned retrieval, reranking, and grounding a grep-parser cannot fake. "
+            "Reuses the v5 scoring contract."
+        ),
+        "highlights": [
+            "Memory-as-data: a stored note that tries to override a real fact must be "
+            "read as data, not executed (payload leak is a hard zero)",
+            "Multi-query fan-out: answerable only by intersecting two sub-queries",
+            "Non-verbatim / computed answers (unit conversion; answer in no message)",
+            "Passive cross-session consolidation (earliest fact of an evolving topic)",
+        ],
+    },
+]
+
+
+def version_entries() -> list[dict]:
+    """The bench_version changelog, newest first, as serializable dicts."""
+    return sorted(BENCH_VERSIONS, key=lambda v: v["version"], reverse=True)

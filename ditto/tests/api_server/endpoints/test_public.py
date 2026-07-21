@@ -3592,6 +3592,12 @@ def test_bench_glossary_explains_every_v5_category_and_metric() -> None:
         assert c["kind"] in kinds
     # The metrics / quality factors that pull the composite below the halves.
     metrics = {m["key"] for m in bg.metric_entries()}
+    # bench_version changelog is present, newest first, complete per version.
+    versions = bg.version_entries()
+    assert [v["version"] for v in versions] == [6, 5, 4, 3, 2]
+    for v in versions:
+        assert v["title"] and v["summary"] and v["epoch"]
+
     for key in (
         "composite",
         "conversational_sanity",

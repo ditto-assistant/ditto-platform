@@ -65,6 +65,7 @@ from ditto.api_models import (
     PublicBenchIntegrity,
     PublicBenchmarkProgress,
     PublicBenchRolloutResponse,
+    PublicBenchVersionDoc,
     PublicCaseResult,
     PublicCategoryDoc,
     PublicCategoryStat,
@@ -2671,6 +2672,9 @@ async def bench_glossary(response: Response) -> PublicBenchGlossaryResponse:
             PublicCategoryDoc(**c) for c in bench_glossary_data.category_entries()
         ],
         metrics=[PublicMetricDoc(**m) for m in bench_glossary_data.metric_entries()],
+        versions=[
+            PublicBenchVersionDoc(**v) for v in bench_glossary_data.version_entries()
+        ],
     )
 
 
