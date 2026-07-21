@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
@@ -30,6 +31,7 @@ from ditto.api_server.endpoints import (
     admin_scoring_readiness_router,
     admin_validation_retry_router,
     health_router,
+    inference_router,
     metrics_router,
     public_router,
     retrieval_router,
@@ -122,6 +124,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             stack.push_async_callback(generator.aclose)
             app.state.dataset_generator = generator
 
+            inference_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(config.inference_proxy.timeout_seconds),
+                follow_redirects=False,
+                limits=httpx.Limits(
+                    max_connections=config.inference_proxy.global_concurrency,
+                    max_keepalive_connections=config.inference_proxy.global_concurrency,
+                ),
+            )
+            stack.push_async_callback(inference_client.aclose)
+            app.state.inference_client = inference_client
+
             validator_names = app.state.validator_names
             stack.push_async_callback(validator_names.aclose)
             await validator_names.start()
@@ -191,6 +204,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(upload_router, prefix="/api/v1")
     app.include_router(retrieval_router, prefix="/api/v1")
     app.include_router(validator_router, prefix="/api/v1")
+    app.include_router(inference_router, prefix="/api/v1")
     app.include_router(screener_router, prefix="/api/v1")
     app.include_router(scoring_router, prefix="/api/v1")
     app.include_router(public_router, prefix="/api/v1")

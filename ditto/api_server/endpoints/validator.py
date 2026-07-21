@@ -35,6 +35,7 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -68,8 +69,13 @@ from ditto.api_models import (
     ValidatorHeartbeatResponse,
 )
 from ditto.api_models.agent_status import SCOREABLE_AGENT_STATUSES, AgentStatus
+from ditto.api_models.benchmark_capacity import (
+    BenchmarkCapacity,
+    benchmark_capacity_signing_token,
+)
 from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.benchmark_progress import benchmark_progress_signing_token
+from ditto.api_models.inference import InferenceGrantOffer
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.stack_health import (
     ValidatorStackHealth,
@@ -130,8 +136,11 @@ from ditto.db.queries.benchmark_rollout import (
     open_rollout,
 )
 from ditto.db.queries.heartbeats import (
+    HeartbeatProgressRegressionError,
+    _validate_same_lease_progress,
     upsert_validator_heartbeat,
 )
+from ditto.db.queries.inference import ensure_inference_grant, revoke_ticket_inference
 from ditto.db.queries.payments import get_miner_coldkey_for_agent
 from ditto.db.queries.score_retests import activate_next_score_retest
 from ditto.db.queries.scores import (
@@ -301,7 +310,7 @@ _qualification_refresh_due = 0.0
 # Reject captured heartbeats outside a short clock-skew/retry window. Workers
 # report every two minutes, so five minutes tolerates normal transient outages.
 _HEARTBEAT_MAX_SKEW_SECONDS = 300
-_HEARTBEAT_MAX_BYTES = 4096
+_HEARTBEAT_MAX_BYTES = 16 * 1024
 
 
 # Object-store key the upload pipeline writes the tarball under.
@@ -452,7 +461,13 @@ ValidatorDep = Annotated[str, Depends(require_validator)]
 
 def _lease_token(deadline: datetime) -> str:
     """Canonical UTC token that binds a score to one ticket lease."""
-    return deadline.astimezone(UTC).isoformat(timespec="microseconds")
+    return _aware_utc(deadline).isoformat(timespec="microseconds")
+
+
+def _aware_utc(value: datetime) -> datetime:
+    """Normalize database-naive UTC values for exact retry comparison."""
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return aware.astimezone(UTC)
 
 
 def _reported_transcript_sha256(report: ScoreReport) -> str | None:
@@ -470,6 +485,26 @@ def _reported_transcript_sha256(report: ScoreReport) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _score_details(
+    report: ScoreReport, *, ticket_deadline: datetime, bench_version: int
+) -> dict[str, Any]:
+    """Build the persisted, retry-comparable telemetry for one score report."""
+    details: dict[str, Any] = dict(report.details or {})
+    details["ticket_deadline"] = _lease_token(ticket_deadline)
+    details["bench_version"] = bench_version
+    if report.composite_stderr is not None:
+        details["composite_stderr"] = report.composite_stderr
+    if report.raw_composite is not None:
+        details["raw_composite"] = report.raw_composite
+    if report.confirmation_composites is not None:
+        details["confirmation_composites"] = report.confirmation_composites
+    if report.confirmation_seeds is not None:
+        details["confirmation_seeds"] = report.confirmation_seeds
+    if report.per_case:
+        details["per_case"] = [item.model_dump(mode="json") for item in report.per_case]
+    return details
 
 
 def _score_signing_message(
@@ -516,11 +551,18 @@ def _score_signing_message(
 
 
 def _job_signing_message(
-    validator_hotkey: str, nonce: UUID, requested_at: datetime
+    validator_hotkey: str,
+    nonce: UUID,
+    requested_at: datetime,
+    slot_id: str | None = None,
 ) -> bytes:
     """Canonical bytes proving possession of a hotkey for one job claim."""
     requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
-    return f"validator-job:{validator_hotkey}:{nonce}:{requested}".encode()
+    if slot_id is None:
+        return f"validator-job:{validator_hotkey}:{nonce}:{requested}".encode()
+    return (
+        f"validator-job:v2:{validator_hotkey}:{slot_id}:{nonce}:{requested}"
+    ).encode()
 
 
 def _artifact_signing_message(
@@ -572,10 +614,31 @@ def _heartbeat_signing_message(
     capabilities: ValidatorCapabilities | None = None,
     stack: ValidatorStackIdentity | None = None,
     stack_health: ValidatorStackHealth | None = None,
+    benchmark_capacity: BenchmarkCapacity | None = None,
 ) -> bytes:
     """Canonical heartbeat payload, mirrored by ``ditto-subnet``."""
     if stack_health is not None and protocol_version < 9:
         raise ValueError("per-component stack health requires heartbeat protocol v9")
+    if benchmark_capacity is not None and protocol_version < 10:
+        raise ValueError("benchmark capacity requires heartbeat protocol v10")
+    if protocol_version >= 10:
+        if capabilities is None or stack is None or stack_health is None:
+            raise ValueError(
+                "heartbeat protocol v10 requires identity and stack health"
+            )
+        if benchmark_capacity is None:
+            raise ValueError("heartbeat protocol v10 requires benchmark capacity")
+        active = str(active_agent_id) if active_agent_id is not None else ""
+        return (
+            "ditto-validator-heartbeat:v10:"
+            f"{validator_hotkey}:{software_version}:{protocol_version}:"
+            f"{code_digest}:{state}:{active}:"
+            f"{system_metrics_signing_token(system_metrics)}:"
+            f"{benchmark_progress_signing_token(benchmark_progress)}:"
+            f"{validator_identity_signing_token(capabilities, stack)}:"
+            f"{validator_stack_health_signing_token(stack_health)}:"
+            f"{benchmark_capacity_signing_token(benchmark_capacity)}:{timestamp}"
+        ).encode()
     if protocol_version >= 9:
         if capabilities is None or stack is None:
             raise ValueError("heartbeat protocol v9 requires capabilities and stack")
@@ -735,6 +798,7 @@ async def heartbeat(
         capabilities=request_body.capabilities,
         stack=request_body.stack,
         stack_health=request_body.stack_health,
+        benchmark_capacity=request_body.benchmark_capacity,
     )
     if not _verify_signature(validator_hotkey, payload, request_body.signature):
         raise ValidatorAuthError("heartbeat signature verification failed")
@@ -747,7 +811,75 @@ async def heartbeat(
             if request_body.benchmark_progress is not None
             else None
         )
-        if request_body.benchmark_progress is not None:
+        stored_benchmark_capacity = request_body.benchmark_capacity
+        if stored_benchmark_capacity is not None:
+            previous_heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
+            previous_slots = {}
+            if previous_heartbeat is not None and isinstance(
+                previous_heartbeat.benchmark_capacity, dict
+            ):
+                with contextlib.suppress(ValidationError):
+                    previous_capacity = BenchmarkCapacity.model_validate(
+                        previous_heartbeat.benchmark_capacity
+                    )
+                    previous_slots = {
+                        slot.slot_id: slot for slot in previous_capacity.active
+                    }
+            valid_active = []
+            for slot in stored_benchmark_capacity.active:
+                agent = await get_agent_by_id(
+                    session, agent_id=slot.agent_id, for_update=True
+                )
+                ticket = await get_open_ticket(
+                    session,
+                    agent_id=slot.agent_id,
+                    validator_hotkey=validator_hotkey,
+                    now=now,
+                    deadline=slot.progress.ticket_deadline,
+                    bench_version=slot.bench_version,
+                    slot_id=slot.slot_id,
+                    for_update=True,
+                )
+                if (
+                    ticket is not None
+                    and agent is not None
+                    and agent.status in _SCOREABLE_STATUSES
+                ):
+                    previous_slot = previous_slots.get(slot.slot_id)
+                    if previous_slot is not None:
+                        try:
+                            _validate_same_lease_progress(
+                                previous_slot.progress, slot.progress
+                            )
+                        except HeartbeatProgressRegressionError:
+                            slot = previous_slot
+                    valid_active.append(slot)
+                else:
+                    logger.info(
+                        "validator heartbeat dropped stale slot progress "
+                        "validator=%s slot=%s",
+                        validator_hotkey,
+                        slot.slot_id,
+                    )
+            valid_active.sort(key=lambda slot: slot.slot_id)
+            stored_benchmark_capacity = stored_benchmark_capacity.model_copy(
+                update={"active": valid_active}
+            )
+            primary = (
+                sorted(valid_active, key=lambda slot: slot.slot_id)[0]
+                if valid_active
+                else None
+            )
+            stored_active_agent_id = primary.agent_id if primary is not None else None
+            stored_benchmark_progress = (
+                primary.progress.model_dump(mode="json")
+                if primary is not None
+                else None
+            )
+        if (
+            stored_benchmark_capacity is None
+            and request_body.benchmark_progress is not None
+        ):
             assert request_body.active_agent_id is not None
             agent = await get_agent_by_id(
                 session, agent_id=request_body.active_agent_id, for_update=True
@@ -811,6 +943,11 @@ async def heartbeat(
                 if request_body.stack_health is not None
                 else None
             ),
+            benchmark_capacity=(
+                stored_benchmark_capacity.model_dump(mode="json")
+                if stored_benchmark_capacity is not None
+                else None
+            ),
             reported_at=reported_at,
             seen_at=now,
             signature=request_body.signature,
@@ -856,7 +993,10 @@ async def request_job(
     if x_validator_hotkey != payload.validator_hotkey:
         raise ValidatorAuthError("job claim header does not match signed hotkey")
     signed = _job_signing_message(
-        payload.validator_hotkey, payload.nonce, payload.requested_at
+        payload.validator_hotkey,
+        payload.nonce,
+        payload.requested_at,
+        payload.slot_id,
     )
     if not _verify_signature(payload.validator_hotkey, signed, payload.signature):
         raise ValidatorAuthError(
@@ -902,6 +1042,44 @@ async def request_job(
                 status_code=409, detail="job claim nonce has already been used"
             ) from exc
         heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
+        inference_required = request.app.state.config.inference_proxy.required
+        if inference_required:
+            try:
+                heartbeat_capabilities = ValidatorCapabilities.model_validate(
+                    heartbeat.capabilities if heartbeat is not None else None
+                )
+            except ValidationError:
+                return Response(status_code=204)
+            if (
+                heartbeat is None
+                or heartbeat.protocol_version < 10
+                or not heartbeat_capabilities.ticket_inference
+            ):
+                return Response(status_code=204)
+        slot_id = payload.slot_id or "slot-0"
+        slot_running_benchmark = validator_state == "running_benchmark"
+        if heartbeat is not None and heartbeat.protocol_version >= 10:
+            if payload.slot_id is None:
+                raise HTTPException(
+                    status_code=409, detail="heartbeat v10 job claims require slot_id"
+                )
+            try:
+                capacity = BenchmarkCapacity.model_validate(
+                    heartbeat.benchmark_capacity
+                )
+            except ValidationError as error:
+                raise HTTPException(
+                    status_code=428,
+                    detail="fresh valid benchmark capacity is required",
+                ) from error
+            slot_running_benchmark = any(
+                slot.slot_id == slot_id for slot in capacity.active
+            )
+            if (
+                capacity.admission != "accepting"
+                or slot_id not in capacity.healthy_slots
+            ):
+                return Response(status_code=204)
         rollout = await open_rollout(session)
         if rollout is not None:
             fresh_lane_due = (
@@ -924,10 +1102,11 @@ async def request_job(
                     ttl=_TICKET_TTL,
                     bench_version=rollout.desired_version,
                     artifact_mode="screened_only",
-                    validator_running_benchmark=validator_state == "running_benchmark",
+                    validator_running_benchmark=slot_running_benchmark,
                     submitted_at_or_after=rollout.created_at,
                     fifo_start_at=rollout.created_at,
                     completion_first=True,
+                    slot_id=slot_id,
                 )
                 if fresh_lane_due
                 else None
@@ -939,7 +1118,8 @@ async def request_job(
                     now=now,
                     ttl=_TICKET_TTL,
                     artifact_mode=artifact_mode,
-                    validator_running_benchmark=validator_state == "running_benchmark",
+                    validator_running_benchmark=slot_running_benchmark,
+                    slot_id=slot_id,
                 )
             if ticket is None and not fresh_lane_due:
                 ticket = await issue_ticket(
@@ -949,10 +1129,11 @@ async def request_job(
                     ttl=_TICKET_TTL,
                     bench_version=rollout.desired_version,
                     artifact_mode="screened_only",
-                    validator_running_benchmark=validator_state == "running_benchmark",
+                    validator_running_benchmark=slot_running_benchmark,
                     submitted_at_or_after=rollout.created_at,
                     fifo_start_at=rollout.created_at,
                     completion_first=True,
+                    slot_id=slot_id,
                 )
         else:
             ticket = await activate_next_score_retest(
@@ -963,7 +1144,8 @@ async def request_job(
                     heartbeat is not None
                     and heartbeat_supports_version(heartbeat, now=now, version=version)
                 ),
-                validator_running_benchmark=validator_state == "running_benchmark",
+                validator_running_benchmark=slot_running_benchmark,
+                slot_id=slot_id,
             )
         canonical_version = await active_bench_version(session)
         if ticket is None:
@@ -976,6 +1158,7 @@ async def request_job(
                 .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
                 .where(
                     ValidatorTicket.validator_hotkey == payload.validator_hotkey,
+                    ValidatorTicket.slot_id == slot_id,
                     ValidatorTicket.bench_version == canonical_version,
                     ValidatorTicket.status == TicketStatus.ISSUED,
                     ValidatorTicket.deadline > now,
@@ -1001,6 +1184,7 @@ async def request_job(
                     select(ValidatorTicket)
                     .where(
                         ValidatorTicket.validator_hotkey == payload.validator_hotkey,
+                        ValidatorTicket.slot_id == slot_id,
                         ValidatorTicket.bench_version != canonical_version,
                         ValidatorTicket.status == TicketStatus.ISSUED,
                         ValidatorTicket.deadline > now,
@@ -1009,7 +1193,7 @@ async def request_job(
                     .with_for_update()
                 )
                 if stale_ticket is not None:
-                    if validator_state == "running_benchmark":
+                    if slot_running_benchmark:
                         # The signed heartbeat says this exact worker is still
                         # occupied; let it finish, but issue nothing else.
                         return Response(status_code=204)
@@ -1044,8 +1228,8 @@ async def request_job(
                         ttl=_TICKET_TTL,
                         bench_version=canonical_version,
                         artifact_mode=artifact_mode,
-                        validator_running_benchmark=validator_state
-                        == "running_benchmark",
+                        validator_running_benchmark=slot_running_benchmark,
+                        slot_id=slot_id,
                     )
                 )
         if ticket is not None:
@@ -1056,8 +1240,19 @@ async def request_job(
                 BenchmarkDataset, (agent.agent_id, ticket.bench_version)
             )
             contract = benchmark_contract(ticket.bench_version)
+            inference_grant = await ensure_inference_grant(
+                session,
+                ticket=ticket,
+                config=request.app.state.config.inference_proxy,
+            )
+            if inference_required and inference_grant is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="ticket inference capability is unavailable",
+                )
             job = JobResponse(
                 agent_id=agent.agent_id,
+                slot_id=ticket.slot_id,
                 miner_hotkey=agent.miner_hotkey,
                 sha256=agent.sha256,
                 deadline=ticket.deadline,
@@ -1083,6 +1278,25 @@ async def request_job(
                     contract.minimum_screening_policy_version
                 ),
                 requires_screened_image=contract.requires_screened_image,
+                inference=(
+                    InferenceGrantOffer(
+                        grant_id=inference_grant.grant_id,
+                        exchange_url=(
+                            f"{request.app.state.config.inference_proxy.public_base_url}"
+                            "/api/v1/inference/exchange"
+                        ),
+                        proxy_url=(
+                            f"{request.app.state.config.inference_proxy.public_base_url}"
+                            "/api/v1/inference/chat/completions"
+                        ),
+                        allowed_models=list(inference_grant.allowed_models),
+                        request_budget=inference_grant.request_budget,
+                        token_budget=inference_grant.token_budget,
+                        expires_at=inference_grant.expires_at,
+                    )
+                    if inference_grant is not None
+                    else None
+                ),
             )
     if job is None:
         # Only a fully authenticated, compatible, replay-checked idle poll can
@@ -1203,6 +1417,7 @@ async def fail_job(
                 # and reissue immediately for another validator/attempt.
                 ticket.retry_after = now
             await session.flush()
+            await revoke_ticket_inference(session, ticket=ticket, now=now)
             reopened = True
     logger.info(
         "validator=%s reported job failure agent=%s reason=%s reopened=%s",
@@ -1489,6 +1704,49 @@ async def submit_score(
         )
         if agent is None:
             raise AgentNotFoundError(f"no agent with id={agent_id}")
+        if payload.ticket_deadline is None:
+            raise HTTPException(
+                status_code=409,
+                detail="score submission is missing its ticket lease deadline",
+            )
+        report_version = report.bench_version or LEGACY_BENCH_VERSION
+        prior_ticket = await session.get(
+            ValidatorTicket,
+            (agent_id, report_version, payload.validator_hotkey),
+            with_for_update=True,
+        )
+        if prior_ticket is not None and prior_ticket.status == TicketStatus.SCORED:
+            prior_score = await session.get(
+                Score, (agent_id, report_version, payload.validator_hotkey)
+            )
+            retry_details = _score_details(
+                report,
+                ticket_deadline=payload.ticket_deadline,
+                bench_version=report_version,
+            )
+            exact_retry = (
+                _lease_token(prior_ticket.deadline)
+                == _lease_token(payload.ticket_deadline)
+                and prior_score is not None
+                and prior_score.run_id == report.run_id
+                and prior_score.seed == report.seed
+                and prior_score.composite == report.composite
+                and prior_score.tool_mean == report.tool_mean
+                and prior_score.memory_mean == report.memory_mean
+                and prior_score.median_ms == report.median_ms
+                and prior_score.n == report.n
+                and _aware_utc(prior_score.generated_at)
+                == _aware_utc(report.generated_at)
+                and prior_score.details == retry_details
+            )
+            if exact_retry:
+                return SubmitScoreResponse(
+                    agent_id=agent_id, status=agent.status, accepted=True
+                )
+            raise HTTPException(
+                status_code=409,
+                detail="scoring ticket was already consumed by a different result",
+            )
         if agent.status not in _SCOREABLE_STATUSES:
             raise AgentNotEvaluatableError(
                 f"agent {agent_id} is {agent.status}, not in {_SCOREABLE_STATUSES}"
@@ -1497,11 +1755,6 @@ async def submit_score(
             raise AgentNotEvaluatableError(
                 f"agent {agent_id} has not passed screening policy "
                 f"{SCREENING_POLICY_VERSION}"
-            )
-        if payload.ticket_deadline is None:
-            raise HTTPException(
-                status_code=409,
-                detail="score submission is missing its ticket lease deadline",
             )
         # k=3 gate: a score is only accepted against a live ticket this validator
         # holds for the agent. No ticket (never issued, expired, or already
@@ -1519,7 +1772,7 @@ async def submit_score(
             # for whatever version is current, find none, and 409. A version-less
             # report means v2 by definition, so pin the frozen legacy version --
             # NOT the rollout's from_version, which moves.
-            bench_version=(report.bench_version or LEGACY_BENCH_VERSION),
+            bench_version=report_version,
             for_update=True,
         )
         if ticket is None:
@@ -1590,36 +1843,11 @@ async def submit_score(
         # the per-case breakdown, all under scores.details. The public leaderboard
         # surfaces a safe subset of this; the full blob (incl. per_case answer-key
         # fields) is only ever read back through validator-gated endpoints.
-        score_details: dict[str, Any] = dict(report.details or {})
-        # Persist the exact lease identity alongside the signature so public
-        # records remain independently verifiable. Existing scores have no such
-        # key and intentionally remain valid legacy records.
-        score_details["ticket_deadline"] = _lease_token(payload.ticket_deadline)
-        # Stamp the current benchmark version when the scorer omitted it, so no
-        # run scored from now on is ever recorded as "legacy" (null version).
-        # An explicit version in the report is left as-is (honest provenance).
-        score_details["bench_version"] = ticket.bench_version
-        # Stash the composite standard error into details so the ledger can
-        # surface it (mirroring bench_version; no schema migration). The
-        # validator reads it back for the KOTH indifference band.
-        if report.composite_stderr is not None:
-            score_details["composite_stderr"] = report.composite_stderr
-        if report.raw_composite is not None:
-            score_details["raw_composite"] = report.raw_composite
-        # Same for the P4 per-seed confirmation composites: the validator submits
-        # one median-run score carrying the K per-seed composites, and the ledger
-        # surfaces them so the KOTH fold dethrones on the median over seeds.
-        if report.confirmation_composites is not None:
-            score_details["confirmation_composites"] = report.confirmation_composites
-        # The K CRN seeds aligned 1:1 with those composites, so the fold can pair
-        # a challenger against the champion on shared seeds (paired-difference
-        # variance) instead of the wider independent-sum band.
-        if report.confirmation_seeds is not None:
-            score_details["confirmation_seeds"] = report.confirmation_seeds
-        if report.per_case:
-            score_details["per_case"] = [
-                c.model_dump(mode="json") for c in report.per_case
-            ]
+        score_details = _score_details(
+            report,
+            ticket_deadline=payload.ticket_deadline,
+            bench_version=ticket.bench_version,
+        )
         audit_now = datetime.now(UTC)
         if replacement_event is not None and agent.status in {
             AgentStatus.SCORED,
@@ -1964,6 +2192,7 @@ async def submit_score(
             validator_hotkey=payload.validator_hotkey,
             bench_version=ticket.bench_version,
         )
+        await revoke_ticket_inference(session, ticket=ticket, now=audit_now)
         heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
         await activate_next_score_retest(
             session,
@@ -1975,6 +2204,7 @@ async def submit_score(
                     heartbeat, now=audit_now, version=version
                 )
             ),
+            slot_id=ticket.slot_id,
         )
         result_status = agent.status
 

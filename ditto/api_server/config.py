@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlparse
 
 from ditto.api_server.datapipeline import (
@@ -53,6 +53,31 @@ class ValidatorCompatibilityConfig:
     minimum_software_version: str | None
     minimum_protocol_version: int
     heartbeat_max_age_seconds: int
+
+
+@dataclass(frozen=True)
+class InferenceProxyConfig:
+    """Platform-owned OpenRouter proxy and ticket budget limits."""
+
+    enabled: bool
+    required: bool
+    public_base_url: str
+    openrouter_api_key: str | None
+    upstream_url: str
+    allowed_models: tuple[str, ...]
+    provider: str
+    request_budget: int
+    token_budget: int
+    per_ticket_concurrency: int
+    per_validator_concurrency: int
+    global_concurrency: int
+    per_ticket_requests_per_minute: int
+    per_validator_requests_per_minute: int
+    global_requests_per_minute: int
+    request_body_bytes: int
+    response_body_bytes: int
+    timeout_seconds: float
+    max_output_tokens: int
 
 
 @dataclass(frozen=True)
@@ -117,6 +142,31 @@ class ApiServerConfig:
 
     validator_compatibility: ValidatorCompatibilityConfig
     """Validator release and heartbeat requirements for scoring tickets."""
+
+    inference_proxy: InferenceProxyConfig = field(
+        default_factory=lambda: InferenceProxyConfig(
+            enabled=False,
+            required=False,
+            public_base_url="http://localhost:8000",
+            openrouter_api_key=None,
+            upstream_url="https://openrouter.ai/api/v1/chat/completions",
+            allowed_models=("qwen/qwen3-32b",),
+            provider="nebius",
+            request_budget=1024,
+            token_budget=4_000_000,
+            per_ticket_concurrency=8,
+            per_validator_concurrency=24,
+            global_concurrency=72,
+            per_ticket_requests_per_minute=240,
+            per_validator_requests_per_minute=960,
+            global_requests_per_minute=2880,
+            request_body_bytes=256 << 10,
+            response_body_bytes=2 << 20,
+            timeout_seconds=90.0,
+            max_output_tokens=8192,
+        )
+    )
+    """Dark-launchable, platform-owned ticket inference proxy."""
 
     admin_api_token: str | None = None
     """Bearer token for private Backroom/operator administration endpoints."""
@@ -194,6 +244,72 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
         raise ApiServerConfigError(
             "validator compatibility protocol and heartbeat age must be integers"
         ) from error
+    inference_enabled = (
+        os.environ.get("DITTO_INFERENCE_PROXY_ENABLED", "false").strip().lower()
+        in _TRUTHY
+    )
+    try:
+        inference_proxy = InferenceProxyConfig(
+            enabled=inference_enabled,
+            required=(
+                os.environ.get("DITTO_INFERENCE_PROXY_REQUIRED", "false")
+                .strip()
+                .lower()
+                in _TRUTHY
+            ),
+            public_base_url=os.environ.get(
+                "DITTO_INFERENCE_PUBLIC_BASE_URL", "http://localhost:8000"
+            ).rstrip("/"),
+            openrouter_api_key=os.environ.get("OPENROUTER_API_KEY") or None,
+            upstream_url=os.environ.get(
+                "DITTO_INFERENCE_UPSTREAM_URL",
+                "https://openrouter.ai/api/v1/chat/completions",
+            ),
+            allowed_models=tuple(
+                model.strip()
+                for model in os.environ.get(
+                    "DITTO_INFERENCE_ALLOWED_MODELS", "qwen/qwen3-32b"
+                ).split(",")
+                if model.strip()
+            ),
+            provider=os.environ.get("DITTO_INFERENCE_PROVIDER", "nebius").strip(),
+            request_budget=int(
+                os.environ.get("DITTO_INFERENCE_REQUEST_BUDGET", "1024")
+            ),
+            token_budget=int(os.environ.get("DITTO_INFERENCE_TOKEN_BUDGET", "4000000")),
+            per_ticket_concurrency=int(
+                os.environ.get("DITTO_INFERENCE_TICKET_CONCURRENCY", "8")
+            ),
+            per_validator_concurrency=int(
+                os.environ.get("DITTO_INFERENCE_VALIDATOR_CONCURRENCY", "24")
+            ),
+            global_concurrency=int(
+                os.environ.get("DITTO_INFERENCE_GLOBAL_CONCURRENCY", "72")
+            ),
+            per_ticket_requests_per_minute=int(
+                os.environ.get("DITTO_INFERENCE_TICKET_RPM", "240")
+            ),
+            per_validator_requests_per_minute=int(
+                os.environ.get("DITTO_INFERENCE_VALIDATOR_RPM", "960")
+            ),
+            global_requests_per_minute=int(
+                os.environ.get("DITTO_INFERENCE_GLOBAL_RPM", "2880")
+            ),
+            request_body_bytes=int(
+                os.environ.get("DITTO_INFERENCE_REQUEST_BODY_BYTES", str(256 << 10))
+            ),
+            response_body_bytes=int(
+                os.environ.get("DITTO_INFERENCE_RESPONSE_BODY_BYTES", str(2 << 20))
+            ),
+            timeout_seconds=float(
+                os.environ.get("DITTO_INFERENCE_TIMEOUT_SECONDS", "90")
+            ),
+            max_output_tokens=int(
+                os.environ.get("DITTO_INFERENCE_MAX_OUTPUT_TOKENS", "8192")
+            ),
+        )
+    except ValueError as error:
+        raise ApiServerConfigError("inference proxy limits must be numeric") from error
 
     return ApiServerConfig(
         host=host,
@@ -217,6 +333,7 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
             minimum_protocol_version=minimum_validator_protocol,
             heartbeat_max_age_seconds=validator_heartbeat_max_age,
         ),
+        inference_proxy=inference_proxy,
         admin_api_token=os.environ.get("DITTO_ADMIN_API_TOKEN") or None,
         dashboard_enabled=dashboard_enabled,
         dashboard_wandb_url=dashboard_wandb_url,
@@ -301,4 +418,72 @@ def check_config(config: ApiServerConfig) -> None:
     ):
         raise ApiServerConfigError(
             "DITTO_MIN_VALIDATOR_SOFTWARE_VERSION must be a stable X.Y.Z release"
+        )
+    inference = config.inference_proxy
+    if inference.enabled and inference.openrouter_api_key is None:
+        raise ApiServerConfigError(
+            "OPENROUTER_API_KEY is required when the inference proxy is enabled"
+        )
+    if inference.required and not inference.enabled:
+        raise ApiServerConfigError(
+            "inference proxy must be enabled before it can be required"
+        )
+    if not inference.allowed_models or len(inference.allowed_models) > 4:
+        raise ApiServerConfigError("inference model allowlist must contain 1-4 models")
+    upstream = urlparse(inference.upstream_url)
+    if (
+        upstream.scheme != "https"
+        or upstream.hostname != "openrouter.ai"
+        or upstream.path != "/api/v1/chat/completions"
+    ):
+        raise ApiServerConfigError(
+            "inference upstream must be OpenRouter chat completions"
+        )
+    public_base = urlparse(inference.public_base_url)
+    if public_base.scheme not in {"http", "https"} or not public_base.netloc:
+        raise ApiServerConfigError("inference public base URL must be absolute")
+    limits = (
+        inference.request_budget,
+        inference.token_budget,
+        inference.per_ticket_concurrency,
+        inference.per_validator_concurrency,
+        inference.global_concurrency,
+        inference.per_ticket_requests_per_minute,
+        inference.per_validator_requests_per_minute,
+        inference.global_requests_per_minute,
+        inference.request_body_bytes,
+        inference.response_body_bytes,
+        inference.max_output_tokens,
+    )
+    if any(value < 1 for value in limits):
+        raise ApiServerConfigError("inference proxy limits must be positive")
+    if not (
+        inference.per_ticket_concurrency
+        <= inference.per_validator_concurrency
+        <= inference.global_concurrency
+        <= 128
+    ):
+        raise ApiServerConfigError(
+            "inference concurrency must be ordered ticket <= validator <= global <= 128"
+        )
+    if not (
+        inference.per_ticket_requests_per_minute
+        <= inference.per_validator_requests_per_minute
+        <= inference.global_requests_per_minute
+        <= 100_000
+    ):
+        raise ApiServerConfigError(
+            "inference request rates must be ordered ticket <= validator <= global"
+        )
+    if (
+        inference.request_budget > 4096
+        or inference.token_budget > 10_000_000
+        or inference.request_body_bytes > 1 << 20
+        or inference.response_body_bytes > 8 << 20
+        or inference.max_output_tokens > 32_768
+    ):
+        raise ApiServerConfigError("inference proxy limit exceeds its safety bound")
+    if not 1 <= inference.timeout_seconds <= 120:
+        raise ApiServerConfigError(
+            "inference timeout must be between 1 and 120 seconds"
         )

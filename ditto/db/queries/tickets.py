@@ -187,6 +187,7 @@ async def issue_ticket(
     submitted_at_or_after: datetime | None = None,
     fifo_start_at: datetime | None = None,
     completion_first: bool = False,
+    slot_id: str = "slot-0",
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
@@ -211,7 +212,9 @@ async def issue_ticket(
     if session.get_bind().dialect.name == "postgresql":
         await session.execute(
             select(
-                func.pg_advisory_xact_lock(func.hashtextextended(validator_hotkey, 0))
+                func.pg_advisory_xact_lock(
+                    func.hashtextextended(f"{validator_hotkey}:{slot_id}", 0)
+                )
             )
         )
     await expire_overdue_tickets(session, now=now)
@@ -229,9 +232,9 @@ async def issue_ticket(
         contract.requires_screened_image or artifact_mode == "screened_only"
     )
 
-    # A validator executes one benchmark at a time. Polling again (including
-    # after a process restart) must resume that still-live lease instead of
-    # allocating unrelated work and leaving the first ticket stranded.
+    # A validator slot executes one benchmark at a time. Polling the same slot
+    # again (including after a process restart) must resume that still-live
+    # lease instead of allocating unrelated work and leaving it stranded.
     complete_screened_image = (
         Agent.screened_image_sha256.is_not(None)
         & Agent.screened_image_size_bytes.is_not(None)
@@ -248,6 +251,7 @@ async def issue_ticket(
         .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
         .where(
             ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.bench_version == bench_version,
             ValidatorTicket.status == TicketStatus.ISSUED,
             ValidatorTicket.deadline > now,
@@ -265,6 +269,7 @@ async def issue_ticket(
         select(ValidatorTicket)
         .where(
             ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.status == TicketStatus.ISSUED,
             ValidatorTicket.deadline > now,
         )
@@ -484,8 +489,9 @@ async def issue_ticket(
         candidate = select(Agent.agent_id).where(
             Agent.status == AgentStatus.EVALUATING,
             Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
-            Agent.agent_id.not_in(already_mine),
         )
+        if not completion_first:
+            candidate = candidate.where(Agent.agent_id.not_in(already_mine))
         if bench_version != 2:
             versioned_dataset = (
                 select(BenchmarkDataset.agent_id)
@@ -562,9 +568,42 @@ async def issue_ticket(
                 ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES),
             )
         )
-        if (occupied or 0) < SCORING_QUORUM:
-            break
-        skipped.append(agent_id)
+        if (occupied or 0) >= SCORING_QUORUM:
+            skipped.append(agent_id)
+            continue
+        if completion_first:
+            # Completion-first admission is global, not per validator slot.
+            # Every slot waits on the same FIFO head. Once the row lock is
+            # acquired, re-check this validator against fresh committed state:
+            # if another slot already owns or scored the head, this slot must
+            # stay idle instead of skipping ahead to a newer submission.
+            same_validator_blocked = await session.scalar(
+                select(func.count()).where(
+                    ValidatorTicket.agent_id == agent_id,
+                    ValidatorTicket.validator_hotkey == validator_hotkey,
+                    ValidatorTicket.bench_version == bench_version,
+                    (
+                        ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES)
+                        | (
+                            (ValidatorTicket.status == TicketStatus.EXPIRED)
+                            & (
+                                (ValidatorTicket.retry_after > now)
+                                | (
+                                    ValidatorTicket.attempt_count
+                                    >= (
+                                        MAX_ATTEMPTS_PER_VERSION
+                                        + ValidatorTicket.manual_retry_grants
+                                        + ValidatorTicket.infra_retry_grants
+                                    )
+                                )
+                            )
+                        )
+                    ),
+                )
+            )
+            if same_validator_blocked:
+                return None
+        break
 
     ticket = await session.get(
         ValidatorTicket, (agent_id, bench_version, validator_hotkey)
@@ -573,6 +612,7 @@ async def issue_ticket(
         ticket = ValidatorTicket(
             agent_id=agent_id,
             validator_hotkey=validator_hotkey,
+            slot_id=slot_id,
             status=TicketStatus.ISSUED,
             issued_at=now,
             deadline=now + ttl,
@@ -586,6 +626,7 @@ async def issue_ticket(
         # The composite PK preserves one validator slot per agent. Reuse the
         # expired row with a fresh lease rather than inserting a duplicate.
         ticket.status = TicketStatus.ISSUED
+        ticket.slot_id = slot_id
         ticket.issued_at = now
         ticket.deadline = now + ttl
         ticket.attempt_count += 1
@@ -602,6 +643,7 @@ async def get_open_ticket(
     now: datetime,
     deadline: datetime,
     bench_version: int | None = 2,
+    slot_id: str | None = None,
     for_update: bool = False,
 ) -> ValidatorTicket | None:
     """Return the validator's live ticket matching the signed lease.
@@ -618,6 +660,8 @@ async def get_open_ticket(
     )
     if bench_version is not None:
         statement = statement.where(ValidatorTicket.bench_version == bench_version)
+    if slot_id is not None:
+        statement = statement.where(ValidatorTicket.slot_id == slot_id)
     if for_update:
         statement = statement.with_for_update()
     ticket = await session.scalar(statement)

@@ -425,6 +425,36 @@ async def test_rollout_idles_validator_until_fleet_finishes_priority_five() -> N
     await engine.dispose()
 
 
+async def test_parallel_rollout_slots_stay_distinct_inside_frozen_priority_five() -> (
+    None
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        priority_ids, _rollout = await _seed_rollout(session, now)
+        slot0 = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            slot_id="slot-0",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        slot1 = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            slot_id="slot-1",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert slot0 is not None and slot1 is not None
+        assert slot0.agent_id != slot1.agent_id
+        assert {slot0.agent_id, slot1.agent_id}.issubset(set(priority_ids))
+    await engine.dispose()
+
+
 async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
