@@ -24,10 +24,12 @@ from ditto.db.queries.benchmark_rollout import (
     DatasetPin,
     RolloutConflictError,
     active_bench_version,
+    authority_selection_state,
     create_rollout_snapshot,
     historical_rescore_cohort,
     rollout_for_desired_version,
     rollout_state,
+    select_active_bench_version,
     supersede_open_rollout,
 )
 
@@ -53,6 +55,14 @@ class AdminRolloutSupersedeRequest(BaseModel):
 
 
 class AdminRolloutStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: _Reason
+    actor: _Actor = "admin_api"
+    confirmation: str
+    expected_active_version: int
+
+
+class AdminActiveContractRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     reason: _Reason
     actor: _Actor = "admin_api"
@@ -160,6 +170,11 @@ async def get_rollout_control(
         "available_target_versions": [
             contract.version for contract in contracts if contract.version > active
         ],
+        "active_contract_candidates": [
+            await authority_selection_state(session, bench_version=contract.version)
+            for contract in contracts
+            if contract.version > active
+        ],
     }
 
 
@@ -213,6 +228,40 @@ async def supersede_rollout(
     return await rollout_state(session, capability_version=target)
 
 
+@router.post("/{desired_version}/select-active")
+async def select_active_contract(
+    _: AdminDep,
+    session: SessionDep,
+    desired_version: str,
+    payload: AdminActiveContractRequest,
+) -> dict[str, object]:
+    """Select a fully qualified superseded contract as weight authority."""
+    target = _parse_desired_version(desired_version)
+    _require_confirmation(payload.confirmation, action="ACTIVATE", version=target)
+    current = await active_bench_version(session)
+    if payload.expected_active_version != current:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "active benchmark changed: expected "
+                f"v{payload.expected_active_version}, found v{current}"
+            ),
+        )
+    try:
+        await select_active_bench_version(
+            session,
+            bench_version=target,
+            actor=payload.actor,
+            reason=payload.reason,
+            now=datetime.now(UTC),
+        )
+    except RolloutConflictError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await session.commit()
+    return await get_rollout_control(None, session)
+
+
 @router.post("/{desired_version}")
 async def start_rollout(
     _: AdminDep,
@@ -237,6 +286,15 @@ async def start_rollout(
     # as-is, whatever it started from. Only then does the forward-only guard
     # apply, so re-POSTing an already-activated version is not a 409.
     existing = await rollout_for_desired_version(session, desired_version=target)
+    if (
+        existing is not None
+        and existing.status == "superseded"
+        and existing.from_version != from_version
+    ):
+        # A recovered authority creates a new transition lineage. The terminal
+        # superseded row remains immutable history; it must not make the fresh
+        # active->target transition look idempotently complete.
+        existing = None
     if existing is None and target <= from_version:
         raise HTTPException(
             status_code=409,
