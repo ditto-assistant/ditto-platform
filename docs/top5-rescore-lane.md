@@ -107,9 +107,23 @@ wants.)*
 - **Membership** = the current emission set (champion via `_champion`, tail via
   `_tail`, `weights.py:346-367`) recomputed each round. New entrant in → gets the
   lane; drop out → doesn't. No manual list.
-- **Tempo** = gate the issuer to fire the confirmation round once per *T* tempos
-  (config `TOP5_RESCORE_TEMPO`, default e.g. 4). Under normal load one extra
-  shared-seed round every ~5 h is negligible.
+- **Tempo = exponential backoff over the champion's reign**, not a fixed
+  interval. The gap between rescore rounds starts small and **slowly** doubles up
+  to a cap as the *champion's* reign lengthens: `interval(blocks_since_crown) =
+  min(base · 2^floor(reign_tempos / K), cap)`. Dense early (a fresh or contested
+  king must prove the crown on many seeds), sparse once the reign is settled —
+  saving tokens on a stable leader. It **never reaches zero rate** (capped, e.g.
+  ~8 tempos): a dynamic competition should keep turning over, so a champion that
+  taper-flatlines at the cap *is itself the signal* that the field has gone
+  stagnant. **Resets on any king change** — a new champion re-enters the dense
+  regime, so churn ⇒ more scoring, stagnation ⇒ less. The schedule is a pure
+  function of `blocks_since_crown` (a deterministic ledger fact — the champion's
+  crown block), so every validator agrees when a round is due. Config: `base`,
+  doubling factor `K`, `cap`.
+- **Front-loads the 24 h source-reveal window** (#277/#278: king source releases
+  after a 24-h reign). Reaching quorum starts that countdown; the backoff keeps
+  the *densest* rescoring across those first ~20 tempos, so the crown is hardened
+  on the most shared seeds exactly as the code is about to become public.
 - **Catch-up** = a tail agent whose `confirmation_seeds` count is below the
   incumbents' gets **2× seeds/round** (score the two most-recent champion seeds it
   is missing) until its depth converges. Bounded so it can never exceed the
@@ -166,7 +180,9 @@ the consensus fold before merge.
 3. **Storage: append-only** — an immutable `ConfirmationScore` ledger (§3), never
    updated; the k=3 `Score` table is untouched.
 4. **Structure: stacked** on #195/#161 (don't rewrite them).
-5. **Tempo `T` = 4** (~one round / 5 h), config-tunable.
+5. **Tempo = exponential backoff** over the champion's reign (dense early,
+   tapering to a non-zero cap, resets on king change; front-loads the 24 h
+   reveal window). Deterministic on `blocks_since_crown`. Config: base/K/cap.
 6. **Catch-up = 2×** fresh missing seeds/round until depth-converged, hard-capped
    at the champion's seed count.
 7. **UI** — top-5 confirmation depth + widened band shown on the leaderboard and
