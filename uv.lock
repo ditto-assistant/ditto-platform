@@ -692,7 +692,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "bittensor", specifier = ">=10.2.1" },
     { name = "bittensor-pylon-client", git = "https://github.com/bittensor-church/bittensor-pylon?subdirectory=pylon_client" },
-    { name = "ditto-screening-protocol", git = "https://github.com/ditto-assistant/ditto-screener.git?subdirectory=packages%2Fditto-screening-protocol&rev=3513ed908c0297dccc265d04b618f6557cb9fc9b" },
+    { name = "ditto-screening-protocol", git = "https://github.com/ditto-assistant/ditto-screener.git?subdirectory=packages%2Fditto-screening-protocol&rev=76c9a42ad958fa6e074215ea833f1486347b44d0" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "prometheus-client", specifier = ">=0.20" },
     { name = "python-multipart", specifier = ">=0.0.9" },
@@ -716,7 +716,7 @@ dev = [
 [[package]]
 name = "ditto-screening-protocol"
 version = "0.12.0"
-source = { git = "https://github.com/ditto-assistant/ditto-screener.git?subdirectory=packages%2Fditto-screening-protocol&rev=3513ed908c0297dccc265d04b618f6557cb9fc9b#3513ed908c0297dccc265d04b618f6557cb9fc9b" }
+source = { git = "https://github.com/ditto-assistant/ditto-screener.git?subdirectory=packages%2Fditto-screening-protocol&rev=76c9a42ad958fa6e074215ea833f1486347b44d0#76c9a42ad958fa6e074215ea833f1486347b44d0" }
 dependencies = [
     { name = "pydantic" },
 ]
