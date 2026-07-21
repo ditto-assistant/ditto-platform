@@ -1208,6 +1208,7 @@ class PublicScreeningAttempt(BaseModel):
     reason: str | None = None
     quarantine_resolution: Literal["release", "rescreen", "reject"] | None = None
     quarantine_resolved_at: datetime | None = None
+    quarantine_resolution_reason: str | None = None
     review_evidence: list[PublicScreeningReviewEvidence] = Field(default_factory=list)
     review_finding: PublicScreeningReviewFinding | None = None
 

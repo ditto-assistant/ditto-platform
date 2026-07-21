@@ -2069,11 +2069,16 @@ async def agent_pipeline(
     }
     resolved_quarantines_by_attempt: dict[
         UUID,
-        tuple[Literal["release", "rescreen", "reject"] | None, datetime | None],
+        tuple[
+            Literal["release", "rescreen", "reject"] | None,
+            datetime | None,
+            str | None,
+        ],
     ] = {
         quarantine.attempt_id: (
             cast(Literal["release", "rescreen", "reject"], quarantine.resolution),
             quarantine.resolved_at,
+            quarantine.resolution_reason,
         )
         for quarantine in quarantines
         if quarantine.status == "resolved"
@@ -2251,11 +2256,14 @@ async def agent_pipeline(
                 finished_at=attempt.finished_at,
                 reason=attempt.public_reason,
                 quarantine_resolution=resolved_quarantines_by_attempt.get(
-                    attempt.attempt_id, (None, None)
+                    attempt.attempt_id, (None, None, None)
                 )[0],
                 quarantine_resolved_at=resolved_quarantines_by_attempt.get(
-                    attempt.attempt_id, (None, None)
+                    attempt.attempt_id, (None, None, None)
                 )[1],
+                quarantine_resolution_reason=resolved_quarantines_by_attempt.get(
+                    attempt.attempt_id, (None, None, None)
+                )[2],
                 review_evidence=public_reviews_by_attempt[attempt.attempt_id][0],
                 review_finding=public_reviews_by_attempt[attempt.attempt_id][1],
             )

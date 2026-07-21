@@ -319,6 +319,9 @@ class TestDashboard:
         assert "Old screener results" in body
         assert "Screener result" in body
         assert "Released from quarantine" in body
+        assert "a.quarantine_resolution_reason" in body
+        assert "esc(a.quarantine_resolution_reason)" in body
+        assert "Operator reason:" in body
         assert "Sent for rescreening" in body
         assert "Rejected after quarantine" in body
         assert 'return ["Quarantined", "warn"]' in body
