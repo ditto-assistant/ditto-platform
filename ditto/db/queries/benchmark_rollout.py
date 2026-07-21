@@ -981,13 +981,16 @@ async def rollout_state(
     rollout = await session.scalar(
         select(BenchmarkRollout).order_by(BenchmarkRollout.created_at.desc()).limit(1)
     )
-    active_version = (
-        DEFAULT_BENCH_VERSION
-        if rollout is None
-        else rollout.desired_version
-        if rollout.status == "activated"
-        else rollout.from_version
-    )
+    # Single source of truth for the active version: whatever the weight-setting
+    # guard (`active_bench_version`) resolves. This endpoint's `active_version` is
+    # what operators read and echo back as `expected_active_version` when starting
+    # a rollout, so deriving it from the same authority the start guard checks means
+    # the two can never disagree and spuriously 409 ("active benchmark changed").
+    # In the normal open-rollout case this is identical to the row-derived value
+    # (the flip predicates are equivalent when MIN_DESIRED_AUTHORITY_AGENTS ==
+    # PRIORITY_COHORT_SIZE); it only reconciles the terminal/edge cases where the
+    # most-recent row and the latest activated row differ.
+    active_version = await active_bench_version(session)
     version = capability_version or (
         rollout.desired_version if rollout is not None else active_version
     )
@@ -1061,12 +1064,6 @@ async def rollout_state(
         bench_version=rollout.desired_version,
         agent_ids=priority_member_ids,
     )
-    authority_active_version = (
-        rollout.desired_version
-        if rollout.status == "activated"
-        or ranked_quorum_agents >= MIN_DESIRED_AUTHORITY_AGENTS
-        else rollout.from_version
-    )
     cohort_ready_count = sum(
         counts.get(member.agent_id, 0) >= SCORING_QUORUM for member in members
     )
@@ -1077,7 +1074,7 @@ async def rollout_state(
         counts.get(member.agent_id, 0) >= SCORING_QUORUM for member in priority_members
     )
     return {
-        "active_version": authority_active_version,
+        "active_version": active_version,
         "desired_version": rollout.desired_version,
         "status": rollout.status,
         "blocked_reason": rollout.blocked_reason,

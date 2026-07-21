@@ -2080,3 +2080,62 @@ async def test_activation_at_five_ranked_quorums_keeps_a_full_emission_set() -> 
         assert {row.bench_version for row in ledger} == {CANARY_BENCH_VERSION}
         assert all(row.eligible for row in ledger)
     await engine.dispose()
+
+
+async def test_rollout_state_active_version_matches_start_guard_authority() -> None:
+    """rollout_state's active_version must equal active_bench_version.
+
+    Regression for the spurious "active benchmark changed: expected v5, found v4"
+    409 on rollout start. The start guard compares the operator-supplied
+    expected_active_version against active_bench_version(), while the operator UI
+    reads it from rollout_state()["active_version"]. When those two derive the
+    active version differently they disagree and start_rollout 409s even though
+    nothing changed.
+
+    The divergent state: an activated older transition plus a newer, terminally
+    superseded transition that never activated (a real sequence -- a v5->v6 rollout
+    opened while a converging v4->v5 briefly read as active, then v4->v5 was
+    reverted, leaving v5->v6 dangling as the most-recent row). The most-recent row
+    (superseded, from=5) and the latest activated row (desired=4) disagree; both
+    reports must nonetheless agree with each other.
+    """
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        base = datetime(2026, 7, 1, tzinfo=UTC)
+        # Older transition, activated: this is what the weight-setting guard treats
+        # as authoritative (latest activated desired_version == 4).
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=3,
+                desired_version=4,
+                status="activated",
+                cohort_size=5,
+                created_at=base,
+                activated_at=base + timedelta(hours=1),
+            )
+        )
+        # Newer transition, terminally superseded (never activated). Its from_version
+        # is 5, so the pre-fix most-recent-row derivation reported active_version == 5.
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=5,
+                desired_version=6,
+                status="superseded",
+                cohort_size=5,
+                created_at=base + timedelta(hours=2),
+            )
+        )
+        await session.flush()
+
+        guard = await active_bench_version(session)
+        state = await rollout_state(session)
+        assert guard == 4
+        # The invariant the fix guarantees: the value the UI echoes back as
+        # expected_active_version is exactly what the start guard checks.
+        assert state["active_version"] == guard
+    await engine.dispose()
