@@ -27,6 +27,7 @@ from ditto.api_server.endpoints import (
     admin_benchmark_rollout_router,
     admin_copy_review_router,
     admin_quarantine_router,
+    admin_scoring_readiness_router,
     admin_validation_retry_router,
     health_router,
     metrics_router,
@@ -196,6 +197,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(admin_benchmark_rollout_router, prefix="/api/v1")
     app.include_router(admin_quarantine_router, prefix="/api/v1")
     app.include_router(admin_validation_retry_router, prefix="/api/v1")
+    app.include_router(admin_scoring_readiness_router, prefix="/api/v1")
     app.include_router(admin_copy_review_router, prefix="/api/v1")
 
     # Serve the public dashboard SPA same-origin at ``/`` so the platform is the

@@ -243,6 +243,85 @@ class JobResponse(BaseModel):
     )
 
 
+FailJobReason = Literal[
+    "infrastructure",
+    "scoring_error",
+]
+"""Coarse reason a validator hands a leased ticket back for reissue.
+
+Deliberately low-cardinality so no run-specific detail leaks. The platform
+branches on it: ``infrastructure`` earns a bounded compensating grant plus an
+escalating cooldown, so a validator-side outage neither spends the agent's
+genuine attempt budget nor hammers the failing provider; ``scoring_error`` is
+the agent's own failure and consumes an attempt with an immediate reissue.
+``infrastructure`` maps to the validator's ``ValidatorInfrastructureError``
+sweep-ending branch; ``scoring_error`` maps to its ``DittobenchError`` /
+``PlatformError`` scoring-failure branch. These values are the wire contract
+shared verbatim with ditto-subnet (which emits them).
+"""
+
+
+class FailJobRequest(BaseModel):
+    """Signed request to hand a still-leased ticket back after a failed attempt.
+
+    A validator whose scoring attempt failed calls this so the platform closes
+    the live ticket immediately (status ``expired``, ``retry_after`` now) and the
+    slot re-opens for a fresh ticket, instead of the lease sitting idle until its
+    deadline. Mirrors :class:`JobRequest`'s proof-of-possession: the signature
+    proves the hotkey, ``nonce`` is one-time, and ``requested_at`` is
+    freshness-bounded. The ``(agent_id, ticket_deadline)`` pair identifies the
+    exact lease the caller must currently hold.
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Failing validator hotkey.")
+    ]
+    agent_id: Annotated[UUID, Field(description="Agent whose ticket failed.")]
+    ticket_deadline: Annotated[
+        datetime,
+        Field(description="Exact deadline from the JobResponse ticket lease."),
+    ]
+    reason: Annotated[
+        FailJobReason,
+        Field(
+            description="Coarse failure class; drives the platform's reissue policy."
+        ),
+    ]
+    nonce: Annotated[UUID, Field(description="One-time claim nonce.")]
+    requested_at: Annotated[
+        datetime, Field(description="UTC time at which the request was signed.")
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            pattern=_SIGNATURE_HEX_PATTERN,
+            description="sr25519 signature over the canonical fail payload.",
+        ),
+    ]
+
+    @field_validator("requested_at", "ticket_deadline")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("timestamps must include a timezone")
+        return value
+
+
+class FailJobResponse(BaseModel):
+    """Returned by ``POST /validator/job/fail``.
+
+    ``reopened`` is ``True`` when a live ticket matching the signed lease was
+    found and closed for immediate reissue; ``False`` when the caller held no
+    such live ticket (already expired, scored, or never issued) — a no-op that
+    is safe to ignore, keeping the endpoint idempotent and best-effort.
+    """
+
+    agent_id: Annotated[UUID, Field(description="Echoes the failed agent id.")]
+    reopened: Annotated[
+        bool, Field(description="``True`` when a live ticket was closed for reissue.")
+    ]
+
+
 class ValidatorHeartbeatRequest(BaseModel):
     """Signed proof of the validator build currently serving a hotkey.
 
@@ -854,7 +933,12 @@ class LedgerResponse(BaseModel):
 
     entries: Annotated[
         list[LedgerEntry],
-        Field(description="Best eligible score per miner, highest composite first."),
+        Field(
+            description=(
+                "Best eligible score per payment-time coldkey, highest composite "
+                "first; the selected generation's hotkey is the weight destination."
+            )
+        ),
     ]
     count: Annotated[int, Field(ge=0, description="Number of entries returned.")]
     generated_at: Annotated[

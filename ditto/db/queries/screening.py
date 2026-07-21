@@ -7,17 +7,19 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import ColumnElement, case, exists, func, or_, select
+from sqlalchemy import ColumnElement, and_, case, exists, func, or_, select
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.selectable import ScalarSelect
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_contract import benchmark_contracts
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.db.models import (
     Agent,
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
+    EvaluationPayment,
     Score,
     ScreeningAttempt,
     ScreeningQuarantine,
@@ -163,6 +165,40 @@ def missing_active_benchmark_dataset() -> ColumnElement[bool]:
         )
     )
     return activation_exists & ~versioned_dataset_exists
+
+
+def missing_active_screened_image() -> ColumnElement[bool]:
+    """Whether the current agent lacks a complete screened image the activated
+    benchmark version requires (v3+).
+
+    Validators only lease an agent for a screened-image benchmark once every
+    ``screened_image_*`` field is set (see ``eligible_screened_image`` in
+    ``db/queries/tickets.py``). An agent quarantined mid-screen — before its
+    image was uploaded and verified — and then RELEASED to ``evaluating`` on the
+    current policy has an incomplete image: validators skip it, and without this
+    predicate no screener re-claims it, so it is stuck for good. Re-screening it
+    rebuilds and verifies the image (and its dataset)."""
+    active_version = (
+        select(BenchmarkRollout.desired_version)
+        .where(BenchmarkRollout.status == "activated")
+        .order_by(BenchmarkRollout.activated_at.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    screened_versions = [
+        contract.version
+        for contract in benchmark_contracts()
+        if contract.requires_screened_image
+    ]
+    incomplete_image = (
+        Agent.screened_image_sha256.is_(None)
+        | Agent.screened_image_size_bytes.is_(None)
+        | Agent.screened_image_id.is_(None)
+        | Agent.screened_image_ref.is_(None)
+        | Agent.screened_image_upload_id.is_(None)
+        | Agent.screened_image_verified_at.is_(None)
+    )
+    return active_version.in_(screened_versions) & incomplete_image
 
 
 async def expire_screening_attempts(session: AsyncSession, *, now: datetime) -> int:
@@ -333,12 +369,32 @@ async def claim_screening_attempts(
             & missing_v3_screen
         ),
         ((Agent.status == AgentStatus.EVALUATING) & missing_active_benchmark_dataset()),
+        # A submission released from an anti-cheat quarantine back to EVALUATING
+        # but without a complete screened image the active version needs is
+        # otherwise stuck forever — validators skip it and nothing re-screens it.
+        ((Agent.status == AgentStatus.EVALUATING) & missing_active_screened_image()),
     )
+    candidate_payment = aliased(EvaluationPayment)
     earlier = aliased(Agent)
+    earlier_payment = aliased(EvaluationPayment)
+    earlier_is_different_owner = and_(
+        earlier.miner_hotkey != Agent.miner_hotkey,
+        or_(
+            candidate_payment.miner_coldkey.is_(None),
+            earlier_payment.miner_coldkey.is_(None),
+            earlier_payment.miner_coldkey != candidate_payment.miner_coldkey,
+        ),
+    )
     earlier_pending = exists(
-        select(earlier.agent_id).where(
+        select(earlier.agent_id)
+        .select_from(earlier)
+        .outerjoin(
+            earlier_payment,
+            earlier_payment.agent_id == earlier.agent_id,
+        )
+        .where(
             earlier.sha256 == Agent.sha256,
-            earlier.miner_hotkey != Agent.miner_hotkey,
+            earlier_is_different_owner,
             (earlier.created_at < Agent.created_at)
             | (
                 (earlier.created_at == Agent.created_at)
@@ -356,6 +412,10 @@ async def claim_screening_attempts(
     agents = list(
         await session.scalars(
             select(Agent)
+            .outerjoin(
+                candidate_payment,
+                candidate_payment.agent_id == Agent.agent_id,
+            )
             .where(eligible, ~has_running, ~earlier_pending)
             .order_by(*screening_priority_order())
             .limit(limit)
@@ -376,6 +436,21 @@ async def claim_screening_attempts(
             )
             continue
         owner = aliased(Agent)
+        owner_payment = aliased(EvaluationPayment)
+        candidate_coldkey = await session.scalar(
+            select(EvaluationPayment.miner_coldkey).where(
+                EvaluationPayment.agent_id == agent.agent_id
+            )
+        )
+        owner_is_different = owner.miner_hotkey != agent.miner_hotkey
+        if candidate_coldkey is not None:
+            owner_is_different = and_(
+                owner_is_different,
+                or_(
+                    owner_payment.miner_coldkey.is_(None),
+                    owner_payment.miner_coldkey != candidate_coldkey,
+                ),
+            )
         # An artifact refused FOR CAUSE stays a valid duplicate owner. Scoping
         # owners to live statuses alone meant banning an original disarmed this
         # check for its clones: the very act of refusing the first copy removed
@@ -407,9 +482,13 @@ async def claim_screening_attempts(
         )
         duplicate_of = await session.scalar(
             select(owner.agent_id)
+            .outerjoin(
+                owner_payment,
+                owner_payment.agent_id == owner.agent_id,
+            )
             .where(
                 owner.sha256 == agent.sha256,
-                owner.miner_hotkey != agent.miner_hotkey,
+                owner_is_different,
                 owner.agent_id != agent.agent_id,
                 (owner.created_at < agent.created_at)
                 | (
@@ -448,6 +527,17 @@ async def claim_screening_attempts(
                         public_reason=agent.screening_reason,
                     )
                 )
+        # An EVALUATING agent on the current policy already cleared the anti-cheat
+        # review (it passed, or an operator released its quarantine). Re-claiming
+        # it — to rebuild a missing screened image or dataset — must NOT re-run
+        # that review, or we would re-judge an approved artifact (and risk a
+        # release/re-quarantine loop). It is a build-only pass. A fresh
+        # (UPLOADED), failed, or stale-policy submission still gets the full
+        # review.
+        build_only = (
+            agent.status == AgentStatus.EVALUATING
+            and agent.screening_policy_version >= SCREENING_POLICY_VERSION
+        )
         attempt = ScreeningAttempt(
             attempt_id=uuid4(),
             agent_id=agent.agent_id,
@@ -460,6 +550,7 @@ async def claim_screening_attempts(
                 "exact-cross-miner-duplicate" if duplicate_of is not None else None
             ),
             duplicate_of=duplicate_of,
+            build_only=build_only,
         )
         session.add(attempt)
         if agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):

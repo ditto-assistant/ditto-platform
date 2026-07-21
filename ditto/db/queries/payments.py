@@ -34,6 +34,35 @@ if TYPE_CHECKING:
 _PAYMENT_REPLAY_CONSTRAINT = "evaluation_payments_pkey"
 
 
+async def get_miner_coldkey_for_agent(
+    session: AsyncSession, *, agent_id: UUID
+) -> str | None:
+    """Return the immutable payment-time coldkey for an agent.
+
+    ``None`` is possible only for legacy/test agents created before paid-upload
+    provenance was mandatory.
+    """
+    return await session.scalar(
+        select(EvaluationPayment.miner_coldkey).where(
+            EvaluationPayment.agent_id == agent_id
+        )
+    )
+
+
+async def get_miner_coldkeys_for_agents(
+    session: AsyncSession, *, agent_ids: set[UUID]
+) -> dict[UUID, str]:
+    """Batch payment-time ownership lookup for operator comparison pages."""
+    if not agent_ids:
+        return {}
+    rows = await session.execute(
+        select(EvaluationPayment.agent_id, EvaluationPayment.miner_coldkey).where(
+            EvaluationPayment.agent_id.in_(agent_ids)
+        )
+    )
+    return dict(rows.tuples().all())
+
+
 async def get_agent_for_payment_proof(
     session: AsyncSession,
     *,

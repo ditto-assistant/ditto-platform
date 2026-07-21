@@ -66,6 +66,7 @@ from ditto.db.models import (
     Base,
     BenchmarkDataset,
     BenchmarkRollout,
+    EvaluationPayment,
     Score,
     ScreenedImageUpload,
     ScreenerHeartbeat,
@@ -439,26 +440,40 @@ async def _seed_agent(
     miner_hotkey: str = _MINER_HOTKEY,
     sha256: str = _SHA256,
     version: int | None = None,
+    miner_coldkey: str | None = None,
 ) -> UUID:
     aid = agent_id or uuid4()
     async with maker() as s, s.begin():
-        s.add(
-            Agent(
-                agent_id=aid,
-                miner_hotkey=miner_hotkey,
-                name=name,
-                version=version,
-                sha256=sha256,
-                status=status,
-                screening_policy_version=(
-                    SCREENING_POLICY_VERSION
-                    if screening_policy_version is None
-                    and status == AgentStatus.EVALUATING
-                    else (screening_policy_version or 0)
-                ),
-                created_at=created_at or datetime.now(UTC),
-            )
+        created = created_at or datetime.now(UTC)
+        agent = Agent(
+            agent_id=aid,
+            miner_hotkey=miner_hotkey,
+            name=name,
+            version=version,
+            sha256=sha256,
+            status=status,
+            screening_policy_version=(
+                SCREENING_POLICY_VERSION
+                if screening_policy_version is None and status == AgentStatus.EVALUATING
+                else (screening_policy_version or 0)
+            ),
+            created_at=created,
         )
+        s.add(agent)
+        await s.flush()
+        if miner_coldkey is not None:
+            s.add(
+                EvaluationPayment(
+                    block_hash=f"0x{aid.hex}",
+                    extrinsic_index=0,
+                    agent_id=aid,
+                    miner_hotkey=miner_hotkey,
+                    miner_coldkey=miner_coldkey,
+                    amount_rao=1,
+                    dest_address="5Destination",
+                    timestamp=created,
+                )
+            )
     return aid
 
 
@@ -1357,6 +1372,33 @@ class TestClaim:
         assert claimed["precheck_reason_code"] is None
         assert claimed["duplicate_of"] is None
 
+    async def test_same_coldkey_different_hotkey_is_not_prechecked_as_duplicate(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        coldkey = "5SharedColdkey"
+        await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            miner_hotkey="5OldHotkey",
+            miner_coldkey=coldkey,
+        )
+        retry = await _seed_agent(
+            session_maker,
+            status=AgentStatus.UPLOADED,
+            miner_hotkey="5NewHotkey",
+            miner_coldkey=coldkey,
+        )
+        _install_db(app, session_maker)
+
+        claimed = (await client.post(_CLAIM_URL)).json()["items"][0]
+
+        assert claimed["agent_id"] == str(retry)
+        assert claimed["precheck_reason_code"] is None
+        assert claimed["duplicate_of"] is None
+
     async def test_rescreened_older_hash_does_not_use_later_submission_as_owner(
         self,
         app: FastAPI,
@@ -2003,12 +2045,79 @@ class TestQuarantineAdmin:
             assert v2 is not None and v2.sha256 == "ab" * 32
             assert v3 is not None and v3.sha256 == "be" * 32
 
-        # The release adjudicates this exact current-policy artifact. Once its
-        # active benchmark dataset is pinned, it must not immediately re-enter
-        # screening through the missing-dataset eligibility branch.
+        # The release pinned the active dataset, so the missing-DATASET branch
+        # must not re-fire. But this artifact tripped source review BEFORE its
+        # screened image was built (agentic-source-review-tripwire), so it is
+        # released to EVALUATING without the image v3 requires. It therefore
+        # correctly re-enters screening via the missing-screened-image branch to
+        # build that image — otherwise validators would skip it forever.
         next_claim = await client.post(_CLAIM_URL)
         assert next_claim.status_code == 200
-        assert next_claim.json()["items"] == []
+        reclaimed = {item["agent_id"] for item in next_claim.json()["items"]}
+        assert str(agent_id) in reclaimed
+
+    async def test_build_only_attempt_cannot_quarantine(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # An EVALUATING (already-adjudicated) agent missing its image is
+        # re-claimed as a BUILD-ONLY pass. The screener must not be able to
+        # quarantine it — that would let a re-screen silently override the prior
+        # release/pass that made it EVALUATING.
+        agent_id = uuid4()
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            agent = Agent(
+                agent_id=agent_id,
+                miner_hotkey="5HKapproved",
+                name="approved-no-image",
+                sha256=uuid4().hex * 2,
+                status=AgentStatus.EVALUATING,
+            )
+            agent.screening_policy_version = SCREENING_POLICY_VERSION
+            session.add(agent)
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=4,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now - timedelta(hours=1),
+                    activated_at=now,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        claimed = await client.post(_CLAIM_URL)
+        item = next(
+            entry
+            for entry in claimed.json()["items"]
+            if entry["agent_id"] == str(agent_id)
+        )
+        assert item["build_only"] is True
+        attempt_id = UUID(item["attempt_id"])
+
+        rejected = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                attempt_id=attempt_id,
+                outcome="quarantine",
+                manifest_digest="56" * 32,
+                finding_digest="78" * 32,
+                reason_code="agentic-source-review-tripwire",
+            ),
+        )
+        assert rejected.status_code >= 400
+        refreshed_status = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()["status"]
+        assert refreshed_status != "under_review"
 
     async def test_admin_auth_is_required(
         self, app: FastAPI, client: httpx.AsyncClient
@@ -3954,6 +4063,7 @@ class TestQuarantineReviewContext:
         prior_agent = uuid4()
         prior_attempt = uuid4()
         duplicate_agent = uuid4()
+        shared_coldkey = "5SharedPaymentOwner"
         async with session_maker() as session, session.begin():
             # An earlier, already-resolved quarantine from the same miner.
             session.add(
@@ -3965,6 +4075,30 @@ class TestQuarantineReviewContext:
                     status=AgentStatus.REJECTED,
                     screening_policy_version=SCREENING_POLICY_VERSION,
                     created_at=now - timedelta(days=2),
+                )
+            )
+            session.add_all(
+                (
+                    EvaluationPayment(
+                        block_hash=f"0x{agent_id.hex}",
+                        extrinsic_index=0,
+                        agent_id=agent_id,
+                        miner_hotkey=_MINER_HOTKEY,
+                        miner_coldkey=shared_coldkey,
+                        amount_rao=1,
+                        dest_address="5Destination",
+                        timestamp=now,
+                    ),
+                    EvaluationPayment(
+                        block_hash=f"0x{duplicate_agent.hex}",
+                        extrinsic_index=0,
+                        agent_id=duplicate_agent,
+                        miner_hotkey=other_miner,
+                        miner_coldkey=shared_coldkey,
+                        amount_rao=1,
+                        dest_address="5Destination",
+                        timestamp=now,
+                    ),
                 )
             )
             session.add(
@@ -4037,6 +4171,7 @@ class TestQuarantineReviewContext:
                 "agent_status": AgentStatus.UPLOADED,
                 "submitted_at": body["duplicates"][0]["submitted_at"],
                 "match": "identical_artifact",
+                "same_owner": True,
             }
         ]
         # Attribution comes from authoritative SQL aggregates, not the sample.
@@ -4044,6 +4179,8 @@ class TestQuarantineReviewContext:
             "total": 1,
             "cross_miner": 1,
             "same_miner": 0,
+            "cross_owner": 0,
+            "same_owner": 1,
             "sample_truncated": False,
         }
 

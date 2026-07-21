@@ -50,6 +50,53 @@ _LIVE_TICKET_STATUSES = (TicketStatus.ISSUED, TicketStatus.SCORED)
 RETRY_COOLDOWN = timedelta(hours=6)
 MAX_ATTEMPTS_PER_VERSION = 2
 
+# An infrastructure failure (a signed ``fail_job`` with reason
+# ``infrastructure``) is never the agent's fault, so it earns a compensating
+# grant that offsets the attempt the reissue consumes. Bounded so a persistent
+# validator-side outage cannot re-lease one agent forever.
+MAX_INFRA_RETRY_GRANTS = 8
+
+# Infrastructure retries reissue quickly (no 6h agent-failure cooldown) so a
+# transient blip recovers fast, but back-to-back re-leases during a *sustained*
+# provider/relay outage would hammer the failing provider (an inference burst).
+# The cooldown before the next infra retry therefore doubles per grant already
+# earned, capped, so the agent is still retried to success while the failing
+# provider gets breathing room.
+INFRA_RETRY_BACKOFF_BASE = timedelta(minutes=2)
+INFRA_RETRY_BACKOFF_CAP = timedelta(minutes=30)
+
+
+def infra_retry_backoff(infra_retry_grants: int) -> timedelta:
+    """Cooldown before an infrastructure-failed lease may be re-leased.
+
+    ``infra_retry_grants`` is the count *after* this failure bumped it (so the
+    first infra failure passes ``1``). Doubles per prior grant, capped at
+    :data:`INFRA_RETRY_BACKOFF_CAP`.
+    """
+    if infra_retry_grants <= 1:
+        return INFRA_RETRY_BACKOFF_BASE
+    # Clamp the exponent so a large count can't overflow the timedelta multiply;
+    # anything past the cap is clamped to it anyway (real inputs are <= 8).
+    steps = min(infra_retry_grants - 1, 20)
+    scaled = INFRA_RETRY_BACKOFF_BASE * (2**steps)
+    return min(scaled, INFRA_RETRY_BACKOFF_CAP)
+
+
+def ticket_attempt_cap(ticket: ValidatorTicket) -> int:
+    """Total leases a validator may spend on this agent+version.
+
+    The base per-version budget, plus audited operator grants, plus
+    infrastructure-failure compensation. ``attempt_count`` is compared against
+    this everywhere issuance, exhaustion, and natural-retry eligibility are
+    decided, so the three surfaces agree on one budget.
+    """
+    return (
+        MAX_ATTEMPTS_PER_VERSION
+        + ticket.manual_retry_grants
+        + ticket.infra_retry_grants
+    )
+
+
 # The KOTH champion plus four participation-tail miners receive emissions.
 # Ticket continuation uses the current fifth finalized score as a dynamic floor,
 # but only after two scores: with median-of-three, the highest final score still
@@ -242,6 +289,7 @@ async def issue_ticket(
                         >= (
                             MAX_ATTEMPTS_PER_VERSION
                             + ValidatorTicket.manual_retry_grants
+                            + ValidatorTicket.infra_retry_grants
                         )
                     )
                 )

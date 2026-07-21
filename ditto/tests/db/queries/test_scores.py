@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
-from ditto.db.models import Agent
+from ditto.db.models import Agent, EvaluationPayment
 from ditto.db.queries.scores import (
     MIN_ELIGIBLE_CASES,
     list_eligible_ledger,
@@ -109,12 +109,14 @@ async def _seed_scored(
     prompt_fingerprint: dict | None = None,
     code_embedding: list | None = None,
     code_embed_model: str | None = None,
+    coldkey: str | None = None,
+    name: str = "agent",
 ) -> Agent:
     """Seed one agent + its score row, in the given lifecycle state."""
     agent = Agent(
         agent_id=uuid4(),
         miner_hotkey=miner,
-        name="agent",
+        name=name,
         sha256="ab" * 32,
         size_bytes=size_bytes,
         status=status,
@@ -127,6 +129,19 @@ async def _seed_scored(
     async with session.begin():
         session.add(agent)
         await session.flush()
+        if coldkey is not None:
+            session.add(
+                EvaluationPayment(
+                    block_hash=f"0x{agent.agent_id.hex}",
+                    extrinsic_index=0,
+                    agent_id=agent.agent_id,
+                    miner_hotkey=miner,
+                    miner_coldkey=coldkey,
+                    amount_rao=1,
+                    dest_address="5Destination",
+                    timestamp=created_at,
+                )
+            )
         await upsert_score(
             session,
             agent_id=agent.agent_id,
@@ -161,6 +176,86 @@ class TestListEligibleLedger:
         assert ledger[0].composite == pytest.approx(0.8)
         assert ledger[0].miner_hotkey == _MINER
         assert ledger[0].signature == "ab" * 64
+
+    async def test_best_agent_per_coldkey_across_hotkeys_and_names(
+        self, session: AsyncSession
+    ) -> None:
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        coldkey = "5ColdkeyOwner"
+        await _seed_scored(
+            session,
+            miner=_MINER,
+            coldkey=coldkey,
+            name="mnemo-v4",
+            composite=0.91,
+            created_at=t0,
+            n=MIN_ELIGIBLE_CASES,
+        )
+        best = await _seed_scored(
+            session,
+            miner=_MINER_B,
+            coldkey=coldkey,
+            name="mnemo-v5",
+            composite=0.95,
+            created_at=t0.replace(hour=13),
+            n=MIN_ELIGIBLE_CASES,
+        )
+
+        ledger = await list_eligible_ledger(session)
+
+        assert len(ledger) == 1
+        assert ledger[0].agent_id == best.agent_id
+        assert ledger[0].miner_hotkey == _MINER_B
+        assert ledger[0].miner_coldkey == coldkey
+
+    async def test_newer_lower_score_does_not_shadow_coldkey_best(
+        self, session: AsyncSession
+    ) -> None:
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        coldkey = "5ColdkeyOwner"
+        best = await _seed_scored(
+            session,
+            miner=_MINER,
+            coldkey=coldkey,
+            composite=0.95,
+            created_at=t0,
+            n=MIN_ELIGIBLE_CASES,
+        )
+        await _seed_scored(
+            session,
+            miner=_MINER_B,
+            coldkey=coldkey,
+            composite=0.90,
+            created_at=t0.replace(hour=13),
+            n=MIN_ELIGIBLE_CASES,
+        )
+
+        ledger = await list_eligible_ledger(session)
+
+        assert [row.agent_id for row in ledger] == [best.agent_id]
+
+    async def test_different_coldkeys_keep_separate_positions(
+        self, session: AsyncSession
+    ) -> None:
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        await _seed_scored(
+            session,
+            miner=_MINER,
+            coldkey="5ColdkeyA",
+            composite=0.95,
+            created_at=t0,
+            n=MIN_ELIGIBLE_CASES,
+        )
+        await _seed_scored(
+            session,
+            miner=_MINER_B,
+            coldkey="5ColdkeyB",
+            composite=0.90,
+            created_at=t0,
+            n=MIN_ELIGIBLE_CASES,
+        )
+
+        assert len(await list_eligible_ledger(session)) == 2
 
     async def test_normalized_source_hash_flows_through(
         self, session: AsyncSession
@@ -508,6 +603,7 @@ async def _seed_versioned_agent(
     desired_samples: int = 3,
     desired_n: int = MIN_ELIGIBLE_CASES,
     status: AgentStatus = AgentStatus.SCORED,
+    coldkey: str | None = None,
 ) -> Agent:
     """One agent with a full v2 quorum and an optional partial/full v4 quorum."""
     agent = Agent(
@@ -522,6 +618,19 @@ async def _seed_versioned_agent(
     async with session.begin():
         session.add(agent)
         await session.flush()
+        if coldkey is not None:
+            session.add(
+                EvaluationPayment(
+                    block_hash=f"0x{agent.agent_id.hex}",
+                    extrinsic_index=0,
+                    agent_id=agent.agent_id,
+                    miner_hotkey=miner,
+                    miner_coldkey=coldkey,
+                    amount_rao=1,
+                    dest_address="5Destination",
+                    timestamp=created_at,
+                )
+            )
         for index, validator in enumerate(_QUORUM_VALIDATORS):
             await upsert_score(
                 session,
@@ -633,6 +742,28 @@ class TestThresholdGatedAuthority:
         assert ledger[0].composite == pytest.approx(
             0.70 + (MIN_DESIRED_AUTHORITY_AGENTS - 1) / 100
         )
+
+    async def test_duplicate_coldkey_cannot_tip_rollout_threshold(
+        self, session: AsyncSession
+    ) -> None:
+        from ditto.db.queries.benchmark_rollout import MIN_DESIRED_AUTHORITY_AGENTS
+
+        t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+        await _open_rollout(session)
+        for index in range(MIN_DESIRED_AUTHORITY_AGENTS):
+            await _seed_versioned_agent(
+                session,
+                miner=_miner(index),
+                coldkey=("5SharedColdkey" if index < 2 else f"5Coldkey{index:048d}"),
+                created_at=t0,
+                v2_composite=0.50 + index / 100,
+                desired_composite=0.70 + index / 100,
+            )
+
+        ledger = await list_eligible_ledger(session)
+
+        self._assert_single_version(ledger, _ROLLOUT_FROM)
+        assert len(ledger) == MIN_DESIRED_AUTHORITY_AGENTS - 1
 
     async def test_agent_without_desired_quorum_drops_out_after_flip(
         self, session: AsyncSession

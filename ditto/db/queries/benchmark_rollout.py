@@ -150,14 +150,26 @@ async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]
             continue
         candidates.append((agent, float(middle.composite)))
 
-    # Keep one best agent per miner before taking the network-wide top five.
+    from ditto.db.queries.payments import get_miner_coldkeys_for_agents
+
+    coldkeys = await get_miner_coldkeys_for_agents(
+        session, agent_ids={agent.agent_id for agent, _ in candidates}
+    )
+    # Keep one best generation per payment-time coldkey before taking the
+    # network-wide top five. Legacy rows without payment provenance remain
+    # isolated by hotkey.
     candidates.sort(key=lambda item: (-item[1], item[0].created_at, item[0].agent_id))
     unique: list[RolloutSnapshotMember] = []
-    seen_miners: set[str] = set()
+    seen_owners: set[str] = set()
     for agent, composite in candidates:
-        if agent.miner_hotkey in seen_miners:
+        owner = (
+            f"coldkey:{coldkeys[agent.agent_id]}"
+            if agent.agent_id in coldkeys
+            else f"hotkey:{agent.miner_hotkey}"
+        )
+        if owner in seen_owners:
             continue
-        seen_miners.add(agent.miner_hotkey)
+        seen_owners.add(owner)
         unique.append(
             RolloutSnapshotMember(agent.agent_id, agent.miner_hotkey, composite)
         )

@@ -18,12 +18,12 @@ from statistics import median
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, and_, case, func, null, or_, select
+from sqlalchemy import ColumnElement, and_, case, func, literal, null, or_, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
-from ditto.db.models import Agent, Score
+from ditto.db.models import Agent, EvaluationPayment, Score
 from ditto.db.queries.agents import get_agent_by_id
 
 if TYPE_CHECKING:
@@ -68,7 +68,7 @@ def _is_ranked() -> ColumnElement[bool]:
 
 @dataclass(frozen=True)
 class LedgerRow:
-    """One entry of the best-eligible-score-per-miner ledger.
+    """One entry of the best-eligible-score-per-payment-coldkey ledger.
 
     The immutable value object :func:`list_eligible_ledger` returns and the
     ``GET /scoring/scores`` endpoint maps onto the ``LedgerEntry`` wire model.
@@ -89,6 +89,12 @@ class LedgerRow:
     validator_hotkey: str
     signature: str | None
     status: AgentStatus
+    miner_coldkey: str | None = None
+    """Payment-time owner identity used to enforce one emission position.
+
+    This is moderation-only metadata and is not exposed on the public scoring
+    wire model. ``None`` is retained for legacy rows that predate payments.
+    """
     bench_version: int = 1
     content_fingerprint: dict | None = None
     """Shingle MinHash sketch of the tarball source (see
@@ -140,6 +146,22 @@ class LedgerRow:
     per-case breakdown. The public leaderboard exposes a **safe subset** (never
     ``per_case``, which carries the answer key); validator-gated endpoints may
     read it whole. ``None`` for rows scored before details were persisted."""
+
+
+def _emission_owner_key() -> ColumnElement[str]:
+    """Stable owner key for one-emission-position selection.
+
+    New uploads always carry an immutable payment-time coldkey. The hotkey
+    fallback preserves legacy/test rows without accidentally collapsing every
+    missing-payment row into one owner.
+    """
+    return case(
+        (
+            EvaluationPayment.miner_coldkey.is_not(None),
+            literal("coldkey:") + EvaluationPayment.miner_coldkey,
+        ),
+        else_=literal("hotkey:") + Agent.miner_hotkey,
+    )
 
 
 @dataclass(frozen=True)
@@ -573,8 +595,15 @@ async def count_ranked_quorum_agents(
     # Same median arithmetic as the ledger (see list_eligible_ledger): the
     # lower-middle row by ascending composite represents the agent.
     qualifying = (
-        select(per_version.c.agent_id)
+        select(
+            per_version.c.agent_id,
+            _emission_owner_key().label("emission_owner"),
+        )
         .join(Agent, Agent.agent_id == per_version.c.agent_id)
+        .outerjoin(
+            EvaluationPayment,
+            EvaluationPayment.agent_id == per_version.c.agent_id,
+        )
         .where(
             Agent.status == AgentStatus.SCORED,
             per_version.c.cnt >= SCORING_QUORUM,
@@ -586,7 +615,12 @@ async def count_ranked_quorum_agents(
         )
         .subquery()
     )
-    return int(await session.scalar(select(func.count()).select_from(qualifying)) or 0)
+    return int(
+        await session.scalar(
+            select(func.count(func.distinct(qualifying.c.emission_owner)))
+        )
+        or 0
+    )
 
 
 async def list_eligible_ledger(
@@ -595,7 +629,7 @@ async def list_eligible_ledger(
     include_fingerprints: bool = True,
     bench_version: int | None = None,
 ) -> list[LedgerRow]:
-    """Return the best eligible score per miner, highest composite first.
+    """Return the best eligible score per payment-time coldkey.
 
     ``include_fingerprints=False`` selects NULL for the anti-copy sketch
     columns (fingerprints + code embedding, several hundred KB per row) —
@@ -622,7 +656,8 @@ async def list_eligible_ledger(
        signature still verifies against the exposed composite. An agent with a
        single score is its own median, so pre-quorum agents degrade cleanly.
     2. join to ``agents`` filtered to ``scored``.
-    3. a ``ROW_NUMBER`` window keeps each miner's single best agent.
+    3. a ``ROW_NUMBER`` window keeps each payment-time coldkey's single best
+       agent, even when that owner submitted through multiple hotkeys or names.
 
     Two senses of "eligible" apply. *Pool* eligibility = ``status == scored``
     (excludes ``ath_pending_review`` holds and ``banned`` agents). *Ranking*
@@ -631,7 +666,7 @@ async def list_eligible_ledger(
     smoke/practice run *or* a full run that scored 0.000 stays in the pool
     (surfaced as *provisional* / unranked) but is ordered **below** every ranked
     run and dropped by the validator's weight fold, so it can never rank or earn
-    emissions. Both the per-agent and per-miner selections prefer a ranked
+    emissions. Both the per-agent and per-owner selections prefer a ranked
     row/agent, so neither an inflated small run nor a zero-scoring full run
     shadows a miner's real ranked run.
 
@@ -715,6 +750,8 @@ async def list_eligible_ledger(
         select(
             Agent.agent_id.label("agent_id"),
             Agent.miner_hotkey.label("miner_hotkey"),
+            EvaluationPayment.miner_coldkey.label("miner_coldkey"),
+            _emission_owner_key().label("emission_owner"),
             Agent.sha256.label("sha256"),
             Agent.size_bytes.label("size_bytes"),
             *sketch_columns,
@@ -737,6 +774,10 @@ async def list_eligible_ledger(
             agent_best.c.cnt,
         )
         .join(agent_best, agent_best.c.agent_id == Agent.agent_id)
+        .outerjoin(
+            EvaluationPayment,
+            EvaluationPayment.agent_id == Agent.agent_id,
+        )
         # The median row: the middle by ascending composite. Expressed as
         # integer arithmetic (no division, so it is exact + portable across
         # Postgres and the SQLite test path): the lower-middle index m has
@@ -822,7 +863,7 @@ async def list_eligible_ledger(
     rn = (
         func.row_number()
         .over(
-            partition_by=authoritative.c.miner_hotkey,
+            partition_by=authoritative.c.emission_owner,
             # Eligible-first so a miner is represented by their best full-benchmark
             # agent, not an inflated smoke run; composite breaks ties within a tier.
             order_by=(
@@ -863,6 +904,7 @@ async def list_eligible_ledger(
             validator_hotkey=row.validator_hotkey,
             signature=row.signature,
             status=AgentStatus(row.status),
+            miner_coldkey=row.miner_coldkey,
             bench_version=row.bench_version,
             content_fingerprint=row.content_fingerprint,
             structural_fingerprint=row.structural_fingerprint,

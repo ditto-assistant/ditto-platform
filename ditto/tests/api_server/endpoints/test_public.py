@@ -1182,6 +1182,8 @@ class TestPublicActivity:
             "provisional_composite",
             "validator_queue_rank",
             "quorum",
+            "retry_state",
+            "retry_after",
             "screening_policy_version",
             "required_screening_policy_version",
             "screening_attempt_id",
@@ -2138,6 +2140,93 @@ class TestPublicActivity:
         }
         assert scores_by_version[3] == pytest.approx(0.391235)
         assert scores_by_version[4] == pytest.approx(0.391897)
+
+    async def test_retry_state_surfaces_exhausted_and_cooling_submissions(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The public feed labels why a below-quorum submission is (not) advancing."""
+        now = datetime.now(UTC)
+        exhausted_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                name="exhausted",
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        cooling_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_B,
+                status=AgentStatus.EVALUATING,
+                name="cooling",
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        # A rejected submission with the exact same exhausted tickets must NOT be
+        # labelled: retry_state is only meaningful while EVALUATING. (Regression
+        # guard: the classifier once labelled every status.)
+        rejected_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.REJECTED,
+                name="rejected",
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        cooldown_until = now + timedelta(hours=6)
+        async with session_maker() as session, session.begin():
+            for agent_id in (exhausted_id, rejected_id):
+                for index in range(3):
+                    session.add(
+                        ValidatorTicket(
+                            agent_id=agent_id,
+                            validator_hotkey=f"validator-{index}",
+                            status=TicketStatus.EXPIRED,
+                            issued_at=now - timedelta(hours=3),
+                            deadline=now - timedelta(hours=2, minutes=index),
+                            bench_version=2,
+                            attempt_count=2,
+                            manual_retry_grants=0,
+                            retry_after=now - timedelta(hours=1),
+                        )
+                    )
+            session.add(
+                ValidatorTicket(
+                    agent_id=cooling_id,
+                    validator_hotkey="validator-0",
+                    status=TicketStatus.EXPIRED,
+                    issued_at=now - timedelta(hours=1),
+                    deadline=now - timedelta(minutes=30),
+                    bench_version=2,
+                    attempt_count=1,
+                    manual_retry_grants=0,
+                    retry_after=cooldown_until,
+                )
+            )
+        _install_db(app, session_maker)
+
+        by_id = {
+            entry["agent_id"]: entry
+            for entry in (await client.get("/api/v1/public/operations")).json()[
+                "activity"
+            ]["entries"]
+        }
+        assert by_id[str(exhausted_id)]["retry_state"] == "exhausted"
+        assert by_id[str(exhausted_id)]["retry_after"] is None
+        assert by_id[str(cooling_id)]["retry_state"] == "cooling_down"
+        assert (
+            datetime.fromisoformat(by_id[str(cooling_id)]["retry_after"])
+            == cooldown_until
+        )
+        # Rejected (not EVALUATING): no retry_state, despite exhausted tickets.
+        assert by_id[str(rejected_id)]["retry_state"] is None
+        assert by_id[str(rejected_id)]["retry_after"] is None
 
     async def test_progress_is_multi_validator_allowlisted_and_recursively_redacted(
         self,

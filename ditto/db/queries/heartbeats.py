@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -28,6 +29,9 @@ from ditto.db.models import (
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+
+logger = logging.getLogger(__name__)
 
 
 _STAGE_ORDER: dict[BenchmarkProgressStage, int] = {
@@ -76,6 +80,20 @@ def _raw_percent(progress: BenchmarkProgress) -> int | None:
 def _parse_progress(value: dict) -> BenchmarkProgress:
     """Validate a JSON-column value through Pydantic's strict JSON path."""
     return BenchmarkProgress.model_validate_json(json.dumps(value))
+
+
+def _is_same_run(previous: BenchmarkProgress, current: BenchmarkProgress) -> bool:
+    """Whether two progress reports describe the same dittobench run.
+
+    Runs are keyed on the opaque ``run_token``: all heartbeats for one run carry
+    the same token, and a retry or the next confirmation seed carries a fresh
+    one. When the token changes the run is new, so monotonicity must NOT be
+    enforced across the boundary (the fresh run legitimately restarts its
+    counts). Two ``None`` tokens (old validators, or the token-less preparing
+    heartbeat emitted before a run_id exists) compare equal and are treated as
+    the same run, preserving the pre-token monotonicity behaviour.
+    """
+    return previous.run_token == current.run_token
 
 
 def _validate_same_lease_progress(
@@ -200,6 +218,10 @@ async def upsert_validator_heartbeat(
             )
             session.add(row)
             is_new = True
+    # When True, a regression was detected within one run: keep the previously
+    # stored progress as the public display floor instead of moving it backward,
+    # but still persist the fresh liveness/telemetry below (fail-open).
+    keep_stored_progress = False
     if not is_new:
         assert row is not None
         existing_reported_at = row.reported_at
@@ -208,15 +230,37 @@ async def upsert_validator_heartbeat(
         if reported_at <= existing_reported_at:
             return row, False
         if row.benchmark_progress is not None and benchmark_progress is not None:
+            previous_progress: BenchmarkProgress | None
+            current_progress: BenchmarkProgress | None
             try:
                 previous_progress = _parse_progress(row.benchmark_progress)
                 current_progress = _parse_progress(benchmark_progress)
-            except ValidationError as error:
-                raise HeartbeatProgressRegressionError(
-                    "stored benchmark progress is malformed"
-                ) from error
-            if row.benchmark_progress_agent_id == active_agent_id:
-                _validate_same_lease_progress(previous_progress, current_progress)
+            except ValidationError:
+                # A malformed stored or incoming blob is not a reason to reject an
+                # authenticated liveness report. Fail open: skip monotonicity and
+                # accept the incoming progress.
+                previous_progress = None
+                current_progress = None
+            if (
+                previous_progress is not None
+                and current_progress is not None
+                and row.benchmark_progress_agent_id == active_agent_id
+                and _is_same_run(previous_progress, current_progress)
+            ):
+                # Same lease, same run: enforce monotonicity, but fail open on a
+                # regression. A changed run_token skips this block entirely and
+                # rebaselines (the fresh run restarts its counts legitimately).
+                try:
+                    _validate_same_lease_progress(previous_progress, current_progress)
+                except HeartbeatProgressRegressionError:
+                    keep_stored_progress = True
+                    logger.info(
+                        "validator heartbeat kept prior progress after regression "
+                        "validator=%s stored_stage=%s incoming_stage=%s",
+                        validator_hotkey,
+                        previous_progress.stage,
+                        current_progress.stage,
+                    )
     row.software_version = software_version
     row.protocol_version = protocol_version
     row.code_digest = code_digest
@@ -226,10 +270,15 @@ async def upsert_validator_heartbeat(
     row.capabilities = capabilities
     row.stack = stack
     row.stack_health = stack_health
-    if benchmark_progress is not None:
+    if benchmark_progress is not None and not keep_stored_progress:
         row.benchmark_progress = benchmark_progress
         row.benchmark_progress_reported = True
         row.benchmark_progress_agent_id = active_agent_id
+    elif benchmark_progress is not None and keep_stored_progress:
+        # Fail-open regression: retain the stored progress and its agent binding
+        # (never move the public display backward) while still marking it
+        # reported so the live lease keeps showing the last good progress.
+        row.benchmark_progress_reported = True
     else:
         # Retain the last signed progress and its separate agent binding as a
         # private monotonic floor across idle/polling/downgrade heartbeats. The
