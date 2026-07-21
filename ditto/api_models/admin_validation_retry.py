@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from ditto.api_models.retry_state import RetryState
 
@@ -108,6 +108,52 @@ class AdminValidationRetryRequest(BaseModel):
 class AdminValidationRetryResponse(BaseModel):
     recovery: AdminValidationRecovery
     idempotent: bool
+
+
+class AdminBatchRetryItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: UUID
+    request_id: UUID
+    expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class AdminBatchRetryRequest(BaseModel):
+    """Grant recoveries to several stranded submissions in one operator action.
+
+    Each item carries its own ``expected_snapshot`` and idempotency
+    ``request_id`` so the batch is exactly as safe as N single-agent retries:
+    an item whose state moved is skipped, never force-granted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=3, max_length=500),
+    ]
+    items: Annotated[list[AdminBatchRetryItem], Field(min_length=1, max_length=100)]
+
+    @field_validator("items")
+    @classmethod
+    def _unique(cls, items: list[AdminBatchRetryItem]) -> list[AdminBatchRetryItem]:
+        if len({item.agent_id for item in items}) != len(items):
+            raise ValueError("duplicate agent_id in batch")
+        if len({item.request_id for item in items}) != len(items):
+            raise ValueError("duplicate request_id in batch")
+        return items
+
+
+class AdminBatchRetryResult(BaseModel):
+    agent_id: UUID
+    status: Literal["granted", "idempotent", "skipped"]
+    detail: str | None
+    recovery: AdminValidationRecovery | None
+
+
+class AdminBatchRetryResponse(BaseModel):
+    granted: int
+    results: list[AdminBatchRetryResult]
 
 
 class AdminValidatorScoreReplacementDetail(BaseModel):

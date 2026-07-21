@@ -20,6 +20,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.admin_validation_retry import (
+    AdminBatchRetryRequest,
+    AdminBatchRetryResponse,
+    AdminBatchRetryResult,
     AdminScoreOutlier,
     AdminScoreOutlierList,
     AdminScoreOutlierScore,
@@ -401,6 +404,81 @@ async def get_validation_retry(
     )
 
 
+async def _apply_recovery(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    actor: str,
+    reason: str,
+    request_id: UUID,
+    expected_snapshot: str,
+    now: datetime,
+) -> tuple[str, str | None, ValidatorRetryRecovery | None]:
+    """Grant one audited recovery inside the caller's transaction.
+
+    Returns ``(status, detail, recovery)`` and never raises for an expected
+    condition, so the batch route can collect a per-agent verdict instead of
+    aborting the whole set. ``status`` is ``granted`` | ``idempotent`` |
+    ``skipped``; ``detail`` explains a skip.
+    """
+    agent, bench_version, scores, tickets, recoveries = await _load(
+        session, agent_id=agent_id, for_update=True
+    )
+    if agent is None:
+        return "skipped", "agent not found", None
+    existing = await session.get(ValidatorRetryRecovery, request_id)
+    if existing is not None:
+        if (
+            existing.agent_id != agent_id
+            or existing.actor != actor
+            or existing.reason != reason
+            or existing.expected_snapshot != expected_snapshot
+        ):
+            return "skipped", "request id already used", None
+        return "idempotent", None, existing
+
+    current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
+    if current_snapshot != expected_snapshot:
+        return "skipped", "validation state changed", None
+    _, allowed, gate_reason, selected = recovery_gate(
+        agent=agent,
+        scores=scores,
+        tickets=tickets,
+        recovery_count=len(recoveries),
+        now=now,
+        bench_version=bench_version,
+    )
+    if not allowed:
+        return "skipped", gate_reason or "retry unavailable", None
+
+    ticket_snapshot = [_ticket_wire(ticket) for ticket in tickets]
+    for ticket in selected:
+        ticket.manual_retry_grants += 1
+        ticket.retry_after = now
+    recovery = ValidatorRetryRecovery(
+        recovery_id=request_id,
+        agent_id=agent_id,
+        actor=actor,
+        reason=reason,
+        expected_snapshot=current_snapshot,
+        score_count=len(scores),
+        bench_version=bench_version,
+        ticket_snapshot=ticket_snapshot,
+        granted_validator_hotkeys=[ticket.validator_hotkey for ticket in selected],
+        created_at=now,
+    )
+    session.add(recovery)
+    await session.flush()
+    return "granted", None, recovery
+
+
+def _require_actor(x_admin_actor: str | None) -> str:
+    actor = x_admin_actor.strip() if x_admin_actor is not None else ""
+    if not 1 <= len(actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    return actor
+
+
 @router.post(
     "/validation-retries/{agent_id}/retry",
     response_model=AdminValidationRetryResponse,
@@ -412,66 +490,66 @@ async def retry_validation_after_infrastructure_failure(
     session: SessionDep,
     x_admin_actor: Annotated[str | None, Header()] = None,
 ) -> AdminValidationRetryResponse:
-    actor = x_admin_actor.strip() if x_admin_actor is not None else ""
-    if not 1 <= len(actor) <= 120:
-        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    actor = _require_actor(x_admin_actor)
     async with session.begin():
-        agent, bench_version, scores, tickets, recoveries = await _load(
-            session, agent_id=agent_id, for_update=True
-        )
-        if agent is None:
-            raise HTTPException(status_code=404, detail="agent not found")
-        score_count = len(scores)
-
-        existing = await session.get(ValidatorRetryRecovery, payload.request_id)
-        if existing is not None:
-            if (
-                existing.agent_id != agent_id
-                or existing.actor != actor
-                or existing.reason != payload.reason
-                or existing.expected_snapshot != payload.expected_snapshot
-            ):
-                raise HTTPException(status_code=409, detail="request id already used")
-            return AdminValidationRetryResponse(
-                recovery=_recovery_item(existing), idempotent=True
-            )
-
-        current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
-        if current_snapshot != payload.expected_snapshot:
-            raise HTTPException(status_code=409, detail="validation state changed")
-        _, allowed, reason, selected = recovery_gate(
-            agent=agent,
-            scores=scores,
-            tickets=tickets,
-            recovery_count=len(recoveries),
-            now=datetime.now(UTC),
-            bench_version=bench_version,
-        )
-        if not allowed:
-            raise HTTPException(status_code=409, detail=reason or "retry unavailable")
-
-        ticket_snapshot = [_ticket_wire(ticket) for ticket in tickets]
-        now = datetime.now(UTC)
-        for ticket in selected:
-            ticket.manual_retry_grants += 1
-            ticket.retry_after = now
-        recovery = ValidatorRetryRecovery(
-            recovery_id=payload.request_id,
+        status, detail, recovery = await _apply_recovery(
+            session,
             agent_id=agent_id,
             actor=actor,
             reason=payload.reason,
-            expected_snapshot=current_snapshot,
-            score_count=score_count,
-            bench_version=bench_version,
-            ticket_snapshot=ticket_snapshot,
-            granted_validator_hotkeys=[ticket.validator_hotkey for ticket in selected],
-            created_at=now,
+            request_id=payload.request_id,
+            expected_snapshot=payload.expected_snapshot,
+            now=datetime.now(UTC),
         )
-        session.add(recovery)
-        await session.flush()
-    return AdminValidationRetryResponse(
-        recovery=_recovery_item(recovery), idempotent=False
-    )
+        if status == "skipped":
+            code = 404 if detail == "agent not found" else 409
+            raise HTTPException(status_code=code, detail=detail or "retry unavailable")
+        assert recovery is not None
+        return AdminValidationRetryResponse(
+            recovery=_recovery_item(recovery), idempotent=status == "idempotent"
+        )
+
+
+@router.post(
+    "/validation-retries/batch-retry",
+    response_model=AdminBatchRetryResponse,
+)
+async def batch_retry_validation(
+    payload: AdminBatchRetryRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminBatchRetryResponse:
+    """Grant recoveries to several stranded submissions in one operator action.
+
+    Each item is gated and snapshot-checked exactly like the single-agent route;
+    an item whose state moved (or that no longer qualifies) is skipped with a
+    reason rather than force-granted. All grants commit together.
+    """
+    actor = _require_actor(x_admin_actor)
+    now = datetime.now(UTC)
+    results: list[AdminBatchRetryResult] = []
+    async with session.begin():
+        for item in payload.items:
+            status, detail, recovery = await _apply_recovery(
+                session,
+                agent_id=item.agent_id,
+                actor=actor,
+                reason=payload.reason,
+                request_id=item.request_id,
+                expected_snapshot=item.expected_snapshot,
+                now=now,
+            )
+            results.append(
+                AdminBatchRetryResult(
+                    agent_id=item.agent_id,
+                    status=status,  # type: ignore[arg-type]
+                    detail=detail,
+                    recovery=_recovery_item(recovery) if recovery is not None else None,
+                )
+            )
+    granted = sum(1 for result in results if result.status == "granted")
+    return AdminBatchRetryResponse(granted=granted, results=results)
 
 
 async def _replacement_state(
