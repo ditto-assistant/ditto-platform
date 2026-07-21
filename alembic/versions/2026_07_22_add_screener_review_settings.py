@@ -1,8 +1,8 @@
 """add append-only screener review settings
 
 Revision ID: b4c9e2f71a08
-Revises: f3a7c91d2e04
-Create Date: 2026-07-21
+Revises: f1a2c3d4e5b6
+Create Date: 2026-07-22
 """
 
 from collections.abc import Sequence
@@ -13,7 +13,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision: str = "b4c9e2f71a08"
-down_revision: str | Sequence[str] | None = "f3a7c91d2e04"
+down_revision: str | Sequence[str] | None = "f1a2c3d4e5b6"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

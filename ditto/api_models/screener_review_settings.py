@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Annotated, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-ReviewMode = Literal["off", "shadow", "enforce"]
+ReviewMode = Literal["off", "shadow", "enforce", "inherit"]
 ReviewModel = Literal[
     "moonshotai/kimi-k3",
     "z-ai/glm-5.2",
@@ -92,6 +93,33 @@ class AppliedScreenerReviewSettings(BaseModel):
     checksum: str
     source: Literal["platform", "cache", "bootstrap"]
     seen_at: datetime
+    fresh: bool
+    matches_effective: bool
+    expected_revision: int
+    expected_scope: str
+    expected_checksum: str
+
+
+class AdminShadowReviewObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    attempt_id: UUID
+    agent_id: UUID
+    settings_revision: int
+    settings_scope: str
+    settings_checksum: str
+    disposition: Literal["safe", "violation", "inconclusive", "retryable_infra"]
+    risk_level: Literal["low", "medium", "high"] | None
+    categories: list[str]
+    finding_digest: str | None
+    resolution_basis: str | None
+    clearance_path: str | None
+    critic_disposition: str | None
+    adjudicator_disposition: str | None
+    response_models: list[str]
+    response_providers: list[str]
+    usage: dict[str, int | float | None]
+    created_at: datetime
 
 
 class AdminScreenerReviewSettingsResponse(BaseModel):
@@ -101,3 +129,4 @@ class AdminScreenerReviewSettingsResponse(BaseModel):
     history: list[ScreenerReviewSettingsRevision]
     known_instances: list[str]
     applied_instances: list[AppliedScreenerReviewSettings]
+    shadow_observations: list[AdminShadowReviewObservation]

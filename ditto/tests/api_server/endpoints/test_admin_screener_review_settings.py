@@ -106,6 +106,47 @@ async def test_builtin_off_then_global_shadow_and_instance_override(
     assert pet.json()["scope"] == "ditto-screener-prod"
     assert pet.json()["settings"]["mode"] == "off"
 
+    inherit = await client.post(
+        "/api/v1/admin/screener-review-settings",
+        headers=_ADMIN_HEADERS,
+        json=_payload(
+            "ditto-screener-prod",
+            "inherit",
+            expected=override.json()["revision"],
+        ),
+    )
+    assert inherit.status_code == 200, inherit.text
+    inherited = await client.get(
+        "/api/v1/screener/review-settings?instance_id=ditto-screener-prod",
+        headers=_SCREENER_HEADERS,
+    )
+    assert inherited.json()["revision"] == global_revision
+    assert inherited.json()["scope"] == "*"
+    assert inherited.json()["settings"]["mode"] == "shadow"
+
+
+async def test_enforce_and_global_inherit_are_not_activatable(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    settings_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    _install(app, settings_maker)
+    enforce = await client.post(
+        "/api/v1/admin/screener-review-settings",
+        headers=_ADMIN_HEADERS,
+        json=_payload("*", "enforce"),
+    )
+    assert enforce.status_code == 409
+    assert "versioned reviewer settings revision" in enforce.text
+
+    inherit = await client.post(
+        "/api/v1/admin/screener-review-settings",
+        headers=_ADMIN_HEADERS,
+        json=_payload("*", "inherit"),
+    )
+    assert inherit.status_code == 409
+    assert "exact worker scope" in inherit.text
+
 
 async def test_stale_parent_and_duplicate_model_chain_are_rejected(
     app: FastAPI,
@@ -196,6 +237,9 @@ async def test_admin_read_is_authenticated_and_history_is_append_only(
         "ditto-screener-prod"
     )
     assert state.json()["applied_instances"][0]["source"] == "bootstrap"
+    assert state.json()["applied_instances"][0]["fresh"] is True
+    assert state.json()["applied_instances"][0]["matches_effective"] is False
+    assert state.json()["applied_instances"][0]["expected_scope"] == "*"
     assert [item["revision"] for item in state.json()["history"]] == [
         second.json()["revision"],
         first.json()["revision"],

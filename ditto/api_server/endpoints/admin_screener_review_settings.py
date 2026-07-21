@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -16,6 +17,7 @@ from ditto.api_models.screener import ScreenerReviewSettingsStatus
 from ditto.api_models.screener_review_settings import (
     AdminScreenerReviewSettingsRequest,
     AdminScreenerReviewSettingsResponse,
+    AdminShadowReviewObservation,
     AppliedScreenerReviewSettings,
     ScreenerReviewSettings,
 )
@@ -24,12 +26,17 @@ from ditto.api_models.screener_review_settings import (
 )
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
-from ditto.db.models import ScreenerHeartbeat, ScreenerReviewSettingsRevision
+from ditto.db.models import (
+    ScreenerHeartbeat,
+    ScreenerReviewSettingsRevision,
+    ScreenerShadowReview,
+)
 
 router = APIRouter(prefix="/admin/screener-review-settings", tags=["admin"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 AdminDep = Annotated[None, Depends(require_admin)]
 _SCOPE_RE = re.compile(r"^(?:\*|[a-zA-Z0-9._-]{1,63})$")
+_APPLIED_FRESHNESS = timedelta(minutes=5)
 
 
 def _checksum(settings: ScreenerReviewSettings) -> str:
@@ -50,6 +57,15 @@ def _revision(row: ScreenerReviewSettingsRevision) -> RevisionModel:
         created_at=row.created_at,
         checksum=row.checksum,
     )
+
+
+def _effective_row(
+    current_by_scope: dict[str, ScreenerReviewSettingsRevision], instance_id: str
+) -> ScreenerReviewSettingsRevision | None:
+    exact = current_by_scope.get(instance_id)
+    if exact is not None and exact.settings.get("mode") != "inherit":
+        return exact
+    return current_by_scope.get("*")
 
 
 async def _rows(session: AsyncSession) -> list[ScreenerReviewSettingsRevision]:
@@ -87,6 +103,22 @@ async def get_settings(
             status = ScreenerReviewSettingsStatus.model_validate(raw)
         except ValueError:
             continue
+        expected = _effective_row(current_by_scope, heartbeat.instance_id)
+        if expected is None:
+            default_settings = ScreenerReviewSettings()
+            expected_revision = 0
+            expected_scope = "builtin-default"
+            expected_checksum = _checksum(default_settings)
+            scope_matches = status.scope in {"builtin-default", "bootstrap"}
+        else:
+            expected_revision = expected.revision
+            expected_scope = expected.scope
+            expected_checksum = expected.checksum
+            scope_matches = status.scope == expected_scope
+        seen_at = heartbeat.seen_at
+        if seen_at.tzinfo is None:
+            seen_at = seen_at.replace(tzinfo=UTC)
+        fresh = datetime.now(UTC) - seen_at <= _APPLIED_FRESHNESS
         applied.append(
             AppliedScreenerReviewSettings(
                 instance_id=heartbeat.instance_id,
@@ -96,13 +128,53 @@ async def get_settings(
                 checksum=status.checksum,
                 source=status.source,
                 seen_at=heartbeat.seen_at,
+                fresh=fresh,
+                matches_effective=(
+                    status.revision == expected_revision
+                    and scope_matches
+                    and status.checksum == expected_checksum
+                ),
+                expected_revision=expected_revision,
+                expected_scope=expected_scope,
+                expected_checksum=expected_checksum,
             )
         )
+    shadow_rows = list(
+        await session.scalars(
+            select(ScreenerShadowReview)
+            .order_by(ScreenerShadowReview.created_at.desc())
+            .limit(100)
+        )
+    )
     return AdminScreenerReviewSettingsResponse(
         current=[_revision(row) for row in current_by_scope.values()],
         history=[_revision(row) for row in rows[:200]],
         known_instances=instances,
         applied_instances=sorted(applied, key=lambda item: item.instance_id),
+        shadow_observations=[
+            AdminShadowReviewObservation.model_validate(
+                {
+                    "attempt_id": row.attempt_id,
+                    "agent_id": row.agent_id,
+                    "settings_revision": row.settings_revision,
+                    "settings_scope": row.settings_scope,
+                    "settings_checksum": row.settings_checksum,
+                    "disposition": row.disposition,
+                    "risk_level": row.risk_level,
+                    "categories": list(row.categories),
+                    "finding_digest": row.finding_digest,
+                    "resolution_basis": row.resolution_basis,
+                    "clearance_path": row.clearance_path,
+                    "critic_disposition": row.critic_disposition,
+                    "adjudicator_disposition": row.adjudicator_disposition,
+                    "response_models": list(row.response_models),
+                    "response_providers": list(row.response_providers),
+                    "usage": dict(row.usage),
+                    "created_at": row.created_at,
+                }
+            )
+            for row in shadow_rows
+        ],
     )
 
 
@@ -115,6 +187,19 @@ async def create_settings_revision(
     """Append one optimistic, idempotency-safe settings revision."""
     if not _SCOPE_RE.fullmatch(payload.scope):
         raise HTTPException(status_code=422, detail="invalid screener settings scope")
+    if payload.settings.mode == "enforce":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "enforce is not activatable until screening verdicts bind the "
+                "attempt to a versioned reviewer settings revision and checksum"
+            ),
+        )
+    if payload.settings.mode == "inherit" and payload.scope == "*":
+        raise HTTPException(
+            status_code=409,
+            detail="inherit is only valid for an exact worker scope",
+        )
     expected_confirmation = (
         f"APPLY SCREENER REVIEW {payload.scope} {payload.settings.mode.upper()}"
     )

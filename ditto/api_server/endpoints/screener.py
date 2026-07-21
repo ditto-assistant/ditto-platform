@@ -58,7 +58,11 @@ from ditto.api_models import (
     ScreenResultResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.screener import (
+    SCREENING_POLICY_VERSION,
+    ShadowReviewObservationRequest,
+    ShadowReviewObservationResponse,
+)
 from ditto.api_models.screener_review_settings import (
     EffectiveScreenerReviewSettings,
     ScreenerReviewSettings,
@@ -91,6 +95,7 @@ from ditto.db.models import (
     BenchmarkRolloutMember,
     ScreenedImageUpload,
     ScreenerReviewSettingsRevision,
+    ScreenerShadowReview,
     ScreeningAttempt,
     ScreeningQuarantine,
 )
@@ -258,14 +263,21 @@ async def effective_review_settings(
     instance_id: Annotated[str, Query(pattern=_INSTANCE_ID_PATTERN)],
 ) -> EffectiveScreenerReviewSettings:
     """Return the exact-instance override or global settings revision."""
-    row = await session.scalar(
-        select(ScreenerReviewSettingsRevision)
-        .where(ScreenerReviewSettingsRevision.scope.in_((instance_id, "*")))
-        .order_by(
-            (ScreenerReviewSettingsRevision.scope == instance_id).desc(),
-            ScreenerReviewSettingsRevision.revision.desc(),
+    rows = list(
+        await session.scalars(
+            select(ScreenerReviewSettingsRevision)
+            .where(ScreenerReviewSettingsRevision.scope.in_((instance_id, "*")))
+            .order_by(ScreenerReviewSettingsRevision.revision.desc())
         )
-        .limit(1)
+    )
+    latest_by_scope: dict[str, ScreenerReviewSettingsRevision] = {}
+    for candidate in rows:
+        latest_by_scope.setdefault(candidate.scope, candidate)
+    exact = latest_by_scope.get(instance_id)
+    row = (
+        exact
+        if exact is not None and exact.settings.get("mode") != "inherit"
+        else latest_by_scope.get("*")
     )
     if row is None:
         settings = ScreenerReviewSettings()
@@ -287,6 +299,85 @@ async def effective_review_settings(
     response.headers["Cache-Control"] = "private, no-cache"
     response.headers["ETag"] = f'"{result.revision}-{result.checksum}"'
     return result
+
+
+@router.post(
+    "/agent/{agent_id}/shadow-review",
+    response_model=ShadowReviewObservationResponse,
+)
+async def submit_shadow_review(
+    agent_id: UUID,
+    payload: ShadowReviewObservationRequest,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+) -> ShadowReviewObservationResponse:
+    """Persist attempt-owned telemetry without mutating submission state."""
+    async with session.begin():
+        attempt = await get_screening_attempt(
+            session, attempt_id=payload.attempt_id, for_update=True
+        )
+        if (
+            attempt is None
+            or attempt.agent_id != agent_id
+            or attempt.screener_hotkey != screener_hotkey
+            or attempt.status != "running"
+            or attempt.build_only
+        ):
+            raise AgentNotScreenableError(
+                "shadow review does not match an active screening attempt"
+            )
+        deadline = attempt.deadline
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        if datetime.now(UTC) > deadline:
+            raise AgentNotScreenableError("shadow review arrived after lease expiry")
+        agent = await get_agent_by_id(session, agent_id=agent_id, for_update=True)
+        if agent is None:
+            raise AgentNotFoundError(f"no agent with id={agent_id}")
+        if agent.sha256.lower() != payload.artifact_sha256:
+            raise AgentNotScreenableError(
+                "shadow review artifact does not match the claimed submission"
+            )
+        settings = await session.get(
+            ScreenerReviewSettingsRevision, payload.settings_revision
+        )
+        if (
+            settings is None
+            or settings.scope != payload.settings_scope
+            or settings.checksum != payload.settings_checksum
+            or settings.settings.get("mode") != "shadow"
+        ):
+            raise AgentNotScreenableError(
+                "shadow review does not match an applied shadow revision"
+            )
+        values = {
+            "agent_id": agent_id,
+            "screener_hotkey": screener_hotkey,
+            "artifact_sha256": payload.artifact_sha256,
+            "settings_revision": payload.settings_revision,
+            "settings_scope": payload.settings_scope,
+            "settings_checksum": payload.settings_checksum,
+            "disposition": payload.disposition,
+            "risk_level": payload.risk_level,
+            "categories": list(payload.categories),
+            "finding_digest": payload.finding_digest,
+            "resolution_basis": payload.resolution_basis,
+            "clearance_path": payload.clearance_path,
+            "critic_disposition": payload.critic_disposition,
+            "adjudicator_disposition": payload.adjudicator_disposition,
+            "response_models": list(payload.response_models),
+            "response_providers": list(payload.response_providers),
+            "usage": payload.usage.model_dump(mode="json"),
+        }
+        existing = await session.get(ScreenerShadowReview, payload.attempt_id)
+        if existing is not None:
+            if any(getattr(existing, key) != value for key, value in values.items()):
+                raise AgentNotScreenableError(
+                    "shadow review conflicts with the stored attempt observation"
+                )
+            return ShadowReviewObservationResponse(accepted=True)
+        session.add(ScreenerShadowReview(attempt_id=payload.attempt_id, **values))
+    return ShadowReviewObservationResponse(accepted=True)
 
 
 def _heartbeat_signing_message(payload: ScreenerHeartbeatRequest) -> bytes:

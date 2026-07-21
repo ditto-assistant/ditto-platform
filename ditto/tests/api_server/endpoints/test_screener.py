@@ -34,6 +34,7 @@ from ditto.api_models.screener import (
     SourceReviewEvidenceItem,
     SourceReviewFinding,
 )
+from ditto.api_models.screener_review_settings import ScreenerReviewSettings
 from ditto.api_models.system_health import (
     SystemMetrics,
     system_metrics_signing_token,
@@ -50,6 +51,7 @@ from ditto.api_server.endpoints.public import screening_dispute_signing_message
 from ditto.api_server.endpoints.screener import (
     _heartbeat_signing_message,
     _public_screening_reason,
+    _review_settings_checksum,
 )
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_AGENT_NOT_FOUND,
@@ -73,6 +75,8 @@ from ditto.db.models import (
     Score,
     ScreenedImageUpload,
     ScreenerHeartbeat,
+    ScreenerReviewSettingsRevision,
+    ScreenerShadowReview,
     ScreeningAttempt,
     ScreeningDispute,
     ScreeningQuarantine,
@@ -559,6 +563,96 @@ def _authenticate_screener_client(client: httpx.AsyncClient) -> None:
 # --- Queue -----------------------------------------------------------------
 
 
+class TestShadowReview:
+    async def test_attempt_owned_observation_is_idempotent_and_non_authoritative(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        agent_id = await _seed_agent(
+            session_maker, status=AgentStatus.SCREENING, name="shadow-agent"
+        )
+        attempt_id = uuid4()
+        settings = ScreenerReviewSettings(mode="shadow")
+        checksum = _review_settings_checksum(settings)
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            revision = ScreenerReviewSettingsRevision(
+                parent_revision=0,
+                scope="ditto-screener-prod",
+                settings=settings.model_dump(mode="json"),
+                checksum=checksum,
+                reason="bounded shadow canary",
+                actor="test",
+            )
+            session.add(revision)
+            await session.flush()
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=attempt_id,
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="running",
+                    started_at=now,
+                    deadline=now + timedelta(minutes=30),
+                )
+            )
+            revision_id = revision.revision
+        payload = {
+            "attempt_id": str(attempt_id),
+            "artifact_sha256": _SHA256,
+            "settings_revision": revision_id,
+            "settings_scope": "ditto-screener-prod",
+            "settings_checksum": checksum,
+            "disposition": "safe",
+            "risk_level": "low",
+            "categories": ["none"],
+            "finding_digest": "cd" * 32,
+            "resolution_basis": "authoritative_model_tool_path",
+            "clearance_path": "l3_adjudicated_safe",
+            "critic_disposition": "confirm_safe",
+            "adjudicator_disposition": "confirm_safe",
+            "response_models": ["moonshotai/kimi-k3", "openai/gpt-5.6-sol"],
+            "response_providers": ["openrouter", "openrouter"],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cached_input_tokens": 80,
+                "reasoning_tokens": 5,
+                "estimated_cost_usd": 0.1,
+                "reported_cost_usd": 0.09,
+            },
+        }
+        url = f"/api/v1/screener/agent/{agent_id}/shadow-review"
+
+        first = await client.post(url, json=payload)
+        second = await client.post(url, json=payload)
+
+        assert first.status_code == second.status_code == 200
+        async with session_maker() as session:
+            observation = await session.get(ScreenerShadowReview, attempt_id)
+            agent = await session.get(Agent, agent_id)
+            assert observation is not None
+            assert observation.settings_revision == revision_id
+            assert observation.disposition == "safe"
+            assert agent is not None and agent.status == AgentStatus.SCREENING
+
+        conflicting = {**payload, "disposition": "violation", "risk_level": "high"}
+        response = await client.post(url, json=conflicting)
+        assert response.status_code == 409
+
+        async with session_maker() as session, session.begin():
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            assert attempt is not None
+            attempt.started_at = datetime.now(UTC) - timedelta(minutes=2)
+            attempt.deadline = datetime.now(UTC) - timedelta(minutes=1)
+        response = await client.post(url, json=payload)
+        assert response.status_code == 409
+
+
 class TestHeartbeat:
     async def test_v2_progress_is_public_and_clears_on_idle_and_terminal(
         self,
@@ -838,6 +932,7 @@ class TestHeartbeat:
                 ScreenerHeartbeat, (_SCREENER_HOTKEY, "ditto-screener-prod")
             )
             assert heartbeat is not None
+            assert heartbeat.system_metrics is not None
             assert heartbeat.system_metrics["review_settings"] == review
 
     async def test_rejects_tampering_arbitrary_metrics_and_wrong_auth(
