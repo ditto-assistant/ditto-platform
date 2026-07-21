@@ -38,6 +38,10 @@ from ditto.db.queries.tickets import issue_ticket
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "X-Admin-Actor": "operator"}
 _T0 = datetime(2026, 7, 18, 12, tzinfo=UTC)
+# Robust against the CI wall clock the endpoint reads via datetime.now(UTC):
+# _PAST is always behind it, _FUTURE always ahead.
+_PAST = _T0 - timedelta(hours=1)
+_FUTURE = datetime(2099, 1, 1, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -504,3 +508,291 @@ async def test_lists_only_unambiguous_finalized_score_outliers(
     assert by_agent[str(high_id)]["direction"] == "high"
     assert by_agent[str(high_id)]["outlier"]["validator_hotkey"] == "validator-2"
     assert str(broad_id) not in by_agent
+
+
+# --- fleet-wide stuck list ------------------------------------------------
+
+
+async def _seed_states(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    name: str,
+    tickets: list[tuple[str, TicketStatus, int, datetime | None]],
+    created_offset_hours: float = 24.0,
+    agent_status: AgentStatus = AgentStatus.EVALUATING,
+    bench_version: int = DEFAULT_BENCH_VERSION,
+) -> UUID:
+    """Seed one agent with explicit (hotkey, status, attempt_count, retry_after)
+    tickets; a SCORED ticket gets a matching score row."""
+    agent_id = uuid4()
+    async with maker() as session, session.begin():
+        session.add(
+            Agent(
+                agent_id=agent_id,
+                miner_hotkey="5Miner",
+                name=name,
+                version=1,
+                sha256=agent_id.hex * 2,
+                status=agent_status,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+                created_at=_T0 - timedelta(hours=created_offset_hours),
+            )
+        )
+        for index, (hotkey, status, attempt, retry_after) in enumerate(tickets):
+            deadline = (
+                _T0 + timedelta(hours=1)
+                if status == TicketStatus.ISSUED
+                else _T0 - timedelta(hours=2, minutes=index)
+            )
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=hotkey,
+                    status=status,
+                    issued_at=_T0 - timedelta(hours=3, minutes=index),
+                    deadline=deadline,
+                    bench_version=bench_version,
+                    attempt_count=attempt,
+                    manual_retry_grants=0,
+                    retry_after=retry_after,
+                )
+            )
+            if status == TicketStatus.SCORED:
+                session.add(
+                    Score(
+                        agent_id=agent_id,
+                        bench_version=bench_version,
+                        validator_hotkey=hotkey,
+                        run_id=f"run-{hotkey}",
+                        seed=7,
+                        composite=0.7,
+                        tool_mean=0.7,
+                        memory_mean=0.7,
+                        median_ms=100,
+                        n=114,
+                        generated_at=_T0 - timedelta(hours=1),
+                    )
+                )
+    return agent_id
+
+
+async def test_list_classifies_every_retry_state(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_states(
+        retry_maker,
+        name="exhausted-agent",
+        tickets=[
+            ("val-0", TicketStatus.EXPIRED, 2, _PAST),
+            ("val-1", TicketStatus.EXPIRED, 2, _PAST),
+            ("val-2", TicketStatus.EXPIRED, 2, _PAST),
+        ],
+    )
+    await _seed_states(
+        retry_maker,
+        name="cooling-agent",
+        tickets=[("val-0", TicketStatus.EXPIRED, 1, _FUTURE)],
+    )
+    await _seed_states(
+        retry_maker,
+        name="available-agent",
+        tickets=[("val-0", TicketStatus.EXPIRED, 1, _PAST)],
+    )
+    await _seed_states(
+        retry_maker,
+        name="running-agent",
+        tickets=[("val-0", TicketStatus.ISSUED, 1, None)],
+    )
+    await _seed_states(retry_maker, name="queued-agent", tickets=[])
+    _install(app, retry_maker)
+
+    response = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    by_name = {item["agent_name"]: item["retry_state"] for item in body["submissions"]}
+    assert by_name == {
+        "exhausted-agent": "exhausted",
+        "cooling-agent": "cooling_down",
+        "available-agent": "retry_available",
+        "running-agent": "running",
+        "queued-agent": "queued",
+    }
+    assert body["counts"] == {
+        "exhausted": 1,
+        "cooling_down": 1,
+        "retry_available": 1,
+        "running": 1,
+        "queued": 1,
+    }
+    assert body["quorum"] == 3
+
+
+async def test_list_excludes_agents_at_quorum(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_states(
+        retry_maker,
+        name="finished-agent",
+        tickets=[
+            ("val-0", TicketStatus.SCORED, 1, None),
+            ("val-1", TicketStatus.SCORED, 1, None),
+            ("val-2", TicketStatus.SCORED, 1, None),
+        ],
+    )
+    _install(app, retry_maker)
+
+    response = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    assert response.status_code == 200, response.text
+    assert response.json()["submissions"] == []
+    assert response.json()["counts"] == {}
+
+
+async def test_list_state_filter_keeps_fleetwide_counts(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_states(
+        retry_maker,
+        name="exhausted-agent",
+        tickets=[
+            ("val-0", TicketStatus.EXPIRED, 2, _PAST),
+            ("val-1", TicketStatus.EXPIRED, 2, _PAST),
+            ("val-2", TicketStatus.EXPIRED, 2, _PAST),
+        ],
+    )
+    await _seed_states(retry_maker, name="queued-agent", tickets=[])
+    _install(app, retry_maker)
+
+    response = await client.get(
+        "/api/v1/admin/validation-retries",
+        params={"state": "exhausted"},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["agent_name"] for item in body["submissions"]] == ["exhausted-agent"]
+    # counts stay fleet-wide even though the list is filtered.
+    assert body["counts"] == {"exhausted": 1, "queued": 1}
+
+
+async def test_list_rejects_unknown_state(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    _install(app, retry_maker)
+    response = await client.get(
+        "/api/v1/admin/validation-retries",
+        params={"state": "wedged"},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 422
+    assert "unknown retry state: wedged" in response.text
+
+
+async def test_list_snapshot_matches_single_agent_detail(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    # The snapshot an operator reads from the list must drive the per-agent
+    # retry endpoint unchanged, so the two routes must agree byte for byte.
+    agent_id = await _seed_states(
+        retry_maker,
+        name="exhausted-agent",
+        tickets=[
+            ("val-0", TicketStatus.EXPIRED, 2, _PAST),
+            ("val-1", TicketStatus.EXPIRED, 2, _PAST),
+            ("val-2", TicketStatus.EXPIRED, 2, _PAST),
+        ],
+    )
+    _install(app, retry_maker)
+
+    listing = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    assert listing.status_code == 200 and detail.status_code == 200
+    item = listing.json()["submissions"][0]
+    assert item["snapshot"] == detail.json()["snapshot"]
+    assert item["recovery_allowed"] is True
+
+    accepted = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/retry",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": item["snapshot"],
+            "reason": "chutes infrastructure outage burned the attempt budget",
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+
+
+async def test_list_sorts_exhausted_before_queued(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    # An older queued agent must still sort behind a newer exhausted one:
+    # severity, not age, drives the operator's attention.
+    await _seed_states(
+        retry_maker, name="old-queued", tickets=[], created_offset_hours=100.0
+    )
+    await _seed_states(
+        retry_maker,
+        name="new-exhausted",
+        tickets=[
+            ("val-0", TicketStatus.EXPIRED, 2, _PAST),
+            ("val-1", TicketStatus.EXPIRED, 2, _PAST),
+            ("val-2", TicketStatus.EXPIRED, 2, _PAST),
+        ],
+        created_offset_hours=1.0,
+    )
+    _install(app, retry_maker)
+
+    response = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    assert response.status_code == 200, response.text
+    names = [item["agent_name"] for item in response.json()["submissions"]]
+    assert names == ["new-exhausted", "old-queued"]
+
+
+async def test_partial_exhaustion_stays_queued_not_exhausted(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    # One validator burned its budget but two slots were never leased: fresh
+    # validators can still reach quorum, so this is queued (self-heals), not
+    # exhausted (needs an operator).
+    await _seed_states(
+        retry_maker,
+        name="one-exhausted",
+        tickets=[("val-0", TicketStatus.EXPIRED, 2, _PAST)],
+    )
+    # One accepted score + two exhausted validators: only one slot remains
+    # fillable, so a grant IS required → exhausted.
+    await _seed_states(
+        retry_maker,
+        name="two-exhausted-one-scored",
+        tickets=[
+            ("val-0", TicketStatus.SCORED, 1, None),
+            ("val-1", TicketStatus.EXPIRED, 2, _PAST),
+            ("val-2", TicketStatus.EXPIRED, 2, _PAST),
+        ],
+    )
+    _install(app, retry_maker)
+
+    response = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    assert response.status_code == 200, response.text
+    by_name = {
+        item["agent_name"]: item["retry_state"]
+        for item in response.json()["submissions"]
+    }
+    assert by_name["one-exhausted"] == "queued"
+    assert by_name["two-exhausted-one-scored"] == "exhausted"

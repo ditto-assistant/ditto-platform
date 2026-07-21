@@ -49,6 +49,57 @@ class AdminValidationRetryDetail(BaseModel):
     recoveries: list[AdminValidationRecovery]
 
 
+RetryState = Literal[
+    "running",
+    "retry_available",
+    "cooling_down",
+    "exhausted",
+    "queued",
+]
+
+
+class AdminStuckSubmission(BaseModel):
+    """One below-quorum submission plus why it is (or is not) advancing.
+
+    ``retry_state`` is the operator-facing triage label:
+
+    * ``running`` — a validator holds a live ticket right now.
+    * ``retry_available`` — an expired ticket is off cooldown and will be
+      re-leased on the next sweep with budget to spare.
+    * ``cooling_down`` — an expired ticket still has budget but is waiting out
+      its retry cooldown.
+    * ``exhausted`` — no ticket can advance without an operator grant (every
+      remaining validator burned its attempt budget). This is the only state
+      that needs a human.
+    * ``queued`` — below quorum with slots that have simply never been leased
+      yet; it will advance on its own.
+    """
+
+    agent_id: UUID
+    miner_hotkey: str
+    agent_name: str
+    agent_version: int | None
+    bench_version: int
+    score_count: int
+    quorum: int
+    retry_state: RetryState
+    automatic_retry_available: bool
+    recovery_allowed: bool
+    blocking_reason: str | None
+    earliest_retry_after: datetime | None
+    attempts_used: int
+    exhausted_validator_count: int
+    snapshot: str
+    tickets: list[AdminValidationTicket]
+
+
+class AdminStuckSubmissionsResponse(BaseModel):
+    generated_at: datetime
+    quorum: int
+    counts: dict[RetryState, int]
+    submissions: list[AdminStuckSubmission]
+
+
 class AdminValidationRetryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
