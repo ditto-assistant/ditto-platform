@@ -34,6 +34,7 @@ from ditto.api_models.screener import (
     SourceReviewFinding,
 )
 from ditto.api_models.stack_health import (
+    ComponentHealthState,
     ValidatorComponentHealth,
     ValidatorStackHealth,
 )
@@ -1030,7 +1031,9 @@ class TestPublicFleet:
     def test_stack_health_rolls_required_degraded_components_into_warning(
         self,
     ) -> None:
-        def _component(health: str, required: bool = True) -> ValidatorComponentHealth:
+        def _component(
+            health: ComponentHealthState, required: bool = True
+        ) -> ValidatorComponentHealth:
             observed = None if health == "unknown" else 1_784_000_000
             ready = None if health in ("unknown", "unreachable") else True
             return ValidatorComponentHealth(
