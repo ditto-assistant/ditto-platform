@@ -9,6 +9,7 @@ per-case detail.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -42,9 +43,14 @@ from ditto.api_models.stack_health import (
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.datapipeline import DataPipelineError
-from ditto.api_server.dependencies import get_dataset_generator, get_session
+from ditto.api_server.dependencies import (
+    get_dataset_generator,
+    get_session,
+    get_storage_client,
+)
 from ditto.api_server.endpoints import public as public_endpoint
 from ditto.api_server.endpoints.public import _fleet_classification
+from ditto.api_server.storage import ObjectDownloadFailedError
 from ditto.api_server.validator_names import ValidatorNamesSnapshot
 from ditto.chain import ChainError
 from ditto.chain.models import (
@@ -3548,6 +3554,9 @@ class TestBenchConfig:
         assert "dataset_sha256" in body["dataset"]["reproduce"]
         assert body["public_mirror_url_template"] is None
         assert body["public_transcript_url_template"] is None
+        assert body["public_transcript_telemetry_url_template"] == (
+            "/api/v1/public/bench/transcript/{sha256}/telemetry"
+        )
         assert body["ledger_path"] == "/api/v1/scoring/scores"
 
     async def test_mirror_template_from_env(
@@ -3561,6 +3570,132 @@ class TestBenchConfig:
         assert body["public_transcript_url_template"] == (
             "https://storage.googleapis.com/ditto-platform-public-dev/transcripts/{sha256}.json"
         )
+        assert body["public_transcript_telemetry_url_template"] == (
+            "/api/v1/public/bench/transcript/{sha256}/telemetry"
+        )
+
+    async def test_transcript_telemetry_is_verified_allowlisted_and_immutable(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        body = json.dumps(
+            {
+                "execution": {"cases": 1, "succeeded": 1, "max_duration_ms": 25},
+                "model_relay": {"requests": 2, "successes": 1},
+                "cases": [
+                    {
+                        "prompt": "private question",
+                        "response": "private answer",
+                        "execution": {
+                            "total_duration_ms": 25,
+                            "terminal_outcome": "success",
+                            "attempts": [
+                                {
+                                    "attempt": 1,
+                                    "duration_ms": 25,
+                                    "outcome": "success",
+                                    "http_status": 200,
+                                    "error": "private raw error",
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            separators=(",", ":"),
+        ).encode()
+        digest = hashlib.sha256(body).hexdigest()
+        storage = AsyncMock()
+        storage.get_object.return_value = body
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+        response = await client.get(
+            f"/api/v1/public/bench/transcript/{digest}/telemetry"
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "source_sha256": digest,
+            "execution": {
+                "cases": 1,
+                "succeeded": 1,
+                "timed_out": 0,
+                "cancelled": 0,
+                "retried": 0,
+                "total_attempts": 0,
+                "median_duration_ms": None,
+                "p95_duration_ms": None,
+                "max_duration_ms": 25,
+            },
+            "model_relay": {
+                "requests": 2,
+                "successes": 1,
+                "infrastructure_failures": 0,
+                "caller_cancellations": 0,
+                "upstream_attempts": 0,
+                "retries": 0,
+            },
+            "cases": [
+                {
+                    "position": 1,
+                    "total_duration_ms": 25,
+                    "terminal_outcome": "success",
+                    "timed_out": False,
+                    "cancelled": False,
+                    "attempts": [
+                        {
+                            "attempt": 1,
+                            "duration_ms": 25,
+                            "outcome": "success",
+                            "http_status": 200,
+                        }
+                    ],
+                }
+            ],
+        }
+        assert "private" not in response.text
+        assert "immutable" in response.headers["cache-control"]
+        storage.get_object.assert_awaited_once_with(
+            key=f"transcripts/{digest}.json", max_bytes=32 << 20
+        )
+
+    async def test_transcript_rejects_bad_address_and_stored_digest(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        storage = AsyncMock()
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+        assert (
+            await client.get("/api/v1/public/bench/transcript/not-a-digest/telemetry")
+        ).status_code == 404
+        storage.get_object.assert_not_awaited()
+
+        expected = "0" * 64
+        storage.get_object.return_value = b"{}"
+        response = await client.get(
+            f"/api/v1/public/bench/transcript/{expected}/telemetry"
+        )
+        assert response.status_code == 502
+
+    async def test_transcript_missing_is_not_publicly_distinguishable(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        storage = AsyncMock()
+        storage.get_object.side_effect = ObjectDownloadFailedError("missing")
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+        response = await client.get(
+            "/api/v1/public/bench/transcript/" + "a" * 64 + "/telemetry"
+        )
+        assert response.status_code == 404
 
 
 def test_bench_glossary_explains_every_v5_category_and_metric() -> None:

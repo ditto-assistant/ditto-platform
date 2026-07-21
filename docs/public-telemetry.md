@@ -133,6 +133,16 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   block fields exist; otherwise the response labels the unpredictable CSPRNG
   fallback. Unknown historical generator pins fail closed with no command rather
   than silently using `latest`.
+- `GET /api/v1/public/bench/transcript/{sha256}/telemetry` → an allowlisted
+  metrics projection from the immutable transcript whose digest is already
+  bound into an accepted validator score. The platform reads only the
+  content-addressed transcript namespace and verifies the stored bytes against
+  the requested SHA-256 before parsing them. It returns execution totals,
+  latency percentiles, retry/timeout/cancellation counts, relay health, and
+  per-question attempt timing. It never returns question text, prompts, model
+  responses, tool payloads, raw errors, credentials, or host paths. Older
+  transcripts without execution telemetry show a clear unavailable state rather
+  than fabricated metrics.
 - `GET /api/v1/public/submissions?limit=` → `{ generated_at, count, quorum,
   submissions: [ { agent_id, miner_hotkey, status, score_count,
   median_composite, dataset_seed, dataset_sha256, last_scored_at } ] }`.

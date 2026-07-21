@@ -1960,10 +1960,16 @@ class PublicBenchConfigResponse(BaseModel):
     public_transcript_url_template: str | None = Field(
         default=None,
         description=(
-            "Anonymous-read URL template for content-addressed run transcripts "
+            "Public URL template for content-addressed run transcripts "
             "(``{sha256}`` = a score's signature-bound ``transcript_sha256``), "
-            "or null when mirroring is off."
+            "or null when transcript publication is unavailable."
         ),
+    )
+    public_transcript_telemetry_url_template: str = Field(
+        description=(
+            "Same-origin URL template for the digest-verified, allowlisted run "
+            "telemetry projection. This never returns transcript content."
+        )
     )
     ledger_path: str = Field(description="The self-verifying signed score ledger.")
     generated_at: datetime

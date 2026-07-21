@@ -2048,8 +2048,9 @@ async def submit_transcript(
     graded per-case inputs whose digest the validator declared under
     ``details["transcript_sha256"]`` and bound into its score signature. The
     platform accepts the bytes only when their SHA-256 equals that declared
-    digest, then stores them content-addressed in the public bucket. Because
-    the binding is *content* equality against an already-signed digest, a
+    digest, then stores them content-addressed in authoritative storage and
+    mirrors them publicly when configured. Because the binding is *content*
+    equality against an already-signed digest, a
     caller spoofing another validator's hotkey can only ever upload the exact
     bytes that validator attested — so the header + permit check is sufficient
     auth here. Idempotent: re-uploading an existing digest is a no-op.
@@ -2092,23 +2093,14 @@ async def submit_transcript(
             ),
         )
 
-    if storage.public_bucket is None:
-        logger.warning(
-            "transcript %s for agent %s accepted but STORAGE_PUBLIC_BUCKET is "
-            "unset; nothing published",
-            digest,
-            agent_id,
-        )
-        return SubmitTranscriptResponse(
-            agent_id=agent_id, run_id=run_id, transcript_sha256=digest, stored=False
-        )
     key = transcript_object_key(digest)
-    if not await storage.object_exists(key=key, bucket=storage.public_bucket):
+    # The primary bucket is authoritative so transcript-backed dashboard
+    # telemetry works even when no anonymous transparency bucket is configured.
+    if not await storage.object_exists(key=key):
         await storage.put_object(
             key=key,
             body=body,
             content_type="application/json",
-            bucket=storage.public_bucket,
         )
         logger.info(
             "transcript published agent_id=%s run_id=%s sha256=%s bytes=%d",
@@ -2117,6 +2109,20 @@ async def submit_transcript(
             digest,
             len(body),
         )
+    # Preserve the optional anonymous mirror for offline auditors. A mirror
+    # outage must not discard the authoritative transcript after score
+    # acceptance.
+    if storage.public_bucket is not None:
+        try:
+            if not await storage.object_exists(key=key, bucket=storage.public_bucket):
+                await storage.put_object(
+                    key=key,
+                    body=body,
+                    content_type="application/json",
+                    bucket=storage.public_bucket,
+                )
+        except Exception:  # noqa: BLE001 - additive mirror, primary already stored
+            logger.exception("public transcript mirror failed for %s", digest)
     return SubmitTranscriptResponse(
         agent_id=agent_id, run_id=run_id, transcript_sha256=digest, stored=True
     )
