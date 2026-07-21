@@ -25,14 +25,19 @@ from ditto.db.models import (
     Base,
     Score,
     ScoreAuditEntry,
+    ValidatorHeartbeat,
     ValidatorRetryRecovery,
     ValidatorTicket,
 )
 from ditto.db.queries.audit import (
+    EVENT_SCORE_INVALIDATED,
+    EVENT_SCORE_RETEST_QUEUED,
     EVENT_SCORE_RETEST_RELEASED,
     EVENT_SCORE_RETEST_REQUESTED,
+    append_audit_entry,
 )
 from ditto.db.queries.benchmark_rollout import DEFAULT_BENCH_VERSION
+from ditto.db.queries.score_retests import activate_next_score_retest
 from ditto.db.queries.tickets import issue_ticket
 
 _TOKEN = "test-admin-token-at-least-32-characters"
@@ -508,6 +513,164 @@ async def test_lists_only_unambiguous_finalized_score_outliers(
     assert by_agent[str(high_id)]["direction"] == "high"
     assert by_agent[str(high_id)]["outlier"]["validator_hotkey"] == "validator-2"
     assert str(broad_id) not in by_agent
+
+
+async def _seed_capable_heartbeat(
+    maker: async_sessionmaker[AsyncSession], *, hotkey: str
+) -> None:
+    now = datetime.now(UTC)
+    revision = "a" * 40
+    components = {
+        name: {
+            "source_revision": revision if name == "dittobench_api" else "b" * 40,
+            "version": "1.3.0" if name == "dittobench_api" else "1.2.0",
+            "provenance": "committed_pin",
+        }
+        for name in (
+            "ditto_subnet",
+            "dittobench_api",
+            "sandbox_docker",
+            "model_relay",
+            "pylon",
+            "ollama",
+        )
+    }
+    async with maker() as session, session.begin():
+        session.add(
+            ValidatorHeartbeat(
+                validator_hotkey=hotkey,
+                software_version="1.3.0",
+                protocol_version=8,
+                code_digest="d" * 64,
+                state="polling",
+                first_seen_at=now,
+                reported_at=now,
+                seen_at=now,
+                signature="ab" * 64,
+                capabilities={
+                    "screened_images": True,
+                    "require_screened_image": False,
+                    "source_build_fallback": True,
+                    "full_stack_managed": False,
+                    "stack_updater": False,
+                    "sandbox_egress_restricted": True,
+                    "executor_isolation": "privileged_dind",
+                    "scorer_benchmarks": {
+                        "status": "fresh_verified",
+                        "supported_bench_versions": [DEFAULT_BENCH_VERSION],
+                        "observed_at": int(now.timestamp()),
+                        "software_version": "1.3.0",
+                        "source_revision": revision,
+                    },
+                },
+                stack={
+                    "mode": "source",
+                    "compose_schema": 1,
+                    "release_descriptor_digest": None,
+                    "components": components,
+                },
+            )
+        )
+
+
+async def test_bulk_outlier_queue_waits_behind_validator_and_promotes_serially(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    first = await _seed(retry_maker, score_count=3, composites=[0.12, 0.81, 0.83])
+    second = await _seed(retry_maker, score_count=3, composites=[0.18, 0.84, 0.85])
+    busy_agent = await _seed(retry_maker)
+    async with retry_maker() as session, session.begin():
+        for agent_id in (first, second):
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.status = AgentStatus.SCORED
+        busy = await session.get(
+            ValidatorTicket,
+            (busy_agent, DEFAULT_BENCH_VERSION, "validator-0"),
+        )
+        assert busy is not None
+        busy.status = TicketStatus.ISSUED
+        busy.deadline = datetime.now(UTC) + timedelta(minutes=30)
+    await _seed_capable_heartbeat(retry_maker, hotkey="validator-0")
+    _install(app, retry_maker)
+
+    outliers = await client.get("/api/v1/admin/score-outliers", headers=_HEADERS)
+    by_id = {item["agent_id"]: item for item in outliers.json()["items"]}
+    request_ids = {first: uuid4(), second: uuid4()}
+    response = await client.post(
+        "/api/v1/admin/validation-retries/validators/validator-0/queue-score-retests",
+        headers=_HEADERS,
+        json={
+            "reason": "Shared validator infrastructure failure across these outliers",
+            "items": [
+                {
+                    "agent_id": str(agent_id),
+                    "request_id": str(request_ids[agent_id]),
+                    "expected_snapshot": by_id[str(agent_id)]["snapshot"],
+                    "expected_run_id": "run-0",
+                }
+                for agent_id in (first, second)
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["activated"] == 0
+    assert response.json()["queued"] == 2
+    assert [item["queue_position"] for item in response.json()["results"]] == [1, 2]
+
+    async with retry_maker() as session, session.begin():
+        busy = await session.get(
+            ValidatorTicket,
+            (busy_agent, DEFAULT_BENCH_VERSION, "validator-0"),
+        )
+        assert busy is not None
+        busy.status = TicketStatus.SCORED
+        promoted = await activate_next_score_retest(
+            session,
+            validator_hotkey="validator-0",
+            now=datetime.now(UTC),
+            supports_version=lambda version: version == DEFAULT_BENCH_VERSION,
+        )
+        assert promoted is not None and promoted.agent_id == first
+        first_request = await session.scalar(
+            select(ScoreAuditEntry)
+            .where(
+                ScoreAuditEntry.agent_id == first,
+                ScoreAuditEntry.event == EVENT_SCORE_RETEST_REQUESTED,
+            )
+            .order_by(ScoreAuditEntry.seq.desc())
+        )
+        assert first_request is not None
+        promoted.status = TicketStatus.SCORED
+        await append_audit_entry(
+            session,
+            agent_id=first,
+            validator_hotkey="validator-0",
+            event=EVENT_SCORE_INVALIDATED,
+            payload={"request_id": str(request_ids[first])},
+            recorded_at=datetime.now(UTC),
+        )
+        next_ticket = await activate_next_score_retest(
+            session,
+            validator_hotkey="validator-0",
+            now=datetime.now(UTC),
+            supports_version=lambda version: version == DEFAULT_BENCH_VERSION,
+        )
+        assert next_ticket is not None and next_ticket.agent_id == second
+        queued_count = len(
+            list(
+                (
+                    await session.scalars(
+                        select(ScoreAuditEntry).where(
+                            ScoreAuditEntry.event == EVENT_SCORE_RETEST_QUEUED
+                        )
+                    )
+                ).all()
+            )
+        )
+        assert queued_count == 2
 
 
 # --- fleet-wide stuck list ------------------------------------------------

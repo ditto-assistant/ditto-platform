@@ -133,6 +133,7 @@ from ditto.db.queries.heartbeats import (
     upsert_validator_heartbeat,
 )
 from ditto.db.queries.payments import get_miner_coldkey_for_agent
+from ditto.db.queries.score_retests import activate_next_score_retest
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     get_score_for_validator,
@@ -871,14 +872,26 @@ async def request_job(
             raise HTTPException(
                 status_code=409, detail="job claim nonce has already been used"
             ) from exc
-        ticket = await issue_rollout_ticket(
+        heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
+        ticket = await activate_next_score_retest(
             session,
             validator_hotkey=payload.validator_hotkey,
             now=now,
-            ttl=_TICKET_TTL,
-            artifact_mode=artifact_mode,
+            supports_version=lambda version: (
+                heartbeat is not None
+                and heartbeat_supports_version(heartbeat, now=now, version=version)
+            ),
             validator_running_benchmark=validator_state == "running_benchmark",
         )
+        if ticket is None:
+            ticket = await issue_rollout_ticket(
+                session,
+                validator_hotkey=payload.validator_hotkey,
+                now=now,
+                ttl=_TICKET_TTL,
+                artifact_mode=artifact_mode,
+                validator_running_benchmark=validator_state == "running_benchmark",
+            )
         canonical_version = await active_bench_version(session)
         rollout = await open_rollout(session)
         if ticket is None:
@@ -1890,6 +1903,18 @@ async def submit_score(
             agent_id=agent_id,
             validator_hotkey=payload.validator_hotkey,
             bench_version=ticket.bench_version,
+        )
+        heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
+        await activate_next_score_retest(
+            session,
+            validator_hotkey=payload.validator_hotkey,
+            now=audit_now,
+            supports_version=lambda version: (
+                heartbeat is not None
+                and heartbeat_supports_version(
+                    heartbeat, now=audit_now, version=version
+                )
+            ),
         )
         result_status = agent.status
 
