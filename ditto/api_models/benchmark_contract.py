@@ -26,6 +26,11 @@ _CONTRACTS = {
     # contract makes it a rollout target but does not activate it; the scorer
     # also withholds v5 capability until every provider baseline is calibrated.
     5: BenchmarkContract(5, 9, True),
+    # v6 adds memory-as-data (stored-instruction) plus the multi-query,
+    # non-verbatim, and passive-consolidation complexity cases. Same policy-9
+    # screener floor and verified-archive requirement as v5; shipping the
+    # contract makes it an operator rollout target without activating it.
+    6: BenchmarkContract(6, 9, True),
 }
 
 
