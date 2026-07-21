@@ -16,6 +16,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
+from ditto.api_models.retry_state import RetryState
 from ditto.api_models.screener import ScreenerProgressStage, ScreenerRuntimeState
 from ditto.api_models.stack_health import ValidatorStackHealth
 from ditto.api_models.validator import ValidatorRuntimeState
@@ -1016,6 +1017,27 @@ class PublicActivityEntry(BaseModel):
         int,
         Field(ge=1, description="Independent validator scores required to finalize."),
     ]
+    retry_state: Annotated[
+        RetryState | None,
+        Field(
+            default=None,
+            description=(
+                "Why a below-quorum submission is or isn't advancing: running, "
+                "retry_available, cooling_down, exhausted (needs operator "
+                "recovery), or queued. Null once finalized or not yet evaluating."
+            ),
+        ),
+    ] = None
+    retry_after: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description=(
+                "Earliest time an expired ticket becomes eligible to retry (UTC); "
+                "set while cooling_down."
+            ),
+        ),
+    ] = None
     screening_policy_version: Annotated[
         int, Field(ge=0, description="Latest completed screening policy version.")
     ]
