@@ -1693,6 +1693,18 @@ class PublicValidatorHeartbeat(BaseModel):
     online: bool
     availability: FleetAvailability
     health: FleetHealth
+    health_reasons: Annotated[
+        list[str],
+        Field(
+            default_factory=list,
+            description=(
+                "Detailed labels explaining a non-healthy `health` badge (e.g. "
+                "'dittobench_api: degraded', 'benchmark stalled'). Empty when "
+                "healthy. Intended for a badge tooltip so the summary stays compact "
+                "without hiding the reason."
+            ),
+        ),
+    ]
     system_metrics: PublicSystemMetrics | None = None
     capabilities: ValidatorCapabilities | None = None
     stack: ValidatorStackIdentity | None = None

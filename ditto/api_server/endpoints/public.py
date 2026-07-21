@@ -520,6 +520,69 @@ def _fleet_classification(
     return online, availability, health
 
 
+# A required stack component observed in one of these states means the validator
+# cannot reliably do its job even when host metrics look fine (e.g. a scorer that
+# is reachable but cannot reach its model relay). "unknown" is NOT here: it means
+# the component was not observed (startup, mock, or an unconfigured probe), which
+# must not raise a false warning.
+_STACK_HEALTH_WARNING_STATES = frozenset(
+    {"degraded", "unreachable", "identity_mismatch"}
+)
+
+
+def _stack_component_issues(stack_health: ValidatorStackHealth | None) -> list[str]:
+    """Per-component labels for every required component that is not healthy.
+
+    e.g. ``["dittobench_api: degraded", "model_relay: unreachable"]``. This is the
+    detail behind a fleet ``warning`` — the rollup badge stays a single word, but
+    these labels name exactly which component and state caused it so the UI can
+    show them (e.g. a badge tooltip) without hiding the reason or crowding the
+    view. Empty when nothing is wrong.
+    """
+    if stack_health is None:
+        return []
+    return [
+        f"{name}: {component.health}"
+        for name in type(stack_health).model_fields
+        for component in (getattr(stack_health, name),)
+        if component.required and component.health in _STACK_HEALTH_WARNING_STATES
+    ]
+
+
+def _health_reasons(
+    *,
+    state: str,
+    metrics: PublicSystemMetrics | None,
+    active_benchmark: PublicBenchmarkProgress | None,
+    stack_health: ValidatorStackHealth | None,
+) -> list[str]:
+    """Human-readable labels explaining a non-healthy fleet badge.
+
+    Mirrors the same conditions ``_fleet_classification`` and the entry rollup use
+    for ``health``, so the badge never says ``warning``/``unknown`` without the
+    payload also carrying exactly why. Empty for a fully healthy validator.
+    Intended for a badge tooltip: detailed, but off the main view.
+    """
+    reasons: list[str] = []
+    if state == "error":
+        reasons.append("worker reported an error state")
+    if metrics is None:
+        reasons.append("host metrics not reported")
+    else:
+        if metrics.memory_percent >= 90:
+            reasons.append(f"memory {metrics.memory_percent}%")
+        if metrics.disk_percent >= 95:
+            reasons.append(f"disk {metrics.disk_percent}%")
+        if metrics.docker_status == "degraded":
+            reasons.append("docker degraded")
+        elif metrics.docker_status == "unavailable":
+            reasons.append("docker unavailable")
+    if active_benchmark is not None and active_benchmark.stalled:
+        reasons.append("benchmark stalled")
+    reasons.extend(_stack_component_issues(stack_health))
+    return reasons
+
+
 def _safe_models(details: dict) -> PublicRunModels | None:
     """Pull the run's models from the details blob, tolerating a malformed shape."""
     raw = details.get("models")
@@ -1211,13 +1274,24 @@ def _validator_heartbeats_response(
                 seen_at=seen_at,
                 online=online,
                 availability=availability,
-                # A wedged benchmark is a real operational problem regardless of
-                # how the host metrics look (or whether they were reported), so
-                # surface it as a warning in the fleet health roll-up.
+                # A wedged benchmark or a required stack component that is
+                # degraded/unreachable/identity-mismatched is a real operational
+                # problem regardless of how the host metrics look (or whether they
+                # were reported), so surface it as a warning in the fleet health
+                # roll-up rather than only in the nested per-component map.
                 health=(
                     "warning"
-                    if active_benchmark is not None and active_benchmark.stalled
+                    if (active_benchmark is not None and active_benchmark.stalled)
+                    or _stack_component_issues(stack_health)
                     else health
+                ),
+                # The detailed "why" behind the badge — kept as structured labels
+                # (for a tooltip) so the summary stays compact without hiding info.
+                health_reasons=_health_reasons(
+                    state=row.state,
+                    metrics=metrics,
+                    active_benchmark=active_benchmark,
+                    stack_health=stack_health,
                 ),
                 system_metrics=metrics,
                 capabilities=capabilities,
