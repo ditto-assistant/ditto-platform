@@ -61,13 +61,16 @@ from ditto.api_models import (
     PublicBenchConfigResponse,
     PublicBenchCorpusEntry,
     PublicBenchCorpusResponse,
+    PublicBenchGlossaryResponse,
     PublicBenchIntegrity,
     PublicBenchmarkProgress,
     PublicBenchRolloutResponse,
     PublicCaseResult,
+    PublicCategoryDoc,
     PublicCategoryStat,
     PublicChainWeight,
     PublicChainWeightsResponse,
+    PublicCompositeBreakdown,
     PublicDatasetReveal,
     PublicDethroneDecision,
     PublicEmissionRecipient,
@@ -75,6 +78,7 @@ from ditto.api_models import (
     PublicKothEmissions,
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
+    PublicMetricDoc,
     PublicOperationsResponse,
     PublicProvisionalScore,
     PublicRunModels,
@@ -101,6 +105,7 @@ from ditto.api_models import (
     PublicValidatorScore,
     PublicValidatorWeightVector,
 )
+from ditto.api_models import bench_glossary as bench_glossary_data
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.public import (
@@ -761,6 +766,68 @@ def _safe_token_efficiency(details: dict) -> PublicTokenEfficiency | None:
         return None
 
 
+def _safe_raw_composite(details: dict) -> float | None:
+    raw = details.get("raw_composite")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
+
+
+def _composite_breakdown(
+    *,
+    tool_mean: float,
+    memory_mean: float,
+    final_composite: float,
+    details: dict,
+) -> PublicCompositeBreakdown | None:
+    """Explain score arithmetic without reimplementing scorer gate policy.
+
+    DittoBench owns the individual pre-token gates. The platform derives their
+    combined multiplier from the scorer's signed pre-token composite, then
+    publishes the independently recorded v5 token multiplier. That makes the
+    full arithmetic auditable while keeping this API from drifting from the Go
+    scorer or exposing answer-key-bearing case internals.
+    """
+    values = (tool_mean, memory_mean, final_composite)
+    if any(not math.isfinite(v) or not 0.0 <= v <= 1.0 for v in values):
+        return None
+
+    base = 0.5 * tool_mean + 0.5 * memory_mean
+    token = _safe_token_efficiency(details)
+    raw = _safe_raw_composite(details)
+    if raw is None and token is not None:
+        raw = token.raw_composite
+    pre_token = raw if raw is not None else final_composite
+    if base == 0.0:
+        if pre_token != 0.0:
+            return None
+        quality_multiplier = 1.0
+    else:
+        # Every current gate is subtractive. Clamp only sub-micro rounding noise
+        # from the scorer's six-decimal wire representation.
+        quality_multiplier = min(1.0, max(0.0, pre_token / base))
+
+    token_multiplier = token.multiplier if token is not None else None
+    token_penalty = (
+        min(0.1, max(0.0, 1.0 - token_multiplier))
+        if token_multiplier is not None
+        else None
+    )
+    try:
+        return PublicCompositeBreakdown(
+            base_accuracy=base,
+            benchmark_quality_multiplier=quality_multiplier,
+            pre_token_composite=pre_token,
+            token_efficiency_multiplier=token_multiplier,
+            token_penalty=token_penalty,
+            maximum_token_penalty=(token.maximum_penalty if token else None),
+            final_composite=final_composite,
+        )
+    except ValidationError:
+        return None
+
+
 def _public_entry(
     rank: int,
     r: LedgerRow,
@@ -836,6 +903,12 @@ def _public_entry(
         tokens=tokens,
         token_usage=_safe_token_usage(details),
         token_efficiency=_safe_token_efficiency(details),
+        composite_breakdown=_composite_breakdown(
+            tool_mean=r.tool_mean,
+            memory_mean=r.memory_mean,
+            final_composite=r.composite,
+            details=details,
+        ),
         history=trend,
         case_results=_safe_case_results(details),
     )
@@ -1525,6 +1598,15 @@ def _public_validator_score(s) -> PublicValidatorScore:
         composite=s.composite,
         tool_mean=s.tool_mean,
         memory_mean=s.memory_mean,
+        raw_composite=_safe_raw_composite(details),
+        token_usage=_safe_token_usage(details),
+        token_efficiency=_safe_token_efficiency(details),
+        composite_breakdown=_composite_breakdown(
+            tool_mean=s.tool_mean,
+            memory_mean=s.memory_mean,
+            final_composite=s.composite,
+            details=details,
+        ),
         median_ms=s.median_ms,
         n=s.n,
         bench_version=_score_bench_version(s),
@@ -2201,6 +2283,12 @@ async def agent_pipeline(
                     if isinstance(score.details, dict)
                     else None
                 ),
+                composite_breakdown=_composite_breakdown(
+                    tool_mean=score.tool_mean,
+                    memory_mean=score.memory_mean,
+                    final_composite=score.composite,
+                    details=(score.details if isinstance(score.details, dict) else {}),
+                ),
                 seed=str(score.seed),
                 run_size=agent.dataset_run_size,
                 bench_version=_score_bench_version(score),
@@ -2563,6 +2651,26 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
         public_transcript_url_template=transcript_template,
         ledger_path="/api/v1/scoring/scores",
         generated_at=datetime.now(UTC),
+    )
+
+
+@router.get("/bench/glossary", response_model=PublicBenchGlossaryResponse)
+async def bench_glossary(response: Response) -> PublicBenchGlossaryResponse:
+    """Every scored category and every metric / composite-gate factor, explained.
+
+    So miners understand exactly what a score reflects: what each test category
+    probes (never the answer key) and how each headline metric and gate factor is
+    computed. This is the programmatic source for the dashboard's category and
+    metric glossaries, and it names the quality factors (conversational-sanity,
+    metamorphic-consistency, tool-efficiency) folded into the composite breakdown.
+    """
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return PublicBenchGlossaryResponse(
+        bench_version=CURRENT_BENCH_VERSION,
+        categories=[
+            PublicCategoryDoc(**c) for c in bench_glossary_data.category_entries()
+        ],
+        metrics=[PublicMetricDoc(**m) for m in bench_glossary_data.metric_entries()],
     )
 
 
