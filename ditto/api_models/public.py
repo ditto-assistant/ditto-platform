@@ -1,7 +1,7 @@
 """Public, unauthenticated read models for the subnet dashboard.
 
-These expose the **aggregate** shape only — composite plus tool/memory means and
-rank — and deliberately omit the fields on :class:`LedgerEntry` that are either
+These expose the **aggregate** shape only: composite plus tool/memory means and
+rank, and deliberately omit the fields on :class:`LedgerEntry` that are either
 integrity-internal (``sha256``, ``signature``, ``validator_hotkey``) or would
 hand a miner the benchmark's answer key (per-case ``expected``/``called``). See
 ``docs/public-telemetry.md`` for the transparency policy this encodes.
@@ -100,7 +100,7 @@ class PublicBenchIntegrity(BaseModel):
 class PublicCaseResult(BaseModel):
     """One scored case, **redacted** for public per-case analysis.
 
-    Carries only *how the agent did* on the case — its category, kind, score,
+    Carries only *how the agent did* on the case: its category, kind, score,
     pass/fail, latency, and the scorer's mechanical notes (e.g. "1 extra tool
     call", "capped: self-report untrusted"). It deliberately **omits the answer
     key**: the ``expected`` tools/answer, the agent's ``called`` tools (which on a
@@ -241,7 +241,7 @@ class PublicLeaderboardEntry(BaseModel):
     """One miner's best score, aggregate-only, for public display.
 
     Beyond the headline composite + tool/memory means, this carries the
-    benchmark provenance a transparent leaderboard needs — the models that
+    benchmark provenance a transparent leaderboard needs: the models that
     generated + graded the run, the ``bench_version`` and ``dataset_sha256``
     (which pins the exact scored artifact for a dispute re-score), latency, case
     count, and a per-category breakdown. All are advisory and deliberately
@@ -417,7 +417,7 @@ class PublicLeaderboardEntry(BaseModel):
                 "Mean Brier score over cases where the harness self-reported a "
                 "confidence: mean((confidence - correct)^2), lower is better. "
                 "Honest confidence minimizes it; always-100% does not. Advisory "
-                "only — never folded into the composite, so a harness that omits "
+                "only; never folded into the composite, so a harness that omits "
                 "confidence is unaffected. None when no case carried a confidence."
             ),
         ),
@@ -512,7 +512,7 @@ class PublicLeaderboardEntry(BaseModel):
             default=None,
             description=(
                 "This miner's recent composite scores, oldest→newest (across their "
-                "submissions / re-scores), for a trend sparkline. Aggregate only — "
+                "submissions / re-scores), for a trend sparkline. Aggregate only: "
                 "no seeds, no per-case content. None / omitted when there is no "
                 "history beyond the current score."
             ),
@@ -523,7 +523,7 @@ class PublicLeaderboardEntry(BaseModel):
         Field(
             default=None,
             description=(
-                "Redacted per-case results for detailed analysis — each case's "
+                "Redacted per-case results for detailed analysis: each case's "
                 "category / kind / score / pass / latency / mechanical notes, but "
                 "never the answer key (``expected`` / ``called`` / ``case_id``). "
                 "None when the run carries no per-case data."
@@ -695,7 +695,7 @@ class PublicLeaderboardResponse(BaseModel):
         Literal["authoritative", "historical"],
         Field(
             description=(
-                "authoritative is the pool that drives validator weights — "
+                "authoritative is the pool that drives validator weights: "
                 "pinned to active_bench_version while a rollout is collecting "
                 "(the desired version takes over only at rollout activation); "
                 "historical is a requested single version."
@@ -753,7 +753,7 @@ class PublicValidatorScore(BaseModel):
     ``signature`` so the row is independently verifiable against the published
     validator public key. Unlike the aggregate leaderboard this deliberately
     exposes ``validator_hotkey`` (a public on-chain identity) and the raw
-    ``seed`` — the whole point of the record is to show *who* scored an agent on
+    ``seed``: the whole point of the record is to show *who* scored an agent on
     *which* dataset, so an observer can reproduce and audit the number.
     """
 
@@ -873,7 +873,7 @@ class PublicValidatorScore(BaseModel):
         Field(
             default=None,
             description=(
-                "Redacted per-case breakdown of this validator's run — each case's "
+                "Redacted per-case breakdown of this validator's run: each case's "
                 "category / kind / score / pass / latency / mechanical notes, so an "
                 "observer can audit exactly where the agent gained or lost points. "
                 "Never the answer key (expected / called / case_id). None when the "
@@ -1656,7 +1656,7 @@ class PublicHealthResponse(BaseModel):
 
     Derived only from what the platform records (submissions + reported scores).
     Run started/failed counts, set-weights latency and per-stage timings are
-    validator-side telemetry (wandb), not served here — the platform only ever
+    validator-side telemetry (wandb), not served here; the platform only ever
     sees a *successful* score, so it deliberately reports no "success rate".
     """
 
@@ -1711,7 +1711,7 @@ ValidatorAssignmentState = Literal[
     # The validator is doing exactly the work the platform leased it.
     "synchronized",
     # The lease was issued too recently for the validator to have reported it yet
-    # (a normal job hand-off). A transient, non-alarming state — kept separate so
+    # (a normal job hand-off). A transient, non-alarming state, kept separate so
     # the fleet view does not flap red between jobs.
     "assigning",
     # The validator has gone quiet (no fresh heartbeat within the online window).
@@ -2010,7 +2010,7 @@ class PublicBenchRolloutResponse(BaseModel):
     ``active_version`` is the one that currently drives on-chain weights, and
     ``desired_version`` is the one being rolled out. The whole ledger switches
     at once, and only once ``ranked_quorum_agents`` reaches
-    ``min_ranked_quorum_agents`` — that gate is what guarantees the emission set
+    ``min_ranked_quorum_agents``: that gate is what guarantees the emission set
     (champion plus tail) is never short at the moment authority moves.
 
     Extra keys are preserved rather than dropped: this model documents the shape
@@ -2034,7 +2034,7 @@ class PublicBenchRolloutResponse(BaseModel):
         default=None,
         description=(
             "How many eligible agents hold a complete RANKED quorum at "
-            "desired_version — a full-benchmark median row with a positive "
+            "desired_version: a full-benchmark median row with a positive "
             "composite, not merely a row count. The authority switch is gated "
             "on this reaching min_ranked_quorum_agents."
         ),

@@ -22,7 +22,7 @@ CATEGORY_GLOSSARY: dict[str, tuple[str, CategoryKind, str]] = {
     "single-session-recall": (
         "Single-session recall",
         "memory",
-        "Recall of a fact stated within one conversation and asked straight back — "
+        "Recall of a fact stated within one conversation and asked straight back, "
         "the baseline memory case before any cross-session or temporal difficulty.",
     ),
     "multi-session": (
@@ -37,7 +37,7 @@ CATEGORY_GLOSSARY: dict[str, tuple[str, CategoryKind, str]] = {
         "Time-aware recall",
         "memory",
         "Time-aware memory: a fact is revised over the timeline and the question "
-        "asks for its value at a specific point — the version correct for that "
+        "asks for its value at a specific point, the version correct for that "
         "moment, not the latest or the first.",
     ),
     "temporal-depth": (
@@ -90,7 +90,7 @@ CATEGORY_GLOSSARY: dict[str, tuple[str, CategoryKind, str]] = {
         "Preference in action",
         "memory",
         "Whether a remembered preference changes behavior on a later, differently- "
-        "worded task. Quoting the preference back is not enough — it has to shape "
+        "worded task. Quoting the preference back is not enough; it has to shape "
         "the answer.",
     ),
     "assistant-recall": (
@@ -168,7 +168,7 @@ CATEGORY_GLOSSARY: dict[str, tuple[str, CategoryKind, str]] = {
         "Apply a declared preference",
         "conversational",
         "Whether a preference the user simply stated (no save verb) actually "
-        "changes behavior on a later task — the agent cannot apply what it never "
+        "changes behavior on a later task; the agent cannot apply what it never "
         "stored.",
     ),
     "canary": (
@@ -200,14 +200,14 @@ CATEGORY_GLOSSARY: dict[str, tuple[str, CategoryKind, str]] = {
         "memory",
         "Saved items are each tagged with two independent attributes; the question "
         "asks for the one matching BOTH. Answerable only by issuing more than one "
-        "focused query and intersecting the results — each decoy matches exactly one "
+        "focused query and intersecting the results; each decoy matches exactly one "
         "attribute, so a single-shot recall returns a wrong item.",
     ),
     "nonverbatim-computed": (
         "Non-verbatim / computed answer",
         "memory",
         "The fact is stored in one unit and asked in another (minutes vs hours, "
-        "dozens vs units), so the answer token appears in no stored message — a grep "
+        "dozens vs units), so the answer token appears in no stored message; a grep "
         "fails, a reader who converts succeeds. Graded against an accept-set of "
         "equivalent forms; the un-converted stored form is deliberately not accepted.",
     ),
@@ -216,7 +216,7 @@ CATEGORY_GLOSSARY: dict[str, tuple[str, CategoryKind, str]] = {
         "memory",
         "A topic accrues details across several non-adjacent sessions with no save "
         "instruction; the question asks for the EARLIEST detail. Passing needs "
-        "genuine passive capture and long-horizon consolidation — a recency-biased or "
+        "genuine passive capture and long-horizon consolidation; a recency-biased or "
         "save-cue-only harness returns a later value and fails.",
     ),
     "web_search": (
@@ -420,7 +420,7 @@ CATEGORY_GLOSSARY: dict[str, tuple[str, CategoryKind, str]] = {
     "multi_web_read": (
         "Search then read",
         "multi_step",
-        "A multi-step trajectory: search the web, then read a result — scored with "
+        "A multi-step trajectory: search the web, then read a result, scored with "
         "order credit for doing both in sequence.",
     ),
     "parallel_web_image": (
@@ -502,12 +502,12 @@ METRIC_GLOSSARY: dict[str, tuple[str, str]] = {
     ),
     "conversational_sanity": (
         "Conversational sanity",
-        "v5+ gate metric: the geometric mean of three slice pass-rates — greeting "
+        "v5+ gate metric: the geometric mean of three slice pass-rates: greeting "
         "non-leak, no-save-verb declarative capture, and preference application. A "
         "fully-failed slice (a leaked greeting, an uncaptured declarative) still "
         "zeroes it, but a partially-weak slice no longer dominates, so the per-seed "
         "variance is low. The applied factor is 0.5 + 0.5 × metric, so a metric of 0 "
-        "halves the composite — this is what separates a grounded assistant from a "
+        "halves the composite; this is what separates a grounded assistant from a "
         "phrase-list router.",
     ),
     "metamorphic_consistency": (
@@ -588,7 +588,7 @@ BENCH_VERSIONS: list[dict] = [
         "epoch": "2026-08-01",
         "title": "False-positive corrections",
         "summary": (
-            "Not a new benchmark — v3 with scoring false positives corrected, so "
+            "Not a new benchmark: v3 with scoring false positives corrected, so "
             "several ways of being correct no longer lose points. Same tests, same "
             "shape, corrected grading."
         ),
@@ -610,7 +610,7 @@ BENCH_VERSIONS: list[dict] = [
         ),
         "highlights": [
             "Conversational-sanity gate (greeting non-leak, declarative capture, "
-            "preference application) — floors the composite at 0.5 when failed",
+            "preference application); floors the composite at 0.5 when failed",
             "No-save-verb declarative writes with persistence + behavior proofs",
             "Multi-hop relational (KG-join) and temporal-depth memory",
             "Accept-set grading (non-verbatim answers) and Code Mode tool coverage",

@@ -760,7 +760,7 @@
     .benchmark-progress.failed progress::-moz-progress-bar { background: var(--warn); }
     /* Custom track for the non-determinate stages: an animated sliver while a
        quick pre-run stage is working, and a pinned warning fill when stalled or
-       failed (never animated — nothing is progressing). */
+       failed (never animated, nothing is progressing). */
     .benchmark-progress .bench-bar { display: block; width: 100%; height: 7px; margin-top: 5px; border-radius: 999px; overflow: hidden; background: var(--bg-elev-2); }
     .benchmark-progress .bench-bar > i { display: block; height: 100%; width: 100%; border-radius: 999px; background: var(--accent-2); }
     .benchmark-progress.indeterminate .bench-bar > i { width: 38%; animation: bench-indeterminate 1.15s ease-in-out infinite; }
@@ -2082,7 +2082,7 @@
             <th scope="col" class="sortable" data-sort="name"><span class="tip" tabindex="0" data-tooltip="The miner's best-scoring agent, with its current SN118 UID and on-chain hotkey below. Open either identity for details, or copy the hotkey.">Best-scoring agent</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" style="width:128px"><span class="tip" id="emissions-col-tip" tabindex="0" data-tooltip="Current KOTH role. The incumbent champion takes a fixed share of the miner pool; a participation tail splits the remainder.">Emissions</span></th>
             <th scope="col" class="hide-md sortable" data-sort="bench" style="width:180px"><span class="tip" tabindex="0" data-tooltip="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under. Sort to group runs by benchmark version.">Model</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" style="width:230px" class="sortable" data-sort="composite"><span class="tip" tabindex="0" data-tooltip="Headline score in [0,1]. The base is the equal-weight tool/memory average (½·tool + ½·memory); the benchmark quality gates then multiply it down (the 'gates −%' chip shows how much — mostly the conversational-sanity gate), and v5 token efficiency can remove at most 10% more (the 'token' chip). That is why the composite is not simply the tool/memory average. The band is ±1 standard error.">Composite</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" style="width:230px" class="sortable" data-sort="composite"><span class="tip" tabindex="0" data-tooltip="Headline score in [0,1]. The base is the equal-weight tool/memory average (½·tool + ½·memory); the benchmark quality gates then multiply it down (the 'gates −%' chip shows how much, mostly the conversational-sanity gate), and v5 token efficiency can remove at most 10% more (the 'token' chip). That is why the composite is not simply the tool/memory average. The band is ±1 standard error.">Composite</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="hide-sm sortable" data-sort="tool" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="hide-sm sortable" data-sort="memory" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Mean score across the memory cases. Did the agent recall and reason over stored facts across sessions, over time, and while resisting injected instructions?">Memory</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="num hide-sm sortable" data-sort="latency" style="width:96px"><span class="tip" tabindex="0" data-tooltip="Median per-case response time for the run, and how many cases were scored (a full benchmark is ~114 cases).">Latency</span><span class="sarrow" aria-hidden="true">▲</span></th>
@@ -2338,12 +2338,12 @@
       </div>
       <div class="pillar" id="bench-versions" style="margin-top:14px">
         <h2>Version history</h2>
-        <p style="margin-bottom:10px">Each <code>bench_version</code> is an immutable contract; a scoring change ships as a new version rather than editing an old one. Newest first — the current version is highlighted.</p>
+        <p style="margin-bottom:10px">Each <code>bench_version</code> is an immutable contract; a scoring change ships as a new version rather than editing an old one. Newest first; the current version is highlighted.</p>
         <div id="bench-changelog"><p class="muted">Loading the benchmark changelog…</p></div>
       </div>
       <div class="pillar" id="bench-glossary" style="margin-top:14px">
         <h2>Glossary</h2>
-        <p style="margin-bottom:10px">What every score metric and gate factor means, and what each scored test category probes. Definitions come from the public <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">grader</a> — never an answer key.</p>
+        <p style="margin-bottom:10px">What every score metric and gate factor means, and what each scored test category probes. Definitions come from the public <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">grader</a>, never an answer key.</p>
         <div id="bench-glossary-display"><p class="muted">Loading the glossary…</p></div>
       </div>
     </section>
@@ -2502,8 +2502,8 @@
     var resolvingEntityKey = "";
     var entityReturnUrl = "";
 
-    // Sidebar pages (title, subtitle). Declared here — before the boot-time URL
-    // sanitizer runs — because currentPageName() consults it.
+    // Sidebar pages (title, subtitle). Declared here, before the boot-time URL
+    // sanitizer runs, because currentPageName() consults it.
     var PAGES = {
       overview:    ["Overview", "Subnet snapshot and the full leaderboard · ranked by composite"],
       operations:  ["Network operations", "Live submission pipeline and validator / screener fleet health"],
@@ -2516,7 +2516,7 @@
       Object.keys(ENTITY_PARAMS).forEach(function (kind) { query.delete(ENTITY_PARAMS[kind]); });
     }
 
-    // All SPA state — the entity overlay params and the activity filters — lives
+    // All SPA state (the entity overlay params and the activity filters) lives
     // in a query string INSIDE the hash ("#/submissions?agent=…&status=…"). The
     // real (server-visible) query string carries only deploy/config knobs
     // (?api=, ?wandb=), so the document URL and its HTTP cache entry stay
@@ -2634,7 +2634,7 @@
       clearEntityParams(query);
       // Same page (e.g. closing an overlay) keeps that page's view state; moving
       // to a different page drops it so it never reappears as stale filters or a
-      // stale page number — and so both pagers can safely share the "page" key.
+      // stale page number, and so both pagers can safely share the "page" key.
       if (page !== currentPageName()) {
         PAGE_SCOPED_PARAMS.forEach(function (key) { query.delete(key); });
       }
@@ -2661,7 +2661,7 @@
 
     function restoreActivityUrl() {
       // Canonical: filters in the hash query. Legacy links carried them in the
-      // real query — honor those once and report them for normalization.
+      // real query, honor those once and report them for normalization.
       var hashQuery = parseHashRoute().query;
       var searchQuery = new URLSearchParams(location.search);
       var hasIn = function (query) {
@@ -2705,7 +2705,7 @@
       if (currentPageName() === "submissions") {
         if (activityPage > 1) query.set("page", String(activityPage)); else query.delete("page");
       }
-      // Keep an open overlay in the URL — including a legacy real-query entity
+      // Keep an open overlay in the URL, including a legacy real-query entity
       // that resolveEntityRoute has not normalized into the hash yet.
       var entity = readEntityRoute();
       if (entity && !entity.full) query.set(ENTITY_PARAMS[entity.kind], entity.id);
@@ -2803,8 +2803,8 @@
     var benchHasOlderRuns = false;
     // True while the API reports an open rollout (active < desired) on the
     // authoritative view. Mid-rollout the pool mixes settled active-version
-    // medians with desired-version medians that flip in per agent at quorum —
-    // two incomparable scales — so the board ranks by each agent's settled
+    // medians with desired-version medians that flip in per agent at quorum,
+    // two incomparable scales, so the board ranks by each agent's settled
     // active-version composite and surfaces the desired-version settlement
     // state (median so far + score count) per row instead.
     var rolloutSettledView = false;
@@ -2835,7 +2835,7 @@
     // exceeds the indifference band, and the band is the LARGER of the flat
     // relative margin and, when both sides carry a standard error,
     // dethrone_z * sqrt(se_challenger^2 + se_champion^2). Only the margin term
-    // is knowable in advance — the statistical term depends on the challenger's
+    // is knowable in advance, the statistical term depends on the challenger's
     // own measurement noise, which does not exist until it has been scored. So
     // this is published as a floor, explicitly, and never as a sufficient
     // number: a noisy challenger clearing it can still be held inside the band.
@@ -2859,7 +2859,7 @@
       var band = Number.isFinite(z) && z > 0
         ? " The band is the larger of that margin and " + num(z) +
           " × √(challenger SE² + champion SE²), so a challenger with noisier scores has to clear more than " +
-          fx(floor) + " — this is a floor, not a guarantee."
+          fx(floor) + ". This is a floor, not a guarantee."
         : " This is a floor: the fold takes the larger of the margin and the statistical uncertainty band.";
       el.innerHTML =
         '<b>Beat this to contend:</b> <span class="beat">' + esc(fx(floor)) + '</span> composite. ' +
@@ -2968,7 +2968,7 @@
       } else if (rolling && Number.isFinite(ready) && Number.isFinite(needed)) {
         progress.innerHTML =
           '<span class="count">' + esc(String(ready)) + " of " + esc(String(needed)) + '</span> ' +
-          esc("agents ready at v" + desired + " — finalized on the full benchmark with a complete ranked quorum.");
+          esc("agents ready at v" + desired + ", finalized on the full benchmark with a complete ranked quorum.");
         note.textContent =
           "Weights stay on v" + active + " until that threshold is met, then the whole ledger flips to v" + desired +
           " at once. The gate exists so the emission set is never short: the champion and the full participation tail " +
@@ -2988,7 +2988,7 @@
     }
 
     // "Old" (not comparable) means below the SETTLED benchmark version, not the
-    // version currently being collected — during a rollout the active version is
+    // version currently being collected, during a rollout the active version is
     // the baseline, and tagging it "old" misreads as stale data.
     function settledBenchVersion() {
       return Number(activeBench) || Number(currentBench) || null;
@@ -3262,7 +3262,7 @@
 
     // ── Render efficiency ────────────────────────────────────
     // Skip an innerHTML rebuild when a section's data is byte-identical to what
-    // is already on screen — this preserves keyboard focus and expanded state
+    // is already on screen, this preserves keyboard focus and expanded state
     // that a blind rebuild would destroy every 30 s. A coarse minute bucket is
     // folded into the signature so relative timestamps ("5m ago") never drift
     // more than a minute stale; a manual Refresh calls forceRender() to rebuild
@@ -3379,7 +3379,7 @@
             ? "Reference baseline: the stock (unmodified) starter-kit harness on the locked model, " +
               baseline.method + ", measured on bench_version " + currentBench + " (" + baseline.run +
               "). Source: dittobench-api docs/BASELINES.md. This is the score a submission must beat " +
-              "to be worth submitting — it is not the score that wins, which is the champion's."
+              "to be worth submitting; it is not the score that wins, which is the champion's."
             : "No reference baseline has been measured on bench_version " + (currentBench || "?") +
               " yet. A baseline is a real run of the stock starter-kit harness on the locked model, so it " +
               "cannot be carried over from an earlier version: composites are only comparable within one " +
@@ -3618,7 +3618,7 @@
               '<span class="winner-miner" title="' + esc(e.miner_hotkey) + '"><span class="winner-miner-label" aria-hidden="true">Miner</span><span class="miner-uid" title="Current SN118 UID">UID ' + (e.miner_uid == null ? "–" : esc(e.miner_uid)) + '</span><span class="hotkey">' + entityAnchor("miner", e.miner_hotkey, shortKey(e.miner_hotkey)) + '</span>' +
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></span></span></td>' +
             '<td>' + (emission ? '<span class="emission-badge ' + esc(emission.role) + '"><span aria-hidden="true">●</span> ' +
-              (emission.role === "champion" ? "Champion" : "Tail") + ' · ' + pct(emission.share_of_miner_pool) + '</span>' : '<span class="muted">—</span>') +
+              (emission.role === "champion" ? "Champion" : "Tail") + ' · ' + pct(emission.share_of_miner_pool) + '</span>' : '<span class="muted">–</span>') +
               (chainWeight ? '<span class="chain-weight-note" title="How many validators most recently revealed this miner as their top choice, or assigned it any weight. Block ' + esc(lastChainWeights.block) + '; this can lag active commitments and is not final Yuma emissions.">' + esc(chainWeightLabel(chainWeight)) + '</span>' : '') + '</td>' +
             modelCell(e) +
             compositeCell(e) +
@@ -3637,7 +3637,7 @@
         if (tab === boardView.tab) return;
         boardView.tab = tab;
         // Tab/sort aren't URL state, so a reset-to-1 only drops the pager param
-        // (replaceState, not push — there is no meaningful entry to go back to).
+        // (replaceState, not push; there is no meaningful entry to go back to).
         boardView.page = 1;
         writeBoardPage(false);
         renderBoardRows();
@@ -3674,7 +3674,7 @@
     // Every benchmark version with at least one accepted score (newest first,
     // from the leaderboard API). Each gets a history pill next to "Current
     // rollout", so a new version (e.g. the next one Nick ships) grows a pill
-    // the moment its first score lands — no dashboard change needed.
+    // the moment its first score lands, no dashboard change needed.
     var availableBenchVersions = [2];
 
     // The pills are data-driven, so clicks are delegated to the group container
@@ -3759,7 +3759,7 @@
       var w = clamp01(v) * 100;
       // The stashed stderr describes the authoritative composite; when the cell
       // shows the settled value instead (mid-rollout, agent already on the new
-      // version) the band would be attached to the wrong number — drop it.
+      // version) the band would be attached to the wrong number, drop it.
       var band = v === e.composite ? errBand(v, e.composite_stderr) : "";
       var row = '<div class="metric"><div class="barwrap">' + band +
         '<div class="bar composite" style="width:' + w.toFixed(1) + '%"></div></div>' +
@@ -3784,11 +3784,11 @@
       if (!(reduction > 0.005)) return ""; // no meaningful gate effect
       var tip = "The composite base is the ½·tool + ½·memory average (" +
         (b.base_accuracy != null ? fx(b.base_accuracy) : "avg") +
-        "). The benchmark quality gates — conversational sanity (leaking on a " +
-        "greeting or missing a plain declarative floors it at 0.5), plus consistency, " +
-        "canary integrity, and wasteful tool use — multiply that by " + fx(mult) +
-        " (−" + (reduction * 100).toFixed(1) + "%). That is why the composite sits below " +
-        "the tool/memory average. Open the row for the full breakdown.";
+        "). The benchmark quality gates multiply that by " + fx(mult) +
+        " (−" + (reduction * 100).toFixed(1) + "%), which is why the composite sits " +
+        "below the average. The largest gate is conversational sanity: leaking on a " +
+        "greeting or missing a plain declarative floors it at 0.5. Consistency, canary " +
+        "integrity, and wasteful tool use also count. Open the row for the full breakdown.";
       return '<span class="gate-chip" title="' + esc(tip) + '">gates −' + (reduction * 100).toFixed(0) + '%</span>';
     }
     function tokenPenaltyChip(e) {
@@ -4076,7 +4076,7 @@
         (e.calibration_brier != null
           ? stat("Calibration (Brier)", fx(e.calibration_brier) +
               (e.calibration_n != null ? "  over " + e.calibration_n + " case(s)" : "") +
-              " — advisory, unscored; lower is better")
+              " (advisory, unscored; lower is better)")
           : "") +
         // Reproduce-under-transform audit. A share of every run's cases is
         // re-asked under a rephrasing derived from the post-commit seed, so the
@@ -4086,7 +4086,7 @@
         (e.transform_robustness != null
           ? stat("Transform robustness", fx(e.transform_robustness) +
               (e.audit_case_count != null ? "  over " + e.audit_case_count + " audit pair(s)" : "") +
-              " — agreement when a case is re-asked in wording the miner could not predict; higher is better")
+              ": agreement when a case is re-asked in wording the miner could not predict; higher is better")
           : "") +
         stat("First seen", new Date(e.first_seen).toLocaleString()) +
         stat("Rank", isEligible(e)
@@ -4212,7 +4212,7 @@
         if (consensusToken !== agentId || !r || !r.scores || !r.scores.length) return;
         var quorum = Math.max(1, Number(r.quorum) || 3);
         // A re-scored agent carries score rows from more than one benchmark
-        // version, and composites compare only within a version — so the rows
+        // version, and composites compare only within a version, so the rows
         // group under a per-version heading (newest first) instead of one flat
         // list where a v2 and a v3 number would read as comparable.
         var byVersion = {};
@@ -4251,7 +4251,7 @@
         box.innerHTML = '<div class="stat-group"><div class="stat-head">Consensus (k=' +
           quorum + ')</div>' +
           '<div class="muted" style="margin:0 0 6px">Independent validators that scored this agent; the platform finalizes on the median, so no single validator decides the score.' +
-          (multi ? ' This agent was scored under more than one benchmark version — scores compare only within a version, never across.' : '') + '</div>' +
+          (multi ? ' This agent was scored under more than one benchmark version; scores compare only within a version, never across.' : '') + '</div>' +
           groups + med + '</div>';
       }).catch(function () { /* held / still-evaluating: leave empty */ });
     }
@@ -4775,7 +4775,7 @@
       if (!result) return;
       closeSearch();
       if (result.type === "miner") {
-        // Resolve the CURRENT board position by hotkey — a background refresh may
+        // Resolve the CURRENT board position by hotkey; a background refresh may
         // have re-sorted lastEntries since the corpus was built, so the captured
         // index could point at a different miner. If the miner has since dropped
         // off the board, fall back to its canonical entity route.
@@ -5014,7 +5014,7 @@
       if (progress.stage === "failed_retrying") return "Failed · a new attempt will start shortly";
       if (progress.stalled) {
         return benchmarkStageLabel(progress.stage) + " · stalled" +
-          (progress.started_at ? " — no progress for " + elapsedDuration(progress.started_at) : "");
+          (progress.started_at ? ", no progress for " + elapsedDuration(progress.started_at) : "");
       }
       if (progress.percent == null) return benchmarkStageLabel(progress.stage) + " · working…";
       var text = "Benchmark " + progress.percent + "%";
@@ -5669,7 +5669,7 @@
     // their own and get no chip. Fed by the ops feed's per-entry retry_state.
     function retryStateChip(entry) {
       if (entry.retry_state === "exhausted") {
-        return '<span class="retry-chip exhausted" title="Every validator spent its retry budget on this submission — it needs an operator retry grant to be scored.">Stuck · needs operator</span>';
+        return '<span class="retry-chip exhausted" title="Every validator spent its retry budget on this submission; it needs an operator retry grant to be scored.">Stuck · needs operator</span>';
       }
       if (entry.retry_state === "cooling_down") {
         var when = entry.retry_after ? " · " + relTime(entry.retry_after) : "";
@@ -6618,7 +6618,7 @@
 
       var visiblePage = document.querySelector(".page.active");
       var visibleName = visiblePage && visiblePage.getAttribute("data-page");
-      // Agent/miner drilldowns are overlays over whatever page is active — never
+      // Agent/miner drilldowns are overlays over whatever page is active, never
       // switch the page underneath. Fleet-row targets (validators/screeners)
       // live on the operations page only, so normalize the URL there first.
       if (entity.kind === "validators" || entity.kind === "screeners") {
@@ -6889,7 +6889,7 @@
             GLOSSARY_DATA.metrics.length + ')</summary>' + metricRows + '</details>' +
           '<details class="gloss"><summary>Every scored test category (' +
             GLOSSARY_DATA.categories.length + ')</summary>' +
-            '<div class="gdesc" style="padding:4px 0 6px">What each case probes — never the answer key.</div>' +
+            '<div class="gdesc" style="padding:4px 0 6px">What each case probes, never the answer key.</div>' +
             catBlocks + '</details>';
       }
     }
@@ -7046,7 +7046,7 @@
       var routeHash = hash.indexOf("#/") === 0;
       if (!entity && !m && hash && !routeHash && !initial) return;
       // The hash owns the page. An entity param is an overlay on top of that
-      // page, not a page itself — ENTITY_PAGES only decides where a cold link
+      // page, not a page itself; ENTITY_PAGES only decides where a cold link
       // with no page route lands. (Hash must win or the URL and the sidebar
       // disagree after closing an overlay.)
       var page = (m && PAGES[m[1]]) ? m[1] : (entity ? ENTITY_PAGES[entity.kind] : "overview");
@@ -7070,7 +7070,7 @@
       // A non-route fragment (skip link's "#main-content") keeps the browser's
       // native scroll-to-fragment; only real routes reset to the top.
       if (entity || routeHash || !hash) window.scrollTo(0, 0);
-      // On a page switch (not the boot resolve — the boot load() covers that),
+      // On a page switch (not the boot resolve; the boot load() covers that),
       // immediately fetch that page's sections so nothing looks stale while the
       // 30 s poll waits.
       if (!initial) loadPageSections(page);
