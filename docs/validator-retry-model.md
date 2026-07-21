@@ -92,5 +92,12 @@ infrastructure:
    clears their cooldown. Accepted scores, screening verdicts, and ticket history
    are preserved; it is **not** a rescreen.
 
+To recover several stranded submissions at once (e.g. the batch left exhausted
+by one outage), `POST /api/v1/admin/validation-retries/batch-retry` with a shared
+`reason` and one `{agent_id, request_id, expected_snapshot}` item per agent. Each
+item is gated and snapshot-checked exactly like the single route; an item whose
+state moved is **skipped** with a reason rather than force-granted, and all grants
+commit together.
+
 Recoveries are bounded (`MAX_OPERATOR_RECOVERIES_PER_AGENT = 3`) and audited in
 `ValidatorRetryRecovery`.

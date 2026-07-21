@@ -847,3 +847,139 @@ async def test_infra_grant_lifts_a_would_be_exhausted_ticket(
     assert item["retry_state"] == "retry_available"
     assert item["tickets"][0]["infra_retry_grants"] == 1
     assert item["tickets"][0]["retry_budget_exhausted"] is False
+
+
+# --- batch retry-grant ----------------------------------------------------
+
+
+async def _snapshot_of(client: httpx.AsyncClient, agent_id: UUID) -> str:
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    return detail.json()["snapshot"]
+
+
+async def test_batch_retry_grants_recoverable_and_skips_the_rest(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    recoverable_a = await _seed(retry_maker)
+    recoverable_b = await _seed(retry_maker)
+    queued = await _seed_states(retry_maker, name="queued", tickets=[])
+    stale = await _seed(retry_maker)
+    _install(app, retry_maker)
+
+    payload = {
+        "reason": "chutes infrastructure outage recovery batch",
+        "items": [
+            {
+                "agent_id": str(recoverable_a),
+                "request_id": str(uuid4()),
+                "expected_snapshot": await _snapshot_of(client, recoverable_a),
+            },
+            {
+                "agent_id": str(recoverable_b),
+                "request_id": str(uuid4()),
+                "expected_snapshot": await _snapshot_of(client, recoverable_b),
+            },
+            {
+                "agent_id": str(queued),
+                "request_id": str(uuid4()),
+                "expected_snapshot": await _snapshot_of(client, queued),
+            },
+            {
+                "agent_id": str(stale),
+                "request_id": str(uuid4()),
+                "expected_snapshot": "0" * 64,
+            },
+        ],
+    }
+    resp = await client.post(
+        "/api/v1/admin/validation-retries/batch-retry", headers=_HEADERS, json=payload
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["granted"] == 2
+    by_id = {result["agent_id"]: result for result in body["results"]}
+    assert by_id[str(recoverable_a)]["status"] == "granted"
+    assert by_id[str(recoverable_b)]["status"] == "granted"
+    assert by_id[str(queued)]["status"] == "skipped"
+    assert (
+        by_id[str(queued)]["detail"] == "not enough expired tickets to restore quorum"
+    )
+    assert by_id[str(stale)]["status"] == "skipped"
+    assert by_id[str(stale)]["detail"] == "validation state changed"
+
+    # A granted item actually raised the cap on its tickets.
+    async with retry_maker() as session:
+        tickets = list(
+            (
+                await session.scalars(
+                    select(ValidatorTicket).where(
+                        ValidatorTicket.agent_id == recoverable_a
+                    )
+                )
+            ).all()
+        )
+        # The gate grants exactly the quorum (3) minimum slots needed.
+        assert sum(t.manual_retry_grants for t in tickets) == 3
+
+
+async def test_batch_retry_is_idempotent(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker)
+    _install(app, retry_maker)
+    payload = {
+        "reason": "outage recovery, replayed",
+        "items": [
+            {
+                "agent_id": str(agent_id),
+                "request_id": str(uuid4()),
+                "expected_snapshot": await _snapshot_of(client, agent_id),
+            }
+        ],
+    }
+    first = await client.post(
+        "/api/v1/admin/validation-retries/batch-retry", headers=_HEADERS, json=payload
+    )
+    assert first.json()["results"][0]["status"] == "granted"
+
+    second = await client.post(
+        "/api/v1/admin/validation-retries/batch-retry", headers=_HEADERS, json=payload
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["granted"] == 0
+    assert second.json()["results"][0]["status"] == "idempotent"
+
+
+async def test_batch_retry_rejects_duplicate_agent_ids(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker)
+    _install(app, retry_maker)
+    snapshot = await _snapshot_of(client, agent_id)
+    payload = {
+        "reason": "duplicate agents in one batch",
+        "items": [
+            {
+                "agent_id": str(agent_id),
+                "request_id": str(uuid4()),
+                "expected_snapshot": snapshot,
+            },
+            {
+                "agent_id": str(agent_id),
+                "request_id": str(uuid4()),
+                "expected_snapshot": snapshot,
+            },
+        ],
+    }
+    resp = await client.post(
+        "/api/v1/admin/validation-retries/batch-retry", headers=_HEADERS, json=payload
+    )
+    assert resp.status_code == 422
