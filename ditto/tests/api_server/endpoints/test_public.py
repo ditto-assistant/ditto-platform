@@ -3577,8 +3577,14 @@ def test_bench_glossary_explains_every_v5_category_and_metric() -> None:
         "multi-hop-relational",
         "temporal-depth",
         "canary",
+        # bench_version 6 complexity classes
+        "injection-stored-instruction",
+        "stored-instruction-benign",
+        "multi-query-recall",
+        "nonverbatim-computed",
+        "passive-consolidation",
     ):
-        assert key in cats, f"undocumented v5 category: {key}"
+        assert key in cats, f"undocumented category: {key}"
     # Every entry is complete and public-safe (a purpose, a known kind, no blanks).
     kinds = {"memory", "conversational", "tool", "multi_step", "integrity"}
     for c in cats.values():
