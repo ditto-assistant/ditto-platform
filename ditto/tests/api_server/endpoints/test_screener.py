@@ -2045,12 +2045,79 @@ class TestQuarantineAdmin:
             assert v2 is not None and v2.sha256 == "ab" * 32
             assert v3 is not None and v3.sha256 == "be" * 32
 
-        # The release adjudicates this exact current-policy artifact. Once its
-        # active benchmark dataset is pinned, it must not immediately re-enter
-        # screening through the missing-dataset eligibility branch.
+        # The release pinned the active dataset, so the missing-DATASET branch
+        # must not re-fire. But this artifact tripped source review BEFORE its
+        # screened image was built (agentic-source-review-tripwire), so it is
+        # released to EVALUATING without the image v3 requires. It therefore
+        # correctly re-enters screening via the missing-screened-image branch to
+        # build that image — otherwise validators would skip it forever.
         next_claim = await client.post(_CLAIM_URL)
         assert next_claim.status_code == 200
-        assert next_claim.json()["items"] == []
+        reclaimed = {item["agent_id"] for item in next_claim.json()["items"]}
+        assert str(agent_id) in reclaimed
+
+    async def test_build_only_attempt_cannot_quarantine(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # An EVALUATING (already-adjudicated) agent missing its image is
+        # re-claimed as a BUILD-ONLY pass. The screener must not be able to
+        # quarantine it — that would let a re-screen silently override the prior
+        # release/pass that made it EVALUATING.
+        agent_id = uuid4()
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            agent = Agent(
+                agent_id=agent_id,
+                miner_hotkey="5HKapproved",
+                name="approved-no-image",
+                sha256=uuid4().hex * 2,
+                status=AgentStatus.EVALUATING,
+            )
+            agent.screening_policy_version = SCREENING_POLICY_VERSION
+            session.add(agent)
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=4,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now - timedelta(hours=1),
+                    activated_at=now,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        claimed = await client.post(_CLAIM_URL)
+        item = next(
+            entry
+            for entry in claimed.json()["items"]
+            if entry["agent_id"] == str(agent_id)
+        )
+        assert item["build_only"] is True
+        attempt_id = UUID(item["attempt_id"])
+
+        rejected = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                attempt_id=attempt_id,
+                outcome="quarantine",
+                manifest_digest="56" * 32,
+                finding_digest="78" * 32,
+                reason_code="agentic-source-review-tripwire",
+            ),
+        )
+        assert rejected.status_code >= 400
+        refreshed_status = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()["status"]
+        assert refreshed_status != "under_review"
 
     async def test_admin_auth_is_required(
         self, app: FastAPI, client: httpx.AsyncClient
