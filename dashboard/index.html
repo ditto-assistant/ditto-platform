@@ -6749,10 +6749,12 @@
     }
 
     // Fetch the category/metric glossary once (static, max-age 3600) and merge the
-    // authoritative labels + purposes over the inline fallback maps, so newly added
-    // categories (e.g. the v5 conversational / multi-hop / temporal families) are
-    // explained without shipping a dashboard change. The inline maps remain the
-    // offline fallback if the fetch fails.
+    // authoritative definitions over the inline fallback maps, so newly added
+    // categories (the v5 conversational / multi-hop / temporal and v6 memory-as-data
+    // / multi-query / non-verbatim / consolidation families) AND the composite-gate
+    // metrics (conversational sanity, metamorphic consistency, canary integrity,
+    // token efficiency) are explained without shipping a dashboard change. The inline
+    // maps remain the offline fallback if the fetch fails.
     var glossaryLoaded = false;
     function loadGlossary() {
       if (glossaryLoaded) return;
@@ -6762,6 +6764,15 @@
           if (!c || !c.key) return;
           if (c.label) CATEGORY_LABEL[c.key] = c.label;
           if (c.purpose) CATEGORY_PURPOSE[c.key] = c.purpose;
+        });
+        // Add the scorer's metric / gate-factor definitions to the run term glossary
+        // so every factor that moves the composite (chiefly the conversational-sanity
+        // gate, which floors at 0.5) is documented, not just the headline means. Skip
+        // labels the inline TERM_HELP already carries so the curated copy wins.
+        (g.metrics || []).forEach(function (m) {
+          if (!m || !m.label || !m.description) return;
+          var exists = TERM_HELP.some(function (t) { return t[0] === m.label; });
+          if (!exists) TERM_HELP.push([m.label, m.description]);
         });
       }).catch(function () {});
     }

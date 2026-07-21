@@ -502,10 +502,13 @@ METRIC_GLOSSARY: dict[str, tuple[str, str]] = {
     ),
     "conversational_sanity": (
         "Conversational sanity",
-        "v5 gate metric (weakest-link over greeting non-leak, no-save-verb "
-        "declarative capture, and preference application). The applied factor is "
-        "0.5 + 0.5 × metric, so a metric of 0 halves the composite — this is what "
-        "separates a grounded assistant from a phrase-list router.",
+        "v5+ gate metric: the geometric mean of three slice pass-rates — greeting "
+        "non-leak, no-save-verb declarative capture, and preference application. A "
+        "fully-failed slice (a leaked greeting, an uncaptured declarative) still "
+        "zeroes it, but a partially-weak slice no longer dominates, so the per-seed "
+        "variance is low. The applied factor is 0.5 + 0.5 × metric, so a metric of 0 "
+        "halves the composite — this is what separates a grounded assistant from a "
+        "phrase-list router.",
     ),
     "metamorphic_consistency": (
         "Metamorphic consistency",
