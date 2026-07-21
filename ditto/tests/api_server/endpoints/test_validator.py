@@ -323,6 +323,34 @@ def _job_payload(
     }
 
 
+def _job_fail_payload(
+    agent_id: UUID,
+    keypair: bittensor.Keypair = _KEYPAIR,
+    *,
+    nonce: UUID | None = None,
+    requested_at: datetime | None = None,
+    ticket_deadline: datetime = _TICKET_DEADLINE,
+    reason: str = "infrastructure",
+) -> dict:
+    nonce = nonce or uuid4()
+    requested_at = requested_at or datetime.now(UTC)
+    deadline = ticket_deadline.astimezone(UTC).isoformat(timespec="microseconds")
+    requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
+    signed = (
+        f"validator-job-fail:v1:{keypair.ss58_address}:{agent_id}:{deadline}:"
+        f"{nonce}:{requested}"
+    ).encode()
+    return {
+        "validator_hotkey": keypair.ss58_address,
+        "agent_id": str(agent_id),
+        "ticket_deadline": ticket_deadline.isoformat(),
+        "reason": reason,
+        "nonce": str(nonce),
+        "requested_at": requested_at.isoformat(),
+        "signature": keypair.sign(signed).hex(),
+    }
+
+
 def _artifact_headers(
     agent_id: UUID,
     keypair: bittensor.Keypair = _KEYPAIR,
@@ -1397,7 +1425,7 @@ class TestHeartbeat:
         activity = (await client.get("/api/v1/public/activity")).json()
         assert activity["entries"][0]["active_benchmarks"] == []
 
-    async def test_v4_rejects_regression_omission_and_signature_tampering(
+    async def test_v4_fail_open_regression_omission_and_signature_tampering(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -1422,13 +1450,16 @@ class TestHeartbeat:
             )
         ).status_code == 200
 
+        # A same-run regression must NOT be rejected (fail-open). The signed
+        # liveness report is accepted (200) and the public display keeps the last
+        # good progress (51/114) instead of moving backward.
         regressions = [
             _progress("starting_harness"),
             _progress("running_benchmark", completed=40, total=114),
             _progress("running_benchmark", completed=52, total=120),
         ]
         for offset, progress in enumerate(regressions, start=1):
-            rejected = await client.post(
+            accepted = await client.post(
                 "/api/v1/validator/heartbeat",
                 headers=_AUTH_HEADER,
                 json=_heartbeat_payload(
@@ -1439,7 +1470,13 @@ class TestHeartbeat:
                     benchmark_progress=progress,
                 ),
             )
-            assert rejected.status_code == 409, rejected.text
+            assert accepted.status_code == 200, accepted.text
+            shown = (await client.get("/api/v1/public/validators")).json()[
+                "validators"
+            ][0]["active_benchmark"]
+            assert shown["stage"] == "running_benchmark"
+            assert shown["completed_checks"] == 51
+            assert shown["total_checks"] == 114
 
         omitted = await client.post(
             "/api/v1/validator/heartbeat",
@@ -1496,7 +1533,9 @@ class TestHeartbeat:
                 ),
             ),
         )
-        assert lower_after_downgrade.status_code == 409
+        # Fail-open: a regression after the reported flag toggled is accepted and
+        # the stored progress floor is kept.
+        assert lower_after_downgrade.status_code == 200, lower_after_downgrade.text
 
         tampered = _heartbeat_payload(
             protocol_version=4,
@@ -1534,7 +1573,8 @@ class TestHeartbeat:
                 ),
             ),
         )
-        assert lower_after_idle.status_code == 409
+        # Fail-open: accepted even though it regresses the stored floor.
+        assert lower_after_idle.status_code == 200, lower_after_idle.text
 
         other_agent_id = await _seed_agent(
             session_maker, status=AgentStatus.EVALUATING, name="new-agent"
@@ -2741,6 +2781,192 @@ class TestRequestJob:
         assert resp.status_code == 409
 
 
+class TestFailJob:
+    async def test_closes_live_ticket_for_immediate_reissue(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        resp = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(agent_id),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body == {"agent_id": str(agent_id), "reopened": True}
+
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            # Closed for immediate reissue: expired now with retry_after=now, not
+            # the 6h cooldown, so the next request_job mints a fresh lease.
+            assert ticket.status == TicketStatus.EXPIRED
+            now = datetime.now(UTC)
+            assert ticket.retry_after is not None
+            retry_after = ticket.retry_after
+            if retry_after.tzinfo is None:
+                retry_after = retry_after.replace(tzinfo=UTC)
+            assert abs((retry_after - now).total_seconds()) < 60
+
+    async def test_reissues_a_fresh_ticket_after_failure(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # End-to-end reattempt seam: fail the lease, then request_job hands the
+        # same validator a brand-new ticket (fresh deadline) instead of resuming.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(agent_id),
+        )
+        assert failed.status_code == 200, failed.text
+
+        reissued = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+        assert reissued.status_code == 200, reissued.text
+        job = reissued.json()
+        assert job["agent_id"] == str(agent_id)
+        # A fresh lease, not the failed one: the deadline moved off the seed value.
+        assert datetime.fromisoformat(job["deadline"]) != _TICKET_DEADLINE
+
+    async def test_no_live_ticket_is_a_noop(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        resp = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(agent_id),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"agent_id": str(agent_id), "reopened": False}
+
+    async def test_wrong_deadline_does_not_close_the_ticket(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        resp = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(
+                agent_id, ticket_deadline=_TICKET_DEADLINE + timedelta(hours=1)
+            ),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["reopened"] is False
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.status == TicketStatus.ISSUED
+
+    async def test_header_mismatch_is_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        resp = await client.post(
+            "/api/v1/validator/job/fail",
+            headers={"X-Validator-Hotkey": _DAVE.ss58_address},
+            json=_job_fail_payload(agent_id),
+        )
+        assert resp.status_code == 401
+        assert resp.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
+
+    async def test_tampered_signature_is_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        forged = _job_fail_payload(agent_id)
+        # Move the signed lease deadline without re-signing: the signature binds
+        # (agent_id, ticket_deadline, nonce, requested_at), so it must not verify.
+        forged["ticket_deadline"] = (_TICKET_DEADLINE + timedelta(hours=1)).isoformat()
+        resp = await client.post(
+            "/api/v1/validator/job/fail", headers=_AUTH_HEADER, json=forged
+        )
+        assert resp.status_code == 401
+
+    async def test_replayed_nonce_is_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        claim = _job_fail_payload(agent_id)
+        first = await client.post(
+            "/api/v1/validator/job/fail", headers=_AUTH_HEADER, json=claim
+        )
+        replay = await client.post(
+            "/api/v1/validator/job/fail", headers=_AUTH_HEADER, json=claim
+        )
+        assert first.status_code == 200, first.text
+        assert replay.status_code == 409
+
+    async def test_stale_request_is_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        stale = _job_fail_payload(
+            agent_id, requested_at=datetime.now(UTC) - timedelta(minutes=3)
+        )
+        resp = await client.post(
+            "/api/v1/validator/job/fail", headers=_AUTH_HEADER, json=stale
+        )
+        assert resp.status_code == 409
+
+
 class TestSubmitScore:
     @pytest.mark.parametrize("ticket_version", [3, 4])
     async def test_post_legacy_ticket_requires_explicit_bench_version_binding(
@@ -2855,6 +3081,104 @@ class TestSubmitScore:
             agent = await s.get(Agent, agent_id)
             assert agent is not None
             assert agent.status == AgentStatus.SCORED
+
+    async def test_finalized_score_retest_hot_swaps_without_leaving_finalized_state(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from ditto.db.queries.audit import (
+            EVENT_FINALIZED,
+            EVENT_SCORE,
+            EVENT_SCORE_INVALIDATED,
+            EVENT_SCORE_RETEST_REQUESTED,
+            list_audit_entries,
+        )
+
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        await _score_to_quorum(
+            client, agent_id, maker=session_maker, run_id="original", composite=0.82
+        )
+        token = "test-admin-token-at-least-32-characters"
+        app.state.config = replace(app.state.config, admin_api_token=token)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Admin-Actor": "operator",
+        }
+        inspect = await client.get(
+            f"/api/v1/admin/validation-retries/{agent_id}/validators/{_VALIDATOR_HOTKEY}",
+            headers=headers,
+        )
+        assert inspect.status_code == 200, inspect.text
+        request_id = uuid4()
+        requested = await client.post(
+            f"/api/v1/admin/validation-retries/{agent_id}/validators/{_VALIDATOR_HOTKEY}/replace-score",
+            headers=headers,
+            json={
+                "request_id": str(request_id),
+                "expected_snapshot": inspect.json()["snapshot"],
+                "expected_run_id": "original_0",
+                "reason": (
+                    "Outlying validator result requires an exact same-validator re-test"
+                ),
+            },
+        )
+        assert requested.status_code == 200, requested.text
+        async with session_maker() as session:
+            preserved = await session.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
+            agent = await session.get(Agent, agent_id)
+        assert preserved is not None and preserved.run_id == "original_0"
+        assert agent is not None and agent.status == AgentStatus.SCORED
+
+        deadline = datetime.fromisoformat(
+            requested.json()["replacement_deadline"].replace("Z", "+00:00")
+        )
+        replacement = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(
+                agent_id,
+                keypair=_KEYPAIRS[0],
+                run_id="replacement_0",
+                composite=0.91,
+                ticket_deadline=deadline,
+            ),
+        )
+        assert replacement.status_code == 200, replacement.text
+        assert replacement.json()["status"] == AgentStatus.SCORED
+        async with session_maker() as session:
+            swapped = await session.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
+            scores = list(
+                (
+                    await session.scalars(
+                        select(Score).where(Score.agent_id == agent_id)
+                    )
+                ).all()
+            )
+            entries = await list_audit_entries(session, limit=1000)
+        assert swapped is not None and swapped.run_id == "replacement_0"
+        assert swapped.composite == pytest.approx(0.91)
+        assert len(scores) == 3
+        lifecycle = [
+            entry.event
+            for entry in entries
+            if entry.agent_id == agent_id
+            and entry.event
+            in {
+                EVENT_SCORE_RETEST_REQUESTED,
+                EVENT_SCORE_INVALIDATED,
+                EVENT_SCORE,
+                EVENT_FINALIZED,
+            }
+        ]
+        assert lifecycle[-4:] == [
+            EVENT_SCORE_RETEST_REQUESTED,
+            EVENT_SCORE_INVALIDATED,
+            EVENT_SCORE,
+            EVENT_FINALIZED,
+        ]
 
     async def test_finalize_writes_verifiable_audit_chain(
         self,

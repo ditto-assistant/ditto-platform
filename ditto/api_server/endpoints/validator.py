@@ -56,6 +56,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ditto.api_models import (
     ArtifactResponse,
     BenchmarkProgress,
+    FailJobRequest,
+    FailJobResponse,
     JobRequest,
     JobResponse,
     ScoreReport,
@@ -115,7 +117,10 @@ from ditto.db.queries.audit import (
     EVENT_AUDIT,
     EVENT_FINALIZED,
     EVENT_SCORE,
+    EVENT_SCORE_INVALIDATED,
+    EVENT_SCORE_RETEST_REQUESTED,
     append_audit_entry,
+    get_latest_score_retest_event,
 )
 from ditto.db.queries.benchmark_rollout import (
     LEGACY_BENCH_VERSION,
@@ -125,7 +130,6 @@ from ditto.db.queries.benchmark_rollout import (
     open_rollout,
 )
 from ditto.db.queries.heartbeats import (
-    HeartbeatProgressRegressionError,
     upsert_validator_heartbeat,
 )
 from ditto.db.queries.scores import (
@@ -499,6 +503,28 @@ def _artifact_signing_message(
     ).encode()
 
 
+def _job_fail_signing_message(
+    validator_hotkey: str,
+    agent_id: UUID,
+    ticket_deadline: datetime,
+    nonce: UUID,
+    requested_at: datetime,
+) -> bytes:
+    """Canonical proof-of-possession bytes for one ticket-fail request.
+
+    Mirrored byte-for-byte by ditto-subnet ``ditto/validator/signing.py``. The
+    lease ``ticket_deadline`` is bound so a captured fail request cannot close a
+    later reissued ticket, and both timestamps use the same canonical UTC
+    microsecond form as every other validator write.
+    """
+    deadline = ticket_deadline.astimezone(UTC).isoformat(timespec="microseconds")
+    requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
+    return (
+        f"validator-job-fail:v1:{validator_hotkey}:{agent_id}:{deadline}:"
+        f"{nonce}:{requested}"
+    ).encode()
+
+
 def _heartbeat_signing_message(
     *,
     validator_hotkey: str,
@@ -719,42 +745,43 @@ async def heartbeat(
                     "validator=%s",
                     validator_hotkey,
                 )
-        try:
-            row, accepted = await upsert_validator_heartbeat(
-                session,
-                validator_hotkey=validator_hotkey,
-                software_version=request_body.software_version,
-                protocol_version=request_body.protocol_version,
-                code_digest=request_body.code_digest,
-                state=request_body.state,
-                active_agent_id=stored_active_agent_id,
-                system_metrics=(
-                    request_body.system_metrics.model_dump(mode="json")
-                    if request_body.system_metrics is not None
-                    else None
-                ),
-                benchmark_progress=stored_benchmark_progress,
-                capabilities=(
-                    request_body.capabilities.model_dump(mode="json", exclude_none=True)
-                    if request_body.capabilities is not None
-                    else None
-                ),
-                stack=(
-                    request_body.stack.model_dump(mode="json")
-                    if request_body.stack is not None
-                    else None
-                ),
-                stack_health=(
-                    request_body.stack_health.model_dump(mode="json", exclude_none=True)
-                    if request_body.stack_health is not None
-                    else None
-                ),
-                reported_at=reported_at,
-                seen_at=now,
-                signature=request_body.signature,
-            )
-        except HeartbeatProgressRegressionError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
+        # Progress monotonicity is enforced fail-open inside the query: a
+        # genuine same-run regression keeps the previously stored progress
+        # (never moving the public display backward) but never rejects an
+        # authenticated liveness report, and a fresh run_token rebaselines.
+        row, accepted = await upsert_validator_heartbeat(
+            session,
+            validator_hotkey=validator_hotkey,
+            software_version=request_body.software_version,
+            protocol_version=request_body.protocol_version,
+            code_digest=request_body.code_digest,
+            state=request_body.state,
+            active_agent_id=stored_active_agent_id,
+            system_metrics=(
+                request_body.system_metrics.model_dump(mode="json")
+                if request_body.system_metrics is not None
+                else None
+            ),
+            benchmark_progress=stored_benchmark_progress,
+            capabilities=(
+                request_body.capabilities.model_dump(mode="json", exclude_none=True)
+                if request_body.capabilities is not None
+                else None
+            ),
+            stack=(
+                request_body.stack.model_dump(mode="json")
+                if request_body.stack is not None
+                else None
+            ),
+            stack_health=(
+                request_body.stack_health.model_dump(mode="json", exclude_none=True)
+                if request_body.stack_health is not None
+                else None
+            ),
+            reported_at=reported_at,
+            seen_at=now,
+            signature=request_body.signature,
+        )
     seen_at = row.seen_at
     if seen_at.tzinfo is None:
         seen_at = seen_at.replace(tzinfo=UTC)
@@ -996,6 +1023,108 @@ async def request_job(
         job.deadline.isoformat(),
     )
     return job
+
+
+@router.post(
+    "/job/fail",
+    response_model=FailJobResponse,
+    responses={
+        401: {"description": "Missing/invalid validator auth or signature."},
+        409: {"description": "Stale or replayed signed fail request."},
+        503: {"description": "Chain unavailable for the permit check."},
+    },
+)
+async def fail_job(
+    payload: FailJobRequest,
+    request: Request,
+    response: Response,
+    chain: ChainDep,
+    session: SessionDep,
+    x_validator_hotkey: Annotated[str | None, Header()] = None,
+) -> FailJobResponse:
+    """Hand a failed but still-leased ticket back for immediate reissue.
+
+    A validator whose scoring attempt failed calls this so the platform closes
+    the live ticket now (status ``expired``, ``deadline`` now, ``retry_after``
+    now) instead of leaving the lease idle until its own deadline. The next
+    ``request_job`` then mints a **fresh** ticket (new deadline) rather than
+    resuming the failed lease. Additive and best-effort: an old validator that
+    never calls this behaves exactly as today (the ticket expires on its own via
+    the overdue sweep).
+
+    Auth mirrors the job claim: the header must match the signed hotkey, the
+    signature proves possession, ``requested_at`` is freshness-bounded, the
+    nonce is consumed once, and the caller must actually hold the live ticket
+    named by ``(agent_id, ticket_deadline)``.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    if x_validator_hotkey != payload.validator_hotkey:
+        raise ValidatorAuthError("job-fail header does not match signed hotkey")
+    signed = _job_fail_signing_message(
+        payload.validator_hotkey,
+        payload.agent_id,
+        payload.ticket_deadline,
+        payload.nonce,
+        payload.requested_at,
+    )
+    if not _verify_signature(payload.validator_hotkey, signed, payload.signature):
+        raise ValidatorAuthError(
+            f"job-fail signature did not verify for hotkey {payload.validator_hotkey}"
+        )
+    now = datetime.now(UTC)
+    requested_at = payload.requested_at.astimezone(UTC)
+    if abs(now - requested_at) > _JOB_REQUEST_MAX_AGE:
+        raise HTTPException(status_code=409, detail="job-fail timestamp is stale")
+
+    netuid = request.app.state.config.chain.netuid
+    network = request.app.state.config.chain.subtensor_network
+    await _assert_validator_permitted(
+        chain, netuid, payload.validator_hotkey, network=network
+    )
+
+    reopened = False
+    async with session.begin():
+        try:
+            await consume_validator_nonce(
+                session,
+                nonce=payload.nonce,
+                validator_hotkey=payload.validator_hotkey,
+                now=now,
+                expires_at=now + _JOB_REQUEST_MAX_AGE,
+            )
+        except ValidatorRequestReplayError as exc:
+            raise HTTPException(
+                status_code=409, detail="job-fail nonce has already been used"
+            ) from exc
+        # Authorize off the live ticket the caller holds (cross-version lookup on
+        # the exact lease, same as the heartbeat progress path), never a
+        # standalone nonce grant. A missing/expired/spent lease is a safe no-op.
+        ticket = await get_open_ticket(
+            session,
+            agent_id=payload.agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            now=now,
+            deadline=payload.ticket_deadline,
+            bench_version=None,
+            for_update=True,
+        )
+        if ticket is not None:
+            # Close for immediate reissue: retry_after=now (not the 6h expiry
+            # cooldown) so the next request_job mints a fresh lease instead of
+            # resuming this failed one.
+            ticket.status = TicketStatus.EXPIRED
+            ticket.deadline = now
+            ticket.retry_after = now
+            await session.flush()
+            reopened = True
+    logger.info(
+        "validator=%s reported job failure agent=%s reason=%s reopened=%s",
+        payload.validator_hotkey,
+        payload.agent_id,
+        payload.reason,
+        reopened,
+    )
+    return FailJobResponse(agent_id=payload.agent_id, reopened=reopened)
 
 
 def _stable_version(value: str) -> tuple[int, int, int] | None:
@@ -1331,6 +1460,44 @@ async def submit_score(
                 status_code=409,
                 detail="score benchmark version does not match its ticket lease",
             )
+        existing_score = await session.get(
+            Score, (agent_id, ticket.bench_version, payload.validator_hotkey)
+        )
+        replacement_event = None
+        if existing_score is not None:
+            latest_retest = await get_latest_score_retest_event(
+                session,
+                agent_id=agent_id,
+                validator_hotkey=payload.validator_hotkey,
+            )
+            if (
+                latest_retest is None
+                or latest_retest.event != EVENT_SCORE_RETEST_REQUESTED
+            ):
+                if agent.status not in {AgentStatus.SCORED, AgentStatus.LIVE}:
+                    latest_retest = None
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="accepted score has no operator-authorized re-test",
+                    )
+            if latest_retest is None:
+                replacement_event = None
+            else:
+                if (
+                    int(latest_retest.payload.get("bench_version", -1))
+                    != ticket.bench_version
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="replacement request benchmark version changed",
+                    )
+                if latest_retest.payload.get("run_id") != existing_score.run_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="accepted score changed after replacement request",
+                    )
+                replacement_event = latest_retest
         # Persist the scoring engine's opaque telemetry (models used,
         # bench_version, dataset_sha256, per-category means, token spend, …) plus
         # the per-case breakdown, all under scores.details. The public leaderboard
@@ -1364,6 +1531,45 @@ async def submit_score(
             score_details["per_case"] = [
                 c.model_dump(mode="json") for c in report.per_case
             ]
+        audit_now = datetime.now(UTC)
+        if replacement_event is not None and agent.status in {
+            AgentStatus.SCORED,
+            AgentStatus.LIVE,
+        }:
+            assert existing_score is not None
+            await append_audit_entry(
+                session,
+                agent_id=agent_id,
+                validator_hotkey=payload.validator_hotkey,
+                event=EVENT_SCORE_INVALIDATED,
+                payload={
+                    "request_id": replacement_event.payload["request_id"],
+                    "actor": replacement_event.payload["actor"],
+                    "reason": replacement_event.payload["reason"],
+                    "bench_version": ticket.bench_version,
+                    "run_id": existing_score.run_id,
+                    "invalidated_score": {
+                        "run_id": existing_score.run_id,
+                        "seed": existing_score.seed,
+                        "composite": existing_score.composite,
+                        "tool_mean": existing_score.tool_mean,
+                        "memory_mean": existing_score.memory_mean,
+                        "median_ms": existing_score.median_ms,
+                        "n": existing_score.n,
+                        "bench_version": existing_score.bench_version,
+                        "ticket_deadline": (
+                            existing_score.details.get("ticket_deadline")
+                            if isinstance(existing_score.details, dict)
+                            else None
+                        ),
+                        "signature": existing_score.signature,
+                        "generated_at": existing_score.generated_at.isoformat(),
+                    },
+                    "replacement_run_id": report.run_id,
+                    "replacement_composite": report.composite,
+                },
+                recorded_at=audit_now,
+            )
         await upsert_score(
             session,
             agent_id=agent_id,
@@ -1384,7 +1590,6 @@ async def submit_score(
         # same transaction (durable iff the score is). Records the full signed
         # tuple + signature so the entry is independently verifiable off the
         # public audit feed, never any per-case answer-key content.
-        audit_now = datetime.now(UTC)
         await append_audit_entry(
             session,
             agent_id=agent_id,
@@ -1405,6 +1610,42 @@ async def submit_score(
             },
             recorded_at=audit_now,
         )
+        if replacement_event is not None:
+            replacement_scores = await list_scores_for_agent(
+                session, agent_id=agent_id, bench_version=ticket.bench_version
+            )
+            replacement_median = statistics.median(
+                score.composite for score in replacement_scores
+            )
+            await append_audit_entry(
+                session,
+                agent_id=agent_id,
+                validator_hotkey=None,
+                event=EVENT_FINALIZED,
+                payload={
+                    "miner_hotkey": agent.miner_hotkey,
+                    "median_composite": replacement_median,
+                    "quorum": SCORING_QUORUM,
+                    "score_count": len(replacement_scores),
+                    "validator_hotkeys": sorted(
+                        score.validator_hotkey for score in replacement_scores
+                    ),
+                    "dataset_seed": agent.dataset_seed,
+                    "dataset_sha256": agent.dataset_sha256,
+                    "dataset_seed_block": agent.dataset_seed_block,
+                    "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+                    "status": agent.status.value,
+                    "replacement_request_id": replacement_event.payload["request_id"],
+                    "replaced_run_id": replacement_event.payload["run_id"],
+                },
+                recorded_at=audit_now,
+            )
+            await _publish_finalized_run(
+                storage,
+                agent=agent,
+                scores=replacement_scores,
+                median=replacement_median,
+            )
         # Persist the crate's structural (AST) fingerprint from the report, so it
         # is available for the gate here and for future cross-miner comparison.
         # Advisory + unsigned: only overwrite when the report actually carries one,

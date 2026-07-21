@@ -56,6 +56,15 @@ class BenchmarkProgress(BaseModel):
         StrictInt | None, Field(default=None, ge=1, le=MAX_BENCHMARK_CHECKS)
     ] = None
     ticket_deadline: datetime
+    # Opaque per-run marker. All heartbeats emitted for one dittobench run carry
+    # the same token; a new run (a retry, or the next confirmation seed of the
+    # same lease) carries a fresh one. Optional and additive: old validators omit
+    # it, so it is None and the signing token is byte-identical to the pre-token
+    # format. The platform keys progress monotonicity on it — a changed token
+    # rebaselines the run instead of reading as a regression. Never public.
+    run_token: Annotated[
+        str | None, Field(default=None, pattern=r"^[0-9a-f]{8,64}$")
+    ] = None
 
     @field_validator("ticket_deadline")
     @classmethod
@@ -92,4 +101,10 @@ def benchmark_progress_signing_token(progress: BenchmarkProgress | None) -> str:
     deadline = progress.ticket_deadline.astimezone(UTC).isoformat(
         timespec="microseconds"
     )
-    return f"{progress.stage},{completed},{total},{deadline}"
+    token = f"{progress.stage},{completed},{total},{deadline}"
+    # Backward-compat critical: only extend the token when a run_token is present.
+    # A None run_token (old validators) yields the exact pre-token bytes, so every
+    # existing v4+ heartbeat signature still verifies.
+    if progress.run_token is not None:
+        token += f",{progress.run_token}"
+    return token
