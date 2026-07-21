@@ -2859,7 +2859,7 @@
       var band = Number.isFinite(z) && z > 0
         ? " The band is the larger of that margin and " + num(z) +
           " × √(challenger SE² + champion SE²), so a challenger with noisier scores has to clear more than " +
-          fx(floor) + ". This is a floor, not a guarantee."
+          fx(floor) + ", this is a floor, not a guarantee."
         : " This is a floor: the fold takes the larger of the margin and the statistical uncertainty band.";
       el.innerHTML =
         '<b>Beat this to contend:</b> <span class="beat">' + esc(fx(floor)) + '</span> composite. ' +
