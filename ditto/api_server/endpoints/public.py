@@ -520,6 +520,36 @@ def _fleet_classification(
     return online, availability, health
 
 
+# A required stack component observed in one of these states means the validator
+# cannot reliably do its job even when host metrics look fine (e.g. a scorer that
+# is reachable but cannot reach its model relay). "unknown" is NOT here: it means
+# the component was not observed (startup, mock, or an unconfigured probe), which
+# must not raise a false warning.
+_STACK_HEALTH_WARNING_STATES = frozenset(
+    {"degraded", "unreachable", "identity_mismatch"}
+)
+
+
+def _stack_health_warns(stack_health: ValidatorStackHealth | None) -> bool:
+    """True if any required stack component is observed as not-healthy.
+
+    The per-component v9 stack health was surfaced in the feed but never fed the
+    fleet-level rollup, so a validator whose required scorer/relay was degraded
+    still showed an overall ``healthy`` badge. This lets such a state raise the
+    same ``warning`` the stalled-benchmark and host-metric checks already do, so
+    it is visible at a glance instead of only in the nested per-component map.
+    """
+    if stack_health is None:
+        return False
+    return any(
+        component.required and component.health in _STACK_HEALTH_WARNING_STATES
+        for component in (
+            getattr(stack_health, name)
+            for name in type(stack_health).model_fields
+        )
+    )
+
+
 def _safe_models(details: dict) -> PublicRunModels | None:
     """Pull the run's models from the details blob, tolerating a malformed shape."""
     raw = details.get("models")
@@ -1211,12 +1241,15 @@ def _validator_heartbeats_response(
                 seen_at=seen_at,
                 online=online,
                 availability=availability,
-                # A wedged benchmark is a real operational problem regardless of
-                # how the host metrics look (or whether they were reported), so
-                # surface it as a warning in the fleet health roll-up.
+                # A wedged benchmark or a required stack component that is
+                # degraded/unreachable/identity-mismatched is a real operational
+                # problem regardless of how the host metrics look (or whether they
+                # were reported), so surface it as a warning in the fleet health
+                # roll-up rather than only in the nested per-component map.
                 health=(
                     "warning"
-                    if active_benchmark is not None and active_benchmark.stalled
+                    if (active_benchmark is not None and active_benchmark.stalled)
+                    or _stack_health_warns(stack_health)
                     else health
                 ),
                 system_metrics=metrics,

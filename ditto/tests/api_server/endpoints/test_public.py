@@ -33,6 +33,10 @@ from ditto.api_models.screener import (
     SourceReviewEvidenceItem,
     SourceReviewFinding,
 )
+from ditto.api_models.stack_health import (
+    ValidatorComponentHealth,
+    ValidatorStackHealth,
+)
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.datapipeline import DataPipelineError
@@ -1022,6 +1026,50 @@ class TestPublicFleet:
         assert _fleet_classification(
             state="running_benchmark", seen_at=now, now=now, metrics=None
         )[:2] == (True, "available")
+
+    def test_stack_health_rolls_required_degraded_components_into_warning(
+        self,
+    ) -> None:
+        def _component(
+            health: str, required: bool = True
+        ) -> ValidatorComponentHealth:
+            observed = None if health == "unknown" else 1_784_000_000
+            ready = None if health in ("unknown", "unreachable") else True
+            return ValidatorComponentHealth(
+                health=health, required=required, observed_at=observed, ready=ready
+            )
+
+        def _stack(**overrides: ValidatorComponentHealth) -> ValidatorStackHealth:
+            base = {
+                name: _component("healthy")
+                for name in ValidatorStackHealth.model_fields
+            }
+            base.update(overrides)
+            return ValidatorStackHealth(**base)
+
+        assert public_endpoint._stack_health_warns(None) is False
+        assert public_endpoint._stack_health_warns(_stack()) is False
+        # A reachable-but-degraded required scorer (its relay path is down) warns.
+        assert public_endpoint._stack_health_warns(
+            _stack(dittobench_api=_component("degraded"))
+        )
+        assert public_endpoint._stack_health_warns(
+            _stack(model_relay=_component("unreachable"))
+        )
+        # "unknown" is not-observed and must never raise a false warning.
+        assert (
+            public_endpoint._stack_health_warns(
+                _stack(model_relay=_component("unknown"))
+            )
+            is False
+        )
+        # A non-required component in a bad state does not warn the fleet.
+        assert (
+            public_endpoint._stack_health_warns(
+                _stack(pylon=_component("degraded", required=False))
+            )
+            is False
+        )
 
     async def test_validator_name_response_is_allowlisted_to_reporters(
         self,
