@@ -66,6 +66,7 @@ from ditto.db.models import (
     Base,
     BenchmarkDataset,
     BenchmarkRollout,
+    EvaluationPayment,
     Score,
     ScreenedImageUpload,
     ScreenerHeartbeat,
@@ -439,26 +440,40 @@ async def _seed_agent(
     miner_hotkey: str = _MINER_HOTKEY,
     sha256: str = _SHA256,
     version: int | None = None,
+    miner_coldkey: str | None = None,
 ) -> UUID:
     aid = agent_id or uuid4()
     async with maker() as s, s.begin():
-        s.add(
-            Agent(
-                agent_id=aid,
-                miner_hotkey=miner_hotkey,
-                name=name,
-                version=version,
-                sha256=sha256,
-                status=status,
-                screening_policy_version=(
-                    SCREENING_POLICY_VERSION
-                    if screening_policy_version is None
-                    and status == AgentStatus.EVALUATING
-                    else (screening_policy_version or 0)
-                ),
-                created_at=created_at or datetime.now(UTC),
-            )
+        created = created_at or datetime.now(UTC)
+        agent = Agent(
+            agent_id=aid,
+            miner_hotkey=miner_hotkey,
+            name=name,
+            version=version,
+            sha256=sha256,
+            status=status,
+            screening_policy_version=(
+                SCREENING_POLICY_VERSION
+                if screening_policy_version is None and status == AgentStatus.EVALUATING
+                else (screening_policy_version or 0)
+            ),
+            created_at=created,
         )
+        s.add(agent)
+        await s.flush()
+        if miner_coldkey is not None:
+            s.add(
+                EvaluationPayment(
+                    block_hash=f"0x{aid.hex}",
+                    extrinsic_index=0,
+                    agent_id=aid,
+                    miner_hotkey=miner_hotkey,
+                    miner_coldkey=miner_coldkey,
+                    amount_rao=1,
+                    dest_address="5Destination",
+                    timestamp=created,
+                )
+            )
     return aid
 
 
@@ -1349,6 +1364,33 @@ class TestClaim:
     ) -> None:
         await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         retry = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+
+        claimed = (await client.post(_CLAIM_URL)).json()["items"][0]
+
+        assert claimed["agent_id"] == str(retry)
+        assert claimed["precheck_reason_code"] is None
+        assert claimed["duplicate_of"] is None
+
+    async def test_same_coldkey_different_hotkey_is_not_prechecked_as_duplicate(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        coldkey = "5SharedColdkey"
+        await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            miner_hotkey="5OldHotkey",
+            miner_coldkey=coldkey,
+        )
+        retry = await _seed_agent(
+            session_maker,
+            status=AgentStatus.UPLOADED,
+            miner_hotkey="5NewHotkey",
+            miner_coldkey=coldkey,
+        )
         _install_db(app, session_maker)
 
         claimed = (await client.post(_CLAIM_URL)).json()["items"][0]
@@ -3954,6 +3996,7 @@ class TestQuarantineReviewContext:
         prior_agent = uuid4()
         prior_attempt = uuid4()
         duplicate_agent = uuid4()
+        shared_coldkey = "5SharedPaymentOwner"
         async with session_maker() as session, session.begin():
             # An earlier, already-resolved quarantine from the same miner.
             session.add(
@@ -3965,6 +4008,30 @@ class TestQuarantineReviewContext:
                     status=AgentStatus.REJECTED,
                     screening_policy_version=SCREENING_POLICY_VERSION,
                     created_at=now - timedelta(days=2),
+                )
+            )
+            session.add_all(
+                (
+                    EvaluationPayment(
+                        block_hash=f"0x{agent_id.hex}",
+                        extrinsic_index=0,
+                        agent_id=agent_id,
+                        miner_hotkey=_MINER_HOTKEY,
+                        miner_coldkey=shared_coldkey,
+                        amount_rao=1,
+                        dest_address="5Destination",
+                        timestamp=now,
+                    ),
+                    EvaluationPayment(
+                        block_hash=f"0x{duplicate_agent.hex}",
+                        extrinsic_index=0,
+                        agent_id=duplicate_agent,
+                        miner_hotkey=other_miner,
+                        miner_coldkey=shared_coldkey,
+                        amount_rao=1,
+                        dest_address="5Destination",
+                        timestamp=now,
+                    ),
                 )
             )
             session.add(
@@ -4037,6 +4104,7 @@ class TestQuarantineReviewContext:
                 "agent_status": AgentStatus.UPLOADED,
                 "submitted_at": body["duplicates"][0]["submitted_at"],
                 "match": "identical_artifact",
+                "same_owner": True,
             }
         ]
         # Attribution comes from authoritative SQL aggregates, not the sample.
@@ -4044,6 +4112,8 @@ class TestQuarantineReviewContext:
             "total": 1,
             "cross_miner": 1,
             "same_miner": 0,
+            "cross_owner": 0,
+            "same_owner": 1,
             "sample_truncated": False,
         }
 

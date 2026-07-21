@@ -164,6 +164,7 @@ def evaluate_duplicate_signals(
     content_fingerprint: dict | None = None,
     structural_fingerprint: dict | None = None,
     prompt_fingerprint: dict | None = None,
+    miner_coldkey: str | None = None,
     score_tol: float = _DEFAULT_SCORE_TOL,
     size_tol: int = _DEFAULT_SIZE_TOL,
     jaccard_tol: float = _DEFAULT_JACCARD_TOL,
@@ -173,9 +174,11 @@ def evaluate_duplicate_signals(
 ) -> ReviewDecision:
     """Decide whether a just-scored agent should be held for copy review.
 
-    Copying is only a threat *across* miners, so every rule ignores the agent's
-    own submissions and this miner's other agents (a miner iterating on their own
-    harness is not a copier). Originality attribution also follows upload chronology,
+    Copying is only a threat *across* owners, so every rule ignores the agent's
+    own submissions and other agents paid for by the same coldkey (an owner
+    iterating through different names or hotkeys is not a copier). Legacy rows
+    without payment provenance still fall back to same-hotkey exclusion.
+    Originality attribution also follows upload chronology,
     not score-finalization order: normalized-source and near-duplicate rules compare
     only with another miner's strictly earlier submission. Equal timestamps use the
     UUID as a deterministic tie-break. Held iff:
@@ -218,7 +221,11 @@ def evaluate_duplicate_signals(
     code-embedding) exists to corroborate it.
     """
     other_miners = [
-        e for e in eligible if e.agent_id != agent_id and e.miner_hotkey != miner_hotkey
+        e
+        for e in eligible
+        if e.agent_id != agent_id
+        and e.miner_hotkey != miner_hotkey
+        and not (miner_coldkey is not None and e.miner_coldkey == miner_coldkey)
     ]
     submitted_key = (_utc(submitted_at), agent_id.int)
     earlier_others = sorted(

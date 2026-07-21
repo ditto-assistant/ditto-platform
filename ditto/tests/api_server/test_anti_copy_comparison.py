@@ -38,6 +38,7 @@ def _row(
     prompt: dict | None = None,
     normalized: str | None = None,
     size: int | None = 500_000,
+    coldkey: str | None = None,
 ) -> LedgerRow:
     return LedgerRow(
         miner_hotkey=miner,
@@ -53,6 +54,7 @@ def _row(
         validator_hotkey="validator",
         signature=None,
         status=AgentStatus.SCORED,
+        miner_coldkey=coldkey,
         content_fingerprint=content,
         structural_fingerprint=structural,
         normalized_source_hash=normalized,
@@ -208,5 +210,31 @@ def test_same_miner_pair_is_explicitly_excluded() -> None:
 
     assert result.same_miner_excluded is True
     assert result.chronology_eligible is False
+    assert result.current_decision == "excluded"
+    assert result.exact_byte_match is False
+
+
+def test_same_coldkey_pair_across_hotkeys_is_explicitly_excluded() -> None:
+    values = {f"{i:016x}" for i in range(12)}
+    reference = _row(
+        agent_id=1,
+        miner="old-hotkey",
+        coldkey="shared-coldkey",
+        first_seen=_NOW,
+        sha256="a" * 64,
+        content=_fp(values),
+    )
+    candidate = _row(
+        agent_id=2,
+        miner="new-hotkey",
+        coldkey="shared-coldkey",
+        first_seen=_NOW + timedelta(seconds=1),
+        sha256="a" * 64,
+        content=_fp(values),
+    )
+
+    result = compare_anti_copy_pair(candidate=candidate, reference=reference)
+
+    assert result.same_miner_excluded is True
     assert result.current_decision == "excluded"
     assert result.exact_byte_match is False

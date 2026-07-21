@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import ColumnElement, case, exists, func, or_, select
+from sqlalchemy import ColumnElement, and_, case, exists, func, or_, select
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.selectable import ScalarSelect
 
@@ -18,6 +18,7 @@ from ditto.db.models import (
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
+    EvaluationPayment,
     Score,
     ScreeningAttempt,
     ScreeningQuarantine,
@@ -334,11 +335,27 @@ async def claim_screening_attempts(
         ),
         ((Agent.status == AgentStatus.EVALUATING) & missing_active_benchmark_dataset()),
     )
+    candidate_payment = aliased(EvaluationPayment)
     earlier = aliased(Agent)
+    earlier_payment = aliased(EvaluationPayment)
+    earlier_is_different_owner = and_(
+        earlier.miner_hotkey != Agent.miner_hotkey,
+        or_(
+            candidate_payment.miner_coldkey.is_(None),
+            earlier_payment.miner_coldkey.is_(None),
+            earlier_payment.miner_coldkey != candidate_payment.miner_coldkey,
+        ),
+    )
     earlier_pending = exists(
-        select(earlier.agent_id).where(
+        select(earlier.agent_id)
+        .select_from(earlier)
+        .outerjoin(
+            earlier_payment,
+            earlier_payment.agent_id == earlier.agent_id,
+        )
+        .where(
             earlier.sha256 == Agent.sha256,
-            earlier.miner_hotkey != Agent.miner_hotkey,
+            earlier_is_different_owner,
             (earlier.created_at < Agent.created_at)
             | (
                 (earlier.created_at == Agent.created_at)
@@ -356,6 +373,10 @@ async def claim_screening_attempts(
     agents = list(
         await session.scalars(
             select(Agent)
+            .outerjoin(
+                candidate_payment,
+                candidate_payment.agent_id == Agent.agent_id,
+            )
             .where(eligible, ~has_running, ~earlier_pending)
             .order_by(*screening_priority_order())
             .limit(limit)
@@ -376,6 +397,21 @@ async def claim_screening_attempts(
             )
             continue
         owner = aliased(Agent)
+        owner_payment = aliased(EvaluationPayment)
+        candidate_coldkey = await session.scalar(
+            select(EvaluationPayment.miner_coldkey).where(
+                EvaluationPayment.agent_id == agent.agent_id
+            )
+        )
+        owner_is_different = owner.miner_hotkey != agent.miner_hotkey
+        if candidate_coldkey is not None:
+            owner_is_different = and_(
+                owner_is_different,
+                or_(
+                    owner_payment.miner_coldkey.is_(None),
+                    owner_payment.miner_coldkey != candidate_coldkey,
+                ),
+            )
         # An artifact refused FOR CAUSE stays a valid duplicate owner. Scoping
         # owners to live statuses alone meant banning an original disarmed this
         # check for its clones: the very act of refusing the first copy removed
@@ -407,9 +443,13 @@ async def claim_screening_attempts(
         )
         duplicate_of = await session.scalar(
             select(owner.agent_id)
+            .outerjoin(
+                owner_payment,
+                owner_payment.agent_id == owner.agent_id,
+            )
             .where(
                 owner.sha256 == agent.sha256,
-                owner.miner_hotkey != agent.miner_hotkey,
+                owner_is_different,
                 owner.agent_id != agent.agent_id,
                 (owner.created_at < agent.created_at)
                 | (
