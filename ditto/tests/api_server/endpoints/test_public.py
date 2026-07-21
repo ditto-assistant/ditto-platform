@@ -127,6 +127,89 @@ def test_v5_token_telemetry_public_parser_is_typed_and_fail_closed() -> None:
     assert public_endpoint._safe_token_efficiency(details) is None
 
 
+def test_composite_breakdown_separates_quality_gates_from_token_penalty() -> None:
+    details = {
+        "raw_composite": 0.372854,
+        "token_efficiency": {
+            "formula_version": "v5-relay-token-waste-p90-v1",
+            "baseline_id": "v5-baseline",
+            "baseline_prompt_tokens": 1_200_000,
+            "baseline_completion_tokens": 291_793,
+            "baseline_total_tokens": 1_491_793,
+            "budget_percentile": 0.9,
+            "observed_prompt_tokens": 1_500_000,
+            "observed_completion_tokens": 364_699,
+            "observed_total_tokens": 1_864_699,
+            "excess_ratio": 0.25,
+            "maximum_penalty": 0.1,
+            "minimum_multiplier": 0.9,
+            "multiplier": 0.9800018,
+            "raw_composite": 0.372854,
+            "adjusted_composite": 0.365398,
+            "penalty_applied": True,
+            "decision_reason": "above_budget",
+        },
+    }
+
+    breakdown = public_endpoint._composite_breakdown(
+        tool_mean=0.9278788,
+        memory_mean=0.5729167,
+        final_composite=0.365398,
+        details=details,
+    )
+
+    assert breakdown is not None
+    assert breakdown.base_accuracy == pytest.approx(0.75039775)
+    assert breakdown.benchmark_quality_multiplier == pytest.approx(
+        0.372854 / 0.75039775
+    )
+    assert breakdown.pre_token_composite == 0.372854
+    assert breakdown.token_efficiency_multiplier == pytest.approx(0.9800018)
+    assert breakdown.token_penalty == pytest.approx(0.0199982)
+    assert breakdown.maximum_token_penalty == 0.1
+    assert breakdown.final_composite == 0.365398
+
+
+def test_composite_breakdown_shows_no_token_penalty_when_within_budget() -> None:
+    details = {
+        "raw_composite": 0.493952,
+        "token_efficiency": {
+            "formula_version": "v5-relay-token-waste-p90-v1",
+            "baseline_id": "v5-baseline",
+            "baseline_prompt_tokens": 1_200_000,
+            "baseline_completion_tokens": 291_793,
+            "baseline_total_tokens": 1_491_793,
+            "budget_percentile": 0.9,
+            "observed_prompt_tokens": 1_000_000,
+            "observed_completion_tokens": 283_639,
+            "observed_total_tokens": 1_283_639,
+            "excess_ratio": 0.0,
+            "maximum_penalty": 0.1,
+            "minimum_multiplier": 0.9,
+            "multiplier": 1.0,
+            "raw_composite": 0.493952,
+            "adjusted_composite": 0.493952,
+            "penalty_applied": False,
+            "decision_reason": "within_budget",
+        },
+    }
+
+    breakdown = public_endpoint._composite_breakdown(
+        tool_mean=0.8018181818,
+        memory_mean=0.8333333333,
+        final_composite=0.493952,
+        details=details,
+    )
+
+    assert breakdown is not None
+    assert breakdown.base_accuracy == pytest.approx(0.81757575755)
+    assert breakdown.benchmark_quality_multiplier == pytest.approx(
+        0.493952 / 0.81757575755
+    )
+    assert breakdown.token_efficiency_multiplier == 1.0
+    assert breakdown.token_penalty == 0.0
+
+
 @pytest.fixture
 async def engine() -> AsyncIterator[AsyncEngine]:
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")

@@ -191,6 +191,52 @@ class PublicTokenEfficiency(BaseModel):
     decision_reason: str
 
 
+class PublicCompositeBreakdown(BaseModel):
+    """Public arithmetic from capability means to the final composite.
+
+    ``benchmark_quality_multiplier`` is intentionally aggregate-only. The
+    scorer owns the individual integrity and behavioural gates; publishing one
+    combined multiplier explains the arithmetic without duplicating scorer
+    policy in the platform or leaking benchmark answer-key material.
+    """
+
+    formula: str = (
+        "(0.5 * tool_mean + 0.5 * memory_mean) * "
+        "benchmark_quality_multiplier * token_efficiency_multiplier"
+    )
+    tool_weight: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
+    memory_weight: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
+    base_accuracy: Annotated[float, Field(ge=0.0, le=1.0)]
+    benchmark_quality_multiplier: Annotated[float, Field(ge=0.0, le=1.0)]
+    pre_token_composite: Annotated[float, Field(ge=0.0, le=1.0)]
+    token_efficiency_multiplier: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.9,
+            le=1.0,
+            description=(
+                "Benchmark-v5 token multiplier; null when token efficiency does "
+                "not apply or was unavailable."
+            ),
+        ),
+    ] = None
+    token_penalty: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=0.1,
+            description="Fraction removed by token efficiency; capped at 10%.",
+        ),
+    ] = None
+    maximum_token_penalty: Annotated[
+        float | None,
+        Field(default=None, ge=0.0, le=0.1),
+    ] = None
+    final_composite: Annotated[float, Field(ge=0.0, le=1.0)]
+
+
 class PublicLeaderboardEntry(BaseModel):
     """One miner's best score, aggregate-only, for public display.
 
@@ -449,6 +495,16 @@ class PublicLeaderboardEntry(BaseModel):
     token_efficiency: Annotated[
         PublicTokenEfficiency | None,
         Field(default=None, description="Benchmark-v5 efficiency adjustment."),
+    ] = None
+    composite_breakdown: Annotated[
+        PublicCompositeBreakdown | None,
+        Field(
+            default=None,
+            description=(
+                "Public-safe arithmetic showing the capability mean, combined "
+                "pre-token benchmark gates, token adjustment, and final score."
+            ),
+        ),
     ] = None
     history: Annotated[
         list[float] | None,
@@ -718,6 +774,13 @@ class PublicValidatorScore(BaseModel):
     memory_mean: Annotated[
         float, Field(ge=0.0, le=1.0, description="Mean memory recall in [0,1].")
     ]
+    raw_composite: Annotated[
+        float | None,
+        Field(default=None, ge=0.0, le=1.0, description="Pre-token composite."),
+    ] = None
+    token_usage: PublicTokenUsage | None = None
+    token_efficiency: PublicTokenEfficiency | None = None
+    composite_breakdown: PublicCompositeBreakdown | None = None
     median_ms: Annotated[int, Field(ge=0, description="Median per-case latency (ms).")]
     n: Annotated[int, Field(ge=0, description="Number of cases scored.")]
     bench_version: Annotated[
@@ -1271,6 +1334,7 @@ class PublicProvisionalScore(BaseModel):
     ] = None
     token_usage: PublicTokenUsage | None = None
     token_efficiency: PublicTokenEfficiency | None = None
+    composite_breakdown: PublicCompositeBreakdown | None = None
     seed: Annotated[
         str,
         Field(

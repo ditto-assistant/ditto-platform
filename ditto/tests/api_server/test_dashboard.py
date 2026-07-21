@@ -879,6 +879,20 @@ class TestDashboardScoringTransparency:
         ):
             assert heading in body, f"explainer is missing: {heading}"
         assert "0.5 × tool mean + 0.5 × memory mean" in body
+        assert "token efficiency, which can remove <b>at most 10%</b>" in body
+
+    async def test_composite_detail_separates_quality_and_token_adjustments(
+        self,
+    ) -> None:
+        body = await self._body()
+        assert "Composite calculation" in body
+        assert "Tool/memory base" in body
+        assert "Benchmark quality gates" in body
+        assert "Pre-token composite" in body
+        assert "Token efficiency" in body
+        assert "token no penalty" in body
+        assert "token −" in body
+        assert "Token efficiency is separate and can never remove more than 10%" in body
 
     async def test_benchmark_version_is_never_a_literal(self) -> None:
         body = await self._body()
