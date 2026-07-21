@@ -82,9 +82,22 @@ class AdminScreenerReviewSettingsRequest(BaseModel):
     confirmation: str
 
 
+class AppliedScreenerReviewSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    instance_id: str
+    revision: int
+    scope: str
+    mode: ReviewMode
+    checksum: str
+    source: Literal["platform", "cache", "bootstrap"]
+    seen_at: datetime
+
+
 class AdminScreenerReviewSettingsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     current: list[ScreenerReviewSettingsRevision]
     history: list[ScreenerReviewSettingsRevision]
     known_instances: list[str]
+    applied_instances: list[AppliedScreenerReviewSettings]

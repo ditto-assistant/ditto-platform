@@ -80,6 +80,16 @@ class ScreenerProgress(BaseModel):
     started_at: Annotated[int, Field(ge=0)]
 
 
+class ScreenerReviewSettingsStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    revision: Annotated[int, Field(ge=0)]
+    scope: Annotated[str, Field(pattern=r"^(?:bootstrap|\*|[a-zA-Z0-9._-]{1,63})$")]
+    mode: Literal["off", "shadow", "enforce"]
+    checksum: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    source: Literal["platform", "cache", "bootstrap"]
+
+
 class ScreenerHeartbeatRequest(BaseModel):
     """Dedicated screener identity, work, and optional host-health report."""
 
@@ -95,6 +105,7 @@ class ScreenerHeartbeatRequest(BaseModel):
     instance_id: Annotated[str, Field(pattern=_INSTANCE_ID_PATTERN)] | None = None
     progress: ScreenerProgress | None = None
     system_metrics: SystemMetrics | None = None
+    review_settings: ScreenerReviewSettingsStatus | None = None
     timestamp: Annotated[int, Field(ge=0)]
     signature: Annotated[str, Field(pattern=_SIGNATURE_HEX_PATTERN)]
 
@@ -116,6 +127,14 @@ class ScreenerHeartbeatRequest(BaseModel):
             raise ValueError("progress start cannot be after the heartbeat")
         if self.timestamp - self.progress.started_at > 6 * 60 * 60:
             raise ValueError("progress start is outside the bounded job window")
+        return self
+
+    @model_validator(mode="after")
+    def validate_review_settings(self) -> ScreenerHeartbeatRequest:
+        if self.protocol_version >= 4 and self.review_settings is None:
+            raise ValueError("heartbeat protocol v4 requires review settings status")
+        if self.protocol_version < 4 and self.review_settings is not None:
+            raise ValueError("review settings status requires heartbeat protocol v4")
         return self
 
 

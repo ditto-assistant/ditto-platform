@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -13,7 +14,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_server.dependencies import get_session
-from ditto.db.models import Base
+from ditto.db.models import Base, ScreenerHeartbeat
 
 pytestmark = pytest.mark.asyncio
 
@@ -146,6 +147,33 @@ async def test_admin_read_is_authenticated_and_history_is_append_only(
     settings_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     _install(app, settings_maker)
+    now = datetime.now(UTC)
+    async with settings_maker() as session, session.begin():
+        session.add(
+            ScreenerHeartbeat(
+                screener_hotkey=_SCREENER_HEADERS["X-Screener-Hotkey"],
+                instance_id="ditto-screener-prod",
+                software_version="0.14.1",
+                protocol_version=4,
+                policy_version=9,
+                state="polling",
+                first_seen_at=now,
+                reported_at=now,
+                seen_at=now,
+                signature="ab" * 64,
+                system_metrics={
+                    "system_metrics": None,
+                    "screening_progress": None,
+                    "review_settings": {
+                        "revision": 0,
+                        "scope": "bootstrap",
+                        "mode": "off",
+                        "checksum": "cd" * 32,
+                        "source": "bootstrap",
+                    },
+                },
+            )
+        )
     denied = await client.get("/api/v1/admin/screener-review-settings")
     assert denied.status_code == 401
     first = await client.post(
@@ -164,6 +192,10 @@ async def test_admin_read_is_authenticated_and_history_is_append_only(
     )
     assert state.status_code == 200
     assert len(state.json()["current"]) == 1
+    assert state.json()["applied_instances"][0]["instance_id"] == (
+        "ditto-screener-prod"
+    )
+    assert state.json()["applied_instances"][0]["source"] == "bootstrap"
     assert [item["revision"] for item in state.json()["history"]] == [
         second.json()["revision"],
         first.json()["revision"],

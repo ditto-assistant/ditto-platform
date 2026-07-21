@@ -279,7 +279,9 @@ async def effective_review_settings(
         result = EffectiveScreenerReviewSettings(
             revision=row.revision,
             scope=row.scope,
-            settings=ScreenerReviewSettings.model_validate_json(json.dumps(row.settings)),
+            settings=ScreenerReviewSettings.model_validate_json(
+                json.dumps(row.settings)
+            ),
             checksum=row.checksum,
         )
     response.headers["Cache-Control"] = "private, no-cache"
@@ -302,6 +304,27 @@ def _heartbeat_signing_message(payload: ScreenerHeartbeatRequest) -> bytes:
         if payload.progress is not None
         else "-"
     )
+    if payload.protocol_version >= 4:
+        assert payload.review_settings is not None
+        review = payload.review_settings
+        review_token = ",".join(
+            (
+                str(review.revision),
+                review.scope,
+                review.mode,
+                review.checksum,
+                review.source,
+            )
+        )
+        return (
+            "ditto-screener-heartbeat:v4:"
+            f"{payload.screener_hotkey}:{payload.software_version}:"
+            f"{payload.protocol_version}:{payload.policy_version}:{payload.state}:"
+            f"{payload.active_agent_id or ''}:{payload.instance_id}:"
+            f"{progress}:"
+            f"{system_metrics_signing_token(payload.system_metrics)}:"
+            f"{review_token}:{payload.timestamp}"
+        ).encode()
     if payload.protocol_version >= 3:
         # v3 signs the per-instance identity (the fleet shares one hotkey).
         # instance_id is required for v3 (validated on the request model).
@@ -390,6 +413,11 @@ async def heartbeat(
             system_metrics=(
                 request_body.system_metrics.model_dump(mode="json")
                 if request_body.system_metrics is not None
+                else None
+            ),
+            review_settings=(
+                request_body.review_settings.model_dump(mode="json")
+                if request_body.review_settings is not None
                 else None
             ),
             reported_at=reported_at,

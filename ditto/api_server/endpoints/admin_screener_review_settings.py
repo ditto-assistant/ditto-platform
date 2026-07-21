@@ -12,9 +12,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ditto.api_models.screener import ScreenerReviewSettingsStatus
 from ditto.api_models.screener_review_settings import (
     AdminScreenerReviewSettingsRequest,
     AdminScreenerReviewSettingsResponse,
+    AppliedScreenerReviewSettings,
     ScreenerReviewSettings,
 )
 from ditto.api_models.screener_review_settings import (
@@ -74,10 +76,33 @@ async def get_settings(
         set(await session.scalars(select(ScreenerHeartbeat.instance_id)))
         | {scope for scope in current_by_scope if scope != "*"}
     )
+    applied: list[AppliedScreenerReviewSettings] = []
+    heartbeats = list(await session.scalars(select(ScreenerHeartbeat)))
+    for heartbeat in heartbeats:
+        envelope = heartbeat.system_metrics
+        raw = envelope.get("review_settings") if isinstance(envelope, dict) else None
+        if not isinstance(raw, dict):
+            continue
+        try:
+            status = ScreenerReviewSettingsStatus.model_validate(raw)
+        except ValueError:
+            continue
+        applied.append(
+            AppliedScreenerReviewSettings(
+                instance_id=heartbeat.instance_id,
+                revision=status.revision,
+                scope=status.scope,
+                mode=status.mode,
+                checksum=status.checksum,
+                source=status.source,
+                seen_at=heartbeat.seen_at,
+            )
+        )
     return AdminScreenerReviewSettingsResponse(
         current=[_revision(row) for row in current_by_scope.values()],
         history=[_revision(row) for row in rows[:200]],
         known_instances=instances,
+        applied_instances=sorted(applied, key=lambda item: item.instance_id),
     )
 
 

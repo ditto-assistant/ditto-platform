@@ -437,6 +437,7 @@ async def upsert_screener_heartbeat(
     active_agent_id: UUID | None,
     screening_progress: dict | None,
     system_metrics: dict | None,
+    review_settings: dict | None,
     reported_at: datetime,
     seen_at: datetime,
     signature: str,
@@ -468,8 +469,9 @@ async def upsert_screener_heartbeat(
         {
             "system_metrics": system_metrics,
             "screening_progress": screening_progress,
+            "review_settings": review_settings,
         }
-        if screening_progress is not None
+        if screening_progress is not None or review_settings is not None
         else system_metrics
     )
     row.reported_at = reported_at

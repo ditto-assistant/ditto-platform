@@ -235,6 +235,7 @@ def _heartbeat_payload(
     instance_id: str | None = None,
     progress: dict[str, object] | None = None,
     system_metrics: dict[str, object] | None = None,
+    review_settings: dict[str, object] | None = None,
 ) -> dict[str, object]:
     ts = timestamp if timestamp is not None else int(datetime.now(UTC).timestamp())
     metrics = (
@@ -250,6 +251,19 @@ def _heartbeat_payload(
             "ditto-screener-heartbeat:v1:"
             f"{_SCREENER_HOTKEY}:0.4.2:1:{SCREENING_POLICY_VERSION}:{state}:"
             f"{active_agent_id or ''}:{system_metrics_signing_token(metrics)}:{ts}"
+        ).encode()
+    elif protocol_version >= 4:
+        assert review_settings is not None
+        review_token = ",".join(
+            str(review_settings[key])
+            for key in ("revision", "scope", "mode", "checksum", "source")
+        )
+        message = (
+            "ditto-screener-heartbeat:v4:"
+            f"{_SCREENER_HOTKEY}:0.4.2:{protocol_version}:"
+            f"{SCREENING_POLICY_VERSION}:{state}:{active_agent_id or ''}:{instance_id}:"
+            f"{progress_token}:{system_metrics_signing_token(metrics)}:"
+            f"{review_token}:{ts}"
         ).encode()
     elif protocol_version >= 3:
         message = (
@@ -282,6 +296,8 @@ def _heartbeat_payload(
         payload["progress"] = progress
     if system_metrics is not None:
         payload["system_metrics"] = system_metrics
+    if review_settings is not None:
+        payload["review_settings"] = review_settings
     return payload
 
 
@@ -793,6 +809,36 @@ class TestHeartbeat:
         payload.pop("instance_id", None)
         resp = await client.post("/api/v1/screener/heartbeat", json=payload)
         assert resp.status_code == 422
+
+    async def test_v4_persists_signed_applied_review_settings(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        review = {
+            "revision": 42,
+            "scope": "ditto-screener-prod",
+            "mode": "shadow",
+            "checksum": "cd" * 32,
+            "source": "platform",
+        }
+        response = await client.post(
+            "/api/v1/screener/heartbeat",
+            json=_heartbeat_payload(
+                protocol_version=4,
+                instance_id="ditto-screener-prod",
+                review_settings=review,
+            ),
+        )
+        assert response.status_code == 200, response.text
+        async with session_maker() as session:
+            heartbeat = await session.get(
+                ScreenerHeartbeat, (_SCREENER_HOTKEY, "ditto-screener-prod")
+            )
+            assert heartbeat is not None
+            assert heartbeat.system_metrics["review_settings"] == review
 
     async def test_rejects_tampering_arbitrary_metrics_and_wrong_auth(
         self,
