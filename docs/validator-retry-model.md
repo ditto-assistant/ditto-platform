@@ -42,9 +42,14 @@ attempt_count  >=  MAX_ATTEMPTS_PER_VERSION + manual_retry_grants + infra_retry_
   (bounded at `8`), which offsets the `attempt_count` the reissue adds — so a
   validator-side outage (e.g. a model-relay/upstream failure) never spends the
   agent's genuine `MAX_ATTEMPTS_PER_VERSION` budget. A `scoring_error` is the
-  agent's own failure and consumes an attempt normally. `fail_job` also sets
-  `retry_after = now`, so the reissue is immediate rather than waiting the 6h
-  timeout cooldown.
+  agent's own failure and consumes an attempt normally.
+- **Infrastructure retries back off; scoring failures reissue immediately.** A
+  `scoring_error` sets `retry_after = now` (immediate reissue for another
+  validator/attempt). An `infrastructure` failure instead sets an **escalating
+  cooldown** — `infra_retry_backoff(infra_retry_grants)`, doubling from 2m up to
+  a 30m cap — so a *sustained* provider/relay outage is retried to success
+  without immediate back-to-back re-leases hammering the failing provider (an
+  inference burst). Both are well short of the 6h agent-failure timeout cooldown.
 
 ## Timeout vs. explicit failure
 

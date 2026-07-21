@@ -2797,7 +2797,7 @@ class TestFailJob:
         resp = await client.post(
             "/api/v1/validator/job/fail",
             headers=_AUTH_HEADER,
-            json=_job_fail_payload(agent_id),
+            json=_job_fail_payload(agent_id, reason="scoring_error"),
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -2806,8 +2806,9 @@ class TestFailJob:
         async with session_maker() as s:
             ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
             assert ticket is not None
-            # Closed for immediate reissue: expired now with retry_after=now, not
-            # the 6h cooldown, so the next request_job mints a fresh lease.
+            # A scoring_error closes for immediate reissue: expired now with
+            # retry_after=now, not the 6h cooldown, so the next request_job mints
+            # a fresh lease. (Infrastructure failures instead back off.)
             assert ticket.status == TicketStatus.EXPIRED
             now = datetime.now(UTC)
             assert ticket.retry_after is not None
@@ -2822,8 +2823,9 @@ class TestFailJob:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        # End-to-end reattempt seam: fail the lease, then request_job hands the
-        # same validator a brand-new ticket (fresh deadline) instead of resuming.
+        # End-to-end reattempt seam: a scoring_error fails the lease, then
+        # request_job hands the same validator a brand-new ticket (fresh
+        # deadline) instead of resuming.
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         await _seed_ticket(session_maker, agent_id)
         _install_db(app, session_maker)
@@ -2832,7 +2834,7 @@ class TestFailJob:
         failed = await client.post(
             "/api/v1/validator/job/fail",
             headers=_AUTH_HEADER,
-            json=_job_fail_payload(agent_id),
+            json=_job_fail_payload(agent_id, reason="scoring_error"),
         )
         assert failed.status_code == 200, failed.text
 
@@ -2844,6 +2846,45 @@ class TestFailJob:
         assert job["agent_id"] == str(agent_id)
         # A fresh lease, not the failed one: the deadline moved off the seed value.
         assert datetime.fromisoformat(job["deadline"]) != _TICKET_DEADLINE
+
+    async def test_infrastructure_failure_backs_off_before_reissue(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A sustained outage must not be hammered: an infrastructure failure sets
+        # a short (escalating) cooldown, so the same agent is NOT re-leased on the
+        # very next request_job the way a scoring_error is.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(agent_id, reason="infrastructure"),
+        )
+        assert failed.status_code == 200, failed.text
+
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            now = datetime.now(UTC)
+            retry_after = ticket.retry_after
+            assert retry_after is not None
+            if retry_after.tzinfo is None:
+                retry_after = retry_after.replace(tzinfo=UTC)
+            # Future cooldown (well short of the 6h agent-failure cooldown).
+            assert retry_after > now
+            assert (retry_after - now) <= timedelta(minutes=31)
+
+        # The agent is in cooldown, so request_job does not immediately re-lease it.
+        reissued = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+        assert reissued.status_code == 204, reissued.text
 
     async def test_infrastructure_failure_earns_a_compensating_grant(
         self,
@@ -4159,3 +4200,25 @@ async def test_idle_qualification_refresh_is_single_flight_and_throttled(
     await validator._refresh_qualification_if_due(session, generator=generator, now=now)
 
     refresh.assert_awaited_once_with(session, generator=generator, now=now)
+
+
+def test_infra_retry_backoff_doubles_and_caps() -> None:
+    from ditto.db.queries.tickets import (
+        INFRA_RETRY_BACKOFF_BASE,
+        INFRA_RETRY_BACKOFF_CAP,
+        infra_retry_backoff,
+    )
+
+    # First infra failure gets the base cooldown; each subsequent one doubles
+    # until the cap, so a sustained outage backs off but never past the ceiling.
+    assert infra_retry_backoff(1) == INFRA_RETRY_BACKOFF_BASE
+    assert infra_retry_backoff(2) == INFRA_RETRY_BACKOFF_BASE * 2
+    assert infra_retry_backoff(3) == INFRA_RETRY_BACKOFF_BASE * 4
+    assert infra_retry_backoff(99) == INFRA_RETRY_BACKOFF_CAP
+    # Monotonic non-decreasing and never above the cap.
+    prev = timedelta(0)
+    for grants in range(1, 20):
+        current = infra_retry_backoff(grants)
+        assert current >= prev
+        assert current <= INFRA_RETRY_BACKOFF_CAP
+        prev = current

@@ -142,6 +142,7 @@ from ditto.db.queries.scores import (
 from ditto.db.queries.tickets import (
     MAX_INFRA_RETRY_GRANTS,
     get_open_ticket,
+    infra_retry_backoff,
     issue_ticket,
     mark_ticket_scored,
 )
@@ -1110,22 +1111,25 @@ async def fail_job(
             for_update=True,
         )
         if ticket is not None:
-            # Close for immediate reissue: retry_after=now (not the 6h expiry
-            # cooldown) so the next request_job mints a fresh lease instead of
-            # resuming this failed one.
+            # Close for reissue without the 6h agent-failure cooldown so the
+            # next request_job mints a fresh lease instead of resuming this one.
             ticket.status = TicketStatus.EXPIRED
             ticket.deadline = now
-            ticket.retry_after = now
-            # A validator-side infrastructure failure is not the agent's fault,
-            # so compensate for the attempt the reissue will consume: bump the
-            # infra grant (bounded) that offsets the coming attempt_count++, so
-            # an outage never spends the agent's genuine per-version budget. A
-            # scoring_error is the agent's own failure and consumes the budget.
-            if (
-                payload.reason == "infrastructure"
-                and ticket.infra_retry_grants < MAX_INFRA_RETRY_GRANTS
-            ):
-                ticket.infra_retry_grants += 1
+            if payload.reason == "infrastructure":
+                # Not the agent's fault: bump the (bounded) infra grant that
+                # offsets the coming attempt_count++, so an outage never spends
+                # the agent's genuine per-version budget. Then apply an
+                # escalating cooldown so a *sustained* outage isn't hammered by
+                # immediate back-to-back re-leases of the same agent.
+                if ticket.infra_retry_grants < MAX_INFRA_RETRY_GRANTS:
+                    ticket.infra_retry_grants += 1
+                ticket.retry_after = now + infra_retry_backoff(
+                    ticket.infra_retry_grants
+                )
+            else:
+                # A scoring_error is the agent's own failure: consume the budget
+                # and reissue immediately for another validator/attempt.
+                ticket.retry_after = now
             await session.flush()
             reopened = True
     logger.info(
