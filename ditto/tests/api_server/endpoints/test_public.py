@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.public import PublicSystemMetrics
 from ditto.api_models.screener import (
     SCREENING_POLICY_VERSION,
     SourceReviewEvidenceItem,
@@ -1048,29 +1049,85 @@ class TestPublicFleet:
             base.update(overrides)
             return ValidatorStackHealth(**base)
 
-        assert public_endpoint._stack_health_warns(None) is False
-        assert public_endpoint._stack_health_warns(_stack()) is False
-        # A reachable-but-degraded required scorer (its relay path is down) warns.
-        assert public_endpoint._stack_health_warns(
+        assert public_endpoint._stack_component_issues(None) == []
+        assert public_endpoint._stack_component_issues(_stack()) == []
+        # A reachable-but-degraded required scorer (its relay path is down) is
+        # named with its exact state, not collapsed into a bare flag.
+        assert public_endpoint._stack_component_issues(
             _stack(dittobench_api=_component("degraded"))
-        )
-        assert public_endpoint._stack_health_warns(
+        ) == ["dittobench_api: degraded"]
+        assert public_endpoint._stack_component_issues(
             _stack(model_relay=_component("unreachable"))
-        )
+        ) == ["model_relay: unreachable"]
         # "unknown" is not-observed and must never raise a false warning.
         assert (
-            public_endpoint._stack_health_warns(
+            public_endpoint._stack_component_issues(
                 _stack(model_relay=_component("unknown"))
             )
-            is False
+            == []
         )
         # A non-required component in a bad state does not warn the fleet.
         assert (
-            public_endpoint._stack_health_warns(
+            public_endpoint._stack_component_issues(
                 _stack(pylon=_component("degraded", required=False))
             )
-            is False
+            == []
         )
+
+    def test_health_reasons_name_every_cause_for_the_badge(self) -> None:
+        def _component(
+            health: ComponentHealthState, required: bool = True
+        ) -> ValidatorComponentHealth:
+            observed = None if health == "unknown" else 1_784_000_000
+            ready = None if health in ("unknown", "unreachable") else True
+            return ValidatorComponentHealth(
+                health=health, required=required, observed_at=observed, ready=ready
+            )
+
+        def _stack(**overrides: ValidatorComponentHealth) -> ValidatorStackHealth:
+            base = {
+                name: _component("healthy")
+                for name in ValidatorStackHealth.model_fields
+            }
+            base.update(overrides)
+            return ValidatorStackHealth(**base)
+
+        # A fully healthy validator carries no reasons.
+        assert (
+            public_endpoint._health_reasons(
+                state="idle",
+                metrics=PublicSystemMetrics(
+                    cpu_percent=0,
+                    memory_percent=10,
+                    disk_percent=10,
+                    docker_status="healthy",
+                    running_containers=1,
+                    unhealthy_containers=0,
+                ),
+                active_benchmark=None,
+                stack_health=_stack(),
+            )
+            == []
+        )
+        # Every distinct cause is named; the stack cause carries the component.
+        reasons = public_endpoint._health_reasons(
+            state="idle",
+            metrics=PublicSystemMetrics(
+                cpu_percent=0,
+                memory_percent=95,
+                disk_percent=10,
+                docker_status="healthy",
+                running_containers=1,
+                unhealthy_containers=0,
+            ),
+            active_benchmark=None,
+            stack_health=_stack(dittobench_api=_component("degraded")),
+        )
+        assert reasons == ["memory 95%", "dittobench_api: degraded"]
+        # No metrics reported explains an otherwise-unknown badge.
+        assert public_endpoint._health_reasons(
+            state="idle", metrics=None, active_benchmark=None, stack_health=None
+        ) == ["host metrics not reported"]
 
     async def test_validator_name_response_is_allowlisted_to_reporters(
         self,
