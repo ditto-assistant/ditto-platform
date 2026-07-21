@@ -494,6 +494,7 @@ async def claim(
             lease_deadline=attempt.deadline,
             precheck_reason_code=attempt.reason_code,
             duplicate_of=duplicate_of,
+            build_only=attempt.build_only,
         )
         for agent, attempt, duplicate_of in claimed
     ]
@@ -1108,6 +1109,19 @@ async def submit_result(
             "inconclusive outcomes are not submittable verdicts"
         )
     if payload.outcome == ScreenResultOutcome.QUARANTINE:
+        # A build-only attempt rebuilds an already-adjudicated submission's
+        # prerequisites and runs no source review, so it must not be able to
+        # re-quarantine — that would let a screener silently override the
+        # operator release / prior pass that made it EVALUATING.
+        if payload.attempt_id is not None:
+            async with session.begin():
+                reported_attempt = await get_screening_attempt(
+                    session, attempt_id=payload.attempt_id
+                )
+            if reported_attempt is not None and reported_attempt.build_only:
+                raise AgentNotScreenableError(
+                    "a build-only screening attempt cannot quarantine"
+                )
         target = AgentStatus.QUARANTINED
         public_reason = "Submission held for anti-cheat review"
     elif payload.outcome == ScreenResultOutcome.RETRYABLE_INFRA:

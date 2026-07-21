@@ -12,6 +12,7 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.sql.selectable import ScalarSelect
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_contract import benchmark_contracts
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.db.models import (
     Agent,
@@ -163,6 +164,40 @@ def missing_active_benchmark_dataset() -> ColumnElement[bool]:
         )
     )
     return activation_exists & ~versioned_dataset_exists
+
+
+def missing_active_screened_image() -> ColumnElement[bool]:
+    """Whether the current agent lacks a complete screened image the activated
+    benchmark version requires (v3+).
+
+    Validators only lease an agent for a screened-image benchmark once every
+    ``screened_image_*`` field is set (see ``eligible_screened_image`` in
+    ``db/queries/tickets.py``). An agent quarantined mid-screen — before its
+    image was uploaded and verified — and then RELEASED to ``evaluating`` on the
+    current policy has an incomplete image: validators skip it, and without this
+    predicate no screener re-claims it, so it is stuck for good. Re-screening it
+    rebuilds and verifies the image (and its dataset)."""
+    active_version = (
+        select(BenchmarkRollout.desired_version)
+        .where(BenchmarkRollout.status == "activated")
+        .order_by(BenchmarkRollout.activated_at.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    screened_versions = [
+        contract.version
+        for contract in benchmark_contracts()
+        if contract.requires_screened_image
+    ]
+    incomplete_image = (
+        Agent.screened_image_sha256.is_(None)
+        | Agent.screened_image_size_bytes.is_(None)
+        | Agent.screened_image_id.is_(None)
+        | Agent.screened_image_ref.is_(None)
+        | Agent.screened_image_upload_id.is_(None)
+        | Agent.screened_image_verified_at.is_(None)
+    )
+    return active_version.in_(screened_versions) & incomplete_image
 
 
 async def expire_screening_attempts(session: AsyncSession, *, now: datetime) -> int:
@@ -333,6 +368,10 @@ async def claim_screening_attempts(
             & missing_v3_screen
         ),
         ((Agent.status == AgentStatus.EVALUATING) & missing_active_benchmark_dataset()),
+        # A submission released from an anti-cheat quarantine back to EVALUATING
+        # but without a complete screened image the active version needs is
+        # otherwise stuck forever — validators skip it and nothing re-screens it.
+        ((Agent.status == AgentStatus.EVALUATING) & missing_active_screened_image()),
     )
     earlier = aliased(Agent)
     earlier_pending = exists(
@@ -448,6 +487,17 @@ async def claim_screening_attempts(
                         public_reason=agent.screening_reason,
                     )
                 )
+        # An EVALUATING agent on the current policy already cleared the anti-cheat
+        # review (it passed, or an operator released its quarantine). Re-claiming
+        # it — to rebuild a missing screened image or dataset — must NOT re-run
+        # that review, or we would re-judge an approved artifact (and risk a
+        # release/re-quarantine loop). It is a build-only pass. A fresh
+        # (UPLOADED), failed, or stale-policy submission still gets the full
+        # review.
+        build_only = (
+            agent.status == AgentStatus.EVALUATING
+            and agent.screening_policy_version >= SCREENING_POLICY_VERSION
+        )
         attempt = ScreeningAttempt(
             attempt_id=uuid4(),
             agent_id=agent.agent_id,
@@ -460,6 +510,7 @@ async def claim_screening_attempts(
                 "exact-cross-miner-duplicate" if duplicate_of is not None else None
             ),
             duplicate_of=duplicate_of,
+            build_only=build_only,
         )
         session.add(attempt)
         if agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
