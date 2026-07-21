@@ -475,6 +475,14 @@
     .gitem:last-child { border-bottom: none; }
     .gterm { font-size: 13px; font-weight: 700; color: var(--text); }
     .gdesc { font-size: 13px; color: var(--text-dim); line-height: 1.5; margin-top: 2px; }
+    /* Illustrative example under a category's purpose: a muted, quoted-looking line
+       with a small "e.g." tag, so it reads as a concrete instance, not a definition. */
+    .gex { font-size: 12.5px; color: var(--text-dim); line-height: 1.5; margin-top: 5px; padding-left: 9px; border-left: 2px solid color-mix(in oklab, var(--accent-2) 34%, transparent); }
+    .gex-tag { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-faint); margin-right: 6px; }
+    /* Pointer from a run's detail view to the central Benchmark glossary. */
+    .gloss-link { margin-top: 16px; font-size: 12.5px; }
+    .gloss-link a { color: var(--accent-2); text-decoration: none; font-weight: 600; }
+    .gloss-link a:hover { text-decoration: underline; }
     .gcat-head { font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: var(--text-faint); margin: 12px 0 2px; }
     /* Version-history changelog items */
     .ver-item { padding: 11px 0 12px; border-bottom: 1px solid color-mix(in oklab, var(--border) 52%, transparent); }
@@ -4108,8 +4116,9 @@
         pc +
         shaRow +
         casesSection(e) +
-        categoryGlossary(e) +
-        metricsGlossary(e);
+        // Term + category definitions live only on the Benchmark glossary now, so
+        // this detail view stays about the run. Point there instead of repeating them.
+        '<div class="gloss-link"><a href="#/benchmark">What each category and metric means →</a></div>';
       renderConsensus(e);
 
       showModal();
@@ -4256,21 +4265,6 @@
       }).catch(function () { /* held / still-evaluating: leave empty */ });
     }
 
-    // Plain-language help for the metric and telemetry terms in this drawer. Each
-    // is a short paragraph, rendered collapsed so the panel stays clean by default.
-    var TERM_HELP = [
-      ["Composite", "The headline score from 0 to 1: (0.5 × tool mean + 0.5 × memory mean), multiplied by the benchmark quality gates, then by the v5 token-efficiency multiplier. Token efficiency can remove at most 10%; the calculation panel distinguishes it from the larger pre-token quality adjustment. Final full-benchmark scores drive the competition only while the miner hotkey is currently registered on SN118."],
-      ["Standard error (± SE)", "The uncertainty on the composite, estimated from how much the per-case scores vary. Two miners within about 1 SE of each other are a statistical tie, not a real gap."],
-      ["Tool mean", "Average score over the tool-use cases. Did the agent call the right tools, ground its arguments, and read memory instead of the web when the fact was already known?"],
-      ["Memory mean", "Average score over the memory cases. Did the agent recall and reason over stored facts across sessions, over time, and while resisting instructions hidden in the data?"],
-      ["Benchmark version", "Which DittoBench version scored this run. Scores compare only within one version. A run on an older version is marked and is not ranked against the current one."],
-      ["Provisional", "The run used a smaller profile that did not administer the full benchmark. It omits the hard memory categories, and its few cases are easy to ace. It is shown for transparency but is not ranked and earns no emissions."],
-      ["Paraphrased cases", "Anti-overfit. Counts cases whose wording was regenerated so a harness that memorized answers cannot match on surface text."],
-      ["Lexical-gap rewrites", "Anti-overfit (NoLiMa). Questions are reworded to share fewer words with the stored fact, so answering needs real retrieval instead of keyword overlap. The figure shows word overlap before and after the rewrite."],
-      ["Capped tool cases", "Tool cases where the harness reported a result itself instead of calling the observable endpoint. Self-reports are not trusted, so those cases are capped."],
-      ["Memory seeding waves", "How many staged waves seeded the memory haystack. More waves means a longer gap between when a fact is stored and when it is asked about."],
-    ];
-
     // Human-readable name for each category key the API surfaces. Shown in place
     // of the raw key wherever a category appears (per-case rows, breakdowns, the
     // category glossary). A missing key falls back to the raw string.
@@ -4387,42 +4381,6 @@
       return "low";
     }
 
-    // Collapsed glossary of the metric terms that actually appear in this run.
-    function metricsGlossary(e) {
-      var g = e.integrity || {};
-      var items = TERM_HELP.filter(function (t) {
-        var k = t[0];
-        if (k === "Standard error (± SE)") return e.composite_stderr != null;
-        if (k === "Provisional") return !isEligible(e);
-        if (k === "Paraphrased cases") return g.paraphrase_applied != null;
-        if (k === "Lexical-gap rewrites") return g.lexical_gap_rewritten != null;
-        if (k === "Capped tool cases") return g.capped_tool_cases != null;
-        if (k === "Memory seeding waves") return g.seeding_waves != null;
-        return true; // composite / tool mean / memory mean / bench version always apply
-      });
-      var body = items.map(function (t) {
-        return '<div class="gitem"><div class="gterm">' + esc(t[0]) +
-          '</div><div class="gdesc">' + esc(t[1]) + "</div></div>";
-      }).join("");
-      return '<details class="gloss"><summary>What these terms mean</summary>' + body + "</details>";
-    }
-
-    // Collapsed glossary of the purpose of each test category present in this run.
-    function categoryGlossary(e) {
-      var cats = [];
-      if (e.per_category && e.per_category.length) cats = e.per_category.map(function (c) { return c.category; });
-      else if (e.case_results && e.case_results.length) cats = e.case_results.map(function (c) { return c.category; });
-      var seen = {}, uniq = [];
-      cats.forEach(function (c) { if (c && !seen[c]) { seen[c] = 1; uniq.push(c); } });
-      if (!uniq.length) return "";
-      var body = uniq.sort().map(function (c) {
-        return '<div class="gitem"><div class="gterm">' + esc(categoryLabel(c)) +
-          '</div><div class="gdesc">' + esc(categoryPurpose(c)) + "</div></div>";
-      }).join("");
-      return '<details class="gloss"><summary>What each test category checks</summary>' +
-        '<div class="gdesc" style="padding:4px 0 6px">A short summary of each category’s purpose. The exact prompts and expected answers are never shown.</div>' +
-        body + "</details>";
-    }
     // A case's pass/fail verdict. Memory cases carry a binary deterministic result (correct).
     // Tool cases are graded continuously, so a full deterministic trajectory counts
     // as a pass, a fully wrong one as a fail, and a partial trajectory as partial.
@@ -6816,15 +6774,6 @@
           if (c.label) CATEGORY_LABEL[c.key] = c.label;
           if (c.purpose) CATEGORY_PURPOSE[c.key] = c.purpose;
         });
-        // Add the scorer's metric / gate-factor definitions to the run term glossary
-        // so every factor that moves the composite (chiefly the conversational-sanity
-        // gate, which floors at 0.5) is documented, not just the headline means. Skip
-        // labels the inline TERM_HELP already carries so the curated copy wins.
-        (g.metrics || []).forEach(function (m) {
-          if (!m || !m.label || !m.description) return;
-          var exists = TERM_HELP.some(function (t) { return t[0] === m.label; });
-          if (!exists) TERM_HELP.push([m.label, m.description]);
-        });
         renderBenchDocs();
       }).catch(function () {});
     }
@@ -6875,8 +6824,14 @@
         var catBlocks = kinds.map(function (k) {
           var rows = GLOSSARY_DATA.categories.filter(function (c) { return c.kind === k[0]; })
             .map(function (c) {
+              // Each category carries a short, public-safe example of what the case
+              // looks like (illustrative only, never the actual seeded prompt or its
+              // answer). Rendered under the purpose to make the category concrete.
+              var ex = c.example
+                ? '<div class="gex"><span class="gex-tag">e.g.</span>' + esc(c.example) + '</div>'
+                : '';
               return '<div class="gitem"><div class="gterm">' + esc(c.label) +
-                '</div><div class="gdesc">' + esc(c.purpose) + '</div></div>';
+                '</div><div class="gdesc">' + esc(c.purpose) + '</div>' + ex + '</div>';
             }).join("");
           return rows ? '<div class="gcat-head">' + esc(k[1]) + '</div>' + rows : "";
         }).join("");
