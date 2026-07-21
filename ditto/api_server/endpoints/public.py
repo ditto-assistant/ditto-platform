@@ -91,6 +91,8 @@ from ditto.api_models import (
     PublicSubmissionsResponse,
     PublicSubmissionSummary,
     PublicSystemMetrics,
+    PublicTokenEfficiency,
+    PublicTokenUsage,
     PublicValidationAttempt,
     PublicValidatorHeartbeat,
     PublicValidatorHeartbeatsResponse,
@@ -207,7 +209,12 @@ _CHAIN_WEIGHTS_TIMEOUT_SECONDS = 4.0
 # The exact generator release each benchmark version's reproduction commands
 # pin. v0.8.0 is the tag cut from dittobench-datagen's anti-gaming branch at
 # the v3 release (see dittobench-api docs/v3-release.md for the merge order).
-_DATAGEN_VERSION_BY_BENCH_VERSION = {2: "v0.7.0", 3: "v0.8.0", 4: "v0.9.0"}
+_DATAGEN_VERSION_BY_BENCH_VERSION = {
+    2: "v0.7.0",
+    3: "v0.8.0",
+    4: "v0.9.0",
+    5: "v0.10.0",
+}
 _DATAGEN_RUN_SIZES = frozenset({"small", "medium", "full"})
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 _VALIDATOR_STALE_WINDOW = timedelta(minutes=15)
@@ -671,6 +678,26 @@ def _safe_calibration(details: dict) -> tuple[float | None, int | None]:
     return b, count
 
 
+def _safe_token_usage(details: dict) -> PublicTokenUsage | None:
+    raw = details.get("token_usage")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return PublicTokenUsage.model_validate(raw)
+    except ValidationError:
+        return None
+
+
+def _safe_token_efficiency(details: dict) -> PublicTokenEfficiency | None:
+    raw = details.get("token_efficiency")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return PublicTokenEfficiency.model_validate(raw)
+    except ValidationError:
+        return None
+
+
 def _public_entry(
     rank: int,
     r: LedgerRow,
@@ -717,6 +744,12 @@ def _public_entry(
             finalized and r.eligible and registered if registered is not None else None
         ),
         composite=r.composite,
+        raw_composite=(
+            float(details["raw_composite"])
+            if isinstance(details.get("raw_composite"), (int, float))
+            and not isinstance(details.get("raw_composite"), bool)
+            else None
+        ),
         # Use the exact uncertainty value sent to validators: a stashed re-score
         # SE when present, otherwise the k=3 quorum SEM. This keeps the displayed
         # band and the KOTH projection aligned with the real fold.
@@ -738,6 +771,8 @@ def _public_entry(
         per_category=_safe_categories(details),
         integrity=_safe_integrity(details),
         tokens=tokens,
+        token_usage=_safe_token_usage(details),
+        token_efficiency=_safe_token_efficiency(details),
         history=trend,
         case_results=_safe_case_results(details),
     )
@@ -2070,6 +2105,23 @@ async def agent_pipeline(
         provisional_scores=[
             PublicProvisionalScore(
                 composite=score.composite,
+                raw_composite=(
+                    float(score.details["raw_composite"])
+                    if isinstance(score.details, dict)
+                    and isinstance(score.details.get("raw_composite"), (int, float))
+                    and not isinstance(score.details.get("raw_composite"), bool)
+                    else None
+                ),
+                token_usage=(
+                    _safe_token_usage(score.details)
+                    if isinstance(score.details, dict)
+                    else None
+                ),
+                token_efficiency=(
+                    _safe_token_efficiency(score.details)
+                    if isinstance(score.details, dict)
+                    else None
+                ),
                 seed=str(score.seed),
                 run_size=agent.dataset_run_size,
                 bench_version=_score_bench_version(score),

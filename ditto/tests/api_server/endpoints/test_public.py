@@ -71,6 +71,56 @@ _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 _VALIDATOR_C = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
 
+def test_v5_token_telemetry_public_parser_is_typed_and_fail_closed() -> None:
+    details = {
+        "token_usage": {
+            "accounting_version": 2,
+            "status": "complete",
+            "source": "model_proxy_provider_response",
+            "provider": "openrouter",
+            "profile_revision": "profile-v1",
+            "model": "qwen/qwen3-32b",
+            "prompt_tokens": 1800,
+            "prompt_bytes": 7200,
+            "completion_tokens": 200,
+            "total_tokens": 2000,
+            "requests": 10,
+            "successes": 10,
+            "usage_available": 10,
+            "usage_unavailable": 0,
+            "provider_latency_ms": 2500,
+            "ttft_status": "unavailable_non_streaming",
+        },
+        "token_efficiency": {
+            "formula_version": "v5-relay-token-waste-p90-v1",
+            "baseline_id": "v5-baseline",
+            "baseline_prompt_tokens": 900,
+            "baseline_completion_tokens": 100,
+            "baseline_total_tokens": 1000,
+            "budget_percentile": 0.9,
+            "observed_prompt_tokens": 1800,
+            "observed_completion_tokens": 200,
+            "observed_total_tokens": 2000,
+            "excess_ratio": 1.0,
+            "maximum_penalty": 0.1,
+            "minimum_multiplier": 0.9,
+            "multiplier": 0.95,
+            "raw_composite": 0.9,
+            "adjusted_composite": 0.855,
+            "penalty_applied": True,
+            "decision_reason": "above_budget",
+        },
+    }
+    usage = public_endpoint._safe_token_usage(details)
+    decision = public_endpoint._safe_token_efficiency(details)
+    assert usage is not None and usage.total_tokens == 2000
+    assert decision is not None and decision.adjusted_composite == 0.855
+    assert decision.penalty_applied is True
+
+    details["token_efficiency"]["multiplier"] = 1.001
+    assert public_endpoint._safe_token_efficiency(details) is None
+
+
 @pytest.fixture
 async def engine() -> AsyncIterator[AsyncEngine]:
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")

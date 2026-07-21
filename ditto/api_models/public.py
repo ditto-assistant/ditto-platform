@@ -148,6 +148,49 @@ class PublicRunModels(BaseModel):
     ]
 
 
+class PublicTokenUsage(BaseModel):
+    """Trusted provider usage observed by the validator-owned model proxy."""
+
+    accounting_version: Annotated[int, Field(ge=1)]
+    status: Annotated[str, Field(pattern=r"^(complete|unavailable)$")]
+    source: str
+    provider: str
+    profile_revision: str
+    model: str
+    prompt_tokens: Annotated[int, Field(ge=0)]
+    prompt_bytes: Annotated[int, Field(ge=0)]
+    completion_tokens: Annotated[int, Field(ge=0)]
+    total_tokens: Annotated[int, Field(ge=0)]
+    requests: Annotated[int, Field(ge=0)]
+    successes: Annotated[int, Field(ge=0)]
+    usage_available: Annotated[int, Field(ge=0)]
+    usage_unavailable: Annotated[int, Field(ge=0)]
+    provider_latency_ms: Annotated[int, Field(ge=0)]
+    ttft_status: str
+
+
+class PublicTokenEfficiency(BaseModel):
+    """Auditable v5 relay-token waste penalty."""
+
+    formula_version: str
+    baseline_id: str | None = None
+    baseline_prompt_tokens: Annotated[int | None, Field(default=None, ge=0)]
+    baseline_completion_tokens: Annotated[int | None, Field(default=None, ge=0)]
+    baseline_total_tokens: Annotated[int | None, Field(default=None, ge=0)]
+    budget_percentile: Annotated[float, Field(gt=0.0, le=1.0)]
+    observed_prompt_tokens: Annotated[int, Field(ge=0)]
+    observed_completion_tokens: Annotated[int, Field(ge=0)]
+    observed_total_tokens: Annotated[int, Field(ge=0)]
+    excess_ratio: Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
+    maximum_penalty: Annotated[float, Field(ge=0.0, le=1.0)]
+    minimum_multiplier: Annotated[float, Field(ge=0.0, le=1.0)]
+    multiplier: Annotated[float, Field(ge=0.9, le=1.0)]
+    raw_composite: Annotated[float, Field(ge=0.0, le=1.0)]
+    adjusted_composite: Annotated[float, Field(ge=0.0, le=1.0)]
+    penalty_applied: bool
+    decision_reason: str
+
+
 class PublicLeaderboardEntry(BaseModel):
     """One miner's best score, aggregate-only, for public display.
 
@@ -244,8 +287,22 @@ class PublicLeaderboardEntry(BaseModel):
         ),
     ]
     composite: Annotated[
-        float, Field(ge=0.0, le=1.0, description="Best composite in [0,1].")
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Best composite in [0,1].",
+        ),
     ]
+    raw_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description="Pre-efficiency v5 quality score, when present.",
+        ),
+    ] = None
     composite_stderr: Annotated[
         float | None,
         Field(
@@ -385,6 +442,14 @@ class PublicLeaderboardEntry(BaseModel):
         int | None,
         Field(default=None, ge=0, description="LLM tokens spent generating+judging."),
     ]
+    token_usage: Annotated[
+        PublicTokenUsage | None,
+        Field(default=None, description="Validator-proxy token accounting."),
+    ] = None
+    token_efficiency: Annotated[
+        PublicTokenEfficiency | None,
+        Field(default=None, description="Benchmark-v5 efficiency adjustment."),
+    ] = None
     history: Annotated[
         list[float] | None,
         Field(
@@ -640,7 +705,12 @@ class PublicValidatorScore(BaseModel):
         str, Field(pattern=_SS58_PATTERN, description="Scoring validator's hotkey.")
     ]
     composite: Annotated[
-        float, Field(ge=0.0, le=1.0, description="Composite this validator reported.")
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Composite this validator reported in [0,1].",
+        ),
     ]
     tool_mean: Annotated[
         float, Field(ge=0.0, le=1.0, description="Mean tool accuracy in [0,1].")
@@ -793,7 +863,7 @@ class PublicSubmissionScores(BaseModel):
             default=None,
             ge=0.0,
             le=1.0,
-            description="Median of the reported composites — the canonical score.",
+            description="Median canonical composite in [0,1].",
         ),
     ]
     dataset_seed: Annotated[
@@ -849,7 +919,12 @@ class PublicSubmissionSummary(BaseModel):
     ]
     median_composite: Annotated[
         float | None,
-        Field(default=None, ge=0.0, le=1.0, description="Median canonical composite."),
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description="Median canonical composite in [0,1].",
+        ),
     ]
     dataset_seed: Annotated[
         int | None, Field(default=None, description="Platform-pinned dataset seed.")
@@ -1182,8 +1257,19 @@ class PublicProvisionalScore(BaseModel):
     """
 
     composite: Annotated[
-        float, Field(ge=0.0, le=1.0, description="Accepted composite in [0,1].")
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Accepted composite in [0,1].",
+        ),
     ]
+    raw_composite: Annotated[
+        float | None,
+        Field(default=None, ge=0.0, le=1.0, description="Pre-efficiency v5 score."),
+    ] = None
+    token_usage: PublicTokenUsage | None = None
+    token_efficiency: PublicTokenEfficiency | None = None
     seed: Annotated[
         str,
         Field(
@@ -1389,7 +1475,12 @@ class PublicBenchCorpusEntry(BaseModel):
     seed: Annotated[int, Field(description="Dataset seed for the run.")]
     run_id: Annotated[str, Field(description="Scoring-engine run id.")]
     composite: Annotated[
-        float, Field(ge=0.0, le=1.0, description="Composite this validator reported.")
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Composite this validator reported in [0,1].",
+        ),
     ]
     per_case: Annotated[
         list[dict[str, Any]],
