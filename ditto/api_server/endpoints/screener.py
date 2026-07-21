@@ -27,6 +27,8 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import secrets
@@ -57,6 +59,10 @@ from ditto.api_models import (
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.screener_review_settings import (
+    EffectiveScreenerReviewSettings,
+    ScreenerReviewSettings,
+)
 from ditto.api_models.system_health import system_metrics_signing_token
 from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
 from ditto.api_server.datapipeline import DatasetGenerator
@@ -84,6 +90,7 @@ from ditto.db.models import (
     BenchmarkRollout,
     BenchmarkRolloutMember,
     ScreenedImageUpload,
+    ScreenerReviewSettingsRevision,
     ScreeningAttempt,
     ScreeningQuarantine,
 )
@@ -120,6 +127,7 @@ _SCREENED_IMAGE_PART_SIZE = 64 * 1024**2
 _SCREENING_LEASE_TTL = timedelta(minutes=70)
 _HEARTBEAT_MAX_SKEW_SECONDS = 300
 _HEARTBEAT_MAX_BYTES = 4096
+_INSTANCE_ID_PATTERN = r"^[a-zA-Z0-9._-]{1,63}$"
 # instance_id stored for pre-v3 (no per-instance identity) heartbeats. Distinct
 # from any real GCE instance name, so upgraded workers never collide with it.
 _LEGACY_INSTANCE_ID = "legacy"
@@ -233,6 +241,50 @@ async def require_screener(
 
 
 ScreenerDep = Annotated[str, Depends(require_screener)]
+
+
+def _review_settings_checksum(settings: ScreenerReviewSettings) -> str:
+    payload = json.dumps(
+        settings.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+@router.get("/review-settings", response_model=EffectiveScreenerReviewSettings)
+async def effective_review_settings(
+    response: Response,
+    _screener_hotkey: ScreenerDep,
+    session: SessionDep,
+    instance_id: Annotated[str, Query(pattern=_INSTANCE_ID_PATTERN)],
+) -> EffectiveScreenerReviewSettings:
+    """Return the exact-instance override or global settings revision."""
+    row = await session.scalar(
+        select(ScreenerReviewSettingsRevision)
+        .where(ScreenerReviewSettingsRevision.scope.in_((instance_id, "*")))
+        .order_by(
+            (ScreenerReviewSettingsRevision.scope == instance_id).desc(),
+            ScreenerReviewSettingsRevision.revision.desc(),
+        )
+        .limit(1)
+    )
+    if row is None:
+        settings = ScreenerReviewSettings()
+        result = EffectiveScreenerReviewSettings(
+            revision=0,
+            scope="builtin-default",
+            settings=settings,
+            checksum=_review_settings_checksum(settings),
+        )
+    else:
+        result = EffectiveScreenerReviewSettings(
+            revision=row.revision,
+            scope=row.scope,
+            settings=ScreenerReviewSettings.model_validate_json(json.dumps(row.settings)),
+            checksum=row.checksum,
+        )
+    response.headers["Cache-Control"] = "private, no-cache"
+    response.headers["ETag"] = f'"{result.revision}-{result.checksum}"'
+    return result
 
 
 def _heartbeat_signing_message(payload: ScreenerHeartbeatRequest) -> bytes:
