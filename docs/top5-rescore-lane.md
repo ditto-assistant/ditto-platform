@@ -71,18 +71,36 @@ CRN can key the seed on any set of agent ids. Two options:
 
 Consensus safety: the seed is a pure function of `(champion_id, version,
 tempo_index)` — every validator derives it identically; no wall-clock, no RNG.
+The encoding is **scoped to the major bench version** (v4, v5, …) via
+`crn_seed(ids, version, k)`, so each version has its own seed family and a
+version bump cleanly starts a fresh baseline. **Both repos use the identical crn
+encoding** (`crn.py` is the single source of truth; the platform mirrors it
+byte-for-byte) and the **platform validates the submitted seed** against its own
+derivation — a validator cannot cherry-pick a favorable seed (anti-grind).
 
-### 3. Where the scores land — in-row, no new rows
+### 3. Where the scores land — an append-only confirmation ledger
 
-Each rescore does **not** add a Score row. The validator folds its K per-seed
-composites into **one** median-run row and writes the per-seed arrays into
-`Score.details.confirmation_composites` / `confirmation_seeds` (+ `composite_stderr`)
-(`worker.py:1463-1533`; surfaced by `endpoints/scoring.py:274-276`). The ledger's
-lower-median (`scores.py:665-753`) and the KOTH fold already median over those
-in-row seeds. **Consequence:** none of the "exactly-3" invariants are touched — no
-4th ticket (`tickets.py:471-479` untouched), no 4th `Score` PK row
-(`db/models.py:829-831`), no change to k=3 finalization. "More seeds" = a longer
-`confirmation_composites` array, which the fold already handles.
+Confirmation results are stored **append-only**: a new immutable
+`ConfirmationScore` row per `(agent_id, validator_hotkey, bench_version, seed)` —
+unique key, INSERT-idempotent (`ON CONFLICT DO NOTHING`), **never UPDATEd or
+deleted**. Each rescore round the validator submits **only the newly-scored
+seed's** result (signed); the platform appends it. The longer a champion reigns,
+the more rows accumulate — the record grows monotonically, and history is fully
+auditable (every seed's score kept forever, no destructive read-modify-write).
+
+The authoritative **k=3 `Score` table is untouched** — still no 4th ticket
+(`tickets.py:471-479`), no 4th `Score` PK row (`db/models.py:829-831`), no change
+to k=3 finalization. The confirmation ledger is a *separate*, additive store. The
+KOTH fold (`weights.py`) and its platform mirror (`koth.py`) read the paired
+evidence from this append-only history (group by seed → paired lower-median),
+exposed on the ledger read (`/scoring/scores`, beside #252's signed receipts).
+The median is N-agnostic (`scores.py:665-753`), so "more seeds" is just "more
+rows to median over."
+
+*(This replaces the earlier in-row `Score.details.confirmation_composites` array,
+which was a replace-the-array write — not append-only. Append-only rows are the
+consensus-cleaner, auditable form and are what the accumulate-over-reign property
+wants.)*
 
 ### 4. Membership, tempo, catch-up
 
@@ -99,12 +117,23 @@ in-row seeds. **Consequence:** none of the "exactly-3" invariants are touched �
 
 ## What does NOT change (and why that's the point)
 
-Because rescores land in `details` and not as new rows/validators, all of these
-stay exactly as-is: `SCORING_QUORUM = 3`, the k=3 ticket cap, the
+Because rescores land in a **separate append-only `ConfirmationScore` ledger**
+and not as new rows/validators on the k=3 `Score` table, all of these stay
+exactly as-is: `SCORING_QUORUM = 3`, the k=3 ticket cap, the
 one-ticket-per-validator index, `submit_score` finalization, and the
 `get_score_continuation_floor` two-score bound. The lane is **additive** to the
-authoritative k=3 record; it only enriches the top 5's `details` with more shared
-seeds, which the fold already medians. That is what keeps it consensus-safe.
+authoritative k=3 record; it only accumulates more shared-seed rows the fold
+medians over. That is what keeps it consensus-safe.
+
+## UI
+
+The lane must be legible on the leaderboard/ops surfaces: each top-5 agent
+carries its **confirmation-score count** (shared-seed depth) and the resulting
+**widened median band**, and `dashboard/index.html` shows it — e.g. "N
+shared-seed confirmations" on the top-5 rows, growing while an agent holds its
+spot. A longer-reigning champion visibly accumulates more scores; that
+accumulation *is* the fairness signal, so it should read plainly rather than be
+hidden in `details`.
 
 ## PR breakdown
 
@@ -127,14 +156,18 @@ Each platform/subnet PR opens as a **draft** with this doc linked, because the
 change feeds dethroning → emissions → chain weights and must be reviewed against
 the consensus fold before merge.
 
-## Open decisions (need a call before implementation)
+## Decisions (resolved)
 
-1. **Champion-anchored vs set-anchored seeds** — recommend champion-anchored
-   (§2). Confirm.
-2. **Extend #195 vs stack on it** — recommend a **stacked** PR (keep #195's
-   reviewed single-leader path intact; add the top-5 generalization on top) rather
-   than rewriting #195 in place.
-3. **Tempo default `T`** — 2–8 range given; recommend **4** (~one round / 5 h) as
-   the default, tunable by config.
-4. **Catch-up rate** — recommend **2×** until depth-converged, hard-capped at the
-   champion's seed count.
+1. **Seeds: champion-anchored** (§2) — all 5 score the champion's growing seed
+   set; stable baseline; anchor moves only on dethrone.
+2. **Seed encoding: identical + version-scoped** — both repos use `crn.py`'s
+   `crn_seed(ids, version, k)` byte-for-byte, keyed on the major bench version
+   (v4/v5/…); the platform validates the submitted seed (anti-grind).
+3. **Storage: append-only** — an immutable `ConfirmationScore` ledger (§3), never
+   updated; the k=3 `Score` table is untouched.
+4. **Structure: stacked** on #195/#161 (don't rewrite them).
+5. **Tempo `T` = 4** (~one round / 5 h), config-tunable.
+6. **Catch-up = 2×** fresh missing seeds/round until depth-converged, hard-capped
+   at the champion's seed count.
+7. **UI** — top-5 confirmation depth + widened band shown on the leaderboard and
+   dashboard.
