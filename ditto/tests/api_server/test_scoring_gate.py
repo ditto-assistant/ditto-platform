@@ -59,6 +59,7 @@ def _entry(
     prompt_fingerprint: dict | None = None,
     first_seen: datetime = _FIRST_SEEN,
     agent_id: UUID | None = None,
+    coldkey: str | None = None,
 ) -> LedgerRow:
     return LedgerRow(
         miner_hotkey=miner,
@@ -74,6 +75,7 @@ def _entry(
         validator_hotkey="5Validator",
         signature="ab" * 64,
         status=AgentStatus.SCORED,
+        miner_coldkey=coldkey,
         content_fingerprint=content_fingerprint,
         structural_fingerprint=structural_fingerprint,
         normalized_source_hash=normalized_source_hash,
@@ -109,6 +111,25 @@ class TestEvaluateAntidup:
         assert decision.held is True
         assert decision.duplicate_of == incumbent.agent_id
         assert "sha256" in (decision.reason or "")
+
+    def test_same_coldkey_across_hotkeys_is_lineage_not_copy(self) -> None:
+        incumbent = _entry(
+            composite=0.70,
+            miner="5OldHotkey",
+            coldkey="5SharedColdkey",
+            sha256="cc" * 32,
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5NewHotkey",
+            miner_coldkey="5SharedColdkey",
+            sha256="cc" * 32,
+            composite=0.70,
+            size_bytes=incumbent.size_bytes,
+            eligible=[incumbent],
+        )
+
+        assert decision.held is False
 
     def test_exact_repack_normalized_hash_is_held(self) -> None:
         # Different bytes (sha256) but the same canonicalized source: a reformat /

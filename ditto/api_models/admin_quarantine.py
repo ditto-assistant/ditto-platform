@@ -317,6 +317,7 @@ class AdminArtifactDuplicate(BaseModel):
     agent_status: str
     submitted_at: datetime
     match: Literal["identical_artifact", "identical_normalized_source"]
+    same_owner: bool = False
 
 
 class AdminDuplicateSummary(BaseModel):
@@ -325,6 +326,8 @@ class AdminDuplicateSummary(BaseModel):
     total: int
     cross_miner: int
     same_miner: int
+    cross_owner: int
+    same_owner: int
     sample_truncated: bool
 
 

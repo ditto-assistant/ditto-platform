@@ -14,8 +14,9 @@ from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from ditto.api_models.admin_quarantine import (
     AdminArtifactDuplicate,
@@ -93,6 +94,7 @@ from ditto.db.models import (
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
+    EvaluationPayment,
     Score,
     ScreeningAttempt,
     ScreeningDispute,
@@ -1047,18 +1049,67 @@ async def _build_quarantine_context(
         )
         or 0
     )
-    duplicate_rows = (
+    candidate_coldkey = await session.scalar(
+        select(EvaluationPayment.miner_coldkey).where(
+            EvaluationPayment.agent_id == agent.agent_id
+        )
+    )
+    duplicate_payment = aliased(EvaluationPayment)
+    same_owner_filter = Agent.miner_hotkey == agent.miner_hotkey
+    if candidate_coldkey is not None:
+        same_owner_filter = or_(
+            same_owner_filter,
+            duplicate_payment.miner_coldkey == candidate_coldkey,
+        )
+    cross_owner_filter = Agent.miner_hotkey != agent.miner_hotkey
+    if candidate_coldkey is not None:
+        cross_owner_filter = and_(
+            cross_owner_filter,
+            or_(
+                duplicate_payment.miner_coldkey.is_(None),
+                duplicate_payment.miner_coldkey != candidate_coldkey,
+            ),
+        )
+    same_owner_count = int(
         (
-            await session.execute(
-                select(Agent)
-                .where(*duplicate_filter)
-                .order_by(Agent.created_at.desc(), Agent.agent_id.desc())
-                .limit(20)
+            await session.scalar(
+                select(func.count())
+                .select_from(Agent)
+                .outerjoin(
+                    duplicate_payment,
+                    duplicate_payment.agent_id == Agent.agent_id,
+                )
+                .where(*duplicate_filter, same_owner_filter)
             )
         )
-        .scalars()
-        .all()
+        or 0
     )
+    cross_owner_count = int(
+        (
+            await session.scalar(
+                select(func.count())
+                .select_from(Agent)
+                .outerjoin(
+                    duplicate_payment,
+                    duplicate_payment.agent_id == Agent.agent_id,
+                )
+                .where(*duplicate_filter, cross_owner_filter)
+            )
+        )
+        or 0
+    )
+    duplicate_rows = (
+        await session.execute(
+            select(Agent, duplicate_payment.miner_coldkey)
+            .outerjoin(
+                duplicate_payment,
+                duplicate_payment.agent_id == Agent.agent_id,
+            )
+            .where(*duplicate_filter)
+            .order_by(Agent.created_at.desc(), Agent.agent_id.desc())
+            .limit(20)
+        )
+    ).all()
     duplicates = [
         AdminArtifactDuplicate(
             agent_id=other.agent_id,
@@ -1071,8 +1122,14 @@ async def _build_quarantine_context(
                 if other.sha256 == agent.sha256
                 else "identical_normalized_source"
             ),
+            same_owner=(
+                other.miner_hotkey == agent.miner_hotkey
+                or bool(
+                    candidate_coldkey is not None and other_coldkey == candidate_coldkey
+                )
+            ),
         )
-        for other in duplicate_rows
+        for other, other_coldkey in duplicate_rows
     ]
 
     return AdminQuarantineContext(
@@ -1117,7 +1174,9 @@ async def _build_quarantine_context(
             total=cross_miner_count + same_miner_count,
             cross_miner=cross_miner_count,
             same_miner=same_miner_count,
-            sample_truncated=cross_miner_count + same_miner_count > len(duplicate_rows),
+            cross_owner=cross_owner_count,
+            same_owner=same_owner_count,
+            sample_truncated=cross_owner_count + same_owner_count > len(duplicate_rows),
         ),
     )
 

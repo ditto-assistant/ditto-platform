@@ -132,6 +132,8 @@ from ditto.db.queries.benchmark_rollout import (
 from ditto.db.queries.heartbeats import (
     upsert_validator_heartbeat,
 )
+from ditto.db.queries.payments import get_miner_coldkey_for_agent
+from ditto.db.queries.score_retests import activate_next_score_retest
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     get_score_for_validator,
@@ -140,7 +142,9 @@ from ditto.db.queries.scores import (
     upsert_score,
 )
 from ditto.db.queries.tickets import (
+    MAX_INFRA_RETRY_GRANTS,
     get_open_ticket,
+    infra_retry_backoff,
     issue_ticket,
     mark_ticket_scored,
 )
@@ -868,14 +872,26 @@ async def request_job(
             raise HTTPException(
                 status_code=409, detail="job claim nonce has already been used"
             ) from exc
-        ticket = await issue_rollout_ticket(
+        heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
+        ticket = await activate_next_score_retest(
             session,
             validator_hotkey=payload.validator_hotkey,
             now=now,
-            ttl=_TICKET_TTL,
-            artifact_mode=artifact_mode,
+            supports_version=lambda version: (
+                heartbeat is not None
+                and heartbeat_supports_version(heartbeat, now=now, version=version)
+            ),
             validator_running_benchmark=validator_state == "running_benchmark",
         )
+        if ticket is None:
+            ticket = await issue_rollout_ticket(
+                session,
+                validator_hotkey=payload.validator_hotkey,
+                now=now,
+                ttl=_TICKET_TTL,
+                artifact_mode=artifact_mode,
+                validator_running_benchmark=validator_state == "running_benchmark",
+            )
         canonical_version = await active_bench_version(session)
         rollout = await open_rollout(session)
         if ticket is None:
@@ -1109,12 +1125,25 @@ async def fail_job(
             for_update=True,
         )
         if ticket is not None:
-            # Close for immediate reissue: retry_after=now (not the 6h expiry
-            # cooldown) so the next request_job mints a fresh lease instead of
-            # resuming this failed one.
+            # Close for reissue without the 6h agent-failure cooldown so the
+            # next request_job mints a fresh lease instead of resuming this one.
             ticket.status = TicketStatus.EXPIRED
             ticket.deadline = now
-            ticket.retry_after = now
+            if payload.reason == "infrastructure":
+                # Not the agent's fault: bump the (bounded) infra grant that
+                # offsets the coming attempt_count++, so an outage never spends
+                # the agent's genuine per-version budget. Then apply an
+                # escalating cooldown so a *sustained* outage isn't hammered by
+                # immediate back-to-back re-leases of the same agent.
+                if ticket.infra_retry_grants < MAX_INFRA_RETRY_GRANTS:
+                    ticket.infra_retry_grants += 1
+                ticket.retry_after = now + infra_retry_backoff(
+                    ticket.infra_retry_grants
+                )
+            else:
+                # A scoring_error is the agent's own failure: consume the budget
+                # and reissue immediately for another validator/attempt.
+                ticket.retry_after = now
             await session.flush()
             reopened = True
     logger.info(
@@ -1669,9 +1698,13 @@ async def submit_score(
             if len(agent_scores) >= SCORING_QUORUM:
                 median_composite = statistics.median(s.composite for s in agent_scores)
                 eligible = await list_eligible_ledger(session)
+                miner_coldkey = await get_miner_coldkey_for_agent(
+                    session, agent_id=agent_id
+                )
                 decision = evaluate_duplicate_signals(
                     agent_id=agent_id,
                     miner_hotkey=agent.miner_hotkey,
+                    miner_coldkey=miner_coldkey,
                     submitted_at=agent.created_at,
                     sha256=agent.sha256,
                     composite=median_composite,
@@ -1870,6 +1903,18 @@ async def submit_score(
             agent_id=agent_id,
             validator_hotkey=payload.validator_hotkey,
             bench_version=ticket.bench_version,
+        )
+        heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
+        await activate_next_score_retest(
+            session,
+            validator_hotkey=payload.validator_hotkey,
+            now=audit_now,
+            supports_version=lambda version: (
+                heartbeat is not None
+                and heartbeat_supports_version(
+                    heartbeat, now=audit_now, version=version
+                )
+            ),
         )
         result_status = agent.status
 
