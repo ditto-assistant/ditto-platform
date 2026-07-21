@@ -544,8 +544,7 @@ def _stack_health_warns(stack_health: ValidatorStackHealth | None) -> bool:
     return any(
         component.required and component.health in _STACK_HEALTH_WARNING_STATES
         for component in (
-            getattr(stack_health, name)
-            for name in type(stack_health).model_fields
+            getattr(stack_health, name) for name in type(stack_health).model_fields
         )
     )
 
