@@ -876,6 +876,30 @@
     .pipeline-detail-state { margin: 0; padding: var(--detail-space-md) 0; color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
     .pipeline-detail-state.loading { color: var(--text-faint); }
     .pipeline-detail-state.error { color: var(--warn); }
+    .artifact-release-card {
+      display: grid;
+      gap: var(--detail-space-sm);
+      margin-top: var(--detail-space-lg);
+      padding: var(--detail-space-lg);
+      border: 1px solid color-mix(in oklab, var(--accent) 34%, var(--border));
+      border-radius: 10px;
+      background: color-mix(in oklab, var(--accent) 6%, transparent);
+    }
+    .artifact-release-head { display: flex; align-items: center; justify-content: space-between; gap: var(--detail-space-md); }
+    .artifact-release-head h4 { margin: 0; color: var(--text); font-size: 13px; font-weight: 750; }
+    .artifact-release-state { color: var(--text-dim); font: 700 10.5px/1.3 var(--mono); text-transform: uppercase; }
+    .artifact-release-state.available { color: var(--good); }
+    .artifact-release-state.embargoed { color: var(--warn); }
+    .artifact-release-state.under_review { color: var(--danger); }
+    .artifact-release-detail { margin: 0; color: var(--text-dim); font-size: 12.5px; line-height: 1.5; text-wrap: pretty; }
+    .artifact-release-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--detail-space-sm) var(--detail-space-md); }
+    .artifact-download { min-height: 36px; }
+    .artifact-download-status { color: var(--text-faint); font-size: 11.5px; line-height: 1.4; }
+    .artifact-download-status.error { color: var(--bad); }
+    .source-release-note { display: block; margin-top: 6px; color: var(--text-faint); font-size: 11px; line-height: 1.35; }
+    .source-release-note.available { color: var(--good); }
+    .source-release-note.embargoed { color: var(--warn); }
+    .source-release-note.under_review { color: var(--danger); }
     .screening-dispute {
       padding: var(--detail-space-lg);
       border: 1px solid color-mix(in oklab, var(--warn) 48%, var(--border));
@@ -3163,6 +3187,128 @@
       el.classList.add("show");
     }
 
+    var artifactDownloadLoading = {};
+
+    function artifactReleaseCopy(release) {
+      if (!release) return null;
+      var hours = Number(release.embargo_hours) || 6;
+      var bench = release.bench_version == null ? "" : " on Bench v" + release.bench_version;
+      if (release.status === "available") {
+        return {
+          state: "available",
+          label: "Source public",
+          detail: "The 3/3 score quorum" + bench + " cleared its " + hours + "-hour privacy window. The download link lasts five minutes."
+        };
+      }
+      if (release.status === "embargoed") {
+        return {
+          state: "embargoed",
+          label: "Privacy window",
+          detail: release.available_at
+            ? "Source unlocks " + relTimeUntil(release.available_at) + ", " + hours + " hours after the third accepted score" + bench + "."
+            : "Source unlocks " + hours + " hours after the third accepted score" + bench + "."
+        };
+      }
+      if (release.status === "under_review") {
+        var elapsed = release.available_at && Date.parse(release.available_at) <= Date.now();
+        return {
+          state: "under_review",
+          label: "Held for review",
+          detail: "Source stays private while review is active. If cleared, the original 3/3 timestamp still applies" +
+            (elapsed ? ", so this source will be public immediately." : ".")
+        };
+      }
+      if (release.status === "awaiting_quorum") {
+        return {
+          state: "awaiting_quorum",
+          label: "Awaiting 3/3",
+          detail: "Source remains private until three validators score the same benchmark version, then a " + hours + "-hour privacy window begins."
+        };
+      }
+      return {
+        state: "unavailable",
+        label: "Source private",
+        detail: "Source is private: this submission is not in a cleared public state. If it settles into one, the original 3/3 timestamp still governs release."
+      };
+    }
+
+    function artifactReleaseNote(release) {
+      var copy = artifactReleaseCopy(release);
+      if (!copy || ["available", "embargoed", "under_review"].indexOf(copy.state) < 0) return "";
+      return '<span class="source-release-note ' + esc(copy.state) + '">' + esc(copy.label) +
+        (copy.state === "embargoed" && release.available_at ? " · " + esc(relTimeUntil(release.available_at)) : "") + '</span>';
+    }
+
+    function renderArtifactRelease(release, agentId) {
+      var copy = artifactReleaseCopy(release);
+      if (!copy) return "";
+      var canDownload = copy.state === "available" && release.download_available === true;
+      var action = canDownload
+        ? '<div class="artifact-release-actions"><button class="btn ghost artifact-download" type="button" data-artifact-download="' + esc(agentId) + '">' +
+            '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>' +
+            '<span class="artifact-download-label">Download submitted source</span></button>' +
+            '<span class="artifact-download-status" data-artifact-status="' + esc(agentId) + '" role="status" aria-live="polite"></span></div>'
+        : "";
+      return '<section class="artifact-release-card" aria-label="Submitted source release">' +
+        '<div class="artifact-release-head"><h4>Submitted source</h4><span class="artifact-release-state ' + esc(copy.state) + '">' + esc(copy.label) + '</span></div>' +
+        '<p class="artifact-release-detail">' + esc(copy.detail) + '</p>' + action + '</section>';
+    }
+
+    function downloadArtifact(agentId, button) {
+      if (!agentId || !button || artifactDownloadLoading[agentId]) return;
+      artifactDownloadLoading[agentId] = true;
+      button.disabled = true;
+      var label = button.querySelector(".artifact-download-label");
+      var card = button.closest(".artifact-release-card");
+      var detail = card ? card.querySelector(".artifact-download-status") : null;
+      if (label) label.textContent = "Preparing download…";
+      if (detail) {
+        detail.classList.remove("error");
+        detail.textContent = "Creating a private five-minute link…";
+      }
+      var ctrl = new AbortController();
+      var to = setTimeout(function () { ctrl.abort(); }, 8000);
+      fetch(API_BASE + "/public/agent/" + encodeURIComponent(agentId) + "/artifact", {
+        signal: ctrl.signal,
+        cache: "no-store",
+        headers: { accept: "application/json" }
+      }).then(function (response) {
+        clearTimeout(to);
+        return response.json().catch(function () { return {}; }).then(function (data) {
+          if (!response.ok) {
+            var message = typeof data.message === "string"
+              ? data.message
+              : (typeof data.detail === "string" ? data.detail : "Source is not available yet (HTTP " + response.status + ").");
+            throw new Error(message);
+          }
+          return data;
+        });
+      }, function (error) {
+        clearTimeout(to);
+        throw error;
+      }).then(function (data) {
+        if (!data.download_url) throw new Error("The download credential was missing.");
+        // Same-tab navigation: a synthetic _blank click after the async fetch
+        // is popup-blocked in Safari, and `download` is ignored cross-origin.
+        // The tarball URL answers with an attachment, so the page stays put.
+        window.location.assign(data.download_url);
+        if (detail) detail.textContent = "Download started · the private link expires in five minutes.";
+      }).catch(function (error) {
+        if (detail) {
+          detail.classList.add("error");
+          detail.textContent = error && error.name === "AbortError"
+            ? "The download request timed out. Try again."
+            : (error.message || "Could not prepare the download. Try again.");
+        }
+      }).finally(function () {
+        delete artifactDownloadLoading[agentId];
+        if (button.isConnected) {
+          button.disabled = false;
+          if (label) label.textContent = "Download submitted source";
+        }
+      });
+    }
+
     // The emissions-column tooltip states the split. Both numbers are fold
     // parameters, so they follow the API rather than being written in.
     function applyEmissionsCopy(emissions) {
@@ -3545,6 +3691,17 @@
       if (s < 3600) return Math.floor(s / 60) + "m ago";
       if (s < 86400) return Math.floor(s / 3600) + "h ago";
       return Math.floor(s / 86400) + "d ago";
+    }
+    // Future-facing twin of relTime for deadlines (embargo unlock times).
+    function relTimeUntil(iso) {
+      var t = new Date(iso).getTime();
+      if (isNaN(t)) return "–";
+      var s = (t - Date.now()) / 1000;
+      if (s <= 0) return "any moment now";
+      if (s < 60) return "in " + Math.ceil(s) + "s";
+      if (s < 3600) return "in " + Math.ceil(s / 60) + "m";
+      if (s < 86400) return "in " + Math.ceil(s / 3600) + "h";
+      return "in " + Math.ceil(s / 86400) + "d";
     }
     function esc(s) {
       return String(s).replace(/[&<>"']/g, function (c) {
@@ -4872,6 +5029,7 @@
         : "";
       document.getElementById("d-stats").innerHTML =
         reviewPacketButton(e) +
+        renderArtifactRelease(e.artifact_release, e.agent_id) +
         '<div class="stat-cols">' + colStats + '</div>' +
         '<div id="d-consensus"></div>' +
         pc +
@@ -5310,6 +5468,13 @@
       ev.preventDefault();
       ev.stopPropagation();
       loadRunTelemetry(button);
+    });
+    document.addEventListener("click", function (ev) {
+      var button = ev.target.closest("[data-artifact-download]");
+      if (!button) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      downloadArtifact(button.getAttribute("data-artifact-download"), button);
     });
     document.addEventListener("keydown", function (ev) {
       var copy = ev.target.closest(".copy");
@@ -6564,6 +6729,7 @@
             '</dl>' + reviewPacketButton(e) +
           '</section>' +
         '</div>' +
+        renderArtifactRelease(e.artifact_release, e.agent_id) +
         (stateMessage ? '<p class="pipeline-detail-state ' + esc(stateClass || "") + '">' + esc(stateMessage) + '</p>' : '') +
       '</div>';
     }
@@ -6846,12 +7012,14 @@
             entityAnchor("agent", e.duplicate_of, duplicateLabel(e)) + '</span>';
         }
         var accessibleName = agentLabel(e.name, e.version);
+        var sourceCopy = artifactReleaseCopy(e.artifact_release);
         return '<tr tabindex="0" data-activity-i="' + i + '" aria-label="' +
-          esc("View details for " + accessibleName + ", " + stage[0] + ", " + progress) + '">' +
+          esc("View details for " + accessibleName + ", " + stage[0] + ", " + progress +
+            (sourceCopy ? ", " + sourceCopy.label : "")) + '">' +
           '<td><span class="agent-name">' + esc(agentName(e.name)) + '</span>' + agentVersionBadge(e.version) +
           '<span class="agent-id copyable" title="' + esc(id) + '"><span>' + esc(id.slice(0, 8)) + '</span>' + copyButton(id, "agent ID") + '</span></td>' +
           '<td class="hide-sm"><span class="hotkey copyable" title="' + esc(e.miner_hotkey) + '"><span>' + esc(shortKey(e.miner_hotkey)) + '</span>' + copyButton(e.miner_hotkey, "miner hotkey") + '</span></td>' +
-          '<td class="stage-cell"><span class="stage ' + stage[1] + '">' + stage[0] + '</span>' + evidence + '</td>' +
+          '<td class="stage-cell"><span class="stage ' + stage[1] + '">' + stage[0] + '</span>' + evidence + artifactReleaseNote(e.artifact_release) + '</td>' +
           '<td><span class="validation-progress' + (progress === "Not started" ? " pending" : "") + '">' + esc(progress) + '</span></td>' +
           '<td class="num hide-sm" title="' + esc(e.submitted_at) + '">' + relTime(e.submitted_at) + '</td>' +
           '</tr>';

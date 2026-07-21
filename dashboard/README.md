@@ -22,14 +22,20 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
   counts). Current SN118 registration
   is reported separately: a deregistered hotkey's immutable score stays visible
   but is marked inactive and excluded from weights and emissions until that same
-  hotkey registers again.
+  hotkey registers again. Every leaderboard submission also shows its own
+  public-source state. Source becomes downloadable six hours after the third
+  accepted score in one benchmark version; this is retroactive and independent
+  of KOTH rank. A download requests a five-minute, no-store tarball link.
 - **Submission pipeline** — screening and validator-ticket history, including a
   compact accessible benchmark progress bar for each validator currently
   evaluating the submission. Active benchmark work takes precedence over a
   submission's previously completed stage, so version-rollout rescoring stays
   aligned with the validator fleet. Running work carries its ticket-bound bench
   version, and top-five qualification rows state that the prior score remains
-  authoritative while the next-version quorum is collected. Accepted numeric scores appear immediately
+  authoritative while the next-version quorum is collected. Every submission
+  detail shows whether source is awaiting quorum, in the six-hour privacy window,
+  held for review, or public; review-held and rejected source stays private.
+  Accepted numeric scores appear immediately
   in the current-version summary as provisional feedback; the prior final
   median remains authoritative until the new three-validator quorum. Each score
   includes its post-commit seed and a
