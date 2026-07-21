@@ -22,7 +22,7 @@ from ditto.api_models.ticket_status import TicketStatus
 from ditto.db.models import Agent, Score, ValidatorRetryRecovery, ValidatorTicket
 from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.scores import SCORING_QUORUM
-from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION
+from ditto.db.queries.tickets import ticket_attempt_cap
 
 # Operators may hand-grant at most this many recoveries to one agent before the
 # stuck submission needs a harder look than another retry.
@@ -68,8 +68,7 @@ def is_exhausted(ticket: ValidatorTicket) -> bool:
     """An expired ticket whose validator has spent its whole attempt budget."""
     return (
         ticket.status == TicketStatus.EXPIRED
-        and ticket.attempt_count
-        >= MAX_ATTEMPTS_PER_VERSION + ticket.manual_retry_grants
+        and ticket.attempt_count >= ticket_attempt_cap(ticket)
     )
 
 
@@ -112,7 +111,7 @@ def recovery_gate(
         ticket
         for ticket in non_scored
         if ticket.status == TicketStatus.EXPIRED
-        and ticket.attempt_count < MAX_ATTEMPTS_PER_VERSION + ticket.manual_retry_grants
+        and ticket.attempt_count < ticket_attempt_cap(ticket)
     ]
     if naturally_retryable:
         available = any(

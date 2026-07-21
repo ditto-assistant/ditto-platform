@@ -796,3 +796,54 @@ async def test_partial_exhaustion_stays_queued_not_exhausted(
     }
     assert by_name["one-exhausted"] == "queued"
     assert by_name["two-exhausted-one-scored"] == "exhausted"
+
+
+async def test_infra_grant_lifts_a_would_be_exhausted_ticket(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    # attempt_count sits at the base cap, but an infrastructure grant raised the
+    # cap — so the ticket still has budget and reads as retry_available, not
+    # exhausted. This is the whole point of infra_retry_grants: an outage does
+    # not spend the agent's genuine attempt budget.
+    agent_id = uuid4()
+    async with retry_maker() as session, session.begin():
+        session.add(
+            Agent(
+                agent_id=agent_id,
+                miner_hotkey="5Miner",
+                name="infra-compensated",
+                version=1,
+                sha256=agent_id.hex * 2,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+                created_at=_T0 - timedelta(days=1),
+            )
+        )
+        session.add(
+            ValidatorTicket(
+                agent_id=agent_id,
+                validator_hotkey="val-0",
+                status=TicketStatus.EXPIRED,
+                issued_at=_T0 - timedelta(hours=3),
+                deadline=_T0 - timedelta(hours=2),
+                bench_version=DEFAULT_BENCH_VERSION,
+                attempt_count=2,
+                manual_retry_grants=0,
+                infra_retry_grants=1,
+                retry_after=_PAST,
+            )
+        )
+    _install(app, retry_maker)
+
+    response = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    assert response.status_code == 200, response.text
+    item = next(
+        entry
+        for entry in response.json()["submissions"]
+        if entry["agent_id"] == str(agent_id)
+    )
+    assert item["retry_state"] == "retry_available"
+    assert item["tickets"][0]["infra_retry_grants"] == 1
+    assert item["tickets"][0]["retry_budget_exhausted"] is False

@@ -50,6 +50,28 @@ _LIVE_TICKET_STATUSES = (TicketStatus.ISSUED, TicketStatus.SCORED)
 RETRY_COOLDOWN = timedelta(hours=6)
 MAX_ATTEMPTS_PER_VERSION = 2
 
+# An infrastructure failure (a signed ``fail_job`` with reason
+# ``infrastructure``) is never the agent's fault, so it earns a compensating
+# grant that offsets the attempt the reissue consumes. Bounded so a persistent
+# validator-side outage cannot re-lease one agent forever.
+MAX_INFRA_RETRY_GRANTS = 8
+
+
+def ticket_attempt_cap(ticket: ValidatorTicket) -> int:
+    """Total leases a validator may spend on this agent+version.
+
+    The base per-version budget, plus audited operator grants, plus
+    infrastructure-failure compensation. ``attempt_count`` is compared against
+    this everywhere issuance, exhaustion, and natural-retry eligibility are
+    decided, so the three surfaces agree on one budget.
+    """
+    return (
+        MAX_ATTEMPTS_PER_VERSION
+        + ticket.manual_retry_grants
+        + ticket.infra_retry_grants
+    )
+
+
 # The KOTH champion plus four participation-tail miners receive emissions.
 # Ticket continuation uses the current fifth finalized score as a dynamic floor,
 # but only after two scores: with median-of-three, the highest final score still
@@ -242,6 +264,7 @@ async def issue_ticket(
                         >= (
                             MAX_ATTEMPTS_PER_VERSION
                             + ValidatorTicket.manual_retry_grants
+                            + ValidatorTicket.infra_retry_grants
                         )
                     )
                 )

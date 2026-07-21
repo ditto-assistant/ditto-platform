@@ -75,6 +75,7 @@ from ditto.db.models import (
     ValidatorHeartbeat,
     ValidatorTicket,
 )
+from ditto.db.queries.tickets import MAX_INFRA_RETRY_GRANTS
 
 # Real dev keypairs: sign for real so _verify_signature runs end to end. The k=3
 # quorum needs three distinct permitted validators before an agent finalizes.
@@ -2843,6 +2844,83 @@ class TestFailJob:
         assert job["agent_id"] == str(agent_id)
         # A fresh lease, not the failed one: the deadline moved off the seed value.
         assert datetime.fromisoformat(job["deadline"]) != _TICKET_DEADLINE
+
+    async def test_infrastructure_failure_earns_a_compensating_grant(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # An infrastructure failure is not the agent's fault: it bumps
+        # infra_retry_grants (which offsets the attempt the reissue consumes),
+        # so the agent's genuine per-version budget is never spent.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(agent_id, reason="infrastructure"),
+        )
+        assert failed.status_code == 200, failed.text
+        assert failed.json()["reopened"] is True
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.infra_retry_grants == 1
+
+    async def test_scoring_error_failure_consumes_the_budget(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A scoring_error is the agent's own failure — no compensating grant.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(agent_id, reason="scoring_error"),
+        )
+        assert failed.status_code == 200, failed.text
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.infra_retry_grants == 0
+
+    async def test_infra_retry_grants_are_bounded(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # A persistent validator-side outage cannot re-lease one agent forever:
+        # infra grants stop climbing at the cap.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        async with session_maker() as s, s.begin():
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            ticket.infra_retry_grants = MAX_INFRA_RETRY_GRANTS
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(agent_id, reason="infrastructure"),
+        )
+        assert failed.status_code == 200, failed.text
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.infra_retry_grants == MAX_INFRA_RETRY_GRANTS
 
     async def test_no_live_ticket_is_a_noop(
         self,

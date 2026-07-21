@@ -140,6 +140,7 @@ from ditto.db.queries.scores import (
     upsert_score,
 )
 from ditto.db.queries.tickets import (
+    MAX_INFRA_RETRY_GRANTS,
     get_open_ticket,
     issue_ticket,
     mark_ticket_scored,
@@ -1115,6 +1116,16 @@ async def fail_job(
             ticket.status = TicketStatus.EXPIRED
             ticket.deadline = now
             ticket.retry_after = now
+            # A validator-side infrastructure failure is not the agent's fault,
+            # so compensate for the attempt the reissue will consume: bump the
+            # infra grant (bounded) that offsets the coming attempt_count++, so
+            # an outage never spends the agent's genuine per-version budget. A
+            # scoring_error is the agent's own failure and consumes the budget.
+            if (
+                payload.reason == "infrastructure"
+                and ticket.infra_retry_grants < MAX_INFRA_RETRY_GRANTS
+            ):
+                ticket.infra_retry_grants += 1
             await session.flush()
             reopened = True
     logger.info(
