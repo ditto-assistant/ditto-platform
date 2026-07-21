@@ -1912,6 +1912,17 @@ class PublicCategoryDoc(BaseModel):
     purpose: Annotated[
         str, Field(description="One public-safe sentence: what it probes.")
     ]
+    example: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "A short, public-safe illustration of what the case looks like "
+                "(a representative user turn and any minimal setup). Never an "
+                "answer key or per-seed content; uses generic placeholders."
+            ),
+        ),
+    ] = None
 
 
 class PublicMetricDoc(BaseModel):
