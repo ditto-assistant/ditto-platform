@@ -28,7 +28,7 @@ dependencies = [
 
 [tool.uv.sources]
 bittensor-pylon-client = { git = "https://github.com/bittensor-church/bittensor-pylon", subdirectory = "pylon_client" }
-ditto-screening-protocol = { git = "https://github.com/ditto-assistant/ditto-screener.git", rev = "c4b49fd4154e5e065a2b7f39ce60745ca29515bd", subdirectory = "packages/ditto-screening-protocol" }
+ditto-screening-protocol = { git = "https://github.com/ditto-assistant/ditto-screener.git", rev = "3513ed908c0297dccc265d04b618f6557cb9fc9b", subdirectory = "packages/ditto-screening-protocol" }
 
 [dependency-groups]
 dev = [
