@@ -161,6 +161,10 @@ from ditto.db.queries.heartbeats import (
     list_screener_heartbeats,
     list_validator_heartbeats,
 )
+from ditto.db.queries.retry_state import (
+    AgentRetryState,
+    classify_agent_retry_states,
+)
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
@@ -1490,6 +1494,7 @@ def _public_activity_response(
     query: str | None,
     score_continuation_floor: float | None,
     active_assignment_agent_ids: set[UUID],
+    retry_states: dict[UUID, AgentRetryState] | None = None,
     duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
     ath_review_opened_at: dict[UUID, datetime] | None = None,
     ath_review_composite: dict[UUID, float] | None = None,
@@ -1502,6 +1507,7 @@ def _public_activity_response(
             _public_benchmark_progress(work, now)
         )
     active_agent_ids = set(active_by_agent)
+    retry_by_agent = retry_states or {}
 
     def public_status(row: Any) -> str:
         return _public_activity_status(
@@ -1632,6 +1638,16 @@ def _public_activity_response(
                 provisional_composite=row.provisional_composite,
                 validator_queue_rank=validator_queue_ranks.get(row.agent.agent_id),
                 quorum=SCORING_QUORUM,
+                retry_state=(
+                    retry_by_agent[row.agent.agent_id].state
+                    if row.agent.agent_id in retry_by_agent
+                    else None
+                ),
+                retry_after=(
+                    retry_by_agent[row.agent.agent_id].earliest_retry_after
+                    if row.agent.agent_id in retry_by_agent
+                    else None
+                ),
                 screening_policy_version=row.agent.screening_policy_version,
                 required_screening_policy_version=SCREENING_POLICY_VERSION,
                 screening_attempt_id=(
@@ -1767,6 +1783,9 @@ async def activity(
         active_assignment_agent_ids={
             assignment.agent.agent_id for assignment in assignments
         },
+        retry_states=await classify_agent_retry_states(
+            session, agents=[row.agent for row in rows], now=now
+        ),
         duplicate_metadata=await _duplicate_submission_metadata(session, rows),
         ath_review_opened_at=ath_opened_at,
         ath_review_composite=ath_composite,
@@ -1806,6 +1825,9 @@ async def operations(
         active_assignment_agent_ids={
             assignment.agent.agent_id for assignment in assignments
         },
+        retry_states=await classify_agent_retry_states(
+            session, agents=[row.agent for row in activity_rows], now=now
+        ),
         duplicate_metadata=await _duplicate_submission_metadata(session, activity_rows),
     )
     validator_snapshot = _validator_heartbeats_response(

@@ -8,6 +8,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from ditto.api_models.retry_state import RetryState
+
 
 class AdminValidationTicket(BaseModel):
     validator_hotkey: str
@@ -47,15 +49,6 @@ class AdminValidationRetryDetail(BaseModel):
     blocking_reason: str | None
     tickets: list[AdminValidationTicket]
     recoveries: list[AdminValidationRecovery]
-
-
-RetryState = Literal[
-    "running",
-    "retry_available",
-    "cooling_down",
-    "exhausted",
-    "queued",
-]
 
 
 class AdminStuckSubmission(BaseModel):
