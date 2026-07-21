@@ -169,10 +169,14 @@ def compare_anti_copy_pair(
     identical to the score-write path.
     """
     direction, chronology_eligible = _chronology(candidate, reference)
-    same_miner = candidate.miner_hotkey == reference.miner_hotkey
+    same_miner = candidate.miner_hotkey == reference.miner_hotkey or bool(
+        candidate.miner_coldkey is not None
+        and candidate.miner_coldkey == reference.miner_coldkey
+    )
     decision = evaluate_duplicate_signals(
         agent_id=candidate.agent_id,
         miner_hotkey=candidate.miner_hotkey,
+        miner_coldkey=candidate.miner_coldkey,
         submitted_at=candidate.first_seen,
         sha256=candidate.sha256,
         composite=candidate.composite,
@@ -238,7 +242,7 @@ def compare_anti_copy_pair(
         canonical_reference_revision=provenance["revision"],
         reference_corpus_id=provenance["corpus_id"],
         reference_exclusion_mode=provenance["exclusion_mode"],
-        miner_exclusion_mode="same-miner-excluded",
+        miner_exclusion_mode="same-payment-coldkey-excluded-hotkey-fallback",
         same_miner_excluded=same_miner,
         chronology_direction=direction,
         chronology_eligible=chronology_eligible and not same_miner,

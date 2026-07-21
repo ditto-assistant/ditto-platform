@@ -6,7 +6,9 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+
+from ditto.api_models.retry_state import RetryState
 
 
 class AdminValidationTicket(BaseModel):
@@ -17,6 +19,7 @@ class AdminValidationTicket(BaseModel):
     bench_version: int
     attempt_count: int
     manual_retry_grants: int
+    infra_retry_grants: int
     retry_after: datetime | None
     retry_budget_exhausted: bool
 
@@ -49,6 +52,48 @@ class AdminValidationRetryDetail(BaseModel):
     recoveries: list[AdminValidationRecovery]
 
 
+class AdminStuckSubmission(BaseModel):
+    """One below-quorum submission plus why it is (or is not) advancing.
+
+    ``retry_state`` is the operator-facing triage label:
+
+    * ``running`` — a validator holds a live ticket right now.
+    * ``retry_available`` — an expired ticket is off cooldown and will be
+      re-leased on the next sweep with budget to spare.
+    * ``cooling_down`` — an expired ticket still has budget but is waiting out
+      its retry cooldown.
+    * ``exhausted`` — no ticket can advance without an operator grant (every
+      remaining validator burned its attempt budget). This is the only state
+      that needs a human.
+    * ``queued`` — below quorum with slots that have simply never been leased
+      yet; it will advance on its own.
+    """
+
+    agent_id: UUID
+    miner_hotkey: str
+    agent_name: str
+    agent_version: int | None
+    bench_version: int
+    score_count: int
+    quorum: int
+    retry_state: RetryState
+    automatic_retry_available: bool
+    recovery_allowed: bool
+    blocking_reason: str | None
+    earliest_retry_after: datetime | None
+    attempts_used: int
+    exhausted_validator_count: int
+    snapshot: str
+    tickets: list[AdminValidationTicket]
+
+
+class AdminStuckSubmissionsResponse(BaseModel):
+    generated_at: datetime
+    quorum: int
+    counts: dict[RetryState, int]
+    submissions: list[AdminStuckSubmission]
+
+
 class AdminValidationRetryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -63,6 +108,52 @@ class AdminValidationRetryRequest(BaseModel):
 class AdminValidationRetryResponse(BaseModel):
     recovery: AdminValidationRecovery
     idempotent: bool
+
+
+class AdminBatchRetryItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: UUID
+    request_id: UUID
+    expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class AdminBatchRetryRequest(BaseModel):
+    """Grant recoveries to several stranded submissions in one operator action.
+
+    Each item carries its own ``expected_snapshot`` and idempotency
+    ``request_id`` so the batch is exactly as safe as N single-agent retries:
+    an item whose state moved is skipped, never force-granted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=3, max_length=500),
+    ]
+    items: Annotated[list[AdminBatchRetryItem], Field(min_length=1, max_length=100)]
+
+    @field_validator("items")
+    @classmethod
+    def _unique(cls, items: list[AdminBatchRetryItem]) -> list[AdminBatchRetryItem]:
+        if len({item.agent_id for item in items}) != len(items):
+            raise ValueError("duplicate agent_id in batch")
+        if len({item.request_id for item in items}) != len(items):
+            raise ValueError("duplicate request_id in batch")
+        return items
+
+
+class AdminBatchRetryResult(BaseModel):
+    agent_id: UUID
+    status: Literal["granted", "idempotent", "skipped"]
+    detail: str | None
+    recovery: AdminValidationRecovery | None
+
+
+class AdminBatchRetryResponse(BaseModel):
+    granted: int
+    results: list[AdminBatchRetryResult]
 
 
 class AdminValidatorScoreReplacementDetail(BaseModel):
@@ -110,6 +201,57 @@ class AdminValidatorScoreReplacementResponse(BaseModel):
     idempotent: bool
 
 
+class AdminValidatorScoreRetestQueueItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: UUID
+    request_id: UUID
+    expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_run_id: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
+    ]
+
+
+class AdminValidatorScoreRetestQueueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+    ]
+    items: Annotated[
+        list[AdminValidatorScoreRetestQueueItem], Field(min_length=1, max_length=100)
+    ]
+
+    @field_validator("items")
+    @classmethod
+    def _unique(
+        cls, items: list[AdminValidatorScoreRetestQueueItem]
+    ) -> list[AdminValidatorScoreRetestQueueItem]:
+        if len({item.agent_id for item in items}) != len(items):
+            raise ValueError("duplicate agent_id in queue")
+        if len({item.request_id for item in items}) != len(items):
+            raise ValueError("duplicate request_id in queue")
+        return items
+
+
+class AdminValidatorScoreRetestQueueResult(BaseModel):
+    agent_id: UUID
+    request_id: UUID
+    status: Literal["activated", "queued", "idempotent", "skipped"]
+    detail: str | None
+    queue_position: int | None
+
+
+class AdminValidatorScoreRetestQueueResponse(BaseModel):
+    validator_hotkey: str
+    activated: int
+    queued: int
+    idempotent: int
+    skipped: int
+    results: list[AdminValidatorScoreRetestQueueResult]
+
+
 class AdminValidatorScoreRetestReleaseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -152,9 +294,13 @@ class AdminScoreOutlier(BaseModel):
     peer_spread: float
     ticket_status: Literal["issued", "scored", "expired"] | None
     replacement_pending: bool
+    replacement_queued: bool
+    queue_position: int | None
     replacement_deadline: datetime | None
     replacement_allowed: bool
     blocking_reason: str | None
+    queue_allowed: bool
+    queue_blocking_reason: str | None
 
 
 class AdminScoreOutlierList(BaseModel):

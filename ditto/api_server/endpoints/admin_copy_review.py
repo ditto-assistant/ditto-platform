@@ -42,6 +42,10 @@ from ditto.api_server.source_inspect import (
 )
 from ditto.api_server.storage import ObjectDownloadFailedError, S3StorageClient
 from ditto.db.models import Agent, AgentStatus, AthReview, AthReviewAction, Score
+from ditto.db.queries.payments import (
+    get_miner_coldkey_for_agent,
+    get_miner_coldkeys_for_agents,
+)
 from ditto.db.queries.scores import (
     MIN_ELIGIBLE_CASES,
     LedgerRow,
@@ -213,6 +217,7 @@ async def _batch_comparisons(
             involved.add(agent.agent_id)
             involved.add(review.original_duplicate_of)
     scores_by_agent: defaultdict[UUID, list[Score]] = defaultdict(list)
+    coldkeys_by_agent = await get_miner_coldkeys_for_agents(session, agent_ids=involved)
     if involved:
         score_rows = (
             (await session.execute(select(Score).where(Score.agent_id.in_(involved))))
@@ -242,10 +247,14 @@ async def _batch_comparisons(
             )
             continue
         candidate = _canonical_ledger_row(
-            agent, scores_by_agent.get(agent.agent_id, [])
+            agent,
+            scores_by_agent.get(agent.agent_id, []),
+            miner_coldkey=coldkeys_by_agent.get(agent.agent_id),
         )
         reference_row = _canonical_ledger_row(
-            reference, scores_by_agent.get(reference.agent_id, [])
+            reference,
+            scores_by_agent.get(reference.agent_id, []),
+            miner_coldkey=coldkeys_by_agent.get(reference.agent_id),
         )
         if candidate is None or reference_row is None:
             out[review.review_id] = AdminCopyReviewComparisonUnavailable(
@@ -289,7 +298,12 @@ async def _get_review(
     return None if row is None else (row[0], row[1])
 
 
-def _canonical_ledger_row(agent: Agent, scores: list[Score]) -> LedgerRow | None:
+def _canonical_ledger_row(
+    agent: Agent,
+    scores: list[Score],
+    *,
+    miner_coldkey: str | None = None,
+) -> LedgerRow | None:
     """Build the same median-score value object used by the anti-copy gate."""
     if not scores:
         return None
@@ -311,6 +325,7 @@ def _canonical_ledger_row(agent: Agent, scores: list[Score]) -> LedgerRow | None
         validator_hotkey=canonical.validator_hotkey,
         signature=canonical.signature,
         status=agent.status,
+        miner_coldkey=miner_coldkey,
         content_fingerprint=agent.content_fingerprint,
         structural_fingerprint=agent.structural_fingerprint,
         normalized_source_hash=agent.normalized_source_hash,
@@ -441,8 +456,18 @@ async def get_copy_review_current_comparison(
     reference_scores = await list_scores_for_agent(
         session, agent_id=reference_agent.agent_id
     )
-    candidate = _canonical_ledger_row(candidate_agent, candidate_scores)
-    reference = _canonical_ledger_row(reference_agent, reference_scores)
+    candidate_coldkey = await get_miner_coldkey_for_agent(
+        session, agent_id=candidate_agent.agent_id
+    )
+    reference_coldkey = await get_miner_coldkey_for_agent(
+        session, agent_id=reference_agent.agent_id
+    )
+    candidate = _canonical_ledger_row(
+        candidate_agent, candidate_scores, miner_coldkey=candidate_coldkey
+    )
+    reference = _canonical_ledger_row(
+        reference_agent, reference_scores, miner_coldkey=reference_coldkey
+    )
     if candidate is None or reference is None:
         raise HTTPException(status_code=409, detail="current comparison unavailable")
     comparison = compare_anti_copy_pair(candidate=candidate, reference=reference)

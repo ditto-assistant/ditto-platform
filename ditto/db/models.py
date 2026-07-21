@@ -398,6 +398,14 @@ class ScreeningAttempt(Base):
     duplicate_of: Mapped[UUID | None] = mapped_column(
         SaUUID(as_uuid=True), nullable=True
     )
+    build_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    """This attempt only rebuilds an already-adjudicated submission's missing
+    prerequisites (screened image / dataset); the screener must NOT re-run the
+    anti-cheat source review and cannot quarantine. Set when an EVALUATING agent
+    on the current policy is re-claimed — its review was already cleared, so a
+    re-screen would wrongly re-judge an approved artifact."""
 
     __table_args__ = (
         ForeignKeyConstraint(
@@ -1196,6 +1204,16 @@ class ValidatorTicket(Base):
     rewrite :attr:`attempt_count`; the append-only recovery row records why the
     extra eligibility was created."""
 
+    infra_retry_grants: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    """Automatic cap extensions earned when this lease failed on validator-side
+    infrastructure (a signed ``fail_job`` with reason ``infrastructure``) rather
+    than the agent. Each one offsets the :attr:`attempt_count` increment the
+    reissue will add, so an infrastructure outage never spends the agent's
+    genuine attempt budget. Like :attr:`manual_retry_grants` it only raises the
+    cap; it never rewrites :attr:`attempt_count`."""
+
     retry_after: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
@@ -1241,6 +1259,10 @@ class ValidatorTicket(Base):
         CheckConstraint(
             "manual_retry_grants >= 0",
             name="validator_tickets_manual_retry_grants_nonnegative",
+        ),
+        CheckConstraint(
+            "infra_retry_grants >= 0",
+            name="validator_tickets_infra_retry_grants_nonnegative",
         ),
         # The expiry sweep and the live-slot count both scan open tickets only;
         # a partial index keeps those hot paths off the full table.

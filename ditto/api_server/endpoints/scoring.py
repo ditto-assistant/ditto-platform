@@ -187,7 +187,10 @@ async def scores(
     x_validator_ledger_requested_at: Annotated[datetime | None, Header()] = None,
     x_validator_ledger_signature: Annotated[str | None, Header()] = None,
 ) -> LedgerResponse:
-    """Return the best eligible score per miner, highest composite first.
+    """Return the best eligible score per payment-time coldkey.
+
+    Different names and hotkeys owned by one coldkey compete for one position;
+    the highest eligible canonical score wins and its hotkey is returned.
 
     Serve-last-known: on a transient DB failure the last successfully-read ledger
     is served (flagged ``stale`` with its ``age_seconds``) rather than erroring,

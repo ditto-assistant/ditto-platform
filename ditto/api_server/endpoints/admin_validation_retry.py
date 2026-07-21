@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import statistics
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -20,9 +20,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.admin_validation_retry import (
+    AdminBatchRetryRequest,
+    AdminBatchRetryResponse,
+    AdminBatchRetryResult,
     AdminScoreOutlier,
     AdminScoreOutlierList,
     AdminScoreOutlierScore,
+    AdminStuckSubmission,
+    AdminStuckSubmissionsResponse,
     AdminValidationRecovery,
     AdminValidationRetryDetail,
     AdminValidationRetryRequest,
@@ -31,11 +36,14 @@ from ditto.api_models.admin_validation_retry import (
     AdminValidatorScoreReplacementDetail,
     AdminValidatorScoreReplacementRequest,
     AdminValidatorScoreReplacementResponse,
+    AdminValidatorScoreRetestQueueRequest,
+    AdminValidatorScoreRetestQueueResponse,
+    AdminValidatorScoreRetestQueueResult,
     AdminValidatorScoreRetestReleaseRequest,
     AdminValidatorScoreRetestReleaseResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.retry_state import RETRY_STATE_ORDER, RetryState
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
@@ -43,25 +51,48 @@ from ditto.db.models import (
     Agent,
     Score,
     ScoreAuditEntry,
+    ValidatorHeartbeat,
     ValidatorRetryRecovery,
     ValidatorTicket,
 )
+from ditto.db.queries.agents import list_agents_by_status
 from ditto.db.queries.audit import (
+    EVENT_SCORE_RETEST_QUEUED,
     EVENT_SCORE_RETEST_RELEASED,
     EVENT_SCORE_RETEST_REQUESTED,
     append_audit_entry,
     get_latest_score_retest_event,
 )
-from ditto.db.queries.benchmark_rollout import active_bench_version
+from ditto.db.queries.benchmark_rollout import (
+    active_bench_version,
+    heartbeat_supports_version,
+)
+from ditto.db.queries.retry_state import (
+    classify_agent_retry_states,
+    is_exhausted,
+    recovery_gate,
+    resolve_bench_version,
+)
+from ditto.db.queries.score_retests import (
+    REPLACEMENT_TICKET_TTL,
+    activate_next_score_retest,
+    latest_retest_events_for_validator,
+    retest_is_active,
+    retest_is_open,
+    retest_is_queued,
+    score_retest_queue_positions,
+)
 from ditto.db.queries.scores import SCORING_QUORUM
-from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION
+from ditto.db.queries.tickets import ticket_attempt_cap
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 AdminDep = Annotated[None, Depends(require_admin)]
 
-MAX_OPERATOR_RECOVERIES_PER_AGENT = 3
-_REPLACEMENT_TICKET_TTL = timedelta(minutes=90)
+# How many EVALUATING agents to classify in one fleet sweep. The evaluating
+# backlog is bounded (a few hundred at most); this caps a pathological scan.
+_STUCK_SCAN_LIMIT = 2000
+
 _REPLACEABLE_STATUSES = {
     AgentStatus.EVALUATING,
     AgentStatus.SCORED,
@@ -85,6 +116,7 @@ def _ticket_wire(ticket: ValidatorTicket) -> dict[str, object]:
         "bench_version": ticket.bench_version,
         "attempt_count": ticket.attempt_count,
         "manual_retry_grants": ticket.manual_retry_grants,
+        "infra_retry_grants": ticket.infra_retry_grants,
         "retry_after": (
             _aware(ticket.retry_after).isoformat(timespec="microseconds")
             if ticket.retry_after is not None
@@ -204,76 +236,13 @@ def _ticket_item(ticket: ValidatorTicket) -> AdminValidationTicket:
         bench_version=ticket.bench_version,
         attempt_count=ticket.attempt_count,
         manual_retry_grants=ticket.manual_retry_grants,
+        infra_retry_grants=ticket.infra_retry_grants,
         retry_after=ticket.retry_after,
         retry_budget_exhausted=(
             ticket.status == TicketStatus.EXPIRED
-            and ticket.attempt_count
-            >= MAX_ATTEMPTS_PER_VERSION + ticket.manual_retry_grants
+            and ticket.attempt_count >= ticket_attempt_cap(ticket)
         ),
     )
-
-
-def _recovery_gate(
-    *,
-    agent: Agent,
-    scores: list[Score],
-    tickets: list[ValidatorTicket],
-    recovery_count: int,
-    now: datetime,
-    bench_version: int,
-) -> tuple[bool, bool, str | None, list[ValidatorTicket]]:
-    score_count = len(scores)
-    if agent.status != AgentStatus.EVALUATING:
-        return False, False, "submission is not waiting for validator scores", []
-    if agent.screening_policy_version < SCREENING_POLICY_VERSION:
-        return False, False, "submission is not on the current screening policy", []
-    if score_count >= SCORING_QUORUM:
-        return False, False, "submission already reached scoring quorum", []
-    if any(ticket.status == TicketStatus.ISSUED for ticket in tickets):
-        return False, False, "a validator ticket is still active", []
-    if recovery_count >= MAX_OPERATOR_RECOVERIES_PER_AGENT:
-        return False, False, "operator retry limit reached", []
-
-    score_hotkeys = {score.validator_hotkey for score in scores}
-    non_scored = [
-        ticket
-        for ticket in tickets
-        if ticket.status != TicketStatus.SCORED
-        and ticket.validator_hotkey not in score_hotkeys
-        and ticket.bench_version == bench_version
-    ]
-    naturally_retryable = [
-        ticket
-        for ticket in non_scored
-        if ticket.status == TicketStatus.EXPIRED
-        and ticket.attempt_count < MAX_ATTEMPTS_PER_VERSION + ticket.manual_retry_grants
-    ]
-    if naturally_retryable:
-        available = any(
-            ticket.retry_after is None or _aware(ticket.retry_after) <= now
-            for ticket in naturally_retryable
-        )
-        reason = (
-            "automatic validator retry is already available"
-            if available
-            else "automatic validator retry is still cooling down"
-        )
-        return available, False, reason, []
-
-    needed = SCORING_QUORUM - score_count
-    exhausted = sorted(
-        (
-            ticket
-            for ticket in non_scored
-            if ticket.status == TicketStatus.EXPIRED
-            and ticket.attempt_count
-            >= MAX_ATTEMPTS_PER_VERSION + ticket.manual_retry_grants
-        ),
-        key=lambda ticket: (_aware(ticket.deadline), ticket.validator_hotkey),
-    )
-    if len(exhausted) < needed:
-        return False, False, "not enough expired tickets to restore quorum", []
-    return False, True, None, exhausted[:needed]
 
 
 async def _load(
@@ -311,23 +280,11 @@ async def _load(
         ticket_query = ticket_query.with_for_update()
     all_tickets = list((await session.scalars(ticket_query)).all())
     canonical_version = await active_bench_version(session)
-    work_tickets = [
-        ticket
-        for ticket in all_tickets
-        if ticket.status in (TicketStatus.ISSUED, TicketStatus.EXPIRED)
-    ]
-    if work_tickets:
-        bench_version = max(
-            work_tickets,
-            key=lambda ticket: (_aware(ticket.issued_at), ticket.bench_version),
-        ).bench_version
-    elif all_scores:
-        bench_version = max(
-            all_scores,
-            key=lambda score: (_aware(score.generated_at), score.bench_version),
-        ).bench_version
-    else:
-        bench_version = canonical_version
+    bench_version = resolve_bench_version(
+        all_tickets=all_tickets,
+        all_scores=all_scores,
+        canonical_version=canonical_version,
+    )
     scores = [score for score in all_scores if score.bench_version == bench_version]
     tickets = [
         ticket for ticket in all_tickets if ticket.bench_version == bench_version
@@ -350,6 +307,84 @@ async def _load(
     return agent, bench_version, scores, tickets, recoveries
 
 
+@router.get("/validation-retries", response_model=AdminStuckSubmissionsResponse)
+async def list_validation_retries(
+    _admin: AdminDep,
+    session: SessionDep,
+    state: Annotated[list[str] | None, Query()] = None,
+) -> AdminStuckSubmissionsResponse:
+    """Fleet-wide triage of every below-quorum submission and why it is stuck.
+
+    The single-agent detail route answers "why is *this* one stuck?"; this
+    answers "which ones need me?" without a per-agent sweep. Filter with one or
+    more ``state`` query params (e.g. ``?state=exhausted``); ``counts`` always
+    reflects the whole fleet so a filtered view still shows the totals.
+    """
+    now = datetime.now(UTC)
+    requested_states = set(state or [])
+    unknown = requested_states - set(RETRY_STATE_ORDER)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail="unknown retry state: " + ", ".join(sorted(unknown)),
+        )
+
+    agents = await list_agents_by_status(
+        session, statuses=[AgentStatus.EVALUATING], limit=_STUCK_SCAN_LIMIT
+    )
+    classified = await classify_agent_retry_states(session, agents=agents, now=now)
+    agents_by_id = {agent.agent_id: agent for agent in agents}
+
+    submissions: list[AdminStuckSubmission] = []
+    counts: dict[RetryState, int] = {}
+    for agent_id, retry in classified.items():
+        counts[retry.state] = counts.get(retry.state, 0) + 1
+        if requested_states and retry.state not in requested_states:
+            continue
+        agent = agents_by_id[agent_id]
+        scored_hotkeys = {s.validator_hotkey for s in retry.scores}
+        submissions.append(
+            AdminStuckSubmission(
+                agent_id=agent.agent_id,
+                miner_hotkey=agent.miner_hotkey,
+                agent_name=agent.name,
+                agent_version=agent.version,
+                bench_version=retry.bench_version,
+                score_count=retry.score_count,
+                quorum=SCORING_QUORUM,
+                retry_state=retry.state,
+                automatic_retry_available=retry.automatic_retry_available,
+                recovery_allowed=retry.recovery_allowed,
+                blocking_reason=retry.blocking_reason,
+                earliest_retry_after=retry.earliest_retry_after,
+                attempts_used=max((t.attempt_count for t in retry.tickets), default=0),
+                exhausted_validator_count=sum(
+                    1
+                    for t in retry.tickets
+                    if is_exhausted(t) and t.validator_hotkey not in scored_hotkeys
+                ),
+                snapshot=_snapshot(
+                    agent=agent, scores=retry.scores, tickets=retry.tickets
+                ),
+                tickets=[_ticket_item(t) for t in retry.tickets],
+            )
+        )
+
+    submissions.sort(
+        key=lambda item: (
+            RETRY_STATE_ORDER[item.retry_state],
+            item.earliest_retry_after or datetime.max.replace(tzinfo=UTC),
+            item.agent_id,
+        )
+    )
+    return AdminStuckSubmissionsResponse(
+        generated_at=now,
+        quorum=SCORING_QUORUM,
+        counts=counts,
+        submissions=submissions,
+    )
+
+
 @router.get("/validation-retries/{agent_id}", response_model=AdminValidationRetryDetail)
 async def get_validation_retry(
     agent_id: UUID, _admin: AdminDep, session: SessionDep
@@ -360,7 +395,7 @@ async def get_validation_retry(
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
     score_count = len(scores)
-    automatic, allowed, reason, _ = _recovery_gate(
+    automatic, allowed, reason, _ = recovery_gate(
         agent=agent,
         scores=scores,
         tickets=tickets,
@@ -385,6 +420,81 @@ async def get_validation_retry(
     )
 
 
+async def _apply_recovery(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    actor: str,
+    reason: str,
+    request_id: UUID,
+    expected_snapshot: str,
+    now: datetime,
+) -> tuple[str, str | None, ValidatorRetryRecovery | None]:
+    """Grant one audited recovery inside the caller's transaction.
+
+    Returns ``(status, detail, recovery)`` and never raises for an expected
+    condition, so the batch route can collect a per-agent verdict instead of
+    aborting the whole set. ``status`` is ``granted`` | ``idempotent`` |
+    ``skipped``; ``detail`` explains a skip.
+    """
+    agent, bench_version, scores, tickets, recoveries = await _load(
+        session, agent_id=agent_id, for_update=True
+    )
+    if agent is None:
+        return "skipped", "agent not found", None
+    existing = await session.get(ValidatorRetryRecovery, request_id)
+    if existing is not None:
+        if (
+            existing.agent_id != agent_id
+            or existing.actor != actor
+            or existing.reason != reason
+            or existing.expected_snapshot != expected_snapshot
+        ):
+            return "skipped", "request id already used", None
+        return "idempotent", None, existing
+
+    current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
+    if current_snapshot != expected_snapshot:
+        return "skipped", "validation state changed", None
+    _, allowed, gate_reason, selected = recovery_gate(
+        agent=agent,
+        scores=scores,
+        tickets=tickets,
+        recovery_count=len(recoveries),
+        now=now,
+        bench_version=bench_version,
+    )
+    if not allowed:
+        return "skipped", gate_reason or "retry unavailable", None
+
+    ticket_snapshot = [_ticket_wire(ticket) for ticket in tickets]
+    for ticket in selected:
+        ticket.manual_retry_grants += 1
+        ticket.retry_after = now
+    recovery = ValidatorRetryRecovery(
+        recovery_id=request_id,
+        agent_id=agent_id,
+        actor=actor,
+        reason=reason,
+        expected_snapshot=current_snapshot,
+        score_count=len(scores),
+        bench_version=bench_version,
+        ticket_snapshot=ticket_snapshot,
+        granted_validator_hotkeys=[ticket.validator_hotkey for ticket in selected],
+        created_at=now,
+    )
+    session.add(recovery)
+    await session.flush()
+    return "granted", None, recovery
+
+
+def _require_actor(x_admin_actor: str | None) -> str:
+    actor = x_admin_actor.strip() if x_admin_actor is not None else ""
+    if not 1 <= len(actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    return actor
+
+
 @router.post(
     "/validation-retries/{agent_id}/retry",
     response_model=AdminValidationRetryResponse,
@@ -396,66 +506,66 @@ async def retry_validation_after_infrastructure_failure(
     session: SessionDep,
     x_admin_actor: Annotated[str | None, Header()] = None,
 ) -> AdminValidationRetryResponse:
-    actor = x_admin_actor.strip() if x_admin_actor is not None else ""
-    if not 1 <= len(actor) <= 120:
-        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    actor = _require_actor(x_admin_actor)
     async with session.begin():
-        agent, bench_version, scores, tickets, recoveries = await _load(
-            session, agent_id=agent_id, for_update=True
-        )
-        if agent is None:
-            raise HTTPException(status_code=404, detail="agent not found")
-        score_count = len(scores)
-
-        existing = await session.get(ValidatorRetryRecovery, payload.request_id)
-        if existing is not None:
-            if (
-                existing.agent_id != agent_id
-                or existing.actor != actor
-                or existing.reason != payload.reason
-                or existing.expected_snapshot != payload.expected_snapshot
-            ):
-                raise HTTPException(status_code=409, detail="request id already used")
-            return AdminValidationRetryResponse(
-                recovery=_recovery_item(existing), idempotent=True
-            )
-
-        current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
-        if current_snapshot != payload.expected_snapshot:
-            raise HTTPException(status_code=409, detail="validation state changed")
-        _, allowed, reason, selected = _recovery_gate(
-            agent=agent,
-            scores=scores,
-            tickets=tickets,
-            recovery_count=len(recoveries),
-            now=datetime.now(UTC),
-            bench_version=bench_version,
-        )
-        if not allowed:
-            raise HTTPException(status_code=409, detail=reason or "retry unavailable")
-
-        ticket_snapshot = [_ticket_wire(ticket) for ticket in tickets]
-        now = datetime.now(UTC)
-        for ticket in selected:
-            ticket.manual_retry_grants += 1
-            ticket.retry_after = now
-        recovery = ValidatorRetryRecovery(
-            recovery_id=payload.request_id,
+        status, detail, recovery = await _apply_recovery(
+            session,
             agent_id=agent_id,
             actor=actor,
             reason=payload.reason,
-            expected_snapshot=current_snapshot,
-            score_count=score_count,
-            bench_version=bench_version,
-            ticket_snapshot=ticket_snapshot,
-            granted_validator_hotkeys=[ticket.validator_hotkey for ticket in selected],
-            created_at=now,
+            request_id=payload.request_id,
+            expected_snapshot=payload.expected_snapshot,
+            now=datetime.now(UTC),
         )
-        session.add(recovery)
-        await session.flush()
-    return AdminValidationRetryResponse(
-        recovery=_recovery_item(recovery), idempotent=False
-    )
+        if status == "skipped":
+            code = 404 if detail == "agent not found" else 409
+            raise HTTPException(status_code=code, detail=detail or "retry unavailable")
+        assert recovery is not None
+        return AdminValidationRetryResponse(
+            recovery=_recovery_item(recovery), idempotent=status == "idempotent"
+        )
+
+
+@router.post(
+    "/validation-retries/batch-retry",
+    response_model=AdminBatchRetryResponse,
+)
+async def batch_retry_validation(
+    payload: AdminBatchRetryRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminBatchRetryResponse:
+    """Grant recoveries to several stranded submissions in one operator action.
+
+    Each item is gated and snapshot-checked exactly like the single-agent route;
+    an item whose state moved (or that no longer qualifies) is skipped with a
+    reason rather than force-granted. All grants commit together.
+    """
+    actor = _require_actor(x_admin_actor)
+    now = datetime.now(UTC)
+    results: list[AdminBatchRetryResult] = []
+    async with session.begin():
+        for item in payload.items:
+            status, detail, recovery = await _apply_recovery(
+                session,
+                agent_id=item.agent_id,
+                actor=actor,
+                reason=payload.reason,
+                request_id=item.request_id,
+                expected_snapshot=item.expected_snapshot,
+                now=now,
+            )
+            results.append(
+                AdminBatchRetryResult(
+                    agent_id=item.agent_id,
+                    status=status,  # type: ignore[arg-type]
+                    detail=detail,
+                    recovery=_recovery_item(recovery) if recovery is not None else None,
+                )
+            )
+    granted = sum(1 for result in results if result.status == "granted")
+    return AdminBatchRetryResponse(granted=granted, results=results)
 
 
 async def _replacement_state(
@@ -499,18 +609,36 @@ def _replacement_gate(
     target: Score | None,
     ticket: ValidatorTicket | None,
     validator_busy: bool,
-    replacement_pending: bool = False,
+    replacement_open: bool = False,
 ) -> str | None:
     if agent.status not in _REPLACEABLE_STATUSES:
         return "submission is not in a scoreable state"
     if target is None:
         return "validator has no accepted score to replace"
-    if replacement_pending:
-        return "replacement score is already pending"
+    if replacement_open:
+        return "replacement score is already queued or pending"
     if ticket is None or ticket.status != TicketStatus.SCORED:
         return "accepted score is not backed by a consumed validator ticket"
     if validator_busy:
         return "validator is currently assigned to another submission"
+    return None
+
+
+def _queue_gate(
+    *,
+    agent: Agent,
+    target: Score | None,
+    ticket: ValidatorTicket | None,
+    replacement_open: bool,
+) -> str | None:
+    if agent.status not in _FINALIZED_STATUSES:
+        return "submission is no longer finalized"
+    if target is None:
+        return "validator has no accepted score to replace"
+    if replacement_open:
+        return "replacement score is already queued or pending"
+    if ticket is None or ticket.status != TicketStatus.SCORED:
+        return "accepted score is not backed by a consumed validator ticket"
     return None
 
 
@@ -532,6 +660,8 @@ async def list_score_outliers(
         ).all()
     )
     detected: list[AdminScoreOutlier] = []
+    lifecycle_cache: dict[str, dict[UUID, ScoreAuditEntry]] = {}
+    position_cache: dict[str, dict[UUID, int]] = {}
     for listed_agent in agents:
         agent, bench_version, scores, tickets, _ = await _load(
             session, agent_id=listed_agent.agent_id, for_update=False
@@ -549,12 +679,26 @@ async def list_score_outliers(
             ),
             None,
         )
-        latest = await get_latest_score_retest_event(
-            session,
-            agent_id=agent.agent_id,
-            validator_hotkey=target.validator_hotkey,
-        )
-        pending = latest is not None and latest.event == EVENT_SCORE_RETEST_REQUESTED
+        if target.validator_hotkey not in lifecycle_cache:
+            lifecycle = await latest_retest_events_for_validator(
+                session, validator_hotkey=target.validator_hotkey
+            )
+            lifecycle_cache[target.validator_hotkey] = lifecycle
+            queued_entries = sorted(
+                (
+                    entry
+                    for entry in lifecycle.values()
+                    if entry.event == EVENT_SCORE_RETEST_QUEUED
+                ),
+                key=lambda entry: entry.seq,
+            )
+            position_cache[target.validator_hotkey] = {
+                entry.agent_id: index
+                for index, entry in enumerate(queued_entries, start=1)
+            }
+        latest = lifecycle_cache[target.validator_hotkey].get(agent.agent_id)
+        pending = retest_is_active(latest)
+        queued = retest_is_queued(latest)
         busy = await _validator_busy_elsewhere(
             session,
             agent_id=agent.agent_id,
@@ -565,8 +709,15 @@ async def list_score_outliers(
             target=target,
             ticket=ticket,
             validator_busy=busy,
-            replacement_pending=pending,
+            replacement_open=retest_is_open(latest),
         )
+        queue_blocking = _queue_gate(
+            agent=agent,
+            target=target,
+            ticket=ticket,
+            replacement_open=retest_is_open(latest),
+        )
+        queue_positions = position_cache[target.validator_hotkey]
         detected.append(
             AdminScoreOutlier(
                 agent_id=agent.agent_id,
@@ -587,11 +738,15 @@ async def list_score_outliers(
                 peer_spread=peer_spread,
                 ticket_status=ticket.status.value if ticket is not None else None,
                 replacement_pending=pending,
+                replacement_queued=queued,
+                queue_position=queue_positions.get(agent.agent_id),
                 replacement_deadline=(
                     ticket.deadline if pending and ticket is not None else None
                 ),
                 replacement_allowed=blocking is None,
                 blocking_reason=blocking,
+                queue_allowed=queue_blocking is None,
+                queue_blocking_reason=queue_blocking,
             )
         )
 
@@ -634,7 +789,7 @@ async def inspect_validator_score_replacement(
     latest = await get_latest_score_retest_event(
         session, agent_id=agent_id, validator_hotkey=validator_hotkey
     )
-    pending = latest is not None and latest.event == EVENT_SCORE_RETEST_REQUESTED
+    pending = retest_is_active(latest)
     reason = _replacement_gate(
         agent=agent,
         target=target,
@@ -642,7 +797,7 @@ async def inspect_validator_score_replacement(
         validator_busy=await _validator_busy_elsewhere(
             session, agent_id=agent_id, validator_hotkey=validator_hotkey
         ),
-        replacement_pending=pending,
+        replacement_open=retest_is_open(latest),
     )
     return AdminValidatorScoreReplacementDetail(
         agent_id=agent_id,
@@ -670,6 +825,187 @@ async def inspect_validator_score_replacement(
         ),
         replacement_allowed=reason is None,
         blocking_reason=reason,
+    )
+
+
+@router.post(
+    "/validation-retries/validators/{validator_hotkey}/queue-score-retests",
+    response_model=AdminValidatorScoreRetestQueueResponse,
+)
+async def queue_validator_score_retests(
+    validator_hotkey: str,
+    payload: AdminValidatorScoreRetestQueueRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminValidatorScoreRetestQueueResponse:
+    """Queue exact outliers behind one validator's current assignment.
+
+    Every item is independently snapshot/run checked. Accepted scores stay
+    canonical; only one request is promoted to an issued ticket at a time.
+    """
+    actor = _require_actor(x_admin_actor)
+    now = datetime.now(UTC)
+    preliminary: dict[UUID, tuple[str, str | None]] = {}
+    async with session.begin():
+        for item in payload.items:
+            lifecycle_entries = list(
+                (
+                    await session.scalars(
+                        select(ScoreAuditEntry).where(
+                            ScoreAuditEntry.agent_id == item.agent_id,
+                            ScoreAuditEntry.validator_hotkey == validator_hotkey,
+                            ScoreAuditEntry.event.in_(
+                                (
+                                    EVENT_SCORE_RETEST_QUEUED,
+                                    EVENT_SCORE_RETEST_REQUESTED,
+                                )
+                            ),
+                        )
+                    )
+                ).all()
+            )
+            prior = next(
+                (
+                    entry
+                    for entry in lifecycle_entries
+                    if entry.payload.get("request_id") == str(item.request_id)
+                ),
+                None,
+            )
+            if prior is not None:
+                if (
+                    prior.payload.get("actor") == actor
+                    and prior.payload.get("reason") == payload.reason
+                    and prior.payload.get("run_id") == item.expected_run_id
+                    and prior.payload.get("expected_snapshot") == item.expected_snapshot
+                ):
+                    preliminary[item.agent_id] = ("idempotent", None)
+                else:
+                    preliminary[item.agent_id] = (
+                        "skipped",
+                        "request id already used with different evidence",
+                    )
+                continue
+
+            agent, bench_version, scores, tickets, target = await _replacement_state(
+                session,
+                agent_id=item.agent_id,
+                validator_hotkey=validator_hotkey,
+                for_update=True,
+            )
+            if agent is None:
+                preliminary[item.agent_id] = ("skipped", "agent not found")
+                continue
+            current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
+            if current_snapshot != item.expected_snapshot:
+                preliminary[item.agent_id] = (
+                    "skipped",
+                    "validation state changed",
+                )
+                continue
+            if target is not None and target.run_id != item.expected_run_id:
+                preliminary[item.agent_id] = ("skipped", "accepted score run changed")
+                continue
+            detected = _detect_outlier(scores)
+            if (
+                detected is None
+                or detected[0].validator_hotkey != validator_hotkey
+                or detected[0].run_id != item.expected_run_id
+            ):
+                preliminary[item.agent_id] = (
+                    "skipped",
+                    "validator score is no longer the detected outlier",
+                )
+                continue
+            ticket = next(
+                (
+                    candidate
+                    for candidate in tickets
+                    if candidate.validator_hotkey == validator_hotkey
+                    and candidate.bench_version == bench_version
+                ),
+                None,
+            )
+            latest = await get_latest_score_retest_event(
+                session,
+                agent_id=item.agent_id,
+                validator_hotkey=validator_hotkey,
+            )
+            reason = _queue_gate(
+                agent=agent,
+                target=target,
+                ticket=ticket,
+                replacement_open=retest_is_open(latest),
+            )
+            if reason is not None:
+                preliminary[item.agent_id] = ("skipped", reason)
+                continue
+            assert target is not None
+            await append_audit_entry(
+                session,
+                agent_id=item.agent_id,
+                validator_hotkey=validator_hotkey,
+                event=EVENT_SCORE_RETEST_QUEUED,
+                payload={
+                    "request_id": str(item.request_id),
+                    "actor": actor,
+                    "reason": payload.reason,
+                    "expected_snapshot": item.expected_snapshot,
+                    "bench_version": bench_version,
+                    "run_id": item.expected_run_id,
+                    "preserved_score": _score_evidence(target),
+                    "preserved_score_count": len(scores),
+                    "queue_group_size": len(payload.items),
+                },
+                recorded_at=now,
+            )
+            preliminary[item.agent_id] = ("queued", None)
+
+        heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
+        await activate_next_score_retest(
+            session,
+            validator_hotkey=validator_hotkey,
+            now=now,
+            supports_version=lambda version: (
+                heartbeat is not None
+                and heartbeat_supports_version(heartbeat, now=now, version=version)
+            ),
+        )
+        latest_by_agent = await latest_retest_events_for_validator(
+            session, validator_hotkey=validator_hotkey
+        )
+        positions = await score_retest_queue_positions(
+            session, validator_hotkey=validator_hotkey
+        )
+        results: list[AdminValidatorScoreRetestQueueResult] = []
+        for item in payload.items:
+            status, detail = preliminary[item.agent_id]
+            latest = latest_by_agent.get(item.agent_id)
+            if (
+                status == "queued"
+                and latest is not None
+                and latest.event == EVENT_SCORE_RETEST_REQUESTED
+                and latest.payload.get("request_id") == str(item.request_id)
+            ):
+                status = "activated"
+            results.append(
+                AdminValidatorScoreRetestQueueResult(
+                    agent_id=item.agent_id,
+                    request_id=item.request_id,
+                    status=status,  # type: ignore[arg-type]
+                    detail=detail,
+                    queue_position=positions.get(item.agent_id),
+                )
+            )
+
+    return AdminValidatorScoreRetestQueueResponse(
+        validator_hotkey=validator_hotkey,
+        activated=sum(result.status == "activated" for result in results),
+        queued=sum(result.status == "queued" for result in results),
+        idempotent=sum(result.status == "idempotent" for result in results),
+        skipped=sum(result.status == "skipped" for result in results),
+        results=results,
     )
 
 
@@ -758,13 +1094,13 @@ async def replace_validator_score_after_infrastructure_failure(
             validator_busy=await _validator_busy_elsewhere(
                 session, agent_id=agent_id, validator_hotkey=validator_hotkey
             ),
-            replacement_pending=False,
+            replacement_open=False,
         )
         if reason is not None:
             raise HTTPException(status_code=409, detail=reason)
         assert target is not None and ticket is not None
         now = datetime.now(UTC)
-        deadline = now + _REPLACEMENT_TICKET_TTL
+        deadline = now + REPLACEMENT_TICKET_TTL
         ticket.status = TicketStatus.ISSUED
         ticket.issued_at = now
         ticket.deadline = deadline
@@ -910,6 +1246,16 @@ async def release_validator_score_retest_ticket(
                 "preserved_run_id": target.run_id,
             },
             recorded_at=now,
+        )
+        heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
+        await activate_next_score_retest(
+            session,
+            validator_hotkey=validator_hotkey,
+            now=now,
+            supports_version=lambda version: (
+                heartbeat is not None
+                and heartbeat_supports_version(heartbeat, now=now, version=version)
+            ),
         )
         await session.flush()
     return AdminValidatorScoreRetestReleaseResponse(
