@@ -58,6 +58,8 @@ from ditto.api_models import (
     CreateScreeningDisputeResponse,
     PublicActivityEntry,
     PublicActivityResponse,
+    PublicArtifactDownload,
+    PublicArtifactRelease,
     PublicAuditEntry,
     PublicAuditResponse,
     PublicBenchConfigResponse,
@@ -173,6 +175,10 @@ from ditto.db.models import (
     ValidatorTicket,
 )
 from ditto.db.queries.agents import list_public_activity
+from ditto.db.queries.artifact_release import (
+    ArtifactScoreQuorum,
+    list_first_score_quorums,
+)
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.benchmark_admission import (
     admitted_agent_ids,
@@ -245,6 +251,8 @@ _TIMELINE_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=3600"
 # so this is a long freshness window rather than `immutable`: a reload reuses it
 # with no request at all, and any correction lands within the hour.
 _SETTLED_BENCH_CACHE_CONTROL = "public, max-age=3600, stale-while-revalidate=86400"
+_ARTIFACT_RELEASE_EMBARGO = timedelta(hours=6)
+_ARTIFACT_DOWNLOAD_TTL_SECONDS = 5 * 60
 _REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 1.0
 _REGISTRATION_CACHE_TTL_SECONDS = 15.0
 _REGISTRATION_FAILURE_CACHE_TTL_SECONDS = 5.0
@@ -444,6 +452,73 @@ def _aware(value: datetime | None) -> datetime | None:
     if value is None or value.tzinfo is not None:
         return value
     return value.replace(tzinfo=UTC)
+
+
+def _public_artifact_release(
+    *,
+    status: AgentStatus,
+    score_quorum: ArtifactScoreQuorum | None,
+    now: datetime,
+) -> PublicArtifactRelease:
+    """Project source visibility without mutating a public GET request."""
+    if status in (AgentStatus.REJECTED, AgentStatus.BANNED):
+        return PublicArtifactRelease(status="unavailable")
+
+    finalized_at = score_quorum.finalized_at if score_quorum is not None else None
+    available_at = (
+        finalized_at + _ARTIFACT_RELEASE_EMBARGO if finalized_at is not None else None
+    )
+    release_status: Literal[
+        "awaiting_quorum", "under_review", "embargoed", "available", "unavailable"
+    ]
+    if status in (AgentStatus.ATH_PENDING_REVIEW, AgentStatus.QUARANTINED):
+        release_status = "under_review"
+    elif score_quorum is None:
+        release_status = "awaiting_quorum"
+    elif status in (AgentStatus.SCORED, AgentStatus.LIVE):
+        assert available_at is not None
+        release_status = "available" if now >= available_at else "embargoed"
+    else:
+        release_status = "unavailable"
+
+    return PublicArtifactRelease(
+        status=release_status,
+        bench_version=(
+            score_quorum.bench_version if score_quorum is not None else None
+        ),
+        score_quorum=SCORING_QUORUM,
+        embargo_hours=int(_ARTIFACT_RELEASE_EMBARGO.total_seconds() // 3600),
+        finalized_at=finalized_at,
+        available_at=available_at,
+        download_available=release_status == "available",
+    )
+
+
+async def _artifact_release_snapshot(
+    session: AsyncSession,
+    *,
+    statuses: dict[UUID, AgentStatus],
+    now: datetime,
+) -> dict[UUID, PublicArtifactRelease]:
+    """Batch-load release metadata for a public response.
+
+    Takes ``agent_id -> status`` rather than ORM rows so hot public endpoints
+    can keep their narrow column selects instead of hydrating full ``Agent``
+    entities (which carry embeddings and fingerprint sketches).
+    """
+    score_quorums = await list_first_score_quorums(
+        session,
+        agent_ids=list(statuses),
+        quorum=SCORING_QUORUM,
+    )
+    return {
+        agent_id: _public_artifact_release(
+            status=status,
+            score_quorum=score_quorums.get(agent_id),
+            now=now,
+        )
+        for agent_id, status in statuses.items()
+    }
 
 
 def _public_system_metrics(raw: dict | None) -> PublicSystemMetrics | None:
@@ -898,6 +973,7 @@ def _public_entry(
     settled_composite: float | None = None,
     rollout_composite: float | None = None,
     rollout_score_count: int | None = None,
+    artifact_release: PublicArtifactRelease | None = None,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -922,6 +998,7 @@ def _public_entry(
         agent_id=r.agent_id,
         agent_name=agent_name,
         agent_version=agent_version,
+        artifact_release=artifact_release,
         miner_hotkey=r.miner_hotkey,
         miner_uid=miner_uid,
         registered=registered,
@@ -1217,6 +1294,7 @@ async def leaderboard(
     The selected generation's hotkey remains the on-chain weight destination.
     Legacy rows without payment provenance fall back to one position per hotkey.
     """
+    now = datetime.now(UTC)
     from ditto.db.queries.benchmark_rollout import open_rollout
 
     active_version = await active_bench_version(session)
@@ -1331,18 +1409,25 @@ async def leaderboard(
                 float(statistics.median(desired_pool)) if desired_pool else None,
                 len(desired_pool),
             )
-    agent_metadata = {
-        agent_id: (name, version)
-        for agent_id, name, version in (
+    agent_rows = (
+        (
             await session.execute(
-                select(Agent.agent_id, Agent.name, Agent.version).where(
+                select(Agent.agent_id, Agent.name, Agent.version, Agent.status).where(
                     Agent.agent_id.in_([row.agent_id for row in rows])
                 )
             )
         )
         .tuples()
         .all()
+    )
+    agent_metadata = {
+        agent_id: (name, version) for agent_id, name, version, _ in agent_rows
     }
+    artifact_releases = await _artifact_release_snapshot(
+        session,
+        statuses={agent_id: status for agent_id, _, _, status in agent_rows},
+        now=now,
+    )
     histories = await list_miner_composite_history(
         session,
         [r.miner_hotkey for r in rows],
@@ -1375,6 +1460,7 @@ async def leaderboard(
                     else None
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
+                artifact_release=artifact_releases[row.agent_id],
             )
         )
     for row, count in provisional_rows:
@@ -1403,10 +1489,11 @@ async def leaderboard(
                     else None
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
+                artifact_release=artifact_releases[row.agent_id],
             )
         )
     return PublicLeaderboardResponse(
-        generated_at=datetime.now(UTC),
+        generated_at=now,
         count=len(entries),
         current_bench_version=display_version,
         active_bench_version=active_version,
@@ -1862,12 +1949,15 @@ def _dataset_command(
     return f"{command} -sha" if sha_only else f"{command} -out dataset.json"
 
 
-def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
+def _submission_scores(
+    row: SubmissionRow, *, artifact_release: PublicArtifactRelease
+) -> PublicSubmissionScores:
     """Map a submission row to the full public k=3 record."""
     return PublicSubmissionScores(
         agent_id=row.agent_id,
         miner_hotkey=row.miner_hotkey,
         status=row.status.value,
+        artifact_release=artifact_release,
         quorum=SCORING_QUORUM,
         score_count=len(row.scores),
         median_composite=_median_composite(row),
@@ -1914,12 +2004,15 @@ def _public_validator_score(s) -> PublicValidatorScore:
     )
 
 
-def _submission_summary(row: SubmissionRow) -> PublicSubmissionSummary:
+def _submission_summary(
+    row: SubmissionRow, *, artifact_release: PublicArtifactRelease
+) -> PublicSubmissionSummary:
     """Map a submission row to the compact index entry."""
     return PublicSubmissionSummary(
         agent_id=row.agent_id,
         miner_hotkey=row.miner_hotkey,
         status=row.status.value,
+        artifact_release=artifact_release,
         score_count=len(row.scores),
         median_composite=_median_composite(row),
         dataset_seed=row.dataset_seed,
@@ -1989,6 +2082,7 @@ def _public_activity_response(
     score_continuation_floor: float | None,
     provisional_contender_floor: float | None,
     active_assignment_agent_ids: set[UUID],
+    artifact_releases: dict[UUID, PublicArtifactRelease],
     active_bench_version: int | None = None,
     benchmark_admitted_agent_ids: set[UUID] | None = None,
     retry_states: dict[UUID, AgentRetryState] | None = None,
@@ -2131,6 +2225,7 @@ def _public_activity_response(
                 name=row.agent.name,
                 version=row.agent.version,
                 status=row_status,
+                artifact_release=artifact_releases[row.agent.agent_id],
                 submitted_at=row.agent.created_at,
                 last_scored_at=_aware(row.last_scored_at),
                 screening_reason=(
@@ -2294,6 +2389,11 @@ async def activity(
         score_continuation_floor,
         provisional_contender_floor,
     ) = await get_score_priority_floors(session, bench_version=active_version)
+    artifact_releases = await _artifact_release_snapshot(
+        session,
+        statuses={row.agent.agent_id: row.agent.status for row in rows},
+        now=now,
+    )
     return _public_activity_response(
         rows=rows,
         active_work=await list_active_validator_work(
@@ -2311,6 +2411,7 @@ async def activity(
             for assignment in assignments
             if assignment.ticket.bench_version == active_version
         },
+        artifact_releases=artifact_releases,
         active_bench_version=active_version,
         benchmark_admitted_agent_ids=admitted,
         retry_states=await classify_agent_retry_states(
@@ -2350,6 +2451,11 @@ async def operations(
         score_continuation_floor,
         provisional_contender_floor,
     ) = await get_score_priority_floors(session, bench_version=active_version)
+    artifact_releases = await _artifact_release_snapshot(
+        session,
+        statuses={row.agent.agent_id: row.agent.status for row in activity_rows},
+        now=now,
+    )
     activity_snapshot = _public_activity_response(
         rows=activity_rows,
         active_work=active_work,
@@ -2365,6 +2471,7 @@ async def operations(
             for assignment in assignments
             if assignment.ticket.bench_version == active_version
         },
+        artifact_releases=artifact_releases,
         active_bench_version=active_version,
         benchmark_admitted_agent_ids=admitted,
         retry_states=await classify_agent_retry_states(
@@ -2782,11 +2889,20 @@ async def submissions(
     """
     response.headers["Cache-Control"] = _CACHE_CONTROL
     rows = await list_public_submissions(session, limit=limit)
+    now = datetime.now(UTC)
+    artifact_releases = await _artifact_release_snapshot(
+        session,
+        statuses={row.agent_id: row.status for row in rows},
+        now=now,
+    )
     return PublicSubmissionsResponse(
-        generated_at=datetime.now(UTC),
+        generated_at=now,
         count=len(rows),
         quorum=SCORING_QUORUM,
-        submissions=[_submission_summary(r) for r in rows],
+        submissions=[
+            _submission_summary(row, artifact_release=artifact_releases[row.agent_id])
+            for row in rows
+        ],
     )
 
 
@@ -2809,7 +2925,57 @@ async def agent_scores(
     row = await get_submission_scores(session, agent_id=agent_id)
     if row is None:
         raise HTTPException(status_code=404, detail="no public scores for this agent")
-    return _submission_scores(row)
+    artifact_release = (
+        await _artifact_release_snapshot(
+            session, statuses={agent_id: row.status}, now=datetime.now(UTC)
+        )
+    )[agent_id]
+    return _submission_scores(row, artifact_release=artifact_release)
+
+
+@router.get("/agent/{agent_id}/artifact", response_model=PublicArtifactDownload)
+async def agent_artifact(
+    response: Response,
+    session: SessionDep,
+    storage: StorageDep,
+    agent_id: UUID,
+) -> PublicArtifactDownload:
+    """Return a short-lived source URL six hours after a cleared 3/3 score."""
+    response.headers["Cache-Control"] = "private, no-store"
+    agent = await session.get(Agent, agent_id)
+    if agent is None or agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
+        raise HTTPException(status_code=404, detail="source is not publicly available")
+
+    now = datetime.now(UTC)
+    score_quorum = (
+        await list_first_score_quorums(
+            session, agent_ids=[agent_id], quorum=SCORING_QUORUM
+        )
+    ).get(agent_id)
+    release = _public_artifact_release(
+        status=agent.status,
+        score_quorum=score_quorum,
+        now=now,
+    )
+    if release.status != "available" or score_quorum is None:
+        detail = "source is awaiting a three-validator score quorum"
+        if release.available_at is not None:
+            detail = f"source is embargoed until {release.available_at.isoformat()}"
+        raise HTTPException(status_code=425, detail=detail)
+
+    download_url = await storage.presigned_get_url(
+        key=f"{agent_id}/agent.tar.gz",
+        expires_in=_ARTIFACT_DOWNLOAD_TTL_SECONDS,
+        attachment_filename=f"ditto-agent-{agent_id}.tar.gz",
+    )
+    return PublicArtifactDownload(
+        agent_id=agent.agent_id,
+        bench_version=score_quorum.bench_version,
+        sha256=agent.sha256,
+        finalized_at=score_quorum.finalized_at,
+        download_url=download_url,
+        expires_at=now + timedelta(seconds=_ARTIFACT_DOWNLOAD_TTL_SECONDS),
+    )
 
 
 @router.get("/agent/{agent_id}/dataset", response_model=PublicDatasetReveal)
