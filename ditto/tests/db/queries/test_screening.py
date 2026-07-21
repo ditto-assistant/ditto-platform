@@ -698,9 +698,39 @@ async def test_evaluating_agent_missing_screened_image_is_reclaimed(
 
     claimed = await _claim(session)
 
-    assert agent.agent_id in {claimed_agent.agent_id for claimed_agent, _, _ in claimed}
+    attempt = next(
+        (
+            a
+            for claimed_agent, a, _ in claimed
+            if claimed_agent.agent_id == agent.agent_id
+        ),
+        None,
+    )
+    assert attempt is not None
     refreshed = await session.get(Agent, agent.agent_id)
     assert refreshed is not None and refreshed.status == AgentStatus.SCREENING
+    # It already cleared the anti-cheat review (it was EVALUATING on the current
+    # policy), so this is a BUILD-ONLY pass — rebuild the image, do not re-review.
+    assert attempt.build_only is True
+
+
+async def test_fresh_upload_claim_is_not_build_only(
+    session: AsyncSession,
+) -> None:
+    # A never-reviewed submission gets the full screen (review can quarantine),
+    # not a build-only pass.
+    agent = await _seed_failed_agent(session)  # SCREENING_FAILED, never passed
+    claimed = await _claim(session)
+    attempt = next(
+        (
+            a
+            for claimed_agent, a, _ in claimed
+            if claimed_agent.agent_id == agent.agent_id
+        ),
+        None,
+    )
+    assert attempt is not None
+    assert attempt.build_only is False
 
 
 async def test_evaluating_agent_with_complete_prereqs_is_not_reclaimed(

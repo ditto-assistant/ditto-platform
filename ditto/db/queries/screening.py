@@ -487,6 +487,17 @@ async def claim_screening_attempts(
                         public_reason=agent.screening_reason,
                     )
                 )
+        # An EVALUATING agent on the current policy already cleared the anti-cheat
+        # review (it passed, or an operator released its quarantine). Re-claiming
+        # it — to rebuild a missing screened image or dataset — must NOT re-run
+        # that review, or we would re-judge an approved artifact (and risk a
+        # release/re-quarantine loop). It is a build-only pass. A fresh
+        # (UPLOADED), failed, or stale-policy submission still gets the full
+        # review.
+        build_only = (
+            agent.status == AgentStatus.EVALUATING
+            and agent.screening_policy_version >= SCREENING_POLICY_VERSION
+        )
         attempt = ScreeningAttempt(
             attempt_id=uuid4(),
             agent_id=agent.agent_id,
@@ -499,6 +510,7 @@ async def claim_screening_attempts(
                 "exact-cross-miner-duplicate" if duplicate_of is not None else None
             ),
             duplicate_of=duplicate_of,
+            build_only=build_only,
         )
         session.add(attempt)
         if agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):

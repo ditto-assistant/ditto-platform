@@ -398,6 +398,14 @@ class ScreeningAttempt(Base):
     duplicate_of: Mapped[UUID | None] = mapped_column(
         SaUUID(as_uuid=True), nullable=True
     )
+    build_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    """This attempt only rebuilds an already-adjudicated submission's missing
+    prerequisites (screened image / dataset); the screener must NOT re-run the
+    anti-cheat source review and cannot quarantine. Set when an EVALUATING agent
+    on the current policy is re-claimed — its review was already cleared, so a
+    re-screen would wrongly re-judge an approved artifact."""
 
     __table_args__ = (
         ForeignKeyConstraint(
