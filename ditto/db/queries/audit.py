@@ -51,10 +51,12 @@ EVENT_FINALIZED = "agent_finalized"
 # without the chain itself leaking the dataset's answers.
 EVENT_AUDIT = "transform_audit"
 EVENT_SCORE_INVALIDATED = "score_invalidated"
+EVENT_SCORE_RETEST_QUEUED = "score_retest_queued"
 EVENT_SCORE_RETEST_REQUESTED = "score_retest_requested"
 EVENT_SCORE_RETEST_RELEASED = "score_retest_released"
 
 SCORE_RETEST_EVENTS = (
+    EVENT_SCORE_RETEST_QUEUED,
     EVENT_SCORE_RETEST_REQUESTED,
     EVENT_SCORE_INVALIDATED,
     EVENT_SCORE_RETEST_RELEASED,
@@ -194,8 +196,10 @@ async def get_latest_score_retest_event(
 ) -> ScoreAuditEntry | None:
     """Return the latest lifecycle event for one operator-requested re-test.
 
-    A latest ``score_retest_requested`` entry means the original accepted score
-    is still canonical while the same validator holds a replacement ticket.
+    A latest ``score_retest_queued`` entry means the original accepted score is
+    canonical while the request waits behind that validator's current work. A
+    latest ``score_retest_requested`` entry means the same validator holds a
+    replacement ticket.
     ``score_invalidated`` closes it atomically when the replacement lands;
     ``score_retest_released`` closes it without changing the score.
     """

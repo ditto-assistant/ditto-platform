@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import statistics
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -36,6 +36,9 @@ from ditto.api_models.admin_validation_retry import (
     AdminValidatorScoreReplacementDetail,
     AdminValidatorScoreReplacementRequest,
     AdminValidatorScoreReplacementResponse,
+    AdminValidatorScoreRetestQueueRequest,
+    AdminValidatorScoreRetestQueueResponse,
+    AdminValidatorScoreRetestQueueResult,
     AdminValidatorScoreRetestReleaseRequest,
     AdminValidatorScoreRetestReleaseResponse,
 )
@@ -48,22 +51,36 @@ from ditto.db.models import (
     Agent,
     Score,
     ScoreAuditEntry,
+    ValidatorHeartbeat,
     ValidatorRetryRecovery,
     ValidatorTicket,
 )
 from ditto.db.queries.agents import list_agents_by_status
 from ditto.db.queries.audit import (
+    EVENT_SCORE_RETEST_QUEUED,
     EVENT_SCORE_RETEST_RELEASED,
     EVENT_SCORE_RETEST_REQUESTED,
     append_audit_entry,
     get_latest_score_retest_event,
 )
-from ditto.db.queries.benchmark_rollout import active_bench_version
+from ditto.db.queries.benchmark_rollout import (
+    active_bench_version,
+    heartbeat_supports_version,
+)
 from ditto.db.queries.retry_state import (
     classify_agent_retry_states,
     is_exhausted,
     recovery_gate,
     resolve_bench_version,
+)
+from ditto.db.queries.score_retests import (
+    REPLACEMENT_TICKET_TTL,
+    activate_next_score_retest,
+    latest_retest_events_for_validator,
+    retest_is_active,
+    retest_is_open,
+    retest_is_queued,
+    score_retest_queue_positions,
 )
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import ticket_attempt_cap
@@ -76,7 +93,6 @@ AdminDep = Annotated[None, Depends(require_admin)]
 # backlog is bounded (a few hundred at most); this caps a pathological scan.
 _STUCK_SCAN_LIMIT = 2000
 
-_REPLACEMENT_TICKET_TTL = timedelta(minutes=90)
 _REPLACEABLE_STATUSES = {
     AgentStatus.EVALUATING,
     AgentStatus.SCORED,
@@ -593,18 +609,36 @@ def _replacement_gate(
     target: Score | None,
     ticket: ValidatorTicket | None,
     validator_busy: bool,
-    replacement_pending: bool = False,
+    replacement_open: bool = False,
 ) -> str | None:
     if agent.status not in _REPLACEABLE_STATUSES:
         return "submission is not in a scoreable state"
     if target is None:
         return "validator has no accepted score to replace"
-    if replacement_pending:
-        return "replacement score is already pending"
+    if replacement_open:
+        return "replacement score is already queued or pending"
     if ticket is None or ticket.status != TicketStatus.SCORED:
         return "accepted score is not backed by a consumed validator ticket"
     if validator_busy:
         return "validator is currently assigned to another submission"
+    return None
+
+
+def _queue_gate(
+    *,
+    agent: Agent,
+    target: Score | None,
+    ticket: ValidatorTicket | None,
+    replacement_open: bool,
+) -> str | None:
+    if agent.status not in _FINALIZED_STATUSES:
+        return "submission is no longer finalized"
+    if target is None:
+        return "validator has no accepted score to replace"
+    if replacement_open:
+        return "replacement score is already queued or pending"
+    if ticket is None or ticket.status != TicketStatus.SCORED:
+        return "accepted score is not backed by a consumed validator ticket"
     return None
 
 
@@ -626,6 +660,8 @@ async def list_score_outliers(
         ).all()
     )
     detected: list[AdminScoreOutlier] = []
+    lifecycle_cache: dict[str, dict[UUID, ScoreAuditEntry]] = {}
+    position_cache: dict[str, dict[UUID, int]] = {}
     for listed_agent in agents:
         agent, bench_version, scores, tickets, _ = await _load(
             session, agent_id=listed_agent.agent_id, for_update=False
@@ -643,12 +679,26 @@ async def list_score_outliers(
             ),
             None,
         )
-        latest = await get_latest_score_retest_event(
-            session,
-            agent_id=agent.agent_id,
-            validator_hotkey=target.validator_hotkey,
-        )
-        pending = latest is not None and latest.event == EVENT_SCORE_RETEST_REQUESTED
+        if target.validator_hotkey not in lifecycle_cache:
+            lifecycle = await latest_retest_events_for_validator(
+                session, validator_hotkey=target.validator_hotkey
+            )
+            lifecycle_cache[target.validator_hotkey] = lifecycle
+            queued_entries = sorted(
+                (
+                    entry
+                    for entry in lifecycle.values()
+                    if entry.event == EVENT_SCORE_RETEST_QUEUED
+                ),
+                key=lambda entry: entry.seq,
+            )
+            position_cache[target.validator_hotkey] = {
+                entry.agent_id: index
+                for index, entry in enumerate(queued_entries, start=1)
+            }
+        latest = lifecycle_cache[target.validator_hotkey].get(agent.agent_id)
+        pending = retest_is_active(latest)
+        queued = retest_is_queued(latest)
         busy = await _validator_busy_elsewhere(
             session,
             agent_id=agent.agent_id,
@@ -659,8 +709,15 @@ async def list_score_outliers(
             target=target,
             ticket=ticket,
             validator_busy=busy,
-            replacement_pending=pending,
+            replacement_open=retest_is_open(latest),
         )
+        queue_blocking = _queue_gate(
+            agent=agent,
+            target=target,
+            ticket=ticket,
+            replacement_open=retest_is_open(latest),
+        )
+        queue_positions = position_cache[target.validator_hotkey]
         detected.append(
             AdminScoreOutlier(
                 agent_id=agent.agent_id,
@@ -681,11 +738,15 @@ async def list_score_outliers(
                 peer_spread=peer_spread,
                 ticket_status=ticket.status.value if ticket is not None else None,
                 replacement_pending=pending,
+                replacement_queued=queued,
+                queue_position=queue_positions.get(agent.agent_id),
                 replacement_deadline=(
                     ticket.deadline if pending and ticket is not None else None
                 ),
                 replacement_allowed=blocking is None,
                 blocking_reason=blocking,
+                queue_allowed=queue_blocking is None,
+                queue_blocking_reason=queue_blocking,
             )
         )
 
@@ -728,7 +789,7 @@ async def inspect_validator_score_replacement(
     latest = await get_latest_score_retest_event(
         session, agent_id=agent_id, validator_hotkey=validator_hotkey
     )
-    pending = latest is not None and latest.event == EVENT_SCORE_RETEST_REQUESTED
+    pending = retest_is_active(latest)
     reason = _replacement_gate(
         agent=agent,
         target=target,
@@ -736,7 +797,7 @@ async def inspect_validator_score_replacement(
         validator_busy=await _validator_busy_elsewhere(
             session, agent_id=agent_id, validator_hotkey=validator_hotkey
         ),
-        replacement_pending=pending,
+        replacement_open=retest_is_open(latest),
     )
     return AdminValidatorScoreReplacementDetail(
         agent_id=agent_id,
@@ -764,6 +825,187 @@ async def inspect_validator_score_replacement(
         ),
         replacement_allowed=reason is None,
         blocking_reason=reason,
+    )
+
+
+@router.post(
+    "/validation-retries/validators/{validator_hotkey}/queue-score-retests",
+    response_model=AdminValidatorScoreRetestQueueResponse,
+)
+async def queue_validator_score_retests(
+    validator_hotkey: str,
+    payload: AdminValidatorScoreRetestQueueRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminValidatorScoreRetestQueueResponse:
+    """Queue exact outliers behind one validator's current assignment.
+
+    Every item is independently snapshot/run checked. Accepted scores stay
+    canonical; only one request is promoted to an issued ticket at a time.
+    """
+    actor = _require_actor(x_admin_actor)
+    now = datetime.now(UTC)
+    preliminary: dict[UUID, tuple[str, str | None]] = {}
+    async with session.begin():
+        for item in payload.items:
+            lifecycle_entries = list(
+                (
+                    await session.scalars(
+                        select(ScoreAuditEntry).where(
+                            ScoreAuditEntry.agent_id == item.agent_id,
+                            ScoreAuditEntry.validator_hotkey == validator_hotkey,
+                            ScoreAuditEntry.event.in_(
+                                (
+                                    EVENT_SCORE_RETEST_QUEUED,
+                                    EVENT_SCORE_RETEST_REQUESTED,
+                                )
+                            ),
+                        )
+                    )
+                ).all()
+            )
+            prior = next(
+                (
+                    entry
+                    for entry in lifecycle_entries
+                    if entry.payload.get("request_id") == str(item.request_id)
+                ),
+                None,
+            )
+            if prior is not None:
+                if (
+                    prior.payload.get("actor") == actor
+                    and prior.payload.get("reason") == payload.reason
+                    and prior.payload.get("run_id") == item.expected_run_id
+                    and prior.payload.get("expected_snapshot") == item.expected_snapshot
+                ):
+                    preliminary[item.agent_id] = ("idempotent", None)
+                else:
+                    preliminary[item.agent_id] = (
+                        "skipped",
+                        "request id already used with different evidence",
+                    )
+                continue
+
+            agent, bench_version, scores, tickets, target = await _replacement_state(
+                session,
+                agent_id=item.agent_id,
+                validator_hotkey=validator_hotkey,
+                for_update=True,
+            )
+            if agent is None:
+                preliminary[item.agent_id] = ("skipped", "agent not found")
+                continue
+            current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
+            if current_snapshot != item.expected_snapshot:
+                preliminary[item.agent_id] = (
+                    "skipped",
+                    "validation state changed",
+                )
+                continue
+            if target is not None and target.run_id != item.expected_run_id:
+                preliminary[item.agent_id] = ("skipped", "accepted score run changed")
+                continue
+            detected = _detect_outlier(scores)
+            if (
+                detected is None
+                or detected[0].validator_hotkey != validator_hotkey
+                or detected[0].run_id != item.expected_run_id
+            ):
+                preliminary[item.agent_id] = (
+                    "skipped",
+                    "validator score is no longer the detected outlier",
+                )
+                continue
+            ticket = next(
+                (
+                    candidate
+                    for candidate in tickets
+                    if candidate.validator_hotkey == validator_hotkey
+                    and candidate.bench_version == bench_version
+                ),
+                None,
+            )
+            latest = await get_latest_score_retest_event(
+                session,
+                agent_id=item.agent_id,
+                validator_hotkey=validator_hotkey,
+            )
+            reason = _queue_gate(
+                agent=agent,
+                target=target,
+                ticket=ticket,
+                replacement_open=retest_is_open(latest),
+            )
+            if reason is not None:
+                preliminary[item.agent_id] = ("skipped", reason)
+                continue
+            assert target is not None
+            await append_audit_entry(
+                session,
+                agent_id=item.agent_id,
+                validator_hotkey=validator_hotkey,
+                event=EVENT_SCORE_RETEST_QUEUED,
+                payload={
+                    "request_id": str(item.request_id),
+                    "actor": actor,
+                    "reason": payload.reason,
+                    "expected_snapshot": item.expected_snapshot,
+                    "bench_version": bench_version,
+                    "run_id": item.expected_run_id,
+                    "preserved_score": _score_evidence(target),
+                    "preserved_score_count": len(scores),
+                    "queue_group_size": len(payload.items),
+                },
+                recorded_at=now,
+            )
+            preliminary[item.agent_id] = ("queued", None)
+
+        heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
+        await activate_next_score_retest(
+            session,
+            validator_hotkey=validator_hotkey,
+            now=now,
+            supports_version=lambda version: (
+                heartbeat is not None
+                and heartbeat_supports_version(heartbeat, now=now, version=version)
+            ),
+        )
+        latest_by_agent = await latest_retest_events_for_validator(
+            session, validator_hotkey=validator_hotkey
+        )
+        positions = await score_retest_queue_positions(
+            session, validator_hotkey=validator_hotkey
+        )
+        results: list[AdminValidatorScoreRetestQueueResult] = []
+        for item in payload.items:
+            status, detail = preliminary[item.agent_id]
+            latest = latest_by_agent.get(item.agent_id)
+            if (
+                status == "queued"
+                and latest is not None
+                and latest.event == EVENT_SCORE_RETEST_REQUESTED
+                and latest.payload.get("request_id") == str(item.request_id)
+            ):
+                status = "activated"
+            results.append(
+                AdminValidatorScoreRetestQueueResult(
+                    agent_id=item.agent_id,
+                    request_id=item.request_id,
+                    status=status,  # type: ignore[arg-type]
+                    detail=detail,
+                    queue_position=positions.get(item.agent_id),
+                )
+            )
+
+    return AdminValidatorScoreRetestQueueResponse(
+        validator_hotkey=validator_hotkey,
+        activated=sum(result.status == "activated" for result in results),
+        queued=sum(result.status == "queued" for result in results),
+        idempotent=sum(result.status == "idempotent" for result in results),
+        skipped=sum(result.status == "skipped" for result in results),
+        results=results,
     )
 
 
@@ -852,13 +1094,13 @@ async def replace_validator_score_after_infrastructure_failure(
             validator_busy=await _validator_busy_elsewhere(
                 session, agent_id=agent_id, validator_hotkey=validator_hotkey
             ),
-            replacement_pending=False,
+            replacement_open=False,
         )
         if reason is not None:
             raise HTTPException(status_code=409, detail=reason)
         assert target is not None and ticket is not None
         now = datetime.now(UTC)
-        deadline = now + _REPLACEMENT_TICKET_TTL
+        deadline = now + REPLACEMENT_TICKET_TTL
         ticket.status = TicketStatus.ISSUED
         ticket.issued_at = now
         ticket.deadline = deadline
@@ -1004,6 +1246,16 @@ async def release_validator_score_retest_ticket(
                 "preserved_run_id": target.run_id,
             },
             recorded_at=now,
+        )
+        heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
+        await activate_next_score_retest(
+            session,
+            validator_hotkey=validator_hotkey,
+            now=now,
+            supports_version=lambda version: (
+                heartbeat is not None
+                and heartbeat_supports_version(heartbeat, now=now, version=version)
+            ),
         )
         await session.flush()
     return AdminValidatorScoreRetestReleaseResponse(

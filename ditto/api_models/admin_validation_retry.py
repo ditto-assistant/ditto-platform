@@ -201,6 +201,57 @@ class AdminValidatorScoreReplacementResponse(BaseModel):
     idempotent: bool
 
 
+class AdminValidatorScoreRetestQueueItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: UUID
+    request_id: UUID
+    expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_run_id: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
+    ]
+
+
+class AdminValidatorScoreRetestQueueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+    ]
+    items: Annotated[
+        list[AdminValidatorScoreRetestQueueItem], Field(min_length=1, max_length=100)
+    ]
+
+    @field_validator("items")
+    @classmethod
+    def _unique(
+        cls, items: list[AdminValidatorScoreRetestQueueItem]
+    ) -> list[AdminValidatorScoreRetestQueueItem]:
+        if len({item.agent_id for item in items}) != len(items):
+            raise ValueError("duplicate agent_id in queue")
+        if len({item.request_id for item in items}) != len(items):
+            raise ValueError("duplicate request_id in queue")
+        return items
+
+
+class AdminValidatorScoreRetestQueueResult(BaseModel):
+    agent_id: UUID
+    request_id: UUID
+    status: Literal["activated", "queued", "idempotent", "skipped"]
+    detail: str | None
+    queue_position: int | None
+
+
+class AdminValidatorScoreRetestQueueResponse(BaseModel):
+    validator_hotkey: str
+    activated: int
+    queued: int
+    idempotent: int
+    skipped: int
+    results: list[AdminValidatorScoreRetestQueueResult]
+
+
 class AdminValidatorScoreRetestReleaseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -243,9 +294,13 @@ class AdminScoreOutlier(BaseModel):
     peer_spread: float
     ticket_status: Literal["issued", "scored", "expired"] | None
     replacement_pending: bool
+    replacement_queued: bool
+    queue_position: int | None
     replacement_deadline: datetime | None
     replacement_allowed: bool
     blocking_reason: str | None
+    queue_allowed: bool
+    queue_blocking_reason: str | None
 
 
 class AdminScoreOutlierList(BaseModel):
