@@ -61,10 +61,12 @@ from ditto.api_models import (
     PublicBenchConfigResponse,
     PublicBenchCorpusEntry,
     PublicBenchCorpusResponse,
+    PublicBenchGlossaryResponse,
     PublicBenchIntegrity,
     PublicBenchmarkProgress,
     PublicBenchRolloutResponse,
     PublicCaseResult,
+    PublicCategoryDoc,
     PublicCategoryStat,
     PublicChainWeight,
     PublicChainWeightsResponse,
@@ -76,6 +78,7 @@ from ditto.api_models import (
     PublicKothEmissions,
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
+    PublicMetricDoc,
     PublicOperationsResponse,
     PublicProvisionalScore,
     PublicRunModels,
@@ -102,6 +105,7 @@ from ditto.api_models import (
     PublicValidatorScore,
     PublicValidatorWeightVector,
 )
+from ditto.api_models import bench_glossary as bench_glossary_data
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.public import (
@@ -2647,6 +2651,26 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
         public_transcript_url_template=transcript_template,
         ledger_path="/api/v1/scoring/scores",
         generated_at=datetime.now(UTC),
+    )
+
+
+@router.get("/bench/glossary", response_model=PublicBenchGlossaryResponse)
+async def bench_glossary(response: Response) -> PublicBenchGlossaryResponse:
+    """Every scored category and every metric / composite-gate factor, explained.
+
+    So miners understand exactly what a score reflects: what each test category
+    probes (never the answer key) and how each headline metric and gate factor is
+    computed. This is the programmatic source for the dashboard's category and
+    metric glossaries, and it names the quality factors (conversational-sanity,
+    metamorphic-consistency, tool-efficiency) folded into the composite breakdown.
+    """
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return PublicBenchGlossaryResponse(
+        bench_version=CURRENT_BENCH_VERSION,
+        categories=[
+            PublicCategoryDoc(**c) for c in bench_glossary_data.category_entries()
+        ],
+        metrics=[PublicMetricDoc(**m) for m in bench_glossary_data.metric_entries()],
     )
 
 

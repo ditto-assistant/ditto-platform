@@ -3561,3 +3561,36 @@ class TestBenchConfig:
         assert body["public_transcript_url_template"] == (
             "https://storage.googleapis.com/ditto-platform-public-dev/transcripts/{sha256}.json"
         )
+
+
+def test_bench_glossary_explains_every_v5_category_and_metric() -> None:
+    from ditto.api_models import bench_glossary as bg
+
+    cats = {c["key"]: c for c in bg.category_entries()}
+    # The v5 families the composite quality gate hinges on must be documented.
+    for key in (
+        "conversational-chitchat",
+        "conversational-declarative",
+        "declarative-write",
+        "declarative-write-read",
+        "declarative-behavior",
+        "multi-hop-relational",
+        "temporal-depth",
+        "canary",
+    ):
+        assert key in cats, f"undocumented v5 category: {key}"
+    # Every entry is complete and public-safe (a purpose, a known kind, no blanks).
+    kinds = {"memory", "conversational", "tool", "multi_step", "integrity"}
+    for c in cats.values():
+        assert c["label"] and c["purpose"]
+        assert c["kind"] in kinds
+    # The metrics / quality factors that pull the composite below the halves.
+    metrics = {m["key"] for m in bg.metric_entries()}
+    for key in (
+        "composite",
+        "conversational_sanity",
+        "metamorphic_consistency",
+        "tool_efficiency",
+        "token_efficiency",
+    ):
+        assert key in metrics, f"undocumented metric: {key}"

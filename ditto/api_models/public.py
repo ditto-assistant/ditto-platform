@@ -1900,6 +1900,44 @@ class BenchDatasetConfig(BaseModel):
     )
 
 
+class PublicCategoryDoc(BaseModel):
+    """What one scored test category checks (never the answer key)."""
+
+    key: Annotated[str, Field(description="Exact category slug the scorer surfaces.")]
+    label: Annotated[str, Field(description="Human-readable name.")]
+    kind: Annotated[
+        str,
+        Field(description="memory | conversational | tool | multi_step | integrity."),
+    ]
+    purpose: Annotated[
+        str, Field(description="One public-safe sentence: what it probes.")
+    ]
+
+
+class PublicMetricDoc(BaseModel):
+    """What one headline metric or composite-gate factor means."""
+
+    key: Annotated[str, Field(description="Metric / gate-factor key.")]
+    label: Annotated[str, Field(description="Human-readable name.")]
+    description: Annotated[
+        str, Field(description="How it is computed and what it affects.")
+    ]
+
+
+class PublicBenchGlossaryResponse(BaseModel):
+    """Every scored category and every metric / gate factor explained, so miners
+    understand exactly what a score reflects (``GET /public/bench/glossary``).
+
+    Purposes describe what each case probes and how each metric is computed; no
+    answer keys or per-case content are ever exposed. This is the programmatic
+    companion to the on-dashboard glossaries and the composite breakdown.
+    """
+
+    bench_version: int
+    categories: list[PublicCategoryDoc]
+    metrics: list[PublicMetricDoc]
+
+
 class PublicBenchConfigResponse(BaseModel):
     """The current benchmark setup (``GET /public/bench/config``).
 

@@ -6725,8 +6725,27 @@
         });
     }
 
+    // Fetch the category/metric glossary once (static, max-age 3600) and merge the
+    // authoritative labels + purposes over the inline fallback maps, so newly added
+    // categories (e.g. the v5 conversational / multi-hop / temporal families) are
+    // explained without shipping a dashboard change. The inline maps remain the
+    // offline fallback if the fetch fails.
+    var glossaryLoaded = false;
+    function loadGlossary() {
+      if (glossaryLoaded) return;
+      getJSON("/public/bench/glossary").then(function (g) {
+        glossaryLoaded = true;
+        (g.categories || []).forEach(function (c) {
+          if (!c || !c.key) return;
+          if (c.label) CATEGORY_LABEL[c.key] = c.label;
+          if (c.purpose) CATEGORY_PURPOSE[c.key] = c.purpose;
+        });
+      }).catch(function () {});
+    }
+
     function loadBenchConfig() {
       // Frozen-setup panel; static markup doubles as the fallback.
+      loadGlossary();
       getJSON("/public/bench/config").then(function (c) {
         // Stamp on success only: a failed fetch must be retried on the next
         // 30s tick instead of being locked out for the 5-minute window.
