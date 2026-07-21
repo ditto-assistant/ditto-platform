@@ -249,11 +249,15 @@ FailJobReason = Literal[
 ]
 """Coarse reason a validator hands a leased ticket back for reissue.
 
-Deliberately low-cardinality so no run-specific detail leaks: the platform only
-records the reason, it never branches on it. ``infrastructure`` maps to the
-validator's ``ValidatorInfrastructureError`` sweep-ending branch; ``scoring_error``
-maps to its ``DittobenchError`` / ``PlatformError`` scoring-failure branch. These
-values are the wire contract shared verbatim with ditto-subnet (which emits them).
+Deliberately low-cardinality so no run-specific detail leaks. The platform
+branches on it: ``infrastructure`` earns a bounded compensating grant plus an
+escalating cooldown, so a validator-side outage neither spends the agent's
+genuine attempt budget nor hammers the failing provider; ``scoring_error`` is
+the agent's own failure and consumes an attempt with an immediate reissue.
+``infrastructure`` maps to the validator's ``ValidatorInfrastructureError``
+sweep-ending branch; ``scoring_error`` maps to its ``DittobenchError`` /
+``PlatformError`` scoring-failure branch. These values are the wire contract
+shared verbatim with ditto-subnet (which emits them).
 """
 
 
@@ -278,7 +282,10 @@ class FailJobRequest(BaseModel):
         Field(description="Exact deadline from the JobResponse ticket lease."),
     ]
     reason: Annotated[
-        FailJobReason, Field(description="Coarse failure class (recorded only).")
+        FailJobReason,
+        Field(
+            description="Coarse failure class; drives the platform's reissue policy."
+        ),
     ]
     nonce: Annotated[UUID, Field(description="One-time claim nonce.")]
     requested_at: Annotated[

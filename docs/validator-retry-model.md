@@ -18,12 +18,14 @@ Each validator gets a bounded number of attempts **per benchmark version**:
 | --- | --- | --- |
 | `MAX_ATTEMPTS_PER_VERSION` | `2` | Base attempts a validator may spend on one agent+version. |
 | `manual_retry_grants` | `0`+ | Per-ticket operator extension; raises the cap for that ticket. |
+| `infra_retry_grants` | `0`–`8` | Per-ticket automatic extension earned when a lease fails on validator-side infrastructure; raises the cap so an outage doesn't spend the agent's budget. |
 | `RETRY_COOLDOWN` | `6h` | Delay before the **same** validator may re-lease after a timeout. |
 
 The issuance cap for a ticket is:
 
 ```
-attempt_count  >=  MAX_ATTEMPTS_PER_VERSION + manual_retry_grants   →  no more reissue
+attempt_count  >=  MAX_ATTEMPTS_PER_VERSION + manual_retry_grants + infra_retry_grants
+                                                                  →  no more reissue
 ```
 
 `attempt_count` increments each time the expired ticket is **re-leased**
@@ -34,12 +36,15 @@ attempt_count  >=  MAX_ATTEMPTS_PER_VERSION + manual_retry_grants   →  no more
 - **A benchmark-version bump resets the budget.** Tickets are keyed by
   `bench_version`, so repaired scoring software revisits the artifact with a
   fresh 2-attempt budget on the new version.
-- **The failure reason is recorded but not yet branched on.** The validator
+- **Infrastructure failures don't consume the agent's budget.** The validator
   reports a signed `fail_job` with `reason` (`infrastructure` vs
-  `scoring_error`); the platform currently records it without changing the
-  attempt accounting. A validator-side infrastructure outage therefore consumes
-  the agent's attempt budget exactly like a genuine agent failure — the gap the
-  automatic-recovery follow-up closes.
+  `scoring_error`). On `infrastructure` the platform bumps `infra_retry_grants`
+  (bounded at `8`), which offsets the `attempt_count` the reissue adds — so a
+  validator-side outage (e.g. a model-relay/upstream failure) never spends the
+  agent's genuine `MAX_ATTEMPTS_PER_VERSION` budget. A `scoring_error` is the
+  agent's own failure and consumes an attempt normally. `fail_job` also sets
+  `retry_after = now`, so the reissue is immediate rather than waiting the 6h
+  timeout cooldown.
 
 ## Timeout vs. explicit failure
 

@@ -63,7 +63,7 @@ from ditto.db.queries.retry_state import (
     resolve_bench_version,
 )
 from ditto.db.queries.scores import SCORING_QUORUM
-from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION
+from ditto.db.queries.tickets import ticket_attempt_cap
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
@@ -97,6 +97,7 @@ def _ticket_wire(ticket: ValidatorTicket) -> dict[str, object]:
         "bench_version": ticket.bench_version,
         "attempt_count": ticket.attempt_count,
         "manual_retry_grants": ticket.manual_retry_grants,
+        "infra_retry_grants": ticket.infra_retry_grants,
         "retry_after": (
             _aware(ticket.retry_after).isoformat(timespec="microseconds")
             if ticket.retry_after is not None
@@ -216,11 +217,11 @@ def _ticket_item(ticket: ValidatorTicket) -> AdminValidationTicket:
         bench_version=ticket.bench_version,
         attempt_count=ticket.attempt_count,
         manual_retry_grants=ticket.manual_retry_grants,
+        infra_retry_grants=ticket.infra_retry_grants,
         retry_after=ticket.retry_after,
         retry_budget_exhausted=(
             ticket.status == TicketStatus.EXPIRED
-            and ticket.attempt_count
-            >= MAX_ATTEMPTS_PER_VERSION + ticket.manual_retry_grants
+            and ticket.attempt_count >= ticket_attempt_cap(ticket)
         ),
     )
 

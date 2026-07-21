@@ -19,6 +19,7 @@ class AdminValidationTicket(BaseModel):
     bench_version: int
     attempt_count: int
     manual_retry_grants: int
+    infra_retry_grants: int
     retry_after: datetime | None
     retry_budget_exhausted: bool
 

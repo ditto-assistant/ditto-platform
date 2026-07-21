@@ -1196,6 +1196,16 @@ class ValidatorTicket(Base):
     rewrite :attr:`attempt_count`; the append-only recovery row records why the
     extra eligibility was created."""
 
+    infra_retry_grants: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    """Automatic cap extensions earned when this lease failed on validator-side
+    infrastructure (a signed ``fail_job`` with reason ``infrastructure``) rather
+    than the agent. Each one offsets the :attr:`attempt_count` increment the
+    reissue will add, so an infrastructure outage never spends the agent's
+    genuine attempt budget. Like :attr:`manual_retry_grants` it only raises the
+    cap; it never rewrites :attr:`attempt_count`."""
+
     retry_after: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
@@ -1241,6 +1251,10 @@ class ValidatorTicket(Base):
         CheckConstraint(
             "manual_retry_grants >= 0",
             name="validator_tickets_manual_retry_grants_nonnegative",
+        ),
+        CheckConstraint(
+            "infra_retry_grants >= 0",
+            name="validator_tickets_infra_retry_grants_nonnegative",
         ),
         # The expiry sweep and the live-slot count both scan open tickets only;
         # a partial index keeps those hot paths off the full table.
