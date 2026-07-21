@@ -873,17 +873,8 @@ async def request_job(
                 status_code=409, detail="job claim nonce has already been used"
             ) from exc
         heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
-        ticket = await activate_next_score_retest(
-            session,
-            validator_hotkey=payload.validator_hotkey,
-            now=now,
-            supports_version=lambda version: (
-                heartbeat is not None
-                and heartbeat_supports_version(heartbeat, now=now, version=version)
-            ),
-            validator_running_benchmark=validator_state == "running_benchmark",
-        )
-        if ticket is None:
+        rollout = await open_rollout(session)
+        if rollout is not None:
             ticket = await issue_rollout_ticket(
                 session,
                 validator_hotkey=payload.validator_hotkey,
@@ -892,8 +883,18 @@ async def request_job(
                 artifact_mode=artifact_mode,
                 validator_running_benchmark=validator_state == "running_benchmark",
             )
+        else:
+            ticket = await activate_next_score_retest(
+                session,
+                validator_hotkey=payload.validator_hotkey,
+                now=now,
+                supports_version=lambda version: (
+                    heartbeat is not None
+                    and heartbeat_supports_version(heartbeat, now=now, version=version)
+                ),
+                validator_running_benchmark=validator_state == "running_benchmark",
+            )
         canonical_version = await active_bench_version(session)
-        rollout = await open_rollout(session)
         if ticket is None:
             # During an open rollout, a source-version validator may resume a
             # source-version lease. Once activation completes, only the active
@@ -946,25 +947,11 @@ async def request_job(
                     stale_ticket.retry_after = now
                     await session.flush()
             heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
-            if (
-                rollout is not None
-                and heartbeat is not None
-                and heartbeat_supports_version(
-                    heartbeat, now=now, version=rollout.desired_version
-                )
-            ):
-                # Guarded admin migrations pin a canary dataset without adding
-                # the submission to the top-five activation cohort. Give those
-                # explicitly pinned submissions a canary-capable lane.
-                ticket = await issue_ticket(
-                    session,
-                    validator_hotkey=payload.validator_hotkey,
-                    now=now,
-                    ttl=_TICKET_TTL,
-                    bench_version=rollout.desired_version,
-                    artifact_mode="screened_only",
-                    validator_running_benchmark=validator_state == "running_benchmark",
-                )
+            if rollout is not None:
+                # The rollout cohort is an exclusive fleet-wide lane. If this
+                # validator has no eligible member, idling is intentional: do
+                # not leak into manual retests, source-era work, or rank 26+.
+                return Response(status_code=204)
             if ticket is None:
                 # Any post-legacy benchmark needs a fresh, identity-matched
                 # scorer for THAT version. Keyed on the legacy floor, not on the

@@ -599,7 +599,7 @@ class TestDashboard:
         assert "function pipelineRescoreState(entry)" in body
         assert " score stays live until v" in body
         assert 'class="pipeline-qualification-badge"' in body
-        assert "Top 5 → v" in body
+        assert "Cohort → v" in body
         assert '<progress max="100" value="' in body
         assert "aria-label" in body
         assert "Benchmark progress not reported" in body
