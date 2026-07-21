@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import math
 import os
@@ -139,7 +140,7 @@ from ditto.api_server.endpoints.scoring import (
 )
 from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.upload import _verify_signature
-from ditto.api_server.endpoints.validator import SessionDep
+from ditto.api_server.endpoints.validator import SessionDep, StorageDep
 from ditto.api_server.koth import (
     KOTH_CHAMPION_SHARE,
     KOTH_DETHRONE_Z,
@@ -148,6 +149,7 @@ from ditto.api_server.koth import (
     KothEntry,
     project_koth,
 )
+from ditto.api_server.storage import ObjectDownloadFailedError
 from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
@@ -208,6 +210,8 @@ _REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 1.0
 _REGISTRATION_CACHE_TTL_SECONDS = 15.0
 _REGISTRATION_FAILURE_CACHE_TTL_SECONDS = 5.0
 _CHAIN_WEIGHTS_TIMEOUT_SECONDS = 4.0
+_TRANSCRIPT_MAX_BYTES = 32 << 20
+_TRANSCRIPT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # Historical reproduction must fail closed: only benchmark epochs whose exact
 # generator release is known get a copyable command. Add a mapping deliberately
 # when a future epoch pins its generator; never point an old score at ``latest``.
@@ -2651,9 +2655,158 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
         ),
         public_mirror_url_template=mirror,
         public_transcript_url_template=transcript_template,
+        public_transcript_telemetry_url_template=(
+            "/api/v1/public/bench/transcript/{sha256}/telemetry"
+        ),
         ledger_path="/api/v1/scoring/scores",
         generated_at=datetime.now(UTC),
     )
+
+
+def _telemetry_nonnegative_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _telemetry_nonnegative_number(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def _telemetry_outcome(value: Any) -> str:
+    if not isinstance(value, str):
+        return "unknown"
+    normalized = re.sub(r"[^a-z0-9_-]", "", value.lower())[:40]
+    return normalized or "unknown"
+
+
+def _public_transcript_telemetry(transcript: Any, *, sha256_hex: str) -> dict[str, Any]:
+    """Return the strict public allowlist from a verified private transcript."""
+    source = transcript if isinstance(transcript, dict) else {}
+    execution_source = source.get("execution")
+    execution_source = execution_source if isinstance(execution_source, dict) else {}
+    relay_source = source.get("model_relay")
+    relay_source = relay_source if isinstance(relay_source, dict) else {}
+    execution: dict[str, Any] = {
+        key: _telemetry_nonnegative_int(execution_source.get(key))
+        for key in (
+            "cases",
+            "succeeded",
+            "timed_out",
+            "cancelled",
+            "retried",
+            "total_attempts",
+        )
+    }
+    execution.update(
+        {
+            key: _telemetry_nonnegative_number(execution_source.get(key))
+            for key in ("median_duration_ms", "p95_duration_ms", "max_duration_ms")
+        }
+    )
+    model_relay = {
+        key: _telemetry_nonnegative_int(relay_source.get(key))
+        for key in (
+            "requests",
+            "successes",
+            "infrastructure_failures",
+            "caller_cancellations",
+            "upstream_attempts",
+            "retries",
+        )
+    }
+    cases: list[dict[str, Any]] = []
+    case_sources = source.get("cases")
+    if isinstance(case_sources, list):
+        for position, item in enumerate(case_sources[:500], start=1):
+            item = item if isinstance(item, dict) else {}
+            case_execution = item.get("execution")
+            case_execution = case_execution if isinstance(case_execution, dict) else {}
+            attempts: list[dict[str, Any]] = []
+            attempt_sources = case_execution.get("attempts")
+            if isinstance(attempt_sources, list):
+                for attempt_position, attempt in enumerate(
+                    attempt_sources[:12], start=1
+                ):
+                    attempt = attempt if isinstance(attempt, dict) else {}
+                    status = attempt.get("http_status")
+                    attempts.append(
+                        {
+                            "attempt": _telemetry_nonnegative_int(
+                                attempt.get("attempt")
+                            )
+                            or attempt_position,
+                            "duration_ms": _telemetry_nonnegative_number(
+                                attempt.get("duration_ms")
+                            ),
+                            "outcome": _telemetry_outcome(attempt.get("outcome")),
+                            "http_status": (
+                                status
+                                if isinstance(status, int)
+                                and not isinstance(status, bool)
+                                and 100 <= status <= 599
+                                else None
+                            ),
+                        }
+                    )
+            cases.append(
+                {
+                    "position": position,
+                    "total_duration_ms": _telemetry_nonnegative_number(
+                        case_execution.get("total_duration_ms")
+                    ),
+                    "terminal_outcome": _telemetry_outcome(
+                        case_execution.get("terminal_outcome")
+                    ),
+                    "timed_out": case_execution.get("timed_out") is True,
+                    "cancelled": case_execution.get("cancelled") is True,
+                    "attempts": attempts,
+                }
+            )
+    return {
+        "source_sha256": sha256_hex,
+        "execution": execution,
+        "model_relay": model_relay,
+        "cases": cases,
+    }
+
+
+@router.get("/bench/transcript/{sha256_hex}/telemetry")
+async def public_bench_transcript_telemetry(
+    sha256_hex: str,
+    storage: StorageDep,
+    response: Response,
+) -> dict[str, Any]:
+    """Return safe metrics from one immutable, signature-bound transcript.
+
+    The digest is already public in the signed score. Restricting reads to the
+    content-addressed transcript namespace prevents this endpoint from becoming
+    a general storage proxy. The stored bytes are hashed again before parsing,
+    then projected through a strict allowlist so no transcript content, raw
+    errors, prompts, responses, or tool payloads become public.
+    """
+    if not _TRANSCRIPT_SHA256_RE.fullmatch(sha256_hex):
+        raise HTTPException(status_code=404, detail="transcript not found")
+    response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    key = f"transcripts/{sha256_hex}.json"
+    try:
+        body = await storage.get_object(key=key, max_bytes=_TRANSCRIPT_MAX_BYTES)
+    except ObjectDownloadFailedError:
+        raise HTTPException(status_code=404, detail="transcript not found") from None
+    if hashlib.sha256(body).hexdigest() != sha256_hex:
+        logger.error("stored transcript digest mismatch for %s", sha256_hex)
+        raise HTTPException(status_code=502, detail="transcript integrity check failed")
+    try:
+        transcript = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(
+            status_code=502, detail="transcript telemetry could not be decoded"
+        ) from None
+    return _public_transcript_telemetry(transcript, sha256_hex=sha256_hex)
 
 
 @router.get("/bench/glossary", response_model=PublicBenchGlossaryResponse)
