@@ -38,6 +38,7 @@ from ditto.db.models import (
     BenchmarkRollout,
     BenchmarkRolloutAudit,
     BenchmarkRolloutMember,
+    EvaluationPayment,
     Score,
     ValidatorHeartbeat,
     ValidatorTicket,
@@ -1768,6 +1769,45 @@ async def test_activation_requires_five_ranked_desired_quorum_agents() -> None:
             assert rollout.status == "collecting"
             assert await active_bench_version(session) == 2
         await engine.dispose()
+
+
+async def test_same_coldkey_generations_fill_one_rollout_position() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        agent_ids, _rollout = await _seed_desired_quorum_cohort(session, now)
+        for index, agent_id in enumerate(agent_ids):
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            session.add(
+                EvaluationPayment(
+                    block_hash=f"0x{agent_id.hex}",
+                    extrinsic_index=0,
+                    agent_id=agent_id,
+                    miner_hotkey=agent.miner_hotkey,
+                    miner_coldkey=(
+                        "5SharedColdkey" if index < 2 else f"5Coldkey{index:048d}"
+                    ),
+                    amount_rao=1,
+                    dest_address="5Destination",
+                    timestamp=now,
+                )
+            )
+        await session.flush()
+
+        top = await rolling_top_five(session)
+
+        assert len(top) == MIN_DESIRED_AUTHORITY_AGENTS - 1
+        assert (
+            await count_ranked_quorum_agents(
+                session, bench_version=CANARY_BENCH_VERSION
+            )
+            == MIN_DESIRED_AUTHORITY_AGENTS - 1
+        )
+    await engine.dispose()
 
 
 async def test_activation_refused_when_only_ranked_quorum_count_is_short(

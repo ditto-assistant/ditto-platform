@@ -4,8 +4,8 @@ Three surfaces, all open (no credentials) and fronting the same DB the
 validator-gated ``/scoring/scores`` reads:
 
 * **Aggregate leaderboard / health** (``/leaderboard``, ``/health``): best score
-  per miner, composite plus tool/memory means and rank, never exposing per-case
-  answer-key detail. This half stays aggregate-only.
+  per payment-time coldkey, composite plus tool/memory means and rank, never
+  exposing per-case answer-key detail. This half stays aggregate-only.
 * **Submission lifecycle** (``/activity``, ``/agent/{id}/pipeline``): recent
   uploads, public pipeline stage, safe screening evidence, and accepted numeric
   scores as they arrive. In-progress score rows carry reproducibility inputs but
@@ -837,7 +837,11 @@ async def leaderboard(
     session: SessionDep,
     bench_version: Annotated[int | None, Query(ge=1)] = None,
 ) -> PublicLeaderboardResponse:
-    """Best score per miner, with quorum and current registration eligibility."""
+    """Best score per payment-time coldkey, with registration eligibility.
+
+    The selected generation's hotkey remains the on-chain weight destination.
+    Legacy rows without payment provenance fall back to one position per hotkey.
+    """
     response.headers["Cache-Control"] = _CACHE_CONTROL
     from ditto.db.queries.benchmark_rollout import open_rollout
 

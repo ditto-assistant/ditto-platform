@@ -132,6 +132,7 @@ from ditto.db.queries.benchmark_rollout import (
 from ditto.db.queries.heartbeats import (
     upsert_validator_heartbeat,
 )
+from ditto.db.queries.payments import get_miner_coldkey_for_agent
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     get_score_for_validator,
@@ -1684,9 +1685,13 @@ async def submit_score(
             if len(agent_scores) >= SCORING_QUORUM:
                 median_composite = statistics.median(s.composite for s in agent_scores)
                 eligible = await list_eligible_ledger(session)
+                miner_coldkey = await get_miner_coldkey_for_agent(
+                    session, agent_id=agent_id
+                )
                 decision = evaluate_duplicate_signals(
                     agent_id=agent_id,
                     miner_hotkey=agent.miner_hotkey,
+                    miner_coldkey=miner_coldkey,
                     submitted_at=agent.created_at,
                     sha256=agent.sha256,
                     composite=median_composite,

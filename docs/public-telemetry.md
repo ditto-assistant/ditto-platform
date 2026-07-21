@@ -18,7 +18,8 @@ SN118 publishes publicly and how. Implementation tracked per section below.
 
 ## Anti-gaming posture (the load-bearing rule)
 
-The **aggregate leaderboard** stays aggregate (best-per-miner, no per-run seed).
+The **aggregate leaderboard** stays aggregate (best-per-payment-coldkey, no
+per-run seed).
 The **per-submission k=3 record** (`/submissions`, `/agent/{id}/scores`, added
 2026-07-09) goes further for trust: it publishes which validators scored an
 agent, each one's exact numbers plus signature, the finalized median, and the
@@ -55,7 +56,8 @@ opt-in). No secrets or keys are ever logged.
   category mean (`cat.link_read`, `cat.web_search`, `cat.memory_lookup`,
   `cat.single-session-user`, `cat.temporal-reasoning`, `cat.multi-session`, …),
   `n`, `median_ms`, `seed`, `run_id`.
-- `leaderboard` — best-per-miner ledger: `rank`, `miner`, `composite`,
+- `leaderboard` — best-per-payment-coldkey ledger (legacy hotkey fallback):
+  `rank`, selected-generation `miner`, `composite`,
   `is_champion`, `ath` (all-time-high composite for that miner).
 - `weights` — `miner`, `uid`, `weight` (normalized), `role` (champion|tail),
   plus scalars `koth_margin`, `champion_share`.
@@ -74,7 +76,10 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
     median_ms, bench_version, dataset_sha256, models, per_category,
     integrity, tokens } ], emissions: { champion_agent_id, recipients,
     raw_leader_decision, margin, dethrone_z, champion_share, tail_size } }`.
-  Entries are best-per-miner and ranked by raw finalized composite. During a
+  Entries are best-per-payment-coldkey and ranked by raw finalized composite.
+  Different names and hotkeys under one coldkey compete for one position; the
+  best eligible generation wins and its hotkey remains the weight destination.
+  During a
   benchmark rollout the default response is the exact authoritative hybrid pool
   validators fold: v3 for an agent at 3/3, otherwise that agent's active-version
   fallback. `?bench_version=2` provides a historical single-version view and

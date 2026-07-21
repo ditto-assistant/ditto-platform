@@ -914,7 +914,12 @@ class LedgerResponse(BaseModel):
 
     entries: Annotated[
         list[LedgerEntry],
-        Field(description="Best eligible score per miner, highest composite first."),
+        Field(
+            description=(
+                "Best eligible score per payment-time coldkey, highest composite "
+                "first; the selected generation's hotkey is the weight destination."
+            )
+        ),
     ]
     count: Annotated[int, Field(ge=0, description="Number of entries returned.")]
     generated_at: Annotated[
