@@ -2003,12 +2003,16 @@ class TestQuarantineAdmin:
             assert v2 is not None and v2.sha256 == "ab" * 32
             assert v3 is not None and v3.sha256 == "be" * 32
 
-        # The release adjudicates this exact current-policy artifact. Once its
-        # active benchmark dataset is pinned, it must not immediately re-enter
-        # screening through the missing-dataset eligibility branch.
+        # The release pinned the active dataset, so the missing-DATASET branch
+        # must not re-fire. But this artifact tripped source review BEFORE its
+        # screened image was built (agentic-source-review-tripwire), so it is
+        # released to EVALUATING without the image v3 requires. It therefore
+        # correctly re-enters screening via the missing-screened-image branch to
+        # build that image — otherwise validators would skip it forever.
         next_claim = await client.post(_CLAIM_URL)
         assert next_claim.status_code == 200
-        assert next_claim.json()["items"] == []
+        reclaimed = {item["agent_id"] for item in next_claim.json()["items"]}
+        assert str(agent_id) in reclaimed
 
     async def test_admin_auth_is_required(
         self, app: FastAPI, client: httpx.AsyncClient

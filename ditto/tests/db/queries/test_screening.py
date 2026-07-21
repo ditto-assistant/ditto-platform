@@ -13,7 +13,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
-from ditto.db.models import Agent, AgentStatus, ScreeningAttempt, ScreeningQuarantine
+from ditto.db.models import (
+    Agent,
+    AgentStatus,
+    BenchmarkDataset,
+    BenchmarkRollout,
+    ScreeningAttempt,
+    ScreeningQuarantine,
+)
 from ditto.db.queries.screening import (
     _EXHAUSTED_REASON_CODE,
     MAX_SCREENING_EXPIRIES,
@@ -643,3 +650,89 @@ async def test_appealed_agent_in_screening_failed_is_claimable(session: AsyncSes
     refreshed = await session.get(Agent, agent.agent_id)
     assert refreshed is not None
     assert refreshed.status == AgentStatus.SCREENING
+
+
+async def _activate_v4(session: AsyncSession) -> None:
+    now = datetime.now(UTC)
+    async with session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=2,
+                desired_version=4,
+                status="activated",
+                cohort_size=5,
+                created_at=now - timedelta(hours=1),
+                activated_at=now,
+            )
+        )
+
+
+def _complete_screened_image(agent: Agent) -> None:
+    agent.screened_image_sha256 = "ab" * 32
+    agent.screened_image_size_bytes = 4096
+    agent.screened_image_id = "sha256:" + "cd" * 32
+    agent.screened_image_ref = "registry/agent:screened"
+    agent.screened_image_upload_id = uuid4()
+    agent.screened_image_verified_at = datetime.now(UTC)
+
+
+async def test_evaluating_agent_missing_screened_image_is_reclaimed(
+    session: AsyncSession,
+) -> None:
+    # v4 (which requires a screened image) is active. An agent released from an
+    # anti-cheat quarantine back to EVALUATING on the current policy, but whose
+    # screened image was never uploaded+verified, is otherwise stuck forever:
+    # validators skip it and nothing re-screens it. It must be re-claimed.
+    await _activate_v4(session)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5HK-no-image",
+        name="released-without-image",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.EVALUATING,
+    )
+    agent.screening_policy_version = SCREENING_POLICY_VERSION
+    async with session.begin():
+        session.add(agent)
+
+    claimed = await _claim(session)
+
+    assert agent.agent_id in {claimed_agent.agent_id for claimed_agent, _, _ in claimed}
+    refreshed = await session.get(Agent, agent.agent_id)
+    assert refreshed is not None and refreshed.status == AgentStatus.SCREENING
+
+
+async def test_evaluating_agent_with_complete_prereqs_is_not_reclaimed(
+    session: AsyncSession,
+) -> None:
+    # The mirror: a current-policy EVALUATING agent that HAS a complete screened
+    # image and the active-version dataset needs no re-screen — it must not be
+    # dragged back through screening by either predicate.
+    await _activate_v4(session)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5HK-complete",
+        name="fully-provisioned",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.EVALUATING,
+    )
+    agent.screening_policy_version = SCREENING_POLICY_VERSION
+    _complete_screened_image(agent)
+    async with session.begin():
+        session.add(agent)
+        session.add(
+            BenchmarkDataset(
+                agent_id=agent.agent_id,
+                bench_version=4,
+                seed=7,
+                sha256="ef" * 32,
+                run_size="full",
+                seed_block=100,
+                seed_block_hash="ff" * 32,
+            )
+        )
+
+    claimed = await _claim(session)
+
+    assert agent.agent_id not in {a.agent_id for a, _, _ in claimed}
