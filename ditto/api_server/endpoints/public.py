@@ -11,7 +11,7 @@ validator-gated ``/scoring/scores`` reads:
   scores as they arrive. In-progress score rows carry reproducibility inputs but
   omit validator identity, signatures, ticket leases, and scorer internals.
 * **Per-submission transparency** (``/submissions``, ``/agent/{id}/scores``): the
-  k=3 record for a finalized agent — *which* validators scored it, each one's
+  k=3 record for a finalized agent: *which* validators scored it, each one's
   exact numbers + signature, the median the platform finalized on, and the pinned
   dataset (seed + sha256). This deliberately exposes ``validator_hotkey`` (a
   public on-chain identity) and the raw ``seed`` so anyone can reproduce and audit
@@ -66,6 +66,7 @@ from ditto.api_models import (
     PublicBenchIntegrity,
     PublicBenchmarkProgress,
     PublicBenchRolloutResponse,
+    PublicBenchVersionDoc,
     PublicCaseResult,
     PublicCategoryDoc,
     PublicCategoryStat,
@@ -223,6 +224,7 @@ _DATAGEN_VERSION_BY_BENCH_VERSION = {
     3: "v0.8.0",
     4: "v0.9.0",
     5: "v0.10.0",
+    6: "v0.11.1",
 }
 _DATAGEN_RUN_SIZES = frozenset({"small", "medium", "full"})
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
@@ -444,8 +446,8 @@ def _benchmark_stalled(
     Only the pre-run stages qualify: pulling and starting the screener-built
     image plus generating the dataset take a couple of minutes, so a quarter hour
     still in one of them means the run is wedged (e.g. the sandbox executor cannot
-    start the container). ``running_benchmark`` is deliberately excluded — it can
-    legitimately run up to the validator's 75-minute cap — so a genuinely
+    start the container). ``running_benchmark`` is deliberately excluded: it can
+    legitimately run up to the validator's 75-minute cap, so a genuinely
     progressing benchmark is never mislabelled.
     """
     if stage not in _BENCHMARK_STALL_EARLY_STAGES:
@@ -543,7 +545,7 @@ def _stack_component_issues(stack_health: ValidatorStackHealth | None) -> list[s
     """Per-component labels for every required component that is not healthy.
 
     e.g. ``["dittobench_api: degraded", "model_relay: unreachable"]``. This is the
-    detail behind a fleet ``warning`` — the rollup badge stays a single word, but
+    detail behind a fleet ``warning``: the rollup badge stays a single word, but
     these labels name exactly which component and state caused it so the UI can
     show them (e.g. a badge tooltip) without hiding the reason or crowding the
     view. Empty when nothing is wrong.
@@ -687,7 +689,7 @@ def _safe_integrity(details: dict) -> PublicBenchIntegrity | None:
 def _safe_case_results(details: dict) -> list[PublicCaseResult] | None:
     """Redact ``details.per_case`` down to the publishable per-case view.
 
-    Whitelists only ``category / kind / score / correct / latency_ms / notes`` —
+    Whitelists only ``category / kind / score / correct / latency_ms / notes``:
     the answer-key fields (``expected``, the agent's ``called`` tools, the
     seed-derived ``case_id``, and any other key) are dropped by construction, not
     filtered out, so a new per-case field can never leak by default. ``None`` when
@@ -736,7 +738,7 @@ def _safe_case_results(details: dict) -> list[PublicCaseResult] | None:
 def _safe_calibration(details: dict) -> tuple[float | None, int | None]:
     """Pull the advisory calibration telemetry (prod hardening P5): the mean
     Brier score over confidence-reporting cases and its sample size. Tolerates
-    a malformed blob — anything out of range degrades to ``(None, None)``.
+    a malformed blob: anything out of range degrades to ``(None, None)``.
     Never scored; surfacing it costs nothing to harnesses that omit confidence.
     """
     brier = details.get("calibration_brier")
@@ -859,7 +861,7 @@ def _public_entry(
         if isinstance(raw_tokens, int) and not isinstance(raw_tokens, bool)
         else None
     )
-    # A length-1 history is just the current score — not a trend; drop it so the
+    # A length-1 history is just the current score, not a trend; drop it so the
     # dashboard shows a sparkline only when there's an actual trajectory.
     trend = history if history and len(history) >= 2 else None
     calibration_brier, calibration_n = _safe_calibration(details)
@@ -1235,7 +1237,7 @@ async def health(
 
     Aggregate-only, like the leaderboard: miner/agent counts, last-scored time,
     24h scoring throughput, and average latency. Failure/latency-of-weights
-    telemetry lives in wandb — the platform only sees successful scores.
+    telemetry lives in wandb: the platform only sees successful scores.
     """
     response.headers["Cache-Control"] = _CACHE_CONTROL
     now = datetime.now(UTC)
@@ -1313,7 +1315,7 @@ def _validator_heartbeats_response(
             ):
                 # The lease was issued within the hand-off grace of this heartbeat,
                 # so the validator has not yet had a chance to report picking it
-                # up. A transient hand-off — this is what stops the fleet view from
+                # up. A transient hand-off: this is what stops the fleet view from
                 # flapping red during normal job transitions.
                 assignment_state = "assigning"
             else:
@@ -1362,7 +1364,7 @@ def _validator_heartbeats_response(
                     or _stack_component_issues(stack_health)
                     else health
                 ),
-                # The detailed "why" behind the badge — kept as structured labels
+                # The detailed "why" behind the badge, kept as structured labels
                 # (for a tooltip) so the summary stays compact without hiding info.
                 health_reasons=_health_reasons(
                     state=row.state,
@@ -1526,7 +1528,7 @@ async def screeners(
 
 
 def _median_composite(row: SubmissionRow) -> float | None:
-    """Median of the reported composites — the canonical score, or None if unscored."""
+    """Median of the reported composites: the canonical score, or None if unscored."""
     if not row.scores:
         return None
     return statistics.median(s.composite for s in row.scores)
@@ -2197,8 +2199,8 @@ async def agent_pipeline(
     ]
     # Keyed by the *ticket* the work belongs to, not just the hotkey. A validator
     # holds one ticket per (agent, bench_version), so keying on the hotkey alone
-    # painted its already-finished v2/v3 rows as "Scoring now" — with the live v4
-    # progress bar attached — the moment it picked up the v4 ticket.
+    # painted its already-finished v2/v3 rows as "Scoring now", with the live v4
+    # progress bar attached, the moment it picked up the v4 ticket.
     active_by_ticket = {
         (work.ticket.validator_hotkey, work.ticket.bench_version): work
         for work in active_work
@@ -2400,7 +2402,7 @@ async def submissions(
     composite, how many validators scored it, and the dataset pin (seed +
     sha256); drill into ``/public/agent/{agent_id}/scores`` for the full
     per-validator breakdown. Held-for-review and still-evaluating agents are
-    excluded — only settled public scores appear.
+    excluded: only settled public scores appear.
     """
     response.headers["Cache-Control"] = _CACHE_CONTROL
     rows = await list_public_submissions(session, limit=limit)
@@ -2425,7 +2427,7 @@ async def agent_scores(
     composite the platform finalized on, and the pinned dataset (seed + sha256)
     so anyone can reproduce and audit the score. 404 for an agent that does not
     exist or has not settled into a public status (still evaluating, or held for
-    copy review) — a provisional agent's partial scores are never exposed.
+    copy review): a provisional agent's partial scores are never exposed.
     """
     response.headers["Cache-Control"] = _CACHE_CONTROL
     row = await get_submission_scores(session, agent_id=agent_id)
@@ -2471,7 +2473,7 @@ async def agent_dataset(
             status_code=503, detail="dataset generate service unavailable"
         ) from e
     if row.dataset_sha256 and sha.lower() != row.dataset_sha256.lower():
-        # The regenerated dataset does not hash to what was pinned at scoring —
+        # The regenerated dataset does not hash to what was pinned at scoring,
         # generator drift. Refuse rather than serve a dataset that is not the one
         # that was scored.
         raise HTTPException(
@@ -2824,6 +2826,9 @@ async def bench_glossary(response: Response) -> PublicBenchGlossaryResponse:
             PublicCategoryDoc(**c) for c in bench_glossary_data.category_entries()
         ],
         metrics=[PublicMetricDoc(**m) for m in bench_glossary_data.metric_entries()],
+        versions=[
+            PublicBenchVersionDoc(**v) for v in bench_glossary_data.version_entries()
+        ],
     )
 
 

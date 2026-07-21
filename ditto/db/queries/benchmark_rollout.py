@@ -387,19 +387,56 @@ async def active_bench_version(session: AsyncSession) -> int:
             bench_version=open_transition.desired_version,
             agent_ids=priority_ids,
         )
-        return (
-            open_transition.desired_version
-            if len(priority_ids) == PRIORITY_COHORT_SIZE
+        if (
+            len(priority_ids) == PRIORITY_COHORT_SIZE
             and ready >= MIN_DESIRED_AUTHORITY_AGENTS
-            else open_transition.from_version
+        ):
+            return open_transition.desired_version
+    return await persisted_active_bench_version(session)
+
+
+async def persisted_active_bench_version(session: AsyncSession) -> int:
+    """Return the latest durable benchmark-authority decision.
+
+    Normal rollout activation records authority on the rollout row. Recovery from
+    an already-superseded, fully qualified rollout records an append-only
+    ``authority_selected`` audit event instead of rewriting terminal history.
+    Comparing both timestamps keeps the newest durable authority decision
+    authoritative without adding a second mutable state table.
+    """
+    activated = (
+        await session.execute(
+            select(BenchmarkRollout.desired_version, BenchmarkRollout.activated_at)
+            .where(
+                BenchmarkRollout.status == "activated",
+                BenchmarkRollout.activated_at.is_not(None),
+            )
+            .order_by(BenchmarkRollout.activated_at.desc())
+            .limit(1)
         )
-    version = await session.scalar(
-        select(BenchmarkRollout.desired_version)
-        .where(BenchmarkRollout.status == "activated")
-        .order_by(BenchmarkRollout.activated_at.desc())
-        .limit(1)
-    )
-    return int(version or DEFAULT_BENCH_VERSION)
+    ).first()
+    selected = (
+        await session.execute(
+            select(BenchmarkRollout.desired_version, BenchmarkRolloutAudit.recorded_at)
+            .join(
+                BenchmarkRolloutAudit,
+                BenchmarkRolloutAudit.rollout_id == BenchmarkRollout.rollout_id,
+            )
+            .where(BenchmarkRolloutAudit.event == "authority_selected")
+            .order_by(
+                BenchmarkRolloutAudit.recorded_at.desc(),
+                BenchmarkRolloutAudit.audit_id.desc(),
+            )
+            .limit(1)
+        )
+    ).first()
+    if selected is not None and (
+        activated is None or selected.recorded_at >= activated.activated_at
+    ):
+        return int(selected.desired_version)
+    if activated is not None:
+        return int(activated.desired_version)
+    return DEFAULT_BENCH_VERSION
 
 
 async def open_rollout(
@@ -495,6 +532,11 @@ async def supersede_open_rollout(
         raise RolloutConflictError(
             "an activated benchmark rollout cannot be superseded"
         )
+    if await active_bench_version(session) == rollout.desired_version:
+        raise RolloutConflictError(
+            "a benchmark rollout that already owns active authority cannot be "
+            "superseded; select another qualified active contract first"
+        )
     previous_status = rollout.status
     rollout.status = "superseded"
     rollout.blocked_reason = None
@@ -508,6 +550,130 @@ async def supersede_open_rollout(
             "previous_status": previous_status,
             "from_version": rollout.from_version,
             "desired_version": rollout.desired_version,
+        },
+        now=now,
+    )
+    await session.flush()
+    return rollout
+
+
+async def authority_selection_state(
+    session: AsyncSession, *, bench_version: int
+) -> dict[str, Any]:
+    """Describe whether a historical contract can safely own weight authority."""
+    rollout = await rollout_for_desired_version(session, desired_version=bench_version)
+    if rollout is None:
+        return {
+            "version": bench_version,
+            "ready": False,
+            "ranked_quorum_agents": 0,
+            "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
+            "blocked_reason": "no rollout history exists for this contract",
+        }
+    priority_ids = set(
+        await session.scalars(
+            select(BenchmarkRolloutMember.agent_id).where(
+                BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE,
+            )
+        )
+    )
+    if len(priority_ids) != PRIORITY_COHORT_SIZE:
+        return {
+            "version": bench_version,
+            "ready": False,
+            "ranked_quorum_agents": 0,
+            "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
+            "blocked_reason": "the rollout does not contain a complete priority cohort",
+        }
+    eligible_ids = set(
+        await session.scalars(
+            select(Agent.agent_id).where(
+                Agent.agent_id.in_(priority_ids),
+                Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE)),
+            )
+        )
+    )
+    if eligible_ids != priority_ids:
+        return {
+            "version": bench_version,
+            "ready": False,
+            "ranked_quorum_agents": 0,
+            "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
+            "blocked_reason": "one or more priority agents are no longer eligible",
+        }
+    from ditto.db.queries.scores import count_ranked_quorum_agents
+
+    ranked = await count_ranked_quorum_agents(
+        session, bench_version=bench_version, agent_ids=priority_ids
+    )
+    ready = ranked >= MIN_DESIRED_AUTHORITY_AGENTS
+    return {
+        "version": bench_version,
+        "ready": ready,
+        "ranked_quorum_agents": ranked,
+        "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
+        "blocked_reason": None
+        if ready
+        else "the priority cohort does not yet have five ranked quorums",
+    }
+
+
+async def select_active_bench_version(
+    session: AsyncSession,
+    *,
+    bench_version: int,
+    actor: str,
+    reason: str,
+    now: datetime,
+) -> BenchmarkRollout:
+    """Select a fully qualified historical contract as active authority.
+
+    This is a recovery/control-plane action, not an arbitrary version setter.
+    It is forward-only, requires the rollout target to be terminal, and refuses
+    to race an open rollout. The append-only audit event becomes the durable
+    authority decision while the superseded rollout row remains immutable.
+    """
+    rows = list(
+        (
+            await session.execute(
+                select(BenchmarkRollout)
+                .order_by(BenchmarkRollout.created_at)
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    if any(row.status in ("collecting", "blocked_ineligible") for row in rows):
+        raise RolloutConflictError(
+            "supersede the open benchmark rollout before changing active authority"
+        )
+    current = await persisted_active_bench_version(session)
+    if bench_version <= current:
+        raise RolloutConflictError(
+            f"active benchmark selection is forward-only: current v{current}, "
+            f"requested v{bench_version}"
+        )
+    rollout = next(
+        (row for row in reversed(rows) if row.desired_version == bench_version),
+        None,
+    )
+    if rollout is None or rollout.status != "superseded":
+        raise RolloutConflictError(
+            "only a fully qualified superseded rollout can be selected for recovery"
+        )
+    readiness = await authority_selection_state(session, bench_version=bench_version)
+    if not readiness["ready"]:
+        raise RolloutConflictError(str(readiness["blocked_reason"]))
+    await _audit(
+        session,
+        rollout,
+        "authority_selected",
+        {
+            "actor": actor,
+            "reason": reason,
+            "previous_active_version": current,
+            "bench_version": bench_version,
+            "ranked_quorum_agents": readiness["ranked_quorum_agents"],
         },
         now=now,
     )
@@ -981,13 +1147,16 @@ async def rollout_state(
     rollout = await session.scalar(
         select(BenchmarkRollout).order_by(BenchmarkRollout.created_at.desc()).limit(1)
     )
-    active_version = (
-        DEFAULT_BENCH_VERSION
-        if rollout is None
-        else rollout.desired_version
-        if rollout.status == "activated"
-        else rollout.from_version
-    )
+    # Single source of truth for the active version: whatever the weight-setting
+    # guard (`active_bench_version`) resolves. This endpoint's `active_version` is
+    # what operators read and echo back as `expected_active_version` when starting
+    # a rollout, so deriving it from the same authority the start guard checks means
+    # the two can never disagree and spuriously 409 ("active benchmark changed").
+    # In the normal open-rollout case this is identical to the row-derived value
+    # (the flip predicates are equivalent when MIN_DESIRED_AUTHORITY_AGENTS ==
+    # PRIORITY_COHORT_SIZE); it only reconciles the terminal/edge cases where the
+    # most-recent row and the latest activated row differ.
+    active_version = await active_bench_version(session)
     version = capability_version or (
         rollout.desired_version if rollout is not None else active_version
     )
@@ -1061,12 +1230,6 @@ async def rollout_state(
         bench_version=rollout.desired_version,
         agent_ids=priority_member_ids,
     )
-    authority_active_version = (
-        rollout.desired_version
-        if rollout.status == "activated"
-        or ranked_quorum_agents >= MIN_DESIRED_AUTHORITY_AGENTS
-        else rollout.from_version
-    )
     cohort_ready_count = sum(
         counts.get(member.agent_id, 0) >= SCORING_QUORUM for member in members
     )
@@ -1077,7 +1240,7 @@ async def rollout_state(
         counts.get(member.agent_id, 0) >= SCORING_QUORUM for member in priority_members
     )
     return {
-        "active_version": authority_active_version,
+        "active_version": active_version,
         "desired_version": rollout.desired_version,
         "status": rollout.status,
         "blocked_reason": rollout.blocked_reason,

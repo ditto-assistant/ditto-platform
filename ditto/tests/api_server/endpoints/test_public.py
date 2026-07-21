@@ -3720,13 +3720,22 @@ def test_bench_glossary_explains_every_v5_category_and_metric() -> None:
         "passive-consolidation",
     ):
         assert key in cats, f"undocumented category: {key}"
-    # Every entry is complete and public-safe (a purpose, a known kind, no blanks).
+    # Every entry is complete and public-safe (a purpose, a known kind, no blanks),
+    # and carries a concrete illustrative example so the glossary shows what each
+    # case actually looks like, not just what it probes.
     kinds = {"memory", "conversational", "tool", "multi_step", "integrity"}
     for c in cats.values():
         assert c["label"] and c["purpose"]
         assert c["kind"] in kinds
+        assert c["example"], f"category missing example: {c['key']}"
     # The metrics / quality factors that pull the composite below the halves.
     metrics = {m["key"] for m in bg.metric_entries()}
+    # bench_version changelog is present, newest first, complete per version.
+    versions = bg.version_entries()
+    assert [v["version"] for v in versions] == [6, 5, 4, 3, 2]
+    for v in versions:
+        assert v["title"] and v["summary"] and v["epoch"]
+
     for key in (
         "composite",
         "conversational_sanity",
