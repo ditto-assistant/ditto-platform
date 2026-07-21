@@ -1818,6 +1818,7 @@ class TestPublicActivity:
         assert attempt["status"] == "quarantined"
         assert attempt["quarantine_resolution"] is None
         assert attempt["quarantine_resolved_at"] is None
+        assert attempt["quarantine_resolution_reason"] is None
         assert attempt["review_evidence"] == []
         assert attempt["review_finding"] is None
 
@@ -1880,6 +1881,9 @@ class TestPublicActivity:
         assert attempt["quarantine_resolution"] == "release"
         assert datetime.fromisoformat(attempt["quarantine_resolved_at"]) == now.replace(
             tzinfo=None
+        )
+        assert attempt["quarantine_resolution_reason"] == (
+            "Manual review found no prohibited behavior"
         )
         assert "resolved_by" not in attempt
         assert attempt["review_evidence"] == []

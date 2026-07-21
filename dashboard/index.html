@@ -972,6 +972,7 @@
     .attempt-main { min-width: 0; }
     .attempt-main b { display: block; font-size: 13px; }
     .attempt-meta { margin-top: 3px; color: var(--text-dim); font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere; }
+    .attempt-resolution-reason { max-width: 72ch; margin-top: 5px; color: var(--text-dim); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; text-wrap: pretty; }
     .attempt-time { color: var(--text-faint); font-size: 11.5px; white-space: nowrap; }
     .screening-review {
       grid-column: 2 / -1;
@@ -5332,9 +5333,12 @@
           meta += " · " + a.reason;
         }
         if (a.status === "running") meta += " · deadline " + new Date(a.deadline).toLocaleString();
+        var resolutionReason = a.quarantine_resolution_reason
+          ? '<div class="attempt-resolution-reason"><b>Operator reason:</b> ' + esc(a.quarantine_resolution_reason) + '</div>'
+          : '';
         return '<div class="attempt"><div><span class="attempt-version">Policy v' + esc(a.policy_version) + '</span></div>' +
           '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(label[0]) + '</span></b>' +
-          '<div class="attempt-meta">' + entityAnchor("screener", a.screener_hotkey, "Screener " + shortKey(a.screener_hotkey)) + esc(meta.slice(("Screener " + shortKey(a.screener_hotkey)).length)) + '</div></div>' +
+          '<div class="attempt-meta">' + entityAnchor("screener", a.screener_hotkey, "Screener " + shortKey(a.screener_hotkey)) + esc(meta.slice(("Screener " + shortKey(a.screener_hotkey)).length)) + '</div>' + resolutionReason + '</div>' +
           '<div class="attempt-time" title="' + esc(when) + '">' + relTime(when) + '</div>' + review + '</div>';
       }
       var screening = screeningAttempts.filter(function (a) {
