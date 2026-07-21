@@ -20,12 +20,13 @@ from ditto.db.models import (
     Score,
 )
 from ditto.db.queries.benchmark_rollout import (
+    MAX_RESCORE_COHORT_SIZE,
     DatasetPin,
     RolloutSnapshotMember,
     append_rollout_member,
+    historical_rescore_cohort,
     maybe_activate_rollout,
     open_rollout,
-    rolling_top_five,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,8 +39,56 @@ class PendingQualification:
     run_size: str
     seed_block: int | None
     seed_block_hash: str | None
-    seed_source: Literal["legacy_pin", "source_scores_canonical_min", "versioned_pin"]
+    seed_source: Literal[
+        "legacy_pin",
+        "source_scores_canonical_min",
+        "historical_scores_latest_min",
+        "versioned_pin",
+    ]
     existing_sha256: str | None = None
+
+
+async def _rollout_rescore_cohort(
+    session: AsyncSession, *, rollout: BenchmarkRollout
+) -> list[RolloutSnapshotMember]:
+    """Preserve already-frozen members, then fill to the historical top 25.
+
+    Early rollout code could append a newly risen hybrid-top-five member. Those
+    durable rows and their accepted scores are never deleted, but they also
+    must not expand the corrected cohort past 25.
+    """
+    existing = (
+        (
+            await session.execute(
+                select(BenchmarkRolloutMember)
+                .where(BenchmarkRolloutMember.rollout_id == rollout.rollout_id)
+                .order_by(BenchmarkRolloutMember.position)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(existing) > MAX_RESCORE_COHORT_SIZE:
+        raise RuntimeError("existing benchmark rollout exceeds the top-25 bound")
+    cohort = [
+        RolloutSnapshotMember(
+            member.agent_id,
+            member.frozen_miner_hotkey,
+            member.frozen_composite,
+        )
+        for member in existing
+    ]
+    seen = {member.agent_id for member in cohort}
+    for member in await historical_rescore_cohort(
+        session, source_version=rollout.from_version
+    ):
+        if member.agent_id in seen:
+            continue
+        cohort.append(member)
+        seen.add(member.agent_id)
+        if len(cohort) == MAX_RESCORE_COHORT_SIZE:
+            break
+    return cohort
 
 
 async def qualification_candidate(
@@ -93,20 +142,30 @@ async def qualification_candidate(
             None,
         )
 
-    score_seeds = set(
-        await session.scalars(
-            select(Score.seed)
+    score_rows = (
+        await session.execute(
+            select(Score.bench_version, Score.seed)
             .where(
                 Score.agent_id == member.agent_id,
-                Score.bench_version == source_bench_version,
+                Score.bench_version <= source_bench_version,
             )
-            .distinct()
+            .order_by(Score.bench_version.desc(), Score.seed.asc())
         )
-    )
+    ).all()
+    latest_score_version = score_rows[0][0] if score_rows else None
+    score_seeds = {
+        seed for version, seed in score_rows if version == latest_score_version
+    }
     if score_seeds:
         seed = min(score_seeds)
-        seed_source: Literal["legacy_pin", "source_scores_canonical_min"] = (
+        seed_source: Literal[
+            "legacy_pin",
+            "source_scores_canonical_min",
+            "historical_scores_latest_min",
+        ] = (
             "source_scores_canonical_min"
+            if latest_score_version == source_bench_version
+            else "historical_scores_latest_min"
         )
         seed_block = None
         seed_block_hash = None
@@ -136,12 +195,12 @@ async def qualification_candidate(
 async def rolling_qualification_blockers(
     session: AsyncSession, *, generator_run_size: str | None
 ) -> list[dict[str, str]]:
-    """Describe hybrid-top-five agents that automatic qualification cannot add."""
+    """Describe inherited top-25 agents that automatic qualification cannot add."""
     rollout = await open_rollout(session)
     if rollout is None:
         return []
     blockers: list[dict[str, str]] = []
-    for member in await rolling_top_five(session):
+    for member in await _rollout_rescore_cohort(session, rollout=rollout):
         if (
             await session.get(
                 BenchmarkRolloutMember, (rollout.rollout_id, member.agent_id)
@@ -178,7 +237,7 @@ async def ensure_rolling_qualification(
 async def refresh_rolling_qualification(
     session: AsyncSession, *, generator: DatasetGenerator, now: datetime
 ) -> int:
-    """Append every newly risen hybrid-top-five agent and try activation.
+    """Converge the frozen inherited top-25 cohort and try activation.
 
     Dataset rendering deliberately happens between transactions: the generator
     is a network service and must never run while holding rollout/agent locks.
@@ -190,8 +249,17 @@ async def refresh_rolling_qualification(
         rollout = await open_rollout(session)
         if rollout is None:
             return 0
-        top_five = await rolling_top_five(session)
-        for member in top_five:
+        cohort = await _rollout_rescore_cohort(session, rollout=rollout)
+        if len(cohort) < 5:
+            logger.error(
+                "benchmark rollout cannot build inherited cohort rollout_id=%s "
+                "eligible_members=%s",
+                rollout.rollout_id,
+                len(cohort),
+            )
+            return 0
+        rollout.cohort_size = len(cohort)
+        for member in cohort:
             existing = await session.get(
                 BenchmarkRolloutMember, (rollout.rollout_id, member.agent_id)
             )
@@ -235,11 +303,12 @@ async def refresh_rolling_qualification(
             "blocked_ineligible",
         ):
             return 0
-        current_top = {
-            member.agent_id: member for member in await rolling_top_five(session)
+        current_cohort = {
+            member.agent_id: member
+            for member in await _rollout_rescore_cohort(session, rollout=rollout)
         }
         for candidate, sha256 in rendered:
-            current_member = current_top.get(candidate.member.agent_id)
+            current_member = current_cohort.get(candidate.member.agent_id)
             if current_member is None:
                 continue
             current_candidate, _reason = await qualification_candidate(

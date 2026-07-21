@@ -1930,5 +1930,21 @@ class PublicBenchRolloutResponse(BaseModel):
     )
     current_hybrid_top_five: list[str] = Field(default_factory=list)
     qualification_converged: bool = False
+    cohort_size: int = Field(
+        default=0,
+        description="Frozen inherited rescore cohort size, capped at 25.",
+    )
+    cohort_ready_count: int = Field(
+        default=0,
+        description="Cohort members with a complete desired-version quorum.",
+    )
+    priority_cohort_size: int = Field(
+        default=5,
+        description="Inherited leaders that must finish before later cohort work.",
+    )
+    priority_complete: bool = Field(
+        default=False,
+        description="Whether the fleet-wide first-five scoring barrier is closed.",
+    )
     members: list[PublicBenchRolloutMember] = Field(default_factory=list)
     qualification_blockers: list[dict[str, str]] = Field(default_factory=list)

@@ -1,4 +1,4 @@
-"""Audited operator control for rolling benchmark top-five qualification."""
+"""Audited operator control for bounded benchmark cohort qualification."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from ditto.db.queries.benchmark_rollout import (
     RolloutConflictError,
     active_bench_version,
     create_rollout_snapshot,
-    rolling_top_five,
+    historical_rescore_cohort,
     rollout_for_desired_version,
     rollout_state,
     supersede_open_rollout,
@@ -221,7 +221,7 @@ async def start_rollout(
     desired_version: str,
     payload: AdminRolloutStartRequest,
 ) -> dict[str, object]:
-    """Seed rolling qualification with the current top five and target datasets."""
+    """Seed the bounded historical rescore cohort and target datasets."""
     target = _parse_desired_version(desired_version)
     _require_confirmation(payload.confirmation, action="START", version=target)
     from_version = await active_bench_version(session)
@@ -264,8 +264,8 @@ async def start_rollout(
         return await rollout_state(session, capability_version=target)
     now = datetime.now(UTC)
     await _require_rollout_start_capacity(session, now=now, desired_version=target)
-    members = await rolling_top_five(session)
-    if len(members) != 5:
+    members = await historical_rescore_cohort(session, source_version=from_version)
+    if len(members) < 5:
         raise HTTPException(
             status_code=409,
             detail=(

@@ -48,7 +48,8 @@ LEGACY_BENCH_VERSION = 2
 # Compatibility name for callers/tests that need the newest *shipped* contract.
 # This is discovery metadata only: it no longer opens or selects a rollout.
 CANARY_BENCH_VERSION = latest_benchmark_contract().version
-COHORT_SIZE = 5
+PRIORITY_COHORT_SIZE = 5
+MAX_RESCORE_COHORT_SIZE = 25
 SCORING_QUORUM = 3
 # How many agents must hold a COMPLETE, ranked desired-version quorum before
 # the desired version may take over. Two gates enforce it against the same count
@@ -173,9 +174,104 @@ async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]
         unique.append(
             RolloutSnapshotMember(agent.agent_id, agent.miner_hotkey, composite)
         )
-        if len(unique) == COHORT_SIZE:
+        if len(unique) == PRIORITY_COHORT_SIZE:
             break
     return unique
+
+
+async def historical_rescore_cohort(
+    session: AsyncSession,
+    *,
+    source_version: int,
+    limit: int = MAX_RESCORE_COHORT_SIZE,
+) -> list[RolloutSnapshotMember]:
+    """Freeze the prior-era rescore cohort without admitting the whole ledger.
+
+    The immediately previous benchmark owns the cohort. If it has fewer than
+    ``limit`` finalized distinct miners, the next older scored benchmark fills
+    the remaining positions. No third historical era is consulted: this is the
+    explicit "combine two previous benchmark iterations" fallback, not an
+    unbounded backfill of every legacy submission.
+    """
+    if limit < PRIORITY_COHORT_SIZE or limit > MAX_RESCORE_COHORT_SIZE:
+        raise ValueError(
+            f"rollout cohort limit must be between {PRIORITY_COHORT_SIZE} "
+            f"and {MAX_RESCORE_COHORT_SIZE}"
+        )
+    versions = list(
+        await session.scalars(
+            select(Score.bench_version)
+            .where(Score.bench_version <= source_version)
+            .distinct()
+            .order_by(Score.bench_version.desc())
+            .limit(2)
+        )
+    )
+    if not versions:
+        return []
+    agents = list(
+        await session.scalars(
+            select(Agent).where(
+                Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE))
+            )
+        )
+    )
+    if not agents:
+        return []
+    scores = list(
+        await session.scalars(
+            select(Score).where(
+                Score.agent_id.in_([agent.agent_id for agent in agents]),
+                Score.bench_version.in_(versions),
+            )
+        )
+    )
+    by_version_agent: dict[int, dict[UUID, list[Score]]] = {}
+    for score in scores:
+        by_version_agent.setdefault(score.bench_version, {}).setdefault(
+            score.agent_id, []
+        ).append(score)
+
+    from ditto.db.queries.payments import get_miner_coldkeys_for_agents
+
+    coldkeys = await get_miner_coldkeys_for_agents(
+        session, agent_ids={agent.agent_id for agent in agents}
+    )
+    agent_by_id = {agent.agent_id: agent for agent in agents}
+    selected: list[RolloutSnapshotMember] = []
+    seen_agents: set[UUID] = set()
+    seen_owners: set[str] = set()
+    for version in versions:
+        ranked: list[tuple[Agent, float]] = []
+        for agent_id, version_scores in by_version_agent.get(version, {}).items():
+            # A partial score set is provisional, not a finalized historical
+            # standing, and must not consume one of the bounded rescore slots.
+            if len(version_scores) < SCORING_QUORUM:
+                continue
+            middle = sorted(
+                version_scores,
+                key=lambda row: (row.composite, row.validator_hotkey),
+            )[(len(version_scores) - 1) // 2]
+            if middle.n < 100 or middle.composite <= 0:
+                continue
+            ranked.append((agent_by_id[agent_id], float(middle.composite)))
+        ranked.sort(key=lambda item: (-item[1], item[0].created_at, item[0].agent_id))
+        for agent, composite in ranked:
+            owner = (
+                f"coldkey:{coldkeys[agent.agent_id]}"
+                if agent.agent_id in coldkeys
+                else f"hotkey:{agent.miner_hotkey}"
+            )
+            if agent.agent_id in seen_agents or owner in seen_owners:
+                continue
+            seen_agents.add(agent.agent_id)
+            seen_owners.add(owner)
+            selected.append(
+                RolloutSnapshotMember(agent.agent_id, agent.miner_hotkey, composite)
+            )
+            if len(selected) == limit:
+                return selected
+    return selected
 
 
 async def append_rollout_member(
@@ -187,7 +283,7 @@ async def append_rollout_member(
     now: datetime,
     audit_context: dict[str, Any] | None = None,
 ) -> bool:
-    """Permanently qualify one newly risen hybrid-top-five agent."""
+    """Permanently qualify one member of the frozen historical cohort."""
     locked = await session.get(
         BenchmarkRollout, rollout.rollout_id, with_for_update=True
     )
@@ -274,6 +370,29 @@ async def append_rollout_member(
 
 
 async def active_bench_version(session: AsyncSession) -> int:
+    open_transition = await open_rollout(session)
+    if open_transition is not None:
+        from ditto.db.queries.scores import count_ranked_quorum_agents
+
+        priority_ids = set(
+            await session.scalars(
+                select(BenchmarkRolloutMember.agent_id).where(
+                    BenchmarkRolloutMember.rollout_id == open_transition.rollout_id,
+                    BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE,
+                )
+            )
+        )
+        ready = await count_ranked_quorum_agents(
+            session,
+            bench_version=open_transition.desired_version,
+            agent_ids=priority_ids,
+        )
+        return (
+            open_transition.desired_version
+            if len(priority_ids) == PRIORITY_COHORT_SIZE
+            and ready >= MIN_DESIRED_AUTHORITY_AGENTS
+            else open_transition.from_version
+        )
     version = await session.scalar(
         select(BenchmarkRollout.desired_version)
         .where(BenchmarkRollout.status == "activated")
@@ -406,7 +525,7 @@ async def create_rollout_snapshot(
     desired_version: int = CANARY_BENCH_VERSION,
     audit_context: dict[str, Any] | None = None,
 ) -> BenchmarkRollout:
-    """Freeze exactly five ranked agents and their target dataset pins, idempotently."""
+    """Freeze a bounded prior-era cohort and target dataset pins, idempotently."""
     if desired_version <= from_version:
         raise ValueError("a benchmark rollout must move the version forward")
     if session.get_bind().dialect.name == "postgresql":
@@ -436,11 +555,11 @@ async def create_rollout_snapshot(
             f"{conflicting.desired_version} is still {conflicting.status}; only one "
             "benchmark rollout may be open at a time"
         )
-    if len(members) != COHORT_SIZE:
-        raise ValueError("a benchmark rollout requires exactly five members")
-    if len({m.agent_id for m in members}) != COHORT_SIZE:
+    if not PRIORITY_COHORT_SIZE <= len(members) <= MAX_RESCORE_COHORT_SIZE:
+        raise ValueError("a benchmark rollout requires between five and 25 members")
+    if len({m.agent_id for m in members}) != len(members):
         raise ValueError("benchmark rollout agents must be distinct")
-    if len({m.miner_hotkey for m in members}) != COHORT_SIZE:
+    if len({m.miner_hotkey for m in members}) != len(members):
         raise ValueError("benchmark rollout miners must be distinct")
     if set(datasets) != {m.agent_id for m in members}:
         raise ValueError("every frozen rollout member requires one target dataset pin")
@@ -450,7 +569,7 @@ async def create_rollout_snapshot(
         from_version=from_version,
         desired_version=desired_version,
         status="collecting",
-        cohort_size=COHORT_SIZE,
+        cohort_size=len(members),
         created_at=now,
     )
     session.add(rollout)
@@ -521,10 +640,10 @@ async def _validate_frozen_members(
         for member, agent in rows
         if agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE)
     ]
-    if len(rows) != COHORT_SIZE or invalid:
+    if len(rows) != rollout.cohort_size or invalid:
         reason = (
             "frozen cohort is incomplete"
-            if len(rows) != COHORT_SIZE
+            if len(rows) != rollout.cohort_size
             else "ineligible frozen members: " + ",".join(invalid)
         )
         if rollout.status != "blocked_ineligible" or rollout.blocked_reason != reason:
@@ -672,6 +791,30 @@ async def issue_rollout_ticket(
         )
         .exists()
     )
+    priority_count_rows = (
+        await session.execute(
+            select(
+                BenchmarkRolloutMember.agent_id,
+                func.count(Score.validator_hotkey),
+            )
+            .outerjoin(
+                Score,
+                (Score.agent_id == BenchmarkRolloutMember.agent_id)
+                & (Score.bench_version == rollout.desired_version),
+            )
+            .where(
+                BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE,
+            )
+            .group_by(BenchmarkRolloutMember.agent_id)
+        )
+    ).all()
+    priority_counts: dict[UUID, int] = {
+        agent_id: int(count) for agent_id, count in priority_count_rows
+    }
+    priority_complete = len(priority_counts) == PRIORITY_COHORT_SIZE and all(
+        count >= SCORING_QUORUM for count in priority_counts.values()
+    )
     member_statement = (
         select(BenchmarkRolloutMember)
         .join(Agent, Agent.agent_id == BenchmarkRolloutMember.agent_id)
@@ -684,6 +827,13 @@ async def issue_rollout_ticket(
             score_count + occupied_count < SCORING_QUORUM,
         )
     )
+    if not priority_complete:
+        # This is deliberately fleet-wide, not validator-local. A validator
+        # that has already scored every incomplete priority member idles until
+        # another validator closes those quorums; it must not skip to rank 6.
+        member_statement = member_statement.where(
+            BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE
+        )
     member = await session.scalar(
         member_statement.order_by(
             (score_count + occupied_count).asc(), BenchmarkRolloutMember.position
@@ -744,7 +894,7 @@ async def issue_rollout_ticket(
 async def maybe_activate_rollout(
     session: AsyncSession, rollout: BenchmarkRollout, *, now: datetime
 ) -> bool:
-    """Activate after the rolling qualification set converges at desired quorum."""
+    """Activate after every frozen cohort member reaches desired quorum."""
     # A superseded (or already activated) rollout is terminal and must never be
     # revived by a refresh sweep that still holds a stale reference to it.
     if rollout.status not in ("collecting", "blocked_ineligible"):
@@ -766,9 +916,6 @@ async def maybe_activate_rollout(
     # equality test deadlocks the rollout permanently the first time any member
     # picks up a 4th score (a retry grant, an admin recovery, or a lost race),
     # with no operator escape hatch.
-    top_five = await rolling_top_five(session)
-    if len(top_five) != COHORT_SIZE:
-        return False
     member_rows = (
         await session.execute(
             select(BenchmarkRolloutMember, Agent)
@@ -776,15 +923,15 @@ async def maybe_activate_rollout(
             .where(BenchmarkRolloutMember.rollout_id == rollout.rollout_id)
         )
     ).all()
-    member_ids = {member.agent_id for member, _agent in member_rows}
-    if not {member.agent_id for member in top_five}.issubset(member_ids):
+    if len(member_rows) != rollout.cohort_size:
         return False
-    eligible_ids = {
-        member.agent_id
-        for member, agent in member_rows
-        if agent.status in (AgentStatus.SCORED, AgentStatus.LIVE)
-    }
-    if any(counts.get(agent_id, 0) < SCORING_QUORUM for agent_id in eligible_ids):
+    if any(
+        agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE)
+        for _member, agent in member_rows
+    ):
+        return False
+    member_ids = {member.agent_id for member, _agent in member_rows}
+    if any(counts.get(agent_id, 0) < SCORING_QUORUM for agent_id in member_ids):
         return False
     # Activation is the LAST point at which the full-emission-set guarantee can
     # be enforced. Before activation, list_eligible_ledger's own threshold holds
@@ -794,18 +941,17 @@ async def maybe_activate_rollout(
     # version unconditionally, and that threshold is bypassed entirely — an agent
     # without desired-version scores simply drops out.
     #
-    # The checks above do not imply the threshold. ``eligible_ids`` skips cohort
-    # members that went banned / ath_pending_review, so it can be satisfied by
-    # fewer than five agents; and ``counts`` is a raw count(scores) that a
-    # smoke-profile 3/3 satisfies without ever being rankable. Either path would
-    # activate into a pool too small to fill the champion + tail. Re-check with
-    # the ledger's own definition.
+    # The raw counts above do not imply rankability: a smoke-profile 3/3 can
+    # satisfy them without ever being eligible for weights. Require every
+    # frozen cohort member to hold a ranked quorum before closing the rollout.
     from ditto.db.queries.scores import count_ranked_quorum_agents
 
-    ranked_quorum_agents = await count_ranked_quorum_agents(
-        session, bench_version=rollout.desired_version
+    ranked_cohort_agents = await count_ranked_quorum_agents(
+        session,
+        bench_version=rollout.desired_version,
+        agent_ids=member_ids,
     )
-    if ranked_quorum_agents < MIN_DESIRED_AUTHORITY_AGENTS:
+    if ranked_cohort_agents != len(member_ids):
         return False
     rollout.status = "activated"
     rollout.activated_at = now
@@ -817,7 +963,7 @@ async def maybe_activate_rollout(
         {
             "bench_version": rollout.desired_version,
             "score_counts": {str(k): v for k, v in counts.items()},
-            "ranked_quorum_agents": ranked_quorum_agents,
+            "ranked_quorum_agents": ranked_cohort_agents,
         },
         now=now,
     )
@@ -874,6 +1020,10 @@ async def rollout_state(
             "v3_capable_validator_count": capable_count,
             "current_hybrid_top_five": [],
             "qualification_converged": False,
+            "cohort_size": 0,
+            "cohort_ready_count": 0,
+            "priority_cohort_size": PRIORITY_COHORT_SIZE,
+            "priority_complete": False,
             "members": [],
         }
     count_rows = (
@@ -903,24 +1053,47 @@ async def rollout_state(
     current_top = await rolling_top_five(session)
     current_top_ids = {member.agent_id for member in current_top}
     qualified_ids = {member.agent_id for member in members}
-    return {
-        "active_version": rollout.desired_version
+    priority_member_ids = {
+        member.agent_id for member in members if member.position <= PRIORITY_COHORT_SIZE
+    }
+    ranked_quorum_agents = await count_ranked_quorum_agents(
+        session,
+        bench_version=rollout.desired_version,
+        agent_ids=priority_member_ids,
+    )
+    authority_active_version = (
+        rollout.desired_version
         if rollout.status == "activated"
-        else rollout.from_version,
+        or ranked_quorum_agents >= MIN_DESIRED_AUTHORITY_AGENTS
+        else rollout.from_version
+    )
+    cohort_ready_count = sum(
+        counts.get(member.agent_id, 0) >= SCORING_QUORUM for member in members
+    )
+    priority_members = [
+        member for member in members if member.position <= PRIORITY_COHORT_SIZE
+    ]
+    priority_complete = len(priority_members) == PRIORITY_COHORT_SIZE and all(
+        counts.get(member.agent_id, 0) >= SCORING_QUORUM for member in priority_members
+    )
+    return {
+        "active_version": authority_active_version,
         "desired_version": rollout.desired_version,
         "status": rollout.status,
         "blocked_reason": rollout.blocked_reason,
         "capability_bench_version": version,
-        "ranked_quorum_agents": await count_ranked_quorum_agents(
-            session, bench_version=rollout.desired_version
-        ),
+        "ranked_quorum_agents": ranked_quorum_agents,
         "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
         "canary_capable_validator_count": capable_count,
         # DEPRECATED alias of canary_capable_validator_count; see above.
         "v3_capable_validator_count": capable_count,
         "current_hybrid_top_five": [str(member.agent_id) for member in current_top],
-        "qualification_converged": len(current_top) == COHORT_SIZE
+        "qualification_converged": len(current_top) == PRIORITY_COHORT_SIZE
         and current_top_ids.issubset(qualified_ids),
+        "cohort_size": rollout.cohort_size,
+        "cohort_ready_count": cohort_ready_count,
+        "priority_cohort_size": PRIORITY_COHORT_SIZE,
+        "priority_complete": priority_complete,
         "members": [
             {
                 "agent_id": str(member.agent_id),

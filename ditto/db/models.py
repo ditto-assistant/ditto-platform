@@ -922,7 +922,10 @@ class BenchmarkRollout(Base):
         CheckConstraint(
             "desired_version > from_version", name="benchmark_rollout_forward"
         ),
-        CheckConstraint("cohort_size = 5", name="benchmark_rollout_five_members"),
+        CheckConstraint(
+            "cohort_size BETWEEN 5 AND 25",
+            name="benchmark_rollout_bounded_members",
+        ),
         CheckConstraint(
             # 'superseded' is terminal: an operator abandoned the rollout before
             # activation. The partial open index below excludes it, so it frees

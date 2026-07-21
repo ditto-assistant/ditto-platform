@@ -6,11 +6,17 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
-from ditto.db.models import Agent, EvaluationPayment
+from ditto.db.models import (
+    Agent,
+    BenchmarkRollout,
+    BenchmarkRolloutMember,
+    EvaluationPayment,
+)
 from ditto.db.queries.scores import (
     MIN_ELIGIBLE_CASES,
     list_eligible_ledger,
@@ -578,8 +584,6 @@ _QUORUM_VALIDATORS = ("5Va", "5Vb", "5Vc")
 
 async def _open_rollout(session: AsyncSession) -> None:
     """A collecting v2 -> v4 rollout, the state the threshold rule governs."""
-    from ditto.db.models import BenchmarkRollout
-
     async with session.begin():
         session.add(
             BenchmarkRollout(
@@ -618,6 +622,28 @@ async def _seed_versioned_agent(
     async with session.begin():
         session.add(agent)
         await session.flush()
+        rollout = await session.scalar(
+            select(BenchmarkRollout).where(BenchmarkRollout.status == "collecting")
+        )
+        if rollout is not None:
+            member_count = int(
+                await session.scalar(
+                    select(func.count(BenchmarkRolloutMember.agent_id)).where(
+                        BenchmarkRolloutMember.rollout_id == rollout.rollout_id
+                    )
+                )
+                or 0
+            )
+            if member_count < rollout.cohort_size:
+                session.add(
+                    BenchmarkRolloutMember(
+                        rollout_id=rollout.rollout_id,
+                        agent_id=agent.agent_id,
+                        position=member_count + 1,
+                        frozen_miner_hotkey=agent.miner_hotkey,
+                        frozen_composite=v2_composite,
+                    )
+                )
         if coldkey is not None:
             session.add(
                 EvaluationPayment(
