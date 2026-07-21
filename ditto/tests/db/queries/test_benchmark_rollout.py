@@ -50,8 +50,10 @@ from ditto.db.queries.benchmark_rollout import (
     RolloutConflictError,
     RolloutSnapshotMember,
     active_bench_version,
+    append_rollout_member,
     create_rollout_snapshot,
     heartbeat_supports_version,
+    historical_rescore_cohort,
     issue_rollout_ticket,
     maybe_activate_rollout,
     open_rollout,
@@ -83,6 +85,10 @@ async def test_admin_status_read_does_not_start_rollout() -> None:
             "v3_capable_validator_count": 0,
             "current_hybrid_top_five": [],
             "qualification_converged": False,
+            "cohort_size": 0,
+            "cohort_ready_count": 0,
+            "priority_cohort_size": 5,
+            "priority_complete": False,
             "members": [],
         }
         count = await session.scalar(select(func.count(BenchmarkRollout.rollout_id)))
@@ -217,6 +223,205 @@ async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRo
         )
     await session.flush()
     return agent_ids, rollout
+
+
+async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    expected_v4: list[UUID] = []
+    expected_v3: list[UUID] = []
+    async with maker() as session, session.begin():
+        for version, count in ((4, 10), (3, 20), (2, 5)):
+            for rank in range(count):
+                agent_id = uuid4()
+                session.add(
+                    Agent(
+                        agent_id=agent_id,
+                        miner_hotkey=f"miner-v{version}-{rank}",
+                        name=f"agent-v{version}-{rank}",
+                        sha256=f"{version:x}" * 64,
+                        status=AgentStatus.SCORED,
+                        screening_policy_version=9,
+                        created_at=now + timedelta(seconds=version * 100 + rank),
+                    )
+                )
+                for validator in range(3):
+                    session.add(
+                        Score(
+                            agent_id=agent_id,
+                            bench_version=version,
+                            validator_hotkey=f"validator-{version}-{validator}",
+                            run_id=f"run-{version}-{rank}-{validator}",
+                            signature="aa",
+                            seed=rank,
+                            composite=1 - rank / 100,
+                            tool_mean=0.5,
+                            memory_mean=0.5,
+                            median_ms=1,
+                            n=114,
+                            details={"bench_version": version},
+                            generated_at=now,
+                        )
+                    )
+                if version == 4:
+                    expected_v4.append(agent_id)
+                elif version == 3 and rank < 15:
+                    expected_v3.append(agent_id)
+        await session.flush()
+
+        cohort = await historical_rescore_cohort(session, source_version=4)
+        assert [member.agent_id for member in cohort] == [
+            *expected_v4,
+            *expected_v3,
+        ]
+        assert len(cohort) == 25
+        assert not any("v2" in member.miner_hotkey for member in cohort)
+    await engine.dispose()
+
+
+async def test_rollout_idles_validator_until_fleet_finishes_priority_five() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        priority_ids, rollout = await _seed_rollout(session, now)
+        sixth_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=sixth_id,
+                miner_hotkey="miner-sixth",
+                name="sixth",
+                sha256="e" * 64,
+                status=AgentStatus.SCORED,
+                screening_policy_version=9,
+                screened_image_sha256="e" * 64,
+                screened_image_size_bytes=1024,
+                screened_image_id="sha256:" + "e" * 64,
+                screened_image_ref=f"ditto-screen/{sixth_id}:latest",
+                screened_image_upload_id=uuid4(),
+                screened_image_verified_at=now,
+                created_at=now + timedelta(minutes=1),
+            )
+        )
+        rollout.cohort_size = 6
+        assert await append_rollout_member(
+            session,
+            rollout=rollout,
+            member=RolloutSnapshotMember(sixth_id, "miner-sixth", 0.4),
+            dataset=DatasetPin(seed=6, sha256="e" * 64, run_size="full"),
+            now=now,
+        )
+
+        for index, priority_id in enumerate(priority_ids):
+            ticket = await issue_rollout_ticket(
+                session,
+                validator_hotkey="validator-a",
+                now=now,
+                ttl=timedelta(minutes=90),
+            )
+            assert ticket is not None and ticket.agent_id == priority_id
+            ticket.status = TicketStatus.SCORED
+            session.add(
+                Score(
+                    agent_id=priority_id,
+                    bench_version=CANARY_BENCH_VERSION,
+                    validator_hotkey="validator-a",
+                    run_id=f"priority-a-{index}",
+                    signature="aa",
+                    seed=index,
+                    composite=0.8,
+                    tool_mean=0.8,
+                    memory_mean=0.8,
+                    median_ms=1,
+                    n=114,
+                    details={"bench_version": CANARY_BENCH_VERSION},
+                    generated_at=now,
+                )
+            )
+            await session.flush()
+
+        leaked_outsider_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=leaked_outsider_id,
+                miner_hotkey="miner-leaked-outsider",
+                name="leaked-outsider",
+                sha256="d" * 64,
+                status=AgentStatus.SCORED,
+                screening_policy_version=9,
+                created_at=now + timedelta(minutes=2),
+            )
+        )
+        for validator in range(3):
+            session.add(
+                Score(
+                    agent_id=leaked_outsider_id,
+                    bench_version=CANARY_BENCH_VERSION,
+                    validator_hotkey=f"outsider-{validator}",
+                    run_id=f"outsider-{validator}",
+                    signature="cc",
+                    seed=1,
+                    composite=0.9,
+                    tool_mean=0.9,
+                    memory_mean=0.9,
+                    median_ms=1,
+                    n=114,
+                    details={"bench_version": CANARY_BENCH_VERSION},
+                    generated_at=now,
+                )
+            )
+        await session.flush()
+        # An out-of-cohort v5 quorum left by the old fallback cannot count as a
+        # substitute for an unfinished inherited leader.
+        assert await active_bench_version(session) == 2
+
+        # Validator A has exhausted its legal top-five work, but the fleet has
+        # not completed those quorums. Rank six must not leak through.
+        assert (
+            await issue_rollout_ticket(
+                session,
+                validator_hotkey="validator-a",
+                now=now,
+                ttl=timedelta(minutes=90),
+            )
+            is None
+        )
+
+        for priority_id in priority_ids:
+            for hotkey in ("validator-b", "validator-c"):
+                session.add(
+                    Score(
+                        agent_id=priority_id,
+                        bench_version=CANARY_BENCH_VERSION,
+                        validator_hotkey=hotkey,
+                        run_id=f"priority-{priority_id}-{hotkey}",
+                        signature="bb",
+                        seed=1,
+                        composite=0.8,
+                        tool_mean=0.8,
+                        memory_mean=0.8,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": CANARY_BENCH_VERSION},
+                        generated_at=now,
+                    )
+                )
+        await session.flush()
+        sixth_ticket = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert sixth_ticket is not None and sixth_ticket.agent_id == sixth_id
+        assert await active_bench_version(session) == CANARY_BENCH_VERSION
+        assert not await maybe_activate_rollout(session, rollout, now=now)
+    await engine.dispose()
 
 
 async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() -> None:

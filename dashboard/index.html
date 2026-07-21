@@ -2904,13 +2904,16 @@
       // not be described as "rolling out": nothing is collecting for it and
       // weights will never move to it. Only an open rollout is in progress.
       var rolling = desired > active && status !== "superseded";
+      var collecting = status === "collecting" || status === "blocked_ineligible";
       head.innerHTML =
         '<span>Benchmark rollout</span>' +
         '<span class="rollout-status ' + esc(status) + '">' + esc(status) + '</span>' +
         '<span class="hint">' +
         esc(rolling
           ? "v" + active + " drives validator weights · v" + desired + " is rolling out"
-          : "v" + active + " drives validator weights") +
+          : collecting
+            ? "v" + active + " drives validator weights · inherited cohort scoring continues"
+            : "v" + active + " drives validator weights") +
         '</span>';
       var ready = state.ranked_quorum_agents;
       var needed = state.min_ranked_quorum_agents;
@@ -2919,7 +2922,27 @@
           el.textContent = String(needed);
         });
       }
-      if (rolling && Number.isFinite(ready) && Number.isFinite(needed)) {
+      var prioritySize = Number(state.priority_cohort_size) || 5;
+      var priorityReady = Array.isArray(state.members)
+        ? state.members.filter(function (member) {
+            return Number(member.position) <= prioritySize && Number(member.score_count) >= 3;
+          }).length
+        : 0;
+      if (collecting && !state.priority_complete) {
+        progress.innerHTML =
+          '<span class="count">' + esc(String(priorityReady)) + " of " + esc(String(prioritySize)) + '</span> ' +
+          esc("inherited leaders have complete v" + desired + " quorums.");
+        note.textContent =
+          "The first five from the prior benchmark are a fleet-wide barrier. Validators that have already scored every " +
+          "eligible leader intentionally idle until the other validators finish them; rank 6 and later cannot skip ahead.";
+      } else if (collecting && state.priority_complete) {
+        progress.innerHTML =
+          '<span class="count">' + esc(String(state.cohort_ready_count || 0)) + " of " + esc(String(state.cohort_size || 0)) + '</span> ' +
+          esc("inherited top-cohort agents have complete v" + desired + " quorums.");
+        note.textContent =
+          "The first-five barrier is complete. Only the bounded inherited cohort (up to 25 miners, filled from the two " +
+          "previous benchmark iterations when needed) remains ahead of ordinary work.";
+      } else if (rolling && Number.isFinite(ready) && Number.isFinite(needed)) {
         progress.innerHTML =
           '<span class="count">' + esc(String(ready)) + " of " + esc(String(needed)) + '</span> ' +
           esc("agents ready at v" + desired + " — finalized on the full benchmark with a complete ranked quorum.");
@@ -5701,10 +5724,10 @@
             ? "Provisional " + fx(Number(entry.provisional_composite))
             : "";
           var accessibleName = agentLabel(entry.name, entry.version);
-          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(accessibleName) + ' details' + (isUpNext ? ', up next for validator assignment' : '') + (rescore && rescore.isQualification ? ', top five benchmark qualification in progress' : '') + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
+          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(accessibleName) + ' details' + (isUpNext ? ', up next for validator assignment' : '') + (rescore && rescore.isQualification ? ', inherited benchmark cohort qualification in progress' : '') + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
             '<span class="pipeline-item-heading"><span class="pipeline-item-name">' + esc(agentName(entry.name)) + '</span>' +
               (isUpNext ? '<span class="pipeline-next-badge" title="Highest current priority; validator eligibility can vary">Up next</span>' : '') +
-              (rescore && rescore.isQualification ? '<span class="pipeline-qualification-badge" title="Existing score remains authoritative while this top-five agent qualifies on the next benchmark">Top 5 → v' + esc(rescore.targetVersion) + '</span>' : '') + '</span>' +
+              (rescore && rescore.isQualification ? '<span class="pipeline-qualification-badge" title="Existing score remains authoritative while this inherited cohort agent qualifies on the next benchmark">Cohort → v' + esc(rescore.targetVersion) + '</span>' : '') + '</span>' +
             agentVersionBadge(entry.version) +
             '<span class="pipeline-item-meta"><span>' + esc(String(entry.agent_id || "").slice(0, 8)) + '</span><span>' + esc(meta) + '</span></span>' +
             (rescore && rescore.isQualification ? '<span class="pipeline-item-qualification-detail">v' + esc(rescore.sourceVersion) + ' score stays live until v' + esc(rescore.targetVersion) + ' quorum</span>' : '') +

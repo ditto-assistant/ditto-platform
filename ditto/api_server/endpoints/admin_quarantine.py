@@ -109,9 +109,9 @@ from ditto.db.queries.benchmark_rollout import (
 from ditto.db.queries.benchmark_rollout import (
     active_bench_version,
     append_rollout_member,
+    historical_rescore_cohort,
     maybe_activate_rollout,
     open_rollout,
-    rolling_top_five,
 )
 from ditto.db.queries.tickets import RETRY_COOLDOWN
 
@@ -1917,7 +1917,11 @@ async def _benchmark_qualification_state(
         is not None
     )
     validator_active = issued_ticket_active or heartbeat_active
-    top_five = await rolling_top_five(session) if rollout is not None else []
+    top_five = (
+        await historical_rescore_cohort(session, source_version=rollout.from_version)
+        if rollout is not None
+        else []
+    )
     top_member = next(
         (member for member in top_five if member.agent_id == agent_id), None
     )
@@ -1947,7 +1951,7 @@ async def _benchmark_qualification_state(
     elif agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
         blocking_reason = "submission must be scored or live"
     elif top_member is None:
-        blocking_reason = "submission is not in the current hybrid top five"
+        blocking_reason = "submission is not in the inherited top-25 cohort"
     elif member is not None:
         blocking_reason = "submission is already a rollout member"
     elif screening_active:
@@ -2011,7 +2015,7 @@ async def qualify_benchmark_rollout(
     generator: GeneratorDep,
     x_admin_actor: Annotated[str | None, Header()] = None,
 ) -> AdminBenchmarkQualificationResponse:
-    """Append a guarded top-five contender without touching its accepted scores."""
+    """Append a guarded cohort member without touching its accepted scores."""
     if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
         raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
 

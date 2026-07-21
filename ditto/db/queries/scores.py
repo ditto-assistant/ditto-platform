@@ -23,7 +23,12 @@ from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
-from ditto.db.models import Agent, EvaluationPayment, Score
+from ditto.db.models import (
+    Agent,
+    BenchmarkRolloutMember,
+    EvaluationPayment,
+    Score,
+)
 from ditto.db.queries.agents import get_agent_by_id
 
 if TYPE_CHECKING:
@@ -553,7 +558,10 @@ async def list_miner_composite_history(
 
 
 async def count_ranked_quorum_agents(
-    session: AsyncSession, *, bench_version: int
+    session: AsyncSession,
+    *,
+    bench_version: int,
+    agent_ids: set[UUID] | None = None,
 ) -> int:
     """How many eligible agents hold a complete, RANKED quorum at ``bench_version``.
 
@@ -577,21 +585,22 @@ async def count_ranked_quorum_agents(
     consensus-critical decision: the same DB state must give every reader the
     same answer.
     """
-    per_version = (
-        select(
-            Score.agent_id.label("agent_id"),
-            _is_ranked().label("eligible"),
-            func.count(Score.agent_id).over(partition_by=Score.agent_id).label("cnt"),
-            func.row_number()
-            .over(
-                partition_by=Score.agent_id,
-                order_by=(Score.composite.asc(), Score.validator_hotkey.asc()),
-            )
-            .label("srn"),
+    score_scope = select(
+        Score.agent_id.label("agent_id"),
+        _is_ranked().label("eligible"),
+        func.count(Score.agent_id).over(partition_by=Score.agent_id).label("cnt"),
+        func.row_number()
+        .over(
+            partition_by=Score.agent_id,
+            order_by=(Score.composite.asc(), Score.validator_hotkey.asc()),
         )
-        .where(Score.bench_version == bench_version)
-        .subquery()
-    )
+        .label("srn"),
+    ).where(Score.bench_version == bench_version)
+    if agent_ids is not None:
+        if not agent_ids:
+            return 0
+        score_scope = score_scope.where(Score.agent_id.in_(agent_ids))
+    per_version = score_scope.subquery()
     # Same median arithmetic as the ledger (see list_eligible_ledger): the
     # lower-middle row by ascending composite represents the agent.
     qualifying = (
@@ -795,11 +804,11 @@ async def list_eligible_ledger(
     # During a collecting rollout the ledger is on exactly ONE benchmark version
     # at a time, chosen by a threshold rule evaluated on each read:
     #
-    #   fewer than MIN_DESIRED_AUTHORITY_AGENTS agents hold a complete, ranked
-    #   desired-version quorum  ->  the ACTIVE version stays authoritative for
-    #   every agent (desired-version medians are collected and visible as
-    #   rollout progress only);
-    #   at or above that count  ->  the DESIRED version becomes authoritative
+    #   fewer than MIN_DESIRED_AUTHORITY_AGENTS frozen priority members hold a
+    #   complete, ranked desired-version quorum  ->  the ACTIVE version stays
+    #   authoritative for every agent (desired-version medians are collected
+    #   and visible as rollout progress only);
+    #   all priority members ready  ->  the DESIRED version becomes authoritative
     #   for the whole pool, and an agent without a desired-version quorum has no
     #   authoritative row at all and drops out. That drop-out is the point of the
     #   threshold: it only happens once enough agents have crossed to still fill
@@ -823,18 +832,29 @@ async def list_eligible_ledger(
     if desired_version is None:
         version_priority: ColumnElement[Any] = per_agent.c.bench_version
     else:
+        assert rollout is not None
         desired_at_quorum = and_(
             per_agent.c.bench_version == desired_version,
             per_agent.c.cnt >= SCORING_QUORUM,
         )
         on_canonical = per_agent.c.bench_version == canonical_version
-        # Only genuine, ranked 3/3 desired-version agents count toward the
-        # threshold, so a smoke/practice run or a zero-scoring full run cannot
-        # push the ledger over. Shared with the rollout activation gate, which
-        # must apply the identical definition — see
+        # Only genuine, ranked 3/3 desired-version PRIORITY members count, so a
+        # rank-6 leak, smoke/practice run, or zero-scoring full run cannot push
+        # the ledger over. Shared with the rollout activation gate, which must
+        # apply the identical definition — see
         # :func:`count_ranked_quorum_agents`.
+        priority_ids = set(
+            await session.scalars(
+                select(BenchmarkRolloutMember.agent_id).where(
+                    BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                    BenchmarkRolloutMember.position <= MIN_DESIRED_AUTHORITY_AGENTS,
+                )
+            )
+        )
         desired_ready_agents = await count_ranked_quorum_agents(
-            session, bench_version=desired_version
+            session,
+            bench_version=desired_version,
+            agent_ids=priority_ids,
         )
         if desired_ready_agents >= MIN_DESIRED_AUTHORITY_AGENTS:
             # Whole-pool flip: drop every row that is not a desired-version
