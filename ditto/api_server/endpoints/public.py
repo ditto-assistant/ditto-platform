@@ -220,6 +220,7 @@ _DATAGEN_VERSION_BY_BENCH_VERSION = {
     3: "v0.8.0",
     4: "v0.9.0",
     5: "v0.10.0",
+    6: "v0.11.1",
 }
 _DATAGEN_RUN_SIZES = frozenset({"small", "medium", "full"})
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
