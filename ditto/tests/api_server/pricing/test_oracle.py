@@ -14,7 +14,9 @@ from typing import Any
 
 import httpx
 import pytest
+from tenacity import wait_none
 
+import ditto.api_server.pricing.oracle as oracle_module
 from ditto.api_server.pricing import (
     CoinGeckoOracle,
     MalformedPriceError,
@@ -48,6 +50,12 @@ def make_client(
 
 def ok_response(price_usd: float | str) -> httpx.Response:
     return httpx.Response(200, json={"bittensor": {"usd": price_usd}})
+
+
+@pytest.fixture
+def no_retry_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the retry count without paying production's backoff in tests."""
+    monkeypatch.setattr(oracle_module, "wait_fixed", lambda _seconds: wait_none())
 
 
 class TestOverride:
@@ -100,6 +108,7 @@ class TestFreshFetchAndCache:
         assert call_count == 2
 
 
+@pytest.mark.usefixtures("no_retry_delay")
 class TestRetryBehaviour:
     async def test_two_transient_failures_then_success(self):
         """Tenacity must keep retrying transient errors until either the
@@ -140,6 +149,7 @@ class TestConcurrentFetchLock:
         assert call_count == 1
 
 
+@pytest.mark.usefixtures("no_retry_delay")
 class TestStaleWhileRevalidate:
     async def test_serves_stale_when_oracle_unreachable(self):
         responses: list[httpx.Response | Exception] = [

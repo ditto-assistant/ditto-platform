@@ -3257,7 +3257,10 @@ class TestScreenedImageUpload:
         [
             ("sha256", "ff" * 32),
             ("image-id", "sha256:" + "ff" * 32),
-            ("image-ref", f"ditto-screen/{uuid4()}:latest"),
+            (
+                "image-ref",
+                "ditto-screen/00000000-0000-0000-0000-000000000000:latest",
+            ),
         ],
     )
     async def test_completion_rejects_storage_metadata_mismatch(
