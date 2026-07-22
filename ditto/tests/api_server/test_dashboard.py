@@ -382,6 +382,7 @@ class TestDashboard:
 
         assert 'id="harness-comparison-title">How far miners have taken memory' in body
         assert "Reference only · no emissions" in body
+        assert "Memory subscores only. The leaderboard ranks by composite." in body
         assert 'for="third-party-harness-filter">Third-party harness' in body
         assert 'value="hermes">Hermes Agent' in body
         assert "var THIRD_PARTY_HARNESSES = [{" in body
@@ -395,6 +396,13 @@ class TestDashboard:
         assert "entry.finalized === true && entry.eligible !== false" in body
         assert ".sort(function (a, b)" in body
         assert ".slice(0, 5)" in body
+        assert '" · composite " + fx(composite)' in body
+        assert "<span>Memory</span><strong>" in body
+        assert "Top memory subscore:" in body
+        assert "shown on the leaderboard is its composite" in body
+        assert (
+            "Miner bars show memory subscores, not the leaderboard composite." in body
+        )
         assert "Third-party harnesses never enter score rank, KOTH" in body
         assert "validator weights, or payouts." in body
         assert "8df6ba37a3c4e46ede9db1cb6014551d49ac6ba8" in body
