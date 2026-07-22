@@ -590,7 +590,10 @@ async def proxy_chat_completions(
             },
         )
         raw = upstream.content
-        route_observable = upstream.status_code == 429 or upstream.status_code >= 500
+        # Any provider-side rejection is route-health evidence. In particular,
+        # authentication, balance, and policy failures must cool a route instead
+        # of leaving it looking healthy merely because they are upstream 4xxs.
+        route_observable = upstream.status_code >= 400
         if len(raw) > config.response_body_bytes:
             raise HTTPException(
                 status_code=502, detail="provider response is too large"

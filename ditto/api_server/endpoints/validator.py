@@ -124,6 +124,7 @@ from ditto.db.models import (
     Agent,
     AthReview,
     BenchmarkDataset,
+    InferenceGrant,
     Score,
     ValidatorHeartbeat,
     ValidatorTicket,
@@ -183,6 +184,25 @@ if TYPE_CHECKING:
     from ditto.chain import ChainClient
 
 logger = logging.getLogger(__name__)
+
+
+def _inference_grant_offer(
+    *, request: Request, grant: InferenceGrant, bench_version: int
+) -> InferenceGrantOffer:
+    """Serialize the same ticket-scoped capability for every scoring lane."""
+    public_base_url = request.app.state.config.inference_proxy.public_base_url
+    return InferenceGrantOffer(
+        grant_id=grant.grant_id,
+        exchange_url=f"{public_base_url}/api/v1/inference/exchange",
+        proxy_url=f"{public_base_url}/api/v1/inference/chat/completions",
+        allowed_models=list(grant.allowed_models),
+        request_budget=grant.request_budget,
+        token_budget=grant.token_budget,
+        expires_at=grant.expires_at,
+        provider=grant.route_provider if bench_version >= 7 else None,
+        profile_revision=grant.route_profile if bench_version >= 7 else None,
+    )
+
 
 # Reproduce-under-transform audit (v3 Part A). These mirror the validator's
 # constants in ditto-subnet ``ditto/validator/transform_audit.py``, which in turn
@@ -1362,30 +1382,10 @@ async def request_job(
                 ),
                 requires_screened_image=contract.requires_screened_image,
                 inference=(
-                    InferenceGrantOffer(
-                        grant_id=inference_grant.grant_id,
-                        exchange_url=(
-                            f"{request.app.state.config.inference_proxy.public_base_url}"
-                            "/api/v1/inference/exchange"
-                        ),
-                        proxy_url=(
-                            f"{request.app.state.config.inference_proxy.public_base_url}"
-                            "/api/v1/inference/chat/completions"
-                        ),
-                        allowed_models=list(inference_grant.allowed_models),
-                        request_budget=inference_grant.request_budget,
-                        token_budget=inference_grant.token_budget,
-                        expires_at=inference_grant.expires_at,
-                        provider=(
-                            inference_grant.route_provider
-                            if ticket.bench_version >= 7
-                            else None
-                        ),
-                        profile_revision=(
-                            inference_grant.route_profile
-                            if ticket.bench_version >= 7
-                            else None
-                        ),
+                    _inference_grant_offer(
+                        request=request,
+                        grant=inference_grant,
+                        bench_version=ticket.bench_version,
                     )
                     if inference_grant is not None
                     else None
@@ -1571,6 +1571,30 @@ async def request_top5_confirmation_job(
                 detail="top-5 confirmation claim nonce has already been used",
             ) from exc
         canonical_version = await active_bench_version(session)
+        heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
+        v7_calibration = None
+        if canonical_version >= 7:
+            try:
+                capabilities = ValidatorCapabilities.model_validate(
+                    heartbeat.capabilities if heartbeat is not None else None
+                )
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=428,
+                    detail="fresh benchmark v7 inference capability is required",
+                ) from exc
+            if capabilities.scorer_benchmarks is not None:
+                v7_calibration = capabilities.scorer_benchmarks.v7_calibration
+            if (
+                heartbeat is None
+                or heartbeat.protocol_version < 11
+                or not capabilities.ticket_inference
+                or v7_calibration is None
+            ):
+                raise HTTPException(
+                    status_code=428,
+                    detail="fresh benchmark v7 inference capability is required",
+                )
         members = await _current_emission_set(
             session, canonical_version=canonical_version
         )
@@ -1616,8 +1640,30 @@ async def request_top5_confirmation_job(
         dataset = await session.get(
             BenchmarkDataset, (agent.agent_id, ticket.bench_version)
         )
+        contract = benchmark_contract(ticket.bench_version)
+        inference_grant = await ensure_inference_grant(
+            session,
+            ticket=ticket,
+            config=config.inference_proxy,
+            supported_profiles=(
+                tuple(
+                    route.profile_revision for route in v7_calibration.supported_routes
+                )
+                if v7_calibration is not None
+                else None
+            ),
+            calibration_manifest_sha256=(
+                v7_calibration.manifest_sha256 if v7_calibration is not None else None
+            ),
+        )
+        if ticket.bench_version >= 7 and inference_grant is None:
+            raise HTTPException(
+                status_code=503,
+                detail="ticket inference capability is unavailable",
+            )
         job = JobResponse(
             agent_id=agent.agent_id,
+            slot_id=ticket.slot_id,
             miner_hotkey=agent.miner_hotkey,
             sha256=agent.sha256,
             deadline=ticket.deadline,
@@ -1637,6 +1683,19 @@ async def request_top5_confirmation_job(
                 else agent.dataset_seed_block_hash
             ),
             bench_version=ticket.bench_version,
+            minimum_screening_policy_version=(
+                contract.minimum_screening_policy_version
+            ),
+            requires_screened_image=contract.requires_screened_image,
+            inference=(
+                _inference_grant_offer(
+                    request=request,
+                    grant=inference_grant,
+                    bench_version=ticket.bench_version,
+                )
+                if inference_grant is not None
+                else None
+            ),
         )
     logger.info(
         "issued top-5 rescore job champion=%s member=%s validator=%s",
