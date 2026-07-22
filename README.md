@@ -95,8 +95,8 @@ it remains platform-operated, and validators do not run it.
 ### Planned (scoring + ops)
 
 Weight/score aggregation (`/scoring/*`) and `/admin/*`. See
-[`PROJECT.md`](https://github.com/ditto-assistant/ditto-subnet/blob/main/PROJECT.md) in `ditto-subnet`
-for the evaluation/scoring design.
+[`docs/VALIDATOR.md`](https://github.com/ditto-assistant/ditto-subnet/blob/main/docs/VALIDATOR.md)
+in `ditto-subnet` for validator scoring design and operations.
 
 ---
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -762,6 +763,59 @@ async def test_evaluating_agent_with_complete_prereqs_is_not_reclaimed(
                 seed_block_hash="ff" * 32,
             )
         )
+
+    claimed = await _claim(session)
+
+    assert agent.agent_id not in {a.agent_id for a, _, _ in claimed}
+
+
+async def test_effective_rollout_authority_dataset_is_not_reclaimed(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The rollout start guard can make v6 the effective authority while the
+    # durable activated row remains v4. Backroom and ticketing correctly report
+    # v6 in that state; screening must use the same authority instead of asking
+    # this already-complete agent for an obsolete v4 dataset.
+    await _activate_v4(session)
+    now = datetime.now(UTC)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5HK-effective-v6",
+        name="effective-v6-complete",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.EVALUATING,
+        created_at=now - timedelta(days=1),
+    )
+    agent.screening_policy_version = SCREENING_POLICY_VERSION
+    _complete_screened_image(agent)
+    async with session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=4,
+                desired_version=6,
+                status="collecting",
+                cohort_size=5,
+                created_at=now - timedelta(minutes=5),
+            )
+        )
+        session.add(agent)
+        session.add(
+            BenchmarkDataset(
+                agent_id=agent.agent_id,
+                bench_version=6,
+                seed=7,
+                sha256="ef" * 32,
+                run_size="full",
+                seed_block=100,
+                seed_block_hash="ff" * 32,
+            )
+        )
+
+    async def effective_v6(_session: AsyncSession) -> int:
+        return 6
+
+    monkeypatch.setattr("ditto.db.queries.screening.active_bench_version", effective_v6)
 
     claimed = await _claim(session)
 

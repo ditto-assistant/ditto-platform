@@ -49,7 +49,12 @@ LEGACY_BENCH_VERSION = 2
 # This is discovery metadata only: it no longer opens or selects a rollout.
 CANARY_BENCH_VERSION = latest_benchmark_contract().version
 PRIORITY_COHORT_SIZE = 5
-MAX_RESCORE_COHORT_SIZE = 25
+# New benchmark transitions rescore only the inherited top ten. The database
+# still permits older 11-25-member rollout snapshots so historical audit rows
+# remain readable and an in-flight rollout created by an older deployment can
+# finish without destructive member deletion.
+RESCORE_COHORT_SIZE = 10
+MAX_PERSISTED_RESCORE_COHORT_SIZE = 25
 SCORING_QUORUM = 3
 # How many agents must hold a COMPLETE, ranked desired-version quorum before
 # the desired version may take over. Two gates enforce it against the same count
@@ -183,7 +188,7 @@ async def historical_rescore_cohort(
     session: AsyncSession,
     *,
     source_version: int,
-    limit: int = MAX_RESCORE_COHORT_SIZE,
+    limit: int = RESCORE_COHORT_SIZE,
 ) -> list[RolloutSnapshotMember]:
     """Freeze the prior-era rescore cohort without admitting the whole ledger.
 
@@ -193,10 +198,10 @@ async def historical_rescore_cohort(
     explicit "combine two previous benchmark iterations" fallback, not an
     unbounded backfill of every legacy submission.
     """
-    if limit < PRIORITY_COHORT_SIZE or limit > MAX_RESCORE_COHORT_SIZE:
+    if limit < PRIORITY_COHORT_SIZE or limit > RESCORE_COHORT_SIZE:
         raise ValueError(
             f"rollout cohort limit must be between {PRIORITY_COHORT_SIZE} "
-            f"and {MAX_RESCORE_COHORT_SIZE}"
+            f"and {RESCORE_COHORT_SIZE}"
         )
     versions = list(
         await session.scalars(
@@ -387,19 +392,56 @@ async def active_bench_version(session: AsyncSession) -> int:
             bench_version=open_transition.desired_version,
             agent_ids=priority_ids,
         )
-        return (
-            open_transition.desired_version
-            if len(priority_ids) == PRIORITY_COHORT_SIZE
+        if (
+            len(priority_ids) == PRIORITY_COHORT_SIZE
             and ready >= MIN_DESIRED_AUTHORITY_AGENTS
-            else open_transition.from_version
+        ):
+            return open_transition.desired_version
+    return await persisted_active_bench_version(session)
+
+
+async def persisted_active_bench_version(session: AsyncSession) -> int:
+    """Return the latest durable benchmark-authority decision.
+
+    Normal rollout activation records authority on the rollout row. Recovery from
+    an already-superseded, fully qualified rollout records an append-only
+    ``authority_selected`` audit event instead of rewriting terminal history.
+    Comparing both timestamps keeps the newest durable authority decision
+    authoritative without adding a second mutable state table.
+    """
+    activated = (
+        await session.execute(
+            select(BenchmarkRollout.desired_version, BenchmarkRollout.activated_at)
+            .where(
+                BenchmarkRollout.status == "activated",
+                BenchmarkRollout.activated_at.is_not(None),
+            )
+            .order_by(BenchmarkRollout.activated_at.desc())
+            .limit(1)
         )
-    version = await session.scalar(
-        select(BenchmarkRollout.desired_version)
-        .where(BenchmarkRollout.status == "activated")
-        .order_by(BenchmarkRollout.activated_at.desc())
-        .limit(1)
-    )
-    return int(version or DEFAULT_BENCH_VERSION)
+    ).first()
+    selected = (
+        await session.execute(
+            select(BenchmarkRollout.desired_version, BenchmarkRolloutAudit.recorded_at)
+            .join(
+                BenchmarkRolloutAudit,
+                BenchmarkRolloutAudit.rollout_id == BenchmarkRollout.rollout_id,
+            )
+            .where(BenchmarkRolloutAudit.event == "authority_selected")
+            .order_by(
+                BenchmarkRolloutAudit.recorded_at.desc(),
+                BenchmarkRolloutAudit.audit_id.desc(),
+            )
+            .limit(1)
+        )
+    ).first()
+    if selected is not None and (
+        activated is None or selected.recorded_at >= activated.activated_at
+    ):
+        return int(selected.desired_version)
+    if activated is not None:
+        return int(activated.desired_version)
+    return DEFAULT_BENCH_VERSION
 
 
 async def open_rollout(
@@ -495,6 +537,11 @@ async def supersede_open_rollout(
         raise RolloutConflictError(
             "an activated benchmark rollout cannot be superseded"
         )
+    if await active_bench_version(session) == rollout.desired_version:
+        raise RolloutConflictError(
+            "a benchmark rollout that already owns active authority cannot be "
+            "superseded; select another qualified active contract first"
+        )
     previous_status = rollout.status
     rollout.status = "superseded"
     rollout.blocked_reason = None
@@ -508,6 +555,130 @@ async def supersede_open_rollout(
             "previous_status": previous_status,
             "from_version": rollout.from_version,
             "desired_version": rollout.desired_version,
+        },
+        now=now,
+    )
+    await session.flush()
+    return rollout
+
+
+async def authority_selection_state(
+    session: AsyncSession, *, bench_version: int
+) -> dict[str, Any]:
+    """Describe whether a historical contract can safely own weight authority."""
+    rollout = await rollout_for_desired_version(session, desired_version=bench_version)
+    if rollout is None:
+        return {
+            "version": bench_version,
+            "ready": False,
+            "ranked_quorum_agents": 0,
+            "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
+            "blocked_reason": "no rollout history exists for this contract",
+        }
+    priority_ids = set(
+        await session.scalars(
+            select(BenchmarkRolloutMember.agent_id).where(
+                BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE,
+            )
+        )
+    )
+    if len(priority_ids) != PRIORITY_COHORT_SIZE:
+        return {
+            "version": bench_version,
+            "ready": False,
+            "ranked_quorum_agents": 0,
+            "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
+            "blocked_reason": "the rollout does not contain a complete priority cohort",
+        }
+    eligible_ids = set(
+        await session.scalars(
+            select(Agent.agent_id).where(
+                Agent.agent_id.in_(priority_ids),
+                Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE)),
+            )
+        )
+    )
+    if eligible_ids != priority_ids:
+        return {
+            "version": bench_version,
+            "ready": False,
+            "ranked_quorum_agents": 0,
+            "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
+            "blocked_reason": "one or more priority agents are no longer eligible",
+        }
+    from ditto.db.queries.scores import count_ranked_quorum_agents
+
+    ranked = await count_ranked_quorum_agents(
+        session, bench_version=bench_version, agent_ids=priority_ids
+    )
+    ready = ranked >= MIN_DESIRED_AUTHORITY_AGENTS
+    return {
+        "version": bench_version,
+        "ready": ready,
+        "ranked_quorum_agents": ranked,
+        "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
+        "blocked_reason": None
+        if ready
+        else "the priority cohort does not yet have five ranked quorums",
+    }
+
+
+async def select_active_bench_version(
+    session: AsyncSession,
+    *,
+    bench_version: int,
+    actor: str,
+    reason: str,
+    now: datetime,
+) -> BenchmarkRollout:
+    """Select a fully qualified historical contract as active authority.
+
+    This is a recovery/control-plane action, not an arbitrary version setter.
+    It is forward-only, requires the rollout target to be terminal, and refuses
+    to race an open rollout. The append-only audit event becomes the durable
+    authority decision while the superseded rollout row remains immutable.
+    """
+    rows = list(
+        (
+            await session.execute(
+                select(BenchmarkRollout)
+                .order_by(BenchmarkRollout.created_at)
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    if any(row.status in ("collecting", "blocked_ineligible") for row in rows):
+        raise RolloutConflictError(
+            "supersede the open benchmark rollout before changing active authority"
+        )
+    current = await persisted_active_bench_version(session)
+    if bench_version <= current:
+        raise RolloutConflictError(
+            f"active benchmark selection is forward-only: current v{current}, "
+            f"requested v{bench_version}"
+        )
+    rollout = next(
+        (row for row in reversed(rows) if row.desired_version == bench_version),
+        None,
+    )
+    if rollout is None or rollout.status != "superseded":
+        raise RolloutConflictError(
+            "only a fully qualified superseded rollout can be selected for recovery"
+        )
+    readiness = await authority_selection_state(session, bench_version=bench_version)
+    if not readiness["ready"]:
+        raise RolloutConflictError(str(readiness["blocked_reason"]))
+    await _audit(
+        session,
+        rollout,
+        "authority_selected",
+        {
+            "actor": actor,
+            "reason": reason,
+            "previous_active_version": current,
+            "bench_version": bench_version,
+            "ranked_quorum_agents": readiness["ranked_quorum_agents"],
         },
         now=now,
     )
@@ -555,8 +726,8 @@ async def create_rollout_snapshot(
             f"{conflicting.desired_version} is still {conflicting.status}; only one "
             "benchmark rollout may be open at a time"
         )
-    if not PRIORITY_COHORT_SIZE <= len(members) <= MAX_RESCORE_COHORT_SIZE:
-        raise ValueError("a benchmark rollout requires between five and 25 members")
+    if not PRIORITY_COHORT_SIZE <= len(members) <= RESCORE_COHORT_SIZE:
+        raise ValueError("a benchmark rollout requires between five and ten members")
     if len({m.agent_id for m in members}) != len(members):
         raise ValueError("benchmark rollout agents must be distinct")
     if len({m.miner_hotkey for m in members}) != len(members):

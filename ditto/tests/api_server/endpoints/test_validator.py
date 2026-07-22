@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 from uuid import UUID, uuid4
 
 import bittensor
@@ -56,7 +56,10 @@ from ditto.api_server.dependencies import (
     get_session,
     get_storage_client,
 )
-from ditto.api_server.endpoints.validator import _heartbeat_signing_message
+from ditto.api_server.endpoints.validator import (
+    _fresh_submission_lane_due,
+    _heartbeat_signing_message,
+)
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_AGENT_NOT_EVALUATABLE,
     ERROR_CODE_AGENT_NOT_FOUND,
@@ -2271,6 +2274,52 @@ class TestArtifact:
 
 
 class TestRequestJob:
+    async def test_fresh_submission_lane_uses_three_of_four_completed_jobs(
+        self, session_maker: async_sessionmaker[AsyncSession]
+    ) -> None:
+        started_at = datetime.now(UTC) - timedelta(minutes=1)
+        validator_hotkey = "5LaneValidator"
+        async with session_maker() as session, session.begin():
+            assert await _fresh_submission_lane_due(
+                session,
+                validator_hotkey=validator_hotkey,
+                bench_version=3,
+                rollout_started_at=started_at,
+            )
+            for completed in range(1, 4):
+                agent_id = uuid4()
+                session.add(
+                    Agent(
+                        agent_id=agent_id,
+                        miner_hotkey=f"5Miner-{completed}",
+                        name=f"lane-{completed}",
+                        sha256=f"{completed:064x}",
+                        status=AgentStatus.SCORED,
+                        screening_policy_version=SCREENING_POLICY_VERSION,
+                        created_at=started_at,
+                    )
+                )
+                session.add(
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        bench_version=3,
+                        validator_hotkey=validator_hotkey,
+                        status=TicketStatus.SCORED,
+                        issued_at=started_at,
+                        deadline=started_at + timedelta(minutes=90),
+                        attempt_count=1,
+                        created_at=started_at,
+                    )
+                )
+                await session.flush()
+                due = await _fresh_submission_lane_due(
+                    session,
+                    validator_hotkey=validator_hotkey,
+                    bench_version=3,
+                    rollout_started_at=started_at,
+                )
+                assert due is (completed != 2)
+
     @staticmethod
     def _v8_capabilities() -> dict[str, object]:
         return {
@@ -3941,11 +3990,16 @@ class TestTranscriptPublication:
         body = response.json()
         assert body["stored"] is True
         assert body["transcript_sha256"] == self._digest
-        storage.put_object.assert_awaited_once()
-        kwargs = storage.put_object.await_args.kwargs
-        assert kwargs["bucket"] == "ditto-public"
-        assert kwargs["key"] == f"transcripts/{self._digest}.json"
-        assert kwargs["body"] == self._TRANSCRIPT
+        key = f"transcripts/{self._digest}.json"
+        assert storage.put_object.await_args_list == [
+            call(key=key, body=self._TRANSCRIPT, content_type="application/json"),
+            call(
+                key=key,
+                body=self._TRANSCRIPT,
+                content_type="application/json",
+                bucket="ditto-public",
+            ),
+        ]
 
         # Idempotent: a re-upload of an existing object writes nothing new.
         storage.object_exists = AsyncMock(return_value=True)
@@ -3955,7 +4009,36 @@ class TestTranscriptPublication:
             headers={"X-Validator-Hotkey": _VALIDATOR_HOTKEY},
         )
         assert response.status_code == 200
-        storage.put_object.assert_awaited_once()  # still exactly one write
+        assert storage.put_object.await_count == 2  # still exactly two writes
+
+    async def test_submit_transcript_stores_without_public_mirror(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+        storage.public_bucket = None
+        storage.put_object = AsyncMock()
+        storage.object_exists = AsyncMock(return_value=False)
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await self._record_score_with_transcript(client, session_maker, agent_id)
+
+        response = await client.put(
+            f"/api/v1/validator/agent/{agent_id}/transcript/run_t_0",
+            content=self._TRANSCRIPT,
+            headers={"X-Validator-Hotkey": _VALIDATOR_HOTKEY},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["stored"] is True
+        storage.put_object.assert_awaited_once_with(
+            key=f"transcripts/{self._digest}.json",
+            body=self._TRANSCRIPT,
+            content_type="application/json",
+        )
 
     async def test_submit_transcript_digest_mismatch_rejected(
         self,

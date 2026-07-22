@@ -59,6 +59,7 @@ from ditto.db.queries.benchmark_rollout import (
     open_rollout,
     rolling_top_five,
     rollout_state,
+    select_active_bench_version,
     supersede_open_rollout,
 )
 from ditto.db.queries.scores import count_ranked_quorum_agents, list_eligible_ledger
@@ -234,7 +235,7 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> 
     expected_v4: list[UUID] = []
     expected_v3: list[UUID] = []
     async with maker() as session, session.begin():
-        for version, count in ((4, 10), (3, 20), (2, 5)):
+        for version, count in ((4, 6), (3, 10), (2, 5)):
             for rank in range(count):
                 agent_id = uuid4()
                 session.add(
@@ -268,7 +269,7 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> 
                     )
                 if version == 4:
                     expected_v4.append(agent_id)
-                elif version == 3 and rank < 15:
+                elif version == 3 and rank < 4:
                     expected_v3.append(agent_id)
         await session.flush()
 
@@ -277,7 +278,7 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> 
             *expected_v4,
             *expected_v3,
         ]
-        assert len(cohort) == 25
+        assert len(cohort) == 10
         assert not any("v2" in member.miner_hotkey for member in cohort)
     await engine.dispose()
 
@@ -1787,6 +1788,63 @@ async def test_superseded_rollout_issues_no_tickets_and_never_activates() -> Non
         assert not await maybe_activate_rollout(session, rollout, now=now)
         assert rollout.status == "superseded"
         assert await active_bench_version(session) == 2
+    await engine.dispose()
+
+
+async def test_supersede_refuses_rollout_after_priority_cohort_owns_authority() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
+        assert await active_bench_version(session) == CANARY_BENCH_VERSION
+
+        with pytest.raises(RolloutConflictError, match="already owns active authority"):
+            await supersede_open_rollout(
+                session,
+                actor="operator",
+                reason="must not roll authority backward",
+                now=now,
+            )
+
+        assert rollout.status == "collecting"
+    await engine.dispose()
+
+
+async def test_operator_can_select_fully_qualified_superseded_authority() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
+        rollout.status = "superseded"
+        await session.flush()
+        assert await active_bench_version(session) == 2
+
+        selected = await select_active_bench_version(
+            session,
+            bench_version=CANARY_BENCH_VERSION,
+            actor="operator",
+            reason="restore the completed contract",
+            now=now + timedelta(minutes=1),
+        )
+
+        assert selected.rollout_id == rollout.rollout_id
+        assert selected.status == "superseded"
+        assert await active_bench_version(session) == CANARY_BENCH_VERSION
+        audit = await session.scalar(
+            select(BenchmarkRolloutAudit).where(
+                BenchmarkRolloutAudit.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutAudit.event == "authority_selected",
+            )
+        )
+        assert audit is not None
+        assert audit.payload["previous_active_version"] == 2
+        assert audit.payload["bench_version"] == CANARY_BENCH_VERSION
     await engine.dispose()
 
 

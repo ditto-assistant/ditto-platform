@@ -24,6 +24,7 @@ from ditto.db.models import (
     ScreeningAttempt,
     ScreeningQuarantine,
 )
+from ditto.db.queries.benchmark_rollout import active_bench_version, open_rollout
 from ditto.db.queries.scores import SCORING_QUORUM
 
 if TYPE_CHECKING:
@@ -144,15 +145,25 @@ def screening_priority_order() -> tuple[ColumnElement[Any], ...]:
     )
 
 
-def missing_active_benchmark_dataset() -> ColumnElement[bool]:
-    """Whether the current agent lacks the activated benchmark-version pin."""
-    active_version = (
-        select(BenchmarkRollout.desired_version)
-        .where(BenchmarkRollout.status == "activated")
-        .order_by(BenchmarkRollout.activated_at.desc())
-        .limit(1)
-        .scalar_subquery()
-    )
+async def missing_required_benchmark_dataset(
+    session: AsyncSession,
+) -> ColumnElement[bool]:
+    """Whether the agent lacks the dataset its next score would consume.
+
+    Effective benchmark authority can move to an open rollout's desired version
+    before that rollout's durable row becomes ``activated``. New submissions
+    created during an open rollout also enter its desired version immediately,
+    even before the authority guard flips. Mirror those two rules here instead
+    of treating the most recent literal ``activated`` row as current authority.
+    """
+    effective_version = await active_bench_version(session)
+    rollout = await open_rollout(session)
+    required_version: int | ColumnElement[int] = effective_version
+    if rollout is not None:
+        required_version = case(
+            (Agent.created_at >= rollout.created_at, rollout.desired_version),
+            else_=effective_version,
+        )
     activation_exists = exists(
         select(BenchmarkRollout.rollout_id).where(
             BenchmarkRollout.status == "activated"
@@ -161,7 +172,7 @@ def missing_active_benchmark_dataset() -> ColumnElement[bool]:
     versioned_dataset_exists = exists(
         select(BenchmarkDataset.agent_id).where(
             BenchmarkDataset.agent_id == Agent.agent_id,
-            BenchmarkDataset.bench_version == active_version,
+            BenchmarkDataset.bench_version == required_version,
         )
     )
     return activation_exists & ~versioned_dataset_exists
@@ -356,6 +367,7 @@ async def claim_screening_attempts(
         | Agent.screened_image_upload_id.is_(None)
         | Agent.screened_image_verified_at.is_(None)
     )
+    missing_dataset = await missing_required_benchmark_dataset(session)
     eligible = or_(
         Agent.status == AgentStatus.UPLOADED,
         Agent.status == AgentStatus.SCREENING_FAILED,
@@ -368,7 +380,7 @@ async def claim_screening_attempts(
             & rolling_qualified
             & missing_v3_screen
         ),
-        ((Agent.status == AgentStatus.EVALUATING) & missing_active_benchmark_dataset()),
+        ((Agent.status == AgentStatus.EVALUATING) & missing_dataset),
         # A submission released from an anti-cheat quarantine back to EVALUATING
         # but without a complete screened image the active version needs is
         # otherwise stuck forever — validators skip it and nothing re-screens it.

@@ -50,7 +50,7 @@ from uuid import UUID, uuid4
 import bittensor
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
@@ -251,6 +251,35 @@ def _transform_audit_verdict(
 
 
 router = APIRouter(prefix="/validator", tags=["validator"])
+
+# Three fresh-submission jobs for every one rollout-tail job. The counter is
+# per validator, so every validator rotates through both lanes and new agents
+# can still reach the three-validator scoring quorum.
+_FRESH_SUBMISSION_SLOTS = frozenset((0, 1, 3))
+_LANE_CYCLE_SIZE = 4
+
+
+async def _fresh_submission_lane_due(
+    session: AsyncSession,
+    *,
+    validator_hotkey: str,
+    bench_version: int,
+    rollout_started_at: datetime,
+) -> bool:
+    completed_since_rollout = await session.scalar(
+        select(func.count())
+        .select_from(ValidatorTicket)
+        .where(
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.bench_version == bench_version,
+            ValidatorTicket.status == TicketStatus.SCORED,
+            ValidatorTicket.created_at >= rollout_started_at,
+        )
+    )
+    return int(completed_since_rollout or 0) % _LANE_CYCLE_SIZE in (
+        _FRESH_SUBMISSION_SLOTS
+    )
+
 
 # How long a pre-signed artifact URL stays valid.
 _ARTIFACT_URL_TTL = timedelta(minutes=5)
@@ -875,14 +904,56 @@ async def request_job(
         heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
         rollout = await open_rollout(session)
         if rollout is not None:
-            ticket = await issue_rollout_ticket(
-                session,
-                validator_hotkey=payload.validator_hotkey,
-                now=now,
-                ttl=_TICKET_TTL,
-                artifact_mode=artifact_mode,
-                validator_running_benchmark=validator_state == "running_benchmark",
+            fresh_lane_due = (
+                heartbeat is not None
+                and heartbeat_supports_version(
+                    heartbeat, now=now, version=rollout.desired_version
+                )
+                and await _fresh_submission_lane_due(
+                    session,
+                    validator_hotkey=payload.validator_hotkey,
+                    bench_version=rollout.desired_version,
+                    rollout_started_at=rollout.created_at,
+                )
             )
+            ticket = (
+                await issue_ticket(
+                    session,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                    ttl=_TICKET_TTL,
+                    bench_version=rollout.desired_version,
+                    artifact_mode="screened_only",
+                    validator_running_benchmark=validator_state == "running_benchmark",
+                    submitted_at_or_after=rollout.created_at,
+                    fifo_start_at=rollout.created_at,
+                    completion_first=True,
+                )
+                if fresh_lane_due
+                else None
+            )
+            if ticket is None:
+                ticket = await issue_rollout_ticket(
+                    session,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                    ttl=_TICKET_TTL,
+                    artifact_mode=artifact_mode,
+                    validator_running_benchmark=validator_state == "running_benchmark",
+                )
+            if ticket is None and not fresh_lane_due:
+                ticket = await issue_ticket(
+                    session,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                    ttl=_TICKET_TTL,
+                    bench_version=rollout.desired_version,
+                    artifact_mode="screened_only",
+                    validator_running_benchmark=validator_state == "running_benchmark",
+                    submitted_at_or_after=rollout.created_at,
+                    fifo_start_at=rollout.created_at,
+                    completion_first=True,
+                )
         else:
             ticket = await activate_next_score_retest(
                 session,
@@ -948,9 +1019,9 @@ async def request_job(
                     await session.flush()
             heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
             if rollout is not None:
-                # The rollout cohort is an exclusive fleet-wide lane. If this
-                # validator has no eligible member, idling is intentional: do
-                # not leak into manual retests, source-era work, or rank 26+.
+                # During a transition only the rollout tail and submissions
+                # received since that transition may consume capacity. Do not
+                # leak into manual retests or retired source-era work.
                 return Response(status_code=204)
             if ticket is None:
                 # Any post-legacy benchmark needs a fresh, identity-matched
@@ -2048,8 +2119,9 @@ async def submit_transcript(
     graded per-case inputs whose digest the validator declared under
     ``details["transcript_sha256"]`` and bound into its score signature. The
     platform accepts the bytes only when their SHA-256 equals that declared
-    digest, then stores them content-addressed in the public bucket. Because
-    the binding is *content* equality against an already-signed digest, a
+    digest, then stores them content-addressed in authoritative storage and
+    mirrors them publicly when configured. Because the binding is *content*
+    equality against an already-signed digest, a
     caller spoofing another validator's hotkey can only ever upload the exact
     bytes that validator attested — so the header + permit check is sufficient
     auth here. Idempotent: re-uploading an existing digest is a no-op.
@@ -2092,23 +2164,14 @@ async def submit_transcript(
             ),
         )
 
-    if storage.public_bucket is None:
-        logger.warning(
-            "transcript %s for agent %s accepted but STORAGE_PUBLIC_BUCKET is "
-            "unset; nothing published",
-            digest,
-            agent_id,
-        )
-        return SubmitTranscriptResponse(
-            agent_id=agent_id, run_id=run_id, transcript_sha256=digest, stored=False
-        )
     key = transcript_object_key(digest)
-    if not await storage.object_exists(key=key, bucket=storage.public_bucket):
+    # The primary bucket is authoritative so transcript-backed dashboard
+    # telemetry works even when no anonymous transparency bucket is configured.
+    if not await storage.object_exists(key=key):
         await storage.put_object(
             key=key,
             body=body,
             content_type="application/json",
-            bucket=storage.public_bucket,
         )
         logger.info(
             "transcript published agent_id=%s run_id=%s sha256=%s bytes=%d",
@@ -2117,6 +2180,20 @@ async def submit_transcript(
             digest,
             len(body),
         )
+    # Preserve the optional anonymous mirror for offline auditors. A mirror
+    # outage must not discard the authoritative transcript after score
+    # acceptance.
+    if storage.public_bucket is not None:
+        try:
+            if not await storage.object_exists(key=key, bucket=storage.public_bucket):
+                await storage.put_object(
+                    key=key,
+                    body=body,
+                    content_type="application/json",
+                    bucket=storage.public_bucket,
+                )
+        except Exception:  # noqa: BLE001 - additive mirror, primary already stored
+            logger.exception("public transcript mirror failed for %s", digest)
     return SubmitTranscriptResponse(
         agent_id=agent_id, run_id=run_id, transcript_sha256=digest, stored=True
     )

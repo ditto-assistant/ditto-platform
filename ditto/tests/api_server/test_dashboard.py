@@ -303,6 +303,18 @@ class TestDashboard:
         assert 'copyButton(score.reproduction_command, "dataset command")' in body
         assert "esc(score.reproduction_command)" in body
         assert "esc(score.verification_command)" in body
+        assert 'class="run-telemetry-load"' in body
+        assert "function loadRunTelemetry(button)" in body
+        assert "function renderRunTelemetry(transcript)" in body
+        assert "TRANSCRIPT_TELEMETRY_URL_TEMPLATE" in body
+        assert "telemetry.source_sha256 !== sha256" in body
+        assert "Run telemetry could not be verified or loaded." in body
+        assert "Per-question execution" in body
+        assert "Model relay:" in body
+        assert "caller_cancellations" in body
+        assert "infrastructure_failures" in body
+        assert "caseEntry.response" not in body
+        assert "caseEntry.error" not in body
         assert (
             "Derived from an on-chain block hash after submission commitment." in body
         )
@@ -849,6 +861,7 @@ class TestDashboardScoringTransparency:
             "2% incumbent margin",
             "receives 90% of the miner pool",
             "up to four participation-tail recipients",
+            "up to 25 miners",
         ):
             assert literal not in body, f"hardcoded fold constant: {literal}"
 
@@ -865,6 +878,8 @@ class TestDashboardScoringTransparency:
         assert "/public/bench/rollout" in body
         assert "ranked_quorum_agents" in body
         assert "min_ranked_quorum_agents" in body
+        assert "This rollout's bounded inherited cohort has " in body
+        assert "Number(state.cohort_size)" in body
 
     async def test_explainer_covers_scoring_emissions_and_koth(self) -> None:
         body = await self._body()

@@ -11,7 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
-from ditto.db.models import Agent, BenchmarkDataset, Score, ValidatorTicket
+from ditto.db.models import (
+    Agent,
+    BenchmarkDataset,
+    BenchmarkRollout,
+    Score,
+    ValidatorTicket,
+)
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import (
     EMISSION_CONTENDER_COUNT,
@@ -137,6 +143,110 @@ async def _seed_two_scores_below_floor(
 
 
 class TestIssueTicket:
+    async def test_fresh_lane_excludes_pre_rollout_backlog(
+        self, session: AsyncSession
+    ) -> None:
+        rollout_started = _NOW - timedelta(minutes=5)
+        old = await _seed_evaluating(
+            session,
+            created_at=rollout_started - timedelta(days=1),
+            name="old",
+            screened=True,
+        )
+        fresh = await _seed_evaluating(
+            session,
+            created_at=rollout_started + timedelta(minutes=1),
+            name="fresh",
+            screened=True,
+        )
+        async with session.begin():
+            for agent_id in (old, fresh):
+                session.add(
+                    BenchmarkDataset(
+                        agent_id=agent_id,
+                        bench_version=3,
+                        seed=123,
+                        sha256="cd" * 32,
+                        run_size="full",
+                    )
+                )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5Fresh",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=3,
+                submitted_at_or_after=rollout_started,
+                fifo_start_at=rollout_started,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == fresh
+        assert ticket.agent_id != old
+
+    async def test_new_benchmark_resets_fifo_age_to_rollout_start(
+        self, session: AsyncSession
+    ) -> None:
+        rollout_started = _NOW - timedelta(minutes=5)
+        lower_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        higher_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        async with session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=rollout_started,
+                    activated_at=rollout_started,
+                )
+            )
+            for agent_id, created_at in (
+                (higher_id, rollout_started - timedelta(days=2)),
+                (lower_id, rollout_started - timedelta(days=1)),
+            ):
+                session.add(
+                    Agent(
+                        agent_id=agent_id,
+                        miner_hotkey=f"5Miner-{agent_id}",
+                        name=str(agent_id),
+                        sha256=f"{agent_id.int:064x}",
+                        status=AgentStatus.EVALUATING,
+                        screening_policy_version=9,
+                        screened_image_sha256="12" * 32,
+                        screened_image_size_bytes=123,
+                        screened_image_id="sha256:" + "34" * 32,
+                        screened_image_ref=f"ditto-screen/{agent_id}:latest",
+                        screened_image_upload_id=uuid4(),
+                        screened_image_verified_at=_NOW,
+                        created_at=created_at,
+                    )
+                )
+                session.add(
+                    BenchmarkDataset(
+                        agent_id=agent_id,
+                        bench_version=3,
+                        seed=123,
+                        sha256="ef" * 32,
+                        run_size="full",
+                    )
+                )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5EraFIFO",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=3,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == lower_id
+
     async def test_screened_only_skips_source_only_agent(
         self, session: AsyncSession
     ) -> None:
@@ -867,6 +977,64 @@ class TestIssueTicket:
                 claimed.append(ticket.agent_id)
 
         assert claimed == agents
+
+    async def test_completion_first_finishes_oldest_before_opening_next(
+        self, session: AsyncSession
+    ) -> None:
+        oldest = await _seed_evaluating(session, created_at=_NOW, name="oldest")
+        newer = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="newer",
+        )
+
+        claimed: list[UUID] = []
+        async with session.begin():
+            for index in range(SCORING_QUORUM):
+                ticket = await issue_ticket(
+                    session,
+                    validator_hotkey=f"5Finish-{index}",
+                    now=_NOW,
+                    ttl=_TTL,
+                    completion_first=True,
+                )
+                assert ticket is not None
+                claimed.append(ticket.agent_id)
+            next_ticket = await issue_ticket(
+                session,
+                validator_hotkey="5Finish-next",
+                now=_NOW,
+                ttl=_TTL,
+                completion_first=True,
+            )
+
+        assert claimed == [oldest] * SCORING_QUORUM
+        assert next_ticket is not None
+        assert next_ticket.agent_id == newer
+
+    async def test_completion_first_does_not_demote_oldest_below_floor(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_finalized_top_five(session, fifth_place=0.80)
+        oldest = await _seed_two_scores_below_floor(session)
+        newer = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="newer",
+        )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5Finish-oldest",
+                now=_NOW,
+                ttl=_TTL,
+                completion_first=True,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == oldest
+        assert ticket.agent_id != newer
 
     async def test_live_assignment_and_accepted_score_are_equal_coverage(
         self, session: AsyncSession
