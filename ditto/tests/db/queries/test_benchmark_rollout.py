@@ -235,7 +235,7 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> 
     expected_v4: list[UUID] = []
     expected_v3: list[UUID] = []
     async with maker() as session, session.begin():
-        for version, count in ((4, 10), (3, 20), (2, 5)):
+        for version, count in ((4, 6), (3, 10), (2, 5)):
             for rank in range(count):
                 agent_id = uuid4()
                 session.add(
@@ -269,7 +269,7 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> 
                     )
                 if version == 4:
                     expected_v4.append(agent_id)
-                elif version == 3 and rank < 15:
+                elif version == 3 and rank < 4:
                     expected_v3.append(agent_id)
         await session.flush()
 
@@ -278,7 +278,7 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> 
             *expected_v4,
             *expected_v3,
         ]
-        assert len(cohort) == 25
+        assert len(cohort) == 10
         assert not any("v2" in member.miner_hotkey for member in cohort)
     await engine.dispose()
 

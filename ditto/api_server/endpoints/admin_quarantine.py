@@ -1951,7 +1951,7 @@ async def _benchmark_qualification_state(
     elif agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
         blocking_reason = "submission must be scored or live"
     elif top_member is None:
-        blocking_reason = "submission is not in the inherited top-25 cohort"
+        blocking_reason = "submission is not in the inherited top-ten cohort"
     elif member is not None:
         blocking_reason = "submission is already a rollout member"
     elif screening_active:
