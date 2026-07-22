@@ -26,7 +26,13 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
-from ditto.db.models import Agent, BenchmarkDataset, Score, ValidatorTicket
+from ditto.db.models import (
+    Agent,
+    BenchmarkDataset,
+    BenchmarkRollout,
+    Score,
+    ValidatorTicket,
+)
 from ditto.db.queries.scores import SCORING_QUORUM, list_eligible_ledger
 
 if TYPE_CHECKING:
@@ -178,6 +184,8 @@ async def issue_ticket(
     bench_version: int | None = 2,
     artifact_mode: Literal["legacy", "prefer_screened", "screened_only"] = "legacy",
     validator_running_benchmark: bool = False,
+    submitted_at_or_after: datetime | None = None,
+    fifo_start_at: datetime | None = None,
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
@@ -206,6 +214,13 @@ async def issue_ticket(
     await expire_overdue_tickets(session, now=now)
     if bench_version is None:
         raise ValueError("benchmark version is required for ticket issuance")
+    if fifo_start_at is None:
+        fifo_start_at = await session.scalar(
+            select(BenchmarkRollout.created_at)
+            .where(BenchmarkRollout.desired_version == bench_version)
+            .order_by(BenchmarkRollout.created_at.desc())
+            .limit(1)
+        )
     contract = benchmark_contract(bench_version)
     requires_screened = (
         contract.requires_screened_image or artifact_mode == "screened_only"
@@ -478,8 +493,18 @@ async def issue_ticket(
             candidate = candidate.where(versioned_dataset)
         if requires_screened:
             candidate = candidate.where(eligible_screened_image)
+        if submitted_at_or_after is not None:
+            candidate = candidate.where(Agent.created_at >= submitted_at_or_after)
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
+        fifo_age = (
+            case(
+                (Agent.created_at < fifo_start_at, fifo_start_at),
+                else_=Agent.created_at,
+            )
+            if fifo_start_at is not None
+            else Agent.created_at
+        )
         candidate = (
             # First finish the bounded set of strongest 2-of-3 provisional
             # contenders, one best submission per miner. Then round-robin the
@@ -507,7 +532,7 @@ async def issue_ticket(
                 total_coverage.asc(),
                 had_prior_ticket.asc(),
                 covered_lane_score.desc(),
-                Agent.created_at.asc(),
+                fifo_age.asc(),
                 Agent.agent_id.asc(),
             )
             .limit(1)
