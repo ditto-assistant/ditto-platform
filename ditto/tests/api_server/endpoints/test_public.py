@@ -3612,7 +3612,7 @@ class TestBenchConfig:
         )
         assert body["ledger_path"] == "/api/v1/scoring/scores"
 
-    async def test_open_v7_rollout_publishes_gpt_oss_setup(
+    async def test_open_v7_rollout_keeps_active_v6_harness_authoritative(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -3636,12 +3636,12 @@ class TestBenchConfig:
 
         body = (await client.get("/api/v1/public/bench/config")).json()
 
-        assert body["bench_version"] == 7
-        assert body["harness"]["canonical_id"] == "openai/gpt-oss-20b"
-        assert body["harness"]["serving"] == "OpenRouter dynamic provider route"
-        assert body["harness"]["thinking"] is True
-        assert body["harness"]["reasoning_effort"] == "medium"
-        assert "medium reasoning effort" in body["harness"]["enforcement"]
+        assert body["bench_version"] == DEFAULT_BENCH_VERSION
+        assert body["desired_bench_version"] == 7
+        assert body["harness"]["canonical_id"] == "qwen/qwen3-32b"
+        assert body["harness"]["serving"] == "Qwen/Qwen3-32B-TEE"
+        assert body["harness"]["thinking"] is False
+        assert body["harness"]["reasoning_effort"] is None
 
     async def test_mirror_template_from_env(
         self,

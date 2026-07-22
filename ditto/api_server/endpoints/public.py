@@ -2719,8 +2719,8 @@ async def bench_config(
     response.headers["Cache-Control"] = "public, max-age=300"
     active_version = await active_bench_version(session)
     rollout = await open_rollout(session)
-    display_version = rollout.desired_version if rollout is not None else active_version
-    v7_or_newer = display_version >= 7
+    desired_version = rollout.desired_version if rollout is not None else None
+    v7_or_newer = active_version >= 7
     default_model = "openai/gpt-oss-20b" if v7_or_newer else "qwen/qwen3-32b"
     default_serving = (
         "OpenRouter dynamic provider route" if v7_or_newer else "Qwen/Qwen3-32B-TEE"
@@ -2737,7 +2737,8 @@ async def bench_config(
         else None
     )
     return PublicBenchConfigResponse(
-        bench_version=display_version,
+        bench_version=active_version,
+        desired_bench_version=desired_version,
         harness=BenchHarnessConfig(
             locked=True,
             canonical_id=os.environ.get("BENCH_HARNESS_MODEL_ID", default_model),

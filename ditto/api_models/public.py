@@ -2012,6 +2012,13 @@ class PublicBenchConfigResponse(BaseModel):
     """
 
     bench_version: int
+    desired_bench_version: int | None = Field(
+        default=None,
+        description=(
+            "A newer contract currently collecting qualification scores, or null. "
+            "bench_version and harness always describe the active scoring authority."
+        ),
+    )
     harness: BenchHarnessConfig
     grading: BenchGradingConfig
     dataset: BenchDatasetConfig
