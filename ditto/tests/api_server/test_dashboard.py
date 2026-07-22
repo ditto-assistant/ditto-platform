@@ -380,15 +380,27 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
 
+        overview_start = body.index(
+            '<section class="page active" data-page="overview">'
+        )
+        benchmark_start = body.index('<section class="page" data-page="benchmark">')
+        comparison_start = body.index('<section class="harness-comparison"')
+        assert overview_start < benchmark_start < comparison_start
         assert 'id="harness-comparison-title">How far miners have taken memory' in body
         assert "Reference only · no emissions" in body
-        assert "Memory subscores only. The leaderboard ranks by composite." in body
+        assert 'data-tooltip="This isolates memory performance.' in body
         assert 'for="third-party-harness-filter">Third-party harness' in body
+        assert '<details class="harness-comparison-method">' in body
+        assert "Method and comparability caveats" in body
         assert 'value="hermes">Hermes Agent' in body
         assert 'value="openclaw">OpenClaw' in body
         assert "var THIRD_PARTY_HARNESSES = [{" in body
-        assert "memoryMean: 0.2604166666666667" in body
-        assert "baselineMemoryMean: 0.23958333333333334" in body
+        assert "memoryMean: 0.3020833333333333" in body
+        assert "baselineMemoryMean: 0.2604166666666667" in body
+        assert 'baselineLabel: "Prior favorable Qwen run"' in body
+        assert 'model: "anthropic/claude-sonnet-4.6"' in body
+        assert "modelMismatch: true" in body
+        assert 'evidence.modelMismatch ? "a different model, "' in body
         assert "memoryCases: 96" in body
         assert "totalCases: 206" in body
         assert 'seed: "3058240546919425205"' in body
@@ -406,7 +418,7 @@ class TestDashboard:
         )
         assert "Third-party harnesses never enter score rank, KOTH" in body
         assert "validator weights, or payouts." in body
-        assert "8df6ba37a3c4e46ede9db1cb6014551d49ac6ba8" in body
+        assert "bad82ede7b19f3bb8dc1c03bb77f1bf33f9dab8f" in body
         assert 'subject: "OpenClaw 2026.7.1"' in body
         assert "memoryMean: 0.4270833333333333" in body
         assert "baselineMemoryMean: 0.3854166666666667" in body
@@ -930,7 +942,12 @@ class TestDashboardScoringTransparency:
 
     async def test_explainer_covers_scoring_emissions_and_koth(self) -> None:
         body = await self._body()
-        assert 'id="scoring-explainer"' in body
+        assert '<details class="bench-disclosure" id="scoring-explainer">' in body
+        assert '<details class="bench-disclosure" id="bench-setup">' in body
+        assert '<details class="bench-disclosure" id="bench-versions">' in body
+        assert '<details class="bench-disclosure" id="bench-glossary">' in body
+        assert "Memory cases contribute half of the unadjusted composite." in body
+        assert "Tool-use cases contribute the other half" in body
         for heading in (
             "What a score is.",
             "Which runs rank.",

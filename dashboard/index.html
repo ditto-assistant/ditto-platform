@@ -1488,7 +1488,7 @@
        This comparison panel can grow by adding evidence records in JS without
        teaching ranking, KOTH, or emissions about off-network runs. */
     .harness-comparison {
-      margin: 0 0 38px;
+      margin: 14px 0;
       border: 1px solid var(--border);
       border-radius: 4px;
       background: var(--bg-elev);
@@ -1641,16 +1641,26 @@
     }
     .memory-chart-axis-scale { display: flex; justify-content: space-between; }
     .harness-comparison-method {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 18px;
       margin-top: 20px;
       padding-top: 16px;
       border-top: 1px solid var(--border);
       color: var(--text-dim);
       font-size: 11.5px;
       line-height: 1.55;
+    }
+    .harness-comparison-method > summary {
+      width: fit-content;
+      color: var(--text);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .harness-comparison-method > summary:hover { color: var(--accent); }
+    .harness-comparison-method-body {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      padding-top: 12px;
     }
     .harness-comparison-method p { max-width: 86ch; margin: 0; }
     .harness-comparison-method a { flex: none; color: var(--accent); font-weight: 700; white-space: nowrap; }
@@ -1671,7 +1681,7 @@
       .memory-chart-name strong { font-size: 11.5px; }
       .memory-chart-row.external .memory-chart-name strong { overflow: visible; white-space: normal; }
       .memory-chart-name span { font-size: 8.5px; }
-      .harness-comparison-method { display: block; }
+      .harness-comparison-method-body { display: block; }
       .harness-comparison-method a { display: inline-block; margin-top: 10px; }
     }
 
@@ -1748,7 +1758,44 @@
     .about .pillar:last-child { border-right: 0; }
     .about .pillar h2 { font-family: var(--display); font-size: 17px; font-weight: 400; }
     .about .pillar p { color: var(--text-dim); }
-    #bench-setup { border: 1px solid var(--border); border-radius: 4px; }
+    .benchmark-reference { display: grid; gap: 10px; margin-top: 14px; }
+    .bench-disclosure {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg-elev);
+    }
+    .bench-disclosure > summary {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-height: 54px;
+      padding: 12px 16px;
+      color: var(--text);
+      cursor: pointer;
+      list-style: none;
+    }
+    .bench-disclosure > summary::-webkit-details-marker { display: none; }
+    .bench-disclosure-icon {
+      margin-left: auto;
+      color: var(--text-faint);
+      font: 500 17px/1 var(--mono);
+    }
+    .bench-disclosure-icon::before { content: "+"; }
+    .bench-disclosure[open] > summary {
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-elev-2);
+    }
+    .bench-disclosure[open] .bench-disclosure-icon::before { content: "−"; }
+    .bench-disclosure > summary:hover strong { color: var(--accent); }
+    .bench-disclosure-title { display: grid; gap: 2px; min-width: 0; }
+    .bench-disclosure-title strong { font-size: 13.5px; }
+    .bench-disclosure-title span { color: var(--text-faint); font: 10.5px/1.4 var(--mono); }
+    .bench-disclosure .tag { margin-left: auto; }
+    .bench-disclosure .tag + .bench-disclosure-icon { margin-left: 0; }
+    .bench-disclosure-body { padding: 16px 18px 18px; color: var(--text-dim); font-size: 13px; line-height: 1.6; }
+    .bench-disclosure-body > :first-child { margin-top: 0; }
+    .bench-disclosure-body > :last-child { margin-bottom: 0; }
+    .bench-disclosure-body ul { margin: 0; padding-left: 18px; line-height: 1.7; }
     footer { border-color: var(--border); }
     footer a { color: var(--accent); }
 
@@ -1799,6 +1846,8 @@
       .about .pillars { grid-template-columns: 1fr; }
       .about .pillar { border-right: 0; border-bottom: 1px solid var(--border); }
       .about .pillar:last-child { border-bottom: 0; }
+      .bench-disclosure > summary { align-items: flex-start; }
+      .bench-disclosure .tag { flex: none; }
     }
 
     /* ── Fleet atlas ─────────────────────────────────────────
@@ -2266,30 +2315,6 @@
       <div class="card"><div class="label">Last scored</div><div class="value" id="h-last">–</div></div>
     </section>
 
-    <section class="harness-comparison" aria-labelledby="harness-comparison-title">
-      <div class="harness-comparison-head">
-        <div class="harness-comparison-title">
-          <div class="harness-comparison-kicker">Independent comparison <span class="reference-badge">Reference only · no emissions</span></div>
-          <h2 id="harness-comparison-title">How far miners have taken memory</h2>
-          <p class="harness-comparison-lead">Memory subscores only. The leaderboard ranks by composite. Top finalized DittoBench v6 miners are compared with a third-party harness measured against the same benchmark contract.</p>
-        </div>
-        <div class="harness-filter">
-          <label for="third-party-harness-filter">Third-party harness</label>
-          <select id="third-party-harness-filter">
-            <option value="hermes">Hermes Agent</option>
-            <option value="openclaw">OpenClaw</option>
-          </select>
-        </div>
-      </div>
-      <div class="harness-comparison-body">
-        <div id="harness-comparison-chart" class="harness-comparison-state">Loading finalized v6 memory subscores…</div>
-        <div class="harness-comparison-method">
-          <p id="harness-comparison-method">Third-party harnesses are off-network reference runs. They never enter score rank, KOTH, validator weights, or payouts.</p>
-          <a id="harness-comparison-evidence" href="https://github.com/ditto-assistant/dittobench-api/blob/8df6ba37a3c4e46ede9db1cb6014551d49ac6ba8/docs/hermes-benchmark/README.md" target="_blank" rel="noopener">Evidence and method ↗</a>
-        </div>
-      </div>
-    </section>
-
     <div class="section-head">
       <h2 id="leaderboard-title">Leaderboard</h2>
       <span class="hint" id="leaderboard-hint">raw score rank · KOTH emissions shown separately · click a row for detail</span>
@@ -2553,17 +2578,46 @@
       <p class="lead">A seeded, procedurally generated benchmark for agentic-memory harnesses on Subnet 118. Every run is scored on two capability pillars, weighted equally into the composite. The cases are generated fresh for each submission, so a harness has to be capable rather than tuned to a fixed test set.</p>
       <div class="pillars">
         <div class="pillar mem">
-          <h2>Agentic memory <span class="tag">50%</span></h2>
+          <h2>Agentic memory <span class="tag tip" tabindex="0" data-tooltip="Memory cases contribute half of the unadjusted composite. Quality gates and token efficiency can then reduce the final score.">50%</span></h2>
           <p>Can the harness store what matters and get it back when it counts? Cases check recall across sessions, facts that change over time, applying a remembered preference to a new task, combining evidence spread across many past mentions, and resisting instructions hidden inside stored content. The harder categories are written to defeat keyword matching. Paraphrase and lexical-gap rewrites keep recall from passing on surface text alone.</p>
         </div>
         <div class="pillar tool">
-          <h2>Tool-use judgment <span class="tag">50%</span></h2>
+          <h2>Tool-use judgment <span class="tag tip" tabindex="0" data-tooltip="Tool-use cases contribute the other half of the unadjusted composite and are scored from validator-observed actions.">50%</span></h2>
           <p>Does the agent reach for the right action at the right time? Cases reward searching the web when the answer is not known, answering from memory when it is, grounding tool arguments only in what the user supplied, and splitting a multi-part request into the independent calls it needs, issued together and in full.</p>
         </div>
       </div>
-      <div class="pillar" id="scoring-explainer" style="margin-top:14px">
-        <h2>How a score becomes emissions</h2>
-        <ul style="margin:0;padding-left:18px;line-height:1.7">
+
+      <section class="harness-comparison" aria-labelledby="harness-comparison-title">
+        <div class="harness-comparison-head">
+          <div class="harness-comparison-title">
+            <div class="harness-comparison-kicker">Independent comparison <span class="reference-badge">Reference only · no emissions</span></div>
+            <h2 id="harness-comparison-title">How far miners have taken memory</h2>
+            <p class="harness-comparison-lead"><span class="tip" tabindex="0" data-tooltip="This isolates memory performance. The public leaderboard ranks agents by the full composite, not this subscore alone.">Memory subscores only</span>. Top finalized DittoBench v6 miners are compared with a third-party harness measured against the same benchmark contract.</p>
+          </div>
+          <div class="harness-filter">
+            <label for="third-party-harness-filter">Third-party harness</label>
+            <select id="third-party-harness-filter">
+              <option value="hermes">Hermes Agent</option>
+              <option value="openclaw">OpenClaw</option>
+            </select>
+          </div>
+        </div>
+        <div class="harness-comparison-body">
+          <div id="harness-comparison-chart" class="harness-comparison-state">Loading finalized v6 memory subscores…</div>
+          <details class="harness-comparison-method">
+            <summary>Method and comparability caveats</summary>
+            <div class="harness-comparison-method-body">
+              <p id="harness-comparison-method">Third-party harnesses are off-network reference runs. They never enter score rank, KOTH, validator weights, or payouts.</p>
+              <a id="harness-comparison-evidence" href="https://github.com/ditto-assistant/dittobench-api/blob/8df6ba37a3c4e46ede9db1cb6014551d49ac6ba8/docs/hermes-benchmark/README.md" target="_blank" rel="noopener">Evidence and method ↗</a>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <div class="benchmark-reference" aria-label="Benchmark reference material">
+      <details class="bench-disclosure" id="scoring-explainer">
+        <summary><span class="bench-disclosure-title"><strong>How a score becomes emissions</strong><span>Scoring, eligibility, versioning, and KOTH rules</span></span><span class="bench-disclosure-icon" aria-hidden="true"></span></summary>
+        <div class="bench-disclosure-body"><ul>
           <li><b>What a score is.</b> The <b>composite</b> starts at <code>0.5 × tool mean + 0.5 × memory mean</code>. DittoBench then applies benchmark quality gates for wasteful tool use, consistency, unnecessary memory-side actions, canary integrity, and v5 conversational sanity. Finally, v5 applies token efficiency, which can remove <b>at most 10%</b>. The row detail shows the exact base, combined quality multiplier, token multiplier, and final arithmetic. A low composite can therefore come from the benchmark quality gates even when the token penalty is zero.</li>
           <li><b>Which runs rank.</b> Only runs that administer the <b>full</b> benchmark profile rank or earn emissions. Smaller practice profiles omit the hardest memory categories and their few remaining cases are easy to ace, so they are published as <b>provisional</b> and are never folded into weights. A run also needs the full 3-of-3 validator quorum before it is final; below that it is feedback, and its composite can still move.</li>
           <li><b>Scores compare only within one benchmark version.</b> A <code>bench_version</code> is an immutable generation contract: for a given seed it emits the same bytes forever and grades them the same way forever, which is what makes an old score auditable by anyone holding the seed. A correction to grading therefore cannot be applied to an existing version. It ships as a new one. Two composites from different versions are two different measurements, and the board never ranks them against each other.</li>
@@ -2571,12 +2625,12 @@
           <li><b>How emissions work.</b> The KOTH fold pays a champion and a tail: the champion takes <span id="ex-champion-share">a fixed share</span> of the miner pool, and up to <span id="ex-tail-size">a fixed number of</span> runners-up by composite split <span id="ex-tail-share">the remainder</span> equally. Only finalized, full-benchmark, currently-registered entries with a positive composite are eligible. The live values are shown on the leaderboard's emissions strip.</li>
           <li><b>How the crown changes hands.</b> The fold runs in <b>first-seen</b> order, so the incumbent keeps the crown unless a challenger clearly beats it. Being marginally ahead on one dataset is not enough. A challenger dethrones only if its lead exceeds the <b>indifference band</b>, which is the larger of the flat relative <span id="ex-margin">incumbent margin</span> and the statistical band <code><span id="ex-dethrone-z">dethrone_z</span> × √(SE<sub>challenger</sub>² + SE<sub>champion</sub>²)</code> when both sides carry a standard error. A lead inside the band is not thrown away: both agents are re-scored on <b>shared confirmation seeds</b> and the next fold decides on the paired comparison, where per-dataset difficulty cancels. Dataset luck never decides emissions.</li>
           <li><b>When weights move to a new version.</b> The whole ledger sits on one version at a time. Weights stay on the <b>active</b> version until at least <span class="quorum-needed">the required number of</span> agents hold a complete ranked quorum at the version being rolled out, and then the entire ledger flips at once. Ranking a partly-migrated pool would mix two incomparable scales; flipping early would leave the emission set (champion plus tail) short of recipients. Live progress is on the leaderboard's rollout strip.</li>
-        </ul>
-      </div>
-      <div class="pillar" id="bench-setup" style="margin-top:14px">
-        <h2>Frozen setup <span class="tag" id="bs-version">v–</span></h2>
-        <p style="margin-bottom:8px">Every harness runs against <b>one frozen open-weight model</b> and every run is graded by <b>deterministic, judge-free rules</b>. A score is a pure function of the dataset and the transcript, and anyone can re-check it.</p>
-        <ul style="margin:0;padding-left:18px;line-height:1.7">
+        </ul></div>
+      </details>
+      <details class="bench-disclosure" id="bench-setup">
+        <summary><span class="bench-disclosure-title"><strong>Frozen setup</strong><span>Model pinning, deterministic grading, and audit trail</span></span><span class="tag" id="bs-version">v–</span><span class="bench-disclosure-icon" aria-hidden="true"></span></summary>
+        <div class="bench-disclosure-body"><p style="margin-bottom:8px">Every harness runs against <b>one frozen open-weight model</b> and every run is graded by <b>deterministic, judge-free rules</b>. A score is a pure function of the dataset and the transcript, and anyone can re-check it.</p>
+        <ul>
           <li><b>Model</b>: <code id="bs-model">qwen/qwen3-32b</code> served as <code id="bs-serving">Qwen/Qwen3-32B-TEE</code> (hardware-attested TEE), reasoning mode locked <b id="bs-thinking">off</b>. A model-pinning gateway forces the model on every request; sandbox egress is deny-all, so no other model is reachable.</li>
           <li><b>Grading</b>: no LLM judge. Deterministic per-kind checks from the public <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">dittobench-datagen</a> module (also the generator: dataset + answer keys are byte-reproducible from the seed).</li>
           <li><b>Seed</b>: derived from an on-chain block hash fixed <i>after</i> the miner commits. The result is unpredictable: one fresh dataset per submission, pinned by <code>dataset_sha256</code> in every score.</li>
@@ -2584,17 +2638,20 @@
           <li><b>Transcript</b>: each scored run publishes its graded inputs (every response and observed tool call) content-addressed as <code>transcript_sha256</code>, and that digest is bound <i>inside</i> the validator's score signature. Dataset + transcript + public grader reproduce any score offline, with no trust in the platform or validators required.</li>
           <li><b>Crown contests</b>: a challenger inside the dethrone band is re-scored, together with the champion, on shared confirmation seeds; the crown then moves or holds on the paired comparison, so dataset luck can never decide emissions.</li>
           <li id="bs-mirror-li" style="display:none"><b>Verify it yourself</b>: finalized run records (dataset pin + all signed scores) are public. View the <a id="bs-mirror" href="#" target="_blank" rel="noopener">run record mirror ↗</a> and signed <a id="bs-ledger" href="#" target="_blank" rel="noopener">score ledger ↗</a>.</li>
-        </ul>
-      </div>
-      <div class="pillar" id="bench-versions" style="margin-top:14px">
-        <h2>Version history</h2>
-        <p style="margin-bottom:10px">Each <code>bench_version</code> is an immutable contract; a scoring change ships as a new version rather than editing an old one. Newest first; the current version is highlighted.</p>
+        </ul></div>
+      </details>
+      <details class="bench-disclosure" id="bench-versions">
+        <summary><span class="bench-disclosure-title"><strong>Version history</strong><span>What changed in each immutable benchmark contract</span></span><span class="bench-disclosure-icon" aria-hidden="true"></span></summary>
+        <div class="bench-disclosure-body"><p style="margin-bottom:10px">Each <code>bench_version</code> is an immutable contract; a scoring change ships as a new version rather than editing an old one. Newest first; the current version is highlighted.</p>
         <div id="bench-changelog"><p class="muted">Loading the benchmark changelog…</p></div>
-      </div>
-      <div class="pillar" id="bench-glossary" style="margin-top:14px">
-        <h2>Glossary</h2>
-        <p style="margin-bottom:10px">What every score metric and gate factor means, and what each scored test category probes. Definitions come from the public <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">grader</a>, never an answer key.</p>
+        </div>
+      </details>
+      <details class="bench-disclosure" id="bench-glossary">
+        <summary><span class="bench-disclosure-title"><strong>Glossary</strong><span>Metrics, gate factors, and scored test categories</span></span><span class="bench-disclosure-icon" aria-hidden="true"></span></summary>
+        <div class="bench-disclosure-body"><p style="margin-bottom:10px">What every score metric and gate factor means, and what each scored test category probes. Definitions come from the public <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">grader</a>, never an answer key.</p>
         <div id="bench-glossary-display"><p class="muted">Loading the glossary…</p></div>
+        </div>
+      </details>
       </div>
     </section>
 
@@ -3384,18 +3441,19 @@
       id: "hermes",
       label: "Hermes Agent",
       subject: "Hermes Agent 0.19.0",
-      profile: "Favorable native SessionDB",
+      profile: "Native session_search · stronger-model upper bound",
       benchVersion: 6,
-      memoryMean: 0.2604166666666667,
-      baselineMemoryMean: 0.23958333333333334,
-      baselineLabel: "Original Hermes baseline",
+      memoryMean: 0.3020833333333333,
+      baselineMemoryMean: 0.2604166666666667,
+      baselineLabel: "Prior favorable Qwen run",
       memoryCases: 96,
       totalCases: 206,
       seed: "3058240546919425205",
       datasetSha256: "f9b8e6eea10f20316a6fc82c2f6b0af0f0cf0bc3f263cf96a760e68cdaa3ea2d",
-      model: "qwen/qwen3-32b",
+      model: "anthropic/claude-sonnet-4.6",
+      modelMismatch: true,
       provider: "OpenRouter",
-      evidenceUrl: "https://github.com/ditto-assistant/dittobench-api/blob/8df6ba37a3c4e46ede9db1cb6014551d49ac6ba8/docs/hermes-benchmark/README.md"
+      evidenceUrl: "https://github.com/ditto-assistant/dittobench-api/blob/bad82ede7b19f3bb8dc1c03bb77f1bf33f9dab8f/docs/hermes-benchmark/README.md"
     }, {
       id: "openclaw",
       label: "OpenClaw",
@@ -3657,7 +3715,7 @@
         " medians. " + evidence.subject + " is one off-network " + evidence.provider +
         " practice run on " + evidence.model + " (" + evidence.memoryCases + " memory cases; " +
         evidence.totalCases + " total; seed " + evidence.seed + ")." + baselineMethod +
-        " Same benchmark version, but different provider route, " +
+        " Same benchmark version, but " + (evidence.modelMismatch ? "a different model, " : "") + "different provider route, " +
         "seeds, and aggregation. Third-party harnesses never enter score rank, KOTH, validator weights, or payouts.";
 
       if (!entries.length) {
