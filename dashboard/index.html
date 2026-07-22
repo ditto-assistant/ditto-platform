@@ -1482,6 +1482,187 @@
     .card.primary .context { max-width: 20ch; margin-top: 12px; color: var(--text-dim); font-size: 12px; line-height: 1.45; }
     .cards > .card:last-child { grid-column: span 2; }
 
+    /* Third-party harnesses are deliberately kept outside the leaderboard.
+       This comparison panel can grow by adding evidence records in JS without
+       teaching ranking, KOTH, or emissions about off-network runs. */
+    .harness-comparison {
+      margin: 0 0 38px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg-elev);
+      overflow: hidden;
+    }
+    .harness-comparison-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 20px 22px 18px;
+      border-bottom: 1px solid var(--border);
+      background: color-mix(in oklch, var(--accent-2) 4%, var(--bg-elev));
+    }
+    .harness-comparison-title { min-width: 0; }
+    .harness-comparison-kicker {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 7px;
+      color: var(--accent-2);
+      font: 700 10px/1 var(--mono);
+      letter-spacing: .07em;
+      text-transform: uppercase;
+    }
+    .harness-comparison-kicker .reference-badge {
+      padding: 3px 6px;
+      border: 1px solid color-mix(in oklch, var(--accent-2) 42%, var(--border));
+      border-radius: 3px;
+      color: var(--accent-2);
+      background: color-mix(in oklch, var(--accent-2) 8%, transparent);
+    }
+    .harness-comparison h2 {
+      margin: 0;
+      font-family: var(--display);
+      font-size: 24px;
+      font-weight: 400;
+      line-height: 1.1;
+      letter-spacing: -0.01em;
+    }
+    .harness-comparison-lead {
+      max-width: 72ch;
+      margin: 8px 0 0;
+      color: var(--text-dim);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .harness-filter { flex: 0 0 210px; }
+    .harness-filter label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--text-dim);
+      font: 700 9.5px/1 var(--mono);
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    .harness-filter select {
+      width: 100%;
+      min-height: 38px;
+      padding: 7px 30px 7px 10px;
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      background: var(--bg-elev-2);
+      color: var(--text);
+      font: 650 12px/1.2 var(--sans);
+      cursor: pointer;
+    }
+    .harness-comparison-body { padding: 21px 22px 18px; }
+    .harness-comparison-summary {
+      margin: 0 0 18px;
+      color: var(--text-dim);
+      font-size: 12.5px;
+    }
+    .harness-comparison-summary strong { color: var(--text); font-variant-numeric: tabular-nums; }
+    .memory-chart { display: grid; gap: 11px; }
+    .memory-chart-row {
+      display: grid;
+      grid-template-columns: minmax(145px, 220px) minmax(180px, 1fr) 58px;
+      align-items: center;
+      gap: 13px;
+    }
+    .memory-chart-row.external {
+      margin-top: 5px;
+      padding-top: 16px;
+      border-top: 1px dashed var(--border-strong);
+    }
+    .memory-chart-name { min-width: 0; }
+    .memory-chart-name strong {
+      display: block;
+      overflow: hidden;
+      color: var(--text);
+      font-size: 12.5px;
+      font-weight: 700;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .memory-chart-name .entity-link { color: inherit; }
+    .memory-chart-name span {
+      display: block;
+      margin-top: 2px;
+      color: var(--text-faint);
+      font: 9.5px/1.35 var(--mono);
+      letter-spacing: .02em;
+      text-transform: uppercase;
+    }
+    .memory-chart-track {
+      position: relative;
+      height: 18px;
+      border: 1px solid var(--border);
+      background:
+        linear-gradient(90deg, transparent calc(25% - 1px), var(--border) 25%, transparent calc(25% + 1px), transparent calc(50% - 1px), var(--border) 50%, transparent calc(50% + 1px), transparent calc(75% - 1px), var(--border) 75%, transparent calc(75% + 1px)),
+        var(--bg-elev-2);
+      overflow: visible;
+    }
+    .memory-chart-fill { height: 100%; background: var(--memory); }
+    .memory-chart-row.external .memory-chart-fill {
+      background: repeating-linear-gradient(135deg, var(--accent) 0 5px, color-mix(in oklch, var(--accent) 38%, transparent) 5px 9px);
+    }
+    .memory-baseline-marker {
+      position: absolute;
+      top: -5px;
+      bottom: -5px;
+      width: 2px;
+      background: var(--text);
+      box-shadow: 0 0 0 1px var(--bg-elev);
+    }
+    .memory-chart-value {
+      color: var(--text);
+      font: 700 12px/1 var(--mono);
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .memory-chart-axis {
+      display: grid;
+      grid-template-columns: minmax(145px, 220px) minmax(180px, 1fr) 58px;
+      gap: 13px;
+      margin-top: -4px;
+      color: var(--text-faint);
+      font: 9px/1 var(--mono);
+    }
+    .memory-chart-axis-scale { display: flex; justify-content: space-between; }
+    .harness-comparison-method {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      margin-top: 20px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      color: var(--text-dim);
+      font-size: 11.5px;
+      line-height: 1.55;
+    }
+    .harness-comparison-method p { max-width: 86ch; margin: 0; }
+    .harness-comparison-method a { flex: none; color: var(--accent); font-weight: 700; white-space: nowrap; }
+    .harness-comparison-state {
+      padding: 28px 18px;
+      border: 1px dashed var(--border-strong);
+      color: var(--text-dim);
+      font-size: 12.5px;
+      text-align: center;
+    }
+
+    @media (max-width: 720px) {
+      .harness-comparison-head { display: block; padding: 18px; }
+      .harness-filter { margin-top: 16px; }
+      .harness-comparison-body { padding: 18px; }
+      .memory-chart-row,
+      .memory-chart-axis { grid-template-columns: minmax(92px, 118px) minmax(110px, 1fr) 50px; gap: 9px; }
+      .memory-chart-name strong { font-size: 11.5px; }
+      .memory-chart-row.external .memory-chart-name strong { overflow: visible; white-space: normal; }
+      .memory-chart-name span { font-size: 8.5px; }
+      .harness-comparison-method { display: block; }
+      .harness-comparison-method a { display: inline-block; margin-top: 10px; }
+    }
+
     .section-head { align-items: flex-end; margin: 34px 0 10px; }
     .section-head h2 { font-family: var(--display); font-size: 21px; font-weight: 400; line-height: 1.1; letter-spacing: -0.01em; }
     .section-head .hint { color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; }
@@ -2070,6 +2251,29 @@
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
       <div class="card"><div class="label">Scored agents</div><div class="value" id="h-agents">–</div></div>
       <div class="card"><div class="label">Last scored</div><div class="value" id="h-last">–</div></div>
+    </section>
+
+    <section class="harness-comparison" aria-labelledby="harness-comparison-title">
+      <div class="harness-comparison-head">
+        <div class="harness-comparison-title">
+          <div class="harness-comparison-kicker">Independent comparison <span class="reference-badge">Reference only · no emissions</span></div>
+          <h2 id="harness-comparison-title">How far miners have taken memory</h2>
+          <p class="harness-comparison-lead">Top finalized DittoBench v6 miner memory scores compared with a third-party harness measured against the same benchmark contract.</p>
+        </div>
+        <div class="harness-filter">
+          <label for="third-party-harness-filter">Third-party harness</label>
+          <select id="third-party-harness-filter">
+            <option value="hermes">Hermes Agent</option>
+          </select>
+        </div>
+      </div>
+      <div class="harness-comparison-body">
+        <div id="harness-comparison-chart" class="harness-comparison-state">Loading finalized v6 memory scores…</div>
+        <div class="harness-comparison-method">
+          <p id="harness-comparison-method">Third-party harnesses are off-network reference runs. They never enter score rank, KOTH, validator weights, or payouts.</p>
+          <a id="harness-comparison-evidence" href="https://github.com/ditto-assistant/dittobench-api/blob/8df6ba37a3c4e46ede9db1cb6014551d49ac6ba8/docs/hermes-benchmark/README.md" target="_blank" rel="noopener">Evidence and method ↗</a>
+        </div>
+      </div>
     </section>
 
     <div class="section-head">
@@ -3156,6 +3360,28 @@
       4: { composite: 0.429, method: "one full run, seed 20260719", run: "Run 5" }
     };
 
+    // Off-network comparison records. Adding OpenClaw or another third-party
+    // harness here automatically grows the filter; these records never enter
+    // the leaderboard data model or any ranking/emissions calculation.
+    var THIRD_PARTY_HARNESSES = [{
+      id: "hermes",
+      label: "Hermes Agent",
+      subject: "Hermes Agent 0.19.0",
+      profile: "Favorable native SessionDB",
+      benchVersion: 6,
+      memoryMean: 0.2604166666666667,
+      baselineMemoryMean: 0.23958333333333334,
+      memoryCases: 96,
+      totalCases: 206,
+      seed: "3058240546919425205",
+      datasetSha256: "f9b8e6eea10f20316a6fc82c2f6b0af0f0cf0bc3f263cf96a760e68cdaa3ea2d",
+      model: "qwen/qwen3-32b",
+      provider: "OpenRouter",
+      evidenceUrl: "https://github.com/ditto-assistant/dittobench-api/blob/8df6ba37a3c4e46ede9db1cb6014551d49ac6ba8/docs/hermes-benchmark/README.md"
+    }];
+    var selectedThirdPartyHarness = "hermes";
+    var lastThirdPartyLeaderboardData = null;
+
     // Rank-movement baseline: the ranks from the viewer's last visit. Every
     // render compares against this snapshot (kept for the session) and then
     // rewrites localStorage, so the arrows read "since your last visit". Guarded
@@ -3332,6 +3558,102 @@
     function refreshElapsedFlag() {
       hasElapsedNodes = !!document.querySelector(".screener-progress-time[data-started-at], .benchmark-progress-time[data-started-at]");
     }
+
+    // ── Third-party harness comparison ───────────────────────
+    function selectedHarnessEvidence() {
+      return THIRD_PARTY_HARNESSES.filter(function (item) {
+        return item.id === selectedThirdPartyHarness;
+      })[0] || THIRD_PARTY_HARNESSES[0];
+    }
+
+    function renderThirdPartyHarnessFilter() {
+      var select = document.getElementById("third-party-harness-filter");
+      select.innerHTML = THIRD_PARTY_HARNESSES.map(function (item) {
+        return '<option value="' + esc(item.id) + '"' +
+          (item.id === selectedThirdPartyHarness ? ' selected' : '') + '>' +
+          esc(item.label) + '</option>';
+      }).join("");
+    }
+
+    function memoryComparisonRow(entry, external, evidence) {
+      var score = external ? evidence.memoryMean : Number(entry.memory_mean);
+      var label = external
+        ? esc(evidence.subject)
+        : entityAnchor("agent", entry.agent_id, agentName(entry.agent_name));
+      var context = external
+        ? "Third-party · " + esc(evidence.profile)
+        : "Miner · finalized " + esc(entry.score_count) + "/" + esc(entry.score_quorum);
+      var baseline = external
+        ? '<span class="memory-baseline-marker" style="left:' + (evidence.baselineMemoryMean * 100).toFixed(4) +
+          '%" title="Original Hermes baseline: ' + fx(evidence.baselineMemoryMean) + '" aria-hidden="true"></span>'
+        : "";
+      var aria = (external ? evidence.subject : agentName(entry.agent_name)) +
+        " memory score " + fx(score) + (external ? ", original baseline " + fx(evidence.baselineMemoryMean) : "");
+      return '<div class="memory-chart-row' + (external ? ' external' : '') + '" role="listitem" aria-label="' + esc(aria) + '">' +
+        '<div class="memory-chart-name"><strong>' + label + '</strong><span>' + context + '</span></div>' +
+        '<div class="memory-chart-track"><div class="memory-chart-fill" style="width:' + (score * 100).toFixed(4) + '%"></div>' + baseline + '</div>' +
+        '<div class="memory-chart-value">' + fx(score) + '</div></div>';
+    }
+
+    function renderThirdPartyComparison(data) {
+      var target = document.getElementById("harness-comparison-chart");
+      var evidence = selectedHarnessEvidence();
+      var entries = (data && data.entries || []).filter(function (entry) {
+        return entry.finalized === true && entry.eligible !== false &&
+          Number(entry.bench_version) === evidence.benchVersion &&
+          Number.isFinite(Number(entry.memory_mean));
+      }).sort(function (a, b) {
+        return Number(b.memory_mean) - Number(a.memory_mean) ||
+          String(a.agent_id).localeCompare(String(b.agent_id));
+      }).slice(0, 5);
+
+      document.getElementById("harness-comparison-evidence").href = evidence.evidenceUrl;
+      document.getElementById("harness-comparison-method").textContent =
+        "Miner bars are live finalized 3-validator v" + evidence.benchVersion +
+        " medians. " + evidence.subject + " is one off-network " + evidence.provider +
+        " practice run on " + evidence.model + " (" + evidence.memoryCases + " memory cases; " +
+        evidence.totalCases + " total; seed " + evidence.seed + "). Its white marker is the original " +
+        fx(evidence.baselineMemoryMean) + " baseline. Same benchmark version, but different provider route, " +
+        "seeds, and aggregation. Third-party harnesses never enter score rank, KOTH, validator weights, or payouts.";
+
+      if (!entries.length) {
+        target.className = "harness-comparison-state";
+        target.textContent = "Finalized v" + evidence.benchVersion + " miner memory scores are temporarily unavailable. No substitute miner data is shown.";
+        return;
+      }
+
+      var best = Number(entries[0].memory_mean);
+      var multiple = best / evidence.memoryMean;
+      target.className = "";
+      target.innerHTML = '<p class="harness-comparison-summary">The strongest finalized miner currently scores <strong>' +
+        multiple.toFixed(1) + '×</strong> the selected third-party harness on memory (<strong>' +
+        fx(best) + '</strong> vs <strong>' + fx(evidence.memoryMean) + '</strong>).</p>' +
+        '<div class="memory-chart" role="list" aria-label="Top finalized v' + evidence.benchVersion +
+        ' miner memory scores compared with ' + esc(evidence.subject) + '">' +
+        entries.map(function (entry) { return memoryComparisonRow(entry, false, evidence); }).join("") +
+        memoryComparisonRow(null, true, evidence) +
+        '<div class="memory-chart-axis" aria-hidden="true"><span></span><div class="memory-chart-axis-scale"><span>0</span><span>.25</span><span>.50</span><span>.75</span><span>1.0</span></div><span></span></div>' +
+        '</div>';
+    }
+
+    function loadThirdPartyComparison() {
+      var evidence = selectedHarnessEvidence();
+      getJSON("/public/leaderboard?bench_version=" + encodeURIComponent(evidence.benchVersion))
+        .then(function (data) {
+          lastThirdPartyLeaderboardData = data;
+          renderThirdPartyComparison(data);
+        })
+        .catch(function () {
+          if (lastThirdPartyLeaderboardData) renderThirdPartyComparison(lastThirdPartyLeaderboardData);
+          else renderThirdPartyComparison(null);
+        });
+    }
+
+    renderThirdPartyHarnessFilter();
+    document.getElementById("third-party-harness-filter").addEventListener("change", function (event) {
+      selectedThirdPartyHarness = event.target.value;
+      loadThirdPartyComparison();
+    });
 
     // ── Render ───────────────────────────────────────────────
     function render(data) {
@@ -7099,6 +7421,10 @@
         loadValidatorNames();
         loadScreeners();
       }
+      // Third-party comparisons are observational only and use a fixed benchmark
+      // version. They refresh independently from the current-rollout board so a
+      // future v7 switch cannot silently compare Hermes v6 with v7 miner scores.
+      loadThirdPartyComparison();
       // bench/config is effectively static (max-age 300); refresh at most every
       // 5 minutes, but always on boot and on a manual refresh.
       if (manual || all || Date.now() - benchConfigAt >= 300000) loadBenchConfig();
