@@ -1012,6 +1012,30 @@ class TestIssueTicket:
         assert next_ticket is not None
         assert next_ticket.agent_id == newer
 
+    async def test_completion_first_does_not_demote_oldest_below_floor(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_finalized_top_five(session, fifth_place=0.80)
+        oldest = await _seed_two_scores_below_floor(session)
+        newer = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="newer",
+        )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5Finish-oldest",
+                now=_NOW,
+                ttl=_TTL,
+                completion_first=True,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == oldest
+        assert ticket.agent_id != newer
+
     async def test_live_assignment_and_accepted_score_are_equal_coverage(
         self, session: AsyncSession
     ) -> None:
