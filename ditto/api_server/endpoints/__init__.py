@@ -17,6 +17,9 @@ from ditto.api_server.endpoints.admin_quarantine import (
 from ditto.api_server.endpoints.admin_scoring_readiness import (
     router as admin_scoring_readiness_router,
 )
+from ditto.api_server.endpoints.admin_screener_review_settings import (
+    router as admin_screener_review_settings_router,
+)
 from ditto.api_server.endpoints.admin_validation_retry import (
     router as admin_validation_retry_router,
 )
@@ -38,6 +41,7 @@ __all__ = [
     "admin_miner_fees_router",
     "admin_quarantine_router",
     "admin_scoring_readiness_router",
+    "admin_screener_review_settings_router",
     "admin_validation_retry_router",
     "metrics_router",
     "public_router",

@@ -348,6 +348,7 @@ class ScreenedImageUpload(Base):
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
+
     expires_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )
@@ -1232,6 +1233,120 @@ class ScreenerHeartbeat(Base):
             "active_agent_id",
             postgresql_where=text("active_agent_id IS NOT NULL"),
         ),
+    )
+
+
+class ScreenerReviewSettingsRevision(Base):
+    """Append-only, operator-audited L2/L3 settings revision."""
+
+    __tablename__ = "screener_review_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope = '*' OR length(scope) BETWEEN 1 AND 63",
+            name="screener_review_settings_scope_check",
+        ),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="screener_review_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="screener_review_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="screener_review_settings_actor_check",
+        ),
+        Index(
+            "screener_review_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="screener_review_settings_scope_parent_key",
+        ),
+    )
+
+
+class ScreenerShadowReview(Base):
+    """Non-authoritative L2/L3 telemetry bound to one live attempt."""
+
+    __tablename__ = "screener_shadow_reviews"
+
+    attempt_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    screener_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    artifact_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    settings_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    settings_scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings_checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    disposition: Mapped[str] = mapped_column(Text, nullable=False)
+    risk_level: Mapped[str | None] = mapped_column(Text, nullable=True)
+    categories: Mapped[list] = mapped_column(_JSON_VARIANT, nullable=False)
+    finding_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolution_basis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    clearance_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    critic_disposition: Mapped[str | None] = mapped_column(Text, nullable=True)
+    adjudicator_disposition: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_models: Mapped[list] = mapped_column(_JSON_VARIANT, nullable=False)
+    response_providers: Mapped[list] = mapped_column(_JSON_VARIANT, nullable=False)
+    usage: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["attempt_id"],
+            ["screening_attempts.attempt_id"],
+            ondelete="CASCADE",
+            name="screener_shadow_reviews_attempt_id_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="CASCADE",
+            name="screener_shadow_reviews_agent_id_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["settings_revision"],
+            ["screener_review_settings_revisions.revision"],
+            ondelete="RESTRICT",
+            name="screener_shadow_reviews_settings_revision_fkey",
+        ),
+        CheckConstraint(
+            "length(artifact_sha256) = 64",
+            name="screener_shadow_reviews_artifact_sha_check",
+        ),
+        CheckConstraint(
+            "length(settings_checksum) = 64",
+            name="screener_shadow_reviews_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "disposition IN ('safe', 'violation', 'inconclusive', 'retryable_infra')",
+            name="screener_shadow_reviews_disposition_check",
+        ),
+        CheckConstraint(
+            "risk_level IS NULL OR risk_level IN ('low', 'medium', 'high')",
+            name="screener_shadow_reviews_risk_check",
+        ),
+        Index("screener_shadow_reviews_created_idx", "created_at"),
+        Index("screener_shadow_reviews_agent_idx", "agent_id", "created_at"),
     )
 
 

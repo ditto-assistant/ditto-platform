@@ -30,6 +30,7 @@ from ditto.api_server.endpoints import (
     admin_miner_fees_router,
     admin_quarantine_router,
     admin_scoring_readiness_router,
+    admin_screener_review_settings_router,
     admin_validation_retry_router,
     health_router,
     inference_router,
@@ -213,6 +214,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(admin_quarantine_router, prefix="/api/v1")
     app.include_router(admin_validation_retry_router, prefix="/api/v1")
     app.include_router(admin_scoring_readiness_router, prefix="/api/v1")
+    app.include_router(admin_screener_review_settings_router, prefix="/api/v1")
     app.include_router(admin_copy_review_router, prefix="/api/v1")
     app.include_router(admin_miner_fees_router, prefix="/api/v1")
 
