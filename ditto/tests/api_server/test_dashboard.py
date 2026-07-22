@@ -258,6 +258,7 @@ class TestDashboard:
         assert "Recent scores" in body
         assert 'statuses: ["waiting_validator", "below_score_floor"]' in body
         assert 'statuses: ["scored", "live"]' in body
+
         assert 'getJSON("/public/operations")' in body
         assert "max-height: 390px" in body
         assert "indexed.slice(0, 5)" not in body
@@ -374,6 +375,29 @@ class TestDashboard:
         assert "renderScreeningDispute(pipeline)" in body
         assert "Your one dispute was submitted" in body
         assert "private message" in body
+
+    async def test_includes_off_network_harness_memory_comparison(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+
+        assert 'id="harness-comparison-title">How far miners have taken memory' in body
+        assert "Reference only · no emissions" in body
+        assert 'for="third-party-harness-filter">Third-party harness' in body
+        assert 'value="hermes">Hermes Agent' in body
+        assert "var THIRD_PARTY_HARNESSES = [{" in body
+        assert "memoryMean: 0.2604166666666667" in body
+        assert "baselineMemoryMean: 0.23958333333333334" in body
+        assert "memoryCases: 96" in body
+        assert "totalCases: 206" in body
+        assert 'seed: "3058240546919425205"' in body
+        assert "benchVersion: 6" in body
+        assert 'getJSON("/public/leaderboard?bench_version="' in body
+        assert "entry.finalized === true && entry.eligible !== false" in body
+        assert ".sort(function (a, b)" in body
+        assert ".slice(0, 5)" in body
+        assert "Third-party harnesses never enter score rank, KOTH" in body
+        assert "validator weights, or payouts." in body
+        assert "8df6ba37a3c4e46ede9db1cb6014551d49ac6ba8" in body
 
     async def test_api_failures_do_not_render_sample_data(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
