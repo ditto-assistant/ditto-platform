@@ -2490,6 +2490,7 @@ class TestPublicActivity:
         ]
         assert all(response.status_code == 200 for response in responses)
         public_progress_keys = {
+            "slot_id",
             "agent_id",
             "agent_name",
             "bench_version",

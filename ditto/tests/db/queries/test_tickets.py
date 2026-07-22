@@ -635,6 +635,55 @@ class TestIssueTicket:
         assert t2.agent_id == t1.agent_id
         assert t2.deadline == t1.deadline
 
+    async def test_distinct_slots_receive_distinct_agents(
+        self, session: AsyncSession
+    ) -> None:
+        first = await _seed_evaluating(session, name="parallel-a", created_at=_NOW)
+        second = await _seed_evaluating(
+            session, name="parallel-b", created_at=_NOW + timedelta(seconds=1)
+        )
+        async with session.begin():
+            slot0 = await issue_ticket(
+                session,
+                validator_hotkey="5Parallel",
+                slot_id="slot-0",
+                now=_NOW,
+                ttl=_TTL,
+            )
+            slot1 = await issue_ticket(
+                session,
+                validator_hotkey="5Parallel",
+                slot_id="slot-1",
+                now=_NOW,
+                ttl=_TTL,
+            )
+        assert slot0 is not None and slot1 is not None
+        assert {slot0.agent_id, slot1.agent_id} == {first, second}
+        assert slot0.slot_id == "slot-0"
+        assert slot1.slot_id == "slot-1"
+
+    async def test_second_slot_never_duplicates_same_agent(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_evaluating(session, name="only-agent")
+        async with session.begin():
+            first = await issue_ticket(
+                session,
+                validator_hotkey="5Parallel",
+                slot_id="slot-0",
+                now=_NOW,
+                ttl=_TTL,
+            )
+            duplicate = await issue_ticket(
+                session,
+                validator_hotkey="5Parallel",
+                slot_id="slot-1",
+                now=_NOW,
+                ttl=_TTL,
+            )
+        assert first is not None
+        assert duplicate is None
+
     async def test_new_benchmark_era_expires_idle_legacy_ticket(
         self, session: AsyncSession
     ) -> None:
@@ -1035,6 +1084,39 @@ class TestIssueTicket:
         assert ticket is not None
         assert ticket.agent_id == oldest
         assert ticket.agent_id != newer
+
+    async def test_completion_first_second_slot_waits_for_global_oldest(
+        self, session: AsyncSession
+    ) -> None:
+        oldest = await _seed_evaluating(session, created_at=_NOW, name="oldest")
+        newer = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="newer",
+        )
+
+        async with session.begin():
+            slot0 = await issue_ticket(
+                session,
+                validator_hotkey="5ParallelFinish",
+                slot_id="slot-0",
+                now=_NOW,
+                ttl=_TTL,
+                completion_first=True,
+            )
+            slot1 = await issue_ticket(
+                session,
+                validator_hotkey="5ParallelFinish",
+                slot_id="slot-1",
+                now=_NOW,
+                ttl=_TTL,
+                completion_first=True,
+            )
+
+        assert slot0 is not None
+        assert slot0.agent_id == oldest
+        assert slot1 is None
+        assert await session.get(ValidatorTicket, (newer, 2, "5ParallelFinish")) is None
 
     async def test_live_assignment_and_accepted_score_are_equal_coverage(
         self, session: AsyncSession

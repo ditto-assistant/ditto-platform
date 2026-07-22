@@ -886,6 +886,7 @@ async def issue_rollout_ticket(
     ttl: timedelta,
     artifact_mode: Literal["legacy", "prefer_screened", "screened_only"] = "legacy",
     validator_running_benchmark: bool = False,
+    slot_id: str = "slot-0",
 ) -> ValidatorTicket | None:
     """Issue one cohort lease, balanced one score per agent per coverage round."""
     # Retained as a keyword-compatible parameter for mixed platform callers;
@@ -918,6 +919,7 @@ async def issue_rollout_ticket(
         .where(
             BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
             ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.bench_version == rollout.desired_version,
             ValidatorTicket.status == TicketStatus.ISSUED,
             ValidatorTicket.deadline > now,
@@ -962,6 +964,16 @@ async def issue_rollout_ticket(
         )
         .exists()
     )
+    already_ticketed = (
+        select(ValidatorTicket.agent_id)
+        .where(
+            ValidatorTicket.agent_id == BenchmarkRolloutMember.agent_id,
+            ValidatorTicket.bench_version == rollout.desired_version,
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.status.in_((TicketStatus.ISSUED, TicketStatus.SCORED)),
+        )
+        .exists()
+    )
     priority_count_rows = (
         await session.execute(
             select(
@@ -995,6 +1007,7 @@ async def issue_rollout_ticket(
             Agent.screening_policy_version >= contract.minimum_screening_policy_version,
             complete_screened_image,
             ~already_scored,
+            ~already_ticketed,
             score_count + occupied_count < SCORING_QUORUM,
         )
     )
@@ -1018,12 +1031,13 @@ async def issue_rollout_ticket(
     # version lease. Preserve genuinely running work, but an idle/polling
     # validator must not keep resuming that lower-priority lease ahead of the
     # target-version cohort. The database allows only one issued ticket per
-    # validator across all benchmark versions, so release any non-resumable
+    # validator slot across all benchmark versions, so release any non-resumable
     # lease only after proving that eligible rollout work exists.
     competing_ticket = await session.scalar(
         select(ValidatorTicket)
         .where(
             ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.status == TicketStatus.ISSUED,
         )
         .limit(1)
@@ -1045,6 +1059,7 @@ async def issue_rollout_ticket(
             agent_id=member.agent_id,
             bench_version=rollout.desired_version,
             validator_hotkey=validator_hotkey,
+            slot_id=slot_id,
             status=TicketStatus.ISSUED,
             issued_at=now,
             deadline=now + ttl,
@@ -1054,6 +1069,7 @@ async def issue_rollout_ticket(
         session.add(ticket)
     else:
         ticket.status = TicketStatus.ISSUED
+        ticket.slot_id = slot_id
         ticket.issued_at = now
         ticket.deadline = now + ttl
         ticket.attempt_count += 1

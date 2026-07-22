@@ -1021,6 +1021,7 @@ class PublicBenchmarkProgress(BaseModel):
     """Ticket-validated and coarsened public benchmark progress allowlist."""
 
     agent_id: UUID
+    slot_id: str = "slot-0"
     agent_name: str
     bench_version: Annotated[
         int, Field(ge=1, description="DittoBench contract bound to this ticket.")
@@ -1752,6 +1753,11 @@ class PublicValidatorHeartbeat(BaseModel):
     assignment_state: ValidatorAssignmentState
     active_agent_id: UUID | None = None
     active_benchmark: PublicBenchmarkProgress | None = None
+    configured_slots: Annotated[int, Field(ge=1, le=8)] = 1
+    healthy_slots: list[str] = Field(default_factory=lambda: ["slot-0"])
+    admission: Literal["accepting", "draining", "paused"] = "accepting"
+    active_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
+    assigned_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
     first_seen_at: datetime | None = None
     reported_at: datetime
     seen_at: datetime

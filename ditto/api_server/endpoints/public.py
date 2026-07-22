@@ -109,6 +109,7 @@ from ditto.api_models import (
 )
 from ditto.api_models import bench_glossary as bench_glossary_data
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_capacity import BenchmarkCapacity
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.public import (
     FleetAvailability,
@@ -464,6 +465,7 @@ def _public_benchmark_progress(
     if progress is None:
         return PublicBenchmarkProgress(
             agent_id=work.agent.agent_id,
+            slot_id=work.ticket.slot_id,
             agent_name=work.agent.name,
             bench_version=work.ticket.bench_version,
             started_at=started_at,
@@ -487,6 +489,7 @@ def _public_benchmark_progress(
         )
     return PublicBenchmarkProgress(
         agent_id=work.agent.agent_id,
+        slot_id=work.ticket.slot_id,
         agent_name=work.agent.name,
         bench_version=work.ticket.bench_version,
         started_at=started_at,
@@ -1262,10 +1265,14 @@ def _validator_heartbeats_response(
     now: datetime,
 ) -> PublicValidatorHeartbeatsResponse:
     """Reconcile platform leases and signed heartbeat claims without conflating them."""
-    assignment_by_hotkey = {
-        assignment.ticket.validator_hotkey: assignment for assignment in assignments
-    }
-    active_by_hotkey = {work.heartbeat.validator_hotkey: work for work in active_work}
+    assignments_by_hotkey: dict[str, list[ActiveValidatorAssignment]] = {}
+    for assignment_row in assignments:
+        assignments_by_hotkey.setdefault(
+            assignment_row.ticket.validator_hotkey, []
+        ).append(assignment_row)
+    active_by_hotkey: dict[str, list[ActiveValidatorWork]] = {}
+    for work in active_work:
+        active_by_hotkey.setdefault(work.heartbeat.validator_hotkey, []).append(work)
     entries = []
     for row in rows:
         seen_at = cast(datetime, _aware(row.seen_at))
@@ -1273,8 +1280,34 @@ def _validator_heartbeats_response(
         online, availability, health = _fleet_classification(
             state=row.state, seen_at=seen_at, now=now, metrics=metrics
         )
-        assignment = assignment_by_hotkey.get(row.validator_hotkey)
-        synchronized_work = active_by_hotkey.get(row.validator_hotkey)
+        validator_assignments = assignments_by_hotkey.get(row.validator_hotkey, [])
+        synchronized_works = active_by_hotkey.get(row.validator_hotkey, [])
+        capacity = None
+        if row.protocol_version >= 10:
+            with contextlib.suppress(ValidationError):
+                capacity = BenchmarkCapacity.model_validate(row.benchmark_capacity)
+        if capacity is not None:
+            by_identity = {
+                (item.ticket.slot_id, item.agent.agent_id): item
+                for item in validator_assignments
+            }
+            synchronized_works = []
+            for slot in capacity.active:
+                item = by_identity.get((slot.slot_id, slot.agent_id))
+                if item is None or slot.progress.ticket_deadline != _aware(
+                    item.ticket.deadline
+                ):
+                    continue
+                synchronized_works.append(
+                    ActiveValidatorWork(
+                        heartbeat=row,
+                        ticket=item.ticket,
+                        agent=item.agent,
+                        progress=slot.progress,
+                    )
+                )
+        assignment = validator_assignments[0] if validator_assignments else None
+        synchronized_work = synchronized_works[0] if synchronized_works else None
         capabilities = None
         stack = None
         if row.protocol_version >= 7:
@@ -1328,6 +1361,25 @@ def _validator_heartbeats_response(
             if synchronized_work is not None
             else None
         )
+        active_benchmarks = [
+            _public_benchmark_progress(work, now) for work in synchronized_works
+        ]
+        active_benchmarks.sort(key=lambda progress: progress.slot_id)
+        active_by_slot = {work.ticket.slot_id: work for work in synchronized_works}
+        assigned_benchmarks = [
+            _public_benchmark_progress(
+                active_by_slot.get(item.ticket.slot_id)
+                or ActiveValidatorWork(
+                    heartbeat=row,
+                    ticket=item.ticket,
+                    agent=item.agent,
+                    progress=None,
+                ),
+                now,
+            )
+            for item in validator_assignments
+        ]
+        assigned_benchmarks.sort(key=lambda progress: progress.slot_id)
         entries.append(
             PublicValidatorHeartbeat(
                 validator_hotkey=row.validator_hotkey,
@@ -1348,6 +1400,11 @@ def _validator_heartbeats_response(
                     else None
                 ),
                 active_benchmark=active_benchmark,
+                configured_slots=(capacity.configured_slots if capacity else 1),
+                healthy_slots=(capacity.healthy_slots if capacity else ["slot-0"]),
+                admission=(capacity.admission if capacity else "accepting"),
+                active_benchmarks=active_benchmarks,
+                assigned_benchmarks=assigned_benchmarks,
                 first_seen_at=_aware(row.first_seen_at),
                 reported_at=cast(datetime, _aware(row.reported_at)),
                 seen_at=seen_at,

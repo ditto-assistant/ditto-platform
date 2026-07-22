@@ -1023,6 +1023,9 @@ class ValidatorHeartbeat(Base):
     capabilities: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     stack: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     stack_health: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    benchmark_capacity: Mapped[dict | None] = mapped_column(
+        _JSON_VARIANT, nullable=True
+    )
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )
@@ -1174,6 +1177,11 @@ class ValidatorTicket(Base):
     validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
     """SS58 hotkey of the ticket-holding validator. PK part 2 (distinctness)."""
 
+    slot_id: Mapped[str] = mapped_column(
+        Text, nullable=False, default="slot-0", server_default="slot-0"
+    )
+    """Heartbeat-v10 execution slot holding this live lease."""
+
     status: Mapped[TicketStatus] = mapped_column(
         Enum(
             TicketStatus,
@@ -1270,6 +1278,11 @@ class ValidatorTicket(Base):
             "infra_retry_grants >= 0",
             name="validator_tickets_infra_retry_grants_nonnegative",
         ),
+        CheckConstraint(
+            "slot_id IN ('slot-0', 'slot-1', 'slot-2', 'slot-3', "
+            "'slot-4', 'slot-5', 'slot-6', 'slot-7')",
+            name="validator_tickets_slot_id",
+        ),
         # The expiry sweep and the live-slot count both scan open tickets only;
         # a partial index keeps those hot paths off the full table.
         Index(
@@ -1278,12 +1291,128 @@ class ValidatorTicket(Base):
             postgresql_where=text("status = 'issued'"),
         ),
         Index(
-            "validator_tickets_one_issued_per_validator_idx",
+            "validator_tickets_one_issued_per_validator_slot_idx",
             "validator_hotkey",
+            "slot_id",
             unique=True,
             postgresql_where=text("status = 'issued'"),
             sqlite_where=text("status = 'issued'"),
         ),
+    )
+
+
+class InferenceGrant(Base):
+    """One ticket-scoped platform inference capability."""
+
+    __tablename__ = "inference_grants"
+
+    grant_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    slot_id: Mapped[str] = mapped_column(Text, nullable=False)
+    ticket_deadline: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    bearer_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    broker_public_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    allowed_models: Mapped[list[str]] = mapped_column(_JSON_VARIANT, nullable=False)
+    request_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    token_budget: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    request_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    prompt_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    completion_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    cost_microusd: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    active_requests: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["agent_id", "bench_version", "validator_hotkey"],
+            [
+                "validator_tickets.agent_id",
+                "validator_tickets.bench_version",
+                "validator_tickets.validator_hotkey",
+            ],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "agent_id",
+            "bench_version",
+            "validator_hotkey",
+            "ticket_deadline",
+            name="inference_grants_ticket_lease",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'active', 'revoked', 'exhausted')",
+            name="inference_grants_status",
+        ),
+        CheckConstraint("request_budget > 0", name="inference_grants_request_budget"),
+        CheckConstraint("token_budget > 0", name="inference_grants_token_budget"),
+        CheckConstraint(
+            "active_requests >= 0", name="inference_grants_active_requests"
+        ),
+        Index("inference_grants_expiry_idx", "expires_at"),
+    )
+
+
+class InferenceRequest(Base):
+    """Replay ledger and bounded accounting for one proxy request."""
+
+    __tablename__ = "inference_requests"
+
+    grant_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    nonce: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="started")
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint("grant_id", "nonce"),
+        ForeignKeyConstraint(
+            ["grant_id"], ["inference_grants.grant_id"], ondelete="CASCADE"
+        ),
+        CheckConstraint(
+            "status IN ('started', 'completed', 'failed', 'canceled')",
+            name="inference_requests_status",
+        ),
+        CheckConstraint(
+            "reserved_tokens > 0", name="inference_requests_reserved_tokens"
+        ),
+        CheckConstraint("generation > 0", name="inference_requests_generation"),
+        Index("inference_requests_started_idx", "started_at"),
     )
 
 

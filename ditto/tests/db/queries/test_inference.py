@@ -1,0 +1,304 @@
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_server.config import InferenceProxyConfig
+from ditto.db.models import Agent, AgentStatus, ValidatorTicket
+from ditto.db.queries.inference import (
+    activate_inference_grant,
+    begin_inference_request,
+    ensure_inference_grant,
+    finish_inference_request,
+    revoke_ticket_inference,
+)
+
+
+def _config() -> InferenceProxyConfig:
+    return InferenceProxyConfig(
+        enabled=True,
+        required=False,
+        public_base_url="https://platform.example",
+        openrouter_api_key="test-key",
+        upstream_url="https://openrouter.ai/api/v1/chat/completions",
+        allowed_models=("qwen/qwen3-32b",),
+        provider="nebius",
+        request_budget=2,
+        token_budget=100,
+        per_ticket_concurrency=1,
+        per_validator_concurrency=1,
+        global_concurrency=1,
+        per_ticket_requests_per_minute=2,
+        per_validator_requests_per_minute=2,
+        global_requests_per_minute=2,
+        request_body_bytes=1024,
+        response_body_bytes=1024,
+        timeout_seconds=10,
+        max_output_tokens=32,
+    )
+
+
+async def _live_grant(session: AsyncSession):
+    now = datetime.now(UTC)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="miner",
+        name="parallel-inference",
+        sha256="ab" * 32,
+        status=AgentStatus.EVALUATING,
+        created_at=now,
+    )
+    ticket = ValidatorTicket(
+        agent_id=agent.agent_id,
+        validator_hotkey="validator",
+        slot_id="slot-0",
+        status=TicketStatus.ISSUED,
+        issued_at=now,
+        deadline=now + timedelta(minutes=20),
+        bench_version=5,
+        attempt_count=1,
+    )
+    session.add_all([agent, ticket])
+    await session.flush()
+    grant = await ensure_inference_grant(session, ticket=ticket, config=_config())
+    assert grant is not None
+    assert (
+        await activate_inference_grant(
+            session,
+            grant_id=grant.grant_id,
+            validator_hotkey="wrong-validator",
+            broker_public_key="broker-key",
+            now=now,
+        )
+        is None
+    )
+    activated = await activate_inference_grant(
+        session,
+        grant_id=grant.grant_id,
+        validator_hotkey="validator",
+        broker_public_key="broker-key",
+        now=now,
+    )
+    assert activated is not None
+    return ticket, activated[0], activated[1], now
+
+
+@pytest.mark.asyncio
+async def test_grant_rejects_wrong_bearer_model_budget_and_replay(
+    session: AsyncSession,
+) -> None:
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_grant(session)
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer="stolen-sibling-bearer",
+                model="qwen/qwen3-32b",
+                token_reservation=10,
+                now=now,
+                config=_config(),
+            )
+            is None
+        )
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model="not-allowed",
+                token_reservation=10,
+                now=now,
+                config=_config(),
+            )
+            is None
+        )
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=101,
+                now=now,
+                config=_config(),
+            )
+            is None
+        )
+        nonce = uuid4()
+        accepted = await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=nonce,
+            bearer=bearer,
+            model="qwen/qwen3-32b",
+            token_reservation=10,
+            now=now,
+            config=_config(),
+        )
+        assert accepted is not None
+        await finish_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=nonce,
+            generation=grant.generation,
+            status="completed",
+            prompt_tokens=3,
+            completion_tokens=4,
+            cost_microusd=5,
+            usage_available=True,
+            now=now,
+        )
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=nonce,
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=10,
+                now=now,
+                config=_config(),
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_canceled_or_expired_ticket_revokes_capability(
+    session: AsyncSession,
+) -> None:
+    async with session.begin():
+        ticket, grant, bearer, now = await _live_grant(session)
+        await revoke_ticket_inference(session, ticket=ticket, now=now)
+        ticket.status = TicketStatus.EXPIRED
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=10,
+                now=now,
+                config=_config(),
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_revocation_cancels_inflight_and_missing_usage_charges_reservation(
+    session: AsyncSession,
+) -> None:
+    async with session.begin():
+        ticket, grant, bearer, now = await _live_grant(session)
+        nonce = uuid4()
+        assert await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=nonce,
+            bearer=bearer,
+            model="qwen/qwen3-32b",
+            token_reservation=10,
+            now=now,
+            config=_config(),
+        )
+        await revoke_ticket_inference(session, ticket=ticket, now=now)
+        ticket.status = TicketStatus.EXPIRED
+        assert not await finish_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=nonce,
+            generation=grant.generation,
+            status="completed",
+            prompt_tokens=0,
+            completion_tokens=0,
+            cost_microusd=0,
+            usage_available=False,
+            now=now,
+        )
+
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_grant(session)
+        nonce = uuid4()
+        assert await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=nonce,
+            bearer=bearer,
+            model="qwen/qwen3-32b",
+            token_reservation=10,
+            now=now,
+            config=_config(),
+        )
+        assert await finish_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=nonce,
+            generation=grant.generation,
+            status="completed",
+            prompt_tokens=0,
+            completion_tokens=0,
+            cost_microusd=0,
+            usage_available=False,
+            now=now,
+        )
+        assert grant.prompt_tokens == 10
+
+
+@pytest.mark.asyncio
+async def test_ticket_request_rate_is_bounded_after_requests_finish(
+    session: AsyncSession,
+) -> None:
+    config = replace(
+        _config(),
+        request_budget=10,
+        per_ticket_requests_per_minute=1,
+        per_validator_requests_per_minute=10,
+        global_requests_per_minute=10,
+    )
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_grant(session)
+        first_nonce = uuid4()
+        assert await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=first_nonce,
+            bearer=bearer,
+            model="qwen/qwen3-32b",
+            token_reservation=10,
+            now=now,
+            config=config,
+        )
+        assert await finish_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=first_nonce,
+            generation=grant.generation,
+            status="completed",
+            prompt_tokens=2,
+            completion_tokens=1,
+            cost_microusd=0,
+            usage_available=True,
+            now=now,
+        )
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=10,
+                now=now,
+                config=config,
+            )
+            is None
+        )

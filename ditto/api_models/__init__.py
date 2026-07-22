@@ -17,6 +17,10 @@ Usage:
 
 from __future__ import annotations
 
+from ditto.api_models.benchmark_capacity import (
+    ActiveBenchmarkSlot,
+    BenchmarkCapacity,
+)
 from ditto.api_models.benchmark_progress import BenchmarkProgress
 from ditto.api_models.health import HealthResponse
 from ditto.api_models.public import (
@@ -127,6 +131,8 @@ __all__ = [
     "AgentResponse",
     "AgentStatusResponse",
     "ArtifactResponse",
+    "ActiveBenchmarkSlot",
+    "BenchmarkCapacity",
     "BenchmarkProgress",
     "CaseScore",
     "CategoryStat",

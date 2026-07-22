@@ -6826,7 +6826,34 @@
           ? '<span class="current-agent" title="' + esc(entry.active_agent_id) + '">' + entityAnchor("agent", entry.active_agent_id, (entry.active_agent_name || "Agent") + ' · ' + String(entry.active_agent_id).slice(0, 8)) + '</span>'
           : '';
         var assignmentState = singular === "validator" ? renderValidatorAssignment(entry) : "";
-        var currentWork = assignmentState || (singular === "validator" && entry.active_benchmark
+        var slotWork = "";
+        if (singular === "validator") {
+          var activeBySlot = {};
+          (entry.active_benchmarks || []).forEach(function (benchmark) {
+            activeBySlot[benchmark.slot_id || "slot-0"] = benchmark;
+          });
+          var assignedBySlot = {};
+          (entry.assigned_benchmarks || []).forEach(function (benchmark) {
+            assignedBySlot[benchmark.slot_id || "slot-0"] = benchmark;
+          });
+          var healthySlots = entry.healthy_slots || [];
+          var slotCount = Math.max(1, Number(entry.configured_slots) || 1);
+          var slotRows = [];
+          for (var slotIndex = 0; slotIndex < slotCount; slotIndex += 1) {
+            var slotId = "slot-" + slotIndex;
+            var benchmark = activeBySlot[slotId] || assignedBySlot[slotId];
+            var slotState = benchmark
+              ? renderBenchmarkProgress(benchmark, true)
+              : (entry.admission !== "accepting"
+                ? '<span class="stage warn">' + esc(entry.admission) + '</span>'
+                : (healthySlots.indexOf(slotId) >= 0
+                  ? '<span class="stage success">Idle</span>'
+                  : '<span class="stage warn">Unavailable</span>'));
+            slotRows.push('<div title="' + esc(slotId) + '"><span class="fleet-protocol">' + esc(slotId) + '</span> ' + slotState + '</div>');
+          }
+          slotWork = slotRows.join("");
+        }
+        var currentWork = slotWork || assignmentState || (singular === "validator" && entry.active_benchmark
           ? renderBenchmarkProgress(entry.active_benchmark, true)
           : (singular === "screener" && entry.screening_progress ? renderScreenerProgress(entry) : active));
         var hasGranularProgress =
@@ -6838,7 +6865,10 @@
           : '<span class="stage ' + work[1] + '">' + esc(work[0]) + '</span>';
         var protocol = singular === "screener"
           ? "Protocol " + entry.protocol_version + " · Policy " + entry.policy_version
-          : "Protocol " + entry.protocol_version;
+          : "Protocol " + entry.protocol_version + " · " +
+            String((entry.healthy_slots || []).length) + "/" +
+            String(entry.configured_slots || 1) + " slots · " +
+            String(entry.admission || "accepting");
         // Validators are keyed by a distinct hotkey; the screener fleet shares
         // one hotkey, so each worker is distinguished by its instance_id.
         var displayName = singular === "validator" ? validatorNames[hotkey] : (entry.instance_id || "");

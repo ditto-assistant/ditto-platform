@@ -30,6 +30,10 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_capacity import (
+    BenchmarkCapacity,
+    benchmark_capacity_signing_token,
+)
 from ditto.api_models.benchmark_progress import (
     BenchmarkProgress,
     benchmark_progress_signing_token,
@@ -314,17 +318,25 @@ def _job_payload(
     *,
     nonce: UUID | None = None,
     requested_at: datetime | None = None,
+    slot_id: str | None = None,
 ) -> dict:
     nonce = nonce or uuid4()
     requested_at = requested_at or datetime.now(UTC)
     requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
-    signed = f"validator-job:{keypair.ss58_address}:{nonce}:{requested}".encode()
-    return {
+    signed = (
+        f"validator-job:{keypair.ss58_address}:{nonce}:{requested}"
+        if slot_id is None
+        else f"validator-job:v2:{keypair.ss58_address}:{slot_id}:{nonce}:{requested}"
+    ).encode()
+    payload = {
         "validator_hotkey": keypair.ss58_address,
         "nonce": str(nonce),
         "requested_at": requested_at.isoformat(),
         "signature": keypair.sign(signed).hex(),
     }
+    if slot_id is not None:
+        payload["slot_id"] = slot_id
+    return payload
 
 
 def _job_fail_payload(
@@ -389,6 +401,7 @@ def _heartbeat_payload(
     capabilities: dict[str, object] | None = None,
     stack: dict[str, object] | None = None,
     stack_health: dict[str, object] | None = None,
+    benchmark_capacity: dict[str, object] | None = None,
 ) -> dict[str, object]:
     ts = timestamp if timestamp is not None else int(datetime.now(UTC).timestamp())
     hotkey = keypair.ss58_address
@@ -410,7 +423,23 @@ def _heartbeat_payload(
         identity_token = validator_identity_signing_token(
             typed_capabilities, typed_stack
         )
-        if protocol_version >= 9:
+        if protocol_version >= 10:
+            typed_health = ValidatorStackHealth.model_validate_json(
+                json.dumps(stack_health)
+            )
+            typed_capacity = BenchmarkCapacity.model_validate_json(
+                json.dumps(benchmark_capacity)
+            )
+            message = (
+                f"ditto-validator-heartbeat:v10:{hotkey}:0.1.0:{protocol_version}:"
+                f"{code_digest}:{state}:{active_agent_id or ''}:"
+                f"{system_metrics_signing_token(metrics)}:"
+                f"{benchmark_progress_signing_token(progress)}:"
+                f"{identity_token}:"
+                f"{validator_stack_health_signing_token(typed_health)}:"
+                f"{benchmark_capacity_signing_token(typed_capacity)}:{ts}"
+            )
+        elif protocol_version >= 9:
             typed_health = ValidatorStackHealth.model_validate_json(
                 json.dumps(stack_health)
             )
@@ -490,6 +519,8 @@ def _heartbeat_payload(
         payload["stack"] = stack
     if stack_health is not None:
         payload["stack_health"] = stack_health
+    if benchmark_capacity is not None:
+        payload["benchmark_capacity"] = benchmark_capacity
     return payload
 
 
@@ -651,6 +682,7 @@ async def _seed_ticket(
     deadline: datetime = _TICKET_DEADLINE,
     bench_version: int = 2,
     issued_at: datetime | None = None,
+    slot_id: str = "slot-0",
 ) -> None:
     """Seat (or re-open) an issued ticket for a specific (agent, validator) so a
     score against that agent is accepted by the k=3 gate. Upserts so a test can
@@ -668,6 +700,7 @@ async def _seed_ticket(
                     agent_id=agent_id,
                     bench_version=bench_version,
                     validator_hotkey=keypair.ss58_address,
+                    slot_id=slot_id,
                     status=TicketStatus.ISSUED,
                     issued_at=issued,
                     deadline=deadline,
@@ -675,6 +708,7 @@ async def _seed_ticket(
             )
         else:
             existing.status = TicketStatus.ISSUED
+            existing.slot_id = slot_id
             existing.issued_at = issued
             existing.deadline = deadline
 
@@ -984,6 +1018,72 @@ class TestHeartbeat:
             )
         ).status_code == 401
 
+    async def test_v10_persists_and_publishes_every_active_slot(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        first = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, name="slot-a"
+        )
+        second = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="slot-b",
+            miner_hotkey="5SecondMiner" + "x" * 35,
+        )
+        await _seed_ticket(session_maker, first, slot_id="slot-0")
+        await _seed_ticket(session_maker, second, slot_id="slot-1")
+        _install_db(app, session_maker)
+        _install_chain(app)
+        first_progress = _progress("running_benchmark", completed=3, total=10)
+        second_progress = _progress("running_benchmark", completed=7, total=10)
+        capacity = {
+            "configured_slots": 2,
+            "healthy_slots": ["slot-0", "slot-1"],
+            "admission": "accepting",
+            "active": [
+                {
+                    "slot_id": "slot-0",
+                    "agent_id": str(first),
+                    "bench_version": 2,
+                    "progress": first_progress,
+                },
+                {
+                    "slot_id": "slot-1",
+                    "agent_id": str(second),
+                    "bench_version": 2,
+                    "progress": second_progress,
+                },
+            ],
+        }
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=10,
+                state="running_benchmark",
+                active_agent_id=first,
+                benchmark_progress=first_progress,
+                capabilities=_V9_CAPABILITIES,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert response.status_code == 200, response.text
+
+        public = (await client.get("/api/v1/public/validators")).json()["validators"][0]
+        assert public["configured_slots"] == 2
+        assert public["healthy_slots"] == ["slot-0", "slot-1"]
+        assert public["admission"] == "accepting"
+        assert [item["slot_id"] for item in public["active_benchmarks"]] == [
+            "slot-0",
+            "slot-1",
+        ]
+        assert public["active_benchmark"] == public["active_benchmarks"][0]
+
     async def test_malformed_stored_stack_health_is_omitted_publicly(
         self,
         app: FastAPI,
@@ -1185,6 +1285,7 @@ class TestHeartbeat:
         )
         assert started_at.tzinfo == UTC
         assert active_benchmark == {
+            "slot_id": "slot-0",
             "agent_id": str(agent_id),
             "agent_name": "alpha-agent",
             "bench_version": 2,
@@ -1500,6 +1601,7 @@ class TestHeartbeat:
         )
         assert started_at.tzinfo == UTC
         assert active_benchmark == {
+            "slot_id": "slot-0",
             "agent_id": str(agent_id),
             "agent_name": "alpha-agent",
             "bench_version": 2,
@@ -1980,7 +2082,7 @@ class TestHeartbeat:
         _install_chain(app)
         response = await client.post(
             "/api/v1/validator/heartbeat",
-            headers={**_AUTH_HEADER, "Content-Length": "4097"},
+            headers={**_AUTH_HEADER, "Content-Length": str(16 * 1024 + 1)},
             json=_heartbeat_payload(),
         )
         assert response.status_code == 413
@@ -1989,7 +2091,7 @@ class TestHeartbeat:
         response = await client.post(
             "/api/v1/validator/heartbeat",
             headers={**_AUTH_HEADER, "Content-Type": "application/json"},
-            content=(" " * 4097) + payload,
+            content=(" " * (16 * 1024 + 1)) + payload,
         )
         assert response.status_code == 413
 
@@ -2460,6 +2562,57 @@ class TestRequestJob:
         assert response.status_code == 200
         assert response.json()["agent_id"] == str(agent_id)
         refresh.assert_not_awaited()
+
+    async def test_required_proxy_issues_only_to_v10_ticket_inference_slots(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=9,
+            capabilities=_V9_CAPABILITIES,
+            stack=_V7_STACK,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        app.state.config = replace(
+            app.state.config,
+            inference_proxy=replace(
+                app.state.config.inference_proxy,
+                enabled=True,
+                required=True,
+                openrouter_api_key="test-only",
+            ),
+        )
+
+        legacy = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+        assert legacy.status_code == 204
+
+        async with session_maker() as session, session.begin():
+            heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert heartbeat is not None
+            heartbeat.protocol_version = 10
+            heartbeat.capabilities = {**_V9_CAPABILITIES, "ticket_inference": True}
+            heartbeat.benchmark_capacity = {
+                "configured_slots": 1,
+                "healthy_slots": ["slot-0"],
+                "admission": "accepting",
+                "active": [],
+            }
+
+        issued = await client.post(
+            "/api/v1/validator/job",
+            headers=_AUTH_HEADER,
+            json=_job_payload(slot_id="slot-0"),
+        )
+        assert issued.status_code == 200, issued.text
+        assert issued.json()["agent_id"] == str(agent_id)
+        assert issued.json()["inference"]["grant_id"]
 
     async def test_after_activation_v2_only_expires_v2_and_stays_idle(
         self,
@@ -3468,6 +3621,14 @@ class TestSubmitScore:
             json=_score_payload(agent_id, run_id="run_a", composite=0.5),
         )
         assert r1.status_code == 200
+        # Transport retries of the exact signed request return the original
+        # acceptance instead of turning a committed score into a false failure.
+        exact_retry = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id, run_id="run_a", composite=0.5),
+        )
+        assert exact_retry.status_code == 200
+        assert exact_retry.json()["accepted"] is True
         # Ticket spent: the re-score has no open ticket.
         r2 = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
@@ -3482,6 +3643,38 @@ class TestSubmitScore:
             assert len(scores) == 1
             assert scores[0].run_id == "run_a"  # the first (only) score stands
             assert scores[0].composite == pytest.approx(0.5)
+
+    async def test_exact_retry_survives_quorum_finalization(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        final_payload: dict[str, object] | None = None
+        for index, keypair in enumerate(_KEYPAIRS):
+            await _seed_ticket(session_maker, agent_id, keypair=keypair)
+            payload = _score_payload(
+                agent_id,
+                run_id=f"finalize_{index}",
+                keypair=keypair,
+                composite=0.82,
+            )
+            response = await client.post(
+                f"/api/v1/validator/agent/{agent_id}/score", json=payload
+            )
+            assert response.status_code == 200, response.text
+            final_payload = payload
+
+        assert final_payload is not None
+        retry = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score", json=final_payload
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["status"] == AgentStatus.SCORED
 
     async def test_superseded_ticket_lease_rejects_late_score(
         self,
