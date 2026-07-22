@@ -87,7 +87,7 @@ from ditto.db.models import (
     ScreeningQuarantine,
 )
 from ditto.db.queries.agents import get_agent_by_id
-from ditto.db.queries.benchmark_rollout import active_bench_version
+from ditto.db.queries.benchmark_rollout import active_bench_version, open_rollout
 from ditto.db.queries.heartbeats import (
     prune_stale_screener_heartbeats,
     upsert_screener_heartbeat,
@@ -1144,7 +1144,11 @@ async def submit_result(
             else _public_screening_reason(payload.detail, payload.reason_code)
         )
 
-    # 3. Generate the active-version dataset (outside the row lock). The legacy
+    # 3. Generate the scoring-version dataset (outside the row lock). A new
+    #    submission received after an open rollout starts enters that desired
+    #    benchmark era immediately; older submissions remain on the active
+    #    version unless they separately qualify for the rollout cohort.
+    #    The legacy
     #    agent-level columns hold the original/v2 pin, so their presence does not
     #    prove a v3 BenchmarkDataset exists. A policy rescreen after activation
     #    must backfill that missing row from the same immutable seed or the agent
@@ -1158,6 +1162,9 @@ async def submit_result(
             if existing is None:
                 raise AgentNotFoundError(f"no agent with id={agent_id}")
             bench_version = await active_bench_version(session)
+            rollout = await open_rollout(session)
+            if rollout is not None and existing.created_at >= rollout.created_at:
+                bench_version = rollout.desired_version
             versioned_dataset = await session.get(
                 BenchmarkDataset, (agent_id, bench_version)
             )
