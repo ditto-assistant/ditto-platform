@@ -340,6 +340,7 @@ def _make_verified_payment(**overrides: Any) -> VerifiedPayment:
         "miner_hotkey": "5Hotkey",  # overridden in fixtures
         "miner_coldkey": "5Coldkey",
         "amount_rao": 17_500_000,
+        "tao_usd_rate": Decimal("400"),
         "dest_address": "5SendAddress",
         "block_timestamp": datetime(2026, 5, 19, 12, 0, tzinfo=UTC),
     }

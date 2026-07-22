@@ -133,7 +133,7 @@ class PaymentVerifier:
             raise PaymentCallTypeMismatch(
                 f"extrinsic call_args missing or non-integer value: {ext.call_args!r}"
             ) from e
-        quote_rao = await self._recompute_quote_rao()
+        quote_rao, tao_usd_rate = await self._recompute_quote()
         lower = int(quote_rao * (Decimal(1) - PAYMENT_DRIFT_TOLERANCE))
         upper = int(quote_rao * (Decimal(1) + PAYMENT_DRIFT_TOLERANCE))
         if value < lower or value > upper:
@@ -163,6 +163,7 @@ class PaymentVerifier:
             miner_hotkey=expected_hotkey,
             miner_coldkey=on_chain_coldkey,
             amount_rao=value,
+            tao_usd_rate=tao_usd_rate,
             dest_address=dest,
             block_timestamp=block_ts,
         )
@@ -172,8 +173,8 @@ class PaymentVerifier:
         )
         return verified
 
-    async def _recompute_quote_rao(self) -> Decimal:
-        """Recompute the current upload-fee quote in rao.
+    async def _recompute_quote(self) -> tuple[Decimal, Decimal]:
+        """Return the current upload-fee quote in rao and its TAO/USD rate.
 
         Reuses the same formula as ``/upload/eval-pricing`` so a verify-
         time recompute that hits the same oracle cache entry produces an
@@ -185,7 +186,7 @@ class PaymentVerifier:
         fee_tao = (
             self._pricing_config.fee_usd * self._pricing_config.fee_buffer
         ) / price_usd
-        return fee_tao * _RAO_PER_TAO
+        return fee_tao * _RAO_PER_TAO, price_usd
 
 
 def _to_ss58(raw: Any) -> str:

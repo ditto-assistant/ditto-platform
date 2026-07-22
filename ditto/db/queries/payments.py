@@ -117,6 +117,7 @@ async def insert_evaluation_payment(
         miner_hotkey=verified.miner_hotkey,
         miner_coldkey=verified.miner_coldkey,
         amount_rao=verified.amount_rao,
+        tao_usd_rate=verified.tao_usd_rate,
         dest_address=verified.dest_address,
         timestamp=verified.block_timestamp,
     )

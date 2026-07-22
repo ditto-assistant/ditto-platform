@@ -11,6 +11,7 @@ cover the dispatch + the actual row write.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -43,6 +44,7 @@ def _make_verified(**overrides: Any) -> VerifiedPayment:
         "miner_hotkey": "5HKAlphaHotkey",
         "miner_coldkey": "5CKAlphaColdkey",
         "amount_rao": 5_000_000_000,
+        "tao_usd_rate": Decimal("400"),
         "dest_address": "5DestAddress",
         "block_timestamp": datetime(2026, 5, 19, 12, 0, tzinfo=UTC),
     }
@@ -116,6 +118,7 @@ class TestInsertEvaluationPaymentHappyPath:
         ).scalar_one()
         assert row.agent_id == agent_id
         assert row.amount_rao == verified.amount_rao
+        assert row.tao_usd_rate == verified.tao_usd_rate
         assert row.dest_address == verified.dest_address
         assert row.miner_coldkey == verified.miner_coldkey
 
