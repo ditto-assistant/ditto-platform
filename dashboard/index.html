@@ -2277,6 +2277,7 @@
           <label for="third-party-harness-filter">Third-party harness</label>
           <select id="third-party-harness-filter">
             <option value="hermes">Hermes Agent</option>
+            <option value="openclaw">OpenClaw</option>
           </select>
         </div>
       </div>
@@ -3387,6 +3388,7 @@
       benchVersion: 6,
       memoryMean: 0.2604166666666667,
       baselineMemoryMean: 0.23958333333333334,
+      baselineLabel: "Original Hermes baseline",
       memoryCases: 96,
       totalCases: 206,
       seed: "3058240546919425205",
@@ -3394,6 +3396,22 @@
       model: "qwen/qwen3-32b",
       provider: "OpenRouter",
       evidenceUrl: "https://github.com/ditto-assistant/dittobench-api/blob/8df6ba37a3c4e46ede9db1cb6014551d49ac6ba8/docs/hermes-benchmark/README.md"
+    }, {
+      id: "openclaw",
+      label: "OpenClaw",
+      subject: "OpenClaw 2026.7.1",
+      profile: "Favorable native memory-core FTS",
+      benchVersion: 6,
+      memoryMean: 0.4270833333333333,
+      baselineMemoryMean: 0.3854166666666667,
+      baselineLabel: "Native 10-result baseline",
+      memoryCases: 96,
+      totalCases: 206,
+      seed: "3058240546919425205",
+      datasetSha256: "f9b8e6eea10f20316a6fc82c2f6b0af0f0cf0bc3f263cf96a760e68cdaa3ea2d",
+      model: "qwen/qwen3-32b",
+      provider: "OpenRouter",
+      evidenceUrl: "https://github.com/ditto-assistant/dittobench-api/blob/efbfeb36ad64ea3e1568de68d77018cbda2bd3db/docs/openclaw-benchmark/README.md"
     }];
     var selectedThirdPartyHarness = "hermes";
     var lastThirdPartyLeaderboardData = null;
@@ -3601,13 +3619,15 @@
         ? "Third-party · " + esc(evidence.profile)
         : "Miner · finalized " + esc(entry.score_count) + "/" + esc(entry.score_quorum) +
           (Number.isFinite(composite) ? " · composite " + fx(composite) : "");
-      var baseline = external
+      var hasBaseline = external && Number.isFinite(evidence.baselineMemoryMean);
+      var baseline = hasBaseline
         ? '<span class="memory-baseline-marker" style="left:' + (evidence.baselineMemoryMean * 100).toFixed(4) +
-          '%" title="Original Hermes baseline: ' + fx(evidence.baselineMemoryMean) + '" aria-hidden="true"></span>'
+          '%" title="' + esc(evidence.baselineLabel || "Baseline") + ': ' + fx(evidence.baselineMemoryMean) + '" aria-hidden="true"></span>'
         : "";
       var aria = (external ? evidence.subject : agentName(entry.agent_name)) +
         " memory subscore " + fx(score) +
-        (external ? ", original baseline " + fx(evidence.baselineMemoryMean) :
+        (hasBaseline ? ", " + String(evidence.baselineLabel || "baseline").toLowerCase() +
+          " " + fx(evidence.baselineMemoryMean) :
           (Number.isFinite(composite) ? ", leaderboard composite " + fx(composite) : ""));
       return '<div class="memory-chart-row' + (external ? ' external' : '') + '" role="listitem" aria-label="' + esc(aria) + '">' +
         '<div class="memory-chart-name"><strong>' + label + '</strong><span>' + context + '</span></div>' +
@@ -3628,12 +3648,16 @@
       }).slice(0, 5);
 
       document.getElementById("harness-comparison-evidence").href = evidence.evidenceUrl;
+      var baselineMethod = Number.isFinite(evidence.baselineMemoryMean)
+        ? " Its white marker is the " + String(evidence.baselineLabel || "baseline").toLowerCase() +
+          " at " + fx(evidence.baselineMemoryMean) + "."
+        : "";
       document.getElementById("harness-comparison-method").textContent =
         "Miner bars show memory subscores, not the leaderboard composite. They are live finalized 3-validator v" + evidence.benchVersion +
         " medians. " + evidence.subject + " is one off-network " + evidence.provider +
         " practice run on " + evidence.model + " (" + evidence.memoryCases + " memory cases; " +
-        evidence.totalCases + " total; seed " + evidence.seed + "). Its white marker is the original " +
-        fx(evidence.baselineMemoryMean) + " baseline. Same benchmark version, but different provider route, " +
+        evidence.totalCases + " total; seed " + evidence.seed + ")." + baselineMethod +
+        " Same benchmark version, but different provider route, " +
         "seeds, and aggregation. Third-party harnesses never enter score rank, KOTH, validator weights, or payouts.";
 
       if (!entries.length) {

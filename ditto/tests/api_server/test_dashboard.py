@@ -385,6 +385,7 @@ class TestDashboard:
         assert "Memory subscores only. The leaderboard ranks by composite." in body
         assert 'for="third-party-harness-filter">Third-party harness' in body
         assert 'value="hermes">Hermes Agent' in body
+        assert 'value="openclaw">OpenClaw' in body
         assert "var THIRD_PARTY_HARNESSES = [{" in body
         assert "memoryMean: 0.2604166666666667" in body
         assert "baselineMemoryMean: 0.23958333333333334" in body
@@ -406,6 +407,11 @@ class TestDashboard:
         assert "Third-party harnesses never enter score rank, KOTH" in body
         assert "validator weights, or payouts." in body
         assert "8df6ba37a3c4e46ede9db1cb6014551d49ac6ba8" in body
+        assert 'subject: "OpenClaw 2026.7.1"' in body
+        assert "memoryMean: 0.4270833333333333" in body
+        assert "baselineMemoryMean: 0.3854166666666667" in body
+        assert 'baselineLabel: "Native 10-result baseline"' in body
+        assert "efbfeb36ad64ea3e1568de68d77018cbda2bd3db" in body
 
     async def test_api_failures_do_not_render_sample_data(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
