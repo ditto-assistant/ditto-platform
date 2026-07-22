@@ -47,7 +47,10 @@ from ditto.api_server.dependencies import (
     get_storage_client,
 )
 from ditto.api_server.endpoints.public import screening_dispute_signing_message
-from ditto.api_server.endpoints.screener import _heartbeat_signing_message
+from ditto.api_server.endpoints.screener import (
+    _heartbeat_signing_message,
+    _public_screening_reason,
+)
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_AGENT_NOT_FOUND,
     ERROR_CODE_AGENT_NOT_SCREENABLE,
@@ -91,6 +94,28 @@ def _sign(message: str | bytes) -> str:
     return _KEYPAIR.sign(
         message.encode() if isinstance(message, str) else message
     ).hex()
+
+
+def test_public_rust_contract_reason_is_actionable() -> None:
+    detail = (
+        "error[SCR-RUST-002]: archive contains a duplicate path\n\n"
+        "help: package each path exactly once"
+    )
+
+    assert _public_screening_reason(detail, "rust-harness-contract") == (
+        "Rust harness contract failed (SCR-RUST-002): archive contains a duplicate "
+        "path. Package each path exactly once."
+    )
+
+
+def test_unknown_rust_contract_detail_stays_public_safe() -> None:
+    reason = _public_screening_reason(
+        "error[SCR-RUST-999]: SECRET_FROM_UNTRUSTED_DETAIL",
+        "rust-harness-contract",
+    )
+
+    assert reason.startswith("Submission does not satisfy the Rust harness contract")
+    assert "SECRET_FROM_UNTRUSTED_DETAIL" not in reason
 
 
 def _result_payload(
@@ -3383,6 +3408,45 @@ class TestSubmitResult:
             assert agent.screening_reason == "Docker image build failed"
             assert agent.screening_policy_version == 0
             assert "SECRET_FROM_BUILD" not in agent.screening_reason
+
+    async def test_rust_contract_rejection_persists_actionable_reason(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        detail = (
+            "error[SCR-RUST-002]: archive contains a duplicate path\n\n"
+            "help: package each path exactly once"
+        )
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            headers=_AUTH_HEADER,
+            json=_result_payload(
+                agent_id,
+                attempt_id=attempt_id,
+                passed=False,
+                outcome="deterministic_reject",
+                detail=detail,
+                reason_code="rust-harness-contract",
+            ),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == AgentStatus.REJECTED
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            assert agent.screening_reason == (
+                "Rust harness contract failed (SCR-RUST-002): archive contains a "
+                "duplicate path. Package each path exactly once."
+            )
 
     @pytest.mark.parametrize(
         ("outcome", "detail", "expected"),

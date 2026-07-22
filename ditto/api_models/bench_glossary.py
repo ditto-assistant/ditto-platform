@@ -699,7 +699,7 @@ def metric_entries() -> list[dict]:
 BENCH_VERSIONS: list[dict] = [
     {
         "version": 2,
-        "epoch": "2026-01-01",
+        "epoch": "2026-07-07",
         "title": "Launch contract",
         "summary": (
             "The first on-chain scoring contract, frozen since scoring began. Its "
@@ -710,7 +710,7 @@ BENCH_VERSIONS: list[dict] = [
     },
     {
         "version": 3,
-        "epoch": "2026-07-01",
+        "epoch": "2026-07-18",
         "title": "Anti-gaming release",
         "summary": (
             "Hardens the suite against gaming: dump-guard grading, needle gating, "
@@ -725,7 +725,7 @@ BENCH_VERSIONS: list[dict] = [
     },
     {
         "version": 4,
-        "epoch": "2026-08-01",
+        "epoch": "2026-07-19",
         "title": "False-positive corrections",
         "summary": (
             "Not a new benchmark: v3 with scoring false positives corrected, so "
@@ -740,7 +740,7 @@ BENCH_VERSIONS: list[dict] = [
     },
     {
         "version": 5,
-        "epoch": "2026-09-01",
+        "epoch": "2026-07-21",
         "title": "Conversational grounding, coverage & efficiency",
         "summary": (
             "Closes the 'Aurora-9' hole where a phrase-list router that dumps memory "
@@ -759,7 +759,7 @@ BENCH_VERSIONS: list[dict] = [
     },
     {
         "version": 6,
-        "epoch": "2026-10-01",
+        "epoch": "2026-07-21",
         "title": "Memory-as-data & the complexity suite",
         "summary": (
             "Keeps the v5 suite and adds four complexity classes that reward the "
