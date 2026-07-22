@@ -1,189 +1,93 @@
-# Top-5 continual shared-seed rescore lane
+# Top-five continual shared-seed re-benchmark lane
 
-**Status:** design / RFC.
-**Depends on:** ditto-platform #195 + ditto-subnet #161 (`confirm uncertain KOTH
-challengers`) — this generalizes them.
+**Status:** implementation-ready RFC.
+**Canonical PRs:** ditto-platform #280, ditto-subnet #202.
+**Supersedes:** ditto-platform #195 and ditto-subnet #161.
 
 ## Goal
 
-Continually re-score the **emission set (champion + 4 tail = top 5)** on fresh,
-**uniform-but-random** benchmark seeds so their medians keep widening over more
-data. Every top-5 agent is scored on the *same* dataset each round (random yet
-identical across the five), which cancels dataset-difficulty and keeps
-**intra-top-5 ranking fair** — the champion holds the crown on paired evidence,
-not on a lucky seed. Runs on a **tempo** (once every *T* ∈ 2–8 tempos, a tempo =
-360 blocks ≈ 72 min) so it is negligible under normal evaluation load. Membership
-**follows the set**: a new agent entering the top 5 automatically joins; one that
-drops out stops. A fresh entrant gets **catch-up** (extra seeds/round) until its
-confirmation depth matches the incumbents.
+Continually re-benchmark the current KOTH emission set—the champion plus four
+participation-tail agents—on champion-anchored shared seeds. The extra evidence
+reduces dataset-luck in crown and tail ordering without changing the authoritative
+three-validator score quorum.
 
-## TL;DR — most of this already exists
+Membership follows the live emission set. A new entrant automatically joins and
+catches up at a bounded rate; an agent that leaves the set stops consuming this
+lane. Seed families are scoped to the active benchmark contract, so a benchmark
+version change starts a fresh comparable history without any deployed-version
+hard-code.
 
-This is **~80% wiring, not a redesign.** The consensus-critical machinery is
-already built and deployed on the subnet side:
+## Safety invariants
 
-| Piece you need | Already exists | Where |
-| --- | --- | --- |
-| Deterministic uniform-but-random shared seed across a set of agents | **CRN** `crn_seed(agent_ids, version, k) = SHA256(sorted(ids)‖version‖k)` — every validator derives the identical seed | `ditto-subnet ditto/validator/crn.py:32-62` |
-| A loop that continually re-scores champion + tail on those seeds | `worker._rescore_stale_champions` (every sweep) → `_rescore_stale_champion_and_tail` / `_confirm_contested_dethrone` | `ditto-subnet ditto/validator/worker.py:787-962` |
-| Median that widens over more seeds without more Score rows | multi-seed data lives **in-row** in `Score.details.confirmation_composites`; the median (`_effective_composite`) and lower-median ledger read are **N-agnostic** | `ditto-subnet weights.py`; `ditto-platform scores.py:665-753` |
-| The KOTH fold consuming paired shared-seed evidence | `_paired_dethrone` / `_beats` / `contested_confirmation_set` | `ditto-subnet weights.py:266-494`; platform mirror `koth.py:99-198` |
-| A platform confirmation-ticket lane (for **one** challenger) | #195/#161 | (open PRs) |
+1. **The canonical score is immutable here.** Top-five results never use the
+   ordinary `/validator/agent/{id}/score` endpoint and never replace a k=3 score.
+2. **Every benchmark is platform-leased.** The validator must obtain a dedicated
+   top-five ticket before running. The platform owns membership, freshness,
+   validator authorization, replay protection, and tempo.
+3. **Evidence is append-only.** One immutable row is stored per validator,
+   benchmark version, and seed. Duplicate submissions are idempotent.
+4. **All signed pairs are bound.** One member claim may evaluate multiple missing
+   seeds; the dedicated receipt signature binds the complete ordered
+   `(seed, composite)` list.
+5. **Failure is isolated.** A declined claim, expired lease, or failed member run
+   does not block normal scoring or chain weights.
+6. **No extra quorum voter.** The lane adds measurement evidence only; it does not
+   consume or expand the three-score finalization budget.
 
-**The only gap:** the subnet's rescore submissions carry **no `ticket_deadline`**
-(`worker.py:1298` default `None`), and the platform `submit_score` **rejects any
-submission without a live ticket** (`endpoints/validator.py:1411-1415,
-1435-1442`). So the machinery is inert against the platform. #195 opens that lane
-for the single uncertain leader; this doc opens it for the **whole top 5,
-continually**.
+## Contract
 
-## The design
+### Claim
 
-### 1. The lane = a parallel issuer, not a new ticket column
+`POST /api/v1/validator/top5-confirmation-job`
 
-There is **no ticket type/kind column** today; `ValidatorTicket`'s only
-discriminator is `bench_version` (`db/models.py:1220-1224`). The established
-precedent for a second lane is **a separate issuer keyed off a durable table**,
-wired into `request_job`: `issue_rollout_ticket` (`benchmark_rollout.py:579`)
-already sits beside `issue_ticket` (`tickets.py:125`) in
-`endpoints/validator.py:840-973`. The top-5 lane is a **third issuer**
-(`issue_top5_confirmation_ticket`) selected there, ahead of normal evaluation
-only when the tempo says so. It grants a **confirmation ticket** the existing
-`submit_score` path can bind to (the #195 mechanism, generalized), so it **never
-consumes an agent's k=3 evaluation budget** and adds **no fourth scorer** to the
-authoritative quorum.
+The signed request identifies both the projected champion and the requested
+emission-set member. The platform recomputes current membership and rejects stale
+or ineligible claims. A successful response is a normal artifact-bound ticket with
+an exact deadline and current benchmark version.
 
-### 2. Champion-anchored shared seeds (recommended over set-anchored)
+### Append
 
-CRN can key the seed on any set of agent ids. Two options:
+`POST /api/v1/validator/agent/{agent_id}/top5-confirmation-score`
 
-- **Set-anchored** (literal "seed derived from the top-5 set"): `crn_seed({all 5},
-  …)`. Problem: the moment membership changes, the seed set changes, the shared
-  baseline re-randomizes, and accumulated paired history is stranded.
-- **Champion-anchored** (recommended, = #195's choice, `worker.py:933-937`): seeds
-  are anchored to the **champion's** agent_id; the champion mints one fresh CRN
-  seed per tempo and **all five score that same seed**. This still gives "all
-  top-5 on one uniform-but-random seed each round," but the baseline is **stable**
-  as tail members churn, a newcomer simply **starts sharing the champion's
-  existing seeds** (O(1), and catch-up = give it more of them), and history
-  accumulates. When the champion is dethroned the anchor moves to the new
-  champion — rare and meaningful. **Recommend champion-anchored.**
+The request carries a representative `ScoreReport` plus aligned
+`confirmation_seeds` and `confirmation_composites`. Its separate signature domain,
+`validator-top5-confirmation-score:v1`, binds every pair. The endpoint validates
+the live ticket, current emission membership, benchmark version, and the exact
+champion-derived seed family before appending rows and spending the ticket.
 
-Consensus safety: the seed is a pure function of `(champion_id, version,
-tempo_index)` — every validator derives it identically; no wall-clock, no RNG.
-The encoding is **scoped to the major bench version** (v4, v5, …) via
-`crn_seed(ids, version, k)`, so each version has its own seed family and a
-version bump cleanly starts a fresh baseline. **Both repos use the identical crn
-encoding** (`crn.py` is the single source of truth; the platform mirrors it
-byte-for-byte) and the **platform validates the submitted seed** against its own
-derivation — a validator cannot cherry-pick a favorable seed (anti-grind).
+This is deliberately separate from ordinary score submission. Reusing `/score`
+would either collide with current re-test guards or overwrite the canonical score,
+both of which violate the design.
 
-### 3. Where the scores land — an append-only confirmation ledger
+## Seed and history model
 
-Confirmation results are stored **append-only**: a new immutable
-`ConfirmationScore` row per `(agent_id, validator_hotkey, bench_version, seed)` —
-unique key, INSERT-idempotent (`ON CONFLICT DO NOTHING`), **never UPDATEd or
-deleted**. Each rescore round the validator submits **only the newly-scored
-seed's** result (signed); the platform appends it. The longer a champion reigns,
-the more rows accumulate — the record grows monotonically, and history is fully
-auditable (every seed's score kept forever, no destructive read-modify-write).
+Seeds are a deterministic function of `(champion_agent_id, benchmark_version,
+replicate_index)`. Champion anchoring keeps the baseline stable when tail members
+change. When the champion changes, the anchor changes and a new family begins.
 
-The authoritative **k=3 `Score` table is untouched** — still no 4th ticket
-(`tickets.py:471-479`), no 4th `Score` PK row (`db/models.py:829-831`), no change
-to k=3 finalization. The confirmation ledger is a *separate*, additive store. The
-KOTH fold (`weights.py`) and its platform mirror (`koth.py`) read the paired
-evidence from this append-only history (group by seed → paired lower-median),
-exposed on the ledger read (`/scoring/scores`, beside #252's signed receipts).
-The median is N-agnostic (`scores.py:665-753`), so "more seeds" is just "more
-rows to median over."
+The validator ledger exposes append-only confirmation history. The fold groups
+records by seed and takes the median across validators for that seed, then uses
+shared seeds for paired dethrone comparisons. Legacy in-row confirmation arrays
+remain a read-only fallback during transition.
 
-*(This replaces the earlier in-row `Score.details.confirmation_composites` array,
-which was a replace-the-array write — not append-only. Append-only rows are the
-consensus-cleaner, auditable form and are what the accumulate-over-reign property
-wants.)*
-
-### 4. Membership, tempo, catch-up
-
-- **Membership** = the current emission set (champion via `_champion`, tail via
-  `_tail`, `weights.py:346-367`) recomputed each round. New entrant in → gets the
-  lane; drop out → doesn't. No manual list.
-- **Tempo = exponential backoff over the champion's reign**, not a fixed
-  interval. The gap between rescore rounds starts small and **slowly** doubles up
-  to a cap as the *champion's* reign lengthens: `interval(blocks_since_crown) =
-  min(base · 2^floor(reign_tempos / K), cap)`. Dense early (a fresh or contested
-  king must prove the crown on many seeds), sparse once the reign is settled —
-  saving tokens on a stable leader. It **never reaches zero rate** (capped, e.g.
-  ~8 tempos): a dynamic competition should keep turning over, so a champion that
-  taper-flatlines at the cap *is itself the signal* that the field has gone
-  stagnant. **Resets on any king change** — a new champion re-enters the dense
-  regime, so churn ⇒ more scoring, stagnation ⇒ less. The schedule is a pure
-  function of `blocks_since_crown` (a deterministic ledger fact — the champion's
-  crown block), so every validator agrees when a round is due. Config: `base`,
-  doubling factor `K`, `cap`.
-- **Front-loads the 24 h source-reveal window** (#277/#278: king source releases
-  after a 24-h reign). Reaching quorum starts that countdown; the backoff keeps
-  the *densest* rescoring across those first ~20 tempos, so the crown is hardened
-  on the most shared seeds exactly as the code is about to become public.
-- **Catch-up** = a tail agent whose `confirmation_seeds` count is below the
-  incumbents' gets **2× seeds/round** (score the two most-recent champion seeds it
-  is missing) until its depth converges. Bounded so it can never exceed the
-  champion's own seed count.
-
-## What does NOT change (and why that's the point)
-
-Because rescores land in a **separate append-only `ConfirmationScore` ledger**
-and not as new rows/validators on the k=3 `Score` table, all of these stay
-exactly as-is: `SCORING_QUORUM = 3`, the k=3 ticket cap, the
-one-ticket-per-validator index, `submit_score` finalization, and the
-`get_score_continuation_floor` two-score bound. The lane is **additive** to the
-authoritative k=3 record; it only accumulates more shared-seed rows the fold
-medians over. That is what keeps it consensus-safe.
+The champion establishes a three-seed baseline, then extends one seed per round up
+to a fixed cap. A behind tail entrant scores up to two missing seeds per claimed
+round until it catches up; it never exceeds the champion's depth.
 
 ## UI
 
-The lane must be legible on the leaderboard/ops surfaces: each top-5 agent
-carries its **confirmation-score count** (shared-seed depth) and the resulting
-**widened median band**, and `dashboard/index.html` shows it — e.g. "N
-shared-seed confirmations" on the top-5 rows, growing while an agent holds its
-spot. A longer-reigning champion visibly accumulates more scores; that
-accumulation *is* the fairness signal, so it should read plainly rather than be
-hidden in `details`.
+The public leaderboard shows confirmation depth for top-five agents. This is
+evidence depth, not a new canonical score count, and must not be presented as a
+fourth quorum score.
 
-## PR breakdown
+## Rollout
 
-Ordering: **land #195 + #161 first** (they establish the confirmation-ticket
-endpoint + the subnet confirmation submit path this generalizes). Then:
+1. Merge and deploy ditto-platform #280.
+2. Merge and release ditto-subnet #202.
+3. Verify successful dedicated claims and appends, unchanged ordinary k=3 scores,
+   healthy normal queue throughput, and healthy weight cycles.
 
-1. **ditto-platform — top-5 confirmation issuer + tempo** (build on #195's
-   endpoint): generalize the single-leader confirmation ticket to the emission set
-   (champion + 4 tail), gate issuance on `TOP5_RESCORE_TEMPO`, select the set from
-   `list_eligible_ledger`/`project_koth`, derive champion-anchored CRN seeds, wire
-   into `request_job`. Leaderboard shows "top-5 shared-seed depth."
-2. **ditto-subnet — point the existing rescore loop at the lane + catch-up**: have
-   `_rescore_stale_champion_and_tail` claim the platform confirmation ticket and
-   submit **with** the granted `ticket_deadline` (the one missing field), and
-   implement the 2× catch-up seed selection for new tail entrants.
-3. **(optional) dittobench-api** — only if datagen needs a set-keyed entry point;
-   likely none (CRN seed → existing generator).
-
-Each platform/subnet PR opens as a **draft** with this doc linked, because the
-change feeds dethroning → emissions → chain weights and must be reviewed against
-the consensus fold before merge.
-
-## Decisions (resolved)
-
-1. **Seeds: champion-anchored** (§2) — all 5 score the champion's growing seed
-   set; stable baseline; anchor moves only on dethrone.
-2. **Seed encoding: identical + version-scoped** — both repos use `crn.py`'s
-   `crn_seed(ids, version, k)` byte-for-byte, keyed on the major bench version
-   (v4/v5/…); the platform validates the submitted seed (anti-grind).
-3. **Storage: append-only** — an immutable `ConfirmationScore` ledger (§3), never
-   updated; the k=3 `Score` table is untouched.
-4. **Structure: stacked** on #195/#161 (don't rewrite them).
-5. **Tempo = exponential backoff** over the champion's reign (dense early,
-   tapering to a non-zero cap, resets on king change; front-loads the 24 h
-   reveal window). Deterministic on `blocks_since_crown`. Config: base/K/cap.
-6. **Catch-up = 2×** fresh missing seeds/round until depth-converged, hard-capped
-   at the champion's seed count.
-7. **UI** — top-5 confirmation depth + widened band shown on the leaderboard and
-   dashboard.
+The platform goes first because a new subnet against an old platform must only see
+a rejected optional claim; normal scoring and weights continue. No data backfill is
+required. Historical confirmation arrays remain readable, while new evidence is
+written only to the append-only ledger.
