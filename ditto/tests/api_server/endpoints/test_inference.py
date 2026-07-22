@@ -8,11 +8,17 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import HTTPException
 
-from ditto.api_models.inference import InferenceExchangeRequest
+from ditto.api_models.inference import InferenceExchangeRequest, InferenceGrantOffer
 from ditto.api_server.endpoints.inference import (
+    _bounded_provider_cost,
     _exchange_message,
+    _locked_upstream_payload,
     _output_token_limit,
+    _provider_preferences,
     _proxy_message,
+    _public_provider_response,
+    _upstream_provider,
+    _validate_request_schema,
 )
 from ditto.api_server.endpoints.validator import _verify_signature
 
@@ -87,3 +93,234 @@ def test_output_token_alias_cannot_bypass_ticket_limit() -> None:
     with pytest.raises(HTTPException):
         _output_token_limit({"max_completion_tokens": 8193}, 8192)
     assert _output_token_limit({"max_completion_tokens": 32}, 8192) == 32
+
+
+@pytest.mark.parametrize(
+    "escape",
+    [
+        {"models": ["attacker/model"]},
+        {"plugins": [{"id": "web"}]},
+        {"provider": {"allow_fallbacks": True}},
+        {"reasoning": {"effort": "high"}},
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": "http://local"}],
+                }
+            ]
+        },
+        {"tools": [{"type": "web_search", "web_search": {}}]},
+    ],
+)
+def test_proxy_schema_rejects_model_provider_and_network_escapes(
+    escape: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "model": "openai/gpt-oss-20b",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    payload.update(escape)
+    with pytest.raises(HTTPException):
+        _validate_request_schema(payload)
+
+
+def test_proxy_schema_allows_only_local_function_tools() -> None:
+    _validate_request_schema(
+        {
+            "model": "openai/gpt-oss-20b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "local harness tool",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        }
+    )
+
+
+def test_aggregate_route_is_speed_sorted_private_and_fallback_enabled() -> None:
+    assert _provider_preferences(
+        routing_mode="aggregate_throughput",
+        provider="openrouter",
+        quantization=None,
+    ) == {
+        "sort": "throughput",
+        "allow_fallbacks": True,
+        "data_collection": "deny",
+        "zdr": True,
+    }
+    assert _bounded_provider_cost({"usage": {"cost": 0.012345}}) == 12_345
+    assert _bounded_provider_cost({"usage": {"cost": float("nan")}}) is None
+
+
+def test_v7_upstream_profile_pins_medium_reasoning_without_changing_v6() -> None:
+    payload = {
+        "model": "attacker/model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_completion_tokens": 999,
+        "stream": False,
+    }
+    v7 = _locked_upstream_payload(payload, model="openai/gpt-oss-20b", max_tokens=256)
+    assert v7["model"] == "openai/gpt-oss-20b"
+    assert v7["max_tokens"] == 256
+    assert v7["reasoning"] == {"effort": "medium", "exclude": True}
+    assert "max_completion_tokens" not in v7
+
+    v6 = _locked_upstream_payload(payload, model="qwen/qwen3-32b", max_tokens=256)
+    assert "reasoning" not in v6
+
+
+def test_router_metadata_provider_is_trusted_but_never_returned_to_harness() -> None:
+    upstream = {
+        "id": "gen-test",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "openai/gpt-oss-20b",
+        "provider": "legacy-provider-must-not-leak",
+        "system_fingerprint": "provider-specific-fingerprint",
+        "service_tier": "provider-specific-tier",
+        "openrouter_metadata": {
+            "summary": "selected Groq",
+            "endpoints": {
+                "available": [
+                    {
+                        "provider": "Groq",
+                        "model": "openai/gpt-oss-20b",
+                        "selected": True,
+                    }
+                ]
+            },
+        },
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "native_finish_reason": "provider-native-finish",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                            "provider_extension": "must-not-leak",
+                        }
+                    ],
+                    "provider_extension": "must-not-leak",
+                },
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 4,
+            "total_tokens": 7,
+            "cost": 0.01,
+            "cost_details": {"upstream_inference_cost": 0.009},
+            "is_byok": False,
+        },
+    }
+
+    assert _upstream_provider(upstream) == "Groq"
+    public = _public_provider_response(upstream)
+    encoded = str(public)
+    for secret in (
+        "Groq",
+        "legacy-provider",
+        "provider-specific",
+        "must-not-leak",
+        "openrouter_metadata",
+        "system_fingerprint",
+        "service_tier",
+        "native_finish_reason",
+        "cost",
+    ):
+        assert secret not in encoded
+    assert public["usage"] == {
+        "prompt_tokens": 3,
+        "completion_tokens": 4,
+        "total_tokens": 7,
+    }
+    assert public["choices"][0]["message"]["tool_calls"][0] == {
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+
+
+def test_router_metadata_rejects_ambiguous_selected_provider() -> None:
+    with pytest.raises(HTTPException):
+        _upstream_provider(
+            {
+                "openrouter_metadata": {
+                    "endpoints": {
+                        "available": [
+                            {"provider": "Groq", "selected": True},
+                            {"provider": "Together", "selected": True},
+                        ]
+                    }
+                }
+            }
+        )
+
+
+def test_provider_choice_error_metadata_is_not_deliverable() -> None:
+    with pytest.raises(HTTPException):
+        _public_provider_response(
+            {
+                "id": "gen-test",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "openai/gpt-oss-20b",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": None},
+                        "error": {
+                            "message": "Groq raw error",
+                            "metadata": {"provider": "Groq"},
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 0},
+            }
+        )
+
+
+def test_adaptive_route_remains_exact_and_disables_fallback() -> None:
+    assert _provider_preferences(
+        routing_mode="adaptive",
+        provider="Groq",
+        quantization="fp8",
+    ) == {
+        "only": ["Groq"],
+        "quantizations": ["fp8"],
+        "allow_fallbacks": False,
+        "data_collection": "deny",
+        "zdr": True,
+    }
+
+
+def test_legacy_offer_omits_additive_v7_route_identity() -> None:
+    offer = InferenceGrantOffer(
+        grant_id=uuid4(),
+        exchange_url="https://platform.test/api/v1/inference/exchange",
+        proxy_url="https://platform.test/api/v1/inference/chat/completions",
+        allowed_models=["qwen/qwen3-32b"],
+        request_budget=10,
+        token_budget=100,
+        expires_at=datetime.now(UTC),
+    )
+    encoded = offer.model_dump(mode="json")
+    assert "provider" not in encoded
+    assert "profile_revision" not in encoded

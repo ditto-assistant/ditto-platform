@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.config import InferenceProxyConfig
-from ditto.db.models import Agent, AgentStatus, ValidatorTicket
+from ditto.db.models import (
+    Agent,
+    AgentStatus,
+    InferenceProviderRoute,
+    InferenceRoutingPolicy,
+    ValidatorTicket,
+)
 from ditto.db.queries.inference import (
     activate_inference_grant,
     begin_inference_request,
@@ -26,6 +32,7 @@ def _config() -> InferenceProxyConfig:
         upstream_url="https://openrouter.ai/api/v1/chat/completions",
         allowed_models=("qwen/qwen3-32b",),
         provider="nebius",
+        routing_mode="adaptive",
         request_budget=2,
         token_budget=100,
         per_ticket_concurrency=1,
@@ -72,6 +79,7 @@ async def _live_grant(session: AsyncSession):
             validator_hotkey="wrong-validator",
             broker_public_key="broker-key",
             now=now,
+            config=_config(),
         )
         is None
     )
@@ -81,9 +89,89 @@ async def _live_grant(session: AsyncSession):
         validator_hotkey="validator",
         broker_public_key="broker-key",
         now=now,
+        config=_config(),
     )
     assert activated is not None
     return ticket, activated[0], activated[1], now
+
+
+@pytest.mark.asyncio
+async def test_v7_grant_requires_and_binds_one_calibrated_dynamic_route(
+    session: AsyncSession,
+) -> None:
+    now = datetime.now(UTC)
+    config = replace(_config(), allowed_models=("qwen/qwen3-32b", "openai/gpt-oss-20b"))
+    async with session.begin():
+        agent = Agent(
+            agent_id=uuid4(),
+            miner_hotkey="miner-v7",
+            name="adaptive-route",
+            sha256="cd" * 32,
+            status=AgentStatus.EVALUATING,
+            created_at=now,
+        )
+        ticket = ValidatorTicket(
+            agent_id=agent.agent_id,
+            validator_hotkey="validator-v7",
+            slot_id="slot-0",
+            status=TicketStatus.ISSUED,
+            issued_at=now,
+            deadline=now + timedelta(minutes=20),
+            bench_version=7,
+            attempt_count=1,
+        )
+        session.add_all([agent, ticket])
+        await session.flush()
+        assert (
+            await ensure_inference_grant(session, ticket=ticket, config=config) is None
+        )
+
+        route = InferenceProviderRoute(
+            model="openai/gpt-oss-20b",
+            provider="discovered-provider",
+            profile_revision="openrouter-route-test-v1",
+            status="healthy",
+            calibration_status="eligible",
+            prompt_price_per_token=0.00000003,
+            completion_price_per_token=0.00000013,
+            ewma_tokens_per_second=150,
+            ewma_latency_ms=900,
+            ewma_error_rate=0,
+            ewma_timeout_rate=0,
+            calibration_tool_accuracy=0.65,
+            calibration_composite=0.20,
+            calibration_sample_count=60,
+            calibration_manifest_sha256="ab" * 32,
+            sample_count=20,
+            discovered_at=now,
+        )
+        session.add(route)
+        session.add(
+            InferenceRoutingPolicy(
+                model="openai/gpt-oss-20b",
+                enabled=True,
+                speed_weight=0.65,
+                cost_weight=0.25,
+                exploration_weight=0.10,
+                exploration_ticket_budget=3,
+                min_tool_accuracy=0.55,
+                min_composite=0.15,
+                min_calibration_samples=20,
+                max_error_rate=0.25,
+                max_timeout_rate=0.15,
+                cooldown_seconds=30,
+                ewma_alpha=0.20,
+                updated_at=now,
+            )
+        )
+        await session.flush()
+        grant = await ensure_inference_grant(session, ticket=ticket, config=config)
+        assert grant is not None
+        assert grant.allowed_models == ["openai/gpt-oss-20b"]
+        assert grant.route_provider == "discovered-provider"
+        assert grant.route_profile == "openrouter-route-test-v1"
+        assert route.selected_ticket_count == 1
+        assert route.exploration_ticket_count == 1
 
 
 @pytest.mark.asyncio
@@ -238,7 +326,7 @@ async def test_revocation_cancels_inflight_and_missing_usage_charges_reservation
             now=now,
             config=_config(),
         )
-        assert await finish_inference_request(
+        assert not await finish_inference_request(
             session,
             grant_id=grant.grant_id,
             nonce=nonce,

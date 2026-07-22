@@ -11,6 +11,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID
@@ -30,6 +32,10 @@ from ditto.api_server.endpoints.validator import (
     ValidatorAuthError,
     _assert_validator_permitted,
     _verify_signature,
+)
+from ditto.api_server.inference_routing import (
+    benchmark_reasoning,
+    record_route_observation,
 )
 from ditto.db.queries.inference import (
     activate_inference_grant,
@@ -80,7 +86,6 @@ def _bounded_usage(payload: dict[str, Any]) -> tuple[int, int, int] | None:
         return None
     prompt = usage.get("prompt_tokens")
     completion = usage.get("completion_tokens")
-    cost = usage.get("cost", 0)
     if (
         not isinstance(prompt, int)
         or isinstance(prompt, bool)
@@ -90,11 +95,253 @@ def _bounded_usage(payload: dict[str, Any]) -> tuple[int, int, int] | None:
         or completion < 0
     ):
         return None
-    try:
-        microusd = max(0, int(float(cost) * 1_000_000))
-    except (TypeError, ValueError, OverflowError):
-        microusd = 0
-    return prompt, completion, microusd
+    if prompt + completion > (1 << 62):
+        return None
+    # Provider-supplied cost is intentionally ignored. The ticket pins catalog
+    # prices and the trusted plane derives cost from validated token counts.
+    return prompt, completion, 0
+
+
+def _bounded_provider_cost(payload: dict[str, Any]) -> int | None:
+    """Convert OpenRouter's direct response cost to bounded integer micro-USD."""
+    usage = payload.get("usage")
+    value = usage.get("cost") if isinstance(usage, dict) else None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    cost = float(value)
+    if not math.isfinite(cost) or cost < 0 or cost > 100:
+        return None
+    return round(cost * 1_000_000)
+
+
+def _upstream_provider(payload: dict[str, Any]) -> str | None:
+    """Extract one actual provider from private OpenRouter routing metadata."""
+    metadata = payload.get("openrouter_metadata")
+    if metadata is None:
+        # Bounded compatibility for older OpenRouter responses. Current
+        # responses expose this only through opt-in router metadata, and cache
+        # hits can intentionally omit that metadata.
+        provider = payload.get("provider")
+        return (
+            provider
+            if isinstance(provider, str) and 1 <= len(provider) <= 120
+            else None
+        )
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=502, detail="provider identity mismatch")
+    endpoints = metadata.get("endpoints")
+    available = endpoints.get("available") if isinstance(endpoints, dict) else None
+    if not isinstance(available, list):
+        raise HTTPException(status_code=502, detail="provider identity mismatch")
+    selected = [
+        endpoint.get("provider")
+        for endpoint in available
+        if isinstance(endpoint, dict) and endpoint.get("selected") is True
+    ]
+    if (
+        len(selected) != 1
+        or not isinstance(selected[0], str)
+        or not 1 <= len(selected[0]) <= 120
+    ):
+        raise HTTPException(status_code=502, detail="provider identity mismatch")
+    return selected[0]
+
+
+def _public_provider_response(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return only the normalized Chat Completions contract used by harnesses.
+
+    OpenRouter's additive response surface includes provider-specific system
+    fingerprints, service tiers, native finish reasons, error metadata, and
+    opt-in routing details. None belongs across the untrusted harness boundary.
+    """
+    response_id = payload.get("id")
+    created = payload.get("created")
+    model = payload.get("model")
+    choices = payload.get("choices")
+    if (
+        not isinstance(response_id, str)
+        or not 1 <= len(response_id) <= 256
+        or not isinstance(created, int)
+        or isinstance(created, bool)
+        or payload.get("object") != "chat.completion"
+        or not isinstance(model, str)
+        or not isinstance(choices, list)
+        or len(choices) != 1
+    ):
+        raise HTTPException(status_code=502, detail="invalid provider response")
+
+    choice = choices[0]
+    if not isinstance(choice, dict) or "error" in choice:
+        raise HTTPException(status_code=502, detail="inference provider unavailable")
+    index = choice.get("index")
+    finish_reason = choice.get("finish_reason")
+    message = choice.get("message")
+    if (
+        not isinstance(index, int)
+        or isinstance(index, bool)
+        or finish_reason not in {"stop", "length", "tool_calls", "content_filter"}
+        or not isinstance(message, dict)
+        or message.get("role") != "assistant"
+        or message.get("content") is not None
+        and not isinstance(message.get("content"), str)
+    ):
+        raise HTTPException(status_code=502, detail="invalid provider response")
+
+    public_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": message.get("content"),
+    }
+    tool_calls = message.get("tool_calls")
+    if tool_calls is not None:
+        if not isinstance(tool_calls, list):
+            raise HTTPException(status_code=502, detail="invalid provider response")
+        public_calls: list[dict[str, Any]] = []
+        for call in tool_calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            if (
+                not isinstance(call, dict)
+                or call.get("type") != "function"
+                or not isinstance(call.get("id"), str)
+                or not isinstance(function, dict)
+                or not isinstance(function.get("name"), str)
+                or not isinstance(function.get("arguments"), str)
+            ):
+                raise HTTPException(status_code=502, detail="invalid provider response")
+            public_calls.append(
+                {
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {
+                        "name": function["name"],
+                        "arguments": function["arguments"],
+                    },
+                }
+            )
+        public_message["tool_calls"] = public_calls
+
+    usage = _bounded_usage(payload)
+    if usage is None:
+        raise HTTPException(status_code=502, detail="invalid provider response")
+    prompt_tokens, completion_tokens, _ = usage
+    return {
+        "id": response_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": index,
+                "finish_reason": finish_reason,
+                "message": public_message,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
+def _provider_preferences(
+    *,
+    routing_mode: str,
+    provider: str,
+    quantization: str | None,
+) -> dict[str, Any]:
+    if routing_mode == "aggregate_throughput":
+        return {
+            "sort": "throughput",
+            "allow_fallbacks": True,
+            "data_collection": "deny",
+            "zdr": True,
+        }
+    preferences: dict[str, Any] = {
+        "only": [provider],
+        "allow_fallbacks": False,
+        "data_collection": "deny",
+        "zdr": True,
+    }
+    if quantization:
+        preferences["quantizations"] = [quantization]
+    return preferences
+
+
+_ALLOWED_REQUEST_FIELDS = {
+    "model",
+    "messages",
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "seed",
+    "stop",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "n",
+    "best_of",
+    "stream",
+}
+
+
+def _validate_request_schema(payload: dict[str, Any]) -> None:
+    """Accept only the text/tool subset used by the benchmark harness."""
+    unknown = set(payload) - _ALLOWED_REQUEST_FIELDS
+    if unknown:
+        raise HTTPException(status_code=400, detail="unsupported inference parameter")
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="messages must be non-empty")
+    for message in messages:
+        if not isinstance(message, dict):
+            raise HTTPException(status_code=400, detail="invalid message")
+        role = message.get("role")
+        if not isinstance(role, str):
+            raise HTTPException(status_code=400, detail="invalid message")
+        allowed = {
+            "system": {"role", "content"},
+            "user": {"role", "content"},
+            "assistant": {"role", "content", "tool_calls"},
+            "tool": {"role", "content", "tool_call_id"},
+        }.get(role)
+        if allowed is None or set(message) - allowed:
+            raise HTTPException(status_code=400, detail="invalid message")
+        if message.get("content") is not None and not isinstance(
+            message.get("content"), str
+        ):
+            raise HTTPException(status_code=400, detail="text content only")
+        tool_calls = message.get("tool_calls", [])
+        if not isinstance(tool_calls, list):
+            raise HTTPException(status_code=400, detail="invalid tool calls")
+        for call in tool_calls:
+            if not isinstance(call, dict) or set(call) - {"id", "type", "function"}:
+                raise HTTPException(status_code=400, detail="invalid tool call")
+            function = call.get("function")
+            if (
+                call.get("type") != "function"
+                or not isinstance(call.get("id"), str)
+                or not isinstance(function, dict)
+                or set(function) - {"name", "arguments"}
+                or not isinstance(function.get("name"), str)
+                or not isinstance(function.get("arguments"), str)
+            ):
+                raise HTTPException(status_code=400, detail="invalid tool call")
+    tools = payload.get("tools", [])
+    if not isinstance(tools, list):
+        raise HTTPException(status_code=400, detail="invalid tools")
+    for tool in tools:
+        if not isinstance(tool, dict) or set(tool) - {"type", "function"}:
+            raise HTTPException(status_code=400, detail="function tools only")
+        function = tool.get("function")
+        if (
+            tool.get("type") != "function"
+            or not isinstance(function, dict)
+            or set(function) - {"name", "description", "parameters", "strict"}
+            or not isinstance(function.get("name"), str)
+            or not isinstance(function.get("parameters", {}), dict)
+        ):
+            raise HTTPException(status_code=400, detail="invalid function tool")
 
 
 def _output_token_limit(payload: dict[str, Any], maximum: int) -> int:
@@ -123,6 +370,24 @@ def _output_token_limit(payload: dict[str, Any], maximum: int) -> int:
             status_code=400, detail="max_tokens exceeds the ticket limit"
         )
     return value
+
+
+def _locked_upstream_payload(
+    payload: dict[str, Any], *, model: str, max_tokens: int
+) -> dict[str, Any]:
+    """Force consensus model/reasoning fields before provider routing."""
+    upstream = dict(payload)
+    upstream.pop("max_completion_tokens", None)
+    upstream.pop("best_of", None)
+    upstream["model"] = model
+    upstream["max_tokens"] = max_tokens
+    upstream["stream"] = False
+    reasoning = benchmark_reasoning(model)
+    if reasoning is None:
+        upstream.pop("reasoning", None)
+    else:
+        upstream["reasoning"] = reasoning
+    return upstream
 
 
 @router.post("/exchange", response_model=InferenceExchangeResponse)
@@ -175,6 +440,7 @@ async def exchange_inference_grant(
             validator_hotkey=payload.validator_hotkey,
             broker_public_key=payload.broker_public_key,
             now=now,
+            config=config,
         )
     if activated is None:
         raise HTTPException(status_code=409, detail="inference grant is not live")
@@ -186,6 +452,9 @@ async def exchange_inference_grant(
         proxy_url=f"{config.public_base_url}/api/v1/inference/chat/completions",
         expires_at=grant.expires_at,
         generation=grant.generation,
+        provider=grant.route_provider if grant.bench_version >= 7 else None,
+        profile_revision=grant.route_profile if grant.bench_version >= 7 else None,
+        model=grant.allowed_models[0] if grant.bench_version >= 7 else None,
     )
 
 
@@ -231,6 +500,7 @@ async def proxy_chat_completions(
         raise HTTPException(status_code=400, detail="invalid JSON request") from error
     if not isinstance(payload, dict) or payload.get("stream") not in {None, False}:
         raise HTTPException(status_code=400, detail="streaming is not supported")
+    _validate_request_schema(payload)
     model = payload.get("model")
     if not isinstance(model, str) or model not in config.allowed_models:
         raise HTTPException(status_code=403, detail="model is not permitted")
@@ -287,21 +557,25 @@ async def proxy_chat_completions(
         if reserved is None:
             raise HTTPException(status_code=429, detail="inference grant unavailable")
 
-    upstream_payload = dict(payload)
-    upstream_payload.pop("max_completion_tokens", None)
-    upstream_payload.pop("best_of", None)
-    upstream_payload["model"] = model
-    upstream_payload["max_tokens"] = max_tokens
-    upstream_payload["stream"] = False
-    upstream_payload["provider"] = {
-        "only": [config.provider],
-        "allow_fallbacks": False,
-        "data_collection": "deny",
-        "zdr": True,
-    }
+    upstream_payload = _locked_upstream_payload(
+        payload, model=model, max_tokens=max_tokens
+    )
+    reserved_grant = reserved[0]
+    if not reserved_grant.route_provider:
+        raise HTTPException(status_code=409, detail="inference route unavailable")
+    aggregate_routing = config.routing_mode == "aggregate_throughput"
+    upstream_payload["provider"] = _provider_preferences(
+        routing_mode=config.routing_mode,
+        provider=reserved_grant.route_provider,
+        quantization=reserved_grant.route_quantization,
+    )
     status = "failed"
     usage: tuple[int, int, int] | None = None
     raw: bytes | None = None
+    started = time.monotonic()
+    timed_out = False
+    route_observable = False
+    upstream_provider: str | None = None
     try:
         upstream = await request.app.state.inference_client.post(
             config.upstream_url,
@@ -309,9 +583,14 @@ async def proxy_chat_completions(
             headers={
                 "Authorization": f"Bearer {config.openrouter_api_key}",
                 "Content-Type": "application/json",
+                # OpenRouter keeps route identity private unless explicitly
+                # requested. It is consumed below for trusted telemetry and
+                # removed by the public response allowlist.
+                "X-OpenRouter-Metadata": "enabled",
             },
         )
         raw = upstream.content
+        route_observable = upstream.status_code == 429 or upstream.status_code >= 500
         if len(raw) > config.response_body_bytes:
             raise HTTPException(
                 status_code=502, detail="provider response is too large"
@@ -326,19 +605,58 @@ async def proxy_chat_completions(
             raise HTTPException(
                 status_code=502, detail="invalid provider response"
             ) from error
+        route_observable = True
         usage = _bounded_usage(decoded if isinstance(decoded, dict) else {})
+        if not isinstance(decoded, dict) or decoded.get("model") != model:
+            raise HTTPException(status_code=502, detail="provider identity mismatch")
+        provider_value = _upstream_provider(decoded)
+        if provider_value is None:
+            raise HTTPException(status_code=502, detail="provider identity mismatch")
+        upstream_provider = provider_value
+        if not aggregate_routing and provider_value != reserved_grant.route_provider:
+            raise HTTPException(status_code=502, detail="provider identity mismatch")
+        if usage is not None:
+            prompt, completion, _ = usage
+            if aggregate_routing:
+                trusted_cost = _bounded_provider_cost(decoded)
+                if trusted_cost is None:
+                    usage = None
+                else:
+                    usage = (prompt, completion, trusted_cost)
+            elif (
+                reserved_grant.route_prompt_price_per_token is None
+                or reserved_grant.route_completion_price_per_token is None
+            ):
+                usage = None
+            else:
+                trusted_cost = int(
+                    (
+                        prompt * reserved_grant.route_prompt_price_per_token
+                        + completion * reserved_grant.route_completion_price_per_token
+                    )
+                    * 1_000_000
+                )
+                usage = (prompt, completion, trusted_cost)
+        # The harness needs the normalized completion and token counts, not
+        # provider, payer, router, system-fingerprint, or native-error metadata.
+        public_response = _public_provider_response(decoded)
+        raw = json.dumps(public_response, separators=(",", ":")).encode()
         status = "completed"
     except httpx.TimeoutException as error:
+        timed_out = True
+        route_observable = True
         raise HTTPException(
             status_code=504, detail="inference provider timed out"
         ) from error
     except httpx.HTTPError as error:
+        route_observable = True
         raise HTTPException(
             status_code=502, detail="inference provider unavailable"
         ) from error
     except HTTPException:
         raise
     finally:
+        finished_at = datetime.now(UTC)
         async with session_maker() as session, session.begin():
             deliverable = await finish_inference_request(
                 session,
@@ -350,8 +668,25 @@ async def proxy_chat_completions(
                 completion_tokens=usage[1] if usage is not None else 0,
                 cost_microusd=usage[2] if usage is not None else 0,
                 usage_available=usage is not None,
-                now=datetime.now(UTC),
+                now=finished_at,
+                upstream_provider=upstream_provider,
+                timed_out=timed_out,
+                latency_ms=max(0, round((time.monotonic() - started) * 1000)),
             )
+            from ditto.db.models import InferenceGrant
+
+            observed_grant = await session.get(InferenceGrant, x_ditto_grant)
+            if observed_grant is not None and route_observable:
+                await record_route_observation(
+                    session,
+                    grant=observed_grant,
+                    success=status == "completed" and usage is not None,
+                    latency_ms=(time.monotonic() - started) * 1000,
+                    completion_tokens=usage[1] if usage is not None else 0,
+                    cost_microusd=usage[2] if usage is not None else 0,
+                    timed_out=timed_out,
+                    now=finished_at,
+                )
     if not deliverable or raw is None:
         raise HTTPException(status_code=409, detail="inference grant is no longer live")
     return Response(

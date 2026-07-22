@@ -844,6 +844,8 @@ def heartbeat_supports_version(
     # validator that can advertise a post-v2 benchmark is already >= 8.
     if heartbeat.protocol_version < 8:
         return False
+    if version >= 7 and heartbeat.protocol_version < 11:
+        return False
     seen_at = (
         heartbeat.seen_at.replace(tzinfo=UTC)
         if heartbeat.seen_at.tzinfo is None
@@ -863,6 +865,10 @@ def heartbeat_supports_version(
         scorer is None
         or scorer.status != "fresh_verified"
         or version not in scorer.supported_bench_versions
+    ):
+        return False
+    if version >= 7 and (
+        not capabilities.ticket_inference or scorer.v7_calibration is None
     ):
         return False
     if (

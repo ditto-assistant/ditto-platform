@@ -109,6 +109,7 @@ from ditto.api_server.dependencies import (
 )
 from ditto.api_server.endpoints.retrieval import AgentNotFoundError
 from ditto.api_server.fingerprint import reference_corpus_provenance
+from ditto.api_server.inference_routing import record_ticket_route_quality
 from ditto.api_server.koth import (
     TOP5_MAX_CONFIRMATION_SEEDS,
     KothEntry,
@@ -684,8 +685,9 @@ def _heartbeat_signing_message(
         if benchmark_capacity is None:
             raise ValueError("heartbeat protocol v10 requires benchmark capacity")
         active = str(active_agent_id) if active_agent_id is not None else ""
+        signing_revision = "v11" if protocol_version >= 11 else "v10"
         return (
-            "ditto-validator-heartbeat:v10:"
+            f"ditto-validator-heartbeat:{signing_revision}:"
             f"{validator_hotkey}:{software_version}:{protocol_version}:"
             f"{code_digest}:{state}:{active}:"
             f"{system_metrics_signing_token(system_metrics)}:"
@@ -1097,7 +1099,16 @@ async def request_job(
                 status_code=409, detail="job claim nonce has already been used"
             ) from exc
         heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
-        inference_required = request.app.state.config.inference_proxy.required
+        canonical_version = await active_bench_version(session)
+        rollout = await open_rollout(session)
+        target_version = (
+            rollout.desired_version if rollout is not None else canonical_version
+        )
+        inference_required = (
+            request.app.state.config.inference_proxy.required or target_version >= 7
+        )
+        heartbeat_capabilities: ValidatorCapabilities | None = None
+        v7_calibration = None
         if inference_required:
             try:
                 heartbeat_capabilities = ValidatorCapabilities.model_validate(
@@ -1106,9 +1117,15 @@ async def request_job(
             except ValidationError:
                 return Response(status_code=204)
             if (
+                heartbeat_capabilities.scorer_benchmarks is not None
+                and target_version >= 7
+            ):
+                v7_calibration = heartbeat_capabilities.scorer_benchmarks.v7_calibration
+            if (
                 heartbeat is None
-                or heartbeat.protocol_version < 10
+                or heartbeat.protocol_version < (11 if target_version >= 7 else 10)
                 or not heartbeat_capabilities.ticket_inference
+                or (target_version >= 7 and v7_calibration is None)
             ):
                 return Response(status_code=204)
         slot_id = payload.slot_id or "slot-0"
@@ -1135,7 +1152,6 @@ async def request_job(
                 or slot_id not in capacity.healthy_slots
             ):
                 return Response(status_code=204)
-        rollout = await open_rollout(session)
         if rollout is not None:
             fresh_lane_due = (
                 heartbeat is not None
@@ -1202,7 +1218,6 @@ async def request_job(
                 validator_running_benchmark=slot_running_benchmark,
                 slot_id=slot_id,
             )
-        canonical_version = await active_bench_version(session)
         if ticket is None:
             # During an open rollout, a source-version validator may resume a
             # source-version lease. Once activation completes, only the active
@@ -1299,6 +1314,19 @@ async def request_job(
                 session,
                 ticket=ticket,
                 config=request.app.state.config.inference_proxy,
+                supported_profiles=(
+                    tuple(
+                        route.profile_revision
+                        for route in v7_calibration.supported_routes
+                    )
+                    if ticket.bench_version >= 7 and v7_calibration is not None
+                    else None
+                ),
+                calibration_manifest_sha256=(
+                    v7_calibration.manifest_sha256
+                    if ticket.bench_version >= 7 and v7_calibration is not None
+                    else None
+                ),
             )
             if inference_required and inference_grant is None:
                 raise HTTPException(
@@ -1348,6 +1376,16 @@ async def request_job(
                         request_budget=inference_grant.request_budget,
                         token_budget=inference_grant.token_budget,
                         expires_at=inference_grant.expires_at,
+                        provider=(
+                            inference_grant.route_provider
+                            if ticket.bench_version >= 7
+                            else None
+                        ),
+                        profile_revision=(
+                            inference_grant.route_profile
+                            if ticket.bench_version >= 7
+                            else None
+                        ),
                     )
                     if inference_grant is not None
                     else None
@@ -2317,6 +2355,16 @@ async def submit_score(
             generated_at=report.generated_at,
             signature=payload.signature,
             details=score_details or None,
+        )
+        await record_ticket_route_quality(
+            session,
+            agent_id=agent_id,
+            bench_version=ticket.bench_version,
+            validator_hotkey=payload.validator_hotkey,
+            ticket_deadline=ticket.deadline,
+            tool_accuracy=report.tool_mean,
+            composite=report.composite,
+            now=datetime.now(UTC),
         )
         # Append the immutable, hash-chained audit entry for this score in the
         # same transaction (durable iff the score is). Records the full signed

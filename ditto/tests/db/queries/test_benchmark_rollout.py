@@ -39,6 +39,8 @@ from ditto.db.models import (
     BenchmarkRolloutAudit,
     BenchmarkRolloutMember,
     EvaluationPayment,
+    InferenceProviderRoute,
+    InferenceRoutingPolicy,
     Score,
     ValidatorHeartbeat,
     ValidatorTicket,
@@ -115,6 +117,7 @@ def _capabilities(now: datetime) -> tuple[dict, dict]:
         "full_stack_managed": False,
         "stack_updater": False,
         "sandbox_egress_restricted": True,
+        "ticket_inference": True,
         "executor_isolation": "privileged_dind",
         "scorer_benchmarks": {
             "status": "fresh_verified",
@@ -122,6 +125,16 @@ def _capabilities(now: datetime) -> tuple[dict, dict]:
             "observed_at": int(now.timestamp()),
             "software_version": "1.3.0",
             "source_revision": revision,
+            "v7_calibration": {
+                "manifest_sha256": "c" * 64,
+                "supported_routes": [
+                    {
+                        "provider": "Groq",
+                        "profile_revision": "openrouter-route-test-v1",
+                        "model": "openai/gpt-oss-20b",
+                    }
+                ],
+            },
         },
     }
     components = {
@@ -148,7 +161,49 @@ def _capabilities(now: datetime) -> tuple[dict, dict]:
     return capabilities, stack
 
 
+def _add_ready_v7_route(session, now: datetime) -> None:
+    session.add(
+        InferenceRoutingPolicy(
+            model="openai/gpt-oss-20b",
+            enabled=True,
+            speed_weight=0.65,
+            cost_weight=0.25,
+            exploration_weight=0.10,
+            exploration_ticket_budget=3,
+            min_tool_accuracy=0.55,
+            min_composite=0.15,
+            min_calibration_samples=20,
+            max_error_rate=0.25,
+            max_timeout_rate=0.15,
+            cooldown_seconds=30,
+            ewma_alpha=0.20,
+            updated_at=now,
+        )
+    )
+    session.add(
+        InferenceProviderRoute(
+            model="openai/gpt-oss-20b",
+            provider="Groq",
+            profile_revision="openrouter-route-test-v1",
+            status="healthy",
+            calibration_status="eligible",
+            calibration_tool_accuracy=0.65,
+            calibration_composite=0.20,
+            calibration_sample_count=60,
+            calibration_manifest_sha256="c" * 64,
+            ewma_error_rate=0,
+            ewma_timeout_rate=0,
+            sample_count=60,
+            selected_ticket_count=0,
+            exploration_ticket_count=0,
+            discovered_at=now,
+            updated_at=now,
+        )
+    )
+
+
 async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRollout]:
+    _add_ready_v7_route(session, now)
     agent_ids = [uuid4() for _ in range(5)]
     members = []
     pins = {}
@@ -211,7 +266,7 @@ async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRo
             ValidatorHeartbeat(
                 validator_hotkey=hotkey,
                 software_version="1.0.0",
-                protocol_version=8,
+                protocol_version=11,
                 code_digest="d" * 64,
                 state="polling",
                 first_seen_at=now,
@@ -499,7 +554,7 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
         assert heartbeat_supports_version(heartbeat, now=now)
         heartbeat.protocol_version = 7
         assert not heartbeat_supports_version(heartbeat, now=now)
-        heartbeat.protocol_version = 8
+        heartbeat.protocol_version = 11
 
         for validator_index, hotkey in enumerate(("validator-a", "validator-b")):
             for agent_index in range(5):
@@ -827,7 +882,7 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists()
             ValidatorHeartbeat(
                 validator_hotkey="validator-d",
                 software_version="1.0.0",
-                protocol_version=8,
+                protocol_version=11,
                 code_digest="d" * 64,
                 state="polling",
                 first_seen_at=now,
@@ -1462,7 +1517,7 @@ async def test_capable_validator_cannot_automatically_seed_rollout_work() -> Non
             ValidatorHeartbeat(
                 validator_hotkey="validator-auto",
                 software_version="1.0.0",
-                protocol_version=8,
+                protocol_version=11,
                 code_digest="d" * 64,
                 state="polling",
                 first_seen_at=now,
@@ -1473,6 +1528,7 @@ async def test_capable_validator_cannot_automatically_seed_rollout_work() -> Non
                 stack=stack,
             )
         )
+        _add_ready_v7_route(session, now)
 
     generator = AsyncMock()
     generator.generate.return_value = "e" * 64
@@ -1609,7 +1665,7 @@ async def test_rollout_start_requires_one_capable_validator_and_matches_telemetr
                 ValidatorHeartbeat(
                     validator_hotkey=f"validator-{index}",
                     software_version="1.0.0",
-                    protocol_version=8,
+                    protocol_version=11,
                     code_digest="d" * 64,
                     state="polling",
                     first_seen_at=now,
@@ -1620,6 +1676,7 @@ async def test_rollout_start_requires_one_capable_validator_and_matches_telemetr
                     stack=stack,
                 )
             )
+        _add_ready_v7_route(session, now)
         await session.flush()
 
         telemetry = await rollout_state(session, now=now)
@@ -1640,11 +1697,50 @@ async def test_rollout_start_requires_one_capable_validator_and_matches_telemetr
     await engine.dispose()
 
 
+async def test_v7_rollout_start_requires_route_and_manifest_intersection() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    capabilities, stack = _capabilities(now)
+    capabilities["scorer_benchmarks"]["v7_calibration"]["manifest_sha256"] = "d" * 64
+    async with maker() as session, session.begin():
+        session.add(
+            ValidatorHeartbeat(
+                validator_hotkey="validator-mismatched-manifest",
+                software_version="1.0.0",
+                protocol_version=11,
+                code_digest="d" * 64,
+                state="polling",
+                first_seen_at=now,
+                reported_at=now,
+                seen_at=now,
+                signature="ab" * 64,
+                capabilities=capabilities,
+                stack=stack,
+            )
+        )
+        _add_ready_v7_route(session, now)
+        await session.flush()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await _require_rollout_start_capacity(
+                session, now=now, desired_version=CANARY_BENCH_VERSION
+            )
+        assert exc_info.value.status_code == 409
+        assert "exact route and manifest match" in str(exc_info.value.detail)
+    await engine.dispose()
+
+
 def _heartbeat(
     hotkey: str, now: datetime, *, versions: list[int], protocol_version: int = 8
 ) -> ValidatorHeartbeat:
     capabilities, stack = _capabilities(now)
     capabilities["scorer_benchmarks"]["supported_bench_versions"] = versions
+    if 7 not in versions:
+        capabilities["scorer_benchmarks"].pop("v7_calibration", None)
+        capabilities["ticket_inference"] = False
     return ValidatorHeartbeat(
         validator_hotkey=hotkey,
         software_version="1.0.0",

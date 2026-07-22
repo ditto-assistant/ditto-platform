@@ -448,7 +448,9 @@ class ValidatorHeartbeatRequest(BaseModel):
         BenchmarkCapacity | None,
         Field(
             default=None,
-            description="Signed bounded slot capacity and progress under protocol v10.",
+            description=(
+                "Signed bounded slot capacity and progress under protocols v10-v11."
+            ),
         ),
     ] = None
     timestamp: Annotated[
@@ -512,6 +514,19 @@ class ValidatorHeartbeatRequest(BaseModel):
             ):
                 raise ValueError(
                     "v10 legacy active fields must mirror the first active slot"
+                )
+            if (
+                self.protocol_version >= 11
+                and self.capabilities is not None
+                and self.capabilities.scorer_benchmarks is not None
+                and 7 in self.capabilities.scorer_benchmarks.supported_bench_versions
+                and (
+                    not self.capabilities.ticket_inference
+                    or self.capabilities.scorer_benchmarks.v7_calibration is None
+                )
+            ):
+                raise ValueError(
+                    "heartbeat v11 requires exact v7 inference calibration identity"
                 )
         elif self.benchmark_capacity is not None:
             raise ValueError("benchmark capacity requires heartbeat protocol v10")

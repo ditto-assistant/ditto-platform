@@ -50,7 +50,9 @@ from ditto.api_models.system_health import (
 )
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator_capabilities import (
+    InferenceCalibrationRoute,
     ScorerBenchmarkCapability,
+    V7InferenceCalibration,
     ValidatorCapabilities,
     ValidatorStackIdentity,
     validator_identity_signing_token,
@@ -267,6 +269,33 @@ def test_scorer_benchmark_capability_is_conservative_unless_fresh_verified() -> 
     )
     assert verified.supported_bench_versions == (2, 3)
 
+    with pytest.raises(ValueError, match="requires exact inference calibration"):
+        ScorerBenchmarkCapability(
+            status="fresh_verified",
+            supported_bench_versions=(2, 7),
+            observed_at=1784020800,
+            software_version="1.3.0",
+            source_revision="a" * 40,
+        )
+    calibrated = ScorerBenchmarkCapability(
+        status="fresh_verified",
+        supported_bench_versions=(2, 7),
+        observed_at=1784020800,
+        software_version="1.3.0",
+        source_revision="a" * 40,
+        v7_calibration=V7InferenceCalibration(
+            manifest_sha256="b" * 64,
+            supported_routes=(
+                InferenceCalibrationRoute(
+                    provider="Groq",
+                    profile_revision="openrouter-route-groq-v1",
+                    model="openai/gpt-oss-20b",
+                ),
+            ),
+        ),
+    )
+    assert calibrated.v7_calibration is not None
+
 
 def _sign(message: str) -> str:
     return _KEYPAIR.sign(message.encode()).hex()
@@ -431,8 +460,9 @@ def _heartbeat_payload(
             typed_capacity = BenchmarkCapacity.model_validate_json(
                 json.dumps(benchmark_capacity)
             )
+            domain = "v11" if protocol_version >= 11 else "v10"
             message = (
-                f"ditto-validator-heartbeat:v10:{hotkey}:0.1.0:{protocol_version}:"
+                f"ditto-validator-heartbeat:{domain}:{hotkey}:0.1.0:{protocol_version}:"
                 f"{code_digest}:{state}:{active_agent_id or ''}:"
                 f"{system_metrics_signing_token(metrics)}:"
                 f"{benchmark_progress_signing_token(progress)}:"

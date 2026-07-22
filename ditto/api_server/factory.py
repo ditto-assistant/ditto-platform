@@ -27,6 +27,7 @@ from ditto.api_server.embedding import create_embedder
 from ditto.api_server.endpoints import (
     admin_benchmark_rollout_router,
     admin_copy_review_router,
+    admin_inference_routes_router,
     admin_miner_fees_router,
     admin_quarantine_router,
     admin_scoring_readiness_router,
@@ -43,6 +44,7 @@ from ditto.api_server.endpoints import (
     validator_router,
 )
 from ditto.api_server.errors import ApiServerLifespanError
+from ditto.api_server.inference_routing import ProviderRouteRefresher
 from ditto.api_server.middleware import (
     AuthPassThroughMiddleware,
     PublicCacheMiddleware,
@@ -136,6 +138,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             stack.push_async_callback(inference_client.aclose)
             app.state.inference_client = inference_client
+            provider_routes = ProviderRouteRefresher(
+                config=config.inference_proxy,
+                session_maker=app.state.session_maker,
+                client=inference_client,
+            )
+            stack.push_async_callback(provider_routes.aclose)
+            await provider_routes.start()
+            app.state.inference_provider_routes = provider_routes
 
             validator_names = app.state.validator_names
             stack.push_async_callback(validator_names.aclose)
@@ -211,6 +221,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(scoring_router, prefix="/api/v1")
     app.include_router(public_router, prefix="/api/v1")
     app.include_router(admin_benchmark_rollout_router, prefix="/api/v1")
+    app.include_router(admin_inference_routes_router, prefix="/api/v1")
     app.include_router(admin_quarantine_router, prefix="/api/v1")
     app.include_router(admin_validation_retry_router, prefix="/api/v1")
     app.include_router(admin_scoring_readiness_router, prefix="/api/v1")

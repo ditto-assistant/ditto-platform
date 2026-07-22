@@ -59,6 +59,8 @@ class TestParseApiServerConfigFromEnv:
         assert config.validator_compatibility.minimum_software_version == "0.7.0"
         assert config.validator_compatibility.minimum_protocol_version == 4
         assert config.validator_compatibility.heartbeat_max_age_seconds == 300
+        assert config.inference_proxy.routing_mode == "aggregate_throughput"
+        assert config.inference_proxy.route_min_calibration_samples == 60
 
     def test_free_taostats_key_config_is_optional(
         self, monkeypatch: pytest.MonkeyPatch
@@ -163,6 +165,15 @@ class TestCheckConfig:
 
     def test_valid_config_passes(self):
         check_config(make_api_server_config())
+
+    def test_unknown_inference_routing_mode_fails_closed(self):
+        base = make_api_server_config()
+        config = replace(
+            base,
+            inference_proxy=replace(base.inference_proxy, routing_mode="unscoped"),
+        )
+        with pytest.raises(ApiServerConfigError, match="ROUTING_MODE"):
+            check_config(config)
 
     def test_port_out_of_range_raises(self):
         config = replace(make_api_server_config(), port=0)
