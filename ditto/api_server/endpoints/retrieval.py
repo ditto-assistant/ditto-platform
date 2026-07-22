@@ -84,9 +84,12 @@ async def agent_by_hotkey(
         agent_id=agent.agent_id,
         miner_hotkey=agent.miner_hotkey,
         name=agent.name,
+        version=agent.version,
         status=status,
         sha256=agent.sha256,
         created_at=agent.created_at,
+        screening_reason=agent.screening_reason,
+        screening_reason_code=agent.screening_reason_code,
     )
 
 
@@ -108,4 +111,9 @@ async def agent_status(
     agent = await get_agent_by_id(session, agent_id=agent_id)
     if agent is None:
         raise AgentNotFoundError(f"no agent with id={agent_id}")
-    return AgentStatusResponse(agent_id=agent.agent_id, status=agent.status)
+    return AgentStatusResponse(
+        agent_id=agent.agent_id,
+        status=agent.status,
+        screening_reason=agent.screening_reason,
+        screening_reason_code=agent.screening_reason_code,
+    )

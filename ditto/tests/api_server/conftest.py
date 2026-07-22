@@ -9,6 +9,7 @@ or set on the app directly.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal
 from typing import Any
@@ -18,7 +19,13 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from ditto.api_server import ApiServerConfig, ScreenerAuthConfig, create_api_server
+from ditto.api_server import (
+    ApiServerConfig,
+    ScreenerAuthConfig,
+    ValidatorCompatibilityConfig,
+    ValidatorNamesConfig,
+    create_api_server,
+)
 from ditto.api_server.datapipeline import DataPipelineConfig, NullGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -29,7 +36,7 @@ from ditto.api_server.dependencies import (
 )
 from ditto.api_server.embedding import EmbeddingConfig, NullEmbedder
 from ditto.api_server.pricing import PricingConfig
-from ditto.api_server.storage import StorageConfig
+from ditto.api_server.storage import ObjectMetadata, StorageConfig
 from ditto.chain import ChainConfig
 from ditto.db.config import PostgresConfig
 
@@ -90,6 +97,12 @@ def make_api_server_config(**overrides: Any) -> ApiServerConfig:
             hotkey="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
             api_token="test-screener-token-at-least-32-characters",
         ),
+        validator_names=ValidatorNamesConfig(),
+        validator_compatibility=ValidatorCompatibilityConfig(
+            minimum_software_version=None,
+            minimum_protocol_version=1,
+            heartbeat_max_age_seconds=300,
+        ),
     )
     if overrides:
         from dataclasses import replace
@@ -101,6 +114,10 @@ def make_api_server_config(**overrides: Any) -> ApiServerConfig:
 @pytest.fixture
 def app() -> Iterator[FastAPI]:
     """A fresh FastAPI app per test, with auto-cleared dependency overrides."""
+    # Endpoint tests assert per-request behavior; the public TTL cache would
+    # serve stale bodies across a test's mutate-then-refetch sequence. The
+    # middleware has its own coverage in tests/api_server/middleware.
+    os.environ["PUBLIC_CACHE_DISABLED"] = "1"
     a = create_api_server(make_api_server_config())
     # Lifespan does not run under ASGITransport, so set the bits the
     # health endpoint reads via app.state directly.
@@ -118,6 +135,19 @@ def app() -> Iterator[FastAPI]:
 
     default_storage = MagicMock()
     default_storage.public_bucket = None
+
+    async def _head_screened_image(*, key: str) -> ObjectMetadata:
+        agent_id = key.split("/", 1)[0]
+        return ObjectMetadata(
+            size_bytes=123,
+            metadata={
+                "sha256": "12" * 32,
+                "image-id": "sha256:" + "34" * 32,
+                "image-ref": f"ditto-screen/{agent_id}:latest",
+            },
+        )
+
+    default_storage.head_object = AsyncMock(side_effect=_head_screened_image)
     a.state.storage = default_storage
     yield a
     a.dependency_overrides.clear()

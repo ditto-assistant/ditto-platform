@@ -1,0 +1,530 @@
+"""Private Backroom/operator models for screening quarantine management."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Annotated, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
+
+QuarantineResolution = Literal["release", "rescreen", "reject"]
+DisputeResolution = Literal["release", "uphold"]
+
+
+class AdminQuarantineResolutionEvent(BaseModel):
+    resolution: QuarantineResolution
+    reason: str
+    actor: str
+    created_at: datetime
+
+
+class AdminQuarantineItem(BaseModel):
+    quarantine_id: UUID
+    agent_id: UUID
+    attempt_id: UUID
+    miner_hotkey: str
+    agent_name: str
+    agent_version: int | None = None
+    artifact_sha256: str
+    policy_version: int
+    manifest_digest: str
+    finding_digest: str | None
+    reason_code: str
+    evidence: list[ScreenEvidenceItem] | None
+    finding: SourceReviewFinding | None
+    finding_verified: bool
+    """True iff ``finding`` is present and its canonical digest equals the
+    ``finding_digest`` bound into the screener's signed verdict."""
+
+    status: Literal["active", "resolved"]
+    created_at: datetime
+    resolved_at: datetime | None
+    resolved_by: str | None
+    resolution: QuarantineResolution | None
+    resolution_reason: str | None
+    resolution_history: list[AdminQuarantineResolutionEvent] = Field(
+        default_factory=list
+    )
+
+
+class AdminQuarantineList(BaseModel):
+    items: list[AdminQuarantineItem]
+    count: int
+
+
+class AdminQuarantineResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: QuarantineResolution
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3)]
+
+
+class AdminQuarantineResolveResponse(BaseModel):
+    quarantine: AdminQuarantineItem
+    agent_status: str
+
+
+class AdminScreeningDisputeItem(BaseModel):
+    dispute_id: UUID
+    agent_id: UUID
+    quarantine_id: UUID
+    miner_hotkey: str
+    agent_name: str
+    agent_version: int | None
+    artifact_sha256: str
+    message: str
+    status: Literal["pending", "resolved"]
+    created_at: datetime
+    original_reason: str | None
+    resolved_at: datetime | None
+    resolved_by: str | None
+    resolution: DisputeResolution | None
+    resolution_reason: str | None
+
+
+class AdminScreeningDisputeList(BaseModel):
+    items: list[AdminScreeningDisputeItem]
+    count: int
+
+
+class AdminScreeningDisputeResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: DisputeResolution
+    reason: Annotated[str, Field(min_length=3, max_length=500)]
+
+
+class AdminScreeningDisputeResolveResponse(BaseModel):
+    dispute: AdminScreeningDisputeItem
+    agent_status: str
+
+
+class AdminScreeningAttempt(BaseModel):
+    attempt_id: UUID
+    policy_version: int
+    status: Literal["running", "passed", "rejected", "failed", "expired", "quarantined"]
+    screener_hotkey: str
+    started_at: datetime
+    deadline: datetime
+    finished_at: datetime | None
+    reason: str | None
+    reason_code: str | None
+    duplicate_of: UUID | None
+    duplicate_name: str | None = None
+    duplicate_version: int | None = None
+
+
+class AdminScreeningSubmission(BaseModel):
+    agent_id: UUID
+    miner_hotkey: str
+    agent_name: str
+    agent_version: int | None = None
+    artifact_sha256: str
+    agent_status: str
+    screening_policy_version: int
+    screening_reason: str | None
+    screening_reason_code: str | None
+    submitted_at: datetime
+    attempts: list[AdminScreeningAttempt]
+
+
+class AdminScreeningSubmissionList(BaseModel):
+    items: list[AdminScreeningSubmission]
+    count: int
+
+
+class AdminScreeningRescreenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_score_count: Annotated[int, Field(ge=0)]
+
+
+class AdminScreeningRescreenResponse(BaseModel):
+    agent_id: UUID
+    agent_status: str
+
+
+class AdminBenchmarkContractRefreshRequest(BaseModel):
+    """Compare-and-swap guard for rebuilding one stale benchmark contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_bench_version: Annotated[int, Field(gt=2)]
+    expected_dataset_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_score_count: Annotated[int, Field(ge=0)]
+
+
+class AdminBenchmarkContractRefreshDetail(BaseModel):
+    """Current compare-and-swap inputs for one guarded contract repair."""
+
+    agent_id: UUID
+    agent_name: str
+    agent_status: str
+    artifact_sha256: str
+    bench_version: int
+    dataset_sha256: str | None
+    score_count: int
+    screening_attempt_active: bool
+    refresh_allowed: bool
+    blocking_reason: str | None
+
+
+class AdminBenchmarkContractRefreshResponse(BaseModel):
+    agent_id: UUID
+    agent_status: str
+    bench_version: int
+    expired_ticket_count: int
+
+
+class AdminBenchmarkContractMigrationRequest(BaseModel):
+    """Compare-and-swap guard for moving one zero-score v2 artifact to v3."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_source_bench_version: Literal[2]
+    expected_target_bench_version: Literal[3]
+    expected_source_dataset_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_source_score_count: Literal[0]
+    expected_target_score_count: Literal[0]
+
+
+class AdminBenchmarkContractMigrationDetail(BaseModel):
+    """Current guarded inputs for one zero-score v2-to-v3 migration."""
+
+    agent_id: UUID
+    agent_name: str
+    agent_status: str
+    artifact_sha256: str
+    source_bench_version: int
+    target_bench_version: int | None
+    source_dataset_sha256: str | None
+    target_dataset_sha256: str | None
+    source_score_count: int
+    target_score_count: int
+    screening_attempt_active: bool
+    validator_run_active: bool
+    migration_allowed: bool
+    blocking_reason: str | None
+
+
+class AdminBenchmarkContractMigrationResponse(BaseModel):
+    agent_id: UUID
+    agent_status: str
+    source_bench_version: int
+    target_bench_version: int
+    target_dataset_sha256: str
+    expired_ticket_count: int
+
+
+class AdminBenchmarkQualificationRequest(BaseModel):
+    """Compare-and-swap guard for qualifying a scored rolling contender."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_rollout_id: UUID
+    expected_total_score_count: Annotated[int, Field(ge=0)]
+    expected_source_score_count: Annotated[int, Field(ge=0)]
+    expected_target_score_count: Annotated[int, Field(ge=0)]
+
+
+class AdminBenchmarkQualificationDetail(BaseModel):
+    agent_id: UUID
+    agent_name: str
+    agent_status: str
+    artifact_sha256: str
+    rollout_id: UUID | None
+    source_bench_version: int | None
+    target_bench_version: int | None
+    currently_top_five: bool
+    rollout_member: bool
+    target_dataset_sha256: str | None
+    total_score_count: int
+    source_score_count: int
+    target_score_count: int
+    screening_attempt_active: bool
+    validator_run_active: bool
+    qualification_allowed: bool
+    blocking_reason: str | None
+
+
+class AdminBenchmarkQualificationResponse(BaseModel):
+    agent_id: UUID
+    agent_status: str
+    rollout_id: UUID
+    target_bench_version: int
+    target_dataset_sha256: str
+    rollout_member: Literal[True] = True
+    screening_queued: bool
+
+
+class AdminQuarantineAgentContext(BaseModel):
+    """Submission metadata an operator needs while judging a quarantine."""
+
+    agent_id: UUID
+    miner_hotkey: str
+    agent_name: str
+    artifact_sha256: str
+    agent_status: str
+    size_bytes: int | None
+    submitted_at: datetime
+    screening_policy_version: int
+    screening_reason: str | None
+
+
+class AdminMinerQuarantineSummary(BaseModel):
+    """One prior quarantine from the same miner, with its resolution."""
+
+    quarantine_id: UUID
+    agent_id: UUID
+    agent_name: str
+    reason_code: str
+    status: Literal["active", "resolved"]
+    resolution: QuarantineResolution | None
+    resolution_reason: str | None
+    created_at: datetime
+    resolved_at: datetime | None
+
+
+class AdminMinerContext(BaseModel):
+    """The submitting miner's track record across all submissions."""
+
+    miner_hotkey: str
+    total_submissions: int
+    quarantine_count: int
+    released_count: int
+    rescreened_count: int
+    rejected_count: int
+    recent_quarantines: list[AdminMinerQuarantineSummary]
+
+
+class AdminArtifactDuplicate(BaseModel):
+    """Another submission whose artifact matches this one."""
+
+    agent_id: UUID
+    miner_hotkey: str
+    agent_name: str
+    agent_status: str
+    submitted_at: datetime
+    match: Literal["identical_artifact", "identical_normalized_source"]
+    same_owner: bool = False
+
+
+class AdminDuplicateSummary(BaseModel):
+    """Authoritative duplicate counts, independent of the bounded sample."""
+
+    total: int
+    cross_miner: int
+    same_miner: int
+    cross_owner: int
+    same_owner: int
+    sample_truncated: bool
+
+
+class AdminQuarantineContext(BaseModel):
+    """Everything the review console shows for one quarantine decision."""
+
+    quarantine: AdminQuarantineItem
+    agent: AdminQuarantineAgentContext
+    attempts: list[AdminScreeningAttempt]
+    miner: AdminMinerContext
+    duplicates: list[AdminArtifactDuplicate]
+    """A bounded sample (at most 20); use ``duplicate_summary`` for counts."""
+
+    duplicate_summary: AdminDuplicateSummary
+
+
+class AdminQuarantineBatchContextRequest(BaseModel):
+    """Bounded context fan-out for queue workbenches and MCP clients."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    quarantine_ids: Annotated[list[UUID], Field(min_length=1, max_length=50)]
+
+
+class AdminQuarantineBatchContextResult(BaseModel):
+    quarantine_id: UUID
+    context: AdminQuarantineContext | None = None
+    error: str | None = None
+
+
+class AdminQuarantineBatchContextResponse(BaseModel):
+    items: list[AdminQuarantineBatchContextResult]
+    count: int
+
+
+class AdminQuarantineBatchDecision(BaseModel):
+    """One guarded decision in a separately previewed batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    quarantine_id: UUID
+    expected_agent_id: UUID
+    expected_artifact_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    resolution: QuarantineResolution
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3)]
+
+
+class AdminQuarantineBatchPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: Annotated[
+        list[AdminQuarantineBatchDecision], Field(min_length=1, max_length=50)
+    ]
+
+
+class AdminQuarantineBatchPreviewItem(BaseModel):
+    quarantine_id: UUID
+    agent_id: UUID | None = None
+    agent_name: str | None = None
+    artifact_sha256: str | None = None
+    resolution: QuarantineResolution
+    reason: str
+    disposition: Literal["ready", "already_applied", "conflict", "not_found"]
+    resulting_agent_status: str | None = None
+    message: str
+
+
+class AdminQuarantineBatchPreviewResponse(BaseModel):
+    preview_token: str
+    expires_at: datetime
+    items: list[AdminQuarantineBatchPreviewItem]
+    ready_count: int
+    already_applied_count: int
+    blocked_count: int
+
+
+class AdminQuarantineBatchExecuteRequest(AdminQuarantineBatchPreviewRequest):
+    preview_token: Annotated[str, Field(min_length=32, max_length=256)]
+    confirmed: Literal[True]
+
+
+class AdminQuarantineBatchExecuteItem(BaseModel):
+    quarantine_id: UUID
+    status: Literal["applied", "already_applied", "failed"]
+    agent_status: str | None = None
+    message: str
+
+
+class AdminQuarantineBatchExecuteResponse(BaseModel):
+    items: list[AdminQuarantineBatchExecuteItem]
+    applied_count: int
+    already_applied_count: int
+    failed_count: int
+
+
+class AdminSourceFileEntry(BaseModel):
+    path: str
+    bytes: int
+
+
+class AdminOpaqueBlobEntry(BaseModel):
+    """A member the text reader cannot show; a natural hiding place."""
+
+    path: str
+    bytes: int
+    reason: Literal["oversized", "non_utf8"]
+
+
+class AdminSourceListing(BaseModel):
+    agent_id: UUID
+    artifact_sha256: str
+    file_count: int
+    files: list[AdminSourceFileEntry]
+    opaque_blobs: list[AdminOpaqueBlobEntry]
+    opaque_total: int
+    """Total unreadable members found; ``opaque_blobs`` shows at most 128."""
+
+    truncated: bool
+
+
+class AdminSourceLine(BaseModel):
+    line: int
+    text: str
+
+
+class AdminSourceExcerpt(BaseModel):
+    agent_id: UUID
+    path: str
+    total_lines: int
+    start_line: int
+    end_line: int
+    lines: list[AdminSourceLine]
+
+
+class AdminValidatorAssignment(BaseModel):
+    agent_id: UUID
+    agent_name: str
+    miner_hotkey: str
+    validator_hotkey: str
+    issued_at: datetime
+    deadline: datetime
+    bench_version: int
+    attempt_count: int
+    score_count: int
+    provisional_composite: float | None
+
+
+class AdminValidatorAssignmentList(BaseModel):
+    items: list[AdminValidatorAssignment]
+    count: int
+
+
+class AdminValidatorAssignmentReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_deadline: datetime
+    reason: Annotated[str, Field(min_length=8, max_length=500)]
+
+
+class AdminValidatorAssignmentReleaseResponse(BaseModel):
+    agent_id: UUID
+    validator_hotkey: str
+    status: Literal["expired"]
+    retry_after: datetime
+
+
+__all__ = [
+    "AdminArtifactDuplicate",
+    "AdminBenchmarkQualificationDetail",
+    "AdminBenchmarkQualificationRequest",
+    "AdminBenchmarkQualificationResponse",
+    "AdminDuplicateSummary",
+    "AdminMinerContext",
+    "AdminMinerQuarantineSummary",
+    "AdminOpaqueBlobEntry",
+    "AdminQuarantineAgentContext",
+    "AdminQuarantineContext",
+    "AdminQuarantineItem",
+    "AdminQuarantineList",
+    "AdminQuarantineResolutionEvent",
+    "AdminQuarantineResolveRequest",
+    "AdminQuarantineResolveResponse",
+    "AdminScreeningAttempt",
+    "AdminScreeningDisputeItem",
+    "AdminScreeningDisputeList",
+    "AdminScreeningDisputeResolveRequest",
+    "AdminScreeningDisputeResolveResponse",
+    "AdminScreeningSubmission",
+    "AdminScreeningSubmissionList",
+    "AdminScreeningRescreenRequest",
+    "AdminScreeningRescreenResponse",
+    "AdminSourceExcerpt",
+    "AdminSourceFileEntry",
+    "AdminSourceLine",
+    "AdminSourceListing",
+    "AdminValidatorAssignment",
+    "AdminValidatorAssignmentList",
+    "AdminValidatorAssignmentReleaseRequest",
+    "AdminValidatorAssignmentReleaseResponse",
+]

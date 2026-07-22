@@ -14,18 +14,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from statistics import median
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, and_, func, or_, select
+from sqlalchemy import ColumnElement, and_, case, func, literal, null, or_, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
-from ditto.db.models import Agent, Score
+from ditto.db.models import (
+    Agent,
+    BenchmarkRolloutMember,
+    EvaluationPayment,
+    Score,
+)
 from ditto.db.queries.agents import get_agent_by_id
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -65,7 +73,7 @@ def _is_ranked() -> ColumnElement[bool]:
 
 @dataclass(frozen=True)
 class LedgerRow:
-    """One entry of the best-eligible-score-per-miner ledger.
+    """One entry of the best-eligible-score-per-payment-coldkey ledger.
 
     The immutable value object :func:`list_eligible_ledger` returns and the
     ``GET /scoring/scores`` endpoint maps onto the ``LedgerEntry`` wire model.
@@ -86,6 +94,13 @@ class LedgerRow:
     validator_hotkey: str
     signature: str | None
     status: AgentStatus
+    miner_coldkey: str | None = None
+    """Payment-time owner identity used to enforce one emission position.
+
+    This is moderation-only metadata and is not exposed on the public scoring
+    wire model. ``None`` is retained for legacy rows that predate payments.
+    """
+    bench_version: int = 1
     content_fingerprint: dict | None = None
     """Shingle MinHash sketch of the tarball source (see
     :mod:`ditto.api_server.fingerprint`); the gate's content-level anti-copy
@@ -138,6 +153,22 @@ class LedgerRow:
     read it whole. ``None`` for rows scored before details were persisted."""
 
 
+def _emission_owner_key() -> ColumnElement[str]:
+    """Stable owner key for one-emission-position selection.
+
+    New uploads always carry an immutable payment-time coldkey. The hotkey
+    fallback preserves legacy/test rows without accidentally collapsing every
+    missing-payment row into one owner.
+    """
+    return case(
+        (
+            EvaluationPayment.miner_coldkey.is_not(None),
+            literal("coldkey:") + EvaluationPayment.miner_coldkey,
+        ),
+        else_=literal("hotkey:") + Agent.miner_hotkey,
+    )
+
+
 @dataclass(frozen=True)
 class HealthRollup:
     """Aggregate subnet-health counters for the public dashboard.
@@ -158,6 +189,8 @@ class HealthRollup:
     """``scored`` agents that actually carry a score row (eligible submissions)."""
     last_scored_at: datetime | None
     """Newest platform score-write time — when a validator last scored anything."""
+    total_scores: int
+    """All validator score records currently stored by the platform."""
     scores_24h: int
     """Scores generated in the last 24h — scoring throughput."""
     avg_latency_ms: int | None
@@ -217,6 +250,7 @@ async def get_public_health(session: AsyncSession, *, now: datetime) -> HealthRo
         scored_miners=int(scored[0]),
         scored_agents=int(scored[1]),
         last_scored_at=max(generated) if generated else None,
+        total_scores=len(rows),
         scores_24h=sum(1 for g in generated if g >= cutoff),
         avg_latency_ms=(round(sum(r[1] for r in rows) / len(rows)) if rows else None),
     )
@@ -227,6 +261,7 @@ async def upsert_score(
     *,
     agent_id: UUID,
     validator_hotkey: str,
+    bench_version: int = 2,
     run_id: str,
     seed: int,
     composite: float,
@@ -252,12 +287,13 @@ async def upsert_score(
             handler validates ranges + agent existence first — so the
             envelope catch-all maps them to HTTP 500.
     """
-    existing = await session.get(Score, (agent_id, validator_hotkey))
+    existing = await session.get(Score, (agent_id, bench_version, validator_hotkey))
     if existing is None:
         session.add(
             Score(
                 agent_id=agent_id,
                 validator_hotkey=validator_hotkey,
+                bench_version=bench_version,
                 run_id=run_id,
                 seed=seed,
                 composite=composite,
@@ -291,6 +327,7 @@ async def list_scores_for_agent(
     session: AsyncSession,
     *,
     agent_id: UUID,
+    bench_version: int | None = None,
 ) -> list[Score]:
     """Return every validator's score for ``agent_id`` (unordered).
 
@@ -298,9 +335,34 @@ async def list_scores_for_agent(
     the validator set. Returns an empty list when no validator has scored
     the agent yet.
     """
-    stmt = select(Score).where(Score.agent_id == agent_id)
+    if bench_version is None:
+        from ditto.db.queries.benchmark_rollout import active_bench_version
+
+        bench_version = await active_bench_version(session)
+    stmt = select(Score).where(
+        Score.agent_id == agent_id, Score.bench_version == bench_version
+    )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def get_score_for_validator(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    validator_hotkey: str,
+) -> Score | None:
+    """One validator's recorded score row for an agent, or ``None``.
+
+    Backs the transcript upload path: the declared ``transcript_sha256`` in
+    this row's details is what an uploaded artifact's bytes must hash to.
+    """
+    stmt = select(Score).where(
+        Score.agent_id == agent_id,
+        Score.validator_hotkey == validator_hotkey,
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
 
 
 # Agents whose scoring has settled into a public, non-provisional state. A held
@@ -344,7 +406,14 @@ async def get_submission_scores(
     agent = await get_agent_by_id(session, agent_id=agent_id)
     if agent is None or agent.status not in _PUBLIC_SUBMISSION_STATUSES:
         return None
-    scores = await list_scores_for_agent(session, agent_id=agent_id)
+    # Every version's rows, not just the active bench version: the public record
+    # covers older + current runs (each row is version-labeled downstream), and
+    # the submissions index batch-fetch is unfiltered the same way.
+    scores = list(
+        (await session.execute(select(Score).where(Score.agent_id == agent_id)))
+        .scalars()
+        .all()
+    )
     last_scored_at = _as_utc(max(s.generated_at for s in scores)) if scores else None
     return SubmissionRow(
         agent_id=agent.agent_id,
@@ -424,14 +493,13 @@ async def list_scores_for_bench_version(
     (generated_at, agent_id, validator_hotkey) and paginated. Powers the retired-
     version corpus release, which serves the FULL unredacted per-case answer keys
     stored in ``scores.details`` — the caller must gate this to retired versions.
-    Filters on the stamped ``details.bench_version`` JSON field, so legacy rows
-    (null version) are excluded.
+    Filters on the first-class version column bound to the ticket and signature;
+    the JSON detail is advisory compatibility telemetry only.
     """
-    version_col = Score.details["bench_version"].as_integer()
     base = (
         select(Score, Agent.miner_hotkey)
         .join(Agent, Agent.agent_id == Score.agent_id)
-        .where(version_col == version)
+        .where(Score.bench_version == version)
     )
     total = (
         await session.execute(select(func.count()).select_from(base.subquery()))
@@ -455,6 +523,7 @@ async def list_miner_composite_history(
     hotkeys: list[str],
     *,
     limit_per: int = 12,
+    bench_versions: dict[str, int] | None = None,
 ) -> dict[str, list[float]]:
     """Per-miner composite trajectory (oldest→newest) for the trend sparkline.
 
@@ -469,7 +538,12 @@ async def list_miner_composite_history(
     if not hotkeys:
         return {}
     stmt = (
-        select(Agent.miner_hotkey, Score.composite, Score.generated_at)
+        select(
+            Agent.miner_hotkey,
+            Score.composite,
+            Score.generated_at,
+            Score.bench_version,
+        )
         .select_from(Score)
         .join(Agent, Agent.agent_id == Score.agent_id)
         .where(Agent.miner_hotkey.in_(hotkeys))
@@ -477,13 +551,101 @@ async def list_miner_composite_history(
     )
     rows = (await session.execute(stmt)).all()
     out: dict[str, list[float]] = {}
-    for hotkey, composite, _generated_at in rows:
-        out.setdefault(hotkey, []).append(float(composite))
+    for hotkey, composite, _generated_at, score_version in rows:
+        if bench_versions is None or bench_versions.get(hotkey) == score_version:
+            out.setdefault(hotkey, []).append(float(composite))
     return {hotkey: series[-limit_per:] for hotkey, series in out.items()}
 
 
-async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
-    """Return the best eligible score per miner, highest composite first.
+async def count_ranked_quorum_agents(
+    session: AsyncSession,
+    *,
+    bench_version: int,
+    agent_ids: set[UUID] | None = None,
+) -> int:
+    """How many eligible agents hold a complete, RANKED quorum at ``bench_version``.
+
+    One definition, two consumers — they must agree or the guarantee they
+    implement has a hole:
+
+    * :func:`list_eligible_ledger` gates the whole-pool authority switch on this
+      count (:data:`~ditto.db.queries.benchmark_rollout.MIN_DESIRED_AUTHORITY_AGENTS`).
+    * :func:`~ditto.db.queries.benchmark_rollout.maybe_activate_rollout` gates
+      activation on it.
+
+    "Eligible" and "ranked" mean exactly what they mean on the ledger: the agent
+    is in ``scored`` (so a ``banned`` / ``ath_pending_review`` agent never
+    counts), it has at least :data:`SCORING_QUORUM` score rows at this version,
+    and its **median** row at this version passes :func:`_is_ranked` — the full
+    benchmark (``n >= MIN_ELIGIBLE_CASES``) with a positive composite. A raw
+    ``count(scores)`` is NOT a substitute: three smoke-profile rows are a quorum
+    by row count but can never rank or earn emissions.
+
+    Deterministic and derived only from committed rows, because it feeds a
+    consensus-critical decision: the same DB state must give every reader the
+    same answer.
+    """
+    score_scope = select(
+        Score.agent_id.label("agent_id"),
+        _is_ranked().label("eligible"),
+        func.count(Score.agent_id).over(partition_by=Score.agent_id).label("cnt"),
+        func.row_number()
+        .over(
+            partition_by=Score.agent_id,
+            order_by=(Score.composite.asc(), Score.validator_hotkey.asc()),
+        )
+        .label("srn"),
+    ).where(Score.bench_version == bench_version)
+    if agent_ids is not None:
+        if not agent_ids:
+            return 0
+        score_scope = score_scope.where(Score.agent_id.in_(agent_ids))
+    per_version = score_scope.subquery()
+    # Same median arithmetic as the ledger (see list_eligible_ledger): the
+    # lower-middle row by ascending composite represents the agent.
+    qualifying = (
+        select(
+            per_version.c.agent_id,
+            _emission_owner_key().label("emission_owner"),
+        )
+        .join(Agent, Agent.agent_id == per_version.c.agent_id)
+        .outerjoin(
+            EvaluationPayment,
+            EvaluationPayment.agent_id == per_version.c.agent_id,
+        )
+        .where(
+            Agent.status == AgentStatus.SCORED,
+            per_version.c.cnt >= SCORING_QUORUM,
+            per_version.c.eligible,
+            or_(
+                per_version.c.srn * 2 == per_version.c.cnt,
+                per_version.c.srn * 2 == per_version.c.cnt + 1,
+            ),
+        )
+        .subquery()
+    )
+    return int(
+        await session.scalar(
+            select(func.count(func.distinct(qualifying.c.emission_owner)))
+        )
+        or 0
+    )
+
+
+async def list_eligible_ledger(
+    session: AsyncSession,
+    *,
+    include_fingerprints: bool = True,
+    bench_version: int | None = None,
+) -> list[LedgerRow]:
+    """Return the best eligible score per payment-time coldkey.
+
+    ``include_fingerprints=False`` selects NULL for the anti-copy sketch
+    columns (fingerprints + code embedding, several hundred KB per row) —
+    the right call for every consumer except the scoring gate, which is the
+    only reader that compares them. The public leaderboard, validator ledger
+    read, and ticket-eligibility paths were paying that serialization cost on
+    every poll for data they never used.
 
     The persistent ledger the validator folds into KOTH+ATH weights (via
     ``GET /scoring/scores``). "Eligible" = agents in ``scored`` — this excludes
@@ -503,7 +665,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
        signature still verifies against the exposed composite. An agent with a
        single score is its own median, so pre-quorum agents degrade cleanly.
     2. join to ``agents`` filtered to ``scored``.
-    3. a ``ROW_NUMBER`` window keeps each miner's single best agent.
+    3. a ``ROW_NUMBER`` window keeps each payment-time coldkey's single best
+       agent, even when that owner submitted through multiple hotkeys or names.
 
     Two senses of "eligible" apply. *Pool* eligibility = ``status == scored``
     (excludes ``ath_pending_review`` holds and ``banned`` agents). *Ranking*
@@ -512,55 +675,96 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
     smoke/practice run *or* a full run that scored 0.000 stays in the pool
     (surfaced as *provisional* / unranked) but is ordered **below** every ranked
     run and dropped by the validator's weight fold, so it can never rank or earn
-    emissions. Both the per-agent and per-miner selections prefer a ranked
+    emissions. Both the per-agent and per-owner selections prefer a ranked
     row/agent, so neither an inflated small run nor a zero-scoring full run
     shadows a miner's real ranked run.
 
     Ordering (``eligible DESC, composite DESC, first_seen ASC, agent_id ASC``)
     matches the validator fold's eligibility gate + champion/tail tie-breaks.
+    During an open rollout the whole ledger sits on ONE benchmark version,
+    chosen by the threshold rule below
+    (:data:`~ditto.db.queries.benchmark_rollout.MIN_DESIRED_AUTHORITY_AGENTS`);
+    a single read never returns a mix of authoritative versions.
+
     The per-agent selection is median-of-quorum (:data:`SCORING_QUORUM`); the
     per-agent ``n`` is uniform across the pool because all validators score the
     same platform-generated dataset, so the median row's ``eligible`` flag
     represents the agent.
     """
-    agent_best = select(
-        Score.agent_id.label("agent_id"),
-        Score.composite.label("composite"),
-        Score.tool_mean.label("tool_mean"),
-        Score.memory_mean.label("memory_mean"),
-        Score.seed.label("seed"),
-        Score.run_id.label("run_id"),
-        Score.median_ms.label("median_ms"),
-        Score.n.label("n"),
-        _is_ranked().label("eligible"),
-        Score.details.label("details"),
-        Score.validator_hotkey.label("validator_hotkey"),
-        Score.signature.label("signature"),
-        # Row count in the agent's pool, so the median position is (cnt+1)/2.
-        func.count(Score.agent_id).over(partition_by=Score.agent_id).label("cnt"),
-        # Ascending composite so the middle row (by srn) is the median; the
-        # validator_hotkey tie-break keeps the pick deterministic.
-        func.row_number()
-        .over(
-            partition_by=Score.agent_id,
-            order_by=(
-                Score.composite.asc(),
-                Score.validator_hotkey.asc(),
-            ),
+    from ditto.db.queries.benchmark_rollout import (
+        MIN_DESIRED_AUTHORITY_AGENTS,
+        SCORING_QUORUM,
+        active_bench_version,
+        open_rollout,
+    )
+
+    canonical_version = await active_bench_version(session)
+    rollout = None if bench_version is not None else await open_rollout(session)
+    desired_version = rollout.desired_version if rollout is not None else None
+    candidate_versions = (
+        (bench_version,)
+        if bench_version is not None
+        else tuple({canonical_version, desired_version} - {None})
+    )
+    agent_best = (
+        select(
+            Score.agent_id.label("agent_id"),
+            Score.bench_version.label("bench_version"),
+            Score.composite.label("composite"),
+            Score.tool_mean.label("tool_mean"),
+            Score.memory_mean.label("memory_mean"),
+            Score.seed.label("seed"),
+            Score.run_id.label("run_id"),
+            Score.median_ms.label("median_ms"),
+            Score.n.label("n"),
+            _is_ranked().label("eligible"),
+            Score.details.label("details"),
+            Score.validator_hotkey.label("validator_hotkey"),
+            Score.signature.label("signature"),
+            # Row count in the agent's pool, so the median position is (cnt+1)/2.
+            func.count(Score.agent_id)
+            .over(partition_by=(Score.agent_id, Score.bench_version))
+            .label("cnt"),
+            # Ascending composite so the middle row (by srn) is the median; the
+            # validator_hotkey tie-break keeps the pick deterministic.
+            func.row_number()
+            .over(
+                partition_by=(Score.agent_id, Score.bench_version),
+                order_by=(
+                    Score.composite.asc(),
+                    Score.validator_hotkey.asc(),
+                ),
+            )
+            .label("srn"),
         )
-        .label("srn"),
-    ).subquery()
+        .where(Score.bench_version.in_(candidate_versions))
+        .subquery()
+    )
+    sketch_columns: tuple[ColumnElement[Any], ...]
+    if include_fingerprints:
+        sketch_columns = (
+            Agent.content_fingerprint.label("content_fingerprint"),
+            Agent.structural_fingerprint.label("structural_fingerprint"),
+            Agent.prompt_fingerprint.label("prompt_fingerprint"),
+            Agent.code_embedding.label("code_embedding"),
+        )
+    else:
+        sketch_columns = (
+            null().label("content_fingerprint"),
+            null().label("structural_fingerprint"),
+            null().label("prompt_fingerprint"),
+            null().label("code_embedding"),
+        )
     per_agent = (
         select(
             Agent.agent_id.label("agent_id"),
             Agent.miner_hotkey.label("miner_hotkey"),
+            EvaluationPayment.miner_coldkey.label("miner_coldkey"),
+            _emission_owner_key().label("emission_owner"),
             Agent.sha256.label("sha256"),
             Agent.size_bytes.label("size_bytes"),
-            Agent.content_fingerprint.label("content_fingerprint"),
-            Agent.structural_fingerprint.label("structural_fingerprint"),
+            *sketch_columns,
             Agent.normalized_source_hash.label("normalized_source_hash"),
-            Agent.prompt_fingerprint.label("prompt_fingerprint"),
-            Agent.code_embedding.label("code_embedding"),
             Agent.code_embed_model.label("code_embed_model"),
             Agent.created_at.label("first_seen"),
             Agent.status.label("status"),
@@ -575,8 +779,14 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             agent_best.c.details,
             agent_best.c.validator_hotkey,
             agent_best.c.signature,
+            agent_best.c.bench_version,
+            agent_best.c.cnt,
         )
         .join(agent_best, agent_best.c.agent_id == Agent.agent_id)
+        .outerjoin(
+            EvaluationPayment,
+            EvaluationPayment.agent_id == Agent.agent_id,
+        )
         # The median row: the middle by ascending composite. Expressed as
         # integer arithmetic (no division, so it is exact + portable across
         # Postgres and the SQLite test path): the lower-middle index m has
@@ -591,22 +801,101 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         )
         .subquery()
     )
+    # During a collecting rollout the ledger is on exactly ONE benchmark version
+    # at a time, chosen by a threshold rule evaluated on each read:
+    #
+    #   fewer than MIN_DESIRED_AUTHORITY_AGENTS frozen priority members hold a
+    #   complete, ranked desired-version quorum  ->  the ACTIVE version stays
+    #   authoritative for every agent (desired-version medians are collected
+    #   and visible as rollout progress only);
+    #   all priority members ready  ->  the DESIRED version becomes authoritative
+    #   for the whole pool, and an agent without a desired-version quorum has no
+    #   authoritative row at all and drops out. That drop-out is the point of the
+    #   threshold: it only happens once enough agents have crossed to still fill
+    #   the KOTH emission set (see MIN_DESIRED_AUTHORITY_AGENTS).
+    #
+    # Deliberately NOT a per-agent switch. Ranking a v_next composite against a
+    # v_active composite inside one KOTH fold compares incomparable scales — a
+    # newer benchmark applies gates the older one does not, so an already-
+    # migrated agent would be systematically penalised against a not-yet-migrated
+    # peer. Keeping the whole ledger on one version avoids that entirely.
+    #
+    # The threshold is computed here, inside the read, from committed rows only:
+    # every validator folds the ledger this query serves, so a given DB state
+    # must yield the same authority decision for every reader. It must never
+    # become time-based or config-drifty.
+    #
+    # Either way partial desired-version samples never affect ranks or weights,
+    # and an explicit ``bench_version`` request stays a historical single-version
+    # view (``desired_version`` is None for those, so this whole block is skipped).
+    authority_filter: ColumnElement[bool] | None = None
+    if desired_version is None:
+        version_priority: ColumnElement[Any] = per_agent.c.bench_version
+    else:
+        assert rollout is not None
+        desired_at_quorum = and_(
+            per_agent.c.bench_version == desired_version,
+            per_agent.c.cnt >= SCORING_QUORUM,
+        )
+        on_canonical = per_agent.c.bench_version == canonical_version
+        # Only genuine, ranked 3/3 desired-version PRIORITY members count, so a
+        # rank-6 leak, smoke/practice run, or zero-scoring full run cannot push
+        # the ledger over. Shared with the rollout activation gate, which must
+        # apply the identical definition — see
+        # :func:`count_ranked_quorum_agents`.
+        priority_ids = set(
+            await session.scalars(
+                select(BenchmarkRolloutMember.agent_id).where(
+                    BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                    BenchmarkRolloutMember.position <= MIN_DESIRED_AUTHORITY_AGENTS,
+                )
+            )
+        )
+        desired_ready_agents = await count_ranked_quorum_agents(
+            session,
+            bench_version=desired_version,
+            agent_ids=priority_ids,
+        )
+        if desired_ready_agents >= MIN_DESIRED_AUTHORITY_AGENTS:
+            # Whole-pool flip: drop every row that is not a desired-version
+            # quorum, so the read cannot return a mix of versions.
+            authority_filter = desired_at_quorum
+            version_priority = per_agent.c.bench_version
+        else:
+            version_priority = case((on_canonical, 0), (desired_at_quorum, 1), else_=2)
+    selected_version_stmt = select(
+        per_agent,
+        func.row_number()
+        .over(
+            partition_by=per_agent.c.agent_id,
+            order_by=(version_priority, per_agent.c.bench_version.desc()),
+        )
+        .label("version_rn"),
+    )
+    if authority_filter is not None:
+        # WHERE is applied before the window function, so the surviving rows are
+        # exactly the desired-version medians.
+        selected_version_stmt = selected_version_stmt.where(authority_filter)
+    selected_version = selected_version_stmt.subquery()
+    authoritative = (
+        select(selected_version).where(selected_version.c.version_rn == 1).subquery()
+    )
     rn = (
         func.row_number()
         .over(
-            partition_by=per_agent.c.miner_hotkey,
+            partition_by=authoritative.c.emission_owner,
             # Eligible-first so a miner is represented by their best full-benchmark
             # agent, not an inflated smoke run; composite breaks ties within a tier.
             order_by=(
-                per_agent.c.eligible.desc(),
-                per_agent.c.composite.desc(),
-                per_agent.c.first_seen.asc(),
-                per_agent.c.agent_id.asc(),
+                authoritative.c.eligible.desc(),
+                authoritative.c.composite.desc(),
+                authoritative.c.first_seen.asc(),
+                authoritative.c.agent_id.asc(),
             ),
         )
         .label("rn")
     )
-    ranked = select(per_agent, rn).subquery()
+    ranked = select(authoritative, rn).subquery()
     stmt = (
         select(ranked)
         .where(ranked.c.rn == 1)
@@ -635,6 +924,8 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
             validator_hotkey=row.validator_hotkey,
             signature=row.signature,
             status=AgentStatus(row.status),
+            miner_coldkey=row.miner_coldkey,
+            bench_version=row.bench_version,
             content_fingerprint=row.content_fingerprint,
             structural_fingerprint=row.structural_fingerprint,
             normalized_source_hash=row.normalized_source_hash,
@@ -648,3 +939,181 @@ async def list_eligible_ledger(session: AsyncSession) -> list[LedgerRow]:
         )
         for row in result
     ]
+
+
+async def quorum_composites(
+    session: AsyncSession,
+    agent_ids: Sequence[UUID],
+    *,
+    bench_versions: dict[UUID, int] | None = None,
+) -> dict[UUID, list[float]]:
+    """Every accepted composite per agent for the given ids.
+
+    Lets the ledger report the between-validator spread — the k=3 quorum's
+    standard error — as the composite's ``composite_stderr`` from data already
+    collected, no re-score. One flat read (no aggregation): the SEM is computed
+    in Python (:func:`ditto.api_server.endpoints.scoring._quorum_stderr`), so this
+    stays portable across Postgres and the SQLite test path (no ``stddev``). The
+    row set matches :func:`list_eligible_ledger`'s median (all of the agent's
+    score rows), so the SE describes the same quorum the composite came from.
+    """
+    if not agent_ids:
+        return {}
+    from ditto.db.queries.benchmark_rollout import active_bench_version
+
+    canonical_version = await active_bench_version(session)
+    versions = bench_versions or dict.fromkeys(agent_ids, canonical_version)
+    result = await session.execute(
+        select(Score.agent_id, Score.composite, Score.bench_version).where(
+            Score.agent_id.in_(agent_ids),
+            Score.bench_version.in_(set(versions.values())),
+        )
+    )
+    out: dict[UUID, list[float]] = {}
+    for agent_id, composite, score_version in result:
+        if versions.get(agent_id) == score_version:
+            out.setdefault(agent_id, []).append(composite)
+    return out
+
+
+async def list_provisional_ledger(
+    session: AsyncSession,
+    *,
+    bench_version: int | None = None,
+) -> list[tuple[LedgerRow, int]]:
+    """Return each unfinalized miner's best partially scored submission.
+
+    This is a public-feedback read only. It deliberately considers only agents
+    still in ``evaluating`` with at least one accepted score; validator weights
+    continue to use :func:`list_eligible_ledger` and therefore remain gated on
+    the finalized ``scored`` status. Numeric fields are medians of the accepted
+    reports available so far. Opaque run details are omitted because, before
+    quorum, no single validator row is the canonical result.
+    """
+    from ditto.db.queries.benchmark_rollout import active_bench_version
+
+    canonical_version = bench_version or await active_bench_version(session)
+    rows = (
+        await session.execute(
+            select(Agent, Score)
+            .join(Score, Score.agent_id == Agent.agent_id)
+            .where(
+                Agent.status == AgentStatus.EVALUATING,
+                Score.bench_version == canonical_version,
+            )
+            .order_by(
+                Agent.created_at.asc(),
+                Agent.agent_id.asc(),
+                Score.generated_at.asc(),
+                Score.validator_hotkey.asc(),
+            )
+        )
+    ).all()
+
+    by_agent: dict[UUID, tuple[Agent, list[Score]]] = {}
+    for agent, score in rows:
+        if agent.agent_id not in by_agent:
+            by_agent[agent.agent_id] = (agent, [])
+        by_agent[agent.agent_id][1].append(score)
+
+    candidates: list[tuple[LedgerRow, int]] = []
+    for agent, scores in by_agent.values():
+        if not scores:
+            continue
+        representative = sorted(
+            scores, key=lambda score: (score.composite, score.validator_hotkey)
+        )[(len(scores) - 1) // 2]
+        composite = float(median(score.composite for score in scores))
+        tool_mean = float(median(score.tool_mean for score in scores))
+        memory_mean = float(median(score.memory_mean for score in scores))
+        median_ms = int(median(score.median_ms for score in scores))
+        n = int(median(score.n for score in scores))
+        candidates.append(
+            (
+                LedgerRow(
+                    miner_hotkey=agent.miner_hotkey,
+                    agent_id=agent.agent_id,
+                    composite=composite,
+                    tool_mean=tool_mean,
+                    memory_mean=memory_mean,
+                    first_seen=agent.created_at,
+                    sha256=agent.sha256,
+                    size_bytes=agent.size_bytes,
+                    run_id=representative.run_id,
+                    seed=representative.seed,
+                    validator_hotkey=representative.validator_hotkey,
+                    signature=representative.signature,
+                    status=AgentStatus.EVALUATING,
+                    bench_version=representative.bench_version,
+                    median_ms=median_ms,
+                    n=n,
+                    eligible=n >= MIN_ELIGIBLE_CASES and composite > 0.0,
+                    details=None,
+                ),
+                len(scores),
+            )
+        )
+
+    candidates.sort(
+        key=lambda candidate: (
+            not candidate[0].eligible,
+            -candidate[0].composite,
+            candidate[0].first_seen,
+            str(candidate[0].agent_id),
+        ),
+    )
+    best_by_miner: dict[str, tuple[LedgerRow, int]] = {}
+    for candidate in candidates:
+        best_by_miner.setdefault(candidate[0].miner_hotkey, candidate)
+    return list(best_by_miner.values())
+
+
+async def list_scored_bench_versions(session: AsyncSession) -> list[int]:
+    """Every benchmark version with at least one accepted score, newest first.
+
+    Backs the dashboard's per-version history pills: a version earns a pill as
+    soon as its first score lands and keeps it as a historical view forever.
+    ``NULL`` (pre-versioning legacy) rows carry no version to browse by and are
+    excluded.
+    """
+    rows = await session.scalars(
+        select(Score.bench_version)
+        .where(Score.bench_version.is_not(None))
+        .distinct()
+        .order_by(Score.bench_version.desc())
+    )
+    return [int(version) for version in rows]
+
+
+async def get_score_counts(
+    session: AsyncSession,
+    agent_ids: list[UUID],
+    *,
+    bench_versions: dict[UUID, int] | None = None,
+) -> dict[UUID, int]:
+    """Return accepted validator-score counts for the requested agents."""
+    if not agent_ids:
+        return {}
+    from ditto.db.queries.benchmark_rollout import active_bench_version
+
+    canonical_version = await active_bench_version(session)
+    versions = bench_versions or dict.fromkeys(agent_ids, canonical_version)
+    rows = (
+        await session.execute(
+            select(
+                Score.agent_id,
+                Score.bench_version,
+                func.count(Score.validator_hotkey),
+            )
+            .where(
+                Score.agent_id.in_(agent_ids),
+                Score.bench_version.in_(set(versions.values())),
+            )
+            .group_by(Score.agent_id, Score.bench_version)
+        )
+    ).all()
+    return {
+        agent_id: int(count)
+        for agent_id, score_version, count in rows
+        if versions.get(agent_id) == score_version
+    }

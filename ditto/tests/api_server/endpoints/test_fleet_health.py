@@ -6,6 +6,8 @@ import pytest
 
 from ditto.api_models.public import PublicSystemMetrics
 from ditto.api_server.endpoints.public import (
+    _BENCHMARK_STALL_AFTER,
+    _benchmark_stalled,
     _fleet_classification,
     _public_system_metrics,
 )
@@ -28,7 +30,8 @@ def healthy_metrics() -> PublicSystemMetrics:
     [
         ("idle", timedelta(seconds=30), "healthy", (True, "available", "healthy")),
         ("idle", timedelta(seconds=30), "warning", (True, "available", "warning")),
-        ("idle", timedelta(minutes=6), "healthy", (False, "offline", "healthy")),
+        ("idle", timedelta(minutes=6), "healthy", (False, "stale", "healthy")),
+        ("idle", timedelta(minutes=16), "healthy", (False, "offline", "healthy")),
         ("paused", timedelta(seconds=30), "healthy", (True, "paused", "healthy")),
         ("idle", timedelta(seconds=30), "missing", (True, "available", "unknown")),
         ("idle", timedelta(seconds=30), "partial", (True, "available", "unknown")),
@@ -44,7 +47,7 @@ def test_classifies_availability_without_turning_missing_metrics_into_outage(
     now = datetime.now(UTC)
     metrics: PublicSystemMetrics | None = healthy_metrics
     if metrics_kind == "warning":
-        metrics = healthy_metrics.model_copy(update={"disk_percent": 90})
+        metrics = healthy_metrics.model_copy(update={"disk_percent": 95})
     elif metrics_kind == "missing":
         metrics = None
     elif metrics_kind == "partial":
@@ -58,6 +61,34 @@ def test_classifies_availability_without_turning_missing_metrics_into_outage(
         )
         == expected
     )
+
+
+def test_disk_usage_below_warning_threshold_is_healthy(
+    healthy_metrics: PublicSystemMetrics,
+) -> None:
+    now = datetime.now(UTC)
+    metrics = healthy_metrics.model_copy(update={"disk_percent": 90})
+
+    assert _fleet_classification(
+        state="idle",
+        seen_at=now - timedelta(seconds=30),
+        now=now,
+        metrics=metrics,
+    ) == (True, "available", "healthy")
+
+
+def test_saturated_cpu_is_healthy_workload(
+    healthy_metrics: PublicSystemMetrics,
+) -> None:
+    now = datetime.now(UTC)
+    busy_metrics = healthy_metrics.model_copy(update={"cpu_percent": 100})
+
+    assert _fleet_classification(
+        state="running_benchmark",
+        seen_at=now - timedelta(seconds=30),
+        now=now,
+        metrics=busy_metrics,
+    ) == (True, "available", "healthy")
 
 
 def test_malformed_stored_metrics_are_not_partially_exposed() -> None:
@@ -74,3 +105,25 @@ def test_malformed_stored_metrics_are_not_partially_exposed() -> None:
         "hostname": "private-host",
     }
     assert _public_system_metrics(raw) is None
+
+
+def test_early_stage_past_threshold_is_stalled() -> None:
+    now = datetime.now(UTC)
+    started = now - _BENCHMARK_STALL_AFTER - timedelta(seconds=1)
+    for stage in ("preparing", "building_harness", "starting_harness"):
+        assert _benchmark_stalled(stage, started, now) is True
+
+
+def test_recent_early_stage_is_not_stalled() -> None:
+    now = datetime.now(UTC)
+    started = now - timedelta(minutes=2)
+    assert _benchmark_stalled("building_harness", started, now) is False
+
+
+def test_running_benchmark_is_never_stalled() -> None:
+    # A long-running benchmark can legitimately run to the 75-minute cap, so it
+    # must never be flagged stalled no matter how long it has been going.
+    now = datetime.now(UTC)
+    started = now - timedelta(hours=1)
+    assert _benchmark_stalled("running_benchmark", started, now) is False
+    assert _benchmark_stalled(None, started, now) is False

@@ -2,7 +2,9 @@
 
 The audit log is the tamper-evident public projection of the k=3 scoring record.
 Where ``scores`` is UPSERTed (only the current score survives a re-score), this
-log is insert-only and ordered: it captures every scoring *event* as it happened.
+log is insert-only and ordered: it captures every scoring *event* as it happened,
+including a re-test request that preserves the accepted row and an explicit
+invalidation committed atomically with the operator-authorized replacement.
 
 Tamper-evidence is a SHA-256 hash chain. Each entry's ``entry_hash`` is the
 digest of its canonical JSON, which embeds ``prev_hash`` (the previous entry's
@@ -40,6 +42,25 @@ GENESIS_HASH = "0" * 64
 # Event kinds recorded in the log.
 EVENT_SCORE = "score"
 EVENT_FINALIZED = "agent_finalized"
+# The reproduce-under-transform audit verdict (v3 Part A). Recorded whenever a
+# finalized agent carried the metric, held or not, so the public feed shows the
+# audit ran and what it found -- not only the failures. Its payload carries the
+# PUBLIC inputs only (seed, block hash, robustness, pair counts) and never an
+# answer key or a transformed expected answer, the same redaction rule the score
+# entry follows: the verdict must be independently checkable from published data
+# without the chain itself leaking the dataset's answers.
+EVENT_AUDIT = "transform_audit"
+EVENT_SCORE_INVALIDATED = "score_invalidated"
+EVENT_SCORE_RETEST_QUEUED = "score_retest_queued"
+EVENT_SCORE_RETEST_REQUESTED = "score_retest_requested"
+EVENT_SCORE_RETEST_RELEASED = "score_retest_released"
+
+SCORE_RETEST_EVENTS = (
+    EVENT_SCORE_RETEST_QUEUED,
+    EVENT_SCORE_RETEST_REQUESTED,
+    EVENT_SCORE_INVALIDATED,
+    EVENT_SCORE_RETEST_RELEASED,
+)
 
 
 def _iso_utc(dt: datetime) -> str:
@@ -165,6 +186,33 @@ async def get_audit_head(session: AsyncSession) -> ScoreAuditEntry | None:
             select(ScoreAuditEntry).order_by(ScoreAuditEntry.seq.desc()).limit(1)
         )
     ).scalar_one_or_none()
+
+
+async def get_latest_score_retest_event(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    validator_hotkey: str,
+) -> ScoreAuditEntry | None:
+    """Return the latest lifecycle event for one operator-requested re-test.
+
+    A latest ``score_retest_queued`` entry means the original accepted score is
+    canonical while the request waits behind that validator's current work. A
+    latest ``score_retest_requested`` entry means the same validator holds a
+    replacement ticket.
+    ``score_invalidated`` closes it atomically when the replacement lands;
+    ``score_retest_released`` closes it without changing the score.
+    """
+    return await session.scalar(
+        select(ScoreAuditEntry)
+        .where(
+            ScoreAuditEntry.agent_id == agent_id,
+            ScoreAuditEntry.validator_hotkey == validator_hotkey,
+            ScoreAuditEntry.event.in_(SCORE_RETEST_EVENTS),
+        )
+        .order_by(ScoreAuditEntry.seq.desc())
+        .limit(1)
+    )
 
 
 def verify_audit_chain(

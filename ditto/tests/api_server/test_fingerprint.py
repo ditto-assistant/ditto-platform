@@ -6,13 +6,20 @@ import gzip
 import hashlib
 import io
 import tarfile
+from array import array
 
+import pytest
+
+import ditto.api_server.fingerprint as fingerprint_module
 from ditto.api_server.fingerprint import (
     _EMBED_INPUT_MAX_CHARS,
     _FP_VERSION,
     _MINHASH_K,
     _PROMPT_VERSION,
     _extract_string_literals,
+    _file_shingles,
+    _normalized_source_shingles,
+    _prompt_shingles,
     compute_content_fingerprint,
     compute_embedding_input,
     compute_normalized_source_hash,
@@ -66,6 +73,23 @@ def _containment(a: dict | None, b: dict | None) -> float:
     return content_similarity(a, b)[1]
 
 
+def _reference_array(shingles: set[str]) -> array[int]:
+    return array("Q", sorted(int(shingle, 16) for shingle in shingles))
+
+
+def _install_reference_fixture(
+    monkeypatch: pytest.MonkeyPatch, baseline: bytes
+) -> None:
+    references = {
+        "lexical": _reference_array(set(_file_shingles(baseline))),
+        "normalized": _reference_array(set(_normalized_source_shingles(baseline))),
+        "prompt": _reference_array(set(_prompt_shingles(baseline))),
+    }
+    monkeypatch.setattr(
+        fingerprint_module, "_reference_shingles", references.__getitem__
+    )
+
+
 class TestNormalizedSourceHash:
     """exact-repack hash: cosmetic repackaging normalizes to the same hash,
     genuinely different source does not, and string literals are preserved."""
@@ -74,7 +98,11 @@ class TestNormalizedSourceHash:
         tar = _tar_gz({"src/lib.rs": _rust_file(5)})
         h1 = compute_normalized_source_hash(tar)
         h2 = compute_normalized_source_hash(tar)
-        assert isinstance(h1, str) and len(h1) == 64  # sha256 hex
+        assert isinstance(h1, str)
+        version, corpus_id, digest = h1.split(":")
+        assert version == "nsh2"
+        assert len(corpus_id) == 64
+        assert len(digest) == 64
         assert h1 == h2
 
     def test_comments_stripped(self) -> None:
@@ -109,8 +137,14 @@ class TestNormalizedSourceHash:
     def test_string_literal_double_slash_preserved(self) -> None:
         # A `//` inside a string is NOT a comment; changing the URL must change
         # the hash (proving the string body is kept, not stripped as a comment).
-        a = b'fn u() -> &\'static str { "http://a.example/x" }\n'
-        b = b'fn u() -> &\'static str { "http://b.example/y" }\n'
+        a = b"\n".join(
+            f'fn u{i}() -> &\'static str {{ "http://a.example/{i}" }}'.encode()
+            for i in range(8)
+        )
+        b = b"\n".join(
+            f'fn u{i}() -> &\'static str {{ "http://b.example/{i}" }}'.encode()
+            for i in range(8)
+        )
         ha = compute_normalized_source_hash(_tar_gz({"lib.rs": a}))
         hb = compute_normalized_source_hash(_tar_gz({"lib.rs": b}))
         assert ha is not None and hb is not None and ha != hb
@@ -148,8 +182,16 @@ class TestComputeContentFingerprint:
     def test_reindent_and_reformat_absorbed(self) -> None:
         # Leading indent change, tabs, CRLF, AND operator-spacing reformat all wash
         # out — the whole-file whitespace churn a formatter (rustfmt) produces.
-        orig = b"fn f(x: i64) -> i64 {\n    let y = x + 1;\n    y * 2\n}\n"
-        reformatted = b"fn f(x:i64)->i64{\r\n\t\tlet  y = x+1 ;\r\n\t\ty*2\r\n}\r\n"
+        orig = b"".join(
+            f"fn f{i}(x: i64) -> i64 {{\n    let y = x + {i};\n    y * 2\n}}\n".encode()
+            for i in range(8)
+        )
+        reformatted = b"".join(
+            (
+                f"fn f{i}(x:i64)->i64{{\r\n\t\tlet  y = x+{i} ;\r\n\t\ty*2\r\n}}\r\n"
+            ).encode()
+            for i in range(8)
+        )
         a = compute_content_fingerprint(_tar_gz({"m.rs": orig}))
         b = compute_content_fingerprint(_tar_gz({"m.rs": reformatted}))
         assert _jaccard(a, b) == 1.0
@@ -228,6 +270,130 @@ class TestComputeContentFingerprint:
         assert compute_content_fingerprint(_tar_gz({"blank": b"\n  \n\t\n"})) is None
 
 
+class TestReferenceAwareFingerprints:
+    _BASELINE_PROMPT = (
+        "Follow the common starter workflow, load the supplied inputs, validate "
+        "each required field, and return the standard structured response safely."
+    )
+    _CUSTOM_A_PROMPT = (
+        "Rank memories using lunar distance and retain only evidence tied to the "
+        "current conversation before composing a concise grounded answer."
+    )
+    _CUSTOM_B_PROMPT = (
+        "Build a graph of recent entities, traverse verified relationships twice, "
+        "then summarize the strongest supported path without adding assumptions."
+    )
+
+    @staticmethod
+    def _source(tag: str, prompt: str) -> bytes:
+        lines = "\n".join(
+            f"{tag}_operation_{i} produces_{tag}_{i} from_{tag}_{i + 1}"
+            for i in range(80)
+        )
+        return f'const PROMPT: &str = r#"{prompt}"#;\n{lines}\n'.encode()
+
+    def test_independent_baseline_forks_do_not_match(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        baseline = self._source("starter", self._BASELINE_PROMPT)
+        _install_reference_fixture(monkeypatch, baseline)
+        fork_a = _tar_gz(
+            {
+                "baseline": baseline,
+                "custom": self._source("alpha", self._CUSTOM_A_PROMPT),
+            }
+        )
+        fork_b = _tar_gz(
+            {
+                "baseline": baseline,
+                "custom": self._source("beta", self._CUSTOM_B_PROMPT),
+            }
+        )
+
+        baseline_fp = compute_content_fingerprint(_tar_gz({"baseline": baseline}))
+        assert baseline_fp is not None and baseline_fp["m"] == []
+        assert content_similarity(baseline_fp, baseline_fp) == (0.0, 0.0)
+        assert content_similarity(
+            compute_content_fingerprint(fork_a), compute_content_fingerprint(fork_b)
+        ) == (0.0, 0.0)
+        prompt_j, prompt_c = content_similarity(
+            compute_prompt_fingerprint(fork_a), compute_prompt_fingerprint(fork_b)
+        )
+        assert prompt_j < 0.75 and prompt_c < 0.95
+
+    def test_small_block_theft_is_still_caught(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the floor value: a ~12-line innovation block leaves a
+        # residual between the floor (8) and the old floor (16). At 16 both the
+        # original and a verbatim copy sketched EMPTY and the theft escaped
+        # every channel; at 8 the copy is caught at exact containment 1.0.
+        baseline = self._source("starter", self._BASELINE_PROMPT)
+        _install_reference_fixture(monkeypatch, baseline)
+        block = "\n".join(
+            f"fn tuned_{i}(x: u64) -> u64 {{ x.rotate_left({i + 1}) ^ 0xA5 }}"
+            for i in range(12)
+        ).encode()
+        original = _tar_gz({"baseline": baseline, "custom": block})
+        copy = _tar_gz(
+            {
+                "baseline": baseline,
+                "custom": block,
+                "padding": b"fn pad(x: u64) -> u64 { x }",
+            }
+        )
+        original_fp = compute_content_fingerprint(original)
+        copy_fp = compute_content_fingerprint(copy)
+        assert original_fp is not None and original_fp["m"] != []
+        assert 8 <= original_fp["card"] < 16
+        _, containment = content_similarity(original_fp, copy_fp)
+        assert containment >= 0.95
+
+    def test_below_floor_residual_sketches_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One edited region (a couple of lines, < 8 residual shingles) stays
+        # below the floor: nothing to compare, nothing worth stealing.
+        baseline = self._source("starter", self._BASELINE_PROMPT)
+        _install_reference_fixture(monkeypatch, baseline)
+        tweaked = _tar_gz(
+            {
+                "baseline": baseline,
+                "custom": b"fn tiny(x: u64) -> u64 { x + 3 }",
+            }
+        )
+        sketch = compute_content_fingerprint(tweaked)
+        assert sketch is not None and sketch["m"] == []
+        assert 0 < sketch["card"] < 8
+        assert content_similarity(sketch, sketch) == (0.0, 0.0)
+
+    def test_shared_custom_residual_still_matches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        baseline = self._source("starter", self._BASELINE_PROMPT)
+        _install_reference_fixture(monkeypatch, baseline)
+        custom = self._source("copied", self._CUSTOM_A_PROMPT)
+        original = _tar_gz({"baseline": baseline, "custom": custom})
+        padded_copy = _tar_gz(
+            {
+                "renamed-baseline": baseline,
+                "renamed-custom": custom,
+                "padding": self._source("padding", self._CUSTOM_B_PROMPT),
+            }
+        )
+
+        lexical_j, lexical_c = content_similarity(
+            compute_content_fingerprint(original),
+            compute_content_fingerprint(padded_copy),
+        )
+        assert lexical_j < 0.75 and lexical_c >= 0.95
+        prompt_j, prompt_c = content_similarity(
+            compute_prompt_fingerprint(original),
+            compute_prompt_fingerprint(padded_copy),
+        )
+        assert prompt_j < 0.75 and prompt_c >= 0.95
+
+
 class TestContentSimilarity:
     def test_missing_or_version_mismatch_scores_zero(self) -> None:
         fp = compute_content_fingerprint(_tar_gz({"a.rs": _rust_file(6)}))
@@ -237,6 +403,12 @@ class TestContentSimilarity:
             0.0,
             0.0,
         )
+
+    def test_corpus_mismatch_scores_zero(self) -> None:
+        fp = compute_content_fingerprint(_tar_gz({"a.rs": _rust_file(10)}))
+        assert fp is not None and fp.get("corpus")
+        incompatible = {**fp, "corpus": "different-reference-corpus"}
+        assert content_similarity(fp, incompatible) == (0.0, 0.0)
 
     def test_exact_when_sets_small(self) -> None:
         # Both shingle sets fit inside k, so the bottom-k sketch is the whole set

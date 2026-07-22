@@ -13,8 +13,8 @@ from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
 import ditto
 from ditto.api_server.config import (
@@ -24,6 +24,11 @@ from ditto.api_server.config import (
 from ditto.api_server.datapipeline import create_generator
 from ditto.api_server.embedding import create_embedder
 from ditto.api_server.endpoints import (
+    admin_benchmark_rollout_router,
+    admin_copy_review_router,
+    admin_quarantine_router,
+    admin_scoring_readiness_router,
+    admin_validation_retry_router,
     health_router,
     metrics_router,
     public_router,
@@ -36,12 +41,16 @@ from ditto.api_server.endpoints import (
 from ditto.api_server.errors import ApiServerLifespanError
 from ditto.api_server.middleware import (
     AuthPassThroughMiddleware,
+    PublicCacheMiddleware,
     RequestIDMiddleware,
+    SizedGZipMiddleware,
     register_exception_handlers,
 )
+from ditto.api_server.middleware.public_cache import compute_etag, if_none_match
 from ditto.api_server.payment_verifier import create_payment_verifier
 from ditto.api_server.pricing import create_price_oracle
 from ditto.api_server.storage import create_storage_client
+from ditto.api_server.validator_names import create_validator_names
 from ditto.chain import create_chain_client
 from ditto.db import create_db_engine, create_session_maker
 
@@ -112,6 +121,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             generator = create_generator(config.data_pipeline)
             stack.push_async_callback(generator.aclose)
             app.state.dataset_generator = generator
+
+            validator_names = app.state.validator_names
+            stack.push_async_callback(validator_names.aclose)
+            await validator_names.start()
         except Exception as e:
             raise ApiServerLifespanError(
                 f"failed to open dependencies during startup: {e}"
@@ -146,12 +159,28 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     )
     app.state.config = config
     app.state.commit_hash = config.commit_hash
+    # The object exists even when lifespan is skipped in unit tests. Its
+    # snapshot path is synchronous and disabled by default; production lifespan
+    # starts the optional background refresher without blocking API startup.
+    app.state.validator_names = create_validator_names(config.validator_names)
 
     # Starlette inserts each middleware at position 0, so the LAST
     # add_middleware call ends up outermost on the wire. RequestIDMiddleware
     # must be outermost so its contextvar is live for every downstream
     # middleware + handler + log line, including any future auth that
     # short-circuits before reaching the app.
+    # PublicCacheMiddleware is innermost: cache hits skip the endpoint (and
+    # its database work) while request-id logging still records every hit.
+    app.add_middleware(PublicCacheMiddleware)
+    # Gzip sits OUTSIDE the public cache (added after it, so it wraps it on
+    # the wire): the cache stores and compares uncompressed bodies (so ETags
+    # are stable), and compression happens outward on every response,
+    # including cache HITs and the 368KB dashboard HTML. SizedGZipMiddleware
+    # (not stock GZipMiddleware) enforces the sub-1KB "leave it uncompressed"
+    # floor from the declared Content-Length, which survives the cache
+    # middleware's BaseHTTPMiddleware re-chunking; stock gzip only applies the
+    # floor to single-message bodies and would compress everything here.
+    app.add_middleware(SizedGZipMiddleware, minimum_size=1000, compresslevel=6)
     app.add_middleware(AuthPassThroughMiddleware)
     app.add_middleware(RequestIDMiddleware)
 
@@ -165,6 +194,11 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(screener_router, prefix="/api/v1")
     app.include_router(scoring_router, prefix="/api/v1")
     app.include_router(public_router, prefix="/api/v1")
+    app.include_router(admin_benchmark_rollout_router, prefix="/api/v1")
+    app.include_router(admin_quarantine_router, prefix="/api/v1")
+    app.include_router(admin_validation_retry_router, prefix="/api/v1")
+    app.include_router(admin_scoring_readiness_router, prefix="/api/v1")
+    app.include_router(admin_copy_review_router, prefix="/api/v1")
 
     # Serve the public dashboard SPA same-origin at ``/`` so the platform is the
     # transparency front door (its ``/api/v1/public/*`` calls need no CORS). The
@@ -177,12 +211,52 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
                 "dashboard SPA not found at %s; serving API only", _DASHBOARD_FILE
             )
         else:
+            # The HTML is rendered once at boot, so hash it once for a strong
+            # ETag. With max-age=60 the SPA revalidates often, but a matching
+            # If-None-Match returns an empty 304 — cheap for the VM and the
+            # main win of the polling dashboard. must-revalidate + the short
+            # TTL keeps deploys visible within a minute.
+            dashboard_etag = compute_etag(dashboard_html.encode("utf-8"))
+            dashboard_headers = {
+                "Cache-Control": "public, max-age=60, must-revalidate",
+                "ETag": dashboard_etag,
+            }
+
+            async def dashboard_response(request: Request) -> Response:
+                if if_none_match(request.headers.get("if-none-match"), dashboard_etag):
+                    # The 200 this revalidates carries "Vary: Accept-Encoding"
+                    # (added by the gzip layer); RFC 9110 §15.4.5 says the 304
+                    # must repeat it. Set here only — on the shared 200 headers
+                    # gzip's add_vary_header would append a duplicate.
+                    return Response(
+                        status_code=304,
+                        headers={**dashboard_headers, "Vary": "Accept-Encoding"},
+                    )
+                return HTMLResponse(content=dashboard_html, headers=dashboard_headers)
 
             @app.get("/", include_in_schema=False, response_class=HTMLResponse)
-            async def dashboard() -> HTMLResponse:
-                return HTMLResponse(
-                    content=dashboard_html,
-                    headers={"Cache-Control": "public, max-age=300"},
+            async def dashboard(request: Request) -> Response:
+                return await dashboard_response(request)
+
+            # Backward-compatible plural URLs serve the SPA shell and normalize to
+            # query-param popovers. Singular agent/miner URLs are dedicated views.
+            for entity_kind in ("agents", "miners", "validators", "screeners"):
+                app.add_api_route(
+                    f"/{entity_kind}/{{entity_id}}",
+                    dashboard_response,
+                    methods=["GET"],
+                    include_in_schema=False,
+                    response_class=HTMLResponse,
+                    name=f"dashboard_{entity_kind}",
+                )
+            for entity_kind in ("agent", "miner"):
+                app.add_api_route(
+                    f"/{entity_kind}/{{entity_id}}",
+                    dashboard_response,
+                    methods=["GET"],
+                    include_in_schema=False,
+                    response_class=HTMLResponse,
+                    name=f"dashboard_{entity_kind}",
                 )
 
             if _DASHBOARD_IMAGE.is_file():

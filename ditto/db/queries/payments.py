@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from asyncpg.exceptions import UniqueViolationError
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 # PaymentReplayedError is a payment-domain outcome that happens to be
@@ -14,7 +15,7 @@ from sqlalchemy.exc import IntegrityError as SAIntegrityError
 # the shipped PaymentVerifier already uses by importing chain.errors.
 from ditto.api_server.payment_verifier import PaymentReplayedError
 from ditto.db.errors import IntegrityError as DbIntegrityError
-from ditto.db.models import EvaluationPayment
+from ditto.db.models import Agent, EvaluationPayment
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -31,6 +32,59 @@ if TYPE_CHECKING:
 # migration that renames the PK is caught before the dispatch silently
 # stops translating replays into PaymentReplayedError.
 _PAYMENT_REPLAY_CONSTRAINT = "evaluation_payments_pkey"
+
+
+async def get_miner_coldkey_for_agent(
+    session: AsyncSession, *, agent_id: UUID
+) -> str | None:
+    """Return the immutable payment-time coldkey for an agent.
+
+    ``None`` is possible only for legacy/test agents created before paid-upload
+    provenance was mandatory.
+    """
+    return await session.scalar(
+        select(EvaluationPayment.miner_coldkey).where(
+            EvaluationPayment.agent_id == agent_id
+        )
+    )
+
+
+async def get_miner_coldkeys_for_agents(
+    session: AsyncSession, *, agent_ids: set[UUID]
+) -> dict[UUID, str]:
+    """Batch payment-time ownership lookup for operator comparison pages."""
+    if not agent_ids:
+        return {}
+    rows = await session.execute(
+        select(EvaluationPayment.agent_id, EvaluationPayment.miner_coldkey).where(
+            EvaluationPayment.agent_id.in_(agent_ids)
+        )
+    )
+    return dict(rows.tuples().all())
+
+
+async def get_agent_for_payment_proof(
+    session: AsyncSession,
+    *,
+    block_hash: str,
+    extrinsic_index: int,
+) -> Agent | None:
+    """Return the agent already funded by a payment proof, if any.
+
+    ``POST /upload/agent`` uses this lookup to make an exact retry idempotent.
+    A gateway failure can hide a successful response after the database commit;
+    returning the original row prevents the miner from paying a second fee.
+    Callers must still authenticate the hotkey and compare the immutable upload
+    identity (hotkey, name, and tar SHA) before treating the request as a retry.
+    """
+    return await session.scalar(
+        select(Agent)
+        .join(EvaluationPayment, EvaluationPayment.agent_id == Agent.agent_id)
+        .where(
+            EvaluationPayment.block_hash == block_hash,
+            EvaluationPayment.extrinsic_index == extrinsic_index,
+        )
+    )
 
 
 async def insert_evaluation_payment(

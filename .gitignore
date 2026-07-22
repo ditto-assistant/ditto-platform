@@ -32,3 +32,8 @@ htmlcov/
 docs/validator/or_gh_secrets.yml
 *secrets*.yml
 *secrets*.yaml
+
+# Local compose overrides (localnet e2e etc.) must never ship to the VMs:
+# scripts/update.sh resets the deploy checkout to origin, and a committed
+# override repoints prod Pylon at a nonexistent local subtensor (2026-07-16).
+docker-compose.override.yml

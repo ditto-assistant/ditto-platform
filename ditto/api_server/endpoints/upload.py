@@ -56,6 +56,7 @@ from ditto.api_server.fingerprint import (
 )
 from ditto.api_server.payment_verifier import (
     PaymentProof,
+    PaymentReplayedError,
     PaymentVerifier,
 )
 from ditto.api_server.pricing import (
@@ -67,7 +68,10 @@ from ditto.chain import ChainError
 from ditto.db.models import AgentStatus
 from ditto.db.queries.agents import insert_agent
 from ditto.db.queries.bans import is_hotkey_banned
-from ditto.db.queries.payments import insert_evaluation_payment
+from ditto.db.queries.payments import (
+    get_agent_for_payment_proof,
+    insert_evaluation_payment,
+)
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -233,15 +237,18 @@ async def upload_agent(
     3. Hotkey registered on the configured netuid (1 Pylon call;
        400 if absent, 503 if chain unreachable).
     4. Stream tar bytes: size cap (413) + sha256 re-verify (400).
-    5. PaymentVerifier.verify_payment (4 chain calls; 3201-3206 on
+    5. Return the original response when this exact authenticated upload already
+       consumed the proof. Reusing a proof for different upload data remains a
+       3207 replay rejection.
+    6. PaymentVerifier.verify_payment (4 chain calls; 3201-3206 on
        payment-side rejection, 503 if chain unreachable).
-    6. ``agent_id = uuid4()``.
-    7. ``storage.put_object`` (orphan blob is cheap on DB failure;
+    7. ``agent_id = uuid4()``.
+    8. ``storage.put_object`` (orphan blob is cheap on DB failure;
        orphan agent rows would break the state machine), then compute the
        content fingerprint (best-effort; ``None`` on an unreadable tarball).
-    8. Atomic DB tx: ``insert_agent`` + ``insert_evaluation_payment``
+    9. Atomic DB tx: ``insert_agent`` + ``insert_evaluation_payment``
        (3207 surfaces here when the PK rejects a replayed proof).
-    9. Return ``UploadAgentResponse``.
+    10. Return ``UploadAgentResponse``.
     """
     netuid = request.app.state.config.chain.netuid
 
@@ -257,6 +264,18 @@ async def upload_agent(
     #     so a banned miner is rejected as cheaply as possible.
     if await is_hotkey_banned(session, hotkey=hotkey):
         raise HTTPException(status_code=403, detail="hotkey is banned from submitting")
+
+    # The ban check autobegan a transaction on the pooled session. End it NOW:
+    # nothing until the atomic insert (step 8) touches the database, and holding
+    # a checked-out connection across the slow middle — streaming the tarball
+    # from a possibly-slow miner, chain payment verification, the storage write,
+    # and the CPU-bound fingerprint computes — starves the pool under concurrent
+    # uploads (the 2026-07-16 outage: idle-in-transaction sessions pinned every
+    # slot while requests queued 30s for a connection).
+    if session.in_transaction():
+        rollback_result = session.rollback()
+        if inspect.isawaitable(rollback_result):
+            await rollback_result
 
     # 3. Hotkey must be registered on this subnet. Chain outage surfaces
     # as 503; falling through would silently accept off-subnet hotkeys.
@@ -281,7 +300,44 @@ async def upload_agent(
             status_code=400, detail="sha256 of received tarball does not match claim"
         )
 
-    # 5. Chain-side verification. Typed PaymentVerifierError subclasses
+    # 5. An upstream/proxy failure can hide the 200 after the original atomic
+    # commit. Authenticate and re-hash first, then recover only an *exact* retry.
+    # The payment proof remains non-transferable: changing hotkey, name, or bytes
+    # keeps the existing 3207 replay rejection.
+    existing = await get_agent_for_payment_proof(
+        session,
+        block_hash=payment_block_hash,
+        extrinsic_index=payment_extrinsic_index,
+    )
+    if existing:
+        if (
+            existing.miner_hotkey == hotkey
+            and existing.name == name
+            and existing.sha256 == sha256
+        ):
+            assert existing.version is not None
+            logger.info(
+                "upload retry recovered hotkey=%s agent_id=%s version=%s block_hash=%s",
+                hotkey,
+                existing.agent_id,
+                existing.version,
+                payment_block_hash,
+            )
+            return UploadAgentResponse(
+                agent_id=existing.agent_id,
+                version=existing.version,
+                status=existing.status,
+            )
+        raise PaymentReplayedError("payment proof already used by a different upload")
+
+    # The replay lookup autobegan a read transaction. Release that pooled
+    # connection before the slow chain/storage/fingerprint work below.
+    if session.in_transaction():
+        rollback_result = session.rollback()
+        if inspect.isawaitable(rollback_result):
+            await rollback_result
+
+    # 6. Chain-side verification. Typed PaymentVerifierError subclasses
     # are mapped to 3201-3206 by the envelope handler; we re-raise them
     # unchanged. A bare ChainError surfaces when one of the verifier's
     # four chain reads cannot reach Pylon, which we treat as a 503 to
@@ -301,10 +357,10 @@ async def upload_agent(
             status_code=503, detail="chain unavailable; retry shortly"
         ) from e
 
-    # 6. Server-generated identity. The CLI cannot pre-supply it.
+    # 7. Server-generated identity. The CLI cannot pre-supply it.
     agent_id = uuid.uuid4()
 
-    # 7. S3 first: orphan blobs are cheap + invisible to the state
+    # 8. S3 first: orphan blobs are cheap + invisible to the state
     # machine. Orphan agent rows would surface as undownloadable agents
     # in the validator polling flow.
     await storage.put_object(
@@ -348,30 +404,56 @@ async def upload_agent(
         if inspect.isawaitable(rollback_result):
             await rollback_result
 
-    # 8. Atomic DB tx: agent + payment commit together or roll back
+    # 9. Atomic DB tx: agent + payment commit together or roll back
     # together. A replayed payment proof surfaces as PaymentReplayedError
     # (3207) and the envelope handler maps it to HTTP 402.
-    async with session.begin():
-        await insert_agent(
+    try:
+        async with session.begin():
+            version = await insert_agent(
+                session,
+                agent_id=agent_id,
+                miner_hotkey=hotkey,
+                name=name,
+                sha256=sha256,
+                size_bytes=len(tar_bytes),
+                content_fingerprint=content_fingerprint,
+                normalized_source_hash=normalized_source_hash,
+                prompt_fingerprint=prompt_fingerprint,
+                code_embedding=code_embedding,
+                code_embed_model=code_embed_model,
+            )
+            await insert_evaluation_payment(
+                session, verified=verified, agent_id=agent_id
+            )
+    except PaymentReplayedError:
+        # A concurrent identical retry may have passed the first lookup before
+        # the winning request committed. The transaction context has rolled this
+        # request back, so perform one final exact-identity lookup.
+        existing = await get_agent_for_payment_proof(
             session,
-            agent_id=agent_id,
-            miner_hotkey=hotkey,
-            name=name,
-            sha256=sha256,
-            size_bytes=len(tar_bytes),
-            content_fingerprint=content_fingerprint,
-            normalized_source_hash=normalized_source_hash,
-            prompt_fingerprint=prompt_fingerprint,
-            code_embedding=code_embedding,
-            code_embed_model=code_embed_model,
+            block_hash=payment_block_hash,
+            extrinsic_index=payment_extrinsic_index,
         )
-        await insert_evaluation_payment(session, verified=verified, agent_id=agent_id)
+        if existing and (
+            existing.miner_hotkey == hotkey
+            and existing.name == name
+            and existing.sha256 == sha256
+        ):
+            assert existing.version is not None
+            return UploadAgentResponse(
+                agent_id=existing.agent_id,
+                version=existing.version,
+                status=existing.status,
+            )
+        raise
 
     logger.info(
-        f"upload accepted hotkey={hotkey} agent_id={agent_id} "
+        f"upload accepted hotkey={hotkey} agent_id={agent_id} version={version} "
         f"amount_rao={verified.amount_rao} block_hash={verified.block_hash}"
     )
-    return UploadAgentResponse(agent_id=agent_id, status=AgentStatus.UPLOADED)
+    return UploadAgentResponse(
+        agent_id=agent_id, version=version, status=AgentStatus.UPLOADED
+    )
 
 
 def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:

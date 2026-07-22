@@ -83,9 +83,12 @@ class TestAgentByHotkey:
             agent_id=uuid4(),
             miner_hotkey=_HOTKEY,
             name="alpha",
+            version=2,
             status=AgentStatus.SCORED,  # the agent itself is fine...
             sha256="ab" * 32,
             created_at=datetime.now(UTC),
+            screening_reason="Submission needs a dependency update",
+            screening_reason_code="docker-build",
         )
 
         async def _agent(*_a: object, **_k: object) -> object:
@@ -107,6 +110,8 @@ class TestAgentByHotkey:
         assert response.status_code == 200
         # ...but the miner is banned, so the response says so.
         assert response.json()["status"] == AgentStatus.BANNED.value
+        assert response.json()["version"] == 2
+        assert response.json()["screening_reason"] == agent.screening_reason
 
     async def test_malformed_hotkey_returns_422(
         self,
@@ -129,6 +134,42 @@ class TestAgentByHotkey:
 
 
 class TestAgentStatus:
+    async def test_returns_miner_visible_screening_reason(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from types import SimpleNamespace
+
+        from ditto.db.models import AgentStatus
+
+        _override_session_with_dummy(app)
+        agent = SimpleNamespace(
+            agent_id=uuid4(),
+            status=AgentStatus.REJECTED,
+            screening_reason="Remove the bundled credential and resubmit",
+            screening_reason_code="source-safety",
+        )
+
+        async def _agent(*_args: object, **_kwargs: object) -> object:
+            return agent
+
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.retrieval.get_agent_by_id",
+            _agent,
+        )
+
+        response = await client.get(f"/api/v1/retrieval/agent/{agent.agent_id}/status")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "agent_id": str(agent.agent_id),
+            "status": AgentStatus.REJECTED.value,
+            "screening_reason": agent.screening_reason,
+            "screening_reason_code": agent.screening_reason_code,
+        }
+
     async def test_404_envelope_when_query_returns_none(
         self,
         app: FastAPI,

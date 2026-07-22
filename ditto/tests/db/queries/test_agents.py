@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import undefer_group
 
 from ditto.db import IntegrityError as DbIntegrityError
 from ditto.db.models import Agent, AgentStatus
@@ -70,7 +71,7 @@ class TestInsertAgentHappyPath:
     async def test_inserts_row(self, session: AsyncSession):
         kwargs = _make_kwargs()
         async with session.begin():
-            await insert_agent(session, **kwargs)  # type: ignore[arg-type]
+            version = await insert_agent(session, **kwargs)  # type: ignore[arg-type]
 
         row = (
             await session.execute(
@@ -80,6 +81,59 @@ class TestInsertAgentHappyPath:
         assert row.miner_hotkey == kwargs["miner_hotkey"]
         assert row.name == kwargs["name"]
         assert row.sha256 == kwargs["sha256"]
+        assert version == 1
+        assert row.version == 1
+
+    async def test_versions_repeat_names_per_hotkey(self, session: AsyncSession):
+        hotkey = "5HKVersionedHotkey"
+        async with session.begin():
+            first = await insert_agent(
+                session,
+                agent_id=uuid4(),
+                miner_hotkey=hotkey,
+                name="memory",
+                sha256="11" * 32,
+                size_bytes=1,
+            )
+        async with session.begin():
+            second = await insert_agent(
+                session,
+                agent_id=uuid4(),
+                miner_hotkey=hotkey,
+                name="memory",
+                sha256="22" * 32,
+                size_bytes=2,
+            )
+        async with session.begin():
+            other_name = await insert_agent(
+                session,
+                agent_id=uuid4(),
+                miner_hotkey=hotkey,
+                name="tools",
+                sha256="33" * 32,
+                size_bytes=3,
+            )
+
+        assert (first, second, other_name) == (1, 2, 1)
+
+    async def test_legacy_rows_remain_unversioned_and_new_series_starts_at_one(
+        self, session: AsyncSession
+    ) -> None:
+        hotkey = "5HKLegacyHotkey"
+        legacy = await _seed_agent(session, miner_hotkey=hotkey, name="memory")
+        assert legacy.version is None
+
+        async with session.begin():
+            first_versioned = await insert_agent(
+                session,
+                agent_id=uuid4(),
+                miner_hotkey=hotkey,
+                name="memory",
+                sha256="44" * 32,
+                size_bytes=4,
+            )
+
+        assert first_versioned == 1
 
     async def test_persists_normalized_source_hash(self, session: AsyncSession):
         # The exact-repack hash computed at upload must round-trip to the row.
@@ -103,7 +157,10 @@ class TestInsertAgentHappyPath:
 
         row = (
             await session.execute(
-                select(Agent).where(Agent.agent_id == kwargs["agent_id"])
+                # The sketch columns are deferred; readers must undefer.
+                select(Agent)
+                .options(undefer_group("anticopy"))
+                .where(Agent.agent_id == kwargs["agent_id"])
             )
         ).scalar_one()
         assert row.prompt_fingerprint == sketch
@@ -120,7 +177,9 @@ class TestInsertAgentHappyPath:
 
         row = (
             await session.execute(
-                select(Agent).where(Agent.agent_id == kwargs["agent_id"])
+                select(Agent)
+                .options(undefer_group("anticopy"))
+                .where(Agent.agent_id == kwargs["agent_id"])
             )
         ).scalar_one()
         assert row.code_embedding == [0.1, 0.2, 0.3]

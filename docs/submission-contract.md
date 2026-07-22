@@ -23,7 +23,7 @@ top of). The platform stores the tarball in object storage keyed by agent id and
 | Stage | Where | Check |
 | --- | --- | --- |
 | **Upload** | `endpoints/upload.py` (`/api/v1/upload/*`) | On-chain eval-fee payment verified (replay-protected); tarball ≤ **20 MiB** by default (`MAX_TARBALL_SIZE_BYTES`, overridable with `DITTO_MAX_TARBALL_SIZE_BYTES`) enforced from the *actual streamed bytes*; **SHA-256 re-verified** against the miner's claim; one payment per upload. |
-| **Screen** | `endpoints/screener.py` (`/api/v1/screener/*`) + worker | The screener worker `docker build`s the crate as a cheap gate and reports a verdict: pass → `evaluating`, fail → `screening_failed`. This is the promotion that was formerly manual. The screener is **platform-operated** (a dedicated team-run host) and authenticates with a dedicated key (an allowlisted hotkey + bearer token), not a validator permit. |
+| **Screen** | `endpoints/screener.py` (`/api/v1/screener/*`) + public `ditto-screener` source | The production-v6 core verifies the bounded archive and SHA-256, enforces the root Rust package contract, builds the image, and requires `/health` with no default `/run` assertion. Its lease-bound signed verdict maps pass → `evaluating`, deterministic fail → `rejected`, and retryable infrastructure failure → `screening_failed`. Private timing, random-control, fingerprint, and behavioral signals can only pass or route to quarantine/inconclusive review; no one signal proves causal model use. The screener is **platform-operated** and authenticates with a dedicated allowlisted hotkey plus bearer token, not a validator permit. |
 | **Evaluate** | `dittobench-api` (mode B) | Fetch the presigned tarball; safe-extract with zip-slip + gzip-bomb guards; require a `Dockerfile` at the tarball root (or a single top-level dir); `docker build` + run the container; drive `GET /health`, `POST /seed`, `POST /run`; score. |
 | **Anti-overfit** | `dittobench-api` datagen | A **fresh seed per run** (stratified categories); the miner cannot see or pin the dataset. Difficulty variance is calibrated to a between-seed stddev ≤ 0.03. |
 
@@ -81,7 +81,9 @@ re-score sweep before old scores are compared to new.
 - **Miner-facing contract + wire protocol** — dittobench-starter-kit `README.md`
   ("Submit") + `PROTOCOL.md`.
 - **Upload** — `ditto/api_server/endpoints/upload.py`.
-- **Screener gate** — `ditto/api_server/endpoints/screener.py`.
+- **Screener protocol and state transitions** — `ditto/api_server/endpoints/screener.py`.
+- **Platform-operated build/run worker (public source)** —
+  `ditto-assistant/ditto-screener`.
 - **Tarball ingest + Docker sandbox (mode B)** — `dittobench-api`
   `internal/sandbox/` (`Dockerfile`-at-root build-context rule, safe extractor).
 - **Validator deploy** — infra `docs/validator-deploy.md`.

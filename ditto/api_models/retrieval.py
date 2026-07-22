@@ -23,6 +23,16 @@ class AgentResponse(BaseModel):
     agent_id: Annotated[UUID, Field(description="Server-generated agent identifier.")]
     miner_hotkey: Annotated[str, Field(description="Submitting miner's SS58 hotkey.")]
     name: Annotated[str, Field(description="Miner-chosen agent name.")]
+    version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description=(
+                "Submission version within this named agent; null for legacy uploads."
+            ),
+        ),
+    ] = None
     status: Annotated[
         AgentStatus, Field(description="Lifecycle state (see MVP-SPEC §9).")
     ]
@@ -32,6 +42,16 @@ class AgentResponse(BaseModel):
     created_at: Annotated[
         datetime, Field(description="When the upload row was inserted (UTC).")
     ]
+    screening_reason: Annotated[
+        str | None,
+        Field(
+            description="Public-safe reason for the current screening outcome.",
+        ),
+    ] = None
+    screening_reason_code: Annotated[
+        str | None,
+        Field(description="Stable machine-readable screening outcome code."),
+    ] = None
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -39,9 +59,11 @@ class AgentResponse(BaseModel):
                 "agent_id": "550e8400-e29b-41d4-a716-446655440000",
                 "miner_hotkey": "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm",
                 "name": "alpha-agent",
+                "version": 1,
                 "status": "uploaded",
                 "sha256": "deadbeef" * 8,
                 "created_at": "2026-06-08T12:00:00Z",
+                "screening_reason": None,
             }
         }
     )
@@ -57,12 +79,23 @@ class AgentStatusResponse(BaseModel):
 
     agent_id: Annotated[UUID, Field(description="Echoes the path-param id.")]
     status: Annotated[AgentStatus, Field(description="Lifecycle state.")]
+    screening_reason: Annotated[
+        str | None,
+        Field(
+            description="Public-safe reason for the current screening outcome.",
+        ),
+    ] = None
+    screening_reason_code: Annotated[
+        str | None,
+        Field(description="Stable machine-readable screening outcome code."),
+    ] = None
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "agent_id": "550e8400-e29b-41d4-a716-446655440000",
                 "status": "screening",
+                "screening_reason": None,
             }
         }
     )

@@ -2,36 +2,68 @@
 
 A single self-contained `index.html` — the public "front door" for Subnet 118.
 No build step, no framework, no external requests, **no secrets**. It reads the
-platform's public, aggregate-only API (`GET /api/v1/public/leaderboard` and
-`GET /api/v1/public/health`) and links out to wandb for the per-epoch deep dive.
+platform's public API and links out to wandb for the per-epoch deep dive.
 This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
-
-## Layout
-
-Desktop/widescreen chrome: a sticky left sidebar lists every section of the
-site; each section is a deep-linkable, hash-routed page (`#/overview`,
-`#/leaderboard`, `#/operations`, `#/submissions`, `#/benchmark`). On narrow
-viewports the sidebar becomes a top bar with a hamburger menu. The
-light/dark/time theme switcher and the telemetry/refresh actions live in the
-sidebar; the status pill and page title sit in a slim main header. Overview is
-the snapshot cards; Network operations holds the live submission pipeline and
-the validator/screener fleet-health table; Submissions is the paginated recent
-uploads; Benchmark explains what DittoBench v2 measures.
 
 ## What it shows
 
 - **Subnet snapshot** — total miners are the primary signal, with scored-miner,
   leaderboard, throughput, and latency metrics in one top-level panel.
-- **Leaderboard** — best eligible score per miner, ranked by composite, with
-  composite / tool / memory bars; the leader is highlighted. Click a row for a
-  drill-down (tool-vs-memory split, first-seen, rank).
-- **Anti-overfit assurance** — states plainly that only aggregates are published
-  and that dataset seeds rotate every submission.
+- **Leaderboard** — best eligible score per miner, ranked by raw finalized
+  composite, with a separate KOTH emissions projection that identifies the
+  first-seen incumbent champion and participation-tail recipients. The projection
+  applies the validator's frozen 2% protection margin and statistical dethrone
+  band, so raw rank #1 is never mislabeled as champion. A native Subtensor read
+  overlays the last publicly revealed validator vectors at one block, while
+  explicitly separating those lagging commit-reveal inputs from stake-weighted
+  Yuma emissions. Click a row for a drill-down (tool-vs-memory split, first-seen,
+  raw rank, projected emissions role, and revealed validator top-choice/support
+  counts). Current SN118 registration
+  is reported separately: a deregistered hotkey's immutable score stays visible
+  but is marked inactive and excluded from weights and emissions until that same
+  hotkey registers again.
+- **Submission pipeline** — screening and validator-ticket history, including a
+  compact accessible benchmark progress bar for each validator currently
+  evaluating the submission. Active benchmark work takes precedence over a
+  submission's previously completed stage, so version-rollout rescoring stays
+  aligned with the validator fleet. Running work carries its ticket-bound bench
+  version, and top-five qualification rows state that the prior score remains
+  authoritative while the next-version quorum is collected. Accepted numeric scores appear immediately
+  in the current-version summary as provisional feedback; the prior final
+  median remains authoritative until the new three-validator quorum. Each score
+  includes its post-commit seed and a
+  version-pinned `dittobench-datagen` reproduction command, without exposing
+  ticket signatures or associating the number with a validator identity.
+- **Validator fleet** — signed worker availability, coarse system health, and
+  the public active agent with the same stage/progress shown in the pipeline.
+  Old clients render as progress not reported; expired or stale work disappears.
+- **Stable object links** — all SPA state (popup/selected-row params, the
+  submissions filters, and both pagers) lives in a query string inside the hash,
+  on whatever page it was opened from (`#/submissions?agent={id}`,
+  `#/overview?miner={hotkey}`, `#/operations?validator={hotkey}`,
+  `#/submissions?status=rejected&page=2`, `#/overview?page=2` for the
+  leaderboard page). Page-scoped view state (the filters and either pager's
+  `page`) is cleared when you navigate to a different page, so it never trails
+  along as stale state — which is also why both pagers can share the `page` key
+  without colliding.
+  The real query string carries only deploy/config knobs (`?api=`, `?wandb=`),
+  so the document URL — and its HTTP cache entry — stays stable while the SPA
+  navigates. Agent and miner popovers link to dedicated `/agent/{id}` and
+  `/miner/{hotkey}` pages. Direct visits and browser back/forward navigation
+  restore the same state; older link forms (`?agent={id}#/submissions`
+  real-query state, plural pathname and hash routes) are recognized and
+  normalized to the current form.
+- **Anti-overfit assurance** — explains that seeds are fixed only after the
+  submission is committed, rotate per submission, and can reproduce a completed
+  evaluation without changing the already-submitted artifact.
 
-It intentionally shows **only** what the public API exposes (aggregates). Weights
-and full per-epoch telemetry live in wandb (linked), matching the endpoint
-boundary in `docs/public-telemetry.md` — the platform does not serve the KOTH
-weight vector.
+It intentionally shows **only** what the public API exposes. In-progress score
+rows are a narrow safe projection (composite, deterministic dataset inputs, and
+acceptance time); identities, signatures, ticket leases, and scorer internals
+stay private. The leaderboard serves a read-only KOTH projection for explanation;
+validators still compute and submit the authoritative weight vector independently,
+and Yuma combines their revealed inputs stake-weightedly. Full per-epoch
+telemetry remains in wandb (linked).
 
 ## Configure
 
@@ -48,7 +80,7 @@ defaults are correct and the query string is only needed for testing.
 ## Run / preview
 
 ```sh
-# Preview the layout (renders SAMPLE data since no API is reachable):
+# Preview the API-unavailable state:
 open dashboard/index.html            # or drag it into a browser
 
 # Against a locally-running API (make api-up):
@@ -56,8 +88,8 @@ python -m http.server -d dashboard 8080
 # then visit http://localhost:8080/?api=http://localhost:8000/api/v1
 ```
 
-If the API can't be reached the page renders **sample data** behind a clearly
-marked amber banner, so the layout is always previewable before deploy.
+If the API can't be reached the page renders an explicit unavailable state. It
+never substitutes sample values for live subnet data.
 
 ## Deploy
 
