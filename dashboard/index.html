@@ -605,6 +605,7 @@
     footer a { color: var(--accent); text-decoration: none; }
     footer a:hover { text-decoration: underline; }
     .foot-links { display: flex; gap: 18px; flex-wrap: wrap; }
+    .foot-label { color: var(--text); font-weight: 650; }
 
     .empty { padding: 40px; text-align: center; color: var(--text-dim); }
     /* A full-colspan message ("No miners scored yet…") lives inside a min-width
@@ -1263,6 +1264,7 @@
     .ic { width: 1em; height: 1em; flex: none; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vertical-align: -0.14em; }
     .nav-item .ni-icon .ic { width: 17px; height: 17px; }
     .btn .ic { width: 15px; height: 15px; }
+    .github-mark { fill: currentColor; stroke: none; }
     .banner .ic { width: 16px; height: 16px; flex: none; }
     a .ic.ext { width: 12px; height: 12px; opacity: 0.7; margin-left: 2px; }
     .side-theme { margin-top: 4px; }
@@ -2149,12 +2151,12 @@
       .sidebar { position: sticky; top: 0; z-index: 30; height: auto; flex: none; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 12px 16px; border-right: none; border-bottom: 1px solid var(--border); }
       .sidebar .brand { flex: 1 1 auto; min-width: 0; order: 0; padding: 0; }
       .sidebar .brand .mark { width: 34px; height: 34px; }
-      /* Footer moves onto row 1, right of the brand: a compact Refresh button and
-         an icon-only telemetry link so mobile users can still refresh. */
+      /* Footer moves onto row 1, right of the brand: Refresh plus compact
+         telemetry and GitHub source links. */
       .side-foot { order: 1; display: flex; flex-direction: row; align-items: center; gap: 8px; margin-top: 0; }
       .side-foot .btn { min-height: 34px; }
-      #wandb-link { padding-inline: 9px; }
-      #wandb-link .btn-label { display: none; }
+      #wandb-link, #github-link { padding-inline: 9px; }
+      #wandb-link .btn-label, #github-link .btn-label { display: none; }
       .nav { order: 2; flex-basis: 100%; width: 100%; flex-direction: row; flex-wrap: nowrap; overflow-x: auto; gap: 4px; margin-top: 2px; }
       .nav-item { flex: 0 0 auto; padding: 7px 11px; border-radius: 8px; }
       .nav-item .ni-desc { display: none; }
@@ -2216,6 +2218,7 @@
       </div>
       <div class="side-foot">
         <a id="wandb-link" class="btn ghost" href="#" target="_blank" rel="noopener" aria-label="Full telemetry (wandb)" title="Full telemetry (wandb)"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg><span class="btn-label"> Full telemetry <svg class="ic ext" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6"/></svg></span></a>
+        <a id="github-link" class="btn ghost" href="https://github.com/ditto-assistant/ditto-platform" target="_blank" rel="noopener" aria-label="Platform source on GitHub" title="Platform source on GitHub"><svg class="ic github-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.64 22.41c.58.11.79-.25.79-.56v-2.23c-3.22.7-3.9-1.37-3.9-1.37-.52-1.34-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.57-.29-5.27-1.28-5.27-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.16 1.18a10.96 10.96 0 0 1 5.76 0c2.19-1.49 3.16-1.18 3.16-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.71 5.38-5.29 5.67.42.36.79 1.07.79 2.16v3.2c0 .31.21.68.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg><span class="btn-label"> GitHub</span></a>
         <button id="refresh" class="btn" title="Refresh now"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg> Refresh</button>
       </div>
     </aside>
@@ -2595,9 +2598,12 @@
     </section>
 
     <footer>
-      <div class="foot-links">
+      <div class="foot-links" aria-label="Open-source Ditto repositories">
+        <span class="foot-label">Open-source stack</span>
         <a id="foot-wandb" href="#" target="_blank" rel="noopener">Full per-epoch telemetry (wandb) ↗</a>
+        <a href="https://github.com/ditto-assistant/ditto-platform" target="_blank" rel="noopener">Platform source ↗</a>
         <a href="https://github.com/ditto-assistant/ditto-subnet" target="_blank" rel="noopener">Subnet &amp; validator ↗</a>
+        <a href="https://github.com/ditto-assistant/ditto-screener" target="_blank" rel="noopener">Screening worker ↗</a>
         <a href="https://github.com/ditto-assistant/dittobench-api" target="_blank" rel="noopener">Scoring engine ↗</a>
         <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">Dataset &amp; grader ↗</a>
         <a href="https://github.com/ditto-assistant/dittobench-starter-kit" target="_blank" rel="noopener">Miner starter kit ↗</a>

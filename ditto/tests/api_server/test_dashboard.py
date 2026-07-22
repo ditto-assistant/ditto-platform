@@ -790,6 +790,15 @@ class TestDashboard:
         assert 'id="leaderboard-title">Leaderboard</h2>' in body  # folded into Overview
         assert 'data-theme-choice="system"' in body  # switcher still wired
 
+    async def test_advertises_public_source_repositories(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        assert 'aria-label="Platform source on GitHub"' in body
+        assert body.count("https://github.com/ditto-assistant/ditto-platform") == 2
+        assert "https://github.com/ditto-assistant/ditto-subnet" in body
+        assert "https://github.com/ditto-assistant/ditto-screener" in body
+        assert 'aria-label="Open-source Ditto repositories"' in body
+
     async def test_dashboard_entities_use_query_popovers_and_pages(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
