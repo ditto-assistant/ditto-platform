@@ -651,7 +651,17 @@ class PublicDethroneDecision(BaseModel):
 class PublicKothEmissions(BaseModel):
     """Current read-only projection of the validator's KOTH weight fold."""
 
-    margin: Annotated[float, Field(ge=0.0, le=1.0)]
+    margin: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Fixed composite-point lead required before uncertainty can permit "
+                "a dethrone."
+            ),
+        ),
+    ]
     dethrone_z: Annotated[float, Field(ge=0.0)]
     champion_share: Annotated[float, Field(gt=0.0, le=1.0)]
     tail_size: Annotated[int, Field(ge=0)]

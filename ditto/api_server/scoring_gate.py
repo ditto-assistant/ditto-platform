@@ -3,10 +3,11 @@
 SN118 artifacts are downloadable, so the central threat is copying: download
 the current best harness and resubmit it (verbatim or lightly tweaked) to
 dethrone the original. The KOTH+ATH fold already defeats a *verbatim* copy — it
-ties the incumbent, never clears the 2% margin, and first-seen protects the
-original. This gate adds cheap signals against a *lightly-tweaked* copy that
-nudges its score just past the incumbent: such a submission scores within a hair
-of the agent it surpasses and matches on the *lexical* fingerprint channel — a
+ties the incumbent, never clears the fixed composite-point margin, and first-seen
+protects the original. This gate adds cheap signals against a *lightly-tweaked*
+copy that nudges its score just past the incumbent: such a submission scores
+within a hair of the agent it surpasses and matches on the *lexical* fingerprint
+channel — a
 reference-aware sketch of the tarball text (:mod:`ditto.api_server.fingerprint`,
 official starter-kit scaffolding subtracted before sketching), which survives
 reindent/reformat/localized-edit and junk-file padding, compared by Jaccard
@@ -43,7 +44,7 @@ if TYPE_CHECKING:
 # noise so a re-rolled verbatim copy cannot clear it on a lucky seed.
 # DittoBench v2 / bench_version 2 (BENCHMARK-V2 §6.2, B8) targets between-seed
 # σ ≤ 0.01 composite. The 0.03 tolerance remains intentionally broader than
-# the validator's 2% KOTH margin so a near-copy that barely clears the crown gate
+# the validator's fixed KOTH margin so a near-copy that barely clears the crown gate
 # is still held for review. Bump this tolerance if the hosted 30-seed σ comes in
 # higher (it was 0.02 for v1).
 _DEFAULT_SCORE_TOL = 0.03

@@ -42,7 +42,7 @@ def _entry(
 
 def test_older_incumbent_survives_a_sub_margin_raw_leader() -> None:
     incumbent = _entry(2, 0.800, minutes=0)
-    raw_leader = _entry(1, 0.815, minutes=1)
+    raw_leader = _entry(1, 0.804, minutes=1)
 
     projection = project_koth([raw_leader, incumbent])
 
@@ -50,8 +50,8 @@ def test_older_incumbent_survives_a_sub_margin_raw_leader() -> None:
     assert projection.champion == incumbent
     assert projection.raw_leader == raw_leader
     assert projection.raw_leader_decision is not None
-    assert projection.raw_leader_decision.challenger_lead == pytest.approx(0.015)
-    assert projection.raw_leader_decision.required_lead == pytest.approx(0.016)
+    assert projection.raw_leader_decision.challenger_lead == pytest.approx(0.004)
+    assert projection.raw_leader_decision.required_lead == pytest.approx(0.005)
     assert projection.raw_leader_decision.method == "flat"
     assert projection.raw_leader_decision.dethrones is False
 
@@ -66,7 +66,7 @@ def test_statistical_band_matches_validator_unpaired_rule() -> None:
     decision = projection.raw_leader_decision
     assert decision is not None
     assert projection.champion == incumbent
-    assert decision.margin_lead == pytest.approx(0.016)
+    assert decision.margin_lead == pytest.approx(0.005)
     assert decision.statistical_lead == pytest.approx(1.64 * (0.03**2 + 0.03**2) ** 0.5)
     assert decision.required_lead == decision.statistical_lead
     assert decision.method == "unpaired"
@@ -85,6 +85,20 @@ def test_clear_challenger_dethrones_and_tail_uses_raw_composite_order() -> None:
     assert projection.tail == (runner_up, incumbent)
 
 
+def test_fixed_margin_does_not_grow_into_a_ceiling_lock() -> None:
+    incumbent = _entry(2, 0.930, minutes=0)
+    challenger = _entry(1, 0.936, minutes=1)
+
+    projection = project_koth([challenger, incumbent])
+
+    assert projection is not None
+    assert projection.champion == challenger
+
+    exact_boundary = project_koth([_entry(3, 0.935, minutes=1), incumbent])
+    assert exact_boundary is not None
+    assert exact_boundary.champion == incumbent
+
+
 def test_confirmation_median_and_paired_seed_band_match_validator_fold() -> None:
     incumbent = _entry(
         2,
@@ -97,7 +111,7 @@ def test_confirmation_median_and_paired_seed_band_match_validator_fold() -> None
         1,
         0.90,
         minutes=1,
-        confirmations=(0.81, 0.83, 0.79),
+        confirmations=(0.804, 0.824, 0.784),
         seeds=(10, 20, 30),
     )
 
@@ -108,8 +122,8 @@ def test_confirmation_median_and_paired_seed_band_match_validator_fold() -> None
     decision = projection.raw_leader_decision
     assert decision is not None
     assert decision.method == "paired"
-    assert decision.challenger_lead == pytest.approx(0.01)
-    assert decision.margin_lead == pytest.approx(0.016)
+    assert decision.challenger_lead == pytest.approx(0.004)
+    assert decision.margin_lead == pytest.approx(0.005)
     assert decision.dethrones is False
 
 

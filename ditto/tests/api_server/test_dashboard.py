@@ -933,6 +933,8 @@ class TestDashboardScoringTransparency:
         # not there is an active contest.
         assert 'id="emissions-threshold"' in body
         assert "Beat this to contend" in body
+        assert "var floor = champComposite + margin" in body
+        assert "champComposite * (1 + margin)" not in body
         # And it is published as a floor, never as a sufficient score.
         assert "this is a floor, not a guarantee" in body
         # Rollout / authority state, with the threshold read from the API.

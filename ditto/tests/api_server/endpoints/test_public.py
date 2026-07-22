@@ -511,7 +511,7 @@ class TestPublicLeaderboard:
         assert body["entries"][0]["rank"] == 1
         assert body["emissions"]["raw_leader_agent_id"] == raw_leader_id
         assert body["emissions"]["champion_agent_id"] == incumbent_id
-        assert body["emissions"]["margin"] == pytest.approx(0.02)
+        assert body["emissions"]["margin"] == pytest.approx(0.005)
         assert body["emissions"]["dethrone_z"] == pytest.approx(1.64)
         decision = body["emissions"]["raw_leader_decision"]
         assert decision["challenger_lead"] == pytest.approx(0.05)

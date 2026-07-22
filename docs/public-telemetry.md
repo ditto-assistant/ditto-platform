@@ -85,7 +85,8 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   fallback. `?bench_version=2` provides a historical single-version view and
   intentionally returns `emissions: null`. In the default view, `emissions` is a
   public-safe, read-only projection of the validator's frozen first-seen KOTH
-  fold over finalized authoritative entries: the 2% incumbent margin, the
+  fold over finalized authoritative entries: the fixed 0.005 composite-point
+  incumbent hysteresis, the
   statistical band, the 90% champion share, and the participation tail. It is
   `null` when no eligible entry exists. Validators still compute and submit their
   own authoritative weight vectors. The provenance block (`models` =
