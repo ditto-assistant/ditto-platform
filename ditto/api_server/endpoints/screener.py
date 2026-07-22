@@ -1,6 +1,6 @@
 """Screener-facing endpoints — the cheap pre-evaluation gate.
 
-The screener worker (in ``ditto-subnet``) drains freshly ``uploaded`` agents,
+The worker in the private ``ditto-screener`` repository drains freshly uploaded agents,
 does a lint + compile + build check on each tarball, and reports a verdict.
 A pass promotes the agent ``uploaded -> evaluating`` so the validator queue
 picks it up. A deterministic submission failure becomes ``rejected``; a
@@ -13,7 +13,8 @@ workers look identical to an operator.
 Lifecycle + scope decisions (documented so they're easy to revisit):
 
 - **Queue = new uploads, retryable failures, and stale-policy results.**
-  Oldest-first drains in arrival order and re-screens in place.
+  Two-score provisional contenders drain by score so likely winners can reach
+  quorum; other submissions drain by fewest accepted scores, then arrival order.
 - **Verdict is a direct promotion.** A pass sets ``evaluating`` (not
   ``screening_passed``). A deterministic fail sets ``rejected``; an
   infrastructure fail remains retryable as ``screening_failed``. Re-reporting
@@ -25,18 +26,27 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
-from sqlalchemy import or_, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
     ArtifactResponse,
+    ScreenedImageAbortRequest,
+    ScreenedImageAbortResponse,
+    ScreenedImageCompleteRequest,
+    ScreenedImageCompleteResponse,
+    ScreenedImagePartRequest,
+    ScreenedImagePartResponse,
+    ScreenedImageUploadRequest,
+    ScreenedImageUploadResponse,
     ScreenerHeartbeatRequest,
     ScreenerHeartbeatResponse,
     ScreenerQueueItem,
@@ -47,6 +57,7 @@ from ditto.api_models import (
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.system_health import system_metrics_signing_token
+from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_dataset_generator,
@@ -59,16 +70,35 @@ from ditto.api_server.endpoints.validator import (
     _verify_signature,
 )
 from ditto.api_server.onchain_seed import derive_seed
-from ditto.api_server.storage import S3StorageClient
+from ditto.api_server.storage import (
+    ObjectDownloadFailedError,
+    ObjectNotFoundError,
+    ObjectUploadFailedError,
+    S3StorageClient,
+)
 from ditto.chain import ChainError
-from ditto.db.models import Agent, ScreeningAttempt
+from ditto.db.models import (
+    Agent,
+    BenchmarkDataset,
+    BenchmarkRollout,
+    BenchmarkRolloutMember,
+    ScreenedImageUpload,
+    ScreeningAttempt,
+    ScreeningQuarantine,
+)
 from ditto.db.queries.agents import get_agent_by_id
-from ditto.db.queries.heartbeats import upsert_screener_heartbeat
+from ditto.db.queries.benchmark_rollout import active_bench_version, open_rollout
+from ditto.db.queries.heartbeats import (
+    prune_stale_screener_heartbeats,
+    upsert_screener_heartbeat,
+)
 from ditto.db.queries.screening import (
     claim_screening_attempts,
     get_screening_attempt,
+    missing_required_benchmark_dataset,
+    screening_priority_order,
 )
-from ditto_screening_protocol import verdict_signing_message
+from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
 
 if TYPE_CHECKING:
     from ditto.chain import ChainClient
@@ -79,9 +109,24 @@ router = APIRouter(prefix="/screener", tags=["screener"])
 
 # How long a pre-signed artifact URL stays valid (mirrors the validator's).
 _ARTIFACT_URL_TTL = timedelta(minutes=5)
-_SCREENING_LEASE_TTL = timedelta(minutes=30)
+_SCREENED_IMAGE_UPLOAD_TTL = timedelta(minutes=15)
+_SCREENED_IMAGE_PART_SIZE = 64 * 1024**2
+# One screening attempt: download + Docker build + serve/health + bounded source
+# review + image export + multipart upload. Must exceed the worker's build cap
+# (SCREENER_BUILD_TIMEOUT_SECONDS, 45m) plus those finalization stages, or a
+# slow-but-legitimate crate outlives the lease and requeues in a loop. Keep this
+# in step with the screener's build and upload deadlines when either moves.
+_SCREENING_LEASE_TTL = timedelta(minutes=70)
 _HEARTBEAT_MAX_SKEW_SECONDS = 300
 _HEARTBEAT_MAX_BYTES = 4096
+# instance_id stored for pre-v3 (no per-instance identity) heartbeats. Distinct
+# from any real GCE instance name, so upgraded workers never collide with it.
+_LEGACY_INSTANCE_ID = "legacy"
+# Drop heartbeat rows unseen this long so scaled-in fleet instances (each has a
+# unique name) don't accumulate dead rows. Far beyond the online/stale windows,
+# so a briefly-offline worker is never pruned out from under the dashboard.
+_HEARTBEAT_RETENTION = timedelta(days=1)
+_CLAIM_FALLBACK_LOCK = asyncio.Lock()
 
 # Policy v1 used the legacy three-field signature. Every policy from v2 onward
 # binds its version, including an older worker reporting a failure during a
@@ -91,6 +136,11 @@ _FIRST_VERSIONED_POLICY = 2
 
 def _artifact_key(agent_id: UUID) -> str:
     return f"{agent_id}/agent.tar.gz"
+
+
+def _screened_image_key(agent_id: UUID, image_upload_id: UUID) -> str:
+    """Return an immutable object key unique to one platform-minted upload."""
+    return f"{agent_id}/screened-images/{image_upload_id}.tar"
 
 
 # Agents a verdict may act on. ``screening`` is included for forward-compat with
@@ -185,12 +235,37 @@ ScreenerDep = Annotated[str, Depends(require_screener)]
 
 
 def _heartbeat_signing_message(payload: ScreenerHeartbeatRequest) -> bytes:
-    """Canonical screener heartbeat bytes, mirrored by ``ditto-subnet``."""
+    """Canonical versioned heartbeat bytes mirrored by ``ditto-screener``."""
+    if payload.protocol_version == 1:
+        return (
+            "ditto-screener-heartbeat:v1:"
+            f"{payload.screener_hotkey}:{payload.software_version}:"
+            f"{payload.protocol_version}:{payload.policy_version}:{payload.state}:"
+            f"{payload.active_agent_id or ''}:"
+            f"{system_metrics_signing_token(payload.system_metrics)}:{payload.timestamp}"
+        ).encode()
+    progress = (
+        f"{payload.progress.stage},{payload.progress.started_at}"
+        if payload.progress is not None
+        else "-"
+    )
+    if payload.protocol_version >= 3:
+        # v3 signs the per-instance identity (the fleet shares one hotkey).
+        # instance_id is required for v3 (validated on the request model).
+        return (
+            "ditto-screener-heartbeat:v3:"
+            f"{payload.screener_hotkey}:{payload.software_version}:"
+            f"{payload.protocol_version}:{payload.policy_version}:{payload.state}:"
+            f"{payload.active_agent_id or ''}:{payload.instance_id}:"
+            f"{progress}:"
+            f"{system_metrics_signing_token(payload.system_metrics)}:{payload.timestamp}"
+        ).encode()
     return (
-        "ditto-screener-heartbeat:v1:"
+        "ditto-screener-heartbeat:v2:"
         f"{payload.screener_hotkey}:{payload.software_version}:"
         f"{payload.protocol_version}:{payload.policy_version}:{payload.state}:"
         f"{payload.active_agent_id or ''}:"
+        f"{progress}:"
         f"{system_metrics_signing_token(payload.system_metrics)}:{payload.timestamp}"
     ).encode()
 
@@ -243,15 +318,22 @@ async def heartbeat(
         raise ScreenerAuthError("heartbeat signature verification failed")
 
     reported_at = datetime.fromtimestamp(request_body.timestamp, tz=UTC)
+    instance_id = request_body.instance_id or _LEGACY_INSTANCE_ID
     async with session.begin():
         row, accepted = await upsert_screener_heartbeat(
             session,
             screener_hotkey=screener_hotkey,
+            instance_id=instance_id,
             software_version=request_body.software_version,
             protocol_version=request_body.protocol_version,
             policy_version=request_body.policy_version,
             state=request_body.state,
             active_agent_id=request_body.active_agent_id,
+            screening_progress=(
+                request_body.progress.model_dump(mode="json")
+                if request_body.progress is not None
+                else None
+            ),
             system_metrics=(
                 request_body.system_metrics.model_dump(mode="json")
                 if request_body.system_metrics is not None
@@ -260,6 +342,11 @@ async def heartbeat(
             reported_at=reported_at,
             seen_at=now,
             signature=request_body.signature,
+        )
+        # Reap heartbeats from long-gone instances (scaled-in fleet workers)
+        # so the per-instance list stays bounded. Cheap indexed delete.
+        await prune_stale_screener_heartbeats(
+            session, before=now - _HEARTBEAT_RETENTION
         )
     seen_at = row.seen_at
     if seen_at.tzinfo is None:
@@ -282,8 +369,26 @@ async def queue(
     session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> ScreenerQueueResponse:
-    """List new and stale-policy agents awaiting screening, oldest first."""
+    """List completion-lane contenders, then least-scored pending agents."""
     response.headers["Cache-Control"] = "no-store"
+    rolling_qualified = exists(
+        select(BenchmarkRolloutMember.agent_id)
+        .join(BenchmarkRollout)
+        .where(
+            BenchmarkRolloutMember.agent_id == Agent.agent_id,
+            BenchmarkRollout.status.in_(("collecting", "blocked_ineligible")),
+        )
+    )
+    missing_v3_screen = (
+        (Agent.screening_policy_version < SCREENING_POLICY_VERSION)
+        | Agent.screened_image_sha256.is_(None)
+        | Agent.screened_image_size_bytes.is_(None)
+        | Agent.screened_image_id.is_(None)
+        | Agent.screened_image_ref.is_(None)
+        | Agent.screened_image_upload_id.is_(None)
+        | Agent.screened_image_verified_at.is_(None)
+    )
+    missing_dataset = await missing_required_benchmark_dataset(session)
     agents = (
         await session.scalars(
             select(Agent)
@@ -300,9 +405,15 @@ async def queue(
                         )
                         & (Agent.screening_policy_version < SCREENING_POLICY_VERSION)
                     ),
+                    (
+                        Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE))
+                        & rolling_qualified
+                        & missing_v3_screen
+                    ),
+                    ((Agent.status == AgentStatus.EVALUATING) & missing_dataset),
                 )
             )
-            .order_by(Agent.created_at.asc())
+            .order_by(*screening_priority_order())
             .limit(limit)
         )
     ).all()
@@ -348,14 +459,27 @@ async def claim(
             f"{SCREENING_POLICY_VERSION}, worker declared {policy_version}"
         )
     now = datetime.now(UTC)
-    async with session.begin():
-        claimed = await claim_screening_attempts(
-            session,
-            screener_hotkey=screener_hotkey,
-            now=now,
-            ttl=_SCREENING_LEASE_TTL,
-            limit=limit,
-        )
+    if session.get_bind().dialect.name == "postgresql":
+        async with session.begin():
+            claimed = await claim_screening_attempts(
+                session,
+                screener_hotkey=screener_hotkey,
+                now=now,
+                ttl=_SCREENING_LEASE_TTL,
+                limit=limit,
+            )
+    else:
+        # SQLite is used by local/test deployments and has no advisory locks.
+        # Hold a process-local lock through commit so its behavior matches the
+        # Postgres transaction-scoped lock used in production.
+        async with _CLAIM_FALLBACK_LOCK, session.begin():
+            claimed = await claim_screening_attempts(
+                session,
+                screener_hotkey=screener_hotkey,
+                now=now,
+                ttl=_SCREENING_LEASE_TTL,
+                limit=limit,
+            )
     items = [
         ScreenerQueueItem(
             agent_id=agent.agent_id,
@@ -366,8 +490,11 @@ async def claim(
             created_at=agent.created_at,
             attempt_id=attempt.attempt_id,
             lease_deadline=attempt.deadline,
+            precheck_reason_code=attempt.reason_code,
+            duplicate_of=duplicate_of,
+            build_only=attempt.build_only,
         )
-        for agent, attempt in claimed
+        for agent, attempt, duplicate_of in claimed
     ]
     logger.info("screener=%s claimed %d item(s)", screener_hotkey, len(items))
     return ScreenerQueueResponse(
@@ -413,13 +540,344 @@ async def agent_artifact(
     )
 
 
-def _public_screening_reason(detail: str) -> str:
+@router.post(
+    "/agent/{agent_id}/screened-image-upload",
+    response_model=ScreenedImageUploadResponse,
+    responses={
+        401: {"description": "Missing/invalid screener auth."},
+        409: {"description": "Screening attempt is not active."},
+        422: {"description": "Malformed image metadata."},
+    },
+)
+async def screened_image_upload(
+    agent_id: UUID,
+    payload: ScreenedImageUploadRequest,
+    response: Response,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+    storage: StorageDep,
+) -> ScreenedImageUploadResponse:
+    """Initiate an immutable multipart upload bound to the active lease."""
+    response.headers["Cache-Control"] = "no-store"
+    expected_ref = f"ditto-screen/{agent_id}:latest"
+    if payload.image_ref != expected_ref:
+        raise AgentNotScreenableError("screened image ref does not match agent")
+    now = datetime.now(UTC)
+    async with session.begin():
+        attempt = await get_screening_attempt(
+            session, attempt_id=payload.attempt_id, for_update=True
+        )
+        if (
+            attempt is None
+            or attempt.agent_id != agent_id
+            or attempt.screener_hotkey != screener_hotkey
+            or attempt.policy_version != SCREENING_POLICY_VERSION
+            or attempt.status != "running"
+        ):
+            raise AgentNotScreenableError(
+                "screened image upload does not match an active screening attempt"
+            )
+        deadline = attempt.deadline
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        if now > deadline:
+            raise AgentNotScreenableError("screened image upload lease has expired")
+
+    image_upload_id = uuid4()
+    expires_at = min(now + _SCREENED_IMAGE_UPLOAD_TTL, deadline)
+    metadata = {
+        "sha256": payload.sha256,
+        "image-id": payload.image_id,
+        "image-ref": payload.image_ref,
+        "attempt-id": str(payload.attempt_id),
+        "image-upload-id": str(image_upload_id),
+    }
+    key = _screened_image_key(agent_id, image_upload_id)
+    storage_upload_id = await storage.create_multipart_upload(
+        key=key,
+        metadata=metadata,
+    )
+    try:
+        async with session.begin():
+            attempt = await get_screening_attempt(
+                session, attempt_id=payload.attempt_id, for_update=True
+            )
+            if (
+                attempt is None
+                or attempt.agent_id != agent_id
+                or attempt.screener_hotkey != screener_hotkey
+                or attempt.policy_version != SCREENING_POLICY_VERSION
+                or attempt.status != "running"
+            ):
+                raise AgentNotScreenableError(
+                    "screened image upload lease changed during initiation"
+                )
+            session.add(
+                ScreenedImageUpload(
+                    image_upload_id=image_upload_id,
+                    agent_id=agent_id,
+                    attempt_id=payload.attempt_id,
+                    screener_hotkey=screener_hotkey,
+                    storage_upload_id=storage_upload_id,
+                    sha256=payload.sha256,
+                    size_bytes=payload.size_bytes,
+                    image_id=payload.image_id,
+                    image_ref=payload.image_ref,
+                    status="initiated",
+                    expires_at=expires_at,
+                )
+            )
+    except Exception:
+        await storage.abort_multipart_upload(key=key, upload_id=storage_upload_id)
+        raise
+    return ScreenedImageUploadResponse(
+        image_upload_id=image_upload_id,
+        storage_upload_id=storage_upload_id,
+        part_size_bytes=_SCREENED_IMAGE_PART_SIZE,
+        expires_at=expires_at,
+    )
+
+
+async def _load_active_image_upload(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    image_upload_id: UUID,
+    attempt_id: UUID,
+    storage_upload_id: str,
+    screener_hotkey: str,
+    for_update: bool = False,
+) -> ScreenedImageUpload:
+    """Load and authenticate one unexpired, attempt-bound multipart session."""
+    upload = await session.get(
+        ScreenedImageUpload, image_upload_id, with_for_update=for_update
+    )
+    if (
+        upload is None
+        or upload.agent_id != agent_id
+        or upload.attempt_id != attempt_id
+        or upload.screener_hotkey != screener_hotkey
+        or upload.storage_upload_id != storage_upload_id
+        or upload.status != "initiated"
+    ):
+        raise AgentNotScreenableError(
+            "screened image multipart session is not active or does not match owner"
+        )
+    expires_at = upload.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if datetime.now(UTC) > expires_at:
+        raise AgentNotScreenableError("screened image multipart session has expired")
+    attempt = await get_screening_attempt(
+        session, attempt_id=attempt_id, for_update=for_update
+    )
+    if (
+        attempt is None
+        or attempt.agent_id != agent_id
+        or attempt.screener_hotkey != screener_hotkey
+        or attempt.status != "running"
+        or attempt.policy_version != SCREENING_POLICY_VERSION
+    ):
+        raise AgentNotScreenableError("screening attempt is no longer active")
+    return upload
+
+
+@router.post(
+    "/agent/{agent_id}/screened-image-upload/{image_upload_id}/part",
+    response_model=ScreenedImagePartResponse,
+)
+async def screened_image_upload_part(
+    agent_id: UUID,
+    image_upload_id: UUID,
+    payload: ScreenedImagePartRequest,
+    response: Response,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+    storage: StorageDep,
+) -> ScreenedImagePartResponse:
+    """Mint one short-lived, attempt-bound multipart part URL."""
+    response.headers["Cache-Control"] = "no-store"
+    async with session.begin():
+        upload = await _load_active_image_upload(
+            session,
+            agent_id=agent_id,
+            image_upload_id=image_upload_id,
+            attempt_id=payload.attempt_id,
+            storage_upload_id=payload.storage_upload_id,
+            screener_hotkey=screener_hotkey,
+        )
+        max_parts = (
+            upload.size_bytes + _SCREENED_IMAGE_PART_SIZE - 1
+        ) // _SCREENED_IMAGE_PART_SIZE
+        if payload.part_number > max_parts:
+            raise AgentNotScreenableError("multipart part exceeds declared image size")
+        expected_size = min(
+            _SCREENED_IMAGE_PART_SIZE,
+            upload.size_bytes - (payload.part_number - 1) * _SCREENED_IMAGE_PART_SIZE,
+        )
+        if payload.size_bytes != expected_size:
+            raise AgentNotScreenableError(
+                "multipart part size does not match declaration"
+            )
+        expires_at = upload.expires_at
+    ttl = max(
+        1,
+        min(
+            int(_SCREENED_IMAGE_UPLOAD_TTL.total_seconds()),
+            int(
+                (
+                    expires_at.replace(tzinfo=UTC)
+                    if expires_at.tzinfo is None
+                    else expires_at
+                ).timestamp()
+                - datetime.now(UTC).timestamp()
+            ),
+        ),
+    )
+    url = await storage.presigned_upload_part_url(
+        key=_screened_image_key(agent_id, image_upload_id),
+        upload_id=payload.storage_upload_id,
+        part_number=payload.part_number,
+        expires_in=ttl,
+    )
+    return ScreenedImagePartResponse(
+        upload_url=url,
+        expires_at=datetime.now(UTC) + timedelta(seconds=ttl),
+        required_headers={"Content-Length": str(payload.size_bytes)},
+    )
+
+
+@router.post(
+    "/agent/{agent_id}/screened-image-upload/{image_upload_id}/complete",
+    response_model=ScreenedImageCompleteResponse,
+)
+async def screened_image_upload_complete(
+    agent_id: UUID,
+    image_upload_id: UUID,
+    payload: ScreenedImageCompleteRequest,
+    response: Response,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+    storage: StorageDep,
+) -> ScreenedImageCompleteResponse:
+    """Complete multipart upload and verify the exact final archive bytes."""
+    response.headers["Cache-Control"] = "no-store"
+    async with session.begin():
+        upload = await _load_active_image_upload(
+            session,
+            agent_id=agent_id,
+            image_upload_id=image_upload_id,
+            attempt_id=payload.attempt_id,
+            storage_upload_id=payload.storage_upload_id,
+            screener_hotkey=screener_hotkey,
+        )
+        if (
+            upload.sha256 != payload.sha256
+            or upload.size_bytes != payload.size_bytes
+            or upload.image_id != payload.image_id
+            or upload.image_ref != payload.image_ref
+        ):
+            raise AgentNotScreenableError(
+                "multipart completion metadata does not match initiation"
+            )
+    key = _screened_image_key(agent_id, image_upload_id)
+    try:
+        await storage.complete_multipart_upload(
+            key=key,
+            upload_id=payload.storage_upload_id,
+            parts=[
+                {"PartNumber": part.part_number, "ETag": part.etag}
+                for part in payload.parts
+            ],
+        )
+        stored = await storage.head_object(key=key)
+        expected_metadata = {
+            "sha256": payload.sha256,
+            "image-id": payload.image_id,
+            "image-ref": payload.image_ref,
+            "attempt-id": str(payload.attempt_id),
+            "image-upload-id": str(image_upload_id),
+        }
+        verified = await storage.verify_object_sha256(
+            key=key, expected_size_bytes=payload.size_bytes
+        )
+    except ObjectNotFoundError as error:
+        raise AgentNotScreenableError(
+            "screened image upload is missing or incomplete"
+        ) from error
+    except (ObjectUploadFailedError, ObjectDownloadFailedError) as error:
+        raise HTTPException(
+            status_code=503, detail="screened image storage verification unavailable"
+        ) from error
+    if (
+        stored.size_bytes != payload.size_bytes
+        or stored.metadata != expected_metadata
+        or verified.size_bytes != payload.size_bytes
+        or verified.sha256 != payload.sha256
+    ):
+        await storage.delete_object(key=key)
+        async with session.begin():
+            stored_upload = await session.get(
+                ScreenedImageUpload, image_upload_id, with_for_update=True
+            )
+            if stored_upload is not None:
+                stored_upload.status = "aborted"
+        raise AgentNotScreenableError(
+            "completed screened image bytes do not match the declared digest"
+        )
+    async with session.begin():
+        stored_upload = await session.get(
+            ScreenedImageUpload, image_upload_id, with_for_update=True
+        )
+        if stored_upload is None or stored_upload.status != "initiated":
+            raise AgentNotScreenableError("multipart session is no longer active")
+        stored_upload.status = "verified"
+        stored_upload.verified_at = datetime.now(UTC)
+    return ScreenedImageCompleteResponse(verified=True)
+
+
+@router.post(
+    "/agent/{agent_id}/screened-image-upload/{image_upload_id}/abort",
+    response_model=ScreenedImageAbortResponse,
+)
+async def screened_image_upload_abort(
+    agent_id: UUID,
+    image_upload_id: UUID,
+    payload: ScreenedImageAbortRequest,
+    response: Response,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+    storage: StorageDep,
+) -> ScreenedImageAbortResponse:
+    """Abort a multipart upload and mark the session terminal."""
+    response.headers["Cache-Control"] = "no-store"
+    async with session.begin():
+        upload = await _load_active_image_upload(
+            session,
+            agent_id=agent_id,
+            image_upload_id=image_upload_id,
+            attempt_id=payload.attempt_id,
+            storage_upload_id=payload.storage_upload_id,
+            screener_hotkey=screener_hotkey,
+            for_update=True,
+        )
+        upload.status = "aborted"
+    await storage.abort_multipart_upload(
+        key=_screened_image_key(agent_id, image_upload_id),
+        upload_id=payload.storage_upload_id,
+    )
+    return ScreenedImageAbortResponse(aborted=True)
+
+
+def _public_screening_reason(detail: str, reason_code: str | None = None) -> str:
     """Map untrusted screener detail to a stable, public-safe failure category.
 
     ``detail`` can include a Docker build-log tail produced by miner-controlled
     code. Never persist or return it verbatim: a malicious Dockerfile could print
     the BuildKit secret mounted for private dependency access.
     """
+    if reason_code == "exact-cross-miner-duplicate":
+        return "Artifact is an exact duplicate of another miner submission"
     normalized = detail.strip().casefold()
     if "no dockerfile at tarball root" in normalized:
         return "Dockerfile missing from archive root"
@@ -459,6 +917,52 @@ def _failed_screening_target(detail: str) -> AgentStatus:
     return AgentStatus.REJECTED
 
 
+def _quarantine_payload_json(
+    payload: ScreenResultRequest,
+) -> tuple[list[dict] | None, dict | None]:
+    """JSON-encode the bounded review payloads carried on a quarantine verdict."""
+    evidence_json = (
+        [item.model_dump(mode="json") for item in payload.evidence]
+        if payload.evidence
+        else None
+    )
+    finding_json = (
+        payload.finding.model_dump(mode="json") if payload.finding is not None else None
+    )
+    return evidence_json, finding_json
+
+
+async def _backfill_quarantine_payloads(
+    session: AsyncSession,
+    *,
+    attempt_id: UUID,
+    payload: ScreenResultRequest,
+) -> None:
+    """Backfill review payloads onto an existing quarantine, never rewriting.
+
+    A re-reported verdict may carry payloads an older worker, an earlier
+    retry, or an older platform build did not persist. Only null fields are
+    filled, and a finding is only accepted for the digest the original signed
+    verdict bound.
+    """
+    evidence_json, finding_json = _quarantine_payload_json(payload)
+    if evidence_json is None and finding_json is None:
+        return
+    quarantine = await session.scalar(
+        select(ScreeningQuarantine).where(ScreeningQuarantine.attempt_id == attempt_id)
+    )
+    if quarantine is None:
+        return
+    if quarantine.evidence is None and evidence_json:
+        quarantine.evidence = evidence_json
+    if (
+        quarantine.finding is None
+        and finding_json
+        and quarantine.finding_digest == payload.finding_digest
+    ):
+        quarantine.finding = finding_json
+
+
 @router.post(
     "/agent/{agent_id}/result",
     response_model=ScreenResultResponse,
@@ -477,6 +981,7 @@ async def submit_result(
     chain: ChainDep,
     session: SessionDep,
     generator: GeneratorDep,
+    storage: StorageDep,
 ) -> ScreenResultResponse:
     """Record the screener's verdict and advance the agent's lifecycle.
 
@@ -497,11 +1002,31 @@ async def submit_result(
 
     if payload.screener_hotkey != screener_hotkey:
         raise ScreenerAuthError("payload hotkey does not match authenticated screener")
+    if payload.policy_version >= 9 and payload.outcome is None:
+        raise AgentNotScreenableError("policy-9 verdicts require a typed outcome")
+    image_upload_id = payload.image_upload_id
 
     # Signature proves the screener owns the hotkey and binds THIS verdict:
     #    ``passed`` is signed, so a captured result can't be replayed with the
     #    boolean flipped to grief (or unfairly promote) a miner.
-    if payload.attempt_id is not None:
+    if payload.outcome is not None:
+        signed = verdict_signing_message(
+            screener_hotkey=payload.screener_hotkey,
+            agent_id=agent_id,
+            attempt_id=payload.attempt_id,
+            passed=payload.passed,
+            policy_version=payload.policy_version,
+            outcome=payload.outcome,
+            manifest_digest=payload.manifest_digest,
+            finding_digest=payload.finding_digest,
+            reason_code=payload.reason_code,
+            image_sha256=payload.image_sha256,
+            image_size_bytes=payload.image_size_bytes,
+            image_id=payload.image_id,
+            image_ref=payload.image_ref,
+            image_upload_id=image_upload_id,
+        )
+    elif payload.attempt_id is not None:
         signed = verdict_signing_message(
             screener_hotkey=payload.screener_hotkey,
             agent_id=agent_id,
@@ -529,18 +1054,104 @@ async def submit_result(
         raise AgentNotScreenableError(
             f"passing verdict requires screening policy {SCREENING_POLICY_VERSION}"
         )
+    if (
+        payload.reason_code == "exact-cross-miner-duplicate"
+        and payload.outcome != ScreenResultOutcome.DETERMINISTIC_REJECT
+    ):
+        raise AgentNotScreenableError(
+            "exact duplicate precheck requires a deterministic rejection"
+        )
 
-    target = (
-        AgentStatus.EVALUATING
-        if payload.passed
-        else _failed_screening_target(payload.detail)
-    )
-    public_reason = None if payload.passed else _public_screening_reason(payload.detail)
+    verified_upload: ScreenedImageUpload | None = None
+    if payload.image_sha256 is not None:
+        if image_upload_id is None:
+            raise AgentNotScreenableError(
+                "passing screened image is missing its upload identity"
+            )
+        async with session.begin():
+            verified_upload = await session.get(ScreenedImageUpload, image_upload_id)
+        if (
+            verified_upload is None
+            or verified_upload.status != "verified"
+            or verified_upload.agent_id != agent_id
+            or verified_upload.attempt_id != payload.attempt_id
+            or verified_upload.screener_hotkey != screener_hotkey
+            or verified_upload.sha256 != payload.image_sha256
+            or verified_upload.size_bytes != payload.image_size_bytes
+            or verified_upload.image_id != payload.image_id
+            or verified_upload.image_ref != payload.image_ref
+            or verified_upload.verified_at is None
+        ):
+            raise AgentNotScreenableError(
+                "screened image was not verified for this screening attempt"
+            )
+        key = _screened_image_key(agent_id, image_upload_id)
+        try:
+            stored_image = await storage.head_object(key=key)
+        except ObjectNotFoundError as error:
+            raise AgentNotScreenableError(
+                "verified screened image is missing from storage"
+            ) from error
+        if stored_image.size_bytes != payload.image_size_bytes:
+            raise AgentNotScreenableError(
+                "stored screened image size changed after verification"
+            )
 
-    # 3. Generate the per-submission dataset (outside the row lock). Only on a pass,
-    #    when generation is enabled, and when the agent is not already pinned (a
-    #    cheap pre-read guards a re-reported verdict from regenerating).
-    new_dataset: tuple[int, str, str, int | None, str | None] | None = None
+    public_reason: str | None
+    if payload.outcome == ScreenResultOutcome.INCONCLUSIVE:
+        # Inconclusive is explicitly a NON-verdict: the worker keeps it
+        # private (journal + lease expiry) and never posts it. Accepting one
+        # here would fall through to the legacy detail-based mapping and turn
+        # "we could not tell" into a rejection.
+        raise AgentNotScreenableError(
+            "inconclusive outcomes are not submittable verdicts"
+        )
+    if payload.outcome == ScreenResultOutcome.QUARANTINE:
+        # A build-only attempt rebuilds an already-adjudicated submission's
+        # prerequisites and runs no source review, so it must not be able to
+        # re-quarantine — that would let a screener silently override the
+        # operator release / prior pass that made it EVALUATING.
+        if payload.attempt_id is not None:
+            async with session.begin():
+                reported_attempt = await get_screening_attempt(
+                    session, attempt_id=payload.attempt_id
+                )
+            if reported_attempt is not None and reported_attempt.build_only:
+                raise AgentNotScreenableError(
+                    "a build-only screening attempt cannot quarantine"
+                )
+        target = AgentStatus.QUARANTINED
+        public_reason = "Submission held for anti-cheat review"
+    elif payload.outcome == ScreenResultOutcome.RETRYABLE_INFRA:
+        target = AgentStatus.SCREENING_FAILED
+        public_reason = "Screening infrastructure error"
+    elif payload.outcome == ScreenResultOutcome.DETERMINISTIC_REJECT:
+        target = AgentStatus.REJECTED
+        public_reason = _public_screening_reason(payload.detail, payload.reason_code)
+    else:
+        # Legacy workers did not send typed pass/fail outcomes. Preserve their
+        # detail-based behavior during rolling upgrades.
+        target = (
+            AgentStatus.EVALUATING
+            if payload.passed
+            else _failed_screening_target(payload.detail)
+        )
+        public_reason = (
+            None
+            if payload.passed
+            else _public_screening_reason(payload.detail, payload.reason_code)
+        )
+
+    # 3. Generate the scoring-version dataset (outside the row lock). A new
+    #    submission received after an open rollout starts enters that desired
+    #    benchmark era immediately; older submissions remain on the active
+    #    version unless they separately qualify for the rollout cohort.
+    #    The legacy
+    #    agent-level columns hold the original/v2 pin, so their presence does not
+    #    prove a v3 BenchmarkDataset exists. A policy rescreen after activation
+    #    must backfill that missing row from the same immutable seed or the agent
+    #    is left evaluating forever with no ticket candidate.
+    new_dataset: tuple[int, int, str, str, int | None, str | None] | None = None
     if payload.passed and generator.run_size is not None:
         # Own transaction so the read commits/closes before the write txn below
         # (a bare SELECT autobegins a transaction that would collide with it).
@@ -548,11 +1159,29 @@ async def submit_result(
             existing = await get_agent_by_id(session, agent_id=agent_id)
             if existing is None:
                 raise AgentNotFoundError(f"no agent with id={agent_id}")
-            needs_dataset = existing.dataset_seed is None
+            bench_version = await active_bench_version(session)
+            rollout = await open_rollout(session)
+            if rollout is not None and existing.created_at >= rollout.created_at:
+                bench_version = rollout.desired_version
+            versioned_dataset = await session.get(
+                BenchmarkDataset, (agent_id, bench_version)
+            )
+            needs_dataset = versioned_dataset is None
+            existing_seed = existing.dataset_seed
+            existing_seed_block = existing.dataset_seed_block
+            existing_seed_block_hash = existing.dataset_seed_block_hash
         if needs_dataset:
-            seed, block_number, block_hash = await _derive_dataset_seed(chain, agent_id)
-            dataset_sha256 = await generator.generate(seed)
+            if existing_seed is None:
+                seed, block_number, block_hash = await _derive_dataset_seed(
+                    chain, agent_id
+                )
+            else:
+                seed = existing_seed
+                block_number = existing_seed_block
+                block_hash = existing_seed_block_hash
+            dataset_sha256 = await generator.generate(seed, bench_version=bench_version)
             new_dataset = (
+                bench_version,
                 seed,
                 dataset_sha256,
                 generator.run_size,
@@ -568,7 +1197,9 @@ async def submit_result(
             raise AgentNotFoundError(f"no agent with id={agent_id}")
         attempt: ScreeningAttempt | None = None
         attempt_status = (
-            "passed"
+            "quarantined"
+            if target == AgentStatus.QUARANTINED
+            else "passed"
             if payload.passed
             else ("rejected" if target == AgentStatus.REJECTED else "failed")
         )
@@ -585,10 +1216,30 @@ async def submit_result(
                 raise AgentNotScreenableError(
                     "verdict does not match the claimed screening attempt"
                 )
+            if attempt.reason_code == "exact-cross-miner-duplicate" and (
+                payload.reason_code != attempt.reason_code
+            ):
+                raise AgentNotScreenableError(
+                    "verdict does not match the platform precheck disposition"
+                )
             deadline = attempt.deadline
             if deadline.tzinfo is None:
                 deadline = deadline.replace(tzinfo=UTC)
-            if attempt.status == attempt_status and agent.status == target:
+            if attempt.status == attempt_status and (
+                agent.status == target
+                or (
+                    attempt_status == "passed"
+                    and agent.status in (AgentStatus.SCORED, AgentStatus.LIVE)
+                )
+            ):
+                # Idempotent re-report: nothing transitions, but a retry may
+                # carry review payloads that an earlier report (or an older
+                # platform build) did not persist. Backfill them before
+                # returning or they would be unrecoverable for this attempt.
+                if target == AgentStatus.QUARANTINED:
+                    await _backfill_quarantine_payloads(
+                        session, attempt_id=attempt.attempt_id, payload=payload
+                    )
                 result_status = agent.status
                 return ScreenResultResponse(
                     agent_id=agent_id, status=result_status, accepted=True
@@ -606,8 +1257,24 @@ async def submit_result(
             )
             and agent.screening_policy_version < SCREENING_POLICY_VERSION
         )
+        rolling_rescreen = bool(
+            await session.scalar(
+                select(
+                    exists().where(
+                        BenchmarkRolloutMember.agent_id == agent.agent_id,
+                        BenchmarkRolloutMember.rollout_id
+                        == BenchmarkRollout.rollout_id,
+                        BenchmarkRollout.status.in_(
+                            ("collecting", "blocked_ineligible")
+                        ),
+                    )
+                )
+            )
+        ) and agent.status in (AgentStatus.SCORED, AgentStatus.LIVE)
         idempotent = agent.status == target
-        if agent.status in _SCREENABLE_STATUSES or rescreening:
+        if rolling_rescreen and payload.passed:
+            pass
+        elif rolling_rescreen or agent.status in _SCREENABLE_STATUSES or rescreening:
             agent.status = target
         elif agent.status == target:
             pass  # idempotent re-report of the same verdict
@@ -617,11 +1284,29 @@ async def submit_result(
                 f"passed={payload.passed} (target {target})"
             )
         agent.screening_reason = public_reason
+        agent.screening_reason_code = None if payload.passed else payload.reason_code
+        if payload.reason_code == "exact-cross-miner-duplicate":
+            if attempt is None or attempt.duplicate_of is None:
+                raise AgentNotScreenableError(
+                    "exact duplicate verdict requires a platform precheck"
+                )
+            agent.duplicate_of = attempt.duplicate_of
+        elif payload.passed:
+            agent.duplicate_of = None
         # Persist the policy that produced either terminal verdict. Rejected
         # submissions retry only after a policy bump; infrastructure failures
         # remain retryable under the same policy.
         if payload.policy_version == SCREENING_POLICY_VERSION:
             agent.screening_policy_version = payload.policy_version
+        if payload.passed:
+            agent.screened_image_sha256 = payload.image_sha256
+            agent.screened_image_size_bytes = payload.image_size_bytes
+            agent.screened_image_id = payload.image_id
+            agent.screened_image_ref = payload.image_ref
+            agent.screened_image_upload_id = image_upload_id
+            agent.screened_image_verified_at = (
+                verified_upload.verified_at if verified_upload is not None else None
+            )
         if attempt is None and not idempotent:
             now = datetime.now(UTC)
             attempt = ScreeningAttempt(
@@ -640,21 +1325,94 @@ async def submit_result(
             attempt.status = attempt_status
             attempt.finished_at = datetime.now(UTC)
             attempt.public_reason = public_reason
-        # Pin the generated dataset once, when evaluating and not yet set (the
-        # `is None` guard keeps a concurrent/duplicate verdict from overwriting).
-        if (
-            new_dataset is not None
-            and agent.status == AgentStatus.EVALUATING
-            and agent.dataset_seed is None
+            attempt.reason_code = payload.reason_code
+        if target == AgentStatus.QUARANTINED:
+            if attempt is None:
+                raise AgentNotScreenableError(
+                    "quarantine requires a claimed screening attempt"
+                )
+            if payload.manifest_digest is None or payload.reason_code is None:
+                raise AgentNotScreenableError(
+                    "quarantine result is missing bounded evidence"
+                )
+            # The review payloads were digest/bounds-validated at parse time
+            # (the finding must hash to the signed finding_digest).
+            evidence_json, finding_json = _quarantine_payload_json(payload)
+            existing_quarantine = await session.scalar(
+                select(ScreeningQuarantine).where(
+                    ScreeningQuarantine.attempt_id == attempt.attempt_id
+                )
+            )
+            if existing_quarantine is None:
+                session.add(
+                    ScreeningQuarantine(
+                        quarantine_id=uuid4(),
+                        agent_id=agent_id,
+                        attempt_id=attempt.attempt_id,
+                        screener_hotkey=screener_hotkey,
+                        policy_version=payload.policy_version,
+                        manifest_digest=payload.manifest_digest,
+                        finding_digest=payload.finding_digest,
+                        reason_code=payload.reason_code,
+                        evidence=evidence_json,
+                        finding=finding_json,
+                        status="active",
+                    )
+                )
+            else:
+                await _backfill_quarantine_payloads(
+                    session, attempt_id=attempt.attempt_id, payload=payload
+                )
+        # Pin the generated version row once. Locking the agent serializes two
+        # verdicts; the second lookup prevents a duplicate insert if another
+        # path backfilled the row while generation was in flight.
+        if new_dataset is not None and agent.status in (
+            AgentStatus.EVALUATING,
+            AgentStatus.SCORED,
+            AgentStatus.LIVE,
         ):
             (
-                agent.dataset_seed,
-                agent.dataset_sha256,
-                agent.dataset_run_size,
-                agent.dataset_seed_block,
-                agent.dataset_seed_block_hash,
+                bench_version,
+                seed,
+                dataset_sha256,
+                dataset_run_size,
+                seed_block,
+                seed_block_hash,
             ) = new_dataset
+            existing_versioned = await session.get(
+                BenchmarkDataset, (agent.agent_id, bench_version)
+            )
+            if existing_versioned is None:
+                session.add(
+                    BenchmarkDataset(
+                        agent_id=agent.agent_id,
+                        bench_version=bench_version,
+                        seed=seed,
+                        sha256=dataset_sha256,
+                        run_size=dataset_run_size,
+                        seed_block=seed_block,
+                        seed_block_hash=seed_block_hash,
+                    )
+                )
+            # First-time submissions still mirror their initial pin into the
+            # compatibility columns. Never overwrite an older/v2 pin during a
+            # v3 backfill.
+            if agent.dataset_seed is None:
+                agent.dataset_seed = seed
+                agent.dataset_sha256 = dataset_sha256
+                agent.dataset_run_size = dataset_run_size
+                agent.dataset_seed_block = seed_block
+                agent.dataset_seed_block_hash = seed_block_hash
         result_status = agent.status
+
+    try:
+        await refresh_rolling_qualification(
+            session, generator=generator, now=datetime.now(UTC)
+        )
+    except Exception:
+        # The signed verdict and image binding are already committed. A dataset
+        # renderer outage must not make the screener retry an accepted verdict.
+        logger.exception("rolling benchmark qualification refresh failed")
 
     logger.info(
         "screen verdict agent_id=%s screener=%s passed=%s status=%s dataset=%s "

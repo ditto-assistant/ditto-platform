@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
+from sqlalchemy.orm import undefer_group
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
@@ -37,7 +39,7 @@ async def insert_agent(
     prompt_fingerprint: dict | None = None,
     code_embedding: list | None = None,
     code_embed_model: str | None = None,
-) -> None:
+) -> int:
     """Insert one ``agents`` row inside the caller-owned transaction.
 
     Status is omitted so the schema default ``'uploaded'`` applies; the
@@ -68,11 +70,36 @@ async def insert_agent(
             invalid enum value, etc.). No agents-level constraint is a
             miner-facing action, so the envelope catch-all maps every
             case to HTTP 500.
+
+    Returns:
+        The immutable version assigned within this hotkey-and-name series.
     """
+    # Serialize one logical agent series on Postgres so concurrent uploads with
+    # the same hotkey + name cannot claim the same revision. SQLite tests run
+    # single-process; the UNIQUE constraint remains the final invariant on both.
+    if session.get_bind().dialect.name == "postgresql":
+        series_key = f"{miner_hotkey}:{len(name)}:{name}"
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:series_key, 0))"),
+            {"series_key": series_key},
+        )
+    version = int(
+        (
+            await session.scalar(
+                select(func.coalesce(func.max(Agent.version), 0) + 1).where(
+                    Agent.miner_hotkey == miner_hotkey,
+                    Agent.name == name,
+                )
+            )
+        )
+        or 1
+    )
+
     row = Agent(
         agent_id=agent_id,
         miner_hotkey=miner_hotkey,
         name=name,
+        version=version,
         sha256=sha256,
         size_bytes=size_bytes,
         content_fingerprint=content_fingerprint,
@@ -86,6 +113,7 @@ async def insert_agent(
         await session.flush()
     except SAIntegrityError as e:
         raise DbIntegrityError(f"agents insert violated constraint: {e.orig}") from e
+    return version
 
 
 async def resolve_review(
@@ -158,6 +186,7 @@ async def get_agent_by_id(
     *,
     agent_id: UUID,
     for_update: bool = False,
+    include_anticopy: bool = False,
 ) -> Agent | None:
     """Return the ``agents`` row for the given id, or ``None``.
 
@@ -165,9 +194,15 @@ async def get_agent_by_id(
     read-then-conditional-write transition (screener promotion, score finalize)
     serializes against a concurrent writer instead of last-writer-wins. The lock
     is a no-op on the SQLite unit-test fallback and a real row lock on Postgres.
+
+    ``include_anticopy=True`` also loads the deferred anti-copy sketch columns
+    (fingerprints + code embedding); only the scoring-gate path reads them.
     """
     return await session.get(
-        Agent, agent_id, with_for_update=True if for_update else None
+        Agent,
+        agent_id,
+        with_for_update=True if for_update else None,
+        options=[undefer_group("anticopy")] if include_anticopy else None,
     )
 
 
@@ -200,27 +235,50 @@ class PublicActivityRow:
 
     agent: Agent
     score_count: int
+    provisional_composite: float | None
+    highest_composite: float | None
+    last_scored_at: datetime | None
     screening_attempt: ScreeningAttempt | None
 
 
 async def list_public_activity(
     session: AsyncSession,
     *,
-    limit: int,
+    bench_version: int,
+    limit: int | None = None,
     offset: int = 0,
 ) -> tuple[list[PublicActivityRow], int]:
-    """Return a page of recent submissions and the total row count."""
+    """Return recent submissions and active-benchmark score progress.
+
+    ``limit=None`` lets callers that must filter on the derived public status
+    inspect the complete dataset before applying their own pagination.
+
+    Scores from different benchmark eras are not comparable. Keep the public
+    count, provisional composite, continuation-floor projection, and queue
+    rank pinned to the same active version used by validator tickets.
+    """
     total = int(await session.scalar(select(func.count(Agent.agent_id))) or 0)
     score_counts = (
         select(
             Score.agent_id,
             func.count(Score.validator_hotkey).label("score_count"),
+            func.avg(Score.composite).label("provisional_composite"),
+            func.max(Score.composite).label("highest_composite"),
+            func.max(Score.updated_at).label("last_scored_at"),
         )
+        .where(Score.bench_version == bench_version)
         .group_by(Score.agent_id)
         .subquery()
     )
     stmt = (
-        select(Agent, func.coalesce(score_counts.c.score_count, 0), ScreeningAttempt)
+        select(
+            Agent,
+            func.coalesce(score_counts.c.score_count, 0),
+            score_counts.c.provisional_composite,
+            score_counts.c.highest_composite,
+            score_counts.c.last_scored_at,
+            ScreeningAttempt,
+        )
         .outerjoin(score_counts, score_counts.c.agent_id == Agent.agent_id)
         .outerjoin(
             ScreeningAttempt,
@@ -228,18 +286,36 @@ async def list_public_activity(
             & (ScreeningAttempt.status == "running"),
         )
         .order_by(Agent.created_at.desc(), Agent.agent_id.desc())
-        .offset(offset)
-        .limit(limit)
     )
+    if offset:
+        stmt = stmt.offset(offset)
+    if limit is not None:
+        stmt = stmt.limit(limit)
     result = await session.execute(stmt)
     return (
         [
             PublicActivityRow(
                 agent=agent,
                 score_count=int(score_count),
+                provisional_composite=(
+                    float(provisional_composite)
+                    if provisional_composite is not None
+                    else None
+                ),
+                highest_composite=(
+                    float(highest_composite) if highest_composite is not None else None
+                ),
+                last_scored_at=last_scored_at,
                 screening_attempt=screening_attempt,
             )
-            for agent, score_count, screening_attempt in result.all()
+            for (
+                agent,
+                score_count,
+                provisional_composite,
+                highest_composite,
+                last_scored_at,
+                screening_attempt,
+            ) in result.all()
         ],
         total,
     )

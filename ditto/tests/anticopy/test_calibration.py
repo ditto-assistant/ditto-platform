@@ -33,10 +33,16 @@ from ditto.api_server.fingerprint import compute_normalized_source_hash
 
 _SEED = {
     "src/lib.rs": (
-        b'const NAME: &str = "seed";\n'
-        b"fn compute(x: i64) -> i64 {\n    let step = x + 1;\n    step * 2\n}\n"
+        b'const NAME: &str = "quartz-orbit-seed";\n'
+        + b"".join(
+            f"fn compute_{i}(x: i64) -> i64 {{\n"
+            f"    let step_{i} = x + {i + 101};\n"
+            f"    step_{i} * {i + 17}\n"
+            "}\n".encode()
+            for i in range(8)
+        )
     ),
-    "Cargo.toml": b'[package]\nname = "seed"\n',
+    "Cargo.toml": b'[package]\nname = "quartz-orbit-seed"\n',
 }
 
 

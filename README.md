@@ -8,6 +8,11 @@ weights on chain). It owns miner intake, on-chain payment verification, object
 storage for submissions, the evaluation job queue, the score ledger, and the
 operational state machine that moves a submission from `uploaded` to `live`.
 
+The source in this repository is open under the [MIT License](LICENSE). The
+production service remains centrally operated. Publishing the source does not
+publish private miner artifacts, operator review evidence, credentials, or
+protected operational data, and it does not grant access to admin endpoints.
+
 > The chain is the settlement layer (weights, stake, payments). This platform is
 > the **workflow** layer the chain can't hold — queues, leases, payment
 > replay-protection, submission status, and the public score ledger.
@@ -27,13 +32,14 @@ operational state machine that moves a submission from `uploaded` to `live`.
 ```
 
 - **Miner side & validator daemon:** [`ditto-subnet`](https://github.com/ditto-assistant/ditto-subnet)
+- **Platform-operated screening worker:** [`ditto-screener`](https://github.com/ditto-assistant/ditto-screener)
 - **Reference memory harness (what miners fork):** [`ditto-harness`](https://github.com/ditto-assistant/ditto-harness)
 - **This repo** is the platform/API only. It is intentionally split out so it can
   be deployed and scaled independently of the miner/validator code.
 
-The contract between this service and the miner/validator is the **OpenAPI schema**
-served at `/docs` (Swagger) and `/openapi.json`. There is no shared Python package;
-clients are validated against that schema.
+The miner/validator contract is the **OpenAPI schema** served at `/docs`
+(Swagger) and `/openapi.json`. The screener additionally shares only the
+dependency-light `ditto-screening-protocol` package, pinned to an exact commit.
 
 ---
 
@@ -69,12 +75,15 @@ clients are validated against that schema.
 
 Screening is a **platform-operated** pre-evaluation gate: a dedicated host the team
 runs (not the validators). It drains `uploaded` agents, `docker build`s and
-health-checks each crate in isolation, and promotes pass → `evaluating` /
-fail → `screening_failed`, so a crate that does not compile never costs a full
-benchmark. It authenticates with a dedicated screener credential (an allowlisted
+health-checks each crate in isolation, and promotes passes to `evaluating`,
+rejects deterministic submission failures, and records retryable infrastructure
+failures as `screening_failed` for another claim. A crate that does not compile
+never costs a full benchmark.
+It authenticates with a dedicated screener credential (an allowlisted
 hotkey plus a bearer token), not a validator permit, so the screener key holds no
-stake. A validator may optionally run its own screener locally, but the authoritative
-gate is the one the platform hosts.
+stake. The authoritative worker is deployed from the public, MIT-licensed
+[`ditto-screener`](https://github.com/ditto-assistant/ditto-screener) repository;
+it remains platform-operated, and validators do not run it.
 
 | Method & path | Purpose |
 | --- | --- |

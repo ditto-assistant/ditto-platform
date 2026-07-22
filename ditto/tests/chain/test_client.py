@@ -53,6 +53,20 @@ def make_neurons_response(neurons: dict[str, MagicMock]) -> MagicMock:
     )
 
 
+class AsyncRows:
+    """Small async iterator matching ``query_map`` results."""
+
+    def __init__(self, rows: list[tuple[Any, Any]]) -> None:
+        self._rows = rows
+
+    def __aiter__(self):
+        async def iterate():
+            for row in self._rows:
+                yield row
+
+        return iterate()
+
+
 def make_pylon_extrinsic_arg(name: str, value: Any) -> MagicMock:
     """Build a Pylon ``ExtrinsicCallArg``-shaped object.
 
@@ -360,6 +374,84 @@ class TestPutWeights:
 
 
 @pytest.mark.usefixtures("install_pylon_module")
+class TestGetWeights:
+    async def test_reads_block_consistent_revealed_matrix(
+        self, install_substrate_module: AsyncMock
+    ) -> None:
+        validator = "5" + "V" * 47
+        miner = "5" + "M" * 47
+        install_substrate_module.get_chain_head.return_value = "0x" + "ab" * 32
+        install_substrate_module.get_block_header.return_value = {
+            "header": {"number": 12345}
+        }
+        install_substrate_module.query_map.side_effect = [
+            AsyncRows([(25, [(169, 14745), (0, 65535)])]),
+            AsyncRows([(0, "5" + "B" * 47), (25, validator), (169, miner)]),
+        ]
+        install_substrate_module.query.return_value = "5" + "B" * 47
+
+        async with ChainClient(make_chain_config()) as client:
+            snapshot = await client.get_weights(118)
+
+        assert snapshot.netuid == 118
+        assert snapshot.block == 12345
+        assert snapshot.block_hash == "0x" + "ab" * 32
+        assert snapshot.owner_hotkey == "5" + "B" * 47
+        assert snapshot.vectors[0].validator_uid == 25
+        assert snapshot.vectors[0].validator_hotkey == validator
+        assert snapshot.vectors[0].weights[0].uid == 169
+        assert snapshot.vectors[0].weights[0].hotkey == miner
+        assert snapshot.vectors[0].weights[0].value == 14745
+        calls = install_substrate_module.query_map.await_args_list
+        assert [call.kwargs["storage_function"] for call in calls] == [
+            "Weights",
+            "Keys",
+        ]
+        assert all(call.kwargs["block_hash"] == snapshot.block_hash for call in calls)
+        assert install_substrate_module.query.await_args.kwargs["storage_function"] == (
+            "SubnetOwnerHotkey"
+        )
+
+    async def test_skips_unknown_uids_and_malformed_weights(
+        self, install_substrate_module: AsyncMock
+    ) -> None:
+        validator = "5" + "V" * 47
+        install_substrate_module.get_chain_head.return_value = "0x" + "cd" * 32
+        install_substrate_module.get_block_header.return_value = {
+            "header": {"number": "0x2a"}
+        }
+        install_substrate_module.query_map.side_effect = [
+            AsyncRows([(7, [(999, 4), (7,), (7, 0)])]),
+            AsyncRows([(7, validator)]),
+        ]
+        install_substrate_module.query.return_value = None
+
+        async with ChainClient(make_chain_config()) as client:
+            snapshot = await client.get_weights(118)
+
+        assert snapshot.block == 42
+        assert snapshot.owner_hotkey is None
+        assert snapshot.vectors == ()
+
+    async def test_timeout_is_wrapped(
+        self, install_substrate_module: AsyncMock
+    ) -> None:
+        install_substrate_module.get_chain_head.side_effect = TimeoutError()
+        async with ChainClient(make_chain_config()) as client:
+            with pytest.raises(ChainTimeoutError):
+                await client.get_weights(118)
+
+    async def test_malformed_header_is_wrapped(
+        self, install_substrate_module: AsyncMock
+    ) -> None:
+        install_substrate_module.get_chain_head.return_value = "0x" + "ef" * 32
+        install_substrate_module.get_block_header.return_value = {"header": {}}
+        async with ChainClient(make_chain_config()) as client:
+            with pytest.raises(ChainConnectionError):
+                await client.get_weights(118)
+
+
+@pytest.mark.usefixtures("install_pylon_module")
 class TestCheckExtrinsicSuccess:
     """Tests for ChainClient.check_extrinsic_success (the Pylon-events gap)."""
 
@@ -411,6 +503,43 @@ class TestCheckExtrinsicSuccess:
         async with ChainClient(make_chain_config()) as client:
             with pytest.raises(ChainTimeoutError):
                 await client.check_extrinsic_success("0xhash", 3)
+
+    async def test_historical_read_uses_authenticated_archive(
+        self, install_substrate_module: AsyncMock
+    ):
+        install_substrate_module.query.return_value = MagicMock(
+            value=[make_event_record(3, event_id="ExtrinsicSuccess")]
+        )
+        config = make_chain_config(
+            archive_rpc_url="wss://archive.example/rpc",
+            archive_rpc_api_key="key with spaces",
+        )
+
+        async with ChainClient(config) as client:
+            await client.check_extrinsic_success("0xhash", 3)
+
+        substrate_module = sys.modules["async_substrate_interface"]
+        substrate_module.AsyncSubstrateInterface.assert_called_once_with(
+            url="wss://archive.example/rpc?authorization=key%20with%20spaces"
+        )
+
+    async def test_archive_key_is_redacted_from_connection_error(
+        self, install_substrate_module: AsyncMock
+    ):
+        install_substrate_module.query.side_effect = RuntimeError(
+            "failed wss://archive.example?authorization=super-secret"
+        )
+        config = make_chain_config(
+            archive_rpc_url="wss://archive.example",
+            archive_rpc_api_key="super-secret",
+        )
+
+        async with ChainClient(config) as client:
+            with pytest.raises(ChainConnectionError) as exc_info:
+                await client.check_extrinsic_success("0xhash", 3)
+
+        assert "super-secret" not in str(exc_info.value)
+        assert "<redacted>" in str(exc_info.value)
 
 
 @pytest.mark.usefixtures("install_pylon_module")

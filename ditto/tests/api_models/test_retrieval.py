@@ -29,6 +29,7 @@ class TestAgentResponse:
         assert parsed.agent_id == UUID("550e8400-e29b-41d4-a716-446655440000")
         assert parsed.miner_hotkey == "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
         assert parsed.name == "alpha-agent"
+        assert parsed.version == 1
         assert parsed.status == AgentStatus.UPLOADED
         assert parsed.sha256 == "deadbeef" * 8
         assert parsed.created_at == datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
@@ -44,6 +45,11 @@ class TestAgentResponse:
         dumped = parsed.model_dump()
         assert "ip_address" not in dumped
 
+    def test_legacy_fixture_without_version_parses_as_unversioned(self) -> None:
+        payload = _load_fixture("agent_response_v1.json")
+        payload.pop("version")
+        assert AgentResponse.model_validate(payload).version is None
+
 
 class TestAgentStatusResponse:
     def test_parses_v1_fixture(self) -> None:
@@ -53,11 +59,17 @@ class TestAgentStatusResponse:
         assert parsed.agent_id == UUID("550e8400-e29b-41d4-a716-446655440000")
         assert parsed.status == AgentStatus.SCREENING
 
-    def test_minimal_shape(self) -> None:
-        """Polling endpoint: only two fields. Any extra field is a
-        regression on the wire-size contract."""
+    def test_stable_polling_shape(self) -> None:
+        """Polling includes safe human and machine-readable screening reasons."""
         parsed = AgentStatusResponse.model_validate(
             _load_fixture("agent_status_response_v1.json")
         )
         dumped = parsed.model_dump()
-        assert set(dumped.keys()) == {"agent_id", "status"}
+        assert set(dumped.keys()) == {
+            "agent_id",
+            "status",
+            "screening_reason",
+            "screening_reason_code",
+        }
+        assert dumped["screening_reason"] is None
+        assert dumped["screening_reason_code"] is None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
 
 from ditto.api_server.storage.errors import StorageConfigurationError
 
@@ -59,6 +60,39 @@ class StoredObject:
     sha256: str
     """Hex sha256 of the body the client uploaded. Lets callers correlate
     the stored object with the tar bytes they previously hashed."""
+
+
+@dataclass(frozen=True)
+class ObjectMetadata:
+    """Bounded HEAD metadata for a directly uploaded object."""
+
+    size_bytes: int
+    metadata: dict[str, str]
+
+
+@dataclass(frozen=True)
+class VerifiedObject:
+    """Digest and size computed while streaming an object from storage."""
+
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ListedObject:
+    """One object returned by a bounded lifecycle listing."""
+
+    key: str
+    last_modified: datetime
+
+
+@dataclass(frozen=True)
+class MultipartUpload:
+    """One incomplete multipart upload returned for janitor cleanup."""
+
+    key: str
+    upload_id: str
+    initiated_at: datetime
 
 
 def _parse_bool(name: str, raw: str) -> bool:

@@ -14,6 +14,9 @@ wash out. The normalized lines are cut into overlapping **k-line shingles**
 are unioned into one set. Shingling is per-file then unioned, so renaming or
 reordering files is invisible and a *localized* edit only disturbs the handful of
 shingles that span it — unlike a whole-file hash, which any single edit voids.
+Before sketching, shingles found in the complete official starter-kit mainline
+history are removed. Shared reference scaffolding is therefore neutral evidence;
+only the miner-authored residual contributes to a near-copy comparison.
 
 **Storage — a MinHash (bottom-k) sketch.** Keeping the full shingle set would grow
 with harness size; instead the fingerprint stores the ``k`` smallest shingle
@@ -42,9 +45,15 @@ from __future__ import annotations
 import gzip
 import hashlib
 import io
+import json
 import logging
+import sys
 import tarfile
+from array import array
+from bisect import bisect_left
 from collections.abc import Iterator
+from functools import lru_cache
+from importlib.resources import files as resource_files
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +61,13 @@ logger = logging.getLogger(__name__)
 # fingerprints from an older algorithm are not silently compared against new ones
 # (a cross-version Jaccard is meaningless). :func:`content_similarity` returns no
 # match unless both sketches carry the same version.
-_FP_VERSION = 1
+_FP_VERSION = 2
 
 # Version of the normalized-source-hash canonicalization
 # (:func:`compute_normalized_source_hash`). Bumped independently of ``_FP_VERSION``
 # so a change to comment/whitespace/file canonicalization doesn't silently compare
 # across formats.
-_NSH_VERSION = 1
+_NSH_VERSION = 2
 
 # A shingle is this many consecutive normalized lines. Small enough that a
 # one-line edit disturbs only a few shingles (robust to sprinkled edits), large
@@ -73,6 +82,73 @@ _MINHASH_K = 256
 # strings sort in the same order as the integers they encode (bottom-k == the k
 # lexicographically-smallest), and JSON-safe (no >2^53 bigints on the wire).
 _HASH_HEX = 16
+
+# Reference-aware v2 fingerprints remove shingles found anywhere in the official
+# starter-kit history before sketching. Below the floor the sketch is emptied:
+# a residual smaller than this is statistically nothing to compare (and nothing
+# a copier needs to steal — the exact-equality rules still catch literal
+# resubmissions). The floor is EIGHT shingles — two full edited regions, since a
+# shingle spans _SHINGLE_LINES(=4) normalized lines and one edited line disturbs
+# at most that many shingles:
+#
+# - 16 was measured to miss real theft: a 12-line innovation block yields a
+#   residual of ~12 shingles, so BOTH the original and a verbatim copy of it
+#   sketched empty and the copy escaped every channel.
+# - 4 (one region) is too coincidence-prone: two honest agents sharing a single
+#   verbatim boilerplate window (a pasted community fix, a common config stanza)
+#   would match on it alone.
+# - Estimator instability is not a factor in this range: for card < k the
+#   sketch IS the full set, so Jaccard/containment are exact — a verbatim
+#   subset scores exactly 1.0 and a one-shingle mismatch drops cleanly below
+#   the 0.95 containment hold either way.
+#
+# Prompt remains an advisory channel with the same eight-shingle floor. The
+# exact normalized-source channel has a smaller floor because equality of the
+# complete residual set is stronger than a fuzzy ratio.
+_MIN_CONTENT_SHINGLES = 8
+_MIN_PROMPT_SHINGLES = 8
+_MIN_NSH_SHINGLES = 4
+_REFERENCE_BUNDLES = {
+    "lexical": "reference_lexical_v2.bin",
+    "normalized": "reference_normalized_v2.bin",
+    "prompt": "reference_prompt_v2.bin",
+}
+
+
+@lru_cache(maxsize=1)
+def _reference_corpus_provenance() -> tuple[str, str, str, str]:
+    manifest = json.loads(
+        resource_files("ditto.anticopy")
+        .joinpath("reference_manifest_v2.json")
+        .read_text()
+    )
+    return (
+        str(manifest["source"]),
+        str(manifest["revision"]),
+        str(manifest["commit_set_sha256"]),
+        "starter-kit-mainline-history",
+    )
+
+
+def reference_corpus_provenance() -> dict[str, str]:
+    """Return the immutable identity fields of the packaged starter-kit corpus.
+
+    The returned mapping is safe to expose as comparison provenance: it contains
+    only the public canonical repository, the exact mainline revision, and the
+    digest of the included commit set. It never contains submitted artifact data.
+    """
+    source, revision, corpus_id, exclusion_mode = _reference_corpus_provenance()
+    return {
+        "source": source,
+        "revision": revision,
+        "corpus_id": corpus_id,
+        "exclusion_mode": exclusion_mode,
+    }
+
+
+def _reference_corpus_id() -> str:
+    return _reference_corpus_provenance()[2]
+
 
 # Decompression-bomb + work guards. The upload cap bounds the *compressed* tarball
 # at 20 MiB by default, but gzip/tar inflate far past that, so fingerprinting
@@ -93,7 +169,7 @@ _MAX_SHINGLES = 500_000
 # integer ``_FP_VERSION`` / structural versions in :func:`content_similarity`'s
 # ``v`` equality check — a prompt sketch is a distinct channel, stored apart, and
 # must never be compared against a lexical/structural one.
-_PROMPT_VERSION = "p1"
+_PROMPT_VERSION = "p2"
 # A string literal must have at least this many whitespace-split words to count as
 # "prompt-like". Filters out identifiers, format specifiers, config keys, and short
 # messages (the shared-scaffolding strings that would otherwise false-match across
@@ -115,20 +191,54 @@ _PROMPT_SHINGLE_WORDS = 5
 _EMBED_INPUT_MAX_CHARS = 24000
 
 
+@lru_cache(maxsize=len(_REFERENCE_BUNDLES))
+def _reference_shingles(channel: str) -> array[int]:
+    """Load one sorted uint64 starter-history shingle bundle.
+
+    Bundles are generated from every blob reachable in the official starter-kit
+    history by ``scripts/build_reference_fingerprints.py``.  Keeping the hashes in
+    a sorted native array uses a few megabytes rather than the much larger Python
+    ``set[str]`` representation; membership remains fast via binary search.
+    """
+    name = _REFERENCE_BUNDLES[channel]
+    raw = resource_files("ditto.anticopy").joinpath(name).read_bytes()
+    if len(raw) % 8:
+        raise RuntimeError(f"invalid reference-fingerprint bundle: {name}")
+    values = array("Q")
+    values.frombytes(raw)
+    if sys.byteorder == "little":
+        values.byteswap()
+    return values
+
+
+def _without_reference(shingles: set[str], channel: str) -> set[str]:
+    """Return ``shingles`` minus official starter-history shingles."""
+    reference = _reference_shingles(channel)
+    residual: set[str] = set()
+    for shingle in shingles:
+        value = int(shingle, 16)
+        i = bisect_left(reference, value)
+        if i == len(reference) or reference[i] != value:
+            residual.add(shingle)
+    return residual
+
+
 def compute_content_fingerprint(tar_gz_bytes: bytes) -> dict | None:
     """Return a MinHash shingle sketch of the tarball's source, or ``None``.
 
-    The returned dict is ``{"v", "k", "card", "m"}`` — algorithm version, sketch
-    budget, true shingle-set cardinality, and the sorted bottom-``k`` shingle
-    hashes — JSON-serializable for the ``agents.content_fingerprint`` column and
-    consumed by :func:`content_similarity`.
+    The returned dict is ``{"v", "corpus", "k", "card", "m"}`` — algorithm
+    version, canonical reference-corpus identity, sketch budget, true residual
+    cardinality, and the sorted bottom-``k`` residual hashes — JSON-serializable
+    for the ``agents.content_fingerprint`` column and consumed by
+    :func:`content_similarity`.
 
-    Returns ``None`` — "no usable fingerprint", which the gate treats as no
-    content match — when the bytes are not a readable tar.gz, contain no source
-    lines, or trip the bomb/work guards. Fingerprinting is a best-effort
-    moderation signal layered on an already-verified upload, so it never raises
-    into the upload path: a hostile or corrupt tarball simply gets no content
-    signal (the validator/screener still reject a broken harness downstream).
+    Returns ``None`` when the bytes are not a readable tar.gz, contain no source
+    lines, or trip the bomb/work guards. A valid artifact with too little
+    post-reference content returns a versioned empty sketch, which is deliberately
+    incomparable but lets the backfill distinguish processed rows. Fingerprinting
+    is a best-effort moderation signal layered on an already-verified upload, so it
+    never raises into the upload path: a hostile or corrupt tarball simply gets no
+    content signal (the validator/screener still reject a broken harness downstream).
     """
     shingles: set[str] = set()
     total = 0
@@ -166,8 +276,18 @@ def compute_content_fingerprint(tar_gz_bytes: bytes) -> dict | None:
 
     if not shingles:
         return None
+    shingles = _without_reference(shingles, "lexical")
+    if len(shingles) < _MIN_CONTENT_SHINGLES:
+        return {
+            "v": _FP_VERSION,
+            "corpus": _reference_corpus_id(),
+            "k": _MINHASH_K,
+            "card": len(shingles),
+            "m": [],
+        }
     return {
         "v": _FP_VERSION,
+        "corpus": _reference_corpus_id(),
         "k": _MINHASH_K,
         "card": len(shingles),
         "m": sorted(shingles)[:_MINHASH_K],
@@ -186,8 +306,9 @@ def compute_normalized_source_hash(tar_gz_bytes: bytes) -> str | None:
 
     Canonicalization, per regular file: strip ``//`` line and ``/* */`` block
     comments (string-``"``-aware so a ``//`` inside a URL literal survives),
-    remove all intra-line whitespace, drop blank lines. The per-file normalized
-    texts are then **sorted** (so renaming/reordering files is invisible) and
+    remove all intra-line whitespace, drop blank lines, cut the result into
+    shingles, and subtract official starter-history shingles. The residual
+    shingles are then **sorted** (so renaming/reordering files is invisible) and
     hashed together. Identifier renaming and statement reordering are *not*
     canonicalized away — that is the AST / behavioral layer's job; this layer only
     promises to see through cosmetic repackaging.
@@ -203,7 +324,7 @@ def compute_normalized_source_hash(tar_gz_bytes: bytes) -> str | None:
     since a
     collision still requires near-identical code.
     """
-    files: list[str] = []
+    shingles: set[str] = set()
     total = 0
     members = 0
     try:
@@ -226,22 +347,20 @@ def compute_normalized_source_hash(tar_gz_bytes: bytes) -> str | None:
                 if total > _MAX_TOTAL_BYTES:
                     logger.warning("nsh: >%d bytes, skipping", _MAX_TOTAL_BYTES)
                     return None
-                normalized = _normalized_source(raw)
-                if normalized:
-                    files.append(normalized)
+                shingles.update(_normalized_source_shingles(raw))
     except (tarfile.TarError, gzip.BadGzipFile, EOFError, OSError) as e:
         logger.info("nsh: unreadable tarball (%s)", type(e).__name__)
         return None
 
-    if not files:
+    shingles = _without_reference(shingles, "normalized")
+    if len(shingles) < _MIN_NSH_SHINGLES:
         return None
-    files.sort()
     digest = hashlib.sha256()
-    digest.update(f"nsh{_NSH_VERSION}\x00".encode())
-    for normalized in files:
-        digest.update(normalized.encode("utf-8"))
-        digest.update(b"\x00")
-    return digest.hexdigest()
+    corpus_id = _reference_corpus_id()
+    digest.update(f"nsh{_NSH_VERSION}:{corpus_id}\x00".encode())
+    for shingle in sorted(shingles):
+        digest.update(bytes.fromhex(shingle))
+    return f"nsh{_NSH_VERSION}:{corpus_id}:{digest.hexdigest()}"
 
 
 def compute_prompt_fingerprint(tar_gz_bytes: bytes) -> dict | None:
@@ -262,14 +381,15 @@ def compute_prompt_fingerprint(tar_gz_bytes: bytes) -> dict | None:
     prompts are usually raw) — is collected; those with at least
     :data:`_PROMPT_MIN_WORDS` words (lowercased, whitespace-collapsed) are cut into
     overlapping :data:`_PROMPT_SHINGLE_WORDS`-word shingles and unioned into a
-    bottom-``k`` MinHash sketch, the same ``{v, k, card, m}`` shape as the lexical
-    channel so :func:`content_similarity` compares it directly. The ``v`` is a
-    string (:data:`_PROMPT_VERSION`) so a prompt sketch never matches a
+    bottom-``k`` MinHash sketch, the same ``{v, corpus, k, card, m}`` shape as the
+    lexical channel so :func:`content_similarity` compares it directly. The ``v``
+    is a string (:data:`_PROMPT_VERSION`) so a prompt sketch never matches a
     lexical/structural sketch.
 
     Returns ``None`` ("no prompt fingerprint", read as no match) when the bytes are
-    unreadable, carry no prompt-length literal, or trip the shared bomb/work guards
-    — same best-effort contract as the other fingerprints.
+    unreadable, carry no prompt-length literal, or trip the shared bomb/work guards.
+    A valid prompt surface below the residual-cardinality floor returns a versioned
+    empty sketch, matching the lexical channel's backfill marker.
 
     the prompt fingerprint is a *review-band* signal: honest agents on the same
     reference harness share
@@ -311,8 +431,18 @@ def compute_prompt_fingerprint(tar_gz_bytes: bytes) -> dict | None:
 
     if not shingles:
         return None
+    shingles = _without_reference(shingles, "prompt")
+    if len(shingles) < _MIN_PROMPT_SHINGLES:
+        return {
+            "v": _PROMPT_VERSION,
+            "corpus": _reference_corpus_id(),
+            "k": _MINHASH_K,
+            "card": len(shingles),
+            "m": [],
+        }
     return {
         "v": _PROMPT_VERSION,
+        "corpus": _reference_corpus_id(),
         "k": _MINHASH_K,
         "card": len(shingles),
         "m": sorted(shingles)[:_MINHASH_K],
@@ -486,6 +616,20 @@ def _normalized_source(raw: bytes) -> str:
     return "\n".join(lines)
 
 
+def _normalized_source_shingles(raw: bytes) -> list[str]:
+    """Hash normalized-source windows for reference-aware exact equality."""
+    normalized = _normalized_source(raw)
+    if not normalized:
+        return []
+    lines = normalized.splitlines()
+    k = _SHINGLE_LINES
+    if len(lines) <= k:
+        return [_hash_shingle("\n".join(lines))]
+    return [
+        _hash_shingle("\n".join(lines[i : i + k])) for i in range(len(lines) - k + 1)
+    ]
+
+
 def _strip_comments(text: str) -> str:
     """Remove ``//`` line and ``/* */`` block comments, preserving string literals.
 
@@ -568,16 +712,19 @@ def content_similarity(a: dict | None, b: dict | None) -> tuple[float, float]:
     retained (``card <= k``).
 
     Returns ``(0.0, 0.0)`` when either sketch is missing, empty, or carries a
-    different sketch-format version (a cross-version comparison is meaningless), so
-    the gate can threshold without special-casing ``None``. The two channels
-    (lexical / structural) are isolated by storage column, and each compares only
-    within its own version — hence the equality check on ``v`` rather than a
-    hard-coded constant, so a channel can version its format independently.
+    different sketch-format version or reference corpus (either comparison is
+    meaningless), so the gate can threshold without special-casing ``None``. The
+    two channels (lexical / structural) are isolated by storage column, and each
+    compares only within its own version — hence the equality check on ``v`` rather
+    than a hard-coded constant, so a channel can version its format independently.
     """
     if not a or not b:
         return (0.0, 0.0)
     va = a.get("v")
     if va is None or va != b.get("v"):
+        return (0.0, 0.0)
+    corpus_a, corpus_b = a.get("corpus"), b.get("corpus")
+    if corpus_a != corpus_b:
         return (0.0, 0.0)
     ma, mb = set(a.get("m", ())), set(b.get("m", ()))
     if not ma or not mb:

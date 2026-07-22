@@ -25,14 +25,20 @@ from __future__ import annotations
 
 from ditto.api_server.storage.client import S3StorageClient
 from ditto.api_server.storage.errors import (
+    ObjectDownloadFailedError,
+    ObjectNotFoundError,
     ObjectUploadFailedError,
     StorageConfigurationError,
     StorageError,
 )
 from ditto.api_server.storage.factory import create_storage_client
 from ditto.api_server.storage.models import (
+    ListedObject,
+    MultipartUpload,
+    ObjectMetadata,
     StorageConfig,
     StoredObject,
+    VerifiedObject,
     parse_storage_config_from_env,
 )
 
@@ -44,7 +50,13 @@ __all__ = [
     "parse_storage_config_from_env",
     # Result models
     "StoredObject",
+    "ObjectMetadata",
+    "VerifiedObject",
+    "ListedObject",
+    "MultipartUpload",
     # Errors
+    "ObjectDownloadFailedError",
+    "ObjectNotFoundError",
     "ObjectUploadFailedError",
     "StorageConfigurationError",
     "StorageError",

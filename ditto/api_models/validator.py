@@ -25,13 +25,19 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_progress import BenchmarkProgress
+from ditto.api_models.stack_health import ValidatorStackHealth
 from ditto.api_models.system_health import SystemMetrics
 from ditto.api_models.upload import (
     _SIGNATURE_HEX_PATTERN,
     _SS58_PATTERN,
+)
+from ditto.api_models.validator_capabilities import (
+    ValidatorCapabilities,
+    ValidatorStackIdentity,
 )
 
 _CODE_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
@@ -65,6 +71,38 @@ class ArtifactResponse(BaseModel):
     expires_at: Annotated[
         datetime, Field(description="When ``download_url`` stops being valid (UTC).")
     ]
+    screened_image_url: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            description="Pre-signed Docker image archive URL when screening built one.",
+        ),
+    ] = None
+    screened_image_sha256: Annotated[str | None, Field(pattern=r"^[0-9a-f]{64}$")] = (
+        None
+    )
+    screened_image_size_bytes: Annotated[int | None, Field(gt=0)] = None
+    screened_image_id: Annotated[
+        str | None, Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ] = None
+    screened_image_ref: Annotated[str | None, Field(min_length=1)] = None
+    bench_version: Annotated[int | None, Field(default=None, ge=1)] = None
+    screening_policy_version: Annotated[int | None, Field(default=None, ge=0)] = None
+
+    @model_validator(mode="after")
+    def screened_image_fields_are_atomic(self) -> ArtifactResponse:
+        fields = (
+            self.screened_image_url,
+            self.screened_image_sha256,
+            self.screened_image_size_bytes,
+            self.screened_image_id,
+            self.screened_image_ref,
+        )
+        if any(value is not None for value in fields) and any(
+            value is None for value in fields
+        ):
+            raise ValueError("screened image metadata must be complete")
+        return self
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -177,6 +215,18 @@ class JobResponse(BaseModel):
             "(anti-grind, prod hardening P2). Null for pre-derivation agents.",
         ),
     ] = None
+    bench_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description="Version-bound benchmark semantics for this lease.",
+        ),
+    ] = None
+    minimum_screening_policy_version: Annotated[
+        int | None, Field(default=None, ge=0)
+    ] = None
+    requires_screened_image: bool | None = None
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -191,6 +241,85 @@ class JobResponse(BaseModel):
             }
         }
     )
+
+
+FailJobReason = Literal[
+    "infrastructure",
+    "scoring_error",
+]
+"""Coarse reason a validator hands a leased ticket back for reissue.
+
+Deliberately low-cardinality so no run-specific detail leaks. The platform
+branches on it: ``infrastructure`` earns a bounded compensating grant plus an
+escalating cooldown, so a validator-side outage neither spends the agent's
+genuine attempt budget nor hammers the failing provider; ``scoring_error`` is
+the agent's own failure and consumes an attempt with an immediate reissue.
+``infrastructure`` maps to the validator's ``ValidatorInfrastructureError``
+sweep-ending branch; ``scoring_error`` maps to its ``DittobenchError`` /
+``PlatformError`` scoring-failure branch. These values are the wire contract
+shared verbatim with ditto-subnet (which emits them).
+"""
+
+
+class FailJobRequest(BaseModel):
+    """Signed request to hand a still-leased ticket back after a failed attempt.
+
+    A validator whose scoring attempt failed calls this so the platform closes
+    the live ticket immediately (status ``expired``, ``retry_after`` now) and the
+    slot re-opens for a fresh ticket, instead of the lease sitting idle until its
+    deadline. Mirrors :class:`JobRequest`'s proof-of-possession: the signature
+    proves the hotkey, ``nonce`` is one-time, and ``requested_at`` is
+    freshness-bounded. The ``(agent_id, ticket_deadline)`` pair identifies the
+    exact lease the caller must currently hold.
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Failing validator hotkey.")
+    ]
+    agent_id: Annotated[UUID, Field(description="Agent whose ticket failed.")]
+    ticket_deadline: Annotated[
+        datetime,
+        Field(description="Exact deadline from the JobResponse ticket lease."),
+    ]
+    reason: Annotated[
+        FailJobReason,
+        Field(
+            description="Coarse failure class; drives the platform's reissue policy."
+        ),
+    ]
+    nonce: Annotated[UUID, Field(description="One-time claim nonce.")]
+    requested_at: Annotated[
+        datetime, Field(description="UTC time at which the request was signed.")
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            pattern=_SIGNATURE_HEX_PATTERN,
+            description="sr25519 signature over the canonical fail payload.",
+        ),
+    ]
+
+    @field_validator("requested_at", "ticket_deadline")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("timestamps must include a timezone")
+        return value
+
+
+class FailJobResponse(BaseModel):
+    """Returned by ``POST /validator/job/fail``.
+
+    ``reopened`` is ``True`` when a live ticket matching the signed lease was
+    found and closed for immediate reissue; ``False`` when the caller held no
+    such live ticket (already expired, scored, or never issued) — a no-op that
+    is safe to ignore, keeping the endpoint idempotent and best-effort.
+    """
+
+    agent_id: Annotated[UUID, Field(description="Echoes the failed agent id.")]
+    reopened: Annotated[
+        bool, Field(description="``True`` when a live ticket was closed for reissue.")
+    ]
 
 
 class ValidatorHeartbeatRequest(BaseModel):
@@ -243,6 +372,32 @@ class ValidatorHeartbeatRequest(BaseModel):
             description="Optional coarse host telemetry under heartbeat protocol v3.",
         ),
     ] = None
+    benchmark_progress: Annotated[
+        BenchmarkProgress | None,
+        Field(
+            default=None,
+            description=(
+                "Optional ticket-bound benchmark progress under heartbeat protocol v4."
+            ),
+        ),
+    ] = None
+    capabilities: Annotated[
+        ValidatorCapabilities | None,
+        Field(default=None, description="Signed execution capabilities (protocol v7)."),
+    ] = None
+    stack: Annotated[
+        ValidatorStackIdentity | None,
+        Field(
+            default=None, description="Signed complete stack identity (protocol v7)."
+        ),
+    ] = None
+    stack_health: Annotated[
+        ValidatorStackHealth | None,
+        Field(
+            default=None,
+            description="Signed per-component runtime health under v9.",
+        ),
+    ] = None
     timestamp: Annotated[
         int, Field(ge=0, description="Validator-reported Unix timestamp (UTC).")
     ]
@@ -253,6 +408,35 @@ class ValidatorHeartbeatRequest(BaseModel):
             description=("sr25519 signature over the canonical v1 heartbeat payload."),
         ),
     ]
+
+    @model_validator(mode="after")
+    def validate_protocol_fields(self) -> ValidatorHeartbeatRequest:
+        if self.protocol_version >= 7:
+            if self.capabilities is None or self.stack is None:
+                raise ValueError(
+                    "heartbeat protocol v7 requires capabilities and stack"
+                )
+            if self.capabilities.full_stack_managed != (self.stack.mode == "managed"):
+                raise ValueError("full_stack_managed contradicts stack mode")
+            if (
+                self.protocol_version == 7
+                and self.capabilities.scorer_benchmarks is not None
+            ):
+                raise ValueError("scorer benchmark capability requires heartbeat v8")
+            if (
+                self.protocol_version >= 8
+                and self.capabilities.scorer_benchmarks is None
+            ):
+                raise ValueError("heartbeat v8 requires scorer benchmark capability")
+        elif self.capabilities is not None or self.stack is not None:
+            raise ValueError("capabilities and stack require heartbeat protocol v7")
+        if self.protocol_version >= 9 and self.stack_health is None:
+            raise ValueError("heartbeat protocol v9 requires stack health")
+        if self.stack_health is not None and self.protocol_version < 9:
+            raise ValueError(
+                "per-component stack health requires heartbeat protocol v9"
+            )
+        return self
 
 
 class ValidatorHeartbeatResponse(BaseModel):
@@ -306,6 +490,64 @@ class CaseScore(BaseModel):
     notes: Annotated[
         list[str], Field(default_factory=list, description="Scorer annotations.")
     ]
+    # bench_version 3 audit fields. Declared so ingest retains them — pydantic's
+    # default ``extra="ignore"`` silently discarded them before, stripping audit
+    # context (v3 review finding 16). None affects the composite; they mirror
+    # ``dittobench-datagen/protocol`` ``CaseScore`` and must stay in sync with
+    # the ditto-subnet copy (guarded by the wire round-trip test).
+    result_usage: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            default=0.0,
+            description=(
+                "Result-usage half of an observed tool case: did the final "
+                "answer incorporate the value only the executed tool served."
+            ),
+        ),
+    ] = 0.0
+    twin_group: Annotated[
+        str,
+        Field(
+            default="",
+            description=(
+                "Metamorphic twin-group id tying rephrasings of one fact, for "
+                "consistency audits."
+            ),
+        ),
+    ] = ""
+    confidence: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Harness self-reported confidence echoed for Brier calibration "
+                "(None = not reported; distinct from 0.0)."
+            ),
+        ),
+    ] = None
+    observed: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "True when the graded trajectory is the validator-observed one "
+                "(mock tool endpoint), i.e. ``called`` is authoritative."
+            ),
+        ),
+    ] = False
+    injection: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "True when the grader flagged injection compliance on this case."
+            ),
+        ),
+    ] = False
 
     @field_validator("called", "expected", "notes", mode="before")
     @classmethod
@@ -336,6 +578,28 @@ class CodeFingerprint(BaseModel):
     ]
 
 
+class CategoryStat(BaseModel):
+    """Per-category aggregate inside a :class:`ScoreReport`.
+
+    Mirrors the DittoBench ``CategoryStat`` wire shape (``pkg/protocol``).
+    Advisory audit context only; the composite never depends on it.
+    """
+
+    category: Annotated[str, Field(description="Case category, e.g. ``web_search``.")]
+    count: Annotated[int, Field(ge=0, description="Cases scored in the category.")]
+    mean: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Mean case score in [0,1].")
+    ]
+    std_err: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            default=0.0,
+            description="Standard error of the category mean (0 when omitted).",
+        ),
+    ] = 0.0
+
+
 class ScoreReport(BaseModel):
     """A completed DittoBench evaluation result for one agent.
 
@@ -347,6 +611,17 @@ class ScoreReport(BaseModel):
     """
 
     run_id: Annotated[str, Field(description="Scoring-engine run identifier.")]
+    bench_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description=(
+                "Version bound into new score signatures. Omission is accepted "
+                "only for legacy benchmark-v2 leases."
+            ),
+        ),
+    ] = None
     seed: Annotated[
         int,
         Field(
@@ -357,8 +632,22 @@ class ScoreReport(BaseModel):
         ),
     ]
     composite: Annotated[
-        float, Field(ge=0.0, le=1.0, description="Aggregate score in [0,1].")
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Aggregate score after any bounded waste penalty, in [0,1].",
+        ),
     ]
+    raw_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description="Pre-efficiency quality composite for benchmark v5.",
+        ),
+    ] = None
     tool_mean: Annotated[
         float, Field(ge=0.0, le=1.0, description="Mean tool accuracy in [0,1].")
     ]
@@ -396,6 +685,21 @@ class ScoreReport(BaseModel):
             ),
         ),
     ]
+    confirmation_seeds: Annotated[
+        list[int] | None,
+        Field(
+            default=None,
+            description=(
+                "The K common CRN seeds aligned 1:1 (same order) with "
+                "``confirmation_composites`` for a version-bump re-score, so the "
+                "KOTH fold can PAIR a challenger against the champion on their "
+                "shared seeds and use the lower paired-difference variance for the "
+                "dethrone band. Advisory: not covered by the signature and never "
+                "affects the score. Stashed into ``scores.details`` and surfaced "
+                "on the ledger."
+            ),
+        ),
+    ]
     generated_at: Annotated[
         datetime, Field(description="When the report was produced (UTC).")
     ]
@@ -403,6 +707,17 @@ class ScoreReport(BaseModel):
         list[CaseScore],
         Field(default_factory=list, description="Optional per-case breakdown."),
     ]
+    per_category: Annotated[
+        list[CategoryStat] | None,
+        Field(
+            default=None,
+            description=(
+                "Optional per-category aggregates (bench_version 3 audit "
+                "context). Advisory: not covered by the signature and never "
+                "affects the score."
+            ),
+        ),
+    ] = None
     structural_fingerprint: Annotated[
         CodeFingerprint | None,
         Field(
@@ -505,7 +820,12 @@ class LedgerEntry(BaseModel):
     miner_hotkey: Annotated[str, Field(description="Miner's SS58 hotkey.")]
     agent_id: Annotated[UUID, Field(description="The miner's best eligible agent.")]
     composite: Annotated[
-        float, Field(ge=0.0, le=1.0, description="Best composite score in [0,1].")
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Best aggregate benchmark score in [0,1].",
+        ),
     ]
     n: Annotated[
         int,
@@ -534,6 +854,19 @@ class LedgerEntry(BaseModel):
     validator_hotkey: Annotated[
         str, Field(description="SS58 hotkey of the validator that produced the score.")
     ]
+    bench_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description=(
+                "Benchmark contract version of this platform-authoritative row. "
+                "During a rollout the ledger may contain a mix: an agent switches "
+                "to the desired version only after reaching quorum. Additive and "
+                "optional so older validators safely ignore it."
+            ),
+        ),
+    ] = None
     signature: Annotated[
         str | None,
         Field(
@@ -570,6 +903,21 @@ class LedgerEntry(BaseModel):
             ),
         ),
     ]
+    confirmation_seeds: Annotated[
+        list[int] | None,
+        Field(
+            default=None,
+            description=(
+                "The K common CRN seeds aligned 1:1 with "
+                "``confirmation_composites`` for this agent's version-bump "
+                "re-score, if the winning score report carried them. Lets the "
+                "validator's KOTH fold pair a challenger against the champion on "
+                "shared seeds (lower paired-difference variance) instead of the "
+                "independent-sum band. Additive-optional; absent means the fold "
+                "uses the unpaired band."
+            ),
+        ),
+    ]
     status: Annotated[
         AgentStatus, Field(description="Agent lifecycle state (always ``scored``).")
     ]
@@ -585,7 +933,12 @@ class LedgerResponse(BaseModel):
 
     entries: Annotated[
         list[LedgerEntry],
-        Field(description="Best eligible score per miner, highest composite first."),
+        Field(
+            description=(
+                "Best eligible score per payment-time coldkey, highest composite "
+                "first; the selected generation's hotkey is the weight destination."
+            )
+        ),
     ]
     count: Annotated[int, Field(ge=0, description="Number of entries returned.")]
     generated_at: Annotated[
@@ -679,3 +1032,28 @@ class SubmitScoreResponse(BaseModel):
             }
         }
     )
+
+
+class SubmitTranscriptResponse(BaseModel):
+    """Response of ``PUT /validator/agent/{agent_id}/transcript/{run_id}``.
+
+    ``stored`` is ``False`` only when the public bucket is unconfigured (the
+    upload was accepted and verified but has nowhere public to land); a digest
+    mismatch is a 409, never a silent drop.
+    """
+
+    agent_id: Annotated[UUID, Field(description="Echoes the path-param id.")]
+    run_id: Annotated[str, Field(description="Echoes the path-param run id.")]
+    transcript_sha256: Annotated[
+        str,
+        Field(description="SHA-256 hex digest of the stored transcript bytes."),
+    ]
+    stored: Annotated[
+        bool,
+        Field(
+            description=(
+                "``True`` when the artifact now exists in the public bucket "
+                "(content-addressed at ``transcripts/{sha256}.json``)."
+            )
+        ),
+    ]

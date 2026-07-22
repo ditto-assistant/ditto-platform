@@ -1,4 +1,4 @@
-"""Scoring-pool endpoint — the public best-score ledger the validator folds.
+"""Scoring-pool endpoint — the validator best-score ledger used for weights.
 
 ``GET /scoring/scores`` returns one entry per active miner: that miner's best
 *eligible* score (status ``scored``), highest composite first. This is the
@@ -12,24 +12,39 @@ D3, weights are computed validator-side: every validator reads this identical
 pool and runs the same deterministic function, so Yuma consensus clips any
 deviator. The platform only exposes the raw, signed scores.
 
-Auth mirrors the validator queue: an ``X-Validator-Hotkey`` header for a
-chain-registered, validator-permitted hotkey. D3's end state makes this pool
-fully public (self-verifying via the stored signatures); gating it to permitted
-validators is the v1 stance.
+The raw pool remains validator-only even though public projections expose a safe
+subset of benchmark results. Reads require a fresh signature from a
+chain-registered, validator-permitted hotkey; a public hotkey is an identity, not
+proof that the caller controls it.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Annotated
+from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 from sqlalchemy.exc import SQLAlchemyError
 
 from ditto.api_models import LedgerEntry, LedgerResponse
-from ditto.api_server.endpoints.validator import SessionDep, ValidatorDep
-from ditto.db.queries.scores import list_eligible_ledger
+from ditto.api_models.upload import _SS58_PATTERN
+from ditto.api_server.endpoints.validator import (
+    ChainDep,
+    SessionDep,
+    ValidatorAuthError,
+    _assert_validator_permitted,
+    _verify_signature,
+)
+from ditto.db.queries.scores import list_eligible_ledger, quorum_composites
+from ditto.db.queries.validator_auth import (
+    ValidatorRequestReplayError,
+    consume_validator_nonce,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +57,15 @@ router = APIRouter(prefix="/scoring", tags=["scoring"])
 # far better than zeroing every miner on a transient DB blip. Beyond this the
 # snapshot could hide a genuine change, so we stop vouching for it.
 _MAX_STALE_SECONDS = 300
+_LEDGER_REQUEST_MAX_AGE = timedelta(minutes=2)
+
+
+def _ledger_signing_message(
+    validator_hotkey: str, nonce: UUID, requested_at: datetime
+) -> bytes:
+    """Canonical proof-of-possession bytes for one scoring-ledger read."""
+    requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
+    return f"validator-ledger:v1:{validator_hotkey}:{nonce}:{requested}".encode()
 
 
 @dataclass
@@ -89,6 +113,54 @@ def _confirmation_composites(details: dict | None) -> list[float] | None:
     return out
 
 
+def _confirmation_seeds(details: dict | None) -> list[int] | None:
+    """Read the P4 confirmation CRN seeds stashed in a score's details blob,
+    aligned 1:1 with :func:`_confirmation_composites`. Returns None unless the
+    value is a non-empty list of non-negative ints, so a malformed value degrades
+    to the unpaired dethrone band rather than corrupting the paired comparison.
+    Surfaced as-is (any length); the validator pairs only over shared seeds."""
+    if not isinstance(details, dict):
+        return None
+    v = details.get("confirmation_seeds")
+    if not isinstance(v, list) or not v:
+        return None
+    out: list[int] = []
+    for x in v:
+        if isinstance(x, bool) or not isinstance(x, int) or x < 0:
+            return None
+        out.append(x)
+    return out
+
+
+def _quorum_stderr(composites: list[float]) -> float | None:
+    """The standard error of an agent's composite from its k=3 quorum spread:
+    ``stdev(composites) / sqrt(n)`` over the validators' composites, or None with
+    fewer than two scores. This turns data the platform ALREADY collects (the
+    quorum) into the KOTH z-band's measurement-uncertainty estimate with no
+    re-score, so a plain quorum-scored champion still gets a noise-aware dethrone
+    band. Only finite composites contribute; a degenerate (identical) quorum
+    yields 0.0 (the band collapses to the flat margin, which is correct)."""
+    xs = [c for c in composites if isinstance(c, (int, float)) and c == c]
+    n = len(xs)
+    if n < 2:
+        return None
+    mean = sum(xs) / n
+    var = sum((c - mean) ** 2 for c in xs) / (n - 1)
+    return math.sqrt(var / n)
+
+
+def _ledger_stderr(details: dict | None, quorum: list[float]) -> float | None:
+    """The composite standard error to surface on a ledger entry. Prefer the
+    run's own stashed ``composite_stderr`` (e.g. a confirmation re-score's pooled
+    between-seed SE); else fall back to the between-validator SEM of the k=3
+    quorum (:func:`_quorum_stderr`), so the KOTH z-band has an uncertainty
+    estimate even for a plain quorum-scored agent, from data already collected."""
+    stashed = _composite_stderr(details)
+    if stashed is not None:
+        return stashed
+    return _quorum_stderr(quorum)
+
+
 def _cached_snapshot(request: Request) -> _LedgerSnapshot | None:
     return getattr(request.app.state, "ledger_snapshot", None)
 
@@ -108,10 +180,17 @@ def _store_snapshot(request: Request, snapshot: _LedgerSnapshot) -> None:
 async def scores(
     request: Request,
     response: Response,
-    validator_hotkey: ValidatorDep,
+    chain: ChainDep,
     session: SessionDep,
+    x_validator_hotkey: Annotated[str | None, Header()] = None,
+    x_validator_ledger_nonce: Annotated[UUID | None, Header()] = None,
+    x_validator_ledger_requested_at: Annotated[datetime | None, Header()] = None,
+    x_validator_ledger_signature: Annotated[str | None, Header()] = None,
 ) -> LedgerResponse:
-    """Return the best eligible score per miner, highest composite first.
+    """Return the best eligible score per payment-time coldkey.
+
+    Different names and hotkeys owned by one coldkey compete for one position;
+    the highest eligible canonical score wins and its hotkey is returned.
 
     Serve-last-known: on a transient DB failure the last successfully-read ledger
     is served (flagged ``stale`` with its ``age_seconds``) rather than erroring,
@@ -120,12 +199,67 @@ async def scores(
     silently folds a dangerously old pool.
     """
     response.headers["Cache-Control"] = "no-store"
+    if (
+        x_validator_hotkey is None
+        or not re.fullmatch(_SS58_PATTERN, x_validator_hotkey)
+        or x_validator_ledger_nonce is None
+        or x_validator_ledger_requested_at is None
+        or x_validator_ledger_signature is None
+        or x_validator_ledger_requested_at.tzinfo is None
+    ):
+        raise ValidatorAuthError("ledger request proof is missing or malformed")
+    signed = _ledger_signing_message(
+        x_validator_hotkey,
+        x_validator_ledger_nonce,
+        x_validator_ledger_requested_at,
+    )
+    if not _verify_signature(x_validator_hotkey, signed, x_validator_ledger_signature):
+        raise ValidatorAuthError("ledger request signature did not verify")
+    auth_now = datetime.now(UTC)
+    if (
+        abs(auth_now - x_validator_ledger_requested_at.astimezone(UTC))
+        > _LEDGER_REQUEST_MAX_AGE
+    ):
+        raise HTTPException(status_code=409, detail="ledger request timestamp is stale")
+    await _assert_validator_permitted(
+        chain,
+        request.app.state.config.chain.netuid,
+        x_validator_hotkey,
+        network=request.app.state.config.chain.subtensor_network,
+    )
+    async with session.begin():
+        try:
+            await consume_validator_nonce(
+                session,
+                nonce=x_validator_ledger_nonce,
+                validator_hotkey=x_validator_hotkey,
+                now=auth_now,
+                expires_at=auth_now + _LEDGER_REQUEST_MAX_AGE,
+            )
+        except ValidatorRequestReplayError as exc:
+            raise HTTPException(
+                status_code=409, detail="ledger request nonce has already been used"
+            ) from exc
+        except SQLAlchemyError as exc:
+            # Never serve cached ledger data when replay protection cannot record
+            # this proof. Failing closed preserves one-time nonce semantics.
+            raise HTTPException(
+                status_code=503,
+                detail="scoring ledger authorization temporarily unavailable",
+            ) from exc
     try:
-        rows = await list_eligible_ledger(session)
+        rows = await list_eligible_ledger(session, include_fingerprints=False)
+        # The k=3 quorum spread per agent -> composite_stderr when the run itself
+        # did not stash one, so the KOTH z-band is noise-aware with no re-score.
+        quorum = await quorum_composites(
+            session,
+            [r.agent_id for r in rows],
+            bench_versions={r.agent_id: r.bench_version for r in rows},
+        )
     except SQLAlchemyError as e:
-        return _serve_last_known(request, validator_hotkey, e)
+        return _serve_last_known(request, x_validator_hotkey, e)
 
-    now = datetime.now(UTC)
+    generated_at = datetime.now(UTC)
     entries = [
         LedgerEntry(
             miner_hotkey=r.miner_hotkey,
@@ -138,21 +272,27 @@ async def scores(
             run_id=r.run_id,
             seed=r.seed,
             validator_hotkey=r.validator_hotkey,
+            bench_version=r.bench_version,
             signature=r.signature,
-            composite_stderr=_composite_stderr(r.details),
+            composite_stderr=_ledger_stderr(r.details, quorum.get(r.agent_id, [])),
             confirmation_composites=_confirmation_composites(r.details),
+            confirmation_seeds=_confirmation_seeds(r.details),
             status=r.status,
         )
         for r in rows
     ]
-    _store_snapshot(request, _LedgerSnapshot(entries=entries, generated_at=now))
+    _store_snapshot(
+        request, _LedgerSnapshot(entries=entries, generated_at=generated_at)
+    )
     logger.info(
-        "validator=%s read scoring ledger: %d miner(s)", validator_hotkey, len(entries)
+        "validator=%s read scoring ledger: %d miner(s)",
+        x_validator_hotkey,
+        len(entries),
     )
     return LedgerResponse(
         entries=entries,
         count=len(entries),
-        generated_at=now,
+        generated_at=generated_at,
         stale=False,
         age_seconds=0,
     )

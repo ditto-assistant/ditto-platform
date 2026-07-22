@@ -7,8 +7,18 @@ import hashlib
 import logging
 from typing import TYPE_CHECKING
 
-from ditto.api_server.storage.errors import ObjectUploadFailedError
-from ditto.api_server.storage.models import StoredObject
+from ditto.api_server.storage.errors import (
+    ObjectDownloadFailedError,
+    ObjectNotFoundError,
+    ObjectUploadFailedError,
+)
+from ditto.api_server.storage.models import (
+    ListedObject,
+    MultipartUpload,
+    ObjectMetadata,
+    StoredObject,
+    VerifiedObject,
+)
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -16,6 +26,11 @@ if TYPE_CHECKING:
     from ditto.api_server.storage.models import StorageConfig
 
 logger = logging.getLogger(__name__)
+
+# Per-read chunk size when draining a download stream. The stream is read in a
+# loop (a single read does not return the whole object), so this only bounds how
+# much is pulled per await, not the total; the caller's ``max_bytes`` bounds that.
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class S3StorageClient:
@@ -173,16 +188,341 @@ class S3StorageClient:
                 f"key={key!r} cause={e}"
             ) from e
 
-    async def object_exists(self, *, key: str) -> bool:
-        """Return ``True`` iff a HEAD against ``key`` succeeds.
+    async def presigned_put_url(
+        self,
+        *,
+        key: str,
+        size_bytes: int,
+        metadata: dict[str, str],
+        content_type: str = "application/x-tar",
+        expires_in: int = 300,
+    ) -> str:
+        """Return a pre-signed PUT constrained to size, type, and metadata."""
+        from botocore.exceptions import BotoCoreError, ClientError
 
-        Used by integration tests + future janitor sweeps. Returns
-        ``False`` on 404, raises :class:`ObjectUploadFailedError`-style
-        errors for any other failure (wrapped via :class:`StorageError`).
+        try:
+            async with self._session.client(
+                "s3",
+                endpoint_url=self._config.endpoint_url,
+                use_ssl=self._config.use_tls,
+                config=self._client_config,
+            ) as s3:
+                return await s3.generate_presigned_url(
+                    "put_object",
+                    Params={
+                        "Bucket": self._config.bucket,
+                        "Key": key,
+                        "ContentLength": size_bytes,
+                        "ContentType": content_type,
+                        "Metadata": metadata,
+                    },
+                    ExpiresIn=expires_in,
+                )
+        except (ClientError, BotoCoreError) as error:
+            raise ObjectUploadFailedError(
+                f"presigned_put_url failed: bucket={self._config.bucket!r} "
+                f"key={key!r} cause={error}"
+            ) from error
+
+    async def create_multipart_upload(
+        self,
+        *,
+        key: str,
+        metadata: dict[str, str],
+        content_type: str = "application/x-tar",
+    ) -> str:
+        """Create a multipart upload and return its opaque storage upload id."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            async with self._session.client(
+                "s3",
+                endpoint_url=self._config.endpoint_url,
+                use_ssl=self._config.use_tls,
+                config=self._client_config,
+            ) as s3:
+                response = await s3.create_multipart_upload(
+                    Bucket=self._config.bucket,
+                    Key=key,
+                    ContentType=content_type,
+                    Metadata=metadata,
+                )
+        except (ClientError, BotoCoreError) as error:
+            raise ObjectUploadFailedError(
+                f"create_multipart_upload failed: key={key!r} cause={error}"
+            ) from error
+        upload_id = str(response.get("UploadId", ""))
+        if not upload_id:
+            raise ObjectUploadFailedError("multipart upload returned no upload id")
+        return upload_id
+
+    async def presigned_upload_part_url(
+        self, *, key: str, upload_id: str, part_number: int, expires_in: int = 300
+    ) -> str:
+        """Return a short-lived URL for one numbered multipart part."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            async with self._session.client(
+                "s3",
+                endpoint_url=self._config.endpoint_url,
+                use_ssl=self._config.use_tls,
+                config=self._client_config,
+            ) as s3:
+                return await s3.generate_presigned_url(
+                    "upload_part",
+                    Params={
+                        "Bucket": self._config.bucket,
+                        "Key": key,
+                        "UploadId": upload_id,
+                        "PartNumber": part_number,
+                    },
+                    ExpiresIn=expires_in,
+                )
+        except (ClientError, BotoCoreError) as error:
+            raise ObjectUploadFailedError(
+                f"presigned_upload_part_url failed: key={key!r} "
+                f"part={part_number} cause={error}"
+            ) from error
+
+    async def complete_multipart_upload(
+        self, *, key: str, upload_id: str, parts: list[dict[str, int | str]]
+    ) -> None:
+        """Complete a multipart upload with caller-observed part ETags."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            async with self._session.client(
+                "s3",
+                endpoint_url=self._config.endpoint_url,
+                use_ssl=self._config.use_tls,
+                config=self._client_config,
+            ) as s3:
+                await s3.complete_multipart_upload(
+                    Bucket=self._config.bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                    MultipartUpload={"Parts": parts},
+                )
+        except ClientError as error:
+            code = error.response.get("Error", {}).get("Code", "")
+            if code in {"404", "NoSuchKey", "NoSuchUpload", "NotFound"}:
+                raise ObjectNotFoundError(
+                    f"multipart upload is unavailable: key={key!r}"
+                ) from error
+            raise ObjectUploadFailedError(
+                f"complete_multipart_upload failed: key={key!r} cause={error}"
+            ) from error
+        except BotoCoreError as error:
+            raise ObjectUploadFailedError(
+                f"complete_multipart_upload failed: key={key!r} cause={error}"
+            ) from error
+
+    async def abort_multipart_upload(self, *, key: str, upload_id: str) -> None:
+        """Abort an incomplete multipart upload; missing uploads are idempotent."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            async with self._session.client(
+                "s3",
+                endpoint_url=self._config.endpoint_url,
+                use_ssl=self._config.use_tls,
+                config=self._client_config,
+            ) as s3:
+                await s3.abort_multipart_upload(
+                    Bucket=self._config.bucket, Key=key, UploadId=upload_id
+                )
+        except ClientError as error:
+            code = error.response.get("Error", {}).get("Code", "")
+            if code not in {"404", "NoSuchUpload", "NotFound"}:
+                raise ObjectUploadFailedError(
+                    f"abort_multipart_upload failed: key={key!r} cause={error}"
+                ) from error
+        except BotoCoreError as error:
+            raise ObjectUploadFailedError(
+                f"abort_multipart_upload failed: key={key!r} cause={error}"
+            ) from error
+
+    async def delete_object(self, *, key: str) -> None:
+        """Delete an object idempotently."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            async with self._session.client(
+                "s3",
+                endpoint_url=self._config.endpoint_url,
+                use_ssl=self._config.use_tls,
+                config=self._client_config,
+            ) as s3:
+                await s3.delete_object(Bucket=self._config.bucket, Key=key)
+        except (ClientError, BotoCoreError) as error:
+            raise ObjectUploadFailedError(
+                f"delete_object failed: key={key!r} cause={error}"
+            ) from error
+
+    async def list_objects(self, *, prefix: str) -> list[ListedObject]:
+        """List object keys and modification times under ``prefix``."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        objects: list[ListedObject] = []
+        token: str | None = None
+        try:
+            while True:
+                async with self._session.client(
+                    "s3",
+                    endpoint_url=self._config.endpoint_url,
+                    use_ssl=self._config.use_tls,
+                    config=self._client_config,
+                ) as s3:
+                    kwargs: dict[str, object] = {
+                        "Bucket": self._config.bucket,
+                        "Prefix": prefix,
+                    }
+                    if token is not None:
+                        kwargs["ContinuationToken"] = token
+                    response = await s3.list_objects_v2(**kwargs)
+                objects.extend(
+                    ListedObject(
+                        key=str(item["Key"]), last_modified=item["LastModified"]
+                    )
+                    for item in response.get("Contents", [])
+                )
+                if not response.get("IsTruncated"):
+                    return objects
+                token = str(response["NextContinuationToken"])
+        except (ClientError, BotoCoreError, KeyError) as error:
+            raise ObjectUploadFailedError(
+                f"list_objects failed: prefix={prefix!r} cause={error}"
+            ) from error
+
+    async def list_multipart_uploads(self, *, prefix: str) -> list[MultipartUpload]:
+        """List all incomplete multipart uploads under ``prefix``."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        uploads: list[MultipartUpload] = []
+        key_marker: str | None = None
+        upload_marker: str | None = None
+        try:
+            while True:
+                async with self._session.client(
+                    "s3",
+                    endpoint_url=self._config.endpoint_url,
+                    use_ssl=self._config.use_tls,
+                    config=self._client_config,
+                ) as s3:
+                    kwargs: dict[str, object] = {
+                        "Bucket": self._config.bucket,
+                        "Prefix": prefix,
+                    }
+                    if key_marker is not None:
+                        kwargs["KeyMarker"] = key_marker
+                    if upload_marker is not None:
+                        kwargs["UploadIdMarker"] = upload_marker
+                    response = await s3.list_multipart_uploads(**kwargs)
+                uploads.extend(
+                    MultipartUpload(
+                        key=str(item["Key"]),
+                        upload_id=str(item["UploadId"]),
+                        initiated_at=item["Initiated"],
+                    )
+                    for item in response.get("Uploads", [])
+                )
+                if not response.get("IsTruncated"):
+                    return uploads
+                key_marker = str(response["NextKeyMarker"])
+                upload_marker = str(response["NextUploadIdMarker"])
+        except (ClientError, BotoCoreError, KeyError) as error:
+            raise ObjectUploadFailedError(
+                f"list_multipart_uploads failed: prefix={prefix!r} cause={error}"
+            ) from error
+
+    async def verify_object_sha256(
+        self, *, key: str, expected_size_bytes: int
+    ) -> VerifiedObject:
+        """Stream all final bytes and compute their full archive SHA-256.
+
+        Multipart ETags and per-part checksums are deliberately not treated as
+        equivalent to this whole-object verification.
+        """
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            async with self._session.client(
+                "s3",
+                endpoint_url=self._config.endpoint_url,
+                use_ssl=self._config.use_tls,
+                config=self._client_config,
+            ) as s3:
+                response = await s3.get_object(Bucket=self._config.bucket, Key=key)
+                stream = response["Body"]
+                while True:
+                    chunk = await stream.read(_DOWNLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > expected_size_bytes:
+                        break
+                    digest.update(chunk)
+        except ClientError as error:
+            code = error.response.get("Error", {}).get("Code", "")
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                raise ObjectNotFoundError(
+                    f"object is unavailable: key={key!r}"
+                ) from error
+            raise ObjectDownloadFailedError(
+                f"verify_object_sha256 failed: key={key!r} cause={error}"
+            ) from error
+        except BotoCoreError as error:
+            raise ObjectDownloadFailedError(
+                f"verify_object_sha256 failed: key={key!r} cause={error}"
+            ) from error
+        return VerifiedObject(size_bytes=total, sha256=digest.hexdigest())
+
+    async def head_object(self, *, key: str) -> ObjectMetadata:
+        """Return object size and user metadata for a direct upload."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            async with self._session.client(
+                "s3",
+                endpoint_url=self._config.endpoint_url,
+                use_ssl=self._config.use_tls,
+                config=self._client_config,
+            ) as s3:
+                response = await s3.head_object(Bucket=self._config.bucket, Key=key)
+        except ClientError as error:
+            code = error.response.get("Error", {}).get("Code", "")
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                raise ObjectNotFoundError(
+                    f"object is unavailable: key={key!r}"
+                ) from error
+            raise ObjectUploadFailedError(
+                f"head_object failed: bucket={self._config.bucket!r} "
+                f"key={key!r} cause={error}"
+            ) from error
+        except BotoCoreError as error:
+            raise ObjectUploadFailedError(
+                f"head_object failed: bucket={self._config.bucket!r} "
+                f"key={key!r} cause={error}"
+            ) from error
+        return ObjectMetadata(
+            size_bytes=int(response.get("ContentLength", -1)),
+            metadata={str(k): str(v) for k, v in response.get("Metadata", {}).items()},
+        )
+
+    async def get_object(self, *, key: str, max_bytes: int) -> bytes:
+        """Download ``key`` into memory, bounded to ``max_bytes``.
+
+        Serves the operator source-inspection endpoints, which extract
+        bounded excerpts from an uploaded tarball server-side. Upload already
+        caps tarballs (20 MiB by default), so an in-memory read is fine; the
+        explicit bound keeps a mis-sized object from ballooning the process.
 
         Raises:
-            ObjectUploadFailedError: When the endpoint returns an error
-                other than 404.
+            ObjectDownloadFailedError: When the object is missing, exceeds
+                ``max_bytes``, or the underlying S3 call fails.
         """
         from botocore.exceptions import BotoCoreError, ClientError
 
@@ -193,18 +533,71 @@ class S3StorageClient:
                 use_ssl=self._config.use_tls,
                 config=self._client_config,
             ) as s3:
-                await s3.head_object(Bucket=self._config.bucket, Key=key)
+                response = await s3.get_object(Bucket=self._config.bucket, Key=key)
+                # aiobotocore's StreamingBody wraps an aiohttp reader whose
+                # read(n) returns only the NEXT buffered chunk (up to n), not
+                # the whole object. A single read(max_bytes + 1) therefore
+                # hands back a truncated prefix for any object large enough to
+                # span multiple chunks, whose sha256 never matches the stored
+                # digest (surfacing to operators as a 502 on every source
+                # inspection). Drain the stream so the returned bytes are the
+                # COMPLETE object, aborting as soon as the running total crosses
+                # the bound so a mis-sized object can't balloon the process.
+                stream = response["Body"]
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = await stream.read(_DOWNLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ObjectDownloadFailedError(
+                            f"get_object exceeded bound: "
+                            f"bucket={self._config.bucket!r} "
+                            f"key={key!r} max_bytes={max_bytes}"
+                        )
+                    chunks.append(chunk)
+        except (ClientError, BotoCoreError) as e:
+            raise ObjectDownloadFailedError(
+                f"get_object failed: bucket={self._config.bucket!r} "
+                f"key={key!r} cause={e}"
+            ) from e
+        return b"".join(chunks)
+
+    async def object_exists(self, *, key: str, bucket: str | None = None) -> bool:
+        """Return ``True`` iff a HEAD against ``key`` succeeds.
+
+        Used by integration tests, the content-addressed transcript upload
+        (idempotence check), and future janitor sweeps. ``bucket`` defaults to
+        the main bucket, mirroring :meth:`put_object`. Returns ``False`` on
+        404, raises :class:`ObjectUploadFailedError`-style errors for any
+        other failure (wrapped via :class:`StorageError`).
+
+        Raises:
+            ObjectUploadFailedError: When the endpoint returns an error
+                other than 404.
+        """
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        target = bucket or self._config.bucket
+        try:
+            async with self._session.client(
+                "s3",
+                endpoint_url=self._config.endpoint_url,
+                use_ssl=self._config.use_tls,
+                config=self._client_config,
+            ) as s3:
+                await s3.head_object(Bucket=target, Key=key)
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
             if code in {"404", "NoSuchKey", "NotFound"}:
                 return False
             raise ObjectUploadFailedError(
-                f"head_object failed: bucket={self._config.bucket!r} "
-                f"key={key!r} cause={e}"
+                f"head_object failed: bucket={target!r} key={key!r} cause={e}"
             ) from e
         except BotoCoreError as e:
             raise ObjectUploadFailedError(
-                f"head_object failed: bucket={self._config.bucket!r} "
-                f"key={key!r} cause={e}"
+                f"head_object failed: bucket={target!r} key={key!r} cause={e}"
             ) from e
         return True

@@ -8,6 +8,7 @@ import pytest
 
 from ditto.api_server.config import check_config, parse_api_server_config_from_env
 from ditto.api_server.errors import ApiServerConfigError
+from ditto.api_server.validator_names import ValidatorNamesConfig
 from ditto.tests.api_server.conftest import make_api_server_config
 
 
@@ -34,6 +35,8 @@ def _set_minimum_env(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     # Override unset by default; tested explicitly elsewhere.
     monkeypatch.delenv("TAO_PRICE_OVERRIDE_USD", raising=False)
+    monkeypatch.delenv("DITTO_TAOSTATS_VALIDATOR_NAMES_URL", raising=False)
+    monkeypatch.delenv("DITTO_TAOSTATS_API_KEY", raising=False)
 
 
 class TestParseApiServerConfigFromEnv:
@@ -51,6 +54,25 @@ class TestParseApiServerConfigFromEnv:
         assert config.port == 8000
         assert config.log_level == "INFO"
         assert config.commit_hash == "abc"
+        assert config.validator_names.url is None
+        assert config.validator_names.api_key is None
+        assert config.validator_compatibility.minimum_software_version == "0.7.0"
+        assert config.validator_compatibility.minimum_protocol_version == 4
+        assert config.validator_compatibility.heartbeat_max_age_seconds == 300
+
+    def test_free_taostats_key_config_is_optional(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        _set_minimum_env(monkeypatch)
+        url = "https://api.taostats.io/api/dtao/validator/available/v1?netuid=118"
+        monkeypatch.setenv("DITTO_TAOSTATS_VALIDATOR_NAMES_URL", url)
+        monkeypatch.setenv("DITTO_TAOSTATS_API_KEY", "free-api-key")
+
+        config = parse_api_server_config_from_env(commit_hash="abc")
+
+        assert config.validator_names.url == url
+        assert config.validator_names.api_key == "free-api-key"
+        assert config.validator_names.enabled is True
 
     def test_overrides_picked_up(self, monkeypatch: pytest.MonkeyPatch):
         _set_minimum_env(monkeypatch)
@@ -157,6 +179,21 @@ class TestCheckConfig:
         with pytest.raises(ApiServerConfigError, match="log_level"):
             check_config(config)
 
+    @pytest.mark.parametrize("version", ["latest", "v0.7.0", "0.7", ""])
+    def test_validator_minimum_requires_stable_version(self, version: str):
+        from ditto.api_server import ValidatorCompatibilityConfig
+
+        config = replace(
+            make_api_server_config(),
+            validator_compatibility=ValidatorCompatibilityConfig(
+                minimum_software_version=version,
+                minimum_protocol_version=4,
+                heartbeat_max_age_seconds=300,
+            ),
+        )
+        with pytest.raises(ApiServerConfigError, match="stable X.Y.Z"):
+            check_config(config)
+
     def test_screener_auth_may_be_disabled(self):
         from ditto.api_server import ScreenerAuthConfig
 
@@ -190,4 +227,78 @@ class TestCheckConfig:
             ),
         )
         with pytest.raises(ApiServerConfigError, match="at least 32"):
+            check_config(config)
+
+    def test_validator_names_accept_only_taostats_https(self):
+        config = replace(
+            make_api_server_config(),
+            validator_names=ValidatorNamesConfig(
+                url="https://api.taostats.io/api/dtao/validator/available/v1?netuid=118",
+                api_key="free-api-key",
+            ),
+        )
+        check_config(config)
+
+        for url in (
+            "http://api.taostats.io/api/dtao/validator/available/v1?netuid=118",
+            "https://taostats.io/subnets/118/metagraph",
+            "https://example.com/taostats",
+            "https://api.taostats.io/api/price/latest/v1?netuid=118",
+            "https://api.taostats.io/api/dtao/validator/available/v1?netuid=13",
+            "https://api.taostats.io:8443/api/dtao/validator/available/v1?netuid=118",
+        ):
+            rejected = replace(
+                config,
+                validator_names=replace(config.validator_names, url=url),
+            )
+            with pytest.raises(ApiServerConfigError, match="documented"):
+                check_config(rejected)
+
+    @pytest.mark.parametrize(
+        "names",
+        [
+            ValidatorNamesConfig(
+                url="https://api.taostats.io/api/dtao/validator/available/v1?netuid=118"
+            ),
+            ValidatorNamesConfig(api_key="free-api-key"),
+        ],
+    )
+    def test_validator_names_reject_partial_auth_config(
+        self, names: ValidatorNamesConfig
+    ) -> None:
+        config = replace(make_api_server_config(), validator_names=names)
+
+        with pytest.raises(ApiServerConfigError, match="must be set together"):
+            check_config(config)
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("timeout_seconds", 5.1, "between 0.1 and 5"),
+            ("retry_seconds", 59, "at least 60"),
+            ("refresh_seconds", 299, "at least the retry"),
+            ("max_stale_seconds", 3599, "at least the refresh"),
+        ],
+    )
+    def test_validator_name_cache_bounds(
+        self, field: str, value: float, message: str
+    ) -> None:
+        names = ValidatorNamesConfig(
+            url="https://api.taostats.io/api/dtao/validator/available/v1?netuid=118",
+            api_key="free-api-key",
+        )
+        if field == "timeout_seconds":
+            names = replace(names, timeout_seconds=value)
+        elif field == "retry_seconds":
+            names = replace(names, retry_seconds=int(value))
+        elif field == "refresh_seconds":
+            names = replace(names, refresh_seconds=int(value))
+        else:
+            names = replace(names, max_stale_seconds=int(value))
+        config = replace(
+            make_api_server_config(),
+            validator_names=names,
+        )
+
+        with pytest.raises(ApiServerConfigError, match=message):
             check_config(config)
