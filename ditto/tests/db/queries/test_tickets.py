@@ -25,6 +25,7 @@ from ditto.db.queries.tickets import (
     PROVISIONAL_CONTENDER_LANE_SIZE,
     expire_overdue_tickets,
     get_open_ticket,
+    issue_confirmation_ticket,
     issue_ticket,
     mark_ticket_scored,
 )
@@ -61,6 +62,31 @@ async def _seed_evaluating(
             agent.screened_image_upload_id = uuid4()
             agent.screened_image_verified_at = _NOW
         session.add(agent)
+    return aid
+
+
+async def _seed_scored(session: AsyncSession) -> UUID:
+    aid = await _seed_evaluating(session)
+    async with session.begin():
+        agent = await session.get(Agent, aid)
+        assert agent is not None
+        agent.status = AgentStatus.SCORED
+        session.add(
+            Score(
+                agent_id=aid,
+                validator_hotkey="5V1",
+                run_id="prior",
+                signature=None,
+                seed=1,
+                composite=0.8,
+                tool_mean=0.8,
+                memory_mean=0.8,
+                median_ms=100,
+                n=114,
+                details={"bench_version": 2},
+                generated_at=_NOW,
+            )
+        )
     return aid
 
 
@@ -1410,6 +1436,72 @@ class TestExpiry:
         async with session.begin():
             n = await expire_overdue_tickets(session, now=_LATER)
         assert n == 1
+
+
+class TestIssueConfirmationTicket:
+    async def test_reissues_scored_validator_slot_with_fresh_lease(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_scored(session)
+        async with session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=aid,
+                    validator_hotkey="5V1",
+                    status=TicketStatus.SCORED,
+                    issued_at=_NOW - _TTL,
+                    deadline=_NOW,
+                    bench_version=2,
+                    attempt_count=1,
+                    manual_retry_grants=0,
+                    retry_after=None,
+                )
+            )
+        async with session.begin():
+            ticket = await issue_confirmation_ticket(
+                session,
+                agent_id=aid,
+                validator_hotkey="5V1",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=2,
+            )
+
+        assert ticket is not None
+        assert ticket.status == TicketStatus.ISSUED
+        assert ticket.deadline == _NOW + _TTL
+        assert ticket.attempt_count == 2
+
+    async def test_does_not_interrupt_another_live_assignment(
+        self, session: AsyncSession
+    ) -> None:
+        target = await _seed_scored(session)
+        other = await _seed_evaluating(session, name="other")
+        async with session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=other,
+                    validator_hotkey="5V1",
+                    status=TicketStatus.ISSUED,
+                    issued_at=_NOW,
+                    deadline=_NOW + _TTL,
+                    bench_version=2,
+                    attempt_count=1,
+                    manual_retry_grants=0,
+                    retry_after=None,
+                )
+            )
+        async with session.begin():
+            ticket = await issue_confirmation_ticket(
+                session,
+                agent_id=target,
+                validator_hotkey="5V1",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=2,
+            )
+
+        assert ticket is None
 
 
 class TestTicketLifecycle:

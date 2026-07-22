@@ -154,6 +154,47 @@ class JobRequest(BaseModel):
         return value
 
 
+class Top5ConfirmationJobRequest(BaseModel):
+    """Fresh signed claim for a member of the top-5 shared-seed rescore lane.
+
+    Covers the whole emission set (champion + participation tail). The
+    validator claims one ticket per set member it wants to rescore this round,
+    each anchored to the current champion so the platform can rebuild the same
+    emission set and validate that ``member_agent_id`` is either the champion or
+    a current tail entrant, and that ``champion_agent_id`` is the reigning
+    incumbent (the CRN seed anchor both sides derive identically).
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Claiming validator hotkey.")
+    ]
+    champion_agent_id: Annotated[
+        UUID, Field(description="Current KOTH incumbent (the CRN seed anchor).")
+    ]
+    member_agent_id: Annotated[
+        UUID,
+        Field(description="Emission-set member (champion or tail) to rescore."),
+    ]
+    nonce: Annotated[UUID, Field(description="One-time claim nonce.")]
+    requested_at: Annotated[
+        datetime, Field(description="UTC time at which the claim was signed.")
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            pattern=_SIGNATURE_HEX_PATTERN,
+            description="sr25519 signature over the canonical top-5 claim.",
+        ),
+    ]
+
+    @field_validator("requested_at")
+    @classmethod
+    def requested_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("requested_at must include a timezone")
+        return value
+
+
 class JobResponse(BaseModel):
     """Returned by ``POST /validator/job`` when a ticket is issued.
 
@@ -843,6 +884,38 @@ class SubmitScoreRequest(BaseModel):
     )
 
 
+class ConfirmationScoreRecord(BaseModel):
+    """One append-only shared-seed confirmation score for a top-5 agent.
+
+    Each row is one ``(validator_hotkey, bench_version, seed)`` confirmation the
+    continual top-5 rescore lane produced for this agent (immutable,
+    INSERT-idempotent on the platform's ``ConfirmationScore`` ledger — never
+    updated). The KOTH fold groups these by ``seed`` to reconstruct the agent's
+    per-seed composite map (paired lower-median), so a longer-reigning champion
+    simply accumulates more rows and its band widens. Mirrors the shape of a
+    signed score receipt (``seed`` + ``composite`` + the producing validator);
+    the exact platform exposure is reconciled against ditto-platform #280.
+    """
+
+    seed: Annotated[int, Field(ge=0, description="Champion-anchored CRN seed.")]
+    composite: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Composite scored on this seed.")
+    ]
+    validator_hotkey: Annotated[
+        str, Field(description="SS58 hotkey of the validator that scored this seed.")
+    ]
+    bench_version: Annotated[
+        int,
+        Field(ge=1, description="Major bench version the seed family is scoped to."),
+    ]
+    signature: Annotated[
+        str | None,
+        Field(
+            default=None, description="Validator's hex sr25519 signature, if stored."
+        ),
+    ] = None
+
+
 class LedgerEntry(BaseModel):
     """One miner's best eligible score, returned by ``GET /scoring/scores``.
 
@@ -956,6 +1029,22 @@ class LedgerEntry(BaseModel):
             ),
         ),
     ]
+    confirmation_history: Annotated[
+        list[ConfirmationScoreRecord] | None,
+        Field(
+            default=None,
+            description=(
+                "Append-only shared-seed confirmation scores for this agent from "
+                "the continual top-5 rescore lane (ditto-platform #280), one row "
+                "per ``(validator_hotkey, bench_version, seed)`` — immutable and "
+                "accumulating over the agent's reign. Supersedes the in-row "
+                "``confirmation_composites``/``confirmation_seeds`` arrays as the "
+                "fold's paired-evidence source: the KOTH fold groups these by "
+                "seed. Additive-optional: absent means the fold falls back to the "
+                "legacy in-row arrays (then the unpaired band)."
+            ),
+        ),
+    ] = None
     status: Annotated[
         AgentStatus, Field(description="Agent lifecycle state (always ``scored``).")
     ]

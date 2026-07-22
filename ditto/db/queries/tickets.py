@@ -635,6 +635,89 @@ async def issue_ticket(
     return ticket
 
 
+async def issue_confirmation_ticket(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    validator_hotkey: str,
+    now: datetime,
+    ttl: timedelta,
+    bench_version: int,
+) -> ValidatorTicket | None:
+    """Reissue this validator's existing quorum slot for top-five maintenance.
+
+    The caller has already proven that ``agent_id`` is the one bounded KOTH
+    confirmation target.  Reusing the existing composite-key row keeps score
+    submission on the dedicated append-only endpoint. A validator with unrelated
+    live work receives no confirmation
+    ticket, so this maintenance run cannot interrupt queue scoring.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        await session.execute(
+            select(
+                func.pg_advisory_xact_lock(func.hashtextextended(validator_hotkey, 0))
+            )
+        )
+    await expire_overdue_tickets(session, now=now)
+    existing_live = await session.scalar(
+        select(ValidatorTicket)
+        .where(
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    if existing_live is not None:
+        return existing_live if existing_live.agent_id == agent_id else None
+
+    agent = await session.scalar(
+        select(Agent).where(Agent.agent_id == agent_id).with_for_update()
+    )
+    if agent is None or agent.status not in {AgentStatus.SCORED, AgentStatus.LIVE}:
+        return None
+    # Confirmation replaces one member of the existing k=3 quorum; it must not
+    # create a fourth scorer and change consensus cardinality.
+    prior_score = await session.scalar(
+        select(Score).where(
+            Score.agent_id == agent_id,
+            Score.bench_version == bench_version,
+            Score.validator_hotkey == validator_hotkey,
+        )
+    )
+    if prior_score is None:
+        return None
+
+    ticket = await session.get(
+        ValidatorTicket, (agent_id, bench_version, validator_hotkey)
+    )
+    if ticket is None:
+        ticket = ValidatorTicket(
+            agent_id=agent_id,
+            validator_hotkey=validator_hotkey,
+            status=TicketStatus.ISSUED,
+            issued_at=now,
+            deadline=now + ttl,
+            bench_version=bench_version,
+            attempt_count=1,
+            manual_retry_grants=0,
+            retry_after=None,
+        )
+        session.add(ticket)
+    else:
+        same_version = ticket.bench_version == bench_version
+        ticket.status = TicketStatus.ISSUED
+        ticket.issued_at = now
+        ticket.deadline = now + ttl
+        ticket.bench_version = bench_version
+        ticket.attempt_count = ticket.attempt_count + 1 if same_version else 1
+        ticket.manual_retry_grants = ticket.manual_retry_grants if same_version else 0
+        ticket.retry_after = None
+    await session.flush()
+    return ticket
+
+
 async def get_open_ticket(
     session: AsyncSession,
     *,

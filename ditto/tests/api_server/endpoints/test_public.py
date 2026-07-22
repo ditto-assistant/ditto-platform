@@ -527,6 +527,7 @@ class TestPublicLeaderboard:
                 "miner_hotkey": _MINER_A,
                 "raw_rank": 2,
                 "share_of_miner_pool": 0.9,
+                "shared_seed_confirmations": 0,
             },
             {
                 "role": "tail",
@@ -534,8 +535,53 @@ class TestPublicLeaderboard:
                 "miner_hotkey": _MINER_B,
                 "raw_rank": 1,
                 "share_of_miner_pool": pytest.approx(0.1),
+                "shared_seed_confirmations": 0,
             },
         ]
+
+    async def test_leaderboard_surfaces_shared_seed_confirmation_depth(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        champion_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.90, 0.90, 0.90],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.80, 0.80, 0.80],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        # The champion accumulated three champion-anchored shared-seed rescores.
+        async with session_maker() as s, s.begin():
+            await append_confirmation_scores(
+                s,
+                rows=[
+                    ConfirmationSeedScore(
+                        UUID(champion_id), "5V1", seed, 0.90, f"r{seed}", None
+                    )
+                    for seed in (100, 200, 300)
+                ],
+                bench_version=DEFAULT_BENCH_VERSION,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+        recipients = {r["agent_id"]: r for r in body["emissions"]["recipients"]}
+        assert recipients[champion_id]["shared_seed_confirmations"] == 3
 
     async def test_marks_deregistered_scores_retained_but_emission_ineligible(
         self,

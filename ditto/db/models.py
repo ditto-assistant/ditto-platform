@@ -873,6 +873,85 @@ class Score(Base):
     )
 
 
+class ConfirmationScore(Base):
+    """One append-only shared-seed rescore result: a top-5 confirmation ledger row.
+
+    The continual top-5 shared-seed rescore lane
+    (``docs/top5-rescore-lane.md``) re-scores each emission-set member on the
+    **champion-anchored** CRN seed set. Unlike :class:`Score` (the authoritative
+    k=3 record, one upserted row per validator), this ledger is **append-only**:
+    one immutable row per ``(agent_id, validator_hotkey, bench_version, seed)``,
+    inserted with ``ON CONFLICT DO NOTHING`` and **never UPDATEd or deleted**. The
+    longer a champion reigns, the more rows accumulate — the record grows
+    monotonically and every seed's score is kept forever (auditable, no
+    destructive read-modify-write).
+
+    The KOTH fold (and its ``koth.py`` platform mirror) read the paired evidence
+    from this history — grouped by seed, lower-median across validators — so
+    "more seeds" is just "more rows to median over". The authoritative k=3
+    ``scores`` table is untouched: no 4th ticket, no 4th ``Score`` PK row, no
+    change to finalization. This ledger is a separate, additive store.
+    """
+
+    __tablename__ = "confirmation_scores"
+
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """FK to ``agents.agent_id``. Unique-key part 1."""
+
+    validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    """SS58 hotkey of the reporting validator. Unique-key part 2."""
+
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Benchmark semantics this signed rescore was produced under. Unique-key
+    part 3 — the champion-anchored seed set is keyed on the major version."""
+
+    seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    """The champion-anchored CRN seed the member was re-scored on. Unique-key
+    part 4 — a validator contributes at most one composite per seed, immutably."""
+
+    composite: Mapped[float] = mapped_column(Float, nullable=False)
+    """Aggregate score in [0, 1] on this seed's dataset (as reported)."""
+
+    run_id: Mapped[str] = mapped_column(Text, nullable=False)
+    """Scoring-engine run identifier for this seed's benchmark run."""
+
+    signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """The reporting validator's sr25519 signature over the parent score payload,
+    hex encoded, so the ledger row is self-verifying alongside the k=3 receipt."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """When this immutable row was appended (UTC). Never updated."""
+
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "agent_id",
+            "bench_version",
+            "validator_hotkey",
+            "seed",
+            name="confirmation_scores_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="CASCADE",
+            name="confirmation_scores_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "composite >= 0 AND composite <= 1",
+            name="confirmation_scores_composite_range_check",
+        ),
+        CheckConstraint(
+            "bench_version > 0", name="confirmation_scores_bench_version_positive"
+        ),
+        CheckConstraint("seed >= 0", name="confirmation_scores_seed_check"),
+        Index("confirmation_scores_agent_version_idx", "agent_id", "bench_version"),
+    )
+
+
 class BenchmarkDataset(Base):
     """Immutable dataset pin for one agent and benchmark version."""
 

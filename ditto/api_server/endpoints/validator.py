@@ -65,6 +65,7 @@ from ditto.api_models import (
     SubmitScoreRequest,
     SubmitScoreResponse,
     SubmitTranscriptResponse,
+    Top5ConfirmationJobRequest,
     ValidatorHeartbeatRequest,
     ValidatorHeartbeatResponse,
 )
@@ -98,6 +99,7 @@ from ditto.api_server.benchmark_rollout import (
     refresh_rolling_qualification,
 )
 from ditto.api_server.config import ValidatorCompatibilityConfig
+from ditto.api_server.crn import champion_anchored_seeds
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -107,6 +109,13 @@ from ditto.api_server.dependencies import (
 )
 from ditto.api_server.endpoints.retrieval import AgentNotFoundError
 from ditto.api_server.fingerprint import reference_corpus_provenance
+from ditto.api_server.koth import (
+    TOP5_MAX_CONFIRMATION_SEEDS,
+    KothEntry,
+    emission_set,
+    project_koth,
+    top5_round_is_due,
+)
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
@@ -135,6 +144,11 @@ from ditto.db.queries.benchmark_rollout import (
     issue_rollout_ticket,
     open_rollout,
 )
+from ditto.db.queries.confirmation_scores import (
+    ConfirmationSeedScore,
+    append_confirmation_scores,
+    confirmation_composites_by_seed,
+)
 from ditto.db.queries.heartbeats import (
     HeartbeatProgressRegressionError,
     _validate_same_lease_progress,
@@ -148,12 +162,14 @@ from ditto.db.queries.scores import (
     get_score_for_validator,
     list_eligible_ledger,
     list_scores_for_agent,
+    quorum_composites,
     upsert_score,
 )
 from ditto.db.queries.tickets import (
     MAX_INFRA_RETRY_GRANTS,
     get_open_ticket,
     infra_retry_backoff,
+    issue_confirmation_ticket,
     issue_ticket,
     mark_ticket_scored,
 )
@@ -562,6 +578,45 @@ def _job_signing_message(
         return f"validator-job:{validator_hotkey}:{nonce}:{requested}".encode()
     return (
         f"validator-job:v2:{validator_hotkey}:{slot_id}:{nonce}:{requested}"
+    ).encode()
+
+
+def _top5_confirmation_job_signing_message(
+    validator_hotkey: str,
+    champion_agent_id: UUID,
+    member_agent_id: UUID,
+    nonce: UUID,
+    requested_at: datetime,
+) -> bytes:
+    """Canonical proof-of-possession bytes for one top-five job claim."""
+    requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
+    return (
+        "validator-top5-confirmation-job:v1:"
+        f"{validator_hotkey}:{champion_agent_id}:{member_agent_id}:"
+        f"{nonce}:{requested}"
+    ).encode()
+
+
+def _top5_confirmation_score_signing_message(
+    validator_hotkey: str,
+    agent_id: UUID,
+    ticket_deadline: datetime,
+    report: ScoreReport,
+) -> bytes:
+    """Bind every append-only seed/composite pair into a confirmation receipt."""
+    lease = _lease_token(ticket_deadline)
+    pairs = list(
+        zip(
+            report.confirmation_seeds or [],
+            report.confirmation_composites or [],
+            strict=False,
+        )
+    )
+    encoded_pairs = json.dumps(pairs, separators=(",", ":"))
+    return (
+        "validator-top5-confirmation-score:v1:"
+        f"{validator_hotkey}:{agent_id}:{lease}:{report.run_id}:"
+        f"{report.bench_version}:{encoded_pairs}"
     ).encode()
 
 
@@ -1311,6 +1366,366 @@ async def request_job(
         job.deadline.isoformat(),
     )
     return job
+
+
+async def _current_koth_entries(
+    session: AsyncSession,
+    *,
+    canonical_version: int,
+) -> list[KothEntry]:
+    """Build the active-version KOTH fold, including append-only confirmations."""
+    from ditto.api_server.endpoints.scoring import (
+        _confirmation_composites,
+        _confirmation_seeds,
+        _ledger_stderr,
+    )
+
+    rows = [
+        row
+        for row in await list_eligible_ledger(
+            session,
+            include_fingerprints=False,
+            bench_version=canonical_version,
+        )
+        if row.eligible and row.composite > 0.0
+    ]
+    rows.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
+    quorum = await quorum_composites(
+        session,
+        [row.agent_id for row in rows],
+        bench_versions=dict.fromkeys([row.agent_id for row in rows], canonical_version),
+    )
+    history = await confirmation_composites_by_seed(
+        session,
+        agent_ids=[row.agent_id for row in rows],
+        bench_version=canonical_version,
+    )
+    entries: list[KothEntry] = []
+    for rank, row in enumerate(rows, start=1):
+        details = row.details if isinstance(row.details, dict) else {}
+        merged: dict[int, float] = {}
+        legacy_seeds = _confirmation_seeds(details)
+        legacy_composites = _confirmation_composites(details)
+        if legacy_seeds is not None and legacy_composites is not None:
+            merged.update(zip(legacy_seeds, legacy_composites, strict=False))
+        merged.update(history.get(row.agent_id, {}))
+        confirmations = tuple(sorted(merged.items())) if len(merged) >= 2 else None
+        entries.append(
+            KothEntry(
+                miner_hotkey=row.miner_hotkey,
+                agent_id=row.agent_id,
+                composite=row.composite,
+                first_seen=row.first_seen,
+                raw_rank=rank,
+                composite_stderr=_ledger_stderr(details, quorum.get(row.agent_id, [])),
+                confirmation_composites=(
+                    tuple(value for _seed, value in confirmations)
+                    if confirmations is not None
+                    else None
+                ),
+                confirmation_seeds=(
+                    tuple(seed for seed, _value in confirmations)
+                    if confirmations is not None
+                    else None
+                ),
+            )
+        )
+    return entries
+
+
+async def _current_emission_set(
+    session: AsyncSession,
+    *,
+    canonical_version: int,
+) -> tuple[KothEntry, ...]:
+    entries = await _current_koth_entries(session, canonical_version=canonical_version)
+    return emission_set(project_koth(entries))
+
+
+async def _champion_anchored_seed_set(
+    session: AsyncSession,
+    *,
+    canonical_version: int,
+) -> frozenset[int]:
+    members = await _current_emission_set(session, canonical_version=canonical_version)
+    if not members:
+        return frozenset()
+    return frozenset(
+        champion_anchored_seeds(
+            members[0].agent_id,
+            version=canonical_version,
+            max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+        )
+    )
+
+
+@router.post(
+    "/top5-confirmation-job",
+    response_model=JobResponse,
+    responses={
+        401: {"description": "Missing/invalid validator auth."},
+        409: {"description": "Stale/replayed claim, closed round, or non-member."},
+        426: {"description": "Validator software or protocol must be upgraded."},
+        428: {"description": "A fresh signed validator heartbeat is required."},
+        503: {"description": "Chain unavailable for the permit / tempo check."},
+    },
+)
+async def request_top5_confirmation_job(
+    payload: Top5ConfirmationJobRequest,
+    request: Request,
+    response: Response,
+    chain: ChainDep,
+    session: SessionDep,
+    x_validator_hotkey: Annotated[str | None, Header()] = None,
+) -> JobResponse:
+    """Lease one current emission-set member for append-only shared-seed work."""
+    response.headers["Cache-Control"] = "no-store"
+    if x_validator_hotkey != payload.validator_hotkey:
+        raise ValidatorAuthError(
+            "top-5 confirmation claim header does not match signed hotkey"
+        )
+    signed = _top5_confirmation_job_signing_message(
+        payload.validator_hotkey,
+        payload.champion_agent_id,
+        payload.member_agent_id,
+        payload.nonce,
+        payload.requested_at,
+    )
+    if not _verify_signature(payload.validator_hotkey, signed, payload.signature):
+        raise ValidatorAuthError("top-5 confirmation claim signature did not verify")
+    now = datetime.now(UTC)
+    if abs(now - payload.requested_at.astimezone(UTC)) > _JOB_REQUEST_MAX_AGE:
+        raise HTTPException(
+            status_code=409, detail="top-5 confirmation claim timestamp is stale"
+        )
+
+    config = request.app.state.config
+    if config.top5_backoff_base <= 0:
+        raise HTTPException(
+            status_code=409, detail="top-5 shared-seed rescore lane is disabled"
+        )
+    await _assert_validator_permitted(
+        chain,
+        config.chain.netuid,
+        payload.validator_hotkey,
+        network=config.chain.subtensor_network,
+    )
+    block = await chain.get_latest_block()
+
+    async with session.begin():
+        await _assert_validator_compatible(
+            session,
+            validator_hotkey=payload.validator_hotkey,
+            now=now,
+            config=config.validator_compatibility,
+        )
+        try:
+            await consume_validator_nonce(
+                session,
+                nonce=payload.nonce,
+                validator_hotkey=payload.validator_hotkey,
+                now=now,
+                expires_at=now + _JOB_REQUEST_MAX_AGE,
+            )
+        except ValidatorRequestReplayError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="top-5 confirmation claim nonce has already been used",
+            ) from exc
+        canonical_version = await active_bench_version(session)
+        members = await _current_emission_set(
+            session, canonical_version=canonical_version
+        )
+        if not members or members[0].agent_id != payload.champion_agent_id:
+            raise HTTPException(
+                status_code=409,
+                detail="the claimed champion is not the current KOTH incumbent",
+            )
+        if payload.member_agent_id not in {member.agent_id for member in members}:
+            raise HTTPException(
+                status_code=409,
+                detail="the requested agent is not in the current emission set",
+            )
+        champion = await get_agent_by_id(session, agent_id=payload.champion_agent_id)
+        assert champion is not None
+        crown_block = champion.dataset_seed_block or block.number
+        if not top5_round_is_due(
+            block.number,
+            crown_block,
+            base=config.top5_backoff_base,
+            doubling_k=config.top5_backoff_doubling_tempos,
+            cap=config.top5_backoff_cap,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="top-5 shared-seed rescore round is not due at this block",
+            )
+        ticket = await issue_confirmation_ticket(
+            session,
+            agent_id=payload.member_agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            now=now,
+            ttl=_TICKET_TTL,
+            bench_version=canonical_version,
+        )
+        if ticket is None:
+            raise HTTPException(
+                status_code=409,
+                detail="validator has another live assignment or no prior quorum slot",
+            )
+        agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
+        assert agent is not None
+        dataset = await session.get(
+            BenchmarkDataset, (agent.agent_id, ticket.bench_version)
+        )
+        job = JobResponse(
+            agent_id=agent.agent_id,
+            miner_hotkey=agent.miner_hotkey,
+            sha256=agent.sha256,
+            deadline=ticket.deadline,
+            seed=dataset.seed if dataset is not None else agent.dataset_seed,
+            dataset_sha256=(
+                dataset.sha256 if dataset is not None else agent.dataset_sha256
+            ),
+            run_size=(
+                dataset.run_size if dataset is not None else agent.dataset_run_size
+            ),
+            dataset_seed_block=(
+                dataset.seed_block if dataset is not None else agent.dataset_seed_block
+            ),
+            dataset_seed_block_hash=(
+                dataset.seed_block_hash
+                if dataset is not None
+                else agent.dataset_seed_block_hash
+            ),
+            bench_version=ticket.bench_version,
+        )
+    logger.info(
+        "issued top-5 rescore job champion=%s member=%s validator=%s",
+        payload.champion_agent_id,
+        payload.member_agent_id,
+        payload.validator_hotkey,
+    )
+    return job
+
+
+@router.post(
+    "/agent/{agent_id}/top5-confirmation-score",
+    response_model=SubmitScoreResponse,
+    responses={
+        401: {"description": "Signature did not verify / not a permitted validator."},
+        409: {"description": "Lease, benchmark, membership, or seed set changed."},
+        503: {"description": "Chain unavailable for the permit check."},
+    },
+)
+async def submit_top5_confirmation_score(
+    agent_id: UUID,
+    payload: SubmitScoreRequest,
+    request: Request,
+    response: Response,
+    chain: ChainDep,
+    session: SessionDep,
+) -> SubmitScoreResponse:
+    """Append shared-seed evidence without replacing the canonical k=3 score."""
+    response.headers["Cache-Control"] = "no-store"
+    report = payload.report
+    if payload.ticket_deadline is None:
+        raise HTTPException(status_code=409, detail="confirmation lease is missing")
+    seeds = report.confirmation_seeds
+    composites = report.confirmation_composites
+    if (
+        seeds is None
+        or composites is None
+        or not seeds
+        or len(seeds) != len(composites)
+        or len(set(seeds)) != len(seeds)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="confirmation report requires unique aligned seed/composite lists",
+        )
+    signed = _top5_confirmation_score_signing_message(
+        payload.validator_hotkey,
+        agent_id,
+        payload.ticket_deadline,
+        report,
+    )
+    if not _verify_signature(payload.validator_hotkey, signed, payload.signature):
+        raise ValidatorAuthError("top-5 confirmation score signature did not verify")
+    await _assert_validator_permitted(
+        chain,
+        request.app.state.config.chain.netuid,
+        payload.validator_hotkey,
+        network=request.app.state.config.chain.subtensor_network,
+    )
+    now = datetime.now(UTC)
+    async with session.begin():
+        agent = await get_agent_by_id(session, agent_id=agent_id, for_update=True)
+        if agent is None:
+            raise AgentNotFoundError(f"no agent with id={agent_id}")
+        if agent.status not in {AgentStatus.SCORED, AgentStatus.LIVE}:
+            raise HTTPException(
+                status_code=409,
+                detail="top-5 confirmation target is not finalized and eligible",
+            )
+        canonical_version = await active_bench_version(session)
+        if report.bench_version != canonical_version:
+            raise HTTPException(
+                status_code=409,
+                detail="confirmation benchmark version is no longer active",
+            )
+        ticket = await get_open_ticket(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            now=now,
+            deadline=payload.ticket_deadline,
+            bench_version=canonical_version,
+            for_update=True,
+        )
+        if ticket is None:
+            raise HTTPException(
+                status_code=409, detail="confirmation lease is not open"
+            )
+        members = await _current_emission_set(
+            session, canonical_version=canonical_version
+        )
+        if agent_id not in {member.agent_id for member in members}:
+            raise HTTPException(
+                status_code=409,
+                detail="agent left the current emission set before submission",
+            )
+        allowed = await _champion_anchored_seed_set(
+            session, canonical_version=canonical_version
+        )
+        if any(seed not in allowed for seed in seeds):
+            raise HTTPException(
+                status_code=409,
+                detail="confirmation report contains a non-canonical seed",
+            )
+        await append_confirmation_scores(
+            session,
+            rows=[
+                ConfirmationSeedScore(
+                    agent_id=agent_id,
+                    validator_hotkey=payload.validator_hotkey,
+                    seed=seed,
+                    composite=composite,
+                    run_id=report.run_id,
+                    signature=payload.signature,
+                )
+                for seed, composite in zip(seeds, composites, strict=True)
+            ],
+            bench_version=canonical_version,
+            created_at=now,
+        )
+        await mark_ticket_scored(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=payload.validator_hotkey,
+            bench_version=canonical_version,
+        )
+    return SubmitScoreResponse(agent_id=agent_id, status=agent.status, accepted=True)
 
 
 @router.post(

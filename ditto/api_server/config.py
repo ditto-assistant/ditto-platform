@@ -184,6 +184,29 @@ class ApiServerConfig:
     ``https://wandb.ai/<entity>/ditto-sn118``. The committed HTML ships a bare
     default so the link still resolves before the project exists."""
 
+    top5_backoff_base: int = 2
+    """Base interval, in tempos (1 tempo = 360 blocks ≈ 72 min), between top-5
+    shared-seed rescore rounds while the champion's reign is fresh
+    (``TOP5_RESCORE_BACKOFF_BASE``). The gap grows as an exponential backoff over
+    the reign -- ``min(base * 2**floor(reign_tempos / K), cap)`` -- so a fresh or
+    contested king is rescored densely and a settled leader sparsely. Set ``0``
+    to disable the lane entirely. Platform-authoritative (the subnet just retries
+    and swallows not-due rejections), so this is not a cross-repo consensus knob;
+    every validator still gets the same due decision because the platform is the
+    single arbiter."""
+
+    top5_backoff_doubling_tempos: int = 20
+    """How many reign-tempos the interval holds at ``base`` before each doubling
+    (``K`` in the backoff; ``TOP5_RESCORE_BACKOFF_K``). At the default ``20`` the
+    densest rounds are front-loaded across the first ~20 tempos (~24 h), matching
+    the king-source-reveal window (#277/#278) so the crown is hardened on the most
+    shared seeds exactly as the code becomes public."""
+
+    top5_backoff_cap: int = 8
+    """Ceiling on the round interval in tempos (``TOP5_RESCORE_BACKOFF_CAP``). The
+    backoff never reaches zero rate: a champion whose interval flatlines at the
+    cap is itself the signal that the field has gone stagnant."""
+
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
@@ -311,6 +334,23 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
     except ValueError as error:
         raise ApiServerConfigError("inference proxy limits must be numeric") from error
 
+    try:
+        top5_backoff_base = int(os.environ.get("TOP5_RESCORE_BACKOFF_BASE", "2"))
+        top5_backoff_doubling_tempos = int(
+            os.environ.get("TOP5_RESCORE_BACKOFF_K", "20")
+        )
+        top5_backoff_cap = int(os.environ.get("TOP5_RESCORE_BACKOFF_CAP", "8"))
+    except ValueError as error:
+        raise ApiServerConfigError(
+            "TOP5_RESCORE_BACKOFF_BASE / _K / _CAP must be integer tempos"
+        ) from error
+    if top5_backoff_base < 0:
+        raise ApiServerConfigError("TOP5_RESCORE_BACKOFF_BASE must be non-negative")
+    if top5_backoff_doubling_tempos < 1:
+        raise ApiServerConfigError("TOP5_RESCORE_BACKOFF_K must be >= 1")
+    if top5_backoff_cap < max(1, top5_backoff_base):
+        raise ApiServerConfigError("TOP5_RESCORE_BACKOFF_CAP must be >= max(1, base)")
+
     return ApiServerConfig(
         host=host,
         port=port,
@@ -337,6 +377,9 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
         admin_api_token=os.environ.get("DITTO_ADMIN_API_TOKEN") or None,
         dashboard_enabled=dashboard_enabled,
         dashboard_wandb_url=dashboard_wandb_url,
+        top5_backoff_base=top5_backoff_base,
+        top5_backoff_doubling_tempos=top5_backoff_doubling_tempos,
+        top5_backoff_cap=top5_backoff_cap,
     )
 
 

@@ -31,7 +31,7 @@ from uuid import UUID
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 from sqlalchemy.exc import SQLAlchemyError
 
-from ditto.api_models import LedgerEntry, LedgerResponse
+from ditto.api_models import ConfirmationScoreRecord, LedgerEntry, LedgerResponse
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_server.endpoints.validator import (
     ChainDep,
@@ -40,6 +40,8 @@ from ditto.api_server.endpoints.validator import (
     _assert_validator_permitted,
     _verify_signature,
 )
+from ditto.db.queries.benchmark_rollout import active_bench_version
+from ditto.db.queries.confirmation_scores import confirmation_history_by_agent
 from ditto.db.queries.scores import list_eligible_ledger, quorum_composites
 from ditto.db.queries.validator_auth import (
     ValidatorRequestReplayError,
@@ -256,6 +258,12 @@ async def scores(
             [r.agent_id for r in rows],
             bench_versions={r.agent_id: r.bench_version for r in rows},
         )
+        canonical_version = await active_bench_version(session)
+        history = await confirmation_history_by_agent(
+            session,
+            agent_ids=[r.agent_id for r in rows],
+            bench_version=canonical_version,
+        )
     except SQLAlchemyError as e:
         return _serve_last_known(request, x_validator_hotkey, e)
 
@@ -277,6 +285,20 @@ async def scores(
             composite_stderr=_ledger_stderr(r.details, quorum.get(r.agent_id, [])),
             confirmation_composites=_confirmation_composites(r.details),
             confirmation_seeds=_confirmation_seeds(r.details),
+            confirmation_history=(
+                [
+                    ConfirmationScoreRecord(
+                        seed=row.seed,
+                        composite=row.composite,
+                        validator_hotkey=row.validator_hotkey,
+                        bench_version=row.bench_version,
+                        signature=row.signature,
+                    )
+                    for row in history[r.agent_id]
+                ]
+                if r.agent_id in history
+                else None
+            ),
             status=r.status,
         )
         for r in rows

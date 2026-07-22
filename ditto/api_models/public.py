@@ -621,6 +621,20 @@ class PublicEmissionRecipient(BaseModel):
             ),
         ),
     ]
+    shared_seed_confirmations: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description=(
+                "Shared-seed confirmation depth: distinct champion-anchored CRN "
+                "seeds this top-5 agent has been re-scored on by the continual "
+                "top-5 rescore lane. Grows while the agent holds its emission-set "
+                "spot; a longer-reigning champion accumulates more, and its median "
+                "band widens accordingly. Zero until the lane has run."
+            ),
+        ),
+    ] = 0
 
 
 class PublicDethroneDecision(BaseModel):
