@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated
@@ -869,6 +870,58 @@ async def screened_image_upload_abort(
     return ScreenedImageAbortResponse(aborted=True)
 
 
+_RUST_CONTRACT_DIAGNOSTIC_RE = re.compile(r"^error\[(SCR-RUST-\d{3})\]:", re.IGNORECASE)
+_RUST_CONTRACT_PUBLIC_REASONS = {
+    "SCR-RUST-001": (
+        "archive contains an unsafe path. Remove absolute paths, parent traversals, "
+        "backslashes, and drive-prefixed entries."
+    ),
+    "SCR-RUST-002": (
+        "archive contains a duplicate path. Package each path exactly once."
+    ),
+    "SCR-RUST-003": (
+        "archive contains a link or special file. Package only regular files and "
+        "directories."
+    ),
+    "SCR-RUST-004": (
+        "archive expands beyond the safety limit. Remove generated assets and build "
+        "output before packaging."
+    ),
+    "SCR-RUST-005": (
+        "Dockerfile is missing from the archive root. Package the crate contents so "
+        "Dockerfile is at the top level."
+    ),
+    "SCR-RUST-006": (
+        "Cargo.toml is missing from the archive root. Package the crate contents, not "
+        "the directory containing the crate."
+    ),
+    "SCR-RUST-007": (
+        "no Rust source file was found under src/. Include at least one .rs source "
+        "file below src/."
+    ),
+    "SCR-RUST-008": (
+        "Cargo.toml could not be read. Recreate the archive from a readable UTF-8 "
+        "crate manifest."
+    ),
+    "SCR-RUST-009": (
+        "Cargo.toml is not valid UTF-8 TOML. Run cargo metadata locally and fix the "
+        "first manifest error."
+    ),
+    "SCR-RUST-010": (
+        "Cargo.toml has no [package] table. Submit a runnable Rust package rather "
+        "than a virtual workspace."
+    ),
+    "SCR-RUST-011": (
+        "archive is not a readable gzip-compressed tar. Recreate it as a .tar.gz "
+        "archive and retry."
+    ),
+    "SCR-RUST-012": (
+        "Dockerfile is not valid UTF-8 text. Commit a readable UTF-8 Dockerfile that "
+        "builds the crate."
+    ),
+}
+
+
 def _public_screening_reason(detail: str, reason_code: str | None = None) -> str:
     """Map untrusted screener detail to a stable, public-safe failure category.
 
@@ -878,6 +931,21 @@ def _public_screening_reason(detail: str, reason_code: str | None = None) -> str
     """
     if reason_code == "exact-cross-miner-duplicate":
         return "Artifact is an exact duplicate of another miner submission"
+    if reason_code == "rust-harness-contract":
+        match = _RUST_CONTRACT_DIAGNOSTIC_RE.match(detail.strip())
+        if match is not None:
+            diagnostic_code = match.group(1).upper()
+            public_detail = _RUST_CONTRACT_PUBLIC_REASONS.get(diagnostic_code)
+            if public_detail is not None:
+                return (
+                    f"Rust harness contract failed ({diagnostic_code}): {public_detail}"
+                )
+        return (
+            "Submission does not satisfy the Rust harness contract. Rebuild the "
+            "archive as a readable .tar.gz containing only regular files and "
+            "directories, with Dockerfile and Cargo.toml at the archive root and "
+            "Rust source under src/."
+        )
     normalized = detail.strip().casefold()
     if "no dockerfile at tarball root" in normalized:
         return "Dockerfile missing from archive root"
