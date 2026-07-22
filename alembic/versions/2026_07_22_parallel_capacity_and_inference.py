@@ -1,8 +1,8 @@
 """add heartbeat v10 slots and ticket inference grants
 
 Revision ID: c7a91f04d2be
-Revises: f3a7c91d2e04
-Create Date: 2026-07-21
+Revises: e6b1a4c92d70
+Create Date: 2026-07-22
 """
 
 from collections.abc import Sequence
@@ -13,7 +13,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision: str = "c7a91f04d2be"
-down_revision: str | None = "f3a7c91d2e04"
+down_revision: str | None = "e6b1a4c92d70"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
