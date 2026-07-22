@@ -195,10 +195,12 @@ async def issue_ticket(
     has fewer than :data:`SCORING_QUORUM` live tickets and (b) this validator
     does not already hold a live or scored ticket for. Candidates with the
     strongest bounded set of 2-of-3 provisional contenders comes first. The
-    remaining candidates are normally ordered by least total coverage (accepted
-    scores plus live assignments), then never-attempted work, then submission
-    age. ``completion_first`` instead makes benchmark-era FIFO primary so the
-    oldest submission reaches quorum before the next submission is opened. A
+    remaining candidates prioritize the bounded 2-of-3 contender lane and then
+    1-of-3 submissions before uncovered work. Live assignments are spread
+    within each lane. This advances settled work toward quorum without letting
+    an unbounded completion backlog starve new miners. ``completion_first``
+    instead makes benchmark-era FIFO primary so the oldest submission reaches
+    quorum before the next submission is opened. A
     2-of-3 submission that can no longer reach this era's emission set sorts
     behind every other candidate rather than being withheld, so it still
     finalizes once the queue drains. A prior expired row is reissued only after
@@ -351,7 +353,6 @@ async def issue_ticket(
         .correlate(Agent)
         .scalar_subquery()
     )
-    total_coverage = accepted_score_count + live_assignment_count
     provisional_composite = func.coalesce(
         (
             select(func.avg(Score.composite))
@@ -480,6 +481,14 @@ async def issue_ticket(
         (Agent.agent_id.in_(top_provisional_contenders), 0),
         else_=1,
     )
+    one_score_completion_lane = case(
+        (accepted_score_count == 1, 0),
+        else_=1,
+    )
+    overflow_two_score_lane = case(
+        (recorded_score_count >= SCORING_QUORUM - 1, 1),
+        else_=0,
+    )
     # Lock one candidate Agent row before counting its tickets. The recount is a
     # separate statement after the lock is acquired, so under Postgres READ
     # COMMITTED it sees any ticket committed by the previous lock holder.
@@ -532,7 +541,16 @@ async def issue_ticket(
                     else_=(0 if artifact_mode == "legacy" else 1),
                 ).asc(),
                 contender_lane.asc(),
-                total_coverage.asc(),
+                # One accepted result is real progress toward the public 3-of-3
+                # settlement contract. Advance those rows before opening a
+                # wider one-score backlog. The separately bounded contender
+                # lane above owns strong 2-of-3 work.
+                one_score_completion_lane.asc(),
+                # Keep the existing bounded-contender guarantee: a two-score
+                # row outside the top contender set must not turn the whole
+                # backlog into an unbounded completion lane.
+                overflow_two_score_lane.asc(),
+                live_assignment_count.asc(),
                 had_prior_ticket.asc(),
                 covered_lane_score.desc(),
                 fifo_age.asc(),
@@ -542,13 +560,12 @@ async def issue_ticket(
         candidate = (
             # The ordinary queue first finishes the bounded set of strongest
             # 2-of-3 provisional contenders, one best submission per miner,
-            # then round-robins the rest of the scoreable backlog. A
-            # live evaluator counts as one
-            # unit of coverage just like an accepted score, so an agent cannot
-            # jump from zero coverage to three concurrent validators while
-            # another eligible agent remains uncovered. Within one coverage
-            # round, never-attempted work precedes this validator's cooled-down
-            # retry. Within any accepted-score coverage round, prefer the
+            # then advances 1-of-3 rows toward quorum before opening uncovered
+            # work. Live assignments are spread only within the same progress
+            # lane, so completed evidence is not treated as equivalent to
+            # speculative in-flight work. Within one lane, never-attempted
+            # work precedes this validator's cooled-down retry. Within any
+            # accepted-score coverage round, prefer the
             # highest provisional composite so the likely emission winner
             # advances first. Submission age and UUID remain stable ties. The
             # fresh-submission lane uses queue_order's FIFO-first alternative

@@ -770,7 +770,7 @@ class TestIssueTicket:
         assert t2.agent_id == a1
         assert t2.agent_id != a2
 
-    async def test_prioritizes_fewest_accepted_scores_before_age(
+    async def test_prioritizes_one_score_completion_before_uncovered_work(
         self, session: AsyncSession
     ) -> None:
         two_scores = await _seed_evaluating(
@@ -810,7 +810,7 @@ class TestIssueTicket:
                 ticket.status = TicketStatus.SCORED
                 claimed.append(ticket.agent_id)
 
-        assert claimed == [zero_scores, one_score, two_scores]
+        assert claimed == [one_score, two_scores, zero_scores]
 
     async def test_completion_lane_prioritizes_highest_provisional_score(
         self, session: AsyncSession
@@ -1144,7 +1144,7 @@ class TestIssueTicket:
         assert slot1 is None
         assert await session.get(ValidatorTicket, (newer, 2, "5ParallelFinish")) is None
 
-    async def test_live_assignment_and_accepted_score_are_equal_coverage(
+    async def test_accepted_score_precedes_uncovered_work_despite_live_assignment(
         self, session: AsyncSession
     ) -> None:
         one_score = await _seed_evaluating(session, name="one-score")
@@ -1175,8 +1175,10 @@ class TestIssueTicket:
                 session, validator_hotkey="5NewB", now=_NOW, ttl=_TTL
             )
 
-        assert first is not None and first.agent_id == zero_scores
+        assert first is not None and first.agent_id == one_score
         assert second is not None and second.agent_id == one_score
+        assert first.agent_id != zero_scores
+        assert second.agent_id != zero_scores
 
 
 class TestExpiry:
