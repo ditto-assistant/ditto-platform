@@ -2605,7 +2605,7 @@
         <summary><span class="bench-disclosure-title"><strong>Frozen setup</strong><span>Model pinning, deterministic grading, and audit trail</span></span><span class="tag" id="bs-version">v–</span><span class="bench-disclosure-icon" aria-hidden="true"></span></summary>
         <div class="bench-disclosure-body"><p style="margin-bottom:8px">Every harness runs against <b>one frozen open-weight model</b> and every run is graded by <b>deterministic, judge-free rules</b>. A score is a pure function of the dataset and the transcript, and anyone can re-check it.</p>
         <ul>
-          <li><b>Model</b>: <code id="bs-model">qwen/qwen3-32b</code> served as <code id="bs-serving">Qwen/Qwen3-32B-TEE</code> (hardware-attested TEE), reasoning mode locked <b id="bs-thinking">off</b>. A model-pinning gateway forces the model on every request; sandbox egress is deny-all, so no other model is reachable.</li>
+          <li><b>Model</b>: <code id="bs-model">qwen/qwen3-32b</code> served through <code id="bs-serving">Qwen/Qwen3-32B-TEE</code>, reasoning mode locked <b id="bs-thinking">off</b>. The trusted gateway forces the active benchmark model and only its eligible serving route; sandbox egress is deny-all, so no other model is reachable.</li>
           <li><b>Grading</b>: no LLM judge. Deterministic per-kind checks from the public <a href="https://github.com/ditto-assistant/dittobench-datagen" target="_blank" rel="noopener">dittobench-datagen</a> module (also the generator: dataset + answer keys are byte-reproducible from the seed).</li>
           <li><b>Seed</b>: derived from an on-chain block hash fixed <i>after</i> the miner commits. The result is unpredictable: one fresh dataset per submission, pinned by <code>dataset_sha256</code> in every score.</li>
           <li><b>Observed execution</b>: tool cases are scored on the trajectory the validator watched through its mock tool endpoint. The harness's own self-report is never used. Every scored run opens with a reachability probe; if the harness cannot reach the endpoint, the run <b>fails and is retried</b>, never scored as zeros.</li>
@@ -7437,7 +7437,7 @@
         applyBenchVersion(benchmarkDisplayVersion() || c.bench_version);
         document.getElementById("bs-model").textContent = c.harness.canonical_id;
         document.getElementById("bs-serving").textContent = c.harness.serving;
-        document.getElementById("bs-thinking").textContent = c.harness.thinking ? "on" : "off";
+        document.getElementById("bs-thinking").textContent = c.harness.reasoning_effort || (c.harness.thinking ? "on" : "off");
         if (c.public_mirror_url_template) {
           var li = document.getElementById("bs-mirror-li");
           li.style.display = "";

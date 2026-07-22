@@ -1894,10 +1894,20 @@ class BenchHarnessConfig(BaseModel):
         description="Canonical locked model id (docs + score reports)."
     )
     serving: str = Field(
-        description="The exact served artifact (fleet standard: Chutes TEE)."
+        description=(
+            "The serving route for the locked model; providers may be selected "
+            "dynamically."
+        )
     )
     thinking: bool = Field(
-        description="Locked hybrid-reasoning mode; false fleet-wide."
+        description="Whether the benchmark model's locked reasoning mode is enabled."
+    )
+    reasoning_effort: Literal["low", "medium", "high"] | None = Field(
+        default=None,
+        description=(
+            "Locked provider-independent reasoning effort, or null when reasoning "
+            "is disabled for the benchmark version."
+        ),
     )
     enforcement: str = Field(description="How the lock is enforced around the sandbox.")
 

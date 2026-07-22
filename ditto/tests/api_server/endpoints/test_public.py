@@ -3583,19 +3583,25 @@ class TestBenchConfig:
     """GET /public/bench/config exposes the frozen-model + grading setup."""
 
     async def test_config_shape_and_defaults(
-        self, client: httpx.AsyncClient, monkeypatch
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch,
     ) -> None:
+        _install_db(app, session_maker)
         monkeypatch.delenv("STORAGE_PUBLIC_BUCKET", raising=False)
         resp = await client.get("/api/v1/public/bench/config")
         assert resp.status_code == 200
         assert "max-age=300" in resp.headers["Cache-Control"]
         body = resp.json()
-        assert body["bench_version"] >= 2
+        assert body["bench_version"] == DEFAULT_BENCH_VERSION
         h = body["harness"]
         assert h["locked"] is True
         assert h["canonical_id"] == "qwen/qwen3-32b"
         assert h["serving"] == "Qwen/Qwen3-32B-TEE"
         assert h["thinking"] is False
+        assert h["reasoning_effort"] is None
         assert body["grading"]["judge_free"] is True
         assert "dittobench-datagen" in body["grading"]["grader"]
         assert "dataset_sha256" in body["dataset"]["reproduce"]
@@ -3606,9 +3612,45 @@ class TestBenchConfig:
         )
         assert body["ledger_path"] == "/api/v1/scoring/scores"
 
-    async def test_mirror_template_from_env(
-        self, client: httpx.AsyncClient, monkeypatch
+    async def test_open_v7_rollout_publishes_gpt_oss_setup(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch,
     ) -> None:
+        _install_db(app, session_maker)
+        monkeypatch.delenv("BENCH_HARNESS_MODEL_ID", raising=False)
+        monkeypatch.delenv("BENCH_HARNESS_SERVING", raising=False)
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=DEFAULT_BENCH_VERSION,
+                    desired_version=7,
+                    status="collecting",
+                    cohort_size=5,
+                    created_at=datetime.now(UTC),
+                )
+            )
+
+        body = (await client.get("/api/v1/public/bench/config")).json()
+
+        assert body["bench_version"] == 7
+        assert body["harness"]["canonical_id"] == "openai/gpt-oss-20b"
+        assert body["harness"]["serving"] == "OpenRouter dynamic provider route"
+        assert body["harness"]["thinking"] is True
+        assert body["harness"]["reasoning_effort"] == "medium"
+        assert "medium reasoning effort" in body["harness"]["enforcement"]
+
+    async def test_mirror_template_from_env(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch,
+    ) -> None:
+        _install_db(app, session_maker)
         monkeypatch.setenv("STORAGE_PUBLIC_BUCKET", "ditto-platform-public-dev")
         body = (await client.get("/api/v1/public/bench/config")).json()
         assert body["public_mirror_url_template"] == (
