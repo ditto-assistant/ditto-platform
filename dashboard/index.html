@@ -1614,11 +1614,21 @@
       box-shadow: 0 0 0 1px var(--bg-elev);
     }
     .memory-chart-value {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 2px;
       color: var(--text);
-      font: 700 12px/1 var(--mono);
       text-align: right;
       font-variant-numeric: tabular-nums;
     }
+    .memory-chart-value span {
+      color: var(--text-faint);
+      font: 700 8px/1 var(--mono);
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .memory-chart-value strong { font: 700 12px/1 var(--mono); }
     .memory-chart-axis {
       display: grid;
       grid-template-columns: minmax(145px, 220px) minmax(180px, 1fr) 58px;
@@ -2258,7 +2268,7 @@
         <div class="harness-comparison-title">
           <div class="harness-comparison-kicker">Independent comparison <span class="reference-badge">Reference only · no emissions</span></div>
           <h2 id="harness-comparison-title">How far miners have taken memory</h2>
-          <p class="harness-comparison-lead">Top finalized DittoBench v6 miner memory scores compared with a third-party harness measured against the same benchmark contract.</p>
+          <p class="harness-comparison-lead">Memory subscores only. The leaderboard ranks by composite. Top finalized DittoBench v6 miners are compared with a third-party harness measured against the same benchmark contract.</p>
         </div>
         <div class="harness-filter">
           <label for="third-party-harness-filter">Third-party harness</label>
@@ -2268,7 +2278,7 @@
         </div>
       </div>
       <div class="harness-comparison-body">
-        <div id="harness-comparison-chart" class="harness-comparison-state">Loading finalized v6 memory scores…</div>
+        <div id="harness-comparison-chart" class="harness-comparison-state">Loading finalized v6 memory subscores…</div>
         <div class="harness-comparison-method">
           <p id="harness-comparison-method">Third-party harnesses are off-network reference runs. They never enter score rank, KOTH, validator weights, or payouts.</p>
           <a id="harness-comparison-evidence" href="https://github.com/ditto-assistant/dittobench-api/blob/8df6ba37a3c4e46ede9db1cb6014551d49ac6ba8/docs/hermes-benchmark/README.md" target="_blank" rel="noopener">Evidence and method ↗</a>
@@ -2320,7 +2330,7 @@
             <th scope="col" class="hide-md sortable" data-sort="bench" style="width:180px"><span class="tip" tabindex="0" data-tooltip="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under. Sort to group runs by benchmark version.">Model</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" style="width:230px" class="sortable" data-sort="composite"><span class="tip" tabindex="0" data-tooltip="Headline score in [0,1]. The base is the equal-weight tool/memory average (½·tool + ½·memory); the benchmark quality gates then multiply it down (the 'gates −%' chip shows how much, mostly the conversational-sanity gate), and v5 token efficiency can remove at most 10% more (the 'token' chip). That is why the composite is not simply the tool/memory average. The band is ±1 standard error.">Composite</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="hide-sm sortable" data-sort="tool" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" class="hide-sm sortable" data-sort="memory" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Mean score across the memory cases. Did the agent recall and reason over stored facts across sessions, over time, and while resisting injected instructions?">Memory</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" class="hide-sm sortable" data-sort="memory" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Memory subscore, not the overall composite used for rank. It is the mean across memory cases: did the agent recall and reason over stored facts across sessions, over time, and while resisting injected instructions?">Memory</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="num hide-sm sortable" data-sort="latency" style="width:96px"><span class="tip" tabindex="0" data-tooltip="Median per-case response time for the run, and how many cases were scored (a full benchmark is ~114 cases).">Latency</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="num hide-sm sortable" data-sort="first_seen" style="width:92px"><span class="tip" tabindex="0" data-tooltip="When this miner's winning agent was first uploaded to the platform.">First seen</span><span class="sarrow" aria-hidden="true">▲</span></th>
           </tr>
@@ -3577,22 +3587,26 @@
 
     function memoryComparisonRow(entry, external, evidence) {
       var score = external ? evidence.memoryMean : Number(entry.memory_mean);
+      var composite = external ? NaN : Number(entry.composite);
       var label = external
         ? esc(evidence.subject)
         : entityAnchor("agent", entry.agent_id, agentName(entry.agent_name));
       var context = external
         ? "Third-party · " + esc(evidence.profile)
-        : "Miner · finalized " + esc(entry.score_count) + "/" + esc(entry.score_quorum);
+        : "Miner · finalized " + esc(entry.score_count) + "/" + esc(entry.score_quorum) +
+          (Number.isFinite(composite) ? " · composite " + fx(composite) : "");
       var baseline = external
         ? '<span class="memory-baseline-marker" style="left:' + (evidence.baselineMemoryMean * 100).toFixed(4) +
           '%" title="Original Hermes baseline: ' + fx(evidence.baselineMemoryMean) + '" aria-hidden="true"></span>'
         : "";
       var aria = (external ? evidence.subject : agentName(entry.agent_name)) +
-        " memory score " + fx(score) + (external ? ", original baseline " + fx(evidence.baselineMemoryMean) : "");
+        " memory subscore " + fx(score) +
+        (external ? ", original baseline " + fx(evidence.baselineMemoryMean) :
+          (Number.isFinite(composite) ? ", leaderboard composite " + fx(composite) : ""));
       return '<div class="memory-chart-row' + (external ? ' external' : '') + '" role="listitem" aria-label="' + esc(aria) + '">' +
         '<div class="memory-chart-name"><strong>' + label + '</strong><span>' + context + '</span></div>' +
         '<div class="memory-chart-track"><div class="memory-chart-fill" style="width:' + (score * 100).toFixed(4) + '%"></div>' + baseline + '</div>' +
-        '<div class="memory-chart-value">' + fx(score) + '</div></div>';
+        '<div class="memory-chart-value"><span>Memory</span><strong>' + fx(score) + '</strong></div></div>';
     }
 
     function renderThirdPartyComparison(data) {
@@ -3609,7 +3623,7 @@
 
       document.getElementById("harness-comparison-evidence").href = evidence.evidenceUrl;
       document.getElementById("harness-comparison-method").textContent =
-        "Miner bars are live finalized 3-validator v" + evidence.benchVersion +
+        "Miner bars show memory subscores, not the leaderboard composite. They are live finalized 3-validator v" + evidence.benchVersion +
         " medians. " + evidence.subject + " is one off-network " + evidence.provider +
         " practice run on " + evidence.model + " (" + evidence.memoryCases + " memory cases; " +
         evidence.totalCases + " total; seed " + evidence.seed + "). Its white marker is the original " +
@@ -3618,16 +3632,20 @@
 
       if (!entries.length) {
         target.className = "harness-comparison-state";
-        target.textContent = "Finalized v" + evidence.benchVersion + " miner memory scores are temporarily unavailable. No substitute miner data is shown.";
+        target.textContent = "Finalized v" + evidence.benchVersion + " miner memory subscores are temporarily unavailable. No substitute miner data is shown.";
         return;
       }
 
       var best = Number(entries[0].memory_mean);
+      var bestComposite = Number(entries[0].composite);
       var multiple = best / evidence.memoryMean;
       target.className = "";
-      target.innerHTML = '<p class="harness-comparison-summary">The strongest finalized miner currently scores <strong>' +
-        multiple.toFixed(1) + '×</strong> the selected third-party harness on memory (<strong>' +
-        fx(best) + '</strong> vs <strong>' + fx(evidence.memoryMean) + '</strong>).</p>' +
+      target.innerHTML = '<p class="harness-comparison-summary">Top memory subscore: <strong>' +
+        fx(best) + '</strong>' + (Number.isFinite(bestComposite)
+          ? '. The <strong>' + fx(bestComposite) + '</strong> shown on the leaderboard is its composite. '
+          : '. ') + 'That is <strong>' + multiple.toFixed(1) +
+        '×</strong> the selected third-party harness memory subscore (<strong>' +
+        fx(evidence.memoryMean) + '</strong>).</p>' +
         '<div class="memory-chart" role="list" aria-label="Top finalized v' + evidence.benchVersion +
         ' miner memory scores compared with ' + esc(evidence.subject) + '">' +
         entries.map(function (entry) { return memoryComparisonRow(entry, false, evidence); }).join("") +
