@@ -95,7 +95,7 @@ from ditto.db.queries.heartbeats import (
 from ditto.db.queries.screening import (
     claim_screening_attempts,
     get_screening_attempt,
-    missing_active_benchmark_dataset,
+    missing_required_benchmark_dataset,
     screening_priority_order,
 )
 from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
@@ -388,6 +388,7 @@ async def queue(
         | Agent.screened_image_upload_id.is_(None)
         | Agent.screened_image_verified_at.is_(None)
     )
+    missing_dataset = await missing_required_benchmark_dataset(session)
     agents = (
         await session.scalars(
             select(Agent)
@@ -409,10 +410,7 @@ async def queue(
                         & rolling_qualified
                         & missing_v3_screen
                     ),
-                    (
-                        (Agent.status == AgentStatus.EVALUATING)
-                        & missing_active_benchmark_dataset()
-                    ),
+                    ((Agent.status == AgentStatus.EVALUATING) & missing_dataset),
                 )
             )
             .order_by(*screening_priority_order())
