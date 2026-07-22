@@ -3834,10 +3834,20 @@
         var rawLeaderEntry = entries.find(function (entry) { return String(entry.agent_id) === String(emissions.raw_leader_agent_id); });
         var championName = championEntry ? agentName(championEntry.agent_name) : shortKey(emissions.champion_miner_hotkey);
         var championRank = championEntry && championEntry.rank ? "raw #" + championEntry.rank : "current score pool";
+        function sharedSeedNote(recipient) {
+          var n = recipient && recipient.shared_seed_confirmations
+            ? recipient.shared_seed_confirmations : 0;
+          return n > 0 ? n + " shared-seed confirmation" + (n === 1 ? "" : "s") : "";
+        }
+        var championRecipient = (emissions.recipients || []).find(function (recipient) {
+          return recipient.role === "champion";
+        });
+        var championConfirmations = sharedSeedNote(championRecipient);
         document.getElementById("emissions-title").innerHTML =
           '<span class="emission-badge champion"><span aria-hidden="true">●</span> KOTH champion</span> · ' +
           (championEntry ? entityAnchor("agent", championEntry.agent_id, championName) : esc(championName)) +
-          ' (' + esc(championRank) + ') receives ' + pct(emissions.champion_share) + ' of the miner pool.';
+          ' (' + esc(championRank) + ') receives ' + pct(emissions.champion_share) + ' of the miner pool.' +
+          (championConfirmations ? ' <span class="tip" title="Distinct champion-anchored seeds scored by the continual top-five lane.">· ' + esc(championConfirmations) + '</span>' : '');
         // Every consensus constant in this strip comes from the fold the API
         // reports (margin, dethrone_z, champion_share, tail_size). Hardcoding
         // any of them lets the copy drift from the rule actually being applied.
@@ -3864,7 +3874,9 @@
           ? '<span class="emission-badge tail">Participation tail</span> · ' + tails.map(function (recipient) {
               var entry = entries.find(function (candidate) { return String(candidate.agent_id) === String(recipient.agent_id); });
               var label = entry ? agentName(entry.agent_name) : shortKey(recipient.miner_hotkey);
-              return (entry ? entityAnchor("agent", entry.agent_id, label) : esc(label)) + " " + pct(recipient.share_of_miner_pool);
+              var note = sharedSeedNote(recipient);
+              return (entry ? entityAnchor("agent", entry.agent_id, label) : esc(label)) + " " + pct(recipient.share_of_miner_pool) +
+                (note ? ' <span class="text-faint">(' + esc(note) + ')</span>' : '');
             }).join(" · ")
           : "No participation-tail recipients in the current pool.";
         emissionsStrip.classList.add("show");
@@ -4389,7 +4401,7 @@
       var m = e.models || {};
       var mKind = unrankedKind(e);
       var det = "";
-      if (e._emission) det += stat("KOTH emissions", (e._emission.role === "champion" ? "Champion · " : "Participation tail · ") + pct(e._emission.share_of_miner_pool) + " of the miner pool. Raw score rank is shown separately.");
+      if (e._emission) det += stat("KOTH emissions", (e._emission.role === "champion" ? "Champion · " : "Participation tail · ") + pct(e._emission.share_of_miner_pool) + " of the miner pool. " + (e._emission.shared_seed_confirmations || 0) + " shared-seed confirmations. Raw score rank is shown separately.");
       if (e._chainWeight) det += stat("Revealed validator support", chainWeightLabel(e._chainWeight) + ". Top choice means the miner received that validator's highest revealed miner weight; support means it received any weight. Block " + lastChainWeights.block.toLocaleString() + "; commit-reveal can make this lag active commitments, and Yuma combines validator inputs stake-weightedly.");
       if (!isFinalized(e)) det += stat("Validation", (e.score_count || 0) + " of " + (e.score_quorum || 3) + " accepted scores. Not final and not used for emissions.");
       if (e.registered === false) det += stat("Registration", "Not currently registered on SN118. The submission, fee record, and scores are retained, but this hotkey is excluded from active weights and emissions until the same hotkey registers again.");

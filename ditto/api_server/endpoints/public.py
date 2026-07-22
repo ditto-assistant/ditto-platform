@@ -164,6 +164,10 @@ from ditto.db.models import (
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.benchmark_rollout import active_bench_version, rollout_state
+from ditto.db.queries.confirmation_scores import (
+    confirmation_composites_by_seed,
+    confirmation_depths,
+)
 from ditto.db.queries.heartbeats import (
     ActiveValidatorAssignment,
     ActiveValidatorWork,
@@ -927,8 +931,12 @@ def _public_koth_emissions(
     rows: list[LedgerRow],
     *,
     stderrs: dict[UUID, float | None],
+    confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
+    confirmation_depth: dict[UUID, int] | None = None,
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
+    by_seed = confirmation_by_seed or {}
+    depths = confirmation_depth or {}
     candidates: list[LedgerRow] = []
     for row in rows:
         if row.eligible and row.composite > 0.0:
@@ -938,6 +946,19 @@ def _public_koth_emissions(
     fold_entries = []
     for raw_rank, row in enumerate(candidates, start=1):
         details = row.details if isinstance(row.details, dict) else {}
+        merged_confirmations: dict[int, float] = {}
+        legacy_seeds = _confirmation_seeds(details)
+        legacy_composites = _confirmation_composites(details)
+        if legacy_seeds is not None and legacy_composites is not None:
+            merged_confirmations.update(
+                zip(legacy_seeds, legacy_composites, strict=False)
+            )
+        merged_confirmations.update(by_seed.get(row.agent_id, {}))
+        confirmations = (
+            sorted(merged_confirmations.items())
+            if len(merged_confirmations) >= 2
+            else None
+        )
         fold_entries.append(
             KothEntry(
                 miner_hotkey=row.miner_hotkey,
@@ -947,13 +968,13 @@ def _public_koth_emissions(
                 raw_rank=raw_rank,
                 composite_stderr=stderrs.get(row.agent_id),
                 confirmation_composites=(
-                    tuple(values)
-                    if (values := _confirmation_composites(details)) is not None
+                    tuple(composite for _seed, composite in confirmations)
+                    if confirmations is not None
                     else None
                 ),
                 confirmation_seeds=(
-                    tuple(seeds)
-                    if (seeds := _confirmation_seeds(details)) is not None
+                    tuple(seed for seed, _composite in confirmations)
+                    if confirmations is not None
                     else None
                 ),
             )
@@ -972,6 +993,7 @@ def _public_koth_emissions(
             miner_hotkey=projection.champion.miner_hotkey,
             raw_rank=projection.champion.raw_rank,
             share_of_miner_pool=KOTH_CHAMPION_SHARE,
+            shared_seed_confirmations=depths.get(projection.champion.agent_id, 0),
         )
     ]
     recipients.extend(
@@ -981,6 +1003,7 @@ def _public_koth_emissions(
             miner_hotkey=entry.miner_hotkey,
             raw_rank=entry.raw_rank,
             share_of_miner_pool=tail_share,
+            shared_seed_confirmations=depths.get(entry.agent_id, 0),
         )
         for entry in projection.tail
     )
@@ -1058,6 +1081,21 @@ async def leaderboard(
         for row in ledger_rows
         if score_counts.get(row.agent_id, 0) >= SCORING_QUORUM
     ]
+    finalized_ids = [row.agent_id for row in finalized_rows]
+    if bench_version is None:
+        confirmation_by_seed = await confirmation_composites_by_seed(
+            session,
+            agent_ids=finalized_ids,
+            bench_version=active_version,
+        )
+        confirmation_depth = await confirmation_depths(
+            session,
+            agent_ids=finalized_ids,
+            bench_version=active_version,
+        )
+    else:
+        confirmation_by_seed = {}
+        confirmation_depth = {}
     finalized_miners = {row.miner_hotkey for row in finalized_rows}
     provisional_candidates = [
         (row, score_counts.get(row.agent_id, 0))
@@ -1193,7 +1231,12 @@ async def leaderboard(
         emissions=(
             None
             if bench_version is not None
-            else _public_koth_emissions(finalized_rows, stderrs=fold_stderrs)
+            else _public_koth_emissions(
+                finalized_rows,
+                stderrs=fold_stderrs,
+                confirmation_by_seed=confirmation_by_seed,
+                confirmation_depth=confirmation_depth,
+            )
         ),
     )
 

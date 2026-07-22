@@ -22,6 +22,19 @@ KOTH_TAIL_SIZE = 4
 KOTH_CHAMPION_SHARE = 0.9
 KOTH_DETHRONE_Z = 1.64
 
+# One tempo = 360 blocks (~72 min at 12 s/block); mirrors the subnet worker's
+# rescore cadence.  The top-5 continual shared-seed rescore lane opens rounds on
+# a reign-backoff over the champion's crown (see ``top5_round_is_due``).
+BLOCKS_PER_TEMPO = 360
+
+# Ceiling on the champion-anchored confirmation-seed depth, mirroring the subnet's
+# ``TOP5_MAX_CONFIRMATION_SEEDS`` (ditto/validator/config.py).  The platform
+# derives ``crn_seed([champion], version, k)`` for ``k in range(this)`` to bound
+# the anti-grind check: a submitted confirmation seed only counts as
+# champion-anchored top-5 evidence if it lands in this set.  Must be >= the
+# subnet's cap so a legitimately-deep champion's newest seed is still recognised.
+TOP5_MAX_CONFIRMATION_SEEDS = 16
+
 
 @dataclass(frozen=True)
 class KothEntry:
@@ -55,6 +68,80 @@ class KothProjection:
     tail: tuple[KothEntry, ...]
     raw_leader: KothEntry
     raw_leader_decision: DethroneDecision | None
+
+
+def emission_set(projection: KothProjection | None) -> tuple[KothEntry, ...]:
+    """Return the emission set (champion + up to 4 distinct-miner tail = top 5).
+
+    This is the membership of the continual top-5 shared-seed rescore lane.  It
+    reuses the frozen KOTH fold (:func:`project_koth`): the champion via the
+    paired dethrone chain, the tail via ``project_koth``'s
+    ``KOTH_TAIL_SIZE``-capped, distinct-miner ``-composite`` ordering.  The
+    champion is always first (the anchor), followed by the tail in fold order.
+    A newcomer that enters the top 5 automatically joins the set; one that drops
+    out stops -- membership follows the set, no manual list.
+
+    The result contains no duplicate ``agent_id`` (``project_koth`` already
+    excludes the champion's miner from the tail), so it is at most five entries.
+    """
+    if projection is None:
+        return ()
+    seen = {projection.champion.agent_id}
+    members = [projection.champion]
+    for entry in projection.tail:
+        if entry.agent_id in seen:
+            continue
+        seen.add(entry.agent_id)
+        members.append(entry)
+    return tuple(members)
+
+
+def tempo_index(block_number: int) -> int:
+    """The tempo ordinal a chain block falls in (``block // BLOCKS_PER_TEMPO``)."""
+    return block_number // BLOCKS_PER_TEMPO
+
+
+def top5_round_is_due(
+    current_block: int,
+    crown_block: int,
+    *,
+    base: int,
+    doubling_k: int,
+    cap: int,
+) -> bool:
+    """Whether a top-5 shared-seed rescore round is due at ``current_block``.
+
+    The interval between rounds is an **exponential backoff over the champion's
+    reign** (``docs/top5-rescore-lane.md`` §4): dense while a fresh or contested
+    king must prove its crown on many seeds, sparse once the reign settles ---
+    saving tokens on a stable leader. Measured in tempos since the champion's
+    ``crown_block`` (a deterministic ledger fact that changes on any king
+    change, so churn re-enters the dense regime and stagnation tapers)::
+
+        interval(reign_tempos) = min(base * 2**floor(reign_tempos / K), cap)
+
+    A round is due exactly when the current reign-tempo lands on a scheduled
+    point of that growing schedule (offset 0 = the crown tempo, then repeatedly
+    advancing by the interval at each reached point). ``base`` holds for the
+    first ``doubling_k`` reign-tempos, front-loading the densest rounds across
+    the ~24 h king-source-reveal window (#277/#278) before doubling begins. The
+    interval is capped, so the rate never reaches zero -- a champion flatlining
+    at ``cap`` is itself the "field has gone stagnant" signal.
+
+    Pure and deterministic: a function only of the two block numbers and the
+    consensus constants, so every validator hitting the platform at the same
+    height gets the same decision. ``base <= 0`` disables the lane.
+    """
+    if base <= 0:
+        return False
+    step_cap = max(base, cap)
+    span = max(1, doubling_k)
+    reign_tempo = max(0, current_block - crown_block) // BLOCKS_PER_TEMPO
+    scheduled = 0
+    while scheduled < reign_tempo:
+        interval = min(base * (2 ** (scheduled // span)), step_cap)
+        scheduled += interval
+    return scheduled == reign_tempo
 
 
 def project_koth(entries: Sequence[KothEntry]) -> KothProjection | None:

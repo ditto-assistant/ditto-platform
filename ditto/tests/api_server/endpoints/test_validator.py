@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import statistics
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -21,7 +22,7 @@ import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event, select
+from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -4498,3 +4499,184 @@ def test_infra_retry_backoff_doubles_and_caps() -> None:
         assert current >= prev
         assert current <= INFRA_RETRY_BACKOFF_CAP
         prev = current
+
+
+def _install_chain_with_block(app: FastAPI, *, block_number: int) -> None:
+    from ditto.chain.models import BlockInfo
+
+    neurons = [
+        NeuronInfo(
+            hotkey=keypair.ss58_address,
+            coldkey="5GReceiverColdkeyPlaceholderXXXXXXXXXXXXXXXXXXX",
+            uid=uid,
+            stake=1000.0,
+            validator_permit=True,
+        )
+        for uid, keypair in enumerate(_KEYPAIRS, start=1)
+    ]
+
+    async def _chain() -> MagicMock:
+        chain = MagicMock()
+        chain.get_recent_neurons = AsyncMock(return_value=neurons)
+        chain.get_latest_block = AsyncMock(
+            return_value=BlockInfo(number=block_number, hash="00" * 32, timestamp=0)
+        )
+        return chain
+
+    app.dependency_overrides[get_chain_client] = _chain
+
+
+async def _seed_top5_emission_set(
+    maker: async_sessionmaker[AsyncSession],
+) -> list[UUID]:
+    composites = [0.90, 0.88, 0.86, 0.84, 0.82, 0.80]
+    agent_ids = [
+        await _seed_agent(
+            maker,
+            status=AgentStatus.SCORED,
+            name=f"top5-{rank}",
+            miner_hotkey=f"5TopMiner{rank}",
+            sha256=f"{rank:02d}" * 32,
+            created_at=datetime.now(UTC) - timedelta(days=10 - rank),
+        )
+        for rank in range(len(composites))
+    ]
+    async with maker() as session, session.begin():
+        for agent_id, composite in zip(agent_ids, composites, strict=True):
+            for index, keypair in enumerate(_KEYPAIRS):
+                session.add(
+                    Score(
+                        agent_id=agent_id,
+                        bench_version=2,
+                        validator_hotkey=keypair.ss58_address,
+                        run_id=f"top5-{agent_id}-{index}",
+                        signature=None,
+                        seed=index,
+                        composite=composite,
+                        tool_mean=composite,
+                        memory_mean=composite,
+                        median_ms=100,
+                        n=114,
+                        details={"bench_version": 2, "composite_stderr": 0.03},
+                        generated_at=datetime.now(UTC),
+                    )
+                )
+    return agent_ids
+
+
+def _top5_job_payload(champion: UUID, member: UUID) -> dict[str, str]:
+    nonce = uuid4()
+    requested_at = datetime.now(UTC)
+    requested = requested_at.isoformat(timespec="microseconds")
+    message = (
+        "validator-top5-confirmation-job:v1:"
+        f"{_VALIDATOR_HOTKEY}:{champion}:{member}:{nonce}:{requested}"
+    ).encode()
+    return {
+        "validator_hotkey": _VALIDATOR_HOTKEY,
+        "champion_agent_id": str(champion),
+        "member_agent_id": str(member),
+        "nonce": str(nonce),
+        "requested_at": requested_at.isoformat(),
+        "signature": _KEYPAIR.sign(message).hex(),
+    }
+
+
+def _top5_score_payload(
+    agent_id: UUID,
+    *,
+    deadline: datetime,
+    seeds: list[int],
+    composites: list[float],
+) -> dict[str, object]:
+    report: dict[str, object] = {
+        "run_id": "top5-confirmation-run",
+        "bench_version": 2,
+        "seed": seeds[0],
+        "composite": statistics.median(composites),
+        "tool_mean": statistics.median(composites),
+        "memory_mean": statistics.median(composites),
+        "median_ms": 100,
+        "n": 114,
+        "confirmation_seeds": seeds,
+        "confirmation_composites": composites,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "per_case": [],
+    }
+    lease = deadline.astimezone(UTC).isoformat(timespec="microseconds")
+    pairs = json.dumps(list(zip(seeds, composites, strict=True)), separators=(",", ":"))
+    message = (
+        "validator-top5-confirmation-score:v1:"
+        f"{_VALIDATOR_HOTKEY}:{agent_id}:{lease}:top5-confirmation-run:2:{pairs}"
+    ).encode()
+    return {
+        "validator_hotkey": _VALIDATOR_HOTKEY,
+        "ticket_deadline": deadline.isoformat(),
+        "signature": _KEYPAIR.sign(message).hex(),
+        "report": report,
+    }
+
+
+class TestTop5ConfirmationLane:
+    async def test_appends_evidence_without_replacing_canonical_score(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from ditto.api_server.crn import champion_anchored_seeds
+        from ditto.db.models import ConfirmationScore
+
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=0)
+        app.state.config = replace(app.state.config, top5_backoff_base=2)
+
+        job = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+        assert job.status_code == 200, job.text
+        deadline = datetime.fromisoformat(job.json()["deadline"])
+        seeds = list(champion_anchored_seeds(champion, version=2, max_seeds=16)[:2])
+        submitted = await client.post(
+            f"/api/v1/validator/agent/{member}/top5-confirmation-score",
+            json=_top5_score_payload(
+                member,
+                deadline=deadline,
+                seeds=seeds,
+                composites=[0.81, 0.83],
+            ),
+        )
+        assert submitted.status_code == 200, submitted.text
+
+        async with session_maker() as session:
+            canonical = await session.get(Score, (member, 2, _VALIDATOR_HOTKEY))
+            confirmations = await session.scalar(
+                select(func.count()).where(ConfirmationScore.agent_id == member)
+            )
+            ticket = await session.get(ValidatorTicket, (member, 2, _VALIDATOR_HOTKEY))
+        assert canonical is not None
+        assert canonical.run_id.startswith("top5-")
+        assert confirmations == 2
+        assert ticket is not None and ticket.status == TicketStatus.SCORED
+
+    async def test_rejects_member_outside_emission_set(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, sixth = agent_ids[0], agent_ids[5]
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=0)
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, sixth),
+        )
+        assert response.status_code == 409
+        assert "emission set" in response.json()["message"]
