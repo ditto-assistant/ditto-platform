@@ -3625,15 +3625,26 @@ class TestSubmitResult:
         rollout_started = datetime.now(UTC) - timedelta(minutes=1)
         agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
         async with session_maker() as session, session.begin():
-            session.add(
-                BenchmarkRollout(
-                    rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
-                    status="collecting",
-                    cohort_size=5,
-                    created_at=rollout_started,
-                )
+            session.add_all(
+                [
+                    BenchmarkRollout(
+                        rollout_id=uuid4(),
+                        from_version=1,
+                        desired_version=2,
+                        status="activated",
+                        cohort_size=5,
+                        created_at=rollout_started - timedelta(hours=1),
+                        activated_at=rollout_started - timedelta(minutes=30),
+                    ),
+                    BenchmarkRollout(
+                        rollout_id=uuid4(),
+                        from_version=2,
+                        desired_version=3,
+                        status="collecting",
+                        cohort_size=5,
+                        created_at=rollout_started,
+                    ),
+                ]
             )
         _install_db(app, session_maker)
         _install_chain(app)
@@ -3657,6 +3668,13 @@ class TestSubmitResult:
             source = await session.get(BenchmarkDataset, (agent_id, 2))
             assert target is not None
             assert source is None
+
+        # The persisted activated row is still v2 while this open rollout
+        # targets v3. The completed v3 submission must not be mistaken for a
+        # missing-v2 backfill and immediately claimed again.
+        next_claim = await client.post(_CLAIM_URL)
+        assert next_claim.status_code == 200, next_claim.text
+        assert next_claim.json()["items"] == []
 
     async def test_rescreen_after_activation_backfills_missing_v3_dataset(
         self,
