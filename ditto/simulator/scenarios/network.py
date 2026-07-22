@@ -2,7 +2,7 @@
 
 Fourteen miners hold finalized agents with composite medians spread across
 [0.35, 0.87]. The **oldest** high scorer is the incumbent emissions champion
-while a *newer* agent holds raw rank #1 within the 2% dethrone margin, so the
+while a *newer* agent holds raw rank #1 inside the statistical dethrone band, so the
 leaderboard's champion-vs-rank-1 explanation renders with a real decision
 (``dethrones=false``). Two miners carry a second agent version whose newer
 run scores *below* the older one, a 4-miner participation tail earns the
@@ -36,8 +36,8 @@ DESCRIPTION = (
 # The ranked field: (index, median composite, age in days, n cases,
 # validator-name triple, pinned per-score median latency in ms).
 #
-# KOTH math (flat/unpaired margin = 2% of the champion's composite ~= 0.017,
-# statistical lead from the ±(0.012/0.015) quorum jitter ~= 0.018): index 1 is
+# KOTH math (fixed margin = 0.005 composite points; statistical lead from the
+# ±(0.012/0.015) quorum jitter ~= 0.018): index 1 is
 # the oldest eligible entry at 0.850, index 2 leads raw rank #1 at 0.862 but
 # its 0.012 lead does not clear the required lead, so the incumbent keeps the
 # crown and the dashboard explains why raw #1 is not the champion. Everyone

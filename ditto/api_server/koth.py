@@ -17,7 +17,7 @@ from typing import Literal
 from uuid import UUID
 
 # Frozen consensus constants from ditto-subnet/ditto/validator/config.py.
-KOTH_MARGIN = 0.02
+KOTH_MARGIN = 0.005
 KOTH_TAIL_SIZE = 4
 KOTH_CHAMPION_SHARE = 0.9
 KOTH_DETHRONE_Z = 1.64
@@ -246,7 +246,7 @@ def _dethrone_decision(challenger: KothEntry, champion: KothEntry) -> DethroneDe
     paired = _paired_statistic(challenger, champion)
     if paired is not None:
         lead, champion_reference, standard_error = paired
-        margin_lead = champion_reference * KOTH_MARGIN
+        margin_lead = KOTH_MARGIN
         paired_statistical_lead = KOTH_DETHRONE_Z * standard_error
         required = max(margin_lead, paired_statistical_lead)
         return DethroneDecision(
@@ -255,13 +255,13 @@ def _dethrone_decision(challenger: KothEntry, champion: KothEntry) -> DethroneDe
             margin_lead=margin_lead,
             statistical_lead=paired_statistical_lead,
             method="paired",
-            dethrones=lead > required,
+            dethrones=(champion_reference + lead > champion_reference + required),
         )
 
     challenger_composite = _effective_composite(challenger)
     champion_composite = _effective_composite(champion)
     lead = challenger_composite - champion_composite
-    margin_lead = champion_composite * KOTH_MARGIN
+    margin_lead = KOTH_MARGIN
     challenger_stderr = _stderr(challenger)
     champion_stderr = _stderr(champion)
     statistical_lead: float | None = None
@@ -281,5 +281,7 @@ def _dethrone_decision(challenger: KothEntry, champion: KothEntry) -> DethroneDe
         margin_lead=margin_lead,
         statistical_lead=statistical_lead,
         method=method,
-        dethrones=lead > required,
+        # Mirror the validator's threshold comparison. Subtracting first can
+        # round an exact decimal boundary infinitesimally upward.
+        dethrones=challenger_composite > champion_composite + required,
     )

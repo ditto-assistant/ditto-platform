@@ -2597,7 +2597,7 @@
           <li><b>Scores compare only within one benchmark version.</b> A <code>bench_version</code> is an immutable generation contract: for a given seed it emits the same bytes forever and grades them the same way forever, which is what makes an old score auditable by anyone holding the seed. A correction to grading therefore cannot be applied to an existing version. It ships as a new one. Two composites from different versions are two different measurements, and the board never ranks them against each other.</li>
           <li><b>What v<span class="bv-desired">–</span> is.</b> <span id="bs-v4-copy">Version 4 is not a new benchmark. It is version 3 with a set of scoring false positives corrected: cases where the machinery penalised an agent for doing the right thing. The suite it administers is the same suite; what changed is that several ways of being <i>correct</i> no longer lose points. A leaking canary is charged once instead of twice, delete instructions are graded as acknowledgements rather than on whether they echoed a noun phrase, decimal durations parse ("1.5 years" was read as 15), and "used to" is treated as a temporal marker rather than a cessation phrase. Scores rise where an agent was being penalised for correct behaviour; the tests themselves are unchanged.</span></li>
           <li><b>How emissions work.</b> The KOTH fold pays a champion and a tail: the champion takes <span id="ex-champion-share">a fixed share</span> of the miner pool, and up to <span id="ex-tail-size">a fixed number of</span> runners-up by composite split <span id="ex-tail-share">the remainder</span> equally. Only finalized, full-benchmark, currently-registered entries with a positive composite are eligible. The live values are shown on the leaderboard's emissions strip.</li>
-          <li><b>How the crown changes hands.</b> The fold runs in <b>first-seen</b> order, so the incumbent keeps the crown unless a challenger clearly beats it. Being marginally ahead on one dataset is not enough. A challenger dethrones only if its lead exceeds the <b>indifference band</b>, which is the larger of the flat relative <span id="ex-margin">incumbent margin</span> and the statistical band <code><span id="ex-dethrone-z">dethrone_z</span> × √(SE<sub>challenger</sub>² + SE<sub>champion</sub>²)</code> when both sides carry a standard error. A lead inside the band is not thrown away: both agents are re-scored on <b>shared confirmation seeds</b> and the next fold decides on the paired comparison, where per-dataset difficulty cancels. Dataset luck never decides emissions.</li>
+          <li><b>How the crown changes hands.</b> The fold runs in <b>first-seen</b> order, so the incumbent keeps the crown unless a challenger clearly beats it. Being marginally ahead on one dataset is not enough. A challenger dethrones only if its lead exceeds the <b>indifference band</b>, which is the larger of the fixed <span id="ex-margin">composite-point hysteresis</span> and the statistical band <code><span id="ex-dethrone-z">dethrone_z</span> × √(SE<sub>challenger</sub>² + SE<sub>champion</sub>²)</code> when both sides carry a standard error. A lead inside the band is not thrown away: both agents are re-scored on <b>shared confirmation seeds</b> and the next fold decides on the paired comparison, where per-dataset difficulty cancels. Dataset luck never decides emissions.</li>
           <li><b>When weights move to a new version.</b> The whole ledger sits on one version at a time. Weights stay on the <b>active</b> version until at least <span class="quorum-needed">the required number of</span> agents hold a complete ranked quorum at the version being rolled out, and then the entire ledger flips at once. Ranking a partly-migrated pool would mix two incomparable scales; flipping early would leave the emission set (champion plus tail) short of recipients. Live progress is on the leaderboard's rollout strip.</li>
         </ul></div>
       </details>
@@ -3103,21 +3103,20 @@
     }
 
     // Consensus constants are read from the fold the API reports, never written
-    // into the copy. A percentage that drifts from emissions.margin is a lie
+    // into the copy. A point value that drifts from emissions.margin is a lie
     // about the rule miners are actually being judged by.
     // Trailing zeros on a consensus parameter read as false precision.
     function num(x) { return String(Number(x.toFixed(4))); }
 
     function marginText(margin) {
       if (!Number.isFinite(margin)) return "incumbent";
-      var v = margin * 100;
-      return (Math.abs(v - Math.round(v)) < 0.05 ? String(Math.round(v)) : v.toFixed(1)) + "%";
+      return num(margin) + " composite points";
     }
 
     // "Beat this to contend." The validator's rule (ditto/validator/weights.py
     // _beats) is: a challenger dethrones only if its lead over the champion
     // exceeds the indifference band, and the band is the LARGER of the flat
-    // relative margin and, when both sides carry a standard error,
+    // fixed composite-point margin and, when both sides carry a standard error,
     // dethrone_z * sqrt(se_challenger^2 + se_champion^2). Only the margin term
     // is knowable in advance, the statistical term depends on the challenger's
     // own measurement noise, which does not exist until it has been scored. So
@@ -3138,7 +3137,7 @@
         el.textContent = "";
         return;
       }
-      var floor = champComposite * (1 + margin);
+      var floor = champComposite + margin;
       var z = emissions.dethrone_z;
       var band = Number.isFinite(z) && z > 0
         ? " The band is the larger of that margin and " + num(z) +
@@ -3148,7 +3147,7 @@
       el.innerHTML =
         '<b>Beat this to contend:</b> <span class="beat">' + esc(fx(floor)) + '</span> composite. ' +
         esc("The champion holds " + fx(champComposite) + ", and a challenger must exceed it by more than the " +
-          marginText(margin) + " incumbent margin." + band +
+          marginText(margin) + " fixed hysteresis." + band +
           " A lead inside the band is not rejected: both agents are re-scored on shared confirmation seeds and the next fold decides on the paired comparison.");
       el.classList.add("show");
     }
@@ -3173,7 +3172,7 @@
       setText("ex-champion-share", pct(emissions.champion_share));
       setText("ex-tail-share", pct(1 - emissions.champion_share));
       if (tailSize != null) setText("ex-tail-size", String(tailSize));
-      if (Number.isFinite(emissions.margin)) setText("ex-margin", marginText(emissions.margin) + " incumbent margin");
+      if (Number.isFinite(emissions.margin)) setText("ex-margin", marginText(emissions.margin) + " hysteresis");
       if (Number.isFinite(emissions.dethrone_z) && emissions.dethrone_z > 0) setText("ex-dethrone-z", num(emissions.dethrone_z));
     }
 
@@ -3896,7 +3895,7 @@
         var decision = emissions.raw_leader_decision;
         if (decision && rawLeaderEntry) {
           var method = decision.method === "paired" ? "paired-seed uncertainty band" :
-            decision.method === "unpaired" ? "statistical uncertainty band" : marginLabel + " incumbent margin";
+            decision.method === "unpaired" ? "statistical uncertainty band" : marginLabel + " fixed hysteresis";
           var contestNote = decision.method === "paired"
             ? " Both sides were scored on shared confirmation seeds, so this decision is a paired comparison: per-dataset difficulty cancels and cannot decide the crown."
             : " A lead inside the band is never left to dataset luck: validators re-score both agents on shared confirmation seeds and the next fold decides the contest on the paired comparison.";

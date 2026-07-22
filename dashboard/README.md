@@ -12,7 +12,7 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 - **Leaderboard** — best eligible score per miner, ranked by raw finalized
   composite, with a separate KOTH emissions projection that identifies the
   first-seen incumbent champion and participation-tail recipients. The projection
-  applies the validator's frozen 2% protection margin and statistical dethrone
+  applies the validator's frozen 0.005 composite-point hysteresis and statistical dethrone
   band, so raw rank #1 is never mislabeled as champion. A native Subtensor read
   overlays the last publicly revealed validator vectors at one block, while
   explicitly separating those lagging commit-reveal inputs from stake-weighted

@@ -1010,7 +1010,7 @@ class LedgerEntry(BaseModel):
                 "score report carried one. The validator's KOTH fold uses it for "
                 "the measurement-uncertainty indifference band (dethrone only when "
                 "a challenger's lead exceeds z*sqrt(se_c^2 + se_champ^2)); absent "
-                "means the fold falls back to the flat relative margin. "
+                "means the fold falls back to the fixed composite-point margin. "
                 "Additive-optional, mirroring bench_version."
             ),
         ),
