@@ -8,6 +8,7 @@ hydrate into typed objects. Models and migrations must stay in sync.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import (
@@ -21,6 +22,7 @@ from sqlalchemy import (
     Index,
     Integer,
     MetaData,
+    Numeric,
     PrimaryKeyConstraint,
     Text,
     UniqueConstraint,
@@ -721,6 +723,9 @@ class EvaluationPayment(Base):
     amount_rao: Mapped[int] = mapped_column(BigInteger, nullable=False)
     """Payment amount in rao (1 TAO = 1e9 rao)."""
 
+    tao_usd_rate: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    """TAO/USD oracle rate used at verification; null only for legacy rows."""
+
     dest_address: Mapped[str] = mapped_column(Text, nullable=False)
     """SS58 address that received the payment."""
 
@@ -748,6 +753,10 @@ class EvaluationPayment(Base):
             name="evaluation_payments_agent_id_miner_hotkey_fkey",
         ),
         CheckConstraint("amount_rao > 0", name="evaluation_payments_amount_rao_check"),
+        CheckConstraint(
+            "tao_usd_rate IS NULL OR tao_usd_rate > 0",
+            name="evaluation_payments_tao_usd_rate_positive",
+        ),
         CheckConstraint(
             "extrinsic_index >= 0",
             name="evaluation_payments_extrinsic_index_check",

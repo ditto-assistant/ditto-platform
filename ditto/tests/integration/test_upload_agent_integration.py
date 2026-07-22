@@ -94,6 +94,7 @@ def _build_fake_verifier(
             miner_hotkey=expected_hotkey,
             miner_coldkey=_COLDKEY,
             amount_rao=_QUOTE_RAO,
+            tao_usd_rate=Decimal("400"),
             dest_address=dest_address,
             block_timestamp=datetime(2026, 5, 19, 12, 0, tzinfo=UTC),
         )

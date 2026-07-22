@@ -8,6 +8,9 @@ from ditto.api_server.endpoints.admin_benchmark_rollout import (
 from ditto.api_server.endpoints.admin_copy_review import (
     router as admin_copy_review_router,
 )
+from ditto.api_server.endpoints.admin_miner_fees import (
+    router as admin_miner_fees_router,
+)
 from ditto.api_server.endpoints.admin_quarantine import (
     router as admin_quarantine_router,
 )
@@ -32,6 +35,7 @@ __all__ = [
     "inference_router",
     "admin_benchmark_rollout_router",
     "admin_copy_review_router",
+    "admin_miner_fees_router",
     "admin_quarantine_router",
     "admin_scoring_readiness_router",
     "admin_validation_retry_router",

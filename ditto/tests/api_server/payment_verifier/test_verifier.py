@@ -158,6 +158,7 @@ class TestVerifyPaymentHappyPath:
         assert result.miner_hotkey == "5Hotkey"
         assert result.miner_coldkey == "5Coldkey"
         assert result.amount_rao == QUOTE_RAO
+        assert result.tao_usd_rate == Decimal("400")
         assert result.dest_address == "5SendAddress"
         assert result.block_timestamp == datetime.fromtimestamp(1_700_000_000, tz=UTC)
 

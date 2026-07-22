@@ -73,6 +73,13 @@ class VerifiedPayment:
     """Payment amount in rao (1 TAO = 1e9 rao). Validated against the
     recomputed quote ±``PAYMENT_DRIFT_TOLERANCE``."""
 
+    tao_usd_rate: Decimal
+    """TAO/USD rate already fetched to validate this payment.
+
+    Persisting the verifier's existing oracle value adds no extra external
+    request and captures the rate used at acceptance time.
+    """
+
     dest_address: str
     """SS58 destination of the transfer. Equals the configured upload
     payment address by construction."""
