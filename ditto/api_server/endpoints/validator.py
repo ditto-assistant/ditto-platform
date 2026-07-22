@@ -927,6 +927,7 @@ async def request_job(
                     validator_running_benchmark=validator_state == "running_benchmark",
                     submitted_at_or_after=rollout.created_at,
                     fifo_start_at=rollout.created_at,
+                    completion_first=True,
                 )
                 if fresh_lane_due
                 else None
@@ -951,6 +952,7 @@ async def request_job(
                     validator_running_benchmark=validator_state == "running_benchmark",
                     submitted_at_or_after=rollout.created_at,
                     fifo_start_at=rollout.created_at,
+                    completion_first=True,
                 )
         else:
             ticket = await activate_next_score_retest(
