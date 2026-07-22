@@ -285,8 +285,10 @@ async def issue_ticket(
 
     # Scoped to the era this ticket is for: a v2 fifth place says nothing about
     # whether a v4 two-score maximum is still in contention.
-    score_continuation_floor = await get_score_continuation_floor(
-        session, bench_version=bench_version
+    score_continuation_floor = (
+        None
+        if completion_first
+        else await get_score_continuation_floor(session, bench_version=bench_version)
     )
 
     # Agents this validator must not receive right now: live/scored tickets,
@@ -510,14 +512,11 @@ async def issue_ticket(
         )
         queue_order = (
             (
-                below_floor_lane.asc(),
-                case(
-                    (complete_screened_image, 0),
-                    else_=(0 if artifact_mode == "legacy" else 1),
-                ).asc(),
+                # Keep the fresh-submission lane independent of the ordinary
+                # queue's contender, coverage, artifact, and continuation-floor
+                # priorities. Age is the contract; UUID is only a stable tie.
                 fifo_age.asc(),
                 Agent.agent_id.asc(),
-                had_prior_ticket.asc(),
             )
             if completion_first
             else (
