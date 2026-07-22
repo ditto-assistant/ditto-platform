@@ -923,6 +923,8 @@ class BenchmarkRollout(Base):
             "desired_version > from_version", name="benchmark_rollout_forward"
         ),
         CheckConstraint(
+            # Retain the historical storage bound for rollout snapshots created
+            # before new transitions were narrowed to ten members.
             "cohort_size BETWEEN 5 AND 25",
             name="benchmark_rollout_bounded_members",
         ),

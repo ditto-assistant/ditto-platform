@@ -20,7 +20,8 @@ from ditto.db.models import (
     Score,
 )
 from ditto.db.queries.benchmark_rollout import (
-    MAX_RESCORE_COHORT_SIZE,
+    MAX_PERSISTED_RESCORE_COHORT_SIZE,
+    RESCORE_COHORT_SIZE,
     DatasetPin,
     RolloutSnapshotMember,
     append_rollout_member,
@@ -51,11 +52,11 @@ class PendingQualification:
 async def _rollout_rescore_cohort(
     session: AsyncSession, *, rollout: BenchmarkRollout
 ) -> list[RolloutSnapshotMember]:
-    """Preserve already-frozen members, then fill to the historical top 25.
+    """Preserve already-frozen members, then fill new rollouts to the top ten.
 
-    Early rollout code could append a newly risen hybrid-top-five member. Those
-    durable rows and their accepted scores are never deleted, but they also
-    must not expand the corrected cohort past 25.
+    Older deployments created cohorts as large as 25. Those durable rows and
+    their accepted scores are never deleted; only rollouts that have not
+    already crossed the new bound are filled to ten.
     """
     existing = (
         (
@@ -68,7 +69,7 @@ async def _rollout_rescore_cohort(
         .scalars()
         .all()
     )
-    if len(existing) > MAX_RESCORE_COHORT_SIZE:
+    if len(existing) > MAX_PERSISTED_RESCORE_COHORT_SIZE:
         raise RuntimeError("existing benchmark rollout exceeds the top-25 bound")
     cohort = [
         RolloutSnapshotMember(
@@ -78,15 +79,19 @@ async def _rollout_rescore_cohort(
         )
         for member in existing
     ]
+    if len(existing) >= RESCORE_COHORT_SIZE:
+        return cohort
     seen = {member.agent_id for member in cohort}
     for member in await historical_rescore_cohort(
-        session, source_version=rollout.from_version
+        session,
+        source_version=rollout.from_version,
+        limit=RESCORE_COHORT_SIZE,
     ):
         if member.agent_id in seen:
             continue
         cohort.append(member)
         seen.add(member.agent_id)
-        if len(cohort) == MAX_RESCORE_COHORT_SIZE:
+        if len(cohort) == RESCORE_COHORT_SIZE:
             break
     return cohort
 
@@ -195,7 +200,7 @@ async def qualification_candidate(
 async def rolling_qualification_blockers(
     session: AsyncSession, *, generator_run_size: str | None
 ) -> list[dict[str, str]]:
-    """Describe inherited top-25 agents that automatic qualification cannot add."""
+    """Describe inherited top-ten agents that automatic qualification cannot add."""
     rollout = await open_rollout(session)
     if rollout is None:
         return []
@@ -237,7 +242,7 @@ async def ensure_rolling_qualification(
 async def refresh_rolling_qualification(
     session: AsyncSession, *, generator: DatasetGenerator, now: datetime
 ) -> int:
-    """Converge the frozen inherited top-25 cohort and try activation.
+    """Converge the frozen inherited top-ten cohort and try activation.
 
     Dataset rendering deliberately happens between transactions: the generator
     is a network service and must never run while holding rollout/agent locks.

@@ -870,6 +870,7 @@ class TestDashboardScoringTransparency:
             "2% incumbent margin",
             "receives 90% of the miner pool",
             "up to four participation-tail recipients",
+            "up to 25 miners",
         ):
             assert literal not in body, f"hardcoded fold constant: {literal}"
 
@@ -886,6 +887,8 @@ class TestDashboardScoringTransparency:
         assert "/public/bench/rollout" in body
         assert "ranked_quorum_agents" in body
         assert "min_ranked_quorum_agents" in body
+        assert "This rollout's bounded inherited cohort has " in body
+        assert "Number(state.cohort_size)" in body
 
     async def test_explainer_covers_scoring_emissions_and_koth(self) -> None:
         body = await self._body()

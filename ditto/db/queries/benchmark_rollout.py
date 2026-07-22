@@ -49,7 +49,12 @@ LEGACY_BENCH_VERSION = 2
 # This is discovery metadata only: it no longer opens or selects a rollout.
 CANARY_BENCH_VERSION = latest_benchmark_contract().version
 PRIORITY_COHORT_SIZE = 5
-MAX_RESCORE_COHORT_SIZE = 25
+# New benchmark transitions rescore only the inherited top ten. The database
+# still permits older 11-25-member rollout snapshots so historical audit rows
+# remain readable and an in-flight rollout created by an older deployment can
+# finish without destructive member deletion.
+RESCORE_COHORT_SIZE = 10
+MAX_PERSISTED_RESCORE_COHORT_SIZE = 25
 SCORING_QUORUM = 3
 # How many agents must hold a COMPLETE, ranked desired-version quorum before
 # the desired version may take over. Two gates enforce it against the same count
@@ -183,7 +188,7 @@ async def historical_rescore_cohort(
     session: AsyncSession,
     *,
     source_version: int,
-    limit: int = MAX_RESCORE_COHORT_SIZE,
+    limit: int = RESCORE_COHORT_SIZE,
 ) -> list[RolloutSnapshotMember]:
     """Freeze the prior-era rescore cohort without admitting the whole ledger.
 
@@ -193,10 +198,10 @@ async def historical_rescore_cohort(
     explicit "combine two previous benchmark iterations" fallback, not an
     unbounded backfill of every legacy submission.
     """
-    if limit < PRIORITY_COHORT_SIZE or limit > MAX_RESCORE_COHORT_SIZE:
+    if limit < PRIORITY_COHORT_SIZE or limit > RESCORE_COHORT_SIZE:
         raise ValueError(
             f"rollout cohort limit must be between {PRIORITY_COHORT_SIZE} "
-            f"and {MAX_RESCORE_COHORT_SIZE}"
+            f"and {RESCORE_COHORT_SIZE}"
         )
     versions = list(
         await session.scalars(
@@ -721,8 +726,8 @@ async def create_rollout_snapshot(
             f"{conflicting.desired_version} is still {conflicting.status}; only one "
             "benchmark rollout may be open at a time"
         )
-    if not PRIORITY_COHORT_SIZE <= len(members) <= MAX_RESCORE_COHORT_SIZE:
-        raise ValueError("a benchmark rollout requires between five and 25 members")
+    if not PRIORITY_COHORT_SIZE <= len(members) <= RESCORE_COHORT_SIZE:
+        raise ValueError("a benchmark rollout requires between five and ten members")
     if len({m.agent_id for m in members}) != len(members):
         raise ValueError("benchmark rollout agents must be distinct")
     if len({m.miner_hotkey for m in members}) != len(members):
