@@ -186,6 +186,7 @@ async def issue_ticket(
     validator_running_benchmark: bool = False,
     submitted_at_or_after: datetime | None = None,
     fifo_start_at: datetime | None = None,
+    completion_first: bool = False,
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
@@ -193,8 +194,10 @@ async def issue_ticket(
     has fewer than :data:`SCORING_QUORUM` live tickets and (b) this validator
     does not already hold a live or scored ticket for. Candidates with the
     strongest bounded set of 2-of-3 provisional contenders comes first. The
-    remaining candidates are ordered by least total coverage (accepted scores
-    plus live assignments), then never-attempted work, then submission age. A
+    remaining candidates are normally ordered by least total coverage (accepted
+    scores plus live assignments), then never-attempted work, then submission
+    age. ``completion_first`` instead makes benchmark-era FIFO primary so the
+    oldest submission reaches quorum before the next submission is opened. A
     2-of-3 submission that can no longer reach this era's emission set sorts
     behind every other candidate rather than being withheld, so it still
     finalizes once the queue drains. A prior expired row is reissued only after
@@ -505,25 +508,20 @@ async def issue_ticket(
             if fifo_start_at is not None
             else Agent.created_at
         )
-        candidate = (
-            # First finish the bounded set of strongest 2-of-3 provisional
-            # contenders, one best submission per miner. Then round-robin the
-            # rest of the scoreable backlog. A
-            # live evaluator counts as one
-            # unit of coverage just like an accepted score, so an agent cannot
-            # jump from zero coverage to three concurrent validators while
-            # another eligible agent remains uncovered. Within one coverage
-            # round, never-attempted work precedes this validator's cooled-down
-            # retry. Within any accepted-score coverage round, prefer the
-            # highest provisional composite so the likely emission winner
-            # advances first. Submission age and UUID remain stable ties.
-            candidate.order_by(
-                # Eliminated-but-unfinished work sorts behind everything else,
-                # so it consumes a validator only once the queue is otherwise
-                # drained.
+        queue_order = (
+            (
                 below_floor_lane.asc(),
-                # Prefer verified screener-built images without excluding
-                # source fallback during the mixed-fleet rollout.
+                case(
+                    (complete_screened_image, 0),
+                    else_=(0 if artifact_mode == "legacy" else 1),
+                ).asc(),
+                fifo_age.asc(),
+                Agent.agent_id.asc(),
+                had_prior_ticket.asc(),
+            )
+            if completion_first
+            else (
+                below_floor_lane.asc(),
                 case(
                     (complete_screened_image, 0),
                     else_=(0 if artifact_mode == "legacy" else 1),
@@ -535,8 +533,25 @@ async def issue_ticket(
                 fifo_age.asc(),
                 Agent.agent_id.asc(),
             )
+        )
+        candidate = (
+            # The ordinary queue first finishes the bounded set of strongest
+            # 2-of-3 provisional contenders, one best submission per miner,
+            # then round-robins the rest of the scoreable backlog. A
+            # live evaluator counts as one
+            # unit of coverage just like an accepted score, so an agent cannot
+            # jump from zero coverage to three concurrent validators while
+            # another eligible agent remains uncovered. Within one coverage
+            # round, never-attempted work precedes this validator's cooled-down
+            # retry. Within any accepted-score coverage round, prefer the
+            # highest provisional composite so the likely emission winner
+            # advances first. Submission age and UUID remain stable ties. The
+            # fresh-submission lane uses queue_order's FIFO-first alternative
+            # and waits briefly on that oldest row so simultaneous validators
+            # do not SKIP LOCKED their way into newer submissions.
+            candidate.order_by(*queue_order)
             .limit(1)
-            .with_for_update(of=Agent, skip_locked=True)
+            .with_for_update(of=Agent, skip_locked=not completion_first)
         )
         agent_id = (await session.execute(candidate)).scalar_one_or_none()
         if agent_id is None:

@@ -978,6 +978,40 @@ class TestIssueTicket:
 
         assert claimed == agents
 
+    async def test_completion_first_finishes_oldest_before_opening_next(
+        self, session: AsyncSession
+    ) -> None:
+        oldest = await _seed_evaluating(session, created_at=_NOW, name="oldest")
+        newer = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="newer",
+        )
+
+        claimed: list[UUID] = []
+        async with session.begin():
+            for index in range(SCORING_QUORUM):
+                ticket = await issue_ticket(
+                    session,
+                    validator_hotkey=f"5Finish-{index}",
+                    now=_NOW,
+                    ttl=_TTL,
+                    completion_first=True,
+                )
+                assert ticket is not None
+                claimed.append(ticket.agent_id)
+            next_ticket = await issue_ticket(
+                session,
+                validator_hotkey="5Finish-next",
+                now=_NOW,
+                ttl=_TTL,
+                completion_first=True,
+            )
+
+        assert claimed == [oldest] * SCORING_QUORUM
+        assert next_ticket is not None
+        assert next_ticket.agent_id == newer
+
     async def test_live_assignment_and_accepted_score_are_equal_coverage(
         self, session: AsyncSession
     ) -> None:
