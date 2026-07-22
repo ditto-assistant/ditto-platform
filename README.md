@@ -236,11 +236,12 @@ so a supervisor restarts cleanly.
 
 ```sh
 make test                 # fast unit suite (default markers excluded)
-make test-integration     # requires the live Docker stack (make stack-up)
+make test-integration     # serial; requires the live Docker stack (make stack-up)
 ```
 
 Test markers (`slow`, `integration`, `localnet`, `e2e`) are excluded by default;
-CI runs `ruff`, `mypy`, and `pytest` on every PR and on `main`.
+the unit suite uses all available CPU cores through `pytest-xdist`. CI runs
+`ruff`, `mypy`, and `pytest` on every PR and on `main`.
 
 ---
 

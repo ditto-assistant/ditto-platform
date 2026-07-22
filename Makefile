@@ -18,7 +18,7 @@ test:
 	uv run pytest
 
 test-integration:
-	set -a && . ./.env && set +a && uv run pytest -m integration
+	set -a && . ./.env && set +a && uv run pytest -n 0 -m integration
 
 smoke-pylon:
 	set -a && . ./.env && set +a && uv run python scripts/smoke_pylon.py
