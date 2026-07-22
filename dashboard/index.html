@@ -2978,6 +2978,7 @@
         });
       }
       var prioritySize = Number(state.priority_cohort_size) || 5;
+      var cohortSize = Number(state.cohort_size) || 0;
       var priorityReady = Array.isArray(state.members)
         ? state.members.filter(function (member) {
             return Number(member.position) <= prioritySize && Number(member.score_count) >= 3;
@@ -2992,11 +2993,11 @@
           "eligible leader intentionally idle until the other validators finish them; rank 6 and later cannot skip ahead.";
       } else if (collecting && state.priority_complete) {
         progress.innerHTML =
-          '<span class="count">' + esc(String(state.cohort_ready_count || 0)) + " of " + esc(String(state.cohort_size || 0)) + '</span> ' +
+          '<span class="count">' + esc(String(state.cohort_ready_count || 0)) + " of " + esc(String(cohortSize)) + '</span> ' +
           esc("inherited top-cohort agents have complete v" + desired + " quorums.");
         note.textContent =
-          "The first-five barrier is complete. Only the bounded inherited cohort (up to 25 miners, filled from the two " +
-          "previous benchmark iterations when needed) remains ahead of ordinary work.";
+          "The first-five barrier is complete. This rollout's bounded inherited cohort has " + cohortSize +
+          " miners, filled from the two previous benchmark iterations when needed; it remains ahead of ordinary work.";
       } else if (rolling && Number.isFinite(ready) && Number.isFinite(needed)) {
         progress.innerHTML =
           '<span class="count">' + esc(String(ready)) + " of " + esc(String(needed)) + '</span> ' +
