@@ -2726,7 +2726,7 @@
     };
     var ACTIVITY_STATUSES = [
       "waiting_screening", "screening", "waiting_validator", "evaluating",
-      "below_score_floor", "under_review", "rejected", "scored", "live"
+      "below_score_floor", "not_queued", "under_review", "rejected", "scored", "live"
     ];
     var activityStatuses = [];
     var activityQuery = "";
@@ -5339,6 +5339,7 @@
         waiting_validator: ["Waiting for scores", "progress"],
         evaluating: ["Evaluating", "progress"],
         below_score_floor: ["Low-priority completion", "warn"],
+        not_queued: ["Historical · not queued", ""],
         scored: ["Scored", "good"],
         live: ["Live", "good"],
         under_review: ["Operator review", "warn"],
@@ -5351,6 +5352,7 @@
       var count = Math.max(0, Number(e.score_count) || 0);
       var quorum = Math.max(1, Number(e.quorum) || 3);
       if (e.status === "below_score_floor") return count + " of " + quorum + " · queued last";
+      if (e.status === "not_queued") return "Not in active benchmark queue";
       var hasStarted = count > 0 || ["waiting_validator", "evaluating", "scored", "live", "under_review"].indexOf(e.status) >= 0;
       return hasStarted ? count + " of " + quorum : "Not started";
     }
@@ -5421,6 +5423,9 @@
         return "Two accepted scores mean even a perfect third run could not raise the median above " +
           fx(bestPossible) + ", below the current fifth-place score of " + fx(scoreFloor) +
           ". The third score is still queued at low priority so this benchmark record reaches 3 of 3.";
+      }
+      if (e.status === "not_queued") {
+        return "This historical submission is retained for audit history but is not admitted to the active benchmark queue. It cannot consume validator capacity unless an explicit audited recovery admits it.";
       }
       if (e.status === "waiting_screening") return "Queued for a screener to claim under the current policy.";
       if (e.status === "screening") return "A screener is currently checking this submission.";
@@ -6356,8 +6361,17 @@
         Number(b.entry.validator_queue_rank || Number.MAX_SAFE_INTEGER);
     }
 
+    function queueRelevantBenchmark(progress) {
+      var version = Number(progress && progress.bench_version);
+      var activeVersion = Number(activeBench) || Number(currentBench);
+      return Number.isInteger(version) && version > 0 &&
+        (!Number.isInteger(activeVersion) || activeVersion <= 0 || version >= activeVersion);
+    }
+
     function pipelineBoardStage(entry) {
-      return (entry.active_benchmarks || []).length ? "evaluating" : entry.status;
+      return (entry.active_benchmarks || []).some(queueRelevantBenchmark)
+        ? "evaluating"
+        : entry.status;
     }
 
     // Flag a waiting submission whose retry state needs a human (exhausted) or
@@ -6376,11 +6390,11 @@
 
     function pipelineRescoreState(entry) {
       if (entry.status === "evaluating") return null;
-      var targetVersion = Math.max.apply(null, (entry.active_benchmarks || []).map(function (progress) {
-        return Number(progress.bench_version) || 0;
-      }));
+      var targetVersion = Math.max.apply(null, (entry.active_benchmarks || [])
+        .filter(queueRelevantBenchmark)
+        .map(function (progress) { return Number(progress.bench_version) || 0; }));
       if (!isFinite(targetVersion) || targetVersion <= 0) return null;
-      var sourceVersion = Number(currentBench) || null;
+      var sourceVersion = Number(activeBench) || Number(currentBench) || null;
       return {
         targetVersion: targetVersion,
         sourceVersion: sourceVersion,

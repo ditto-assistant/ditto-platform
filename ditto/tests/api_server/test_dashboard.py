@@ -245,11 +245,12 @@ class TestDashboard:
         assert "Waiting for scores" in body
         assert "function validatorQueueCompare(a, b)" in body
         assert "indexed.sort(validatorQueueCompare)" in body
+        assert "function queueRelevantBenchmark(progress)" in body
+        assert "Number(activeBench) || Number(currentBench)" in body
+        assert "version >= activeVersion" in body
         assert "function pipelineBoardStage(entry)" in body
-        assert (
-            'return (entry.active_benchmarks || []).length ? "evaluating" : '
-            "entry.status;"
-        ) in body
+        assert "(entry.active_benchmarks || []).some(queueRelevantBenchmark)" in body
+        assert ".filter(queueRelevantBenchmark)" in body
         assert "column.statuses.indexOf(pipelineBoardStage(entry))" in body
         assert '"Bench v" + rescore.targetVersion + " rescore"' in body
         assert "validator_queue_rank" in body
@@ -499,8 +500,9 @@ class TestDashboard:
             in body
         )
         assert 'below_score_floor: ["Low-priority completion", "warn"]' in body
+        assert 'not_queued: ["Historical · not queued", ""]' in body
         assert 'under_review: ["Operator review", "warn"]' in body
-        assert '"below_score_floor", "under_review"' in body
+        assert '"below_score_floor", "not_queued", "under_review"' in body
         assert "var provisionalScores = e.provisional_scores || [];" in body
         assert "if (!provisionalScores.length || !Number.isFinite(scoreFloor))" in body
         assert (

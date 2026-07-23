@@ -171,6 +171,10 @@ from ditto.db.models import (
 )
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
+from ditto.db.queries.benchmark_admission import (
+    admitted_agent_ids,
+    agent_is_admitted,
+)
 from ditto.db.queries.benchmark_rollout import (
     active_bench_version,
     open_rollout,
@@ -276,6 +280,7 @@ _PUBLIC_ACTIVITY_STATUSES = frozenset(
         "waiting_validator",
         "evaluating",
         "below_score_floor",
+        "not_queued",
         "under_review",
         "rejected",
         "scored",
@@ -1861,6 +1866,7 @@ def _public_activity_status(
     score_count: int = 0,
     highest_composite: float | None = None,
     score_continuation_floor: float | None = None,
+    benchmark_admitted: bool = True,
 ) -> str:
     """Collapse internal moderation detail into stable public lifecycle labels."""
     needs_rescreen = (
@@ -1876,6 +1882,12 @@ def _public_activity_status(
     if status in (AgentStatus.UPLOADED, AgentStatus.SCREENING_FAILED) or needs_rescreen:
         return "waiting_screening"
     if status in (AgentStatus.SCREENING_PASSED, AgentStatus.EVALUATING):
+        if (
+            not benchmark_admitted
+            and not has_active_validation
+            and not has_live_assignment
+        ):
+            return "not_queued"
         if (
             status == AgentStatus.EVALUATING
             and not has_live_assignment
@@ -1904,6 +1916,8 @@ def _public_activity_response(
     query: str | None,
     score_continuation_floor: float | None,
     active_assignment_agent_ids: set[UUID],
+    active_bench_version: int | None = None,
+    benchmark_admitted_agent_ids: set[UUID] | None = None,
     retry_states: dict[UUID, AgentRetryState] | None = None,
     duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
     ath_review_opened_at: dict[UUID, datetime] | None = None,
@@ -1916,8 +1930,14 @@ def _public_activity_response(
         active_by_agent.setdefault(work.agent.agent_id, []).append(
             _public_benchmark_progress(work, now)
         )
-    active_agent_ids = set(active_by_agent)
+    active_agent_ids = {
+        work.agent.agent_id
+        for work in active_work
+        if active_bench_version is None
+        or work.ticket.bench_version == active_bench_version
+    }
     retry_by_agent = retry_states or {}
+    admitted = benchmark_admitted_agent_ids
 
     def public_status(row: Any) -> str:
         return _public_activity_status(
@@ -1929,6 +1949,7 @@ def _public_activity_response(
             score_count=row.score_count,
             highest_composite=row.highest_composite,
             score_continuation_floor=score_continuation_floor,
+            benchmark_admitted=(admitted is None or row.agent.agent_id in admitted),
         )
 
     projected = [(row, public_status(row)) for row in rows]
@@ -2050,12 +2071,14 @@ def _public_activity_response(
                 quorum=SCORING_QUORUM,
                 retry_state=(
                     retry_by_agent[row.agent.agent_id].state
-                    if row.agent.agent_id in retry_by_agent
+                    if row_status in ("waiting_validator", "below_score_floor")
+                    and row.agent.agent_id in retry_by_agent
                     else None
                 ),
                 retry_after=(
                     retry_by_agent[row.agent.agent_id].earliest_retry_after
-                    if row.agent.agent_id in retry_by_agent
+                    if row_status in ("waiting_validator", "below_score_floor")
+                    and row.agent.agent_id in retry_by_agent
                     else None
                 ),
                 screening_policy_version=row.agent.screening_policy_version,
@@ -2172,6 +2195,11 @@ async def activity(
     now = datetime.now(UTC)
     active_version = await active_bench_version(session)
     rows, _ = await list_public_activity(session, bench_version=active_version)
+    admitted = await admitted_agent_ids(
+        session,
+        bench_version=active_version,
+        agent_ids=[row.agent.agent_id for row in rows],
+    )
     ath_opened_at: dict[UUID, datetime] = {}
     ath_composite: dict[UUID, float] = {}
     if review == "ath":
@@ -2191,8 +2219,12 @@ async def activity(
             session, bench_version=active_version
         ),
         active_assignment_agent_ids={
-            assignment.agent.agent_id for assignment in assignments
+            assignment.agent.agent_id
+            for assignment in assignments
+            if assignment.ticket.bench_version == active_version
         },
+        active_bench_version=active_version,
+        benchmark_admitted_agent_ids=admitted,
         retry_states=await classify_agent_retry_states(
             session, agents=[row.agent for row in rows], now=now
         ),
@@ -2216,6 +2248,11 @@ async def operations(
     benchmark_rollout = await rollout_state(session, now=now)
     active_version = cast(int, benchmark_rollout["active_version"])
     activity_rows, _ = await list_public_activity(session, bench_version=active_version)
+    admitted = await admitted_agent_ids(
+        session,
+        bench_version=active_version,
+        agent_ids=[row.agent.agent_id for row in activity_rows],
+    )
     heartbeat_rows = await list_validator_heartbeats(session)
     assignments = await list_active_validator_assignments(session, now=now)
     active_work = await list_active_validator_work(
@@ -2233,8 +2270,12 @@ async def operations(
             session, bench_version=active_version
         ),
         active_assignment_agent_ids={
-            assignment.agent.agent_id for assignment in assignments
+            assignment.agent.agent_id
+            for assignment in assignments
+            if assignment.ticket.bench_version == active_version
         },
+        active_bench_version=active_version,
+        benchmark_admitted_agent_ids=admitted,
         retry_states=await classify_agent_retry_states(
             session, agents=[row.agent for row in activity_rows], now=now
         ),
@@ -2462,6 +2503,9 @@ async def agent_pipeline(
     score_continuation_floor = await get_score_continuation_floor(
         session, bench_version=canonical_version
     )
+    benchmark_admitted = await agent_is_admitted(
+        session, bench_version=canonical_version, agent_id=agent_id
+    )
     dispute = await session.scalar(
         select(ScreeningDispute).where(ScreeningDispute.agent_id == agent_id)
     )
@@ -2472,9 +2516,12 @@ async def agent_pipeline(
             agent.status,
             screening_policy_version=agent.screening_policy_version,
             has_active_attempt=running_attempt is not None,
-            has_active_validation=bool(active_work),
+            has_active_validation=any(
+                work.ticket.bench_version == canonical_version for work in active_work
+            ),
             has_live_assignment=any(
                 ticket.status == TicketStatus.ISSUED
+                and ticket.bench_version == canonical_version
                 and cast(datetime, _aware(ticket.deadline)) > now
                 for ticket in tickets
             ),
@@ -2485,6 +2532,7 @@ async def agent_pipeline(
                 else None
             ),
             score_continuation_floor=score_continuation_floor,
+            benchmark_admitted=benchmark_admitted,
         ),
         active_bench_version=canonical_version,
         score_count=len(canonical_scores),
