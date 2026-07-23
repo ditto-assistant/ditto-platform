@@ -1136,6 +1136,9 @@
       --ref-hermes: oklch(52% 0.17 75);
       --ref-openclaw: oklch(52% 0.17 270);
       --radius: 8px;
+      /* Exponential ease-out only: decisive, no bounce. */
+      --ease-out-quart: cubic-bezier(.25, 1, .5, 1);
+      --ease-out-expo: cubic-bezier(.16, 1, .3, 1);
       --display: Georgia, "Times New Roman", serif;
       --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
       --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
@@ -1545,7 +1548,7 @@
     .memory-timeline-legend .hermes i { border-color: var(--ref-hermes); border-top-style: dashed; }
     .memory-timeline-legend .openclaw i { border-color: var(--ref-openclaw); border-top-style: dashed; }
     .memory-timeline-frame { position: relative; border: 1px solid var(--border); background: var(--bg-elev-2); overflow-x: auto; overscroll-behavior-inline: contain; }
-    .memory-timeline-svg { display: block; width: 100%; min-width: 760px; height: auto; }
+    .memory-timeline-svg { display: block; width: 100%; height: auto; }
     .timeline-grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
     .timeline-axis-label { fill: var(--text-faint); font: 10px var(--mono); }
     .timeline-band { fill: color-mix(in oklch, var(--text) 3.5%, transparent); }
@@ -1553,6 +1556,24 @@
     .timeline-era-label { font: 700 12px var(--mono); letter-spacing: .03em; cursor: help; }
     .timeline-era-label:focus { outline: none; text-decoration: underline; }
     .timeline-era-date { fill: var(--text-faint); font: 9.5px var(--mono); }
+    /* Entrance. Every animated mark's end state is its resting state and the
+       animation runs on render, so a hidden tab, a headless shot, or reduced
+       motion all show the finished chart rather than a blank frame. The cloud
+       settles first, then the record line draws over it. */
+    .timeline-field { animation: timeline-dot-in .34s var(--ease-out-quart) both; animation-delay: calc(var(--i, 0) * 14ms); }
+    @keyframes timeline-dot-in { from { opacity: 0; transform: scale(.4); } }
+    .timeline-field { transform-box: fill-box; transform-origin: center; }
+    .timeline-path.miner { stroke-dasharray: 1; animation: timeline-draw .75s var(--ease-out-expo) both; animation-delay: .18s; }
+    @keyframes timeline-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+    .timeline-path.hermes, .timeline-path.openclaw { animation: timeline-mark-in .5s var(--ease-out-quart) both; animation-delay: .34s; }
+    .timeline-point, .timeline-champion-halo, .timeline-champion-ring,
+    .timeline-champion-drop, .timeline-champion-plate {
+      animation: timeline-mark-in .4s var(--ease-out-quart) both; animation-delay: .5s;
+    }
+    @keyframes timeline-mark-in { from { opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) {
+      .timeline-champion-pulse { display: none; }
+    }
     .timeline-path { fill: none; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
     .timeline-path.miner { stroke: var(--memory); stroke-width: 3.5; }
     .timeline-path.hermes { stroke: var(--ref-hermes); stroke-width: 2.5; stroke-dasharray: 7 5; }
@@ -1561,12 +1582,27 @@
        continued. Muted and dashed against the solid in-era segments. */
     .timeline-link { fill: none; stroke: color-mix(in oklch, var(--text-faint) 55%, transparent); stroke-width: 2; stroke-dasharray: 2 6; stroke-linecap: round; vector-effect: non-scaling-stroke; }
     /* The field sits behind the record line: same generation hue, low opacity,
-       small radius, so it reads as density rather than competing marks. */
-    .timeline-field { opacity: .34; stroke: none; cursor: help; transition: opacity .12s; }
-    .timeline-field:hover, .timeline-field:focus { opacity: .95; outline: none; }
-    .timeline-field.champion { opacity: .95; }
-    .timeline-champion-ring { fill: none; stroke: var(--gold); stroke-width: 2; vector-effect: non-scaling-stroke; }
-    .timeline-champion-label { fill: var(--gold); font: 700 10.5px var(--mono); letter-spacing: .02em; }
+       small radius, so it reads as density rather than competing marks. Hover
+       brings one back to full strength without lifting the whole cloud. */
+    .timeline-field { opacity: .2; stroke: none; cursor: help; transition: opacity .14s var(--ease-out-quart); }
+    .timeline-field:hover { opacity: .95; }
+    .timeline-field.champion { opacity: 1; }
+    /* Champion: halo, drop line, and a slow pulse. The pulse is the only looping
+       motion on the page and it marks live state (who holds the crown). */
+    .timeline-champion-halo { fill: color-mix(in oklch, var(--gold) 22%, transparent); }
+    .timeline-champion-drop { stroke: color-mix(in oklch, var(--gold) 42%, transparent); stroke-width: 1; stroke-dasharray: 2 4; vector-effect: non-scaling-stroke; }
+    .timeline-champion-ring { fill: none; stroke: var(--gold); stroke-width: 2.5; vector-effect: non-scaling-stroke; }
+    .timeline-champion-pulse { fill: none; stroke: var(--gold); stroke-width: 2; vector-effect: non-scaling-stroke; transform-box: fill-box; transform-origin: center; animation: timeline-pulse 3.2s var(--ease-out-quart) infinite; }
+    @keyframes timeline-pulse {
+      0% { transform: scale(1); opacity: .5; }
+      70%, 100% { transform: scale(2.1); opacity: 0; }
+    }
+    .timeline-champion-plate rect { fill: var(--bg); stroke: color-mix(in oklch, var(--gold) 62%, transparent); stroke-width: 1; vector-effect: non-scaling-stroke; }
+    .timeline-champion-plate text { fill: var(--gold); font: 700 11px var(--mono); letter-spacing: .02em; }
+    .timeline-champion-plate .crown-score { fill: var(--text); font-variant-numeric: tabular-nums; }
+    .timeline-champion-plate { cursor: help; }
+    .timeline-champion-plate:focus { outline: none; }
+    .timeline-champion-plate:focus rect { stroke: var(--text); stroke-width: 2; }
     .timeline-point { stroke: var(--bg-elev-2); stroke-width: 2; vector-effect: non-scaling-stroke; cursor: help; }
     .timeline-point.miner { fill: var(--memory); }
     .timeline-point.hermes { fill: var(--ref-hermes); }
@@ -3649,10 +3685,10 @@
         return (index ? "L" : "M") + point.x.toFixed(2) + " " + point.y.toFixed(2);
       }).join(" ");
     }
-    function timelinePoint(point, series, color) {
+    function timelinePoint(point, series, color, radius) {
       var label = point.tooltip;
       return '<circle class="timeline-point ' + series + '" cx="' + point.x.toFixed(2) + '" cy="' + point.y.toFixed(2) +
-        '" r="5"' + (color ? ' style="fill:' + color + '"' : "") +
+        '" r="' + (radius || 5) + '"' + (color ? ' style="fill:' + color + '"' : "") +
         ' tabindex="0" role="img" aria-label="' + esc(label) + '" data-timeline-tooltip="' + esc(label) + '"><title>' + esc(label) + '</title></circle>';
     }
     function bindTimelineTooltips(target) {
@@ -3734,10 +3770,27 @@
         if (era) era.points.push(point);
       });
 
-      var width = 960, height = 430, left = 58, right = 26, top = 30, bottom = 62;
+      // The viewBox is measured, not fixed. A fixed 960-unit box scaled down to
+      // a phone shrinks every label with it: 10px type renders at 4px and the
+      // axis becomes unreadable. Laying the chart out at roughly one unit per
+      // CSS pixel keeps type at its real size and re-flows the plot instead of
+      // squashing it, so the chart adapts structurally at every width.
+      var measured = Math.round((target.clientWidth || 960) - 2);
+      timelineRenderedWidth = measured;
+      var width = Math.max(300, Math.min(1200, measured || 960));
+      var narrow = width < 560, tight = width < 400;
+      var height = narrow
+        ? Math.max(300, Math.round(width * 0.86))
+        : Math.max(340, Math.min(470, Math.round(width * 0.42)));
+      var left = tight ? 32 : narrow ? 40 : 58;
+      var right = narrow ? 14 : 26;
+      var top = narrow ? 22 : 30;
+      var bottom = narrow ? 52 : 62;
       var plotWidth = width - left - right, plotHeight = height - top - bottom;
       var bandWidth = plotWidth / eras.length;
-      var inset = Math.min(bandWidth * 0.2, 40);
+      var inset = Math.min(bandWidth * 0.2, narrow ? 14 : 40);
+      var ticks = narrow ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1];
+      var dotR = narrow ? 2.1 : 2.6, recordR = narrow ? 3.6 : 5;
       function bandStart(index) { return left + index * bandWidth; }
       function bandCenter(index) { return left + (index + 0.5) * bandWidth; }
       function y(value) { return top + (1 - value) * plotHeight; }
@@ -3807,7 +3860,7 @@
           svg.push('<rect class="timeline-band" x="' + bandStart(era.index).toFixed(2) + '" y="' + top + '" width="' + bandWidth.toFixed(2) + '" height="' + plotHeight + '"></rect>');
         }
       });
-      [0, 0.25, 0.5, 0.75, 1].forEach(function (tick) {
+      ticks.forEach(function (tick) {
         svg.push('<line class="timeline-grid" x1="' + left + '" x2="' + (width - right) + '" y1="' + y(tick) + '" y2="' + y(tick) + '"></line>');
         svg.push('<text class="timeline-axis-label" x="' + (left - 10) + '" y="' + (y(tick) + 3) + '" text-anchor="end">' + tick.toFixed(2).replace(/^0/, "") + '</text>');
       });
@@ -3818,16 +3871,16 @@
         var releaseTooltip = "DittoBench v" + era.version + " · " + era.release.title + " · released " + timelineDate(era.release.released_at) +
           (era.release.activated_at ? " · activated " + timelineDate(era.release.activated_at) : "") +
           " · " + era.points.length + (era.points.length === 1 ? " record" : " records");
-        svg.push('<text class="timeline-era-label" x="' + bandCenter(era.index).toFixed(2) + '" y="' + (height - bottom + 22) + '" text-anchor="middle" style="fill:' + era.color + '" tabindex="0" role="img" aria-label="' + esc(releaseTooltip) + '" data-timeline-tooltip="' + esc(releaseTooltip) + '">v' + esc(era.version) + '<title>' + esc(releaseTooltip) + '</title></text>');
-        svg.push('<text class="timeline-era-date" x="' + bandCenter(era.index).toFixed(2) + '" y="' + (height - bottom + 38) + '" text-anchor="middle">' + esc(timelineDate(era.release.released_at)) + '</text>');
+        svg.push('<text class="timeline-era-label" x="' + bandCenter(era.index).toFixed(2) + '" y="' + (height - bottom + (narrow ? 20 : 22)) + '" text-anchor="middle" style="fill:' + era.color + '" tabindex="0" role="img" aria-label="' + esc(releaseTooltip) + '" data-timeline-tooltip="' + esc(releaseTooltip) + '">v' + esc(era.version) + '<title>' + esc(releaseTooltip) + '</title></text>');
+        svg.push('<text class="timeline-era-date" x="' + bandCenter(era.index).toFixed(2) + '" y="' + (height - bottom + (narrow ? 34 : 38)) + '" text-anchor="middle">' + esc(timelineDate(era.release.released_at)) + '</text>');
       });
 
       // Field first so the record line and its points always sit on top of the
       // cloud rather than disappearing into it.
       eras.forEach(function (era) {
-        (era.field || []).forEach(function (point) {
+        (era.field || []).forEach(function (point, i) {
           svg.push('<circle class="timeline-field' + (point.champion ? " champion" : "") + '" cx="' + point.x.toFixed(2) + '" cy="' + point.y.toFixed(2) +
-            '" r="' + (point.champion ? 5 : 3) + '" style="fill:' + era.color + '" tabindex="0" role="img" aria-label="' + esc(point.tooltip) + '" data-timeline-tooltip="' + esc(point.tooltip) + '"><title>' + esc(point.tooltip) + '</title></circle>');
+            '" r="' + (point.champion ? recordR + 1 : dotR) + '" style="fill:' + era.color + '; --i:' + Math.min(i, 28) + '" role="img" aria-label="' + esc(point.tooltip) + '" data-timeline-tooltip="' + esc(point.tooltip) + '"><title>' + esc(point.tooltip) + '</title></circle>');
         });
       });
 
@@ -3842,23 +3895,43 @@
       });
       populated.forEach(function (era) {
         if (era.points.length > 1) {
-          svg.push('<path class="timeline-path miner" d="' + timelinePath(era.points) + '" style="stroke:' + era.color + '"></path>');
+          svg.push('<path class="timeline-path miner" pathLength="1" d="' + timelinePath(era.points) + '" style="stroke:' + era.color + '"></path>');
         }
       });
       externalSeries.forEach(function (series) {
         if (series.points.length > 1) svg.push('<path class="timeline-path ' + series.id + '" d="' + timelinePath(series.points) + '"></path>');
-        series.points.forEach(function (point) { svg.push(timelinePoint(point, series.id, "")); });
+        series.points.forEach(function (point) { svg.push(timelinePoint(point, series.id, "", recordR)); });
       });
       populated.forEach(function (era) {
-        era.points.forEach(function (point) { svg.push(timelinePoint(point, "miner", era.color)); });
+        era.points.forEach(function (point) { svg.push(timelinePoint(point, "miner", era.color, recordR)); });
       });
-      // Crown the reigning champion in the newest contract: a ring plus a direct
-      // label, so identity never rests on colour alone.
+      // Crown the reigning champion. Who holds the crown is the single piece of
+      // state this chart exists to show, so it gets the loudest treatment on the
+      // plot: a halo, a drop line to its own contract, a slow pulse, and a named
+      // plate carrying the score. Identity never rests on colour alone.
       if (championDot) {
         var cx = championDot.point.x, cy = championDot.point.y;
-        var labelRight = cx + 12 + 92 < width - right;
-        svg.push('<circle class="timeline-champion-ring" cx="' + cx.toFixed(2) + '" cy="' + cy.toFixed(2) + '" r="10"></circle>');
-        svg.push('<text class="timeline-champion-label" x="' + (labelRight ? cx + 13 : cx - 13).toFixed(2) + '" y="' + (cy + 4).toFixed(2) + '"' + (labelRight ? "" : ' text-anchor="end"') + '>♛ ' + esc(championDot.entry.name) + '</text>');
+        var crownName = championDot.entry.name;
+        var crownScore = fx(championDot.entry.score);
+        // Monospace, so width is countable: name + the crown glyph and its
+        // space, plus room for the right-aligned score and the gap between.
+        var plateW = Math.min(Math.max((crownName.length + 2) * 6.7 + 74, 124), Math.max(plotWidth - 8, 110));
+        var plateH = 21;
+        // Prefer the side with room; on a phone the plate sits above the point.
+        var placeLeft = cx + 14 + plateW > width - right;
+        var plateX = narrow
+          ? Math.min(Math.max(cx - plateW / 2, left + 2), width - right - plateW - 2)
+          : (placeLeft ? cx - 14 - plateW : cx + 14);
+        var plateY = narrow ? Math.max(top + 2, cy - 34) : cy - plateH / 2;
+        svg.push('<line class="timeline-champion-drop" x1="' + cx.toFixed(2) + '" x2="' + cx.toFixed(2) + '" y1="' + (cy + 8).toFixed(2) + '" y2="' + (height - bottom) + '"></line>');
+        svg.push('<circle class="timeline-champion-halo" cx="' + cx.toFixed(2) + '" cy="' + cy.toFixed(2) + '" r="' + (recordR + 13) + '"></circle>');
+        svg.push('<circle class="timeline-champion-pulse" cx="' + cx.toFixed(2) + '" cy="' + cy.toFixed(2) + '" r="' + (recordR + 5) + '"></circle>');
+        svg.push('<circle class="timeline-champion-ring" cx="' + cx.toFixed(2) + '" cy="' + cy.toFixed(2) + '" r="' + (recordR + 5) + '"></circle>');
+        svg.push('<g class="timeline-champion-plate" tabindex="0" role="img" aria-label="' + esc("Reigning champion " + crownName + ", memory " + crownScore) + '" data-timeline-tooltip="' + esc("Reigning champion · " + crownName + " · memory " + crownScore) + '">' +
+          '<rect x="' + plateX.toFixed(2) + '" y="' + plateY.toFixed(2) + '" width="' + plateW.toFixed(2) + '" height="' + plateH + '" rx="3"></rect>' +
+          '<text x="' + (plateX + 9).toFixed(2) + '" y="' + (plateY + 14.5).toFixed(2) + '">♛ ' + esc(crownName) + '</text>' +
+          '<text class="crown-score" x="' + (plateX + plateW - 9).toFixed(2) + '" y="' + (plateY + 14.5).toFixed(2) + '" text-anchor="end">' + esc(crownScore) + '</text>' +
+          '<title>' + esc("Reigning champion · " + crownName + " · memory " + crownScore) + '</title></g>');
       }
 
       var latestMiner = minerPoints.length ? minerPoints[minerPoints.length - 1] : null;
@@ -3922,6 +3995,24 @@
           })
           .catch(function () { /* a missing board just means no cloud for that band */ });
       }).then(function () { return memoryFieldByVersion; });
+    }
+
+    // The chart lays itself out to its measured width, so a resize (or a phone
+    // rotating) has to re-render rather than stretch. Only a material width
+    // change re-renders, so dragging a window edge does not thrash the DOM.
+    var timelineRenderedWidth = 0;
+    function watchTimelineWidth() {
+      var target = document.getElementById("harness-comparison-chart");
+      if (!target || typeof ResizeObserver === "undefined") return;
+      var pending = 0;
+      new ResizeObserver(function (entries) {
+        var next = Math.round(entries[0].contentRect.width);
+        if (!next || Math.abs(next - timelineRenderedWidth) < 12) return;
+        clearTimeout(pending);
+        pending = setTimeout(function () {
+          if (lastMemoryTimelineData) renderMemoryTimeline(lastMemoryTimelineData);
+        }, 120);
+      }).observe(target);
     }
 
     function loadMemoryTimeline() {
@@ -7938,6 +8029,7 @@
       // the current-rollout leaderboard. The renderer windows to the most recent
       // contracts the generation ramp can still separate.
       loadMemoryTimeline();
+      if (!bootComplete) watchTimelineWidth();
       // bench/config is effectively static (max-age 300); refresh at most every
       // 5 minutes, but always on boot and on a manual refresh.
       if (manual || all || Date.now() - benchConfigAt >= 300000) loadBenchConfig();
