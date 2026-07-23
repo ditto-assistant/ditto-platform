@@ -4072,7 +4072,14 @@
       })) {
         return;
       }
-      tb.innerHTML = pageRows.map(function (e, i) {
+      // openModal() indexes lastEntries, so a row must carry its index there,
+      // not its position in the current page. Sorting, filtering by tab, and
+      // paging all reorder rows relative to lastEntries; emitting the loop
+      // index opened whichever miner happened to sit at that offset.
+      var entryIndex = new Map();
+      lastEntries.forEach(function (entry, index) { entryIndex.set(entry, index); });
+      tb.innerHTML = pageRows.map(function (e) {
+        var i = entryIndex.get(e);
         var elig = isEligible(e);
         var finalizedEntry = isFinalized(e);
         var registered = isRegistered(e);
