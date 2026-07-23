@@ -429,6 +429,19 @@ class TestIssueTicket:
                         run_size="full",
                     )
                 )
+            session.add(
+                ValidatorTicket(
+                    agent_id=old,
+                    validator_hotkey="5HistoricalRecovery",
+                    bench_version=3,
+                    status=TicketStatus.EXPIRED,
+                    issued_at=rollout_started - timedelta(hours=2),
+                    deadline=rollout_started - timedelta(hours=1),
+                    retry_after=rollout_started,
+                    attempt_count=2,
+                    manual_retry_grants=1,
+                )
+            )
 
         async with session.begin():
             ticket = await issue_ticket(

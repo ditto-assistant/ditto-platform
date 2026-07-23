@@ -104,6 +104,10 @@ from ditto.db.models import (
     ValidatorHeartbeat,
     ValidatorTicket,
 )
+from ditto.db.queries.audit import (
+    append_audit_entry,
+    benchmark_contract_refresh_event,
+)
 from ditto.db.queries.benchmark_rollout import (
     DatasetPin as RolloutDatasetPin,
 )
@@ -1668,6 +1672,15 @@ async def refresh_benchmark_contract(
             # benchmark version is unchanged. Grant one clean lease without
             # erasing the historical attempt counter.
             ticket.manual_retry_grants += 1
+
+        await append_audit_entry(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=None,
+            event=benchmark_contract_refresh_event(bench_version),
+            payload={"bench_version": bench_version},
+            recorded_at=now,
+        )
 
         await session.execute(
             delete(BenchmarkDataset).where(
