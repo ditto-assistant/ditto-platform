@@ -54,6 +54,7 @@ EVENT_SCORE_INVALIDATED = "score_invalidated"
 EVENT_SCORE_RETEST_QUEUED = "score_retest_queued"
 EVENT_SCORE_RETEST_REQUESTED = "score_retest_requested"
 EVENT_SCORE_RETEST_RELEASED = "score_retest_released"
+EVENT_BENCHMARK_CONTRACT_REFRESH = "benchmark_contract_refresh"
 
 SCORE_RETEST_EVENTS = (
     EVENT_SCORE_RETEST_QUEUED,
@@ -61,6 +62,11 @@ SCORE_RETEST_EVENTS = (
     EVENT_SCORE_INVALIDATED,
     EVENT_SCORE_RETEST_RELEASED,
 )
+
+
+def benchmark_contract_refresh_event(bench_version: int) -> str:
+    """Return the version-scoped durable authorization event for a rebuild."""
+    return f"{EVENT_BENCHMARK_CONTRACT_REFRESH}:v{bench_version}"
 
 
 def _iso_utc(dt: datetime) -> str:

@@ -12,8 +12,10 @@ from ditto.db.models import (
     Agent,
     BenchmarkRollout,
     BenchmarkRolloutMember,
+    ScoreAuditEntry,
     ValidatorTicket,
 )
+from ditto.db.queries.audit import benchmark_contract_refresh_event
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,8 +44,9 @@ def benchmark_admission_predicate(
 
     A generated dataset is deliberately not admission evidence: routine policy
     rescreens can regenerate one for historical submissions. Only submissions
-    received in the new era, frozen rollout members, and explicitly audited
-    operator recoveries may enter the active queue.
+    received in the new era, frozen rollout members, and submissions carrying a
+    version-scoped audited benchmark-contract refresh may enter the active queue.
+    An ordinary retry grant is not a benchmark-era admission credential.
     """
 
     rollout_member = (
@@ -55,7 +58,16 @@ def benchmark_admission_predicate(
         .correlate(Agent)
         .exists()
     )
-    operator_admission = (
+    contract_refresh = (
+        select(ScoreAuditEntry.agent_id)
+        .where(
+            ScoreAuditEntry.agent_id == Agent.agent_id,
+            ScoreAuditEntry.event == benchmark_contract_refresh_event(bench_version),
+        )
+        .correlate(Agent)
+        .exists()
+    )
+    refresh_retry_grant = (
         select(ValidatorTicket.agent_id)
         .where(
             ValidatorTicket.agent_id == Agent.agent_id,
@@ -68,7 +80,7 @@ def benchmark_admission_predicate(
     return or_(
         Agent.created_at >= rollout.created_at,
         rollout_member,
-        operator_admission,
+        contract_refresh & refresh_retry_grant,
     )
 
 

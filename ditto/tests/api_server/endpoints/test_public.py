@@ -2442,6 +2442,19 @@ class TestPublicActivity:
                     deadline=deadline,
                 )
             )
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey="5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    bench_version=4,
+                    status=TicketStatus.EXPIRED,
+                    issued_at=now - timedelta(minutes=30),
+                    deadline=now - timedelta(minutes=15),
+                    retry_after=now - timedelta(minutes=5),
+                    attempt_count=2,
+                    manual_retry_grants=1,
+                )
+            )
             for bench_version, validator, composite in (
                 (3, _VALIDATOR_C, 0.391235),
                 (4, _MINER_B, 0.391897),
