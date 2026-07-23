@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 ReviewMode = Literal["off", "shadow", "enforce", "inherit"]
 ReviewModel = Literal[
@@ -38,6 +38,14 @@ class ScreenerReviewSettings(BaseModel):
     critic_reasoning_effort: ReasoningEffort = "medium"
     cache_ttl_seconds: Annotated[int, Field(ge=60, le=2_592_000)] = 604_800
     audit_retention_days: Annotated[int, Field(ge=1, le=365)] = 30
+
+    @field_validator("l2_fallback_models", mode="before")
+    @classmethod
+    def accept_json_model_chain(cls, value: object) -> object:
+        """Preserve an immutable chain after FastAPI decodes its JSON array."""
+        if isinstance(value, list):
+            return tuple(value)
+        return value
 
     @model_validator(mode="after")
     def validate_model_chain(self) -> ScreenerReviewSettings:
