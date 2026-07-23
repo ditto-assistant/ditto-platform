@@ -28,6 +28,7 @@ from ditto.db.models import (
     BenchmarkRollout,
     BenchmarkRolloutAudit,
     BenchmarkRolloutMember,
+    InferenceProviderRoute,
     Score,
     ValidatorHeartbeat,
     ValidatorTicket,
@@ -1146,6 +1147,58 @@ async def maybe_activate_rollout(
     )
     if ranked_cohort_agents != len(member_ids):
         return False
+    if rollout.desired_version >= 7:
+        routes = list(
+            await session.scalars(
+                select(InferenceProviderRoute).where(
+                    InferenceProviderRoute.model == "openai/gpt-oss-20b",
+                    InferenceProviderRoute.status.in_(("discovered", "healthy")),
+                    InferenceProviderRoute.calibration_status == "eligible",
+                    InferenceProviderRoute.calibration_manifest_sha256.is_not(None),
+                )
+            )
+        )
+        if not routes:
+            return False
+        route_identities = {
+            (
+                route.provider,
+                route.profile_revision,
+                route.calibration_manifest_sha256,
+            )
+            for route in routes
+        }
+        heartbeats = list(await session.scalars(select(ValidatorHeartbeat)))
+        inference_ready = False
+        for heartbeat in heartbeats:
+            if heartbeat.protocol_version < 11 or not heartbeat_supports_version(
+                heartbeat, now=now, version=rollout.desired_version
+            ):
+                continue
+            try:
+                capabilities = ValidatorCapabilities.model_validate_json(
+                    json.dumps(heartbeat.capabilities)
+                )
+            except ValidationError:
+                continue
+            scorer = capabilities.scorer_benchmarks
+            calibration = scorer.v7_calibration if scorer is not None else None
+            if calibration is None or not capabilities.ticket_inference:
+                continue
+            if any(
+                route.model == "openai/gpt-oss-20b"
+                and (
+                    route.provider,
+                    route.profile_revision,
+                    calibration.manifest_sha256,
+                )
+                in route_identities
+                for route in calibration.supported_routes
+            ):
+                inference_ready = True
+                break
+        if not inference_ready:
+            return False
     rollout.status = "activated"
     rollout.activated_at = now
     rollout.blocked_reason = None

@@ -131,6 +131,7 @@ async def _require_rollout_start_capacity(
     now: datetime,
     desired_version: int,
     routing_mode: str = "adaptive",
+    reviewed_manifest_sha256: str | None = None,
 ) -> dict[str, object]:
     """Fail closed until one independently verified target scorer is online."""
     state = await rollout_state(session, now=now, capability_version=desired_version)
@@ -146,43 +147,47 @@ async def _require_rollout_start_capacity(
         )
     if desired_version >= 7:
         model = benchmark_model(desired_version)
-        calibrated_routes = list(
-            await session.scalars(
-                select(InferenceProviderRoute)
-                .join(
-                    InferenceRoutingPolicy,
-                    InferenceRoutingPolicy.model == InferenceProviderRoute.model,
-                )
-                .where(
-                    InferenceProviderRoute.model == model,
-                    (
-                        InferenceRoutingPolicy.enabled.is_(True)
-                        if routing_mode == "adaptive"
-                        else InferenceProviderRoute.provider == AGGREGATE_PROVIDER
-                    ),
-                    (
-                        InferenceProviderRoute.profile_revision
-                        == aggregate_profile_revision(model)
-                        if routing_mode == "aggregate_throughput"
-                        else InferenceProviderRoute.provider.is_not(None)
-                    ),
-                    InferenceProviderRoute.status.in_(("discovered", "healthy")),
-                    InferenceProviderRoute.calibration_status == "eligible",
-                    InferenceProviderRoute.calibration_tool_accuracy
-                    >= InferenceRoutingPolicy.min_tool_accuracy,
-                    InferenceProviderRoute.calibration_composite
-                    >= InferenceRoutingPolicy.min_composite,
-                    (
-                        InferenceProviderRoute.calibration_sample_count
-                        == AGGREGATE_CALIBRATION_SAMPLES
-                        if routing_mode == "aggregate_throughput"
-                        else InferenceProviderRoute.calibration_sample_count
-                        >= InferenceRoutingPolicy.min_calibration_samples
-                    ),
-                    InferenceProviderRoute.calibration_manifest_sha256.is_not(None),
-                )
+        route_statement = (
+            select(InferenceProviderRoute)
+            .join(
+                InferenceRoutingPolicy,
+                InferenceRoutingPolicy.model == InferenceProviderRoute.model,
+            )
+            .where(
+                InferenceProviderRoute.model == model,
+                (
+                    InferenceRoutingPolicy.enabled.is_(True)
+                    if routing_mode == "adaptive"
+                    else InferenceProviderRoute.provider == AGGREGATE_PROVIDER
+                ),
+                (
+                    InferenceProviderRoute.profile_revision
+                    == aggregate_profile_revision(model)
+                    if routing_mode == "aggregate_throughput"
+                    else InferenceProviderRoute.provider.is_not(None)
+                ),
+                InferenceProviderRoute.status.in_(("discovered", "healthy")),
+                InferenceProviderRoute.calibration_status == "eligible",
+                InferenceProviderRoute.calibration_tool_accuracy
+                >= InferenceRoutingPolicy.min_tool_accuracy,
+                InferenceProviderRoute.calibration_composite
+                >= InferenceRoutingPolicy.min_composite,
+                (
+                    InferenceProviderRoute.calibration_sample_count
+                    == AGGREGATE_CALIBRATION_SAMPLES
+                    if routing_mode == "aggregate_throughput"
+                    else InferenceProviderRoute.calibration_sample_count
+                    >= InferenceRoutingPolicy.min_calibration_samples
+                ),
+                InferenceProviderRoute.calibration_manifest_sha256.is_not(None),
             )
         )
+        if reviewed_manifest_sha256 is not None:
+            route_statement = route_statement.where(
+                InferenceProviderRoute.calibration_manifest_sha256
+                == reviewed_manifest_sha256
+            )
+        calibrated_routes = list(await session.scalars(route_statement))
         if not calibrated_routes:
             raise HTTPException(
                 status_code=409,
@@ -425,14 +430,38 @@ async def start_rollout(
             raise _generator_unavailable(target, exc) from exc
         return await rollout_state(session, capability_version=target)
     now = datetime.now(UTC)
+    inference_config = (
+        request.app.state.config.inference_proxy if request is not None else None
+    )
+    if (
+        target >= 7
+        and inference_config is not None
+        and (
+            not inference_config.enabled
+            or inference_config.openrouter_api_key is None
+            or inference_config.reviewed_calibration_manifest_sha256 is None
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"benchmark v{target} rollout requires the enabled platform "
+                "inference proxy and a deployed reviewed calibration manifest"
+            ),
+        )
     await _require_rollout_start_capacity(
         session,
         now=now,
         desired_version=target,
         routing_mode=(
-            request.app.state.config.inference_proxy.routing_mode
-            if request is not None
+            inference_config.routing_mode
+            if inference_config is not None
             else "adaptive"
+        ),
+        reviewed_manifest_sha256=(
+            inference_config.reviewed_calibration_manifest_sha256
+            if target >= 7 and inference_config is not None
+            else None
         ),
     )
     members = await historical_rescore_cohort(session, source_version=from_version)

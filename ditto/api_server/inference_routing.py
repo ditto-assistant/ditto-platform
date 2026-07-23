@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 AGGREGATE_PROVIDER = "openrouter"
 AGGREGATE_CALIBRATION_SAMPLES = 60
 V7_MODEL = "openai/gpt-oss-20b"
-V7_AGGREGATE_PROFILE_REVISION = "openrouter-route-8efde5ce9f5a4e58-v1"
+V7_AGGREGATE_PROFILE_REVISION = "openrouter-route-a471cd87ae7df5b9-v1"
 
 
 def benchmark_reasoning(model: str) -> dict[str, Any] | None:
@@ -45,10 +45,9 @@ def benchmark_reasoning(model: str) -> dict[str, Any] | None:
 
 def aggregate_profile_revision(model: str) -> str:
     """Return the immutable identity for the calibrated aggregate route."""
-    # The v1 GPT-OSS campaign observed OpenRouter's mandatory default-medium
-    # reasoning behavior. The proxy now requests that same behavior explicitly,
-    # so retaining this reviewed revision is a normalization rather than a new
-    # inference profile. Any future reasoning change must use a new revision.
+    # Reasoning is part of benchmark semantics and therefore part of the route
+    # identity. The earlier calibration omitted this field, so it must not make
+    # the explicit-medium route eligible without a fresh reviewed calibration.
     if model == V7_MODEL:
         return V7_AGGREGATE_PROFILE_REVISION
     profile = {

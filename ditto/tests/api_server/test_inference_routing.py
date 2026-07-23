@@ -127,7 +127,7 @@ async def test_aggregate_selection_uses_only_reviewed_logical_route() -> None:
     now = datetime.now(UTC)
     model = "openai/gpt-oss-20b"
     profile = aggregate_profile_revision(model)
-    assert profile == "openrouter-route-8efde5ce9f5a4e58-v1"
+    assert profile == "openrouter-route-a471cd87ae7df5b9-v1"
     async with maker() as session, session.begin():
         session.add(
             InferenceRoutingPolicy(

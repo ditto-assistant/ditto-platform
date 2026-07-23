@@ -342,6 +342,15 @@ async def calibrate_inference_route(
             status_code=409,
             detail="route does not meet reviewed calibration and health floors",
         )
+    if payload.action == "eligible" and (
+        inference_config.reviewed_calibration_manifest_sha256 is None
+        or payload.manifest_sha256
+        != inference_config.reviewed_calibration_manifest_sha256
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="calibration manifest is not the deployed reviewed artifact",
+        )
     now = datetime.now(UTC)
     route.calibration_status = payload.action
     route.calibration_manifest_sha256 = payload.manifest_sha256

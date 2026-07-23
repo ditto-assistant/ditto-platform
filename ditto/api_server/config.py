@@ -94,6 +94,7 @@ class InferenceProxyConfig:
     route_max_error_rate: float = 0.25
     route_max_timeout_rate: float = 0.15
     route_cooldown_seconds: int = 30
+    reviewed_calibration_manifest_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -391,6 +392,10 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
             route_cooldown_seconds=int(
                 os.environ.get("DITTO_INFERENCE_ROUTE_COOLDOWN_SECONDS", "30")
             ),
+            reviewed_calibration_manifest_sha256=(
+                os.environ.get("DITTO_INFERENCE_REVIEWED_CALIBRATION_MANIFEST_SHA256")
+                or None
+            ),
         )
     except ValueError as error:
         raise ApiServerConfigError("inference proxy limits must be numeric") from error
@@ -605,6 +610,12 @@ def check_config(config: ApiServerConfig) -> None:
         raise ApiServerConfigError("inference route timeout ceiling must be in [0, 1]")
     if inference.route_cooldown_seconds < 1:
         raise ApiServerConfigError("inference route cooldown must be positive")
+    if inference.reviewed_calibration_manifest_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", inference.reviewed_calibration_manifest_sha256
+    ):
+        raise ApiServerConfigError(
+            "reviewed inference calibration manifest must be lowercase sha256"
+        )
     if not (
         inference.per_ticket_concurrency
         <= inference.per_validator_concurrency

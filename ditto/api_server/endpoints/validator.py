@@ -1131,8 +1131,10 @@ async def request_job(
         v7_calibration = None
         if inference_required:
             try:
-                heartbeat_capabilities = ValidatorCapabilities.model_validate(
-                    heartbeat.capabilities if heartbeat is not None else None
+                heartbeat_capabilities = ValidatorCapabilities.model_validate_json(
+                    json.dumps(
+                        heartbeat.capabilities if heartbeat is not None else None
+                    )
                 )
             except ValidationError:
                 return Response(status_code=204)
@@ -1575,8 +1577,10 @@ async def request_top5_confirmation_job(
         v7_calibration = None
         if canonical_version >= 7:
             try:
-                capabilities = ValidatorCapabilities.model_validate(
-                    heartbeat.capabilities if heartbeat is not None else None
+                capabilities = ValidatorCapabilities.model_validate_json(
+                    json.dumps(
+                        heartbeat.capabilities if heartbeat is not None else None
+                    )
                 )
             except ValidationError as exc:
                 raise HTTPException(

@@ -46,7 +46,9 @@ async def _install(
         app.state.config,
         admin_api_token=_TOKEN,
         inference_proxy=replace(
-            app.state.config.inference_proxy, routing_mode=routing_mode
+            app.state.config.inference_proxy,
+            routing_mode=routing_mode,
+            reviewed_calibration_manifest_sha256="a" * 64,
         ),
     )
 
@@ -170,6 +172,16 @@ async def test_route_admission_requires_exact_confirmation_and_quality_floor(
     assert rejected.status_code == 409
 
     payload["confirmation"] = f"ELIGIBLE INFERENCE ROUTE {_PROFILE}"
+    payload["manifest_sha256"] = "b" * 64
+    unreviewed = await client.post(
+        f"/api/v1/admin/inference-routes/{_PROFILE}/calibration",
+        headers=_HEADERS,
+        json=payload,
+    )
+    assert unreviewed.status_code == 409
+    assert "deployed reviewed artifact" in unreviewed.json()["message"]
+
+    payload["manifest_sha256"] = "a" * 64
     accepted = await client.post(
         f"/api/v1/admin/inference-routes/{_PROFILE}/calibration",
         headers=_HEADERS,
