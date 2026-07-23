@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const { mockBootParams } = vi.hoisted(() => ({ mockBootParams: new URLSearchParams() }));
 vi.mock("../lib/config", () => ({ bootParams: mockBootParams }));

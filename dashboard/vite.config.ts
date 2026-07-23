@@ -1,11 +1,37 @@
 import solidPlugin from "vite-plugin-solid";
-import { loadEnv } from "vite";
-import { defineConfig } from "vitest/config";
+import { loadEnv, lazyPlugins } from "vite-plus";
+import { defineConfig } from "vite-plus";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "DITTO_");
   return {
-    plugins: [solidPlugin()],
+    fmt: {},
+    lint: {
+      plugins: ["typescript", "unicorn", "oxc"],
+      categories: {
+        correctness: "error",
+        suspicious: "warn",
+      },
+      env: {
+        browser: true,
+        es2022: true,
+      },
+      ignorePatterns: ["dist/**", "node_modules/**"],
+      options: {
+        typeAware: true,
+        typeCheck: true,
+      },
+      jsPlugins: [
+        {
+          name: "vite-plus",
+          specifier: "vite-plus/oxlint-plugin",
+        },
+      ],
+      rules: {
+        "vite-plus/prefer-vite-plus-imports": "error",
+      },
+    },
+    plugins: lazyPlugins(() => [solidPlugin()]),
     server: {
       port: 8080,
       // Same-origin /api/v1 default works in dev by proxying to the local API

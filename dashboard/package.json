@@ -4,17 +4,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "lint": "oxlint -c .oxlintrc.json",
-    "lint:fix": "oxlint -c .oxlintrc.json --fix",
-    "format": "oxfmt",
-    "format:check": "oxfmt --check",
+    "dev": "vp dev",
+    "build": "vp build",
+    "preview": "vp preview",
+    "test": "vp test",
+    "test:watch": "vp test",
+    "lint": "vp lint",
+    "lint:fix": "vp lint --fix",
+    "format": "vp fmt",
+    "format:check": "vp fmt --check",
     "typecheck": "tsc -p . --noEmit",
-    "check": "bun run typecheck && bun run lint && bun run format:check && bun run test"
+    "check": "vp check"
   },
   "dependencies": {
     "solid-js": "1.9.12"
@@ -23,11 +23,21 @@
     "@solidjs/testing-library": "^0.8.10",
     "@testing-library/jest-dom": "^6.9.1",
     "jsdom": "^29.1.1",
-    "oxfmt": "^0.49.0",
-    "oxlint": "^1.49.0",
     "typescript": "^5.9.3",
-    "vite": "^8.0.16",
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.2.6",
     "vite-plugin-solid": "^2.11.12",
-    "vitest": "^4.1.6"
+    "vite-plus": "0.2.6",
+    "vitest": "4.1.10"
+  },
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.2.6",
+    "vitest": "4.1.10"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "npm",
+      "version": "11.17.0",
+      "onFail": "download"
+    }
   }
 }

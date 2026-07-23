@@ -1,6 +1,6 @@
 # Ditto SN118 public dashboard
 
-The public "front door" for Subnet 118 — a Vite + SolidJS + TypeScript SPA.
+The public "front door" for Subnet 118 — a Vite+ + SolidJS + TypeScript SPA.
 No external requests at runtime, **no secrets**. It reads the platform's public
 API and links out to wandb for the per-epoch deep dive. This is Surface 3 in
 [`docs/public-telemetry.md`](../docs/public-telemetry.md).
@@ -12,16 +12,20 @@ markup contract (routes, query params, CSS classes, ARIA) are unchanged.
 
 ## Stack & layout
 
-- [SolidJS](https://solidjs.com) + TypeScript (strict) + [Vite](https://vite.dev),
-  managed with [bun](https://bun.sh). Matches the `ditto-app` frontend stack.
-- Tests: vitest (+ @solidjs/testing-library). Lint/format: oxlint + oxfmt.
+- [SolidJS](https://solidjs.com) + strict TypeScript, managed by
+  [Vite+](https://viteplus.dev/) through the `vp` CLI.
+- Vite+, Rolldown, Vitest, Oxlint, and Oxfmt share `vite.config.ts`; npm is the
+  managed package-manager backend, but day-to-day commands use `vp`.
 
 ```
 dashboard/
   index.html          Vite entry: meta config tags + pre-paint theme bootstrap
   src/
     main.tsx          mounts <App/>, imports styles
-    App.tsx           shell composition, routing + entity-route orchestration
+    App.tsx           small composition root and route switch
+    components/       shared UI, shell, tables, and entity details
+    pages/            one module per dashboard page
+    data/             reactive API resource helpers
     lib/              config, API client, formatters, hash router (pure logic)
     stores/           domain state: leaderboard, activity, operations, bench,
                       ath, theme, route, poller (30s poll / 8s ops fast-poll)
@@ -111,11 +115,12 @@ is only needed for testing.
 
 ```sh
 cd dashboard
-bun install
-bun run dev        # dev server on :8080, proxies /api -> localhost:8000 (make api-up)
-bun run check      # typecheck + lint + format check + vitest
-bun run build      # -> dist/
-bun run preview    # serve the production build locally
+vp install
+vp dev       # dev server on :8080, proxies /api -> localhost:8000 (make api-up)
+vp check     # format + lint + type-check
+vp test      # Vitest suite
+vp build     # -> dist/
+vp preview   # serve the production build locally
 ```
 
 The runtime `?api=` override still works against any host:

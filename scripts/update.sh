@@ -21,17 +21,18 @@ git reset --hard "origin/$branch"
 echo "==> syncing dependencies"
 uv sync
 
-# Build the dashboard SPA (Vite -> dashboard/dist, served by the API at /).
+# Build the dashboard SPA (Vite+ -> dashboard/dist, served by the API at /).
 # The dashboard is optional decoration for the API: a failed build logs loudly
 # but never blocks a platform deploy — the API just serves without it.
-if command -v bun >/dev/null 2>&1 || [ -x "$HOME/.bun/bin/bun" ]; then
-  command -v bun >/dev/null 2>&1 || export PATH="$HOME/.bun/bin:$PATH"
-  echo "==> building dashboard"
-  if ! (cd dashboard && bun install --frozen-lockfile && bun run build); then
-    echo "==> WARNING: dashboard build failed; serving API without the dashboard" >&2
-  fi
-else
-  echo "==> WARNING: bun not installed; skipping dashboard build (API serves without it)" >&2
+if ! command -v vp >/dev/null 2>&1; then
+  echo "==> installing Vite+"
+  curl -fsSL https://vite.plus | bash
+  # shellcheck disable=SC1091
+  . "$HOME/.vite-plus/env"
+fi
+echo "==> building dashboard"
+if ! (cd dashboard && vp install && vp build); then
+  echo "==> WARNING: dashboard build failed; serving API without the dashboard" >&2
 fi
 
 # Upsert a KEY=VALUE into .env, replacing an existing line or appending. Used for

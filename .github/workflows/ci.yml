@@ -30,21 +30,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: latest
+      - name: Install Vite+
+        run: curl -fsSL https://vite.plus | bash
 
       - name: Install dependencies
         working-directory: dashboard
-        run: bun install --frozen-lockfile
+        run: source "$HOME/.vite-plus/env" && vp install
 
-      - name: typecheck + lint + format + test
+      - name: Check
         working-directory: dashboard
-        run: bun run check
+        run: source "$HOME/.vite-plus/env" && vp check
+
+      - name: Test
+        working-directory: dashboard
+        run: source "$HOME/.vite-plus/env" && vp test
 
       - name: build
         working-directory: dashboard
-        run: bun run build
+        run: source "$HOME/.vite-plus/env" && vp build
 
   lint-and-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404

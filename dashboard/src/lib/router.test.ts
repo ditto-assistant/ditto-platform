@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 // The router reads config knobs from the boot-time snapshot in lib/config;
 // stub it with a mutable bag so tests control the boot params.
