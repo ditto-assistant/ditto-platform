@@ -759,6 +759,15 @@ async def issue_ticket(
                 sibling_agent.status == AgentStatus.EVALUATING,
                 same_owner,
                 owner_progress_started_at.is_not(None),
+                (
+                    benchmark_admission_predicate(
+                        rollout=activated_rollout,
+                        bench_version=bench_version,
+                        agent=sibling_agent,
+                    )
+                    if activated_rollout is not None
+                    else literal(True)
+                ),
             )
             .order_by(
                 owner_progress_started_at.asc(),

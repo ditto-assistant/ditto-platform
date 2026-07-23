@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import ColumnElement, or_, select
+from sqlalchemy.orm.util import AliasedClass
 
 from ditto.db.models import (
     Agent,
@@ -38,7 +39,10 @@ async def activated_rollout_for_version(
 
 
 def benchmark_admission_predicate(
-    *, rollout: BenchmarkRollout, bench_version: int
+    *,
+    rollout: BenchmarkRollout,
+    bench_version: int,
+    agent: type[Agent] | AliasedClass[Agent] = Agent,
 ) -> ColumnElement[bool]:
     """SQL predicate for agents allowed to consume this benchmark's capacity.
 
@@ -53,32 +57,32 @@ def benchmark_admission_predicate(
         select(BenchmarkRolloutMember.agent_id)
         .where(
             BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
-            BenchmarkRolloutMember.agent_id == Agent.agent_id,
+            BenchmarkRolloutMember.agent_id == agent.agent_id,
         )
-        .correlate(Agent)
+        .correlate(agent)
         .exists()
     )
     contract_refresh = (
         select(ScoreAuditEntry.agent_id)
         .where(
-            ScoreAuditEntry.agent_id == Agent.agent_id,
+            ScoreAuditEntry.agent_id == agent.agent_id,
             ScoreAuditEntry.event == benchmark_contract_refresh_event(bench_version),
         )
-        .correlate(Agent)
+        .correlate(agent)
         .exists()
     )
     refresh_retry_grant = (
         select(ValidatorTicket.agent_id)
         .where(
-            ValidatorTicket.agent_id == Agent.agent_id,
+            ValidatorTicket.agent_id == agent.agent_id,
             ValidatorTicket.bench_version == bench_version,
             ValidatorTicket.manual_retry_grants > 0,
         )
-        .correlate(Agent)
+        .correlate(agent)
         .exists()
     )
     return or_(
-        Agent.created_at >= rollout.created_at,
+        agent.created_at >= rollout.created_at,
         rollout_member,
         contract_refresh & refresh_retry_grant,
     )

@@ -634,6 +634,84 @@ class TestIssueTicket:
         assert ticket.agent_id == fresh
         assert ticket.agent_id != old
 
+    async def test_inadmissible_owner_history_does_not_pin_fresh_sibling(
+        self, session: AsyncSession
+    ) -> None:
+        rollout_started = _NOW - timedelta(minutes=5)
+        old = await _seed_evaluating(
+            session,
+            created_at=rollout_started - timedelta(days=1),
+            name="old-owner-generation",
+            screened=True,
+        )
+        fresh = await _seed_evaluating(
+            session,
+            created_at=rollout_started + timedelta(minutes=1),
+            name="fresh-owner-generation",
+            screened=True,
+        )
+        async with session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=rollout_started,
+                    activated_at=rollout_started,
+                )
+            )
+            for index, agent_id in enumerate((old, fresh)):
+                agent = await session.get(Agent, agent_id)
+                assert agent is not None
+                session.add_all(
+                    [
+                        BenchmarkDataset(
+                            agent_id=agent_id,
+                            bench_version=3,
+                            seed=123 + index,
+                            sha256=f"{index + 1:02x}" * 32,
+                            run_size="full",
+                        ),
+                        EvaluationPayment(
+                            block_hash=f"0xera-owner-{index}",
+                            extrinsic_index=index,
+                            agent_id=agent_id,
+                            miner_hotkey=agent.miner_hotkey,
+                            miner_coldkey="5SharedEraColdkey",
+                            amount_rao=1,
+                            tao_usd_rate=Decimal("1"),
+                            dest_address="5Destination",
+                            timestamp=_NOW,
+                        ),
+                    ]
+                )
+            session.add(
+                ValidatorTicket(
+                    agent_id=old,
+                    validator_hotkey="5HistoricalOwnerScore",
+                    bench_version=3,
+                    status=TicketStatus.SCORED,
+                    issued_at=rollout_started - timedelta(hours=1),
+                    deadline=rollout_started,
+                    attempt_count=1,
+                    manual_retry_grants=1,
+                )
+            )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5FreshOwnerValidator",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=3,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == fresh
+
     async def test_activated_era_expires_idle_old_nonmember_lease(
         self, session: AsyncSession
     ) -> None:
