@@ -120,10 +120,11 @@ def ticket_attempt_cap(ticket: ValidatorTicket) -> int:
 # make that first score irrelevant to the median.
 EMISSION_CONTENDER_COUNT = 5
 
-# Finish a bounded set of likely leaderboard contenders before starting more
-# uncovered work. Keeping one best submission per miner in this small lane
-# makes strong 2-of-3 submissions emission-eligible quickly without allowing
-# the whole completion backlog to starve new miners.
+# Advance a bounded set of likely leaderboard contenders before the ordinary
+# coverage rounds. Keeping one best submission per miner in this small lane
+# lets a strong 1-of-3 result reach 2-of-3 quickly and still finishes strong
+# 2-of-3 submissions, without allowing the whole scored backlog to starve new
+# miners.
 PROVISIONAL_CONTENDER_LANE_SIZE = 10
 
 
@@ -202,14 +203,12 @@ async def issue_ticket(
 
     Sweeps overdue tickets first, then picks an ``evaluating`` agent that (a)
     has fewer than :data:`SCORING_QUORUM` live tickets and (b) this validator
-    does not already hold a live or scored ticket for. Candidates with the
-    strongest bounded set of 2-of-3 provisional contenders comes first. The
-    remaining candidates prioritize the bounded 2-of-3 contender lane and then
-    1-of-3 submissions before uncovered work. Live assignments are spread
-    within each lane. This advances settled work toward quorum without letting
-    an unbounded completion backlog starve new miners. ``completion_first``
-    instead makes benchmark-era FIFO primary so the oldest submission reaches
-    quorum before the next submission is opened. A
+    does not already hold a live or scored ticket for. Candidates in the
+    strongest bounded set of scored provisional contenders come first. The
+    remaining candidates advance 1-of-3 submissions before uncovered work,
+    with live assignments spread within each lane. ``completion_first`` instead
+    makes benchmark-era FIFO primary so the oldest submission reaches quorum
+    before the next submission is opened. A
     2-of-3 submission that can no longer reach this era's emission set sorts
     behind every other candidate rather than being withheld, so it still
     finalizes once the queue drains. A prior expired row is reissued only after
@@ -507,8 +506,8 @@ async def issue_ticket(
         .where(
             contender.status == AgentStatus.EVALUATING,
             contender.screening_policy_version >= SCREENING_POLICY_VERSION,
-            contender_accepted_score_count == SCORING_QUORUM - 1,
-            contender_recorded_score_count >= SCORING_QUORUM - 1,
+            contender_accepted_score_count.between(1, SCORING_QUORUM - 1),
+            contender_recorded_score_count >= contender_accepted_score_count,
         )
         .subquery()
     )
@@ -525,6 +524,10 @@ async def issue_ticket(
     contender_lane = case(
         (Agent.agent_id.in_(top_provisional_contenders), 0),
         else_=1,
+    )
+    contender_lane_score = case(
+        (Agent.agent_id.in_(top_provisional_contenders), provisional_composite),
+        else_=0.0,
     )
     one_score_completion_lane = case(
         (accepted_score_count == 1, 0),
@@ -588,6 +591,7 @@ async def issue_ticket(
                     else_=(0 if artifact_mode == "legacy" else 1),
                 ).asc(),
                 contender_lane.asc(),
+                contender_lane_score.desc(),
                 # One accepted result is real progress toward the public 3-of-3
                 # settlement contract. Advance those rows before opening a
                 # wider one-score backlog. The separately bounded contender
@@ -605,19 +609,12 @@ async def issue_ticket(
             )
         )
         candidate = (
-            # The ordinary queue first finishes the bounded set of strongest
-            # 2-of-3 provisional contenders, one best submission per miner,
-            # then advances 1-of-3 rows toward quorum before opening uncovered
-            # work. Live assignments are spread only within the same progress
-            # lane, so completed evidence is not treated as equivalent to
-            # speculative in-flight work. Within one lane, never-attempted
-            # work precedes this validator's cooled-down retry. Within any
-            # accepted-score coverage round, prefer the
-            # highest provisional composite so the likely emission winner
-            # advances first. Submission age and UUID remain stable ties. The
-            # fresh-submission lane uses queue_order's FIFO-first alternative
-            # and waits briefly on that oldest row so simultaneous validators
-            # do not SKIP LOCKED their way into newer submissions.
+            # The ordinary queue first advances the bounded set of strongest
+            # scored provisional contenders, one best submission per miner. A
+            # stronger 1-of-3 candidate can therefore receive its second score
+            # before a weaker 2-of-3 candidate receives its third. The remaining
+            # queue advances 1-of-3 rows before uncovered work. The fresh lane
+            # uses queue_order's FIFO-first alternative.
             candidate.order_by(*queue_order)
             .limit(1)
             .with_for_update(of=Agent, skip_locked=not completion_first)

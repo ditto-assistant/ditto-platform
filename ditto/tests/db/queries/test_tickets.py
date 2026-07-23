@@ -1410,6 +1410,60 @@ class TestIssueTicket:
         assert ticket is not None
         assert ticket.agent_id == high
 
+    async def test_promising_one_score_jumps_weaker_completion_candidate(
+        self, session: AsyncSession
+    ) -> None:
+        one_score = await _seed_evaluating(
+            session, created_at=_NOW, name="promising-one-score"
+        )
+        two_scores = await _seed_evaluating(
+            session,
+            created_at=_NOW - timedelta(hours=1),
+            name="weaker-two-scores",
+        )
+        async with session.begin():
+            for agent_id, composites in (
+                (one_score, (0.90,)),
+                (two_scores, (0.60, 0.70)),
+            ):
+                for index, composite in enumerate(composites):
+                    validator = f"5Scored-{agent_id}-{index}"
+                    session.add(
+                        ValidatorTicket(
+                            agent_id=agent_id,
+                            validator_hotkey=validator,
+                            status=TicketStatus.SCORED,
+                            issued_at=_NOW,
+                            deadline=_NOW + _TTL,
+                            bench_version=2,
+                            attempt_count=1,
+                        )
+                    )
+                    session.add(
+                        Score(
+                            agent_id=agent_id,
+                            validator_hotkey=validator,
+                            run_id=f"run-{agent_id}-{index}",
+                            signature=None,
+                            seed=123,
+                            composite=composite,
+                            tool_mean=composite,
+                            memory_mean=composite,
+                            median_ms=100,
+                            n=114,
+                            details=None,
+                            generated_at=_NOW,
+                        )
+                    )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5Next", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == one_score
+
     async def test_top_provisional_contender_precedes_uncovered_work(
         self, session: AsyncSession
     ) -> None:

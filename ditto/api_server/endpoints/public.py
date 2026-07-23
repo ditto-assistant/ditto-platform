@@ -1978,7 +1978,7 @@ def _public_activity_response(
             row
             for row, row_status in waiting_candidates
             if row_status != "below_score_floor"
-            if row.score_count == SCORING_QUORUM - 1
+            if 1 <= row.score_count < SCORING_QUORUM
             and row.provisional_composite is not None
         ),
         key=lambda row: (
@@ -2001,6 +2001,11 @@ def _public_activity_response(
         key=lambda candidate: (
             1 if candidate[1] == "below_score_floor" else 0,
             0 if candidate[0].agent.agent_id in provisional_contender_ids else 1,
+            -(
+                candidate[0].provisional_composite or 0.0
+                if candidate[0].agent.agent_id in provisional_contender_ids
+                else 0.0
+            ),
             candidate[0].score_count,
             -(candidate[0].provisional_composite or 0.0),
             candidate[0].agent.created_at,
