@@ -27,6 +27,7 @@ def _entry(
     stderr: float | None = None,
     confirmations: tuple[float, ...] | None = None,
     seeds: tuple[int, ...] | None = None,
+    bench_version: int = 1,
 ) -> KothEntry:
     return KothEntry(
         miner_hotkey="5" + str(marker) * 47,
@@ -34,10 +35,58 @@ def _entry(
         composite=composite,
         first_seen=_T0 + timedelta(minutes=minutes),
         raw_rank=marker,
+        bench_version=bench_version,
         composite_stderr=stderr,
         confirmation_composites=confirmations,
         confirmation_seeds=seeds,
     )
+
+
+@pytest.mark.parametrize("bench_version", [6, 7, 8])
+def test_high_score_band_decay_applies_from_v6_forward(bench_version: int) -> None:
+    incumbent = _entry(2, 0.95, minutes=0, bench_version=bench_version)
+    challenger = _entry(1, 0.954, minutes=1, bench_version=bench_version)
+
+    projection = project_koth([challenger, incumbent])
+
+    assert projection is not None
+    assert projection.champion == challenger
+
+
+def test_pre_v6_and_mixed_version_comparisons_keep_legacy_band() -> None:
+    incumbent_v5 = _entry(2, 0.95, minutes=0, bench_version=5)
+    challenger_v5 = _entry(1, 0.954, minutes=1, bench_version=5)
+    challenger_v7 = _entry(3, 0.954, minutes=1, bench_version=7)
+
+    pre_v6 = project_koth([challenger_v5, incumbent_v5])
+    mixed = project_koth([challenger_v7, incumbent_v5])
+
+    assert pre_v6 is not None and pre_v6.champion == incumbent_v5
+    assert mixed is not None and mixed.champion == incumbent_v5
+
+
+def test_v6_decay_scales_the_paired_uncertainty_band() -> None:
+    incumbent = _entry(
+        2,
+        0.95,
+        minutes=0,
+        bench_version=6,
+        confirmations=(0.94, 0.95, 0.96),
+        seeds=(10, 20, 30),
+    )
+    challenger = _entry(
+        1,
+        0.96,
+        minutes=1,
+        bench_version=6,
+        confirmations=(0.93, 0.96, 0.985),
+        seeds=(10, 20, 30),
+    )
+
+    projection = project_koth([challenger, incumbent])
+
+    assert projection is not None
+    assert projection.champion == challenger
 
 
 def test_older_incumbent_survives_a_sub_margin_raw_leader() -> None:

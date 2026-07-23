@@ -148,6 +148,9 @@ from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.upload import _verify_signature
 from ditto.api_server.endpoints.validator import SessionDep, StorageDep
 from ditto.api_server.koth import (
+    KOTH_BAND_DECAY_MIN_BENCH_VERSION,
+    KOTH_BAND_DECAY_RATE,
+    KOTH_BAND_DECAY_START_COMPOSITE,
     KOTH_CHAMPION_SHARE,
     KOTH_DETHRONE_Z,
     KOTH_MARGIN,
@@ -992,6 +995,7 @@ def _public_koth_emissions(
                 composite=row.composite,
                 first_seen=row.first_seen,
                 raw_rank=raw_rank,
+                bench_version=row.bench_version,
                 composite_stderr=stderrs.get(row.agent_id),
                 confirmation_composites=(
                     tuple(composite for _seed, composite in confirmations)
@@ -1037,6 +1041,9 @@ def _public_koth_emissions(
     return PublicKothEmissions(
         margin=KOTH_MARGIN,
         dethrone_z=KOTH_DETHRONE_Z,
+        band_decay_min_bench_version=KOTH_BAND_DECAY_MIN_BENCH_VERSION,
+        band_decay_start_composite=KOTH_BAND_DECAY_START_COMPOSITE,
+        band_decay_rate=KOTH_BAND_DECAY_RATE,
         champion_share=KOTH_CHAMPION_SHARE,
         rank_shares=KOTH_RANK_SHARES,
         tail_size=KOTH_TAIL_SIZE,
