@@ -267,6 +267,13 @@ class TestIssueTicket:
             first_agent = await session.get(Agent, first)
             assert first_agent is not None
             first_agent.status = AgentStatus.SCORED
+            for index in range(SCORING_QUORUM):
+                completed = await session.get(
+                    ValidatorTicket,
+                    (first, 2, f"5OwnerValidator-{index}"),
+                )
+                assert completed is not None
+                completed.status = TicketStatus.SCORED
             next_ticket = await issue_ticket(
                 session,
                 validator_hotkey="5OwnerValidator-next",
@@ -276,6 +283,177 @@ class TestIssueTicket:
 
         assert next_ticket is not None
         assert next_ticket.agent_id == second
+
+    async def test_same_coldkey_legacy_partial_scores_do_not_deadlock(
+        self, session: AsyncSession
+    ) -> None:
+        first = await _seed_evaluating(
+            session, created_at=_NOW, name="owner-partial-first"
+        )
+        second = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="owner-partial-second",
+        )
+        async with session.begin():
+            for index, agent_id in enumerate((first, second)):
+                agent = await session.get(Agent, agent_id)
+                assert agent is not None
+                session.add_all(
+                    [
+                        EvaluationPayment(
+                            block_hash=f"0xowner-partial-{index}",
+                            extrinsic_index=index,
+                            agent_id=agent_id,
+                            miner_hotkey=agent.miner_hotkey,
+                            miner_coldkey="5SharedPartialColdkey",
+                            amount_rao=1,
+                            tao_usd_rate=Decimal("1"),
+                            dest_address="5Destination",
+                            timestamp=_NOW,
+                        ),
+                        ValidatorTicket(
+                            agent_id=agent_id,
+                            validator_hotkey=f"5Prior-{index}",
+                            status=TicketStatus.SCORED,
+                            issued_at=_NOW,
+                            deadline=_NOW + _TTL,
+                            bench_version=2,
+                            attempt_count=1,
+                        ),
+                    ]
+                )
+
+        async with session.begin():
+            first_recovery = await issue_ticket(
+                session,
+                validator_hotkey="5Recovery-1",
+                now=_NOW,
+                ttl=_TTL,
+            )
+
+        assert first_recovery is not None
+        assert first_recovery.agent_id == first
+
+        async with session.begin():
+            stored_recovery = await session.get(
+                ValidatorTicket, (first, 2, "5Recovery-1")
+            )
+            assert stored_recovery is not None
+            stored_recovery.status = TicketStatus.SCORED
+
+        async with session.begin():
+            ineligible_recovery = await issue_ticket(
+                session,
+                validator_hotkey="5Prior-0",
+                now=_NOW,
+                ttl=_TTL,
+            )
+            eligible_recovery = await issue_ticket(
+                session,
+                validator_hotkey="5Recovery-2",
+                now=_NOW,
+                ttl=_TTL,
+            )
+
+        assert ineligible_recovery is None
+        assert eligible_recovery is not None
+        assert eligible_recovery.agent_id == first
+
+    async def test_legacy_candidate_serializes_against_paid_same_hotkey(
+        self, session: AsyncSession
+    ) -> None:
+        paid = await _seed_evaluating(session, created_at=_NOW, name="paid-owner")
+        legacy = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="legacy-owner",
+        )
+        async with session.begin():
+            paid_agent = await session.get(Agent, paid)
+            legacy_agent = await session.get(Agent, legacy)
+            assert paid_agent is not None
+            assert legacy_agent is not None
+            legacy_agent.miner_hotkey = paid_agent.miner_hotkey
+            session.add(
+                EvaluationPayment(
+                    block_hash="0xpaid-owner",
+                    extrinsic_index=0,
+                    agent_id=paid,
+                    miner_hotkey=paid_agent.miner_hotkey,
+                    miner_coldkey="5SharedColdkey",
+                    amount_rao=1,
+                    tao_usd_rate=Decimal("1"),
+                    dest_address="5Destination",
+                    timestamp=_NOW,
+                )
+            )
+
+        async with session.begin():
+            first_claim = await issue_ticket(
+                session, validator_hotkey="5PaidClaim", now=_NOW, ttl=_TTL
+            )
+            second_claim = await issue_ticket(
+                session, validator_hotkey="5LegacyClaim", now=_NOW, ttl=_TTL
+            )
+
+        assert first_claim is not None
+        assert first_claim.agent_id == paid
+        assert second_claim is not None
+        assert second_claim.agent_id == paid
+
+    async def test_live_sibling_blocks_across_status_and_benchmark_version(
+        self, session: AsyncSession
+    ) -> None:
+        live = await _seed_evaluating(session, created_at=_NOW, name="live-owner")
+        candidate = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="candidate-owner",
+        )
+        async with session.begin():
+            for index, agent_id in enumerate((live, candidate)):
+                agent = await session.get(Agent, agent_id)
+                assert agent is not None
+                session.add(
+                    EvaluationPayment(
+                        block_hash=f"0xcross-version-owner-{index}",
+                        extrinsic_index=index,
+                        agent_id=agent_id,
+                        miner_hotkey=agent.miner_hotkey,
+                        miner_coldkey="5CrossVersionColdkey",
+                        amount_rao=1,
+                        tao_usd_rate=Decimal("1"),
+                        dest_address="5Destination",
+                        timestamp=_NOW,
+                    )
+                )
+            live_agent = await session.get(Agent, live)
+            assert live_agent is not None
+            live_agent.status = AgentStatus.SCREENING
+            session.add(
+                ValidatorTicket(
+                    agent_id=live,
+                    validator_hotkey="5LiveOtherEra",
+                    status=TicketStatus.ISSUED,
+                    issued_at=_NOW,
+                    deadline=_NOW + _TTL,
+                    bench_version=1,
+                    attempt_count=1,
+                )
+            )
+
+        async with session.begin():
+            blocked = await issue_ticket(
+                session,
+                validator_hotkey="5CurrentEra",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=2,
+            )
+
+        assert blocked is None
+        assert await session.get(ValidatorTicket, (candidate, 2, "5CurrentEra")) is None
 
     async def test_fresh_lane_excludes_pre_rollout_backlog(
         self, session: AsyncSession
