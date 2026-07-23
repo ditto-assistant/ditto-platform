@@ -35,11 +35,17 @@ class InferenceCalibrationRoute(BaseModel):
     model: Annotated[str, Field(min_length=1, max_length=120)]
 
 
+InferenceCalibrationRoutes = Annotated[
+    tuple[InferenceCalibrationRoute, ...],
+    BeforeValidator(lambda value: tuple(value) if isinstance(value, list) else value),
+]
+
+
 class V7InferenceCalibration(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     manifest_sha256: Annotated[str, Field(pattern=_SHA256_PATTERN)]
-    supported_routes: tuple[InferenceCalibrationRoute, ...]
+    supported_routes: InferenceCalibrationRoutes
 
     @model_validator(mode="after")
     def routes_are_nonempty_unique_and_sorted(self) -> V7InferenceCalibration:

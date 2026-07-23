@@ -296,6 +296,24 @@ def test_scorer_benchmark_capability_is_conservative_unless_fresh_verified() -> 
     )
     assert calibrated.v7_calibration is not None
 
+    # Heartbeats arrive as JSON, where tuples are necessarily encoded as arrays.
+    # Strict validation must preserve the immutable tuple internally without
+    # rejecting the wire representation before the endpoint can authenticate it.
+    from_wire = V7InferenceCalibration.model_validate(
+        {
+            "manifest_sha256": "b" * 64,
+            "supported_routes": [
+                {
+                    "provider": "openrouter",
+                    "profile_revision": "openrouter-route-groq-v1",
+                    "model": "openai/gpt-oss-20b",
+                }
+            ],
+        }
+    )
+    assert isinstance(from_wire.supported_routes, tuple)
+    assert from_wire.supported_routes[0].provider == "openrouter"
+
     with pytest.raises(ValueError, match="calibration requires benchmark v7 support"):
         ScorerBenchmarkCapability(
             status="fresh_verified",
@@ -1169,6 +1187,30 @@ class TestHeartbeat:
         )
         assert rejected_v11.status_code == 422, rejected_v11.text
         assert rejected_v11.json()["message"] == "request validation failed"
+
+        capabilities["scorer_benchmarks"]["v7_calibration"] = {
+            "manifest_sha256": "c" * 64,
+            "supported_routes": [
+                {
+                    "provider": "openrouter",
+                    "profile_revision": "openrouter-route-8efde5ce9f5a4e58-v1",
+                    "model": "openai/gpt-oss-20b",
+                }
+            ],
+        }
+        capabilities["ticket_inference"] = True
+        accepted_v11 = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=11,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert accepted_v11.status_code == 200, accepted_v11.text
 
     async def test_malformed_stored_stack_health_is_omitted_publicly(
         self,
