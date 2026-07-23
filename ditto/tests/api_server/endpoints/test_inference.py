@@ -17,9 +17,11 @@ from ditto.api_server.endpoints.inference import (
     _provider_preferences,
     _provider_rejection_is_route_observable,
     _proxy_message,
+    _public_embedding_response,
     _public_provider_response,
     _upstream_provider,
     _validate_request_schema,
+    _validated_embedding_payload,
 )
 from ditto.api_server.endpoints.validator import _verify_signature
 
@@ -86,6 +88,71 @@ def test_broker_proof_binds_generation_nonce_time_and_exact_body() -> None:
     ):
         with pytest.raises(InvalidSignature):
             public.verify(signature, changed)
+
+
+def test_embedding_contract_is_exact_and_response_is_sanitized() -> None:
+    model = "perplexity/pplx-embed-v1-0.6b"
+    payload = {
+        "model": model,
+        "input": ["one", "two"],
+        "dimensions": 768,
+        "encoding_format": "float",
+    }
+    assert _validated_embedding_payload(payload, model=model, dimensions=768) == [
+        "one",
+        "two",
+    ]
+    for changed in (
+        {**payload, "model": "attacker/model"},
+        {**payload, "dimensions": 1536},
+        {**payload, "provider": {"allow_fallbacks": True}},
+        {**payload, "input": []},
+    ):
+        with pytest.raises(HTTPException):
+            _validated_embedding_payload(changed, model=model, dimensions=768)
+
+    vector = [0.0] * 768
+    public, prompt_tokens = _public_embedding_response(
+        {
+            "object": "list",
+            "model": "pplx-embed-v1-0.6b",
+            "provider": "must-not-leak",
+            "data": [
+                {"object": "embedding", "index": 0, "embedding": vector},
+                {"object": "embedding", "index": 1, "embedding": vector},
+            ],
+            "usage": {"prompt_tokens": 7, "total_tokens": 7, "cost": 1},
+        },
+        model=model,
+        dimensions=768,
+        input_count=2,
+    )
+    assert prompt_tokens == 7
+    assert public["model"] == model
+    assert public["usage"] == {"prompt_tokens": 7, "total_tokens": 7}
+    assert "provider" not in public
+    assert "cost" not in str(public)
+
+    for response_model in (
+        "Perplexity/pplx-embed-v1-0.6b",
+        "pplx-embed-v1-0.6b:latest",
+        "attacker/model",
+    ):
+        with pytest.raises(HTTPException, match="provider identity mismatch"):
+            _public_embedding_response(
+                {
+                    "object": "list",
+                    "model": response_model,
+                    "data": [
+                        {"object": "embedding", "index": 0, "embedding": vector},
+                        {"object": "embedding", "index": 1, "embedding": vector},
+                    ],
+                    "usage": {"prompt_tokens": 7, "total_tokens": 7},
+                },
+                model=model,
+                dimensions=768,
+                input_count=2,
+            )
 
 
 def test_output_token_alias_cannot_bypass_ticket_limit() -> None:

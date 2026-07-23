@@ -8,6 +8,7 @@ are intentionally never logged.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -50,6 +51,9 @@ from ditto.db.queries.validator_auth import (
 router = APIRouter(prefix="/inference", tags=["inference"])
 _EXCHANGE_MAX_AGE = timedelta(minutes=2)
 _PROXY_MAX_AGE = timedelta(seconds=30)
+_EMBEDDING_MAX_INPUTS = 256
+_PPLX_EMBED_CONTRACT_MODEL = "perplexity/pplx-embed-v1-0.6b"
+_PPLX_EMBED_RESPONSE_MODEL = "pplx-embed-v1-0.6b"
 
 
 def _exchange_message(payload: InferenceExchangeRequest) -> bytes:
@@ -455,6 +459,89 @@ def _provider_rejection_is_route_observable(status_code: int) -> bool:
     return status_code >= 400 and status_code not in {400, 422}
 
 
+def _validated_embedding_payload(
+    payload: Any, *, model: str, dimensions: int
+) -> list[str]:
+    if not isinstance(payload, dict) or set(payload) != {
+        "model",
+        "input",
+        "dimensions",
+        "encoding_format",
+    }:
+        raise HTTPException(status_code=400, detail="invalid embedding request")
+    inputs = payload.get("input")
+    if (
+        payload.get("model") != model
+        or payload.get("dimensions") != dimensions
+        or payload.get("encoding_format") != "float"
+        or not isinstance(inputs, list)
+        or not 1 <= len(inputs) <= _EMBEDDING_MAX_INPUTS
+        or any(not isinstance(value, str) or not value for value in inputs)
+    ):
+        raise HTTPException(status_code=400, detail="invalid embedding request")
+    return inputs
+
+
+def _public_embedding_response(
+    payload: Any, *, model: str, dimensions: int, input_count: int
+) -> tuple[dict[str, Any], int]:
+    response_models = {model}
+    if model == _PPLX_EMBED_CONTRACT_MODEL:
+        # OpenRouter accepts the catalog-qualified model ID but Perplexity's
+        # response canonicalizes that exact reviewed model to its unqualified
+        # name. Keep the outbound contract frozen while accepting only this
+        # observed response alias.
+        response_models.add(_PPLX_EMBED_RESPONSE_MODEL)
+    if not isinstance(payload, dict) or payload.get("model") not in response_models:
+        raise HTTPException(status_code=502, detail="provider identity mismatch")
+    data = payload.get("data")
+    usage = payload.get("usage")
+    prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    if (
+        not isinstance(data, list)
+        or len(data) != input_count
+        or not isinstance(prompt_tokens, int)
+        or isinstance(prompt_tokens, bool)
+        or prompt_tokens < 0
+    ):
+        raise HTTPException(status_code=502, detail="invalid provider response")
+    public_data: list[dict[str, Any]] = []
+    for expected_index, item in enumerate(data):
+        vector = item.get("embedding") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or item.get("index") != expected_index
+            or not isinstance(vector, list)
+            or len(vector) != dimensions
+            or any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                for value in vector
+            )
+        ):
+            raise HTTPException(status_code=502, detail="invalid provider response")
+        public_data.append(
+            {
+                "object": "embedding",
+                "index": expected_index,
+                "embedding": vector,
+            }
+        )
+    return (
+        {
+            "object": "list",
+            "model": model,
+            "data": public_data,
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "total_tokens": prompt_tokens,
+            },
+        },
+        prompt_tokens,
+    )
+
+
 @router.post("/exchange", response_model=InferenceExchangeResponse)
 async def exchange_inference_grant(
     payload: InferenceExchangeRequest,
@@ -753,6 +840,202 @@ async def proxy_chat_completions(
                 )
     if not deliverable or raw is None:
         raise HTTPException(status_code=409, detail="inference grant is no longer live")
+    return Response(
+        content=raw,
+        status_code=200,
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/embeddings")
+async def proxy_embeddings(
+    request: Request,
+    x_ditto_grant: Annotated[UUID | None, Header()] = None,
+    x_ditto_generation: Annotated[int | None, Header()] = None,
+    x_ditto_nonce: Annotated[UUID | None, Header()] = None,
+    x_ditto_requested_at: Annotated[datetime | None, Header()] = None,
+    x_ditto_proof: Annotated[str | None, Header()] = None,
+    authorization: Annotated[str | None, Header()] = None,
+) -> Response:
+    """Proxy the one reviewed v7 embedding contract under separate budgets."""
+    config = request.app.state.config.inference_proxy
+    if not config.enabled or config.openrouter_api_key is None:
+        raise HTTPException(status_code=404, detail="inference proxy is disabled")
+    if None in {
+        x_ditto_grant,
+        x_ditto_generation,
+        x_ditto_nonce,
+        x_ditto_requested_at,
+        x_ditto_proof,
+        authorization,
+    }:
+        raise HTTPException(status_code=401, detail="missing inference proof")
+    assert x_ditto_grant is not None
+    assert x_ditto_generation is not None
+    assert x_ditto_nonce is not None
+    assert x_ditto_requested_at is not None
+    assert x_ditto_proof is not None
+    assert authorization is not None
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="invalid inference proof")
+    body = await request.body()
+    if len(body) > config.embedding_request_body_bytes:
+        raise HTTPException(status_code=413, detail="embedding request is too large")
+    if abs(datetime.now(UTC) - x_ditto_requested_at.astimezone(UTC)) > _PROXY_MAX_AGE:
+        raise HTTPException(status_code=409, detail="embedding request is stale")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise HTTPException(status_code=400, detail="invalid JSON request") from error
+    inputs = _validated_embedding_payload(
+        payload, model=config.embedding_model, dimensions=config.embedding_dimensions
+    )
+
+    session_maker = request.app.state.session_maker
+    now = datetime.now(UTC)
+    async with session_maker() as session, session.begin():
+        from ditto.db.models import InferenceGrant
+
+        grant = await session.get(InferenceGrant, x_ditto_grant)
+        if (
+            grant is None
+            or grant.bench_version != 7
+            or grant.broker_public_key is None
+            or grant.generation != x_ditto_generation
+            or grant.embedding_model != config.embedding_model
+            or grant.embedding_profile != config.embedding_profile
+            or grant.embedding_provider != config.embedding_provider
+            or grant.embedding_dimensions != config.embedding_dimensions
+        ):
+            raise HTTPException(status_code=401, detail="invalid inference proof")
+        try:
+            proof = base64.urlsafe_b64decode(
+                x_ditto_proof + "=" * (-len(x_ditto_proof) % 4)
+            )
+            _decode_public_key(grant.broker_public_key).verify(
+                proof,
+                _proxy_message(
+                    grant_id=x_ditto_grant,
+                    generation=x_ditto_generation,
+                    nonce=x_ditto_nonce,
+                    requested_at=x_ditto_requested_at,
+                    body=body,
+                ),
+            )
+        except (ValueError, InvalidSignature) as error:
+            raise HTTPException(
+                status_code=401, detail="invalid inference proof"
+            ) from error
+        reserved = await begin_inference_request(
+            session,
+            grant_id=x_ditto_grant,
+            nonce=x_ditto_nonce,
+            bearer=authorization.removeprefix("Bearer "),
+            model=config.embedding_model,
+            token_reservation=max(1, len(body)),
+            now=now,
+            config=config,
+            request_kind="embedding",
+        )
+        if reserved is None:
+            raise HTTPException(status_code=429, detail="embedding grant unavailable")
+
+    upstream_payload = {
+        "model": config.embedding_model,
+        "input": inputs,
+        "dimensions": config.embedding_dimensions,
+        "encoding_format": "float",
+        "provider": {
+            "order": [config.embedding_provider],
+            "allow_fallbacks": False,
+            "data_collection": "deny",
+        },
+    }
+    status = "failed"
+    prompt_tokens = 0
+    raw: bytes | None = None
+    timed_out = False
+    started = time.monotonic()
+    try:
+        upstream: httpx.Response | None = None
+        for attempt in range(3):
+            try:
+                candidate = await request.app.state.inference_client.post(
+                    config.embedding_upstream_url,
+                    json=upstream_payload,
+                    headers={
+                        "Authorization": f"Bearer {config.openrouter_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                )
+            except (httpx.TimeoutException, httpx.TransportError):
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.25 * (2**attempt))
+                continue
+            if candidate.status_code in {408, 429, 500, 502, 503, 504} and attempt < 2:
+                await asyncio.sleep(0.25 * (2**attempt))
+                continue
+            upstream = candidate
+            break
+        if upstream is None:
+            raise HTTPException(
+                status_code=502, detail="embedding provider unavailable"
+            )
+        if len(upstream.content) > config.embedding_response_body_bytes:
+            raise HTTPException(
+                status_code=502, detail="embedding response is too large"
+            )
+        if upstream.status_code >= 400:
+            raise HTTPException(
+                status_code=502, detail="embedding provider unavailable"
+            )
+        try:
+            decoded = upstream.json()
+        except ValueError as error:
+            raise HTTPException(
+                status_code=502, detail="invalid provider response"
+            ) from error
+        public_response, prompt_tokens = _public_embedding_response(
+            decoded,
+            model=config.embedding_model,
+            dimensions=config.embedding_dimensions,
+            input_count=len(inputs),
+        )
+        raw = json.dumps(public_response, separators=(",", ":")).encode()
+        status = "completed"
+    except httpx.TimeoutException as error:
+        timed_out = True
+        raise HTTPException(
+            status_code=504, detail="embedding provider timed out"
+        ) from error
+    except httpx.HTTPError as error:
+        raise HTTPException(
+            status_code=502, detail="embedding provider unavailable"
+        ) from error
+    finally:
+        finished_at = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            deliverable = await finish_inference_request(
+                session,
+                grant_id=x_ditto_grant,
+                nonce=x_ditto_nonce,
+                generation=x_ditto_generation,
+                status=status,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                # Catalog price is $0.004 / 1M input tokens. Provider-reported
+                # direct cost is intentionally not trusted.
+                cost_microusd=round(prompt_tokens * 0.004),
+                usage_available=status == "completed",
+                now=finished_at,
+                upstream_provider=config.embedding_provider,
+                timed_out=timed_out,
+                latency_ms=max(0, round((time.monotonic() - started) * 1000)),
+            )
+    if not deliverable or raw is None:
+        raise HTTPException(status_code=409, detail="embedding grant is no longer live")
     return Response(
         content=raw,
         status_code=200,
