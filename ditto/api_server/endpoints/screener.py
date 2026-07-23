@@ -1258,6 +1258,10 @@ async def submit_result(
             outcome=payload.outcome,
             manifest_digest=payload.manifest_digest,
             finding_digest=payload.finding_digest,
+            review_settings_revision=payload.review_settings_revision,
+            review_settings_instance_id=payload.review_settings_instance_id,
+            review_settings_scope=payload.review_settings_scope,
+            review_settings_checksum=payload.review_settings_checksum,
             reason_code=payload.reason_code,
             image_sha256=payload.image_sha256,
             image_size_bytes=payload.image_size_bytes,
@@ -1455,6 +1459,79 @@ async def submit_result(
                 raise AgentNotScreenableError(
                     "verdict does not match the claimed screening attempt"
                 )
+            binding = (
+                payload.review_settings_revision,
+                payload.review_settings_instance_id,
+                payload.review_settings_scope,
+                payload.review_settings_checksum,
+            )
+            if all(value is not None for value in binding):
+                revision = await session.get(
+                    ScreenerReviewSettingsRevision,
+                    payload.review_settings_revision,
+                )
+                if revision is None:
+                    raise AgentNotScreenableError(
+                        "verdict references an unknown reviewer settings revision"
+                    )
+                settings = ScreenerReviewSettings.model_validate(revision.settings)
+                if (
+                    revision.scope != payload.review_settings_scope
+                    or revision.checksum != payload.review_settings_checksum
+                    or revision.scope not in {"*", payload.review_settings_instance_id}
+                ):
+                    raise AgentNotScreenableError(
+                        "verdict reviewer settings binding does not match "
+                        "platform state"
+                    )
+            else:
+                settings = ScreenerReviewSettings()
+            latest_rows = (
+                await session.scalars(
+                    select(ScreenerReviewSettingsRevision)
+                    .where(
+                        ScreenerReviewSettingsRevision.scope.in_(
+                            ("*", payload.review_settings_instance_id or "")
+                        )
+                    )
+                    .order_by(ScreenerReviewSettingsRevision.revision.desc())
+                )
+            ).all()
+            effective = next(
+                (
+                    row
+                    for row in latest_rows
+                    if row.scope == payload.review_settings_instance_id
+                ),
+                next((row for row in latest_rows if row.scope == "*"), None),
+            )
+            if effective is not None:
+                effective_settings = ScreenerReviewSettings.model_validate(
+                    effective.settings
+                )
+                if effective_settings.mode == "inherit":
+                    effective = next(
+                        (row for row in latest_rows if row.scope == "*"), None
+                    )
+                    effective_settings = (
+                        ScreenerReviewSettings.model_validate(effective.settings)
+                        if effective is not None
+                        else ScreenerReviewSettings()
+                    )
+                if effective_settings.mode == "enforce":
+                    if effective is None:
+                        raise AgentNotScreenableError(
+                            "enforced reviewer settings revision is unavailable"
+                        )
+                    if (
+                        payload.review_settings_revision != effective.revision
+                        or payload.review_settings_checksum != effective.checksum
+                        or settings.mode != "enforce"
+                    ):
+                        raise AgentNotScreenableError(
+                            "enforced reviewer verdict is missing the effective "
+                            "settings binding"
+                        )
             if attempt.reason_code == "exact-cross-miner-duplicate" and (
                 payload.reason_code != attempt.reason_code
             ):
@@ -1565,6 +1642,10 @@ async def submit_result(
             attempt.finished_at = datetime.now(UTC)
             attempt.public_reason = public_reason
             attempt.reason_code = payload.reason_code
+            attempt.review_settings_revision = payload.review_settings_revision
+            attempt.review_settings_instance_id = payload.review_settings_instance_id
+            attempt.review_settings_scope = payload.review_settings_scope
+            attempt.review_settings_checksum = payload.review_settings_checksum
         if target == AgentStatus.QUARANTINED:
             if attempt is None:
                 raise AgentNotScreenableError(

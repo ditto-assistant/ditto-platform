@@ -139,7 +139,7 @@ async def test_builtin_off_then_global_shadow_and_instance_override(
     assert inherited.json()["settings"]["mode"] == "shadow"
 
 
-async def test_enforce_and_global_inherit_are_not_activatable(
+async def test_enforce_is_activatable_but_global_inherit_is_not(
     app: FastAPI,
     client: httpx.AsyncClient,
     settings_maker: async_sessionmaker[AsyncSession],
@@ -150,13 +150,12 @@ async def test_enforce_and_global_inherit_are_not_activatable(
         headers=_ADMIN_HEADERS,
         json=_payload("*", "enforce"),
     )
-    assert enforce.status_code == 409
-    assert "versioned reviewer settings revision" in enforce.text
+    assert enforce.status_code == 200
 
     inherit = await client.post(
         "/api/v1/admin/screener-review-settings",
         headers=_ADMIN_HEADERS,
-        json=_payload("*", "inherit"),
+        json=_payload("*", "inherit", expected=enforce.json()["revision"]),
     )
     assert inherit.status_code == 409
     assert "exact worker scope" in inherit.text
