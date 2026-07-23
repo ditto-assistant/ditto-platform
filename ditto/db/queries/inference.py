@@ -95,6 +95,16 @@ async def ensure_inference_grant(
             route_completion_price_per_token=route_completion_price_per_token,
             request_budget=config.request_budget,
             token_budget=config.token_budget,
+            embedding_model=config.embedding_model,
+            embedding_profile=config.embedding_profile,
+            embedding_provider=config.embedding_provider,
+            embedding_dimensions=config.embedding_dimensions,
+            embedding_request_budget=config.embedding_request_budget,
+            embedding_token_budget=config.embedding_token_budget,
+            embedding_request_count=0,
+            embedding_tokens=0,
+            embedding_cost_microusd=0,
+            embedding_active_requests=0,
             request_count=0,
             prompt_tokens=0,
             completion_tokens=0,
@@ -167,7 +177,10 @@ async def activate_inference_grant(
         request.status = "canceled"
         request.prompt_tokens = request.reserved_tokens
         request.completed_at = now
-        grant.prompt_tokens += request.reserved_tokens
+        if request.request_kind == "chat":
+            grant.prompt_tokens += request.reserved_tokens
+        else:
+            grant.embedding_tokens += request.reserved_tokens
     bearer = secrets.token_urlsafe(32)
     grant.bearer_digest = bearer_digest(bearer)
     grant.broker_public_key = broker_public_key.rstrip("=")
@@ -176,6 +189,7 @@ async def activate_inference_grant(
     grant.slot_id = ticket.slot_id
     grant.expires_at = _aware(ticket.deadline)
     grant.active_requests = 0
+    grant.embedding_active_requests = 0
     grant.updated_at = now
     await session.flush()
     return grant, bearer
@@ -218,9 +232,13 @@ async def revoke_ticket_inference(
             request.status = "canceled"
             request.prompt_tokens = request.reserved_tokens
             request.completed_at = now
-            grant.prompt_tokens += request.reserved_tokens
+            if request.request_kind == "chat":
+                grant.prompt_tokens += request.reserved_tokens
+            else:
+                grant.embedding_tokens += request.reserved_tokens
         grant.status = "revoked"
         grant.active_requests = 0
+        grant.embedding_active_requests = 0
         grant.updated_at = now
 
 
@@ -234,8 +252,11 @@ async def begin_inference_request(
     token_reservation: int,
     now: datetime,
     config: InferenceProxyConfig,
+    request_kind: str = "chat",
 ) -> tuple[InferenceGrant, InferenceRequest] | None:
     """Atomically consume one nonce and reserve bounded proxy capacity."""
+    if request_kind not in {"chat", "embedding"}:
+        return None
     if session.get_bind().dialect.name == "postgresql":
         await session.execute(
             select(func.pg_advisory_xact_lock(func.hashtextextended("inference", 0)))
@@ -259,7 +280,11 @@ async def begin_inference_request(
         or grant.bearer_digest is None
         or not secrets.compare_digest(grant.bearer_digest, bearer_digest(bearer))
         or _aware(grant.expires_at) <= now
-        or model not in grant.allowed_models
+        or (
+            model not in grant.allowed_models
+            if request_kind == "chat"
+            else grant.bench_version < 7 or model != grant.embedding_model
+        )
     ):
         return None
     stale_cutoff = now - timedelta(seconds=config.timeout_seconds * 2)
@@ -270,6 +295,7 @@ async def begin_inference_request(
                 .where(
                     InferenceRequest.grant_id == grant.grant_id,
                     InferenceRequest.status == "started",
+                    InferenceRequest.request_kind == request_kind,
                     InferenceRequest.started_at < stale_cutoff,
                 )
                 .with_for_update()
@@ -280,18 +306,26 @@ async def begin_inference_request(
         stale.status = "canceled"
         stale.prompt_tokens = stale.reserved_tokens
         stale.completed_at = now
-        grant.prompt_tokens += stale.reserved_tokens
+        if request_kind == "chat":
+            grant.prompt_tokens += stale.reserved_tokens
+        else:
+            grant.embedding_tokens += stale.reserved_tokens
     if stale_requests:
         await session.flush()
-        grant.active_requests = int(
+        active_count = int(
             await session.scalar(
                 select(func.count()).where(
                     InferenceRequest.grant_id == grant.grant_id,
                     InferenceRequest.status == "started",
+                    InferenceRequest.request_kind == request_kind,
                 )
             )
             or 0
         )
+        if request_kind == "chat":
+            grant.active_requests = active_count
+        else:
+            grant.embedding_active_requests = active_count
     if (
         ticket is None
         or ticket.status != TicketStatus.ISSUED
@@ -300,25 +334,40 @@ async def begin_inference_request(
     ):
         grant.status = "revoked"
         return None
-    if grant.request_count >= grant.request_budget:
+    if request_kind == "chat" and grant.request_count >= grant.request_budget:
         grant.status = "exhausted"
+        return None
+    if (
+        request_kind == "embedding"
+        and grant.embedding_request_count >= grant.embedding_request_budget
+    ):
         return None
     active_reserved = await session.scalar(
         select(func.coalesce(func.sum(InferenceRequest.reserved_tokens), 0)).where(
             InferenceRequest.grant_id == grant.grant_id,
             InferenceRequest.status == "started",
+            InferenceRequest.request_kind == request_kind,
         )
     )
-    if (
-        token_reservation < 1
-        or grant.prompt_tokens
-        + grant.completion_tokens
-        + int(active_reserved or 0)
-        + token_reservation
-        > grant.token_budget
+    if token_reservation < 1 or (
+        grant.prompt_tokens + grant.completion_tokens
+        if request_kind == "chat"
+        else grant.embedding_tokens
+    ) + int(active_reserved or 0) + token_reservation > (
+        grant.token_budget if request_kind == "chat" else grant.embedding_token_budget
     ):
         return None
-    if grant.active_requests >= config.per_ticket_concurrency:
+    active_requests = (
+        grant.active_requests
+        if request_kind == "chat"
+        else grant.embedding_active_requests
+    )
+    per_ticket_concurrency = (
+        config.per_ticket_concurrency
+        if request_kind == "chat"
+        else config.embedding_per_ticket_concurrency
+    )
+    if active_requests >= per_ticket_concurrency:
         return None
 
     # Fast replay path avoids an ORM identity collision in the common case;
@@ -327,14 +376,19 @@ async def begin_inference_request(
     if await session.get(InferenceRequest, (grant.grant_id, nonce)) is not None:
         return None
 
+    active_column = (
+        InferenceGrant.active_requests
+        if request_kind == "chat"
+        else InferenceGrant.embedding_active_requests
+    )
     validator_active = await session.scalar(
-        select(func.coalesce(func.sum(InferenceGrant.active_requests), 0)).where(
+        select(func.coalesce(func.sum(active_column), 0)).where(
             InferenceGrant.validator_hotkey == grant.validator_hotkey,
             InferenceGrant.status == "active",
         )
     )
     global_active = await session.scalar(
-        select(func.coalesce(func.sum(InferenceGrant.active_requests), 0)).where(
+        select(func.coalesce(func.sum(active_column), 0)).where(
             InferenceGrant.status == "active"
         )
     )
@@ -346,23 +400,53 @@ async def begin_inference_request(
         .where(
             InferenceGrant.validator_hotkey == grant.validator_hotkey,
             InferenceRequest.started_at >= minute_start,
+            InferenceRequest.request_kind == request_kind,
         )
     )
     ticket_recent = await session.scalar(
         select(func.count()).where(
             InferenceRequest.grant_id == grant.grant_id,
             InferenceRequest.started_at >= minute_start,
+            InferenceRequest.request_kind == request_kind,
         )
     )
     global_recent = await session.scalar(
-        select(func.count()).where(InferenceRequest.started_at >= minute_start)
+        select(func.count()).where(
+            InferenceRequest.started_at >= minute_start,
+            InferenceRequest.request_kind == request_kind,
+        )
+    )
+    per_validator_concurrency = (
+        config.per_validator_concurrency
+        if request_kind == "chat"
+        else config.embedding_per_validator_concurrency
+    )
+    global_concurrency = (
+        config.global_concurrency
+        if request_kind == "chat"
+        else config.embedding_global_concurrency
+    )
+    per_ticket_rpm = (
+        config.per_ticket_requests_per_minute
+        if request_kind == "chat"
+        else config.embedding_per_ticket_requests_per_minute
+    )
+    per_validator_rpm = (
+        config.per_validator_requests_per_minute
+        if request_kind == "chat"
+        else config.embedding_per_validator_requests_per_minute
+    )
+    global_rpm = (
+        config.global_requests_per_minute
+        if request_kind == "chat"
+        else config.embedding_global_requests_per_minute
     )
     if (
-        int(validator_active or 0) >= config.per_validator_concurrency
-        or int(global_active or 0) >= config.global_concurrency
-        or int(ticket_recent or 0) >= config.per_ticket_requests_per_minute
-        or int(validator_recent or 0) >= config.per_validator_requests_per_minute
-        or int(global_recent or 0) >= config.global_requests_per_minute
+        int(validator_active or 0) >= per_validator_concurrency
+        or int(global_active or 0) >= global_concurrency
+        or int(ticket_recent or 0) >= per_ticket_rpm
+        or int(validator_recent or 0) >= per_validator_rpm
+        or int(global_recent or 0) >= global_rpm
     ):
         return None
 
@@ -371,6 +455,7 @@ async def begin_inference_request(
         nonce=nonce,
         generation=grant.generation,
         status="started",
+        request_kind=request_kind,
         model=model,
         reserved_tokens=token_reservation,
         started_at=now,
@@ -382,8 +467,12 @@ async def begin_inference_request(
     except IntegrityError:
         # The composite primary key is the distributed replay guard.
         return None
-    grant.request_count += 1
-    grant.active_requests += 1
+    if request_kind == "chat":
+        grant.request_count += 1
+        grant.active_requests += 1
+    else:
+        grant.embedding_request_count += 1
+        grant.embedding_active_requests += 1
     grant.updated_at = now
     await session.flush()
     return grant, request
@@ -471,13 +560,24 @@ async def finish_inference_request(
     request.timed_out = timed_out
     request.latency_ms = latency_ms
     request.completed_at = now
-    if was_started:
-        grant.active_requests = max(0, grant.active_requests - 1)
-    grant.prompt_tokens += prompt_tokens
-    grant.completion_tokens += completion_tokens
-    grant.cost_microusd += cost_microusd
+    if request.request_kind == "chat":
+        if was_started:
+            grant.active_requests = max(0, grant.active_requests - 1)
+        grant.prompt_tokens += prompt_tokens
+        grant.completion_tokens += completion_tokens
+        grant.cost_microusd += cost_microusd
+    else:
+        if was_started:
+            grant.embedding_active_requests = max(
+                0, grant.embedding_active_requests - 1
+            )
+        grant.embedding_tokens += prompt_tokens
+        grant.embedding_cost_microusd += cost_microusd
     grant.updated_at = now
-    if grant.prompt_tokens + grant.completion_tokens >= grant.token_budget:
+    if (
+        request.request_kind == "chat"
+        and grant.prompt_tokens + grant.completion_tokens >= grant.token_budget
+    ):
         grant.status = "exhausted"
     return deliverable
 
