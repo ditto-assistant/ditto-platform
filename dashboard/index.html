@@ -3708,17 +3708,36 @@
         svg.push('<line class="timeline-grid" x1="' + left + '" x2="' + (width - right) + '" y1="' + y(tick) + '" y2="' + y(tick) + '"></line>');
         svg.push('<text class="timeline-axis-label" x="' + (left - 10) + '" y="' + (y(tick) + 3) + '" text-anchor="end">' + tick.toFixed(2).replace(/^0/, "") + '</text>');
       });
-      var releaseLabelLastX = [];
+      // Labels sit right of their dashed line, or flip left near the right
+      // edge so they never clip. Rows track occupied extents (not just start
+      // x) so a flipped label still staggers below its neighbors.
+      var releaseLabelWidth = 72;
+      var releaseLabelRowEnds = [];
       releases.forEach(function (release) {
         var at = releaseTime(release);
-        var releaseX = x(at), depth = 0;
-        while (depth < releaseLabelLastX.length && releaseX - releaseLabelLastX[depth] < 82) depth += 1;
+        var releaseX = x(at);
+        var flip = releaseX + 5 + releaseLabelWidth > width - right;
+        var labelStart = flip ? releaseX - 5 - releaseLabelWidth : releaseX + 5;
+        var depth = 0;
+        while (depth < releaseLabelRowEnds.length && labelStart < releaseLabelRowEnds[depth] + 10) depth += 1;
+        releaseLabelRowEnds[depth] = labelStart + releaseLabelWidth;
         var releaseTooltip = "DittoBench v" + release.bench_version + " · " + release.title + " · released " + timelineDate(release.released_at) + (release.activated_at ? " · activated " + timelineDate(release.activated_at) : "");
-        releaseLabelLastX[depth] = releaseX;
         svg.push('<line class="timeline-release" x1="' + releaseX + '" x2="' + releaseX + '" y1="' + top + '" y2="' + (height - bottom) + '"></line>');
-        svg.push('<text class="timeline-release-label" x="' + (releaseX + 5) + '" y="' + (18 + depth * 13) + '" tabindex="0" role="img" aria-label="' + esc(releaseTooltip) + '" data-timeline-tooltip="' + esc(releaseTooltip) + '">v' + esc(release.bench_version) + ' · ' + esc(timelineDate(release.released_at)) + '<title>' + esc(releaseTooltip) + '</title></text>');
+        svg.push('<text class="timeline-release-label" x="' + (flip ? releaseX - 5 : releaseX + 5) + '" y="' + (18 + depth * 13) + '"' + (flip ? ' text-anchor="end"' : '') + ' tabindex="0" role="img" aria-label="' + esc(releaseTooltip) + '" data-timeline-tooltip="' + esc(releaseTooltip) + '">v' + esc(release.bench_version) + ' · ' + esc(timelineDate(release.released_at)) + '<title>' + esc(releaseTooltip) + '</title></text>');
       });
-      if (minerPoints.length > 1) svg.push('<path class="timeline-path miner" d="' + timelinePath(minerPoints, x, y) + '"></path>');
+      // The running high resets at every contract release, and late rescoring
+      // interleaves eras in wall-clock time, so one chronological line would
+      // zigzag. Draw an independent segment per benchmark version instead.
+      var minerEraByVersion = {};
+      var minerEras = [];
+      minerPoints.forEach(function (point) {
+        var era = minerEraByVersion[point.version];
+        if (!era) { era = minerEraByVersion[point.version] = []; minerEras.push(era); }
+        era.push(point);
+      });
+      minerEras.forEach(function (era) {
+        if (era.length > 1) svg.push('<path class="timeline-path miner" d="' + timelinePath(era, x, y) + '"></path>');
+      });
       minerPoints.forEach(function (point) { svg.push(timelinePoint(point, "miner", x, y)); });
       externalSeries.forEach(function (series) {
         if (series.points.length > 1) svg.push('<path class="timeline-path ' + series.id + '" d="' + timelinePath(series.points, x, y) + '"></path>');
@@ -3743,8 +3762,8 @@
         (latestMiner ? '<span>Latest record <strong>' + fx(latestMiner.score) + '</strong> on v' + latestMiner.version + '</span>' : '<span>Miner history is not yet available</span>') +
         '<span><strong>' + latestReferences.length + '</strong> native reference series</span></p>' +
         '<div class="memory-timeline-legend" aria-label="Timeline legend"><span><i></i>Best finalized miner</span><span class="hermes"><i></i>Hermes Agent</span><span class="openclaw"><i></i>OpenClaw</span></div>' +
-        '<div class="memory-timeline-frame" tabindex="0" role="region" aria-label="Memory-score timeline, horizontally scrollable on small screens"><svg class="memory-timeline-svg" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-labelledby="memory-timeline-title memory-timeline-desc"><title id="memory-timeline-title">Best miner memory score with Hermes and OpenClaw across DittoBench v2 through v6</title><desc id="memory-timeline-desc">A time series from zero to one. Vertical dashed lines mark benchmark releases. Third-party points are retrospective measurements aligned to those dates.</desc>' + svg.join("") + '</svg><div class="memory-timeline-tooltip" role="tooltip" hidden></div></div>' +
-        '<p class="memory-timeline-note">Release markers show contract dates. Third-party points were all measured on ' + esc(THIRD_PARTY_HARNESSES[0].measuredAt) + ' and are aligned to those dates; hover or focus a point for its exact condition.</p>' +
+        '<div class="memory-timeline-frame" tabindex="0" role="region" aria-label="Memory-score timeline, horizontally scrollable on small screens"><svg class="memory-timeline-svg" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-labelledby="memory-timeline-title memory-timeline-desc"><title id="memory-timeline-title">Best miner memory score with Hermes and OpenClaw across DittoBench v2 through v6</title><desc id="memory-timeline-desc">A time series from zero to one. Vertical dashed lines mark benchmark releases. The miner line breaks at each release because every contract rescores from scratch. Third-party points are retrospective measurements aligned to those dates.</desc>' + svg.join("") + '</svg><div class="memory-timeline-tooltip" role="tooltip" hidden></div></div>' +
+        '<p class="memory-timeline-note">Release markers show contract dates; the miner line restarts at each one because every contract rescores from scratch. Third-party points were all measured on ' + esc(THIRD_PARTY_HARNESSES[0].measuredAt) + ' and are aligned to those dates; hover or focus a point for its exact condition.</p>' +
         '<details class="timeline-data-details"><summary>Exact timeline data</summary><div class="timeline-data-table-wrap"><table class="timeline-data-table"><thead><tr><th>Series</th><th>Contract</th><th>Placed at</th><th>Measured</th><th>Memory</th></tr></thead><tbody>' +
         rows.map(function (row) { return '<tr><td>' + (row.agentId ? entityAnchor("agent", row.agentId, row.source) : esc(row.source)) + '</td><td>v' + esc(row.version) + '</td><td>' + esc(row.placed) + '</td><td>' + esc(row.measured) + '</td><td>' + fx(row.score) + '</td></tr>'; }).join("") +
         '</tbody></table></div></details>';
