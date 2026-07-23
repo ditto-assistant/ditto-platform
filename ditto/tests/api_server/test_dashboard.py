@@ -389,18 +389,17 @@ class TestDashboard:
         assert 'id="harness-comparison-title">How far miners have taken memory' in body
         assert "Reference only · no emissions" in body
         assert 'data-tooltip="This isolates memory performance.' in body
-        assert 'for="third-party-harness-filter">Third-party harness' in body
+        assert 'id="third-party-harness-filter"' not in body
         assert '<details class="harness-comparison-method">' in body
         assert "Method and comparability caveats" in body
-        assert 'value="hermes">Hermes Agent' in body
-        assert 'value="openclaw">OpenClaw' in body
+        assert "Hermes Agent and OpenClaw reference runs" in body
+        assert "Both third-party references appear below on the same 0–1 scale" in body
         assert "var THIRD_PARTY_HARNESSES = [{" in body
         assert "memoryMean: 0.3020833333333333" in body
         assert "baselineMemoryMean: 0.2604166666666667" in body
         assert 'baselineLabel: "Prior favorable Qwen run"' in body
         assert 'model: "anthropic/claude-sonnet-4.6"' in body
-        assert "modelMismatch: true" in body
-        assert 'evidence.modelMismatch ? "a different model, "' in body
+        assert "Hermes uses a different model from miners and OpenClaw" in body
         assert "memoryCases: 96" in body
         assert "totalCases: 206" in body
         assert 'seed: "3058240546919425205"' in body
@@ -420,6 +419,10 @@ class TestDashboard:
         assert "validator weights, or payouts." in body
         assert "bad82ede7b19f3bb8dc1c03bb77f1bf33f9dab8f" in body
         assert 'subject: "OpenClaw 2026.7.1"' in body
+        assert "THIRD_PARTY_HARNESSES.map(function (evidence, index)" in body
+        assert "index === 0" in body
+        assert "Hermes Agent evidence ↗" not in body
+        assert "esc(evidence.label) + ' evidence ↗</a>'" in body
         assert "memoryMean: 0.4270833333333333" in body
         assert "baselineMemoryMean: 0.3854166666666667" in body
         assert 'baselineLabel: "Native 10-result baseline"' in body
