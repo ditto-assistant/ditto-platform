@@ -1125,7 +1125,20 @@
       --banner-strong: #4d3010;
       --rank-one-text: #754b18;
       --rank-three-text: #814626;
+      /* Benchmark-generation ramp (ordinal: one hue, monotone lightness, light
+         -> dark as contracts advance). The chart interpolates between these two
+         ends in OKLCH, so any number of contracts up to six keeps a legible
+         lightness gap. Both ends and the two reference hues are validated for
+         the ordinal ramp checks, CVD separation against every ramp step, and
+         contrast on this surface. */
+      --era-from: oklch(70% 0.09 340);
+      --era-to: oklch(36% 0.105 340);
+      --ref-hermes: oklch(52% 0.17 75);
+      --ref-openclaw: oklch(52% 0.17 270);
       --radius: 8px;
+      /* Exponential ease-out only: decisive, no bounce. */
+      --ease-out-quart: cubic-bezier(.25, 1, .5, 1);
+      --ease-out-expo: cubic-bezier(.16, 1, .3, 1);
       --display: Georgia, "Times New Roman", serif;
       --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
       --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
@@ -1186,6 +1199,13 @@
       --banner-strong: oklch(92% .08 75);
       --rank-one-text: oklch(84% .1 75);
       --rank-three-text: oklch(78% .08 45);
+      /* Dark is selected, not flipped: the ramp runs dim -> bright here so the
+         newest contract is still the most prominent, re-stepped for the night
+         surface and re-validated against it. */
+      --era-from: oklch(52% 0.085 340);
+      --era-to: oklch(83% 0.105 340);
+      --ref-hermes: oklch(66% 0.17 75);
+      --ref-openclaw: oklch(66% 0.17 270);
     }
 
     html { color-scheme: light; background: var(--bg); }
@@ -1520,25 +1540,76 @@
     .memory-timeline-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-bottom: 10px; color: var(--text-dim); font: 10.5px/1.4 var(--mono); }
     .memory-timeline-legend span { display: inline-flex; align-items: center; gap: 7px; }
     .memory-timeline-legend i { display: inline-block; width: 25px; border-top: 3px solid var(--memory); }
-    .memory-timeline-legend .hermes i { border-color: var(--accent); border-top-style: dashed; }
-    .memory-timeline-legend .openclaw i { border-color: var(--good); border-top-style: dashed; }
+    /* The generation chips carry the ramp, so they are swatches rather than
+       line samples; the two reference series keep their distinct dash. */
+    .memory-timeline-legend .legend-group { gap: 9px; }
+    .memory-timeline-legend .era { gap: 5px; color: var(--text-faint); }
+    .memory-timeline-legend .era i { width: 11px; height: 11px; border: 0; border-radius: 2px; }
+    .memory-timeline-legend .hermes i { border-color: var(--ref-hermes); border-top-style: dashed; }
+    .memory-timeline-legend .openclaw i { border-color: var(--ref-openclaw); border-top-style: dashed; }
     .memory-timeline-frame { position: relative; border: 1px solid var(--border); background: var(--bg-elev-2); overflow-x: auto; overscroll-behavior-inline: contain; }
-    .memory-timeline-svg { display: block; width: 100%; min-width: 760px; height: auto; }
+    .memory-timeline-svg { display: block; width: 100%; height: auto; }
     .timeline-grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
     .timeline-axis-label { fill: var(--text-faint); font: 10px var(--mono); }
+    .timeline-band { fill: color-mix(in oklch, var(--text) 3.5%, transparent); }
     .timeline-release { stroke: color-mix(in oklch, var(--text-faint) 72%, transparent); stroke-width: 1; stroke-dasharray: 4 5; vector-effect: non-scaling-stroke; }
-    .timeline-release-label { fill: var(--text-dim); font: 700 9.5px var(--mono); letter-spacing: .03em; cursor: help; }
-    .timeline-release-label:focus { outline: none; fill: var(--text); text-decoration: underline; }
+    .timeline-era-label { font: 700 12px var(--mono); letter-spacing: .03em; cursor: help; }
+    .timeline-era-label:focus { outline: none; text-decoration: underline; }
+    .timeline-era-date { fill: var(--text-faint); font: 9.5px var(--mono); }
+    /* Entrance. Every animated mark's end state is its resting state and the
+       animation runs on render, so a hidden tab, a headless shot, or reduced
+       motion all show the finished chart rather than a blank frame. The cloud
+       settles first, then the record line draws over it. */
+    .timeline-field { animation: timeline-dot-in .34s var(--ease-out-quart) both; animation-delay: calc(var(--i, 0) * 14ms); }
+    @keyframes timeline-dot-in { from { opacity: 0; transform: scale(.4); } }
+    .timeline-field { transform-box: fill-box; transform-origin: center; }
+    .timeline-path.miner { stroke-dasharray: 1; animation: timeline-draw .75s var(--ease-out-expo) both; animation-delay: .18s; }
+    @keyframes timeline-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+    .timeline-path.hermes, .timeline-path.openclaw { animation: timeline-mark-in .5s var(--ease-out-quart) both; animation-delay: .34s; }
+    .timeline-point, .timeline-champion-halo, .timeline-champion-ring,
+    .timeline-champion-drop, .timeline-champion-plate {
+      animation: timeline-mark-in .4s var(--ease-out-quart) both; animation-delay: .5s;
+    }
+    @keyframes timeline-mark-in { from { opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) {
+      .timeline-champion-pulse { display: none; }
+    }
     .timeline-path { fill: none; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
     .timeline-path.miner { stroke: var(--memory); stroke-width: 3.5; }
-    .timeline-path.hermes { stroke: var(--accent); stroke-width: 2.5; stroke-dasharray: 7 5; }
-    .timeline-path.openclaw { stroke: var(--good); stroke-width: 2.5; stroke-dasharray: 3 5; }
-    .timeline-point { stroke: var(--bg-elev); stroke-width: 2; vector-effect: non-scaling-stroke; cursor: help; }
+    .timeline-path.hermes { stroke: var(--ref-hermes); stroke-width: 2.5; stroke-dasharray: 7 5; }
+    .timeline-path.openclaw { stroke: var(--ref-openclaw); stroke-width: 2.5; stroke-dasharray: 3 5; }
+    /* Contract boundary: carries the eye across without claiming the score
+       continued. Muted and dashed against the solid in-era segments. */
+    .timeline-link { fill: none; stroke: color-mix(in oklch, var(--text-faint) 55%, transparent); stroke-width: 2; stroke-dasharray: 2 6; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+    /* The field sits behind the record line: same generation hue, low opacity,
+       small radius, so it reads as density rather than competing marks. Hover
+       brings one back to full strength without lifting the whole cloud. */
+    .timeline-field { opacity: .2; stroke: none; cursor: help; transition: opacity .14s var(--ease-out-quart); }
+    .timeline-field:hover { opacity: .95; }
+    .timeline-field.champion { opacity: 1; }
+    /* Champion: halo, drop line, and a slow pulse. The pulse is the only looping
+       motion on the page and it marks live state (who holds the crown). */
+    .timeline-champion-halo { fill: color-mix(in oklch, var(--gold) 22%, transparent); }
+    .timeline-champion-drop { stroke: color-mix(in oklch, var(--gold) 42%, transparent); stroke-width: 1; stroke-dasharray: 2 4; vector-effect: non-scaling-stroke; }
+    .timeline-champion-ring { fill: none; stroke: var(--gold); stroke-width: 2.5; vector-effect: non-scaling-stroke; }
+    .timeline-champion-pulse { fill: none; stroke: var(--gold); stroke-width: 2; vector-effect: non-scaling-stroke; transform-box: fill-box; transform-origin: center; animation: timeline-pulse 3.2s var(--ease-out-quart) infinite; }
+    @keyframes timeline-pulse {
+      0% { transform: scale(1); opacity: .5; }
+      70%, 100% { transform: scale(2.1); opacity: 0; }
+    }
+    .timeline-champion-plate rect { fill: var(--bg); stroke: color-mix(in oklch, var(--gold) 62%, transparent); stroke-width: 1; vector-effect: non-scaling-stroke; }
+    .timeline-champion-plate text { fill: var(--gold); font: 700 11px var(--mono); letter-spacing: .02em; }
+    .timeline-champion-plate .crown-score { fill: var(--text); font-variant-numeric: tabular-nums; }
+    .timeline-champion-plate { cursor: help; }
+    .timeline-champion-plate:focus { outline: none; }
+    .timeline-champion-plate:focus rect { stroke: var(--text); stroke-width: 2; }
+    .timeline-point { stroke: var(--bg-elev-2); stroke-width: 2; vector-effect: non-scaling-stroke; cursor: help; }
     .timeline-point.miner { fill: var(--memory); }
-    .timeline-point.hermes { fill: var(--accent); }
-    .timeline-point.openclaw { fill: var(--good); }
+    .timeline-point.hermes { fill: var(--ref-hermes); }
+    .timeline-point.openclaw { fill: var(--ref-openclaw); }
     .timeline-point:focus { outline: none; stroke: var(--text); stroke-width: 3.5; }
-    .memory-timeline-tooltip { position: absolute; z-index: 3; max-width: 270px; padding: 9px 11px; border: 1px solid var(--border-strong); border-radius: 3px; background: var(--bg); color: var(--text); box-shadow: var(--shadow); font: 11px/1.45 var(--mono); pointer-events: none; transform: translate(-50%, calc(-100% - 10px)); }
+    .memory-timeline-tooltip { position: absolute; z-index: 3; width: max-content; max-width: min(270px, 78%); padding: 9px 11px; border: 1px solid var(--border-strong); border-radius: 3px; background: var(--bg); color: var(--text); box-shadow: var(--shadow); font: 11px/1.45 var(--mono); pointer-events: none; transform: translate(-50%, calc(-100% - 10px)); }
+    .memory-timeline-tooltip.below { transform: translate(-50%, 10px); }
     .memory-timeline-note { margin: 10px 0 0; color: var(--text-faint); font-size: 11px; line-height: 1.5; }
     .timeline-data-details { margin-top: 13px; color: var(--text-dim); font-size: 11.5px; }
     .timeline-data-details > summary { width: fit-content; color: var(--text); font-weight: 700; cursor: pointer; }
@@ -2203,6 +2274,25 @@
     </div>
 
     <section class="page active" data-page="overview">
+      <section class="harness-comparison" aria-labelledby="harness-comparison-title">
+        <div class="harness-comparison-head">
+          <div class="harness-comparison-title">
+            <h2 id="harness-comparison-title">How far miners have taken memory</h2>
+            <p class="harness-comparison-lead"><span class="tip" tabindex="0" data-tooltip="This isolates memory performance. The public leaderboard ranks agents by the full composite, not this subscore alone.">Memory subscores only</span>. Follow the best finalized miner as each benchmark generation unfolds, with Hermes Agent and OpenClaw measured retrospectively on every contract.</p>
+          </div>
+        </div>
+        <div class="harness-comparison-body">
+          <div id="harness-comparison-chart" class="harness-comparison-state">Loading the benchmark memory timeline…</div>
+          <details class="harness-comparison-method">
+            <summary>Method and comparability caveats</summary>
+            <div class="harness-comparison-method-body">
+              <p id="harness-comparison-method">Third-party harnesses are off-network reference runs. They never enter score rank, KOTH, validator weights, or payouts.</p>
+              <div id="harness-comparison-evidence" class="harness-comparison-evidence-links"></div>
+            </div>
+          </details>
+        </div>
+      </section>
+
     <section class="cards" id="cards" aria-labelledby="snapshot-title">
       <h2 class="visually-hidden" id="snapshot-title">Subnet snapshot</h2>
       <div class="card primary"><div class="label">Miners total</div><div class="value" id="h-miners">–</div><div class="context">Distinct miners who have submitted to Subnet 118.</div></div>
@@ -2489,26 +2579,6 @@
         </div>
       </div>
 
-      <section class="harness-comparison" aria-labelledby="harness-comparison-title">
-        <div class="harness-comparison-head">
-          <div class="harness-comparison-title">
-            <div class="harness-comparison-kicker">Independent comparison <span class="reference-badge">Reference only · no emissions</span></div>
-            <h2 id="harness-comparison-title">How far miners have taken memory</h2>
-            <p class="harness-comparison-lead"><span class="tip" tabindex="0" data-tooltip="This isolates memory performance. The public leaderboard ranks agents by the full composite, not this subscore alone.">Memory subscores only</span>. Follow the best finalized miner as each benchmark era unfolds, with Hermes Agent and OpenClaw measured retrospectively on contracts v2 through v6.</p>
-          </div>
-        </div>
-        <div class="harness-comparison-body">
-          <div id="harness-comparison-chart" class="harness-comparison-state">Loading the benchmark memory timeline…</div>
-          <details class="harness-comparison-method">
-            <summary>Method and comparability caveats</summary>
-            <div class="harness-comparison-method-body">
-              <p id="harness-comparison-method">Third-party harnesses are off-network reference runs. They never enter score rank, KOTH, validator weights, or payouts.</p>
-              <div id="harness-comparison-evidence" class="harness-comparison-evidence-links"></div>
-            </div>
-          </details>
-        </div>
-      </section>
-
       <div class="benchmark-reference" aria-label="Benchmark reference material">
       <details class="bench-disclosure" id="scoring-explainer">
         <summary><span class="bench-disclosure-title"><strong>How a score becomes emissions</strong><span>Scoring, eligibility, versioning, and KOTH rules</span></span><span class="bench-disclosure-icon" aria-hidden="true"></span></summary>
@@ -2663,6 +2733,9 @@
     var lastEntries = [];
     var lastLeaderboardData = null;
     var lastChainWeights = null;
+    // Kept so the memory timeline can crown the reigning champion; the timeline
+    // renders on its own cadence and does not receive the leaderboard payload.
+    var lastEmissions = null;
     var lastActivityEntries = [];
     var pipelineEntries = [];
     var pipelineLoaded = false;
@@ -3600,14 +3673,23 @@
     var TIMELINE_DATE = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
     function timelineDate(value) { return TIMELINE_DATE.format(new Date(value)); }
     function releaseTime(release) { return Date.parse(release.released_at); }
-    function timelinePath(points, x, y) {
+    // Every contract rescores from scratch, so a wall-clock axis is the wrong
+    // shape for this data: v3 and v5 each lasted hours while v4 ran for days,
+    // and on a linear time scale those short eras collapsed into slivers of
+    // unreadable dots. Give every contract an equal band instead and order the
+    // points inside it. The axis reads "progress per generation", not clock
+    // time; exact timestamps stay in the tooltip and the data table.
+    var TIMELINE_MAX_ERAS = 6;
+    function timelinePath(points) {
       return points.map(function (point, index) {
-        return (index ? "L" : "M") + x(point.at).toFixed(2) + " " + y(point.score).toFixed(2);
+        return (index ? "L" : "M") + point.x.toFixed(2) + " " + point.y.toFixed(2);
       }).join(" ");
     }
-    function timelinePoint(point, series, x, y) {
+    function timelinePoint(point, series, color, radius) {
       var label = point.tooltip;
-      return '<circle class="timeline-point ' + series + '" cx="' + x(point.at).toFixed(2) + '" cy="' + y(point.score).toFixed(2) + '" r="5" tabindex="0" role="img" aria-label="' + esc(label) + '" data-timeline-tooltip="' + esc(label) + '"><title>' + esc(label) + '</title></circle>';
+      return '<circle class="timeline-point ' + series + '" cx="' + point.x.toFixed(2) + '" cy="' + point.y.toFixed(2) +
+        '" r="' + (radius || 5) + '"' + (color ? ' style="fill:' + color + '"' : "") +
+        ' tabindex="0" role="img" aria-label="' + esc(label) + '" data-timeline-tooltip="' + esc(label) + '"><title>' + esc(label) + '</title></circle>';
     }
     function bindTimelineTooltips(target) {
       var frame = target.querySelector(".memory-timeline-frame");
@@ -3617,9 +3699,21 @@
         var pointRect = node.getBoundingClientRect();
         var frameRect = frame.getBoundingClientRect();
         tooltip.textContent = node.getAttribute("data-timeline-tooltip") || "";
-        tooltip.style.left = (pointRect.left - frameRect.left + frame.scrollLeft + pointRect.width / 2) + "px";
-        tooltip.style.top = (pointRect.top - frameRect.top + frame.scrollTop) + "px";
         tooltip.hidden = false;
+        // Measure after the text is in, then clamp inside the frame. The tooltip
+        // is centred on its point and the frame is a scroll container, so a
+        // point near either edge used to push the box out of view where it was
+        // clipped instead of read.
+        var half = tooltip.offsetWidth / 2;
+        var centre = pointRect.left - frameRect.left + frame.scrollLeft + pointRect.width / 2;
+        var lo = frame.scrollLeft + half + 6;
+        var hi = frame.scrollLeft + frame.clientWidth - half - 6;
+        tooltip.style.left = (hi < lo ? centre : Math.min(Math.max(centre, lo), hi)) + "px";
+        // Flip below the point when there is no room above it.
+        var above = pointRect.top - frameRect.top + frame.scrollTop;
+        var flip = above - tooltip.offsetHeight - 10 < frame.scrollTop;
+        tooltip.classList.toggle("below", flip);
+        tooltip.style.top = (flip ? above + pointRect.height : above) + "px";
       }
       function hide() { tooltip.hidden = true; }
       frame.querySelectorAll("[data-timeline-tooltip]").forEach(function (node) {
@@ -3632,11 +3726,18 @@
 
     function renderMemoryTimeline(data) {
       var target = document.getElementById("harness-comparison-chart");
-      var releases = (data && data.releases || []).filter(function (release) {
-        return Number(release.bench_version) >= 2 && Number(release.bench_version) <= 6;
+      var allReleases = (data && data.releases || []).filter(function (release) {
+        return Number(release.bench_version) >= 2;
       }).sort(function (a, b) { return Number(a.bench_version) - Number(b.bench_version); });
+      // The generation ramp is validated for up to six steps; past that the
+      // lightness gap between adjacent contracts drops below the legible floor,
+      // so window to the most recent six rather than silently muddying it.
+      var releases = allReleases.slice(-TIMELINE_MAX_ERAS);
+      var shownVersions = {};
+      releases.forEach(function (release) { shownVersions[Number(release.bench_version)] = true; });
       var minerPoints = (data && data.points || []).filter(function (point) {
-        return Number.isFinite(Number(point.memory_mean)) && Date.parse(point.recorded_at);
+        return shownVersions[Number(point.bench_version)] &&
+          Number.isFinite(Number(point.memory_mean)) && Date.parse(point.recorded_at);
       }).sort(function (a, b) { return Date.parse(a.recorded_at) - Date.parse(b.recorded_at); }).map(function (point) {
         var name = agentName(point.agent_name);
         return {
@@ -3650,8 +3751,8 @@
         return '<a href="' + esc(evidence.evidenceUrl) + '" target="_blank" rel="noopener">' + esc(evidence.label) + ' evidence ↗</a>';
       }).join("");
       document.getElementById("harness-comparison-method").textContent =
-        "The miner line is the running high of finalized three-validator memory medians within each benchmark version; points use their actual scoring completion time. Hermes and OpenClaw are single-seed off-network practice runs measured on " +
-        THIRD_PARTY_HARNESSES[0].measuredAt + " with the same Qwen3-32B model, pinned OpenRouter/Nebius route, and seed. Their points are positioned at each immutable contract's release date for comparison, not presented as historical measurements. Version changes are not all monotonic difficulty increases: v4 corrects v3 false positives. Third-party harnesses never enter score rank, KOTH, validator weights, or payouts.";
+        "The miner line is the running high of finalized three-validator memory medians within each benchmark version; points are ordered by their actual scoring completion time. The horizontal axis gives every contract an equal band rather than equal clock time, because contracts ran for very different durations and the short ones were unreadable on a wall-clock scale. Hermes and OpenClaw are single-seed off-network practice runs measured on " +
+        THIRD_PARTY_HARNESSES[0].measuredAt + " with the same Qwen3-32B model, pinned OpenRouter/Nebius route, and seed. Their points are positioned in each immutable contract's band for comparison, not presented as historical measurements. Version changes are not all monotonic difficulty increases: v4 corrects v3 false positives. Third-party harnesses never enter score rank, KOTH, validator weights, or payouts.";
 
       if (!releases.length) {
         target.className = "harness-comparison-state";
@@ -3659,77 +3760,179 @@
         return;
       }
 
-      var releaseByVersion = {};
-      releases.forEach(function (release) { releaseByVersion[Number(release.bench_version)] = release; });
+      var eras = releases.map(function (release, index) {
+        return { version: Number(release.bench_version), release: release, at: releaseTime(release), index: index, points: [] };
+      });
+      var eraByVersion = {};
+      eras.forEach(function (era) { eraByVersion[era.version] = era; });
+      minerPoints.forEach(function (point) {
+        var era = eraByVersion[point.version];
+        if (era) era.points.push(point);
+      });
+
+      // The viewBox is measured, not fixed. A fixed 960-unit box scaled down to
+      // a phone shrinks every label with it: 10px type renders at 4px and the
+      // axis becomes unreadable. Laying the chart out at roughly one unit per
+      // CSS pixel keeps type at its real size and re-flows the plot instead of
+      // squashing it, so the chart adapts structurally at every width.
+      var measured = Math.round((target.clientWidth || 960) - 2);
+      timelineRenderedWidth = measured;
+      var width = Math.max(300, Math.min(1200, measured || 960));
+      var narrow = width < 560, tight = width < 400;
+      var height = narrow
+        ? Math.max(300, Math.round(width * 0.86))
+        : Math.max(340, Math.min(470, Math.round(width * 0.42)));
+      var left = tight ? 32 : narrow ? 40 : 58;
+      var right = narrow ? 14 : 26;
+      var top = narrow ? 22 : 30;
+      var bottom = narrow ? 52 : 62;
+      var plotWidth = width - left - right, plotHeight = height - top - bottom;
+      var bandWidth = plotWidth / eras.length;
+      var inset = Math.min(bandWidth * 0.2, narrow ? 14 : 40);
+      var ticks = narrow ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1];
+      var dotR = narrow ? 2.1 : 2.6, recordR = narrow ? 3.6 : 5;
+      function bandStart(index) { return left + index * bandWidth; }
+      function bandCenter(index) { return left + (index + 0.5) * bandWidth; }
+      function y(value) { return top + (1 - value) * plotHeight; }
+      // Points spread left-to-right inside their own band in scoring order.
+      function placeInBand(era, i, n) {
+        if (n <= 1) return bandCenter(era.index);
+        return bandStart(era.index) + inset + i * (bandWidth - 2 * inset) / (n - 1);
+      }
+      // One ordinal ramp, interpolated in OKLCH between two theme-aware ends, so
+      // the reader sees the generation order in the colour itself and the ramp
+      // keeps working when a new contract ships.
+      function eraColor(index) {
+        if (eras.length <= 1) return "var(--era-to)";
+        return "color-mix(in oklch, var(--era-to) " + Math.round(index / (eras.length - 1) * 100) + "%, var(--era-from))";
+      }
+      eras.forEach(function (era) {
+        era.color = eraColor(era.index);
+        era.points.forEach(function (point, i) {
+          point.x = placeInBand(era, i, era.points.length);
+          point.y = y(point.score);
+        });
+      });
+
       var externalSeries = THIRD_PARTY_HARNESSES.map(function (evidence) {
         return {
           id: evidence.id,
           evidence: evidence,
           points: (evidence.points || []).filter(function (point) {
-            return releaseByVersion[Number(point.benchVersion)] && Number.isFinite(Number(point.memoryMean));
+            return eraByVersion[Number(point.benchVersion)] && Number.isFinite(Number(point.memoryMean));
           }).map(function (point) {
-            var release = releaseByVersion[Number(point.benchVersion)];
+            var era = eraByVersion[Number(point.benchVersion)];
             return {
-              at: releaseTime(release), score: Number(point.memoryMean), version: Number(point.benchVersion),
+              at: era.at, score: Number(point.memoryMean), version: era.version,
+              x: bandCenter(era.index), y: y(Number(point.memoryMean)),
               tooltip: evidence.subject + " · v" + point.benchVersion + " · memory " + fx(Number(point.memoryMean)) + " (" + point.memoryCorrect + "/" + point.memoryCases + ") · measured " + evidence.measuredAt,
               source: evidence.subject, measured: evidence.measuredAt, runId: point.runId
             };
-          }).sort(function (a, b) { return a.at - b.at || a.version - b.version; })
+          }).sort(function (a, b) { return a.version - b.version; })
         };
       });
-      var allTimes = releases.map(releaseTime).concat(minerPoints.map(function (point) { return point.at; }));
-      var minTime = Math.min.apply(Math, allTimes);
-      var maxTime = Math.max.apply(Math, allTimes);
-      var timePad = Math.max((maxTime - minTime) * 0.035, 6 * 60 * 60 * 1000);
-      minTime -= timePad;
-      maxTime += timePad;
-      var width = 960, height = 430, left = 58, right = 26, top = 48, bottom = 55;
-      var plotWidth = width - left - right, plotHeight = height - top - bottom;
-      function x(value) { return left + (value - minTime) / (maxTime - minTime) * plotWidth; }
-      function y(value) { return top + (1 - value) * plotHeight; }
+
+      // The whole field for each contract, ordered by upload time so the cloud
+      // reads left-to-right like the records above it. Champion is looked up by
+      // hotkey from the live emissions payload.
+      var championHotkey = lastEmissions ? lastEmissions.champion_miner_hotkey : null;
+      var fieldCount = 0, championDot = null;
+      eras.forEach(function (era) {
+        var field = (memoryFieldByVersion[era.version] || []).slice()
+          .sort(function (a, b) { return a.firstSeen - b.firstSeen || a.score - b.score; });
+        fieldCount += field.length;
+        era.field = field.map(function (entry, i) {
+          var point = {
+            x: placeInBand(era, i, field.length), y: y(entry.score), entry: entry,
+            tooltip: entry.name + " · v" + era.version + " · memory " + fx(entry.score) + " · composite " + fx(entry.composite)
+          };
+          if (championHotkey && entry.hotkey === championHotkey) point.champion = true;
+          if (point.champion && era.index === eras.length - 1) championDot = { point: point, era: era, entry: entry };
+          return point;
+        });
+      });
 
       var svg = [];
-      [0, 0.25, 0.5, 0.75, 1].forEach(function (tick) {
+      // Alternating band tints make the generation boundaries readable without
+      // adding another line to the plot.
+      eras.forEach(function (era) {
+        if (era.index % 2) {
+          svg.push('<rect class="timeline-band" x="' + bandStart(era.index).toFixed(2) + '" y="' + top + '" width="' + bandWidth.toFixed(2) + '" height="' + plotHeight + '"></rect>');
+        }
+      });
+      ticks.forEach(function (tick) {
         svg.push('<line class="timeline-grid" x1="' + left + '" x2="' + (width - right) + '" y1="' + y(tick) + '" y2="' + y(tick) + '"></line>');
         svg.push('<text class="timeline-axis-label" x="' + (left - 10) + '" y="' + (y(tick) + 3) + '" text-anchor="end">' + tick.toFixed(2).replace(/^0/, "") + '</text>');
       });
-      // Labels sit right of their dashed line, or flip left near the right
-      // edge so they never clip. Rows track occupied extents (not just start
-      // x) so a flipped label still staggers below its neighbors.
-      var releaseLabelWidth = 72;
-      var releaseLabelRowEnds = [];
-      releases.forEach(function (release) {
-        var at = releaseTime(release);
-        var releaseX = x(at);
-        var flip = releaseX + 5 + releaseLabelWidth > width - right;
-        var labelStart = flip ? releaseX - 5 - releaseLabelWidth : releaseX + 5;
-        var depth = 0;
-        while (depth < releaseLabelRowEnds.length && labelStart < releaseLabelRowEnds[depth] + 10) depth += 1;
-        releaseLabelRowEnds[depth] = labelStart + releaseLabelWidth;
-        var releaseTooltip = "DittoBench v" + release.bench_version + " · " + release.title + " · released " + timelineDate(release.released_at) + (release.activated_at ? " · activated " + timelineDate(release.activated_at) : "");
-        svg.push('<line class="timeline-release" x1="' + releaseX + '" x2="' + releaseX + '" y1="' + top + '" y2="' + (height - bottom) + '"></line>');
-        svg.push('<text class="timeline-release-label" x="' + (flip ? releaseX - 5 : releaseX + 5) + '" y="' + (18 + depth * 13) + '"' + (flip ? ' text-anchor="end"' : '') + ' tabindex="0" role="img" aria-label="' + esc(releaseTooltip) + '" data-timeline-tooltip="' + esc(releaseTooltip) + '">v' + esc(release.bench_version) + ' · ' + esc(timelineDate(release.released_at)) + '<title>' + esc(releaseTooltip) + '</title></text>');
+      eras.forEach(function (era) {
+        if (era.index) {
+          svg.push('<line class="timeline-release" x1="' + bandStart(era.index).toFixed(2) + '" x2="' + bandStart(era.index).toFixed(2) + '" y1="' + top + '" y2="' + (height - bottom) + '"></line>');
+        }
+        var releaseTooltip = "DittoBench v" + era.version + " · " + era.release.title + " · released " + timelineDate(era.release.released_at) +
+          (era.release.activated_at ? " · activated " + timelineDate(era.release.activated_at) : "") +
+          " · " + era.points.length + (era.points.length === 1 ? " record" : " records");
+        svg.push('<text class="timeline-era-label" x="' + bandCenter(era.index).toFixed(2) + '" y="' + (height - bottom + (narrow ? 20 : 22)) + '" text-anchor="middle" style="fill:' + era.color + '" tabindex="0" role="img" aria-label="' + esc(releaseTooltip) + '" data-timeline-tooltip="' + esc(releaseTooltip) + '">v' + esc(era.version) + '<title>' + esc(releaseTooltip) + '</title></text>');
+        svg.push('<text class="timeline-era-date" x="' + bandCenter(era.index).toFixed(2) + '" y="' + (height - bottom + (narrow ? 34 : 38)) + '" text-anchor="middle">' + esc(timelineDate(era.release.released_at)) + '</text>');
       });
-      // The running high resets at every contract release, and late rescoring
-      // interleaves eras in wall-clock time, so one chronological line would
-      // zigzag. Draw an independent segment per benchmark version instead.
-      var minerEraByVersion = {};
-      var minerEras = [];
-      minerPoints.forEach(function (point) {
-        var era = minerEraByVersion[point.version];
-        if (!era) { era = minerEraByVersion[point.version] = []; minerEras.push(era); }
-        era.push(point);
+
+      // Field first so the record line and its points always sit on top of the
+      // cloud rather than disappearing into it.
+      eras.forEach(function (era) {
+        (era.field || []).forEach(function (point, i) {
+          svg.push('<circle class="timeline-field' + (point.champion ? " champion" : "") + '" cx="' + point.x.toFixed(2) + '" cy="' + point.y.toFixed(2) +
+            '" r="' + (point.champion ? recordR + 1 : dotR) + '" style="fill:' + era.color + '; --i:' + Math.min(i, 28) + '" role="img" aria-label="' + esc(point.tooltip) + '" data-timeline-tooltip="' + esc(point.tooltip) + '"><title>' + esc(point.tooltip) + '</title></circle>');
+        });
       });
-      minerEras.forEach(function (era) {
-        if (era.length > 1) svg.push('<path class="timeline-path miner" d="' + timelinePath(era, x, y) + '"></path>');
+
+      // Carry the eye across the contract boundary without pretending the score
+      // continued: the connector is muted and dashed, the era segments are solid.
+      var populated = eras.filter(function (era) { return era.points.length; });
+      populated.forEach(function (era, i) {
+        var next = populated[i + 1];
+        if (!next) return;
+        var from = era.points[era.points.length - 1], to = next.points[0];
+        svg.push('<path class="timeline-link" d="M' + from.x.toFixed(2) + ' ' + from.y.toFixed(2) + 'L' + to.x.toFixed(2) + ' ' + to.y.toFixed(2) + '"></path>');
       });
-      minerPoints.forEach(function (point) { svg.push(timelinePoint(point, "miner", x, y)); });
+      populated.forEach(function (era) {
+        if (era.points.length > 1) {
+          svg.push('<path class="timeline-path miner" pathLength="1" d="' + timelinePath(era.points) + '" style="stroke:' + era.color + '"></path>');
+        }
+      });
       externalSeries.forEach(function (series) {
-        if (series.points.length > 1) svg.push('<path class="timeline-path ' + series.id + '" d="' + timelinePath(series.points, x, y) + '"></path>');
-        series.points.forEach(function (point) { svg.push(timelinePoint(point, series.id, x, y)); });
+        if (series.points.length > 1) svg.push('<path class="timeline-path ' + series.id + '" d="' + timelinePath(series.points) + '"></path>');
+        series.points.forEach(function (point) { svg.push(timelinePoint(point, series.id, "", recordR)); });
       });
-      svg.push('<text class="timeline-axis-label" x="' + left + '" y="' + (height - 18) + '">' + esc(timelineDate(minTime)) + '</text>');
-      svg.push('<text class="timeline-axis-label" x="' + (width - right) + '" y="' + (height - 18) + '" text-anchor="end">' + esc(timelineDate(maxTime)) + '</text>');
+      populated.forEach(function (era) {
+        era.points.forEach(function (point) { svg.push(timelinePoint(point, "miner", era.color, recordR)); });
+      });
+      // Crown the reigning champion. Who holds the crown is the single piece of
+      // state this chart exists to show, so it gets the loudest treatment on the
+      // plot: a halo, a drop line to its own contract, a slow pulse, and a named
+      // plate carrying the score. Identity never rests on colour alone.
+      if (championDot) {
+        var cx = championDot.point.x, cy = championDot.point.y;
+        var crownName = championDot.entry.name;
+        var crownScore = fx(championDot.entry.score);
+        // Monospace, so width is countable: name + the crown glyph and its
+        // space, plus room for the right-aligned score and the gap between.
+        var plateW = Math.min(Math.max((crownName.length + 2) * 6.7 + 74, 124), Math.max(plotWidth - 8, 110));
+        var plateH = 21;
+        // Prefer the side with room; on a phone the plate sits above the point.
+        var placeLeft = cx + 14 + plateW > width - right;
+        var plateX = narrow
+          ? Math.min(Math.max(cx - plateW / 2, left + 2), width - right - plateW - 2)
+          : (placeLeft ? cx - 14 - plateW : cx + 14);
+        var plateY = narrow ? Math.max(top + 2, cy - 34) : cy - plateH / 2;
+        svg.push('<line class="timeline-champion-drop" x1="' + cx.toFixed(2) + '" x2="' + cx.toFixed(2) + '" y1="' + (cy + 8).toFixed(2) + '" y2="' + (height - bottom) + '"></line>');
+        svg.push('<circle class="timeline-champion-halo" cx="' + cx.toFixed(2) + '" cy="' + cy.toFixed(2) + '" r="' + (recordR + 13) + '"></circle>');
+        svg.push('<circle class="timeline-champion-pulse" cx="' + cx.toFixed(2) + '" cy="' + cy.toFixed(2) + '" r="' + (recordR + 5) + '"></circle>');
+        svg.push('<circle class="timeline-champion-ring" cx="' + cx.toFixed(2) + '" cy="' + cy.toFixed(2) + '" r="' + (recordR + 5) + '"></circle>');
+        svg.push('<g class="timeline-champion-plate" tabindex="0" role="img" aria-label="' + esc("Reigning champion " + crownName + ", memory " + crownScore) + '" data-timeline-tooltip="' + esc("Reigning champion · " + crownName + " · memory " + crownScore) + '">' +
+          '<rect x="' + plateX.toFixed(2) + '" y="' + plateY.toFixed(2) + '" width="' + plateW.toFixed(2) + '" height="' + plateH + '" rx="3"></rect>' +
+          '<text x="' + (plateX + 9).toFixed(2) + '" y="' + (plateY + 14.5).toFixed(2) + '">♛ ' + esc(crownName) + '</text>' +
+          '<text class="crown-score" x="' + (plateX + plateW - 9).toFixed(2) + '" y="' + (plateY + 14.5).toFixed(2) + '" text-anchor="end">' + esc(crownScore) + '</text>' +
+          '<title>' + esc("Reigning champion · " + crownName + " · memory " + crownScore) + '</title></g>');
+      }
 
       var latestMiner = minerPoints.length ? minerPoints[minerPoints.length - 1] : null;
       var latestReferences = externalSeries.map(function (series) { return series.points[series.points.length - 1]; }).filter(Boolean);
@@ -3742,17 +3945,74 @@
         });
       });
       rows.sort(function (a, b) { return a.version - b.version || b.score - a.score || a.source.localeCompare(b.source); });
+      var eraLegend = eras.map(function (era) {
+        return '<span class="era"><i style="background:' + era.color + '"></i>v' + esc(era.version) + '</span>';
+      }).join("");
       target.className = "";
-      target.innerHTML = '<p class="harness-comparison-summary"><span><strong>' + minerPoints.length + '</strong> miner record points</span>' +
+      target.innerHTML = '<p class="harness-comparison-summary">' +
+        (fieldCount ? '<span><strong>' + fieldCount + '</strong> scored runs</span>' : "") +
+        '<span><strong>' + minerPoints.length + '</strong> records</span>' +
         (latestMiner ? '<span>Latest record <strong>' + fx(latestMiner.score) + '</strong> on v' + latestMiner.version + '</span>' : '<span>Miner history is not yet available</span>') +
         '<span><strong>' + latestReferences.length + '</strong> native reference series</span></p>' +
-        '<div class="memory-timeline-legend" aria-label="Timeline legend"><span><i></i>Best finalized miner</span><span class="hermes"><i></i>Hermes Agent</span><span class="openclaw"><i></i>OpenClaw</span></div>' +
-        '<div class="memory-timeline-frame" tabindex="0" role="region" aria-label="Memory-score timeline, horizontally scrollable on small screens"><svg class="memory-timeline-svg" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-labelledby="memory-timeline-title memory-timeline-desc"><title id="memory-timeline-title">Best miner memory score with Hermes and OpenClaw across DittoBench v2 through v6</title><desc id="memory-timeline-desc">A time series from zero to one. Vertical dashed lines mark benchmark releases. The miner line breaks at each release because every contract rescores from scratch. Third-party points are retrospective measurements aligned to those dates.</desc>' + svg.join("") + '</svg><div class="memory-timeline-tooltip" role="tooltip" hidden></div></div>' +
-        '<p class="memory-timeline-note">Release markers show contract dates; the miner line restarts at each one because every contract rescores from scratch. Third-party points were all measured on ' + esc(THIRD_PARTY_HARNESSES[0].measuredAt) + ' and are aligned to those dates; hover or focus a point for its exact condition.</p>' +
+        '<div class="memory-timeline-legend" aria-label="Timeline legend"><span class="legend-group">Best finalized miner' + eraLegend + '</span><span class="hermes"><i></i>Hermes Agent</span><span class="openclaw"><i></i>OpenClaw</span></div>' +
+        '<div class="memory-timeline-frame" tabindex="0" role="region" aria-label="Memory-score timeline, horizontally scrollable on small screens"><svg class="memory-timeline-svg" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-labelledby="memory-timeline-title memory-timeline-desc"><title id="memory-timeline-title">Best miner memory score with Hermes and OpenClaw across DittoBench v' + eras[0].version + ' through v' + eras[eras.length - 1].version + '</title><desc id="memory-timeline-desc">Memory score from zero to one. Each benchmark contract occupies an equal band across the horizontal axis, coloured light to dark as the generations advance, with its records ordered left to right inside the band. A muted dashed connector crosses each contract boundary because every contract rescores from scratch. Third-party points are retrospective measurements placed in each contract band.</desc>' + svg.join("") + '</svg><div class="memory-timeline-tooltip" role="tooltip" hidden></div></div>' +
+        '<p class="memory-timeline-note">Faded dots are every finalized run on that contract, ordered by upload; the solid line traces the record as it was beaten. Each contract gets an equal band, not equal clock time, so a generation that ran for hours stays as readable as one that ran for days. The dashed step between bands marks a contract change, where every agent rescores from scratch. Third-party points were all measured on ' + esc(THIRD_PARTY_HARNESSES[0].measuredAt) + '; hover or focus any point for its exact date and condition.</p>' +
         '<details class="timeline-data-details"><summary>Exact timeline data</summary><div class="timeline-data-table-wrap"><table class="timeline-data-table"><thead><tr><th>Series</th><th>Contract</th><th>Placed at</th><th>Measured</th><th>Memory</th></tr></thead><tbody>' +
         rows.map(function (row) { return '<tr><td>' + (row.agentId ? entityAnchor("agent", row.agentId, row.source) : esc(row.source)) + '</td><td>v' + esc(row.version) + '</td><td>' + esc(row.placed) + '</td><td>' + esc(row.measured) + '</td><td>' + fx(row.score) + '</td></tr>'; }).join("") +
         '</tbody></table></div></details>';
       bindTimelineTooltips(target);
+    }
+
+    // The record line alone hides the shape of the competition: the field is
+    // what shows a whole subnet climbing. Every contract's full finalized board
+    // is already public per bench_version, so the scatter needs no new endpoint.
+    // Settled contracts are immutable, so each is fetched once and kept; only
+    // the newest board is allowed to refetch.
+    var memoryFieldByVersion = {};
+    var memoryFieldNewest = null;
+    function loadMemoryField(versions, activeVersion) {
+      var wanted = versions.filter(function (version) {
+        return !memoryFieldByVersion[version] || version === activeVersion;
+      });
+      if (!wanted.length) return Promise.resolve(memoryFieldByVersion);
+      return poolMap(wanted, 3, function (version) {
+        return getJSON("/public/leaderboard?bench_version=" + version)
+          .then(function (board) {
+            memoryFieldByVersion[version] = (board && board.entries || []).filter(function (entry) {
+              return entry.finalized !== false && Number.isFinite(Number(entry.memory_mean));
+            }).map(function (entry) {
+              return {
+                version: version,
+                score: Number(entry.memory_mean),
+                composite: Number(entry.composite),
+                name: agentName(entry.agent_name),
+                agentId: entry.agent_id,
+                hotkey: entry.miner_hotkey,
+                firstSeen: Date.parse(entry.first_seen) || 0
+              };
+            });
+            if (version === activeVersion) memoryFieldNewest = version;
+          })
+          .catch(function () { /* a missing board just means no cloud for that band */ });
+      }).then(function () { return memoryFieldByVersion; });
+    }
+
+    // The chart lays itself out to its measured width, so a resize (or a phone
+    // rotating) has to re-render rather than stretch. Only a material width
+    // change re-renders, so dragging a window edge does not thrash the DOM.
+    var timelineRenderedWidth = 0;
+    function watchTimelineWidth() {
+      var target = document.getElementById("harness-comparison-chart");
+      if (!target || typeof ResizeObserver === "undefined") return;
+      var pending = 0;
+      new ResizeObserver(function (entries) {
+        var next = Math.round(entries[0].contentRect.width);
+        if (!next || Math.abs(next - timelineRenderedWidth) < 12) return;
+        clearTimeout(pending);
+        pending = setTimeout(function () {
+          if (lastMemoryTimelineData) renderMemoryTimeline(lastMemoryTimelineData);
+        }, 120);
+      }).observe(target);
     }
 
     function loadMemoryTimeline() {
@@ -3760,6 +4020,9 @@
         .then(function (data) {
           lastMemoryTimelineData = data;
           renderMemoryTimeline(data);
+          var versions = (data && data.releases || []).map(function (release) { return Number(release.bench_version); });
+          return loadMemoryField(versions, Math.max.apply(Math, versions.concat([0])))
+            .then(function () { renderMemoryTimeline(lastMemoryTimelineData); });
         })
         .catch(function () {
           if (lastMemoryTimelineData) renderMemoryTimeline(lastMemoryTimelineData);
@@ -3920,6 +4183,7 @@
       }
 
       var emissions = data.emissions || null;
+      lastEmissions = emissions;
       var emissionsByAgent = {};
       if (emissions) {
         (emissions.recipients || []).forEach(function (recipient) {
@@ -7762,8 +8026,10 @@
         loadScreeners();
       }
       // The memory timeline is observational and refreshes independently from
-      // the current-rollout leaderboard. Its API is explicitly bounded to v2-v6.
+      // the current-rollout leaderboard. The renderer windows to the most recent
+      // contracts the generation ramp can still separate.
       loadMemoryTimeline();
+      if (!bootComplete) watchTimelineWidth();
       // bench/config is effectively static (max-age 300); refresh at most every
       // 5 minutes, but always on boot and on a manual refresh.
       if (manual || all || Date.now() - benchConfigAt >= 300000) loadBenchConfig();

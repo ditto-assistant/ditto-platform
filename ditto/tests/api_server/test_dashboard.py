@@ -403,9 +403,10 @@ class TestDashboard:
         )
         benchmark_start = body.index('<section class="page" data-page="benchmark">')
         comparison_start = body.index('<section class="harness-comparison"')
-        assert overview_start < benchmark_start < comparison_start
+        # The timeline leads the overview now; it is no longer on the benchmark
+        # page it used to sit at the bottom of.
+        assert overview_start < comparison_start < benchmark_start
         assert 'id="harness-comparison-title">How far miners have taken memory' in body
-        assert "Reference only · no emissions" in body
         assert 'data-tooltip="This isolates memory performance.' in body
         assert 'id="third-party-harness-filter"' not in body
         assert '<details class="harness-comparison-method">' in body
@@ -422,10 +423,7 @@ class TestDashboard:
         assert 'class="timeline-release"' in body
         assert 'class="timeline-data-details"' in body
         assert "Exact timeline data" in body
-        assert (
-            "Their points are positioned at each immutable contract's release date"
-            in body
-        )
+        assert "Their points are positioned in each immutable contract's band" in body
         assert "v4 corrects v3 false positives" in body
         assert "Third-party harnesses never enter score rank, KOTH" in body
         assert "validator weights, or payouts." in body
@@ -435,6 +433,36 @@ class TestDashboard:
         assert "Hermes Agent evidence ↗" not in body
         assert "esc(evidence.label) + ' evidence ↗</a>'" in body
         assert "memory-chart-row" not in body
+        # The kicker above the title was dropped.
+        assert "Reference only · no emissions" not in body
+
+    async def test_memory_timeline_plots_the_field_and_crowns_the_champion(
+        self,
+    ) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+
+        # Every finalized run per contract, from the existing per-version board.
+        assert 'getJSON("/public/leaderboard?bench_version=" + version)' in body
+        assert 'class="timeline-field' in body
+        # Settled contracts are immutable, so only the newest board refetches.
+        assert "!memoryFieldByVersion[version] || version === activeVersion" in body
+        # The champion is the state the chart exists to show.
+        assert 'class="timeline-champion-plate"' in body
+        assert 'class="timeline-champion-halo"' in body
+        assert "lastEmissions ? lastEmissions.champion_miner_hotkey : null" in body
+        # Contracts are banded, not spaced by wall clock.
+        assert "var bandWidth = plotWidth / eras.length;" in body
+        assert "Each contract gets an equal band, not equal clock time" in body
+        # The ordinal generation ramp, interpolated between two theme-aware ends.
+        assert "color-mix(in oklch, var(--era-to) " in body
+        assert "--era-from: oklch(" in body
+        # The viewBox is measured so type keeps its real size on a phone.
+        assert "var measured = Math.round((target.clientWidth || 960) - 2);" in body
+        assert "new ResizeObserver(function (entries) {" in body
+        # A reveal must enhance an already-visible default.
+        assert "@keyframes timeline-dot-in { from { opacity: 0;" in body
+        assert ".timeline-champion-pulse { display: none; }" in body
 
     async def test_api_failures_do_not_render_sample_data(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
