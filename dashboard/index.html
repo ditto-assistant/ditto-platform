@@ -3281,22 +3281,49 @@
     }
 
     function benchmarkDisplayVersion() {
-      return Math.max(Number(currentBench) || 0, Number(desiredBench) || 0) || null;
+      return Number(activeBench) || Number(currentBench) || null;
+    }
+
+    function benchmarkAuthorityState(activeValue, desiredValue, status) {
+      var active = Number(activeValue) || null;
+      var desired = Number(desiredValue) || active;
+      return {
+        active: active,
+        desired: desired,
+        rolling: !!(active && desired && desired > active &&
+          (status === "collecting" || status === "blocked_ineligible"))
+      };
+    }
+
+    function leaderboardBenchState(selectionMode, currentValue, activeValue, desiredValue, fallbackValue) {
+      var active = Number(activeValue) || null;
+      var desired = Number(desiredValue) || active;
+      var selected = selectionMode === "historical"
+        ? Number(currentValue) || null
+        : active;
+      return {
+        active: active,
+        desired: desired,
+        selected: selected || Number(currentValue) || Number(fallbackValue) || null
+      };
     }
 
     function renderBenchBadge() {
       var badge = document.getElementById("bench-badge");
-      var active = Number(currentBench) || null;
-      var desired = Number(desiredBench) || active;
-      var rolling = active && desired && desired > active &&
-        (benchmarkRolloutStatus === "collecting" || benchmarkRolloutStatus === "blocked_ineligible");
+      var authority = benchmarkAuthorityState(
+        activeBench || currentBench,
+        desiredBench,
+        benchmarkRolloutStatus
+      );
+      var active = authority.active;
+      var desired = authority.desired;
       if (!active) {
         badge.className = "bench-badge";
         badge.textContent = "";
         return;
       }
       badge.className = "bench-badge show";
-      badge.textContent = rolling
+      badge.textContent = authority.rolling
         ? "DittoBench v" + active + " → v" + desired + " rollout"
         : "DittoBench v" + active + (benchHasOlderRuns ? " · older runs marked" : "");
     }
@@ -3717,7 +3744,6 @@
 
     // ── Render ───────────────────────────────────────────────
     function render(data) {
-      activeBench = data.active_bench_version || activeBench;
       // History pills track every version that has ever been scored. Fall back
       // to the versions visible in this payload for an older API that does not
       // list them, so the pills never regress below what the board shows.
@@ -3778,7 +3804,16 @@
         .map(function (e) { return e.bench_version; })
         .filter(function (v) { return v != null; })
         .reduce(function (a, b) { return Math.max(a, b); }, 0);
-      currentBench = data.desired_bench_version || data.current_bench_version || maxBv || currentBench;
+      var benchState = leaderboardBenchState(
+        data.selection_mode,
+        data.current_bench_version,
+        data.active_bench_version,
+        data.desired_bench_version,
+        maxBv || currentBench
+      );
+      activeBench = benchState.active || activeBench;
+      desiredBench = benchState.desired || desiredBench || activeBench;
+      currentBench = benchState.selected || currentBench;
       // Reference-baseline card: only meaningful while the board runs the
       // bench_version the baseline was measured on; otherwise it would mislead.
       // Show the baseline for the version the board is actually showing, so a
