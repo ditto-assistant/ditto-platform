@@ -4,12 +4,42 @@ import type { JSX } from "solid-js";
 import type { TimelinePayload } from "../../types";
 import { timelineDate } from "../../lib/format";
 
+const EVIDENCE_URL =
+  "https://github.com/ditto-assistant/dittobench-api/tree/beb8e1a5fb5a2c35f5c34ce33b422978504d611e/docs/third-party-benchmark-timeline";
+const REFERENCES = [
+  {
+    id: "hermes",
+    label: "Hermes Agent 0.19.0",
+    profile: "Native SessionDB session_search",
+    points: [
+      [2, 0.1111111111],
+      [3, 0.1279661017],
+      [4, 0.1779661017],
+      [5, 0.1690705104],
+      [6, 0.1979166667],
+    ] as Array<[number, number]>,
+  },
+  {
+    id: "openclaw",
+    label: "OpenClaw 2026.7.1",
+    profile: "Native memory-core FTS · 20-result recall",
+    points: [
+      [2, 0.3333333333],
+      [3, 0.3771186441],
+      [4, 0.3559322034],
+      [5, 0.421875],
+      [6, 0.3333333333],
+    ] as Array<[number, number]>,
+  },
+];
+
 export function MemoryTimeline(props: { timeline?: TimelinePayload }): JSX.Element {
   const points = () => props.timeline?.points || [];
   const values = () =>
-    points()
-      .map((point) => Number(point.memory_mean))
-      .filter(Number.isFinite);
+    [
+      ...points().map((point) => Number(point.memory_mean)),
+      ...REFERENCES.flatMap((series) => series.points.map(([, value]) => value)),
+    ].filter(Number.isFinite);
   const dates = () =>
     points()
       .map((point) => Date.parse(point.recorded_at || ""))
@@ -39,11 +69,21 @@ export function MemoryTimeline(props: { timeline?: TimelinePayload }): JSX.Eleme
       )
       .join(" "),
   );
+  const releaseDate = (version: number) =>
+    props.timeline?.releases?.find((release) => Number(release.bench_version) === version)
+      ?.released_at;
+  const referencePath = (series: (typeof REFERENCES)[number]) =>
+    series.points
+      .map(
+        ([version, value], index) =>
+          `${index ? "L" : "M"}${x(releaseDate(version)).toFixed(1)},${y(value).toFixed(1)}`,
+      )
+      .join(" ");
   return (
     <section aria-labelledby="memory-timeline-title">
       <div class="section-head">
         <div>
-          <h2 id="memory-timeline-title">Memory benchmark history</h2>
+          <h2 id="memory-timeline-title">How far miners have taken memory</h2>
           <p>
             Observed best miner memory scores alongside independent reference-harness bounds.
             Version markers separate non-comparable benchmark eras.
@@ -102,6 +142,27 @@ export function MemoryTimeline(props: { timeline?: TimelinePayload }): JSX.Eleme
             )}
           </For>
           <path class="timeline-path miner" d={path()} />
+          <For each={REFERENCES}>
+            {(series) => (
+              <>
+                <path class={`timeline-path ${series.id}`} d={referencePath(series)} />
+                <For each={series.points}>
+                  {([version, value]) => (
+                    <circle
+                      class={`timeline-point ${series.id}`}
+                      cx={x(releaseDate(version))}
+                      cy={y(value)}
+                      r="4"
+                    >
+                      <title>
+                        {series.label} · Bench v{version} · {value.toFixed(3)} · measured 2026-07-23
+                      </title>
+                    </circle>
+                  )}
+                </For>
+              </>
+            )}
+          </For>
           <For each={points()}>
             {(point) => (
               <circle
@@ -119,6 +180,20 @@ export function MemoryTimeline(props: { timeline?: TimelinePayload }): JSX.Eleme
           </For>
         </svg>
       </div>
+      <details class="harness-comparison-method">
+        <summary>Method and comparability</summary>
+        <div class="harness-comparison-method-body">
+          <p>
+            The miner line uses finalized three-validator memory medians within each benchmark era.
+            Hermes and OpenClaw are single-seed off-network practice runs measured retrospectively
+            on immutable v2-v6 contracts with the same Qwen3-32B model, pinned OpenRouter/Nebius
+            route, and seed. They never enter rankings, KOTH, weights, or payouts.
+          </p>
+          <a href={EVIDENCE_URL} target="_blank" rel="noreferrer">
+            Inspect retained run evidence ↗
+          </a>
+        </div>
+      </details>
       <details class="timeline-data-details">
         <summary>View the underlying public observations</summary>
         <div class="timeline-data-table-wrap">
