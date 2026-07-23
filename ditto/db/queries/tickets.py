@@ -629,9 +629,11 @@ async def issue_ticket(
         # One paid owner may have many generations, but only one generation may
         # occupy validator capacity at a time. Serialize by the immutable
         # payment-time coldkey (legacy rows fall back to hotkey), then re-check
-        # for an evaluating sibling after taking the lock. The post-lock check
-        # closes the race where two platform replicas select different agents
-        # for the same owner before either ticket exists.
+        # for an issued sibling after taking the lock. Accepted scores are
+        # history, not occupied capacity, but they keep the first progressing
+        # generation selected until it settles. The post-lock checks close the
+        # race where two platform replicas select different agents for the same
+        # owner before either ticket exists.
         owner_row = (
             await session.execute(
                 select(Agent.miner_hotkey, EvaluationPayment.miner_coldkey)
@@ -643,32 +645,69 @@ async def issue_ticket(
             )
         ).one()
         owner_hotkey, owner_coldkey = owner_row
-        owner_key = (
-            f"coldkey:{owner_coldkey}"
-            if owner_coldkey is not None
-            else f"hotkey:{owner_hotkey}"
-        )
-        if session.get_bind().dialect.name == "postgresql":
-            await session.execute(
-                select(func.pg_advisory_xact_lock(func.hashtextextended(owner_key, 0)))
+        linked_coldkeys = {
+            coldkey
+            for coldkey in (
+                await session.scalars(
+                    select(EvaluationPayment.miner_coldkey)
+                    .where(
+                        EvaluationPayment.miner_hotkey == owner_hotkey,
+                        EvaluationPayment.miner_coldkey.is_not(None),
+                    )
+                    .distinct()
+                )
+            ).all()
+            if coldkey is not None
+        }
+        if owner_coldkey is not None:
+            linked_coldkeys.add(owner_coldkey)
+        linked_hotkeys = {owner_hotkey}
+        if linked_coldkeys:
+            linked_hotkeys.update(
+                (
+                    await session.scalars(
+                        select(EvaluationPayment.miner_hotkey)
+                        .where(EvaluationPayment.miner_coldkey.in_(linked_coldkeys))
+                        .distinct()
+                    )
+                ).all()
             )
+        if session.get_bind().dialect.name == "postgresql":
+            # A legacy row inherits every payment-time coldkey previously
+            # observed for its hotkey. Lock those identities in sorted order,
+            # so it also serializes with a paid generation submitted after a
+            # hotkey rotation. A truly unlinked legacy row falls back to its
+            # hotkey. The canonical ordering prevents multi-key deadlocks.
+            owner_lock_keys = (
+                [f"coldkey:{coldkey}" for coldkey in sorted(linked_coldkeys)]
+                if linked_coldkeys
+                else [f"hotkey:{owner_hotkey}"]
+            )
+            for owner_lock_key in owner_lock_keys:
+                await session.execute(
+                    select(
+                        func.pg_advisory_xact_lock(
+                            func.hashtextextended(owner_lock_key, 0)
+                        )
+                    )
+                )
         sibling_agent = aliased(Agent)
         sibling_payment = aliased(EvaluationPayment)
         same_owner = (
             or_(
-                sibling_payment.miner_coldkey == owner_coldkey,
+                sibling_payment.miner_coldkey.in_(linked_coldkeys),
                 and_(
                     sibling_payment.miner_coldkey.is_(None),
-                    sibling_agent.miner_hotkey == owner_hotkey,
+                    sibling_agent.miner_hotkey.in_(linked_hotkeys),
                 ),
             )
-            if owner_coldkey is not None
+            if linked_coldkeys
             else and_(
                 sibling_payment.miner_coldkey.is_(None),
                 sibling_agent.miner_hotkey == owner_hotkey,
             )
         )
-        active_sibling_count = await session.scalar(
+        live_sibling_count = await session.scalar(
             select(func.count())
             .select_from(ValidatorTicket)
             .join(sibling_agent, sibling_agent.agent_id == ValidatorTicket.agent_id)
@@ -678,13 +717,57 @@ async def issue_ticket(
             )
             .where(
                 sibling_agent.agent_id != agent_id,
-                sibling_agent.status == AgentStatus.EVALUATING,
-                ValidatorTicket.bench_version == bench_version,
-                ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES),
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.deadline > now,
                 same_owner,
             )
         )
-        if (active_sibling_count or 0) > 0:
+        if (live_sibling_count or 0) > 0:
+            skipped.append(agent_id)
+            continue
+
+        # Keep one current-era generation selected across the gaps between its
+        # leases. Otherwise a validator that already scored the selected row
+        # can open a sibling after the last lease becomes SCORED, and that new
+        # lease diverts every eligible validator away from finishing the first
+        # generation. Historical overlaps converge deterministically on the
+        # generation whose accepted/live progress began first. Expired-only
+        # attempts do not pin an owner, so failed work can still drain.
+        owner_progress_started_at = (
+            select(func.min(ValidatorTicket.issued_at))
+            .where(
+                ValidatorTicket.agent_id == sibling_agent.agent_id,
+                ValidatorTicket.bench_version == bench_version,
+                (
+                    (ValidatorTicket.status == TicketStatus.SCORED)
+                    | (
+                        (ValidatorTicket.status == TicketStatus.ISSUED)
+                        & (ValidatorTicket.deadline > now)
+                    )
+                ),
+            )
+            .correlate(sibling_agent)
+            .scalar_subquery()
+        )
+        selected_owner_agent_id = await session.scalar(
+            select(sibling_agent.agent_id)
+            .outerjoin(
+                sibling_payment,
+                sibling_payment.agent_id == sibling_agent.agent_id,
+            )
+            .where(
+                sibling_agent.status == AgentStatus.EVALUATING,
+                same_owner,
+                owner_progress_started_at.is_not(None),
+            )
+            .order_by(
+                owner_progress_started_at.asc(),
+                sibling_agent.created_at.asc(),
+                sibling_agent.agent_id.asc(),
+            )
+            .limit(1)
+        )
+        if selected_owner_agent_id is not None and selected_owner_agent_id != agent_id:
             skipped.append(agent_id)
             continue
         occupied = await session.scalar(
