@@ -91,6 +91,25 @@ class TestScoreIndexes:
         ]
         assert index.dialect_options["postgresql"]["include"] == ["updated_at"]
 
+    def test_benchmark_timeline_index_shape(self):
+        index = next(
+            index
+            for index in Score.__table__.indexes
+            if index.name == "scores_bench_timeline_idx"
+        )
+
+        assert [column.name for column in index.columns] == [
+            "bench_version",
+            "agent_id",
+            "updated_at",
+            "validator_hotkey",
+        ]
+        assert index.dialect_options["postgresql"]["include"] == [
+            "memory_mean",
+            "composite",
+            "n",
+        ]
+
 
 class TestAgentRoundTrip:
     """Insert + select cycles via a real :class:`AsyncSession`."""

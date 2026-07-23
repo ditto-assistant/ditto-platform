@@ -72,6 +72,7 @@ from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator import ArtifactResponse
 from ditto.api_server.benchmark_rollout import (
     PendingQualification,
+    inference_activation_requirements,
     qualification_candidate,
 )
 from ditto.api_server.datapipeline import DatasetGenerator
@@ -102,6 +103,10 @@ from ditto.db.models import (
     ScreeningQuarantineResolution,
     ValidatorHeartbeat,
     ValidatorTicket,
+)
+from ditto.db.queries.audit import (
+    append_audit_entry,
+    benchmark_contract_refresh_event,
 )
 from ditto.db.queries.benchmark_rollout import (
     DatasetPin as RolloutDatasetPin,
@@ -1668,6 +1673,15 @@ async def refresh_benchmark_contract(
             # erasing the historical attempt counter.
             ticket.manual_retry_grants += 1
 
+        await append_audit_entry(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=None,
+            event=benchmark_contract_refresh_event(bench_version),
+            payload={"bench_version": bench_version},
+            recorded_at=now,
+        )
+
         await session.execute(
             delete(BenchmarkDataset).where(
                 BenchmarkDataset.agent_id == agent_id,
@@ -1951,7 +1965,7 @@ async def _benchmark_qualification_state(
     elif agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
         blocking_reason = "submission must be scored or live"
     elif top_member is None:
-        blocking_reason = "submission is not in the inherited top-25 cohort"
+        blocking_reason = "submission is not in the inherited top-ten cohort"
     elif member is not None:
         blocking_reason = "submission is already a rollout member"
     elif screening_active:
@@ -2014,6 +2028,7 @@ async def qualify_benchmark_rollout(
     session: SessionDep,
     generator: GeneratorDep,
     x_admin_actor: Annotated[str | None, Header()] = None,
+    request: Request = None,  # type: ignore[assignment]
 ) -> AdminBenchmarkQualificationResponse:
     """Append a guarded cohort member without touching its accepted scores."""
     if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
@@ -2102,7 +2117,20 @@ async def qualify_benchmark_rollout(
         )
         if not appended:
             raise HTTPException(status_code=409, detail="qualification changed")
-        await maybe_activate_rollout(session, locked_rollout, now=datetime.now(UTC))
+        activation_now = datetime.now(UTC)
+        await maybe_activate_rollout(
+            session,
+            locked_rollout,
+            now=activation_now,
+            inference_requirements=inference_activation_requirements(
+                (
+                    request.app.state.config.inference_proxy
+                    if request is not None
+                    else None
+                ),
+                bench_version=locked_rollout.desired_version,
+            ),
+        )
         screening_queued = (
             locked_agent.screening_policy_version
             < benchmark_contract(target_version).minimum_screening_policy_version

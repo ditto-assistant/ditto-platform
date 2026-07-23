@@ -13,7 +13,8 @@ from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+import httpx
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 import ditto
@@ -26,10 +27,14 @@ from ditto.api_server.embedding import create_embedder
 from ditto.api_server.endpoints import (
     admin_benchmark_rollout_router,
     admin_copy_review_router,
+    admin_inference_routes_router,
+    admin_miner_fees_router,
     admin_quarantine_router,
     admin_scoring_readiness_router,
+    admin_screener_review_settings_router,
     admin_validation_retry_router,
     health_router,
+    inference_router,
     metrics_router,
     public_router,
     retrieval_router,
@@ -39,6 +44,7 @@ from ditto.api_server.endpoints import (
     validator_router,
 )
 from ditto.api_server.errors import ApiServerLifespanError
+from ditto.api_server.inference_routing import ProviderRouteRefresher
 from ditto.api_server.middleware import (
     AuthPassThroughMiddleware,
     PublicCacheMiddleware,
@@ -56,12 +62,13 @@ from ditto.db import create_db_engine, create_session_maker
 
 logger = logging.getLogger(__name__)
 
-# The dashboard SPA lives at the repo root (source checkout on the deployed VM);
-# it is not packaged into the wheel, so a missing file just disables the route.
-_DASHBOARD_FILE = Path(__file__).resolve().parents[2] / "dashboard" / "index.html"
-_DASHBOARD_IMAGE = (
-    Path(__file__).resolve().parents[2] / "dashboard" / "assets" / "paperditto-512.png"
-)
+# The dashboard SPA lives at the repo root (source checkout on the deployed VM)
+# and is built with Vite (`bun run build` in dashboard/, done by update.sh at
+# deploy time). It is not packaged into the wheel, so a missing build just
+# disables the route.
+_DASHBOARD_DIST = Path(__file__).resolve().parents[2] / "dashboard" / "dist"
+_DASHBOARD_FILE = _DASHBOARD_DIST / "index.html"
+_DASHBOARD_ASSETS = _DASHBOARD_DIST / "assets"
 _WANDB_META_RE = re.compile(r'(<meta name="ditto:wandb-url" content=")[^"]*(")')
 
 
@@ -69,7 +76,8 @@ def _render_dashboard(wandb_url: str) -> str | None:
     """Read the dashboard SPA and inject the public wandb project URL.
 
     Returns ``None`` (route is skipped) when the file is absent — e.g. a
-    packaged/wheel install or a checkout without the ``dashboard/`` dir. The
+    packaged/wheel install or a checkout where ``dashboard/dist`` was never
+    built (``bun run build``). The
     ``api-base`` meta is left empty on purpose so the SPA falls back to its
     same-origin ``/api/v1`` default when the platform serves it.
     """
@@ -121,6 +129,25 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             generator = create_generator(config.data_pipeline)
             stack.push_async_callback(generator.aclose)
             app.state.dataset_generator = generator
+
+            inference_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(config.inference_proxy.timeout_seconds),
+                follow_redirects=False,
+                limits=httpx.Limits(
+                    max_connections=config.inference_proxy.global_concurrency,
+                    max_keepalive_connections=config.inference_proxy.global_concurrency,
+                ),
+            )
+            stack.push_async_callback(inference_client.aclose)
+            app.state.inference_client = inference_client
+            provider_routes = ProviderRouteRefresher(
+                config=config.inference_proxy,
+                session_maker=app.state.session_maker,
+                client=inference_client,
+            )
+            stack.push_async_callback(provider_routes.aclose)
+            await provider_routes.start()
+            app.state.inference_provider_routes = provider_routes
 
             validator_names = app.state.validator_names
             stack.push_async_callback(validator_names.aclose)
@@ -175,7 +202,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     # Gzip sits OUTSIDE the public cache (added after it, so it wraps it on
     # the wire): the cache stores and compares uncompressed bodies (so ETags
     # are stable), and compression happens outward on every response,
-    # including cache HITs and the 368KB dashboard HTML. SizedGZipMiddleware
+    # including cache HITs and the dashboard's HTML/JS/CSS. SizedGZipMiddleware
     # (not stock GZipMiddleware) enforces the sub-1KB "leave it uncompressed"
     # floor from the declared Content-Length, which survives the cache
     # middleware's BaseHTTPMiddleware re-chunking; stock gzip only applies the
@@ -191,14 +218,18 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(upload_router, prefix="/api/v1")
     app.include_router(retrieval_router, prefix="/api/v1")
     app.include_router(validator_router, prefix="/api/v1")
+    app.include_router(inference_router, prefix="/api/v1")
     app.include_router(screener_router, prefix="/api/v1")
     app.include_router(scoring_router, prefix="/api/v1")
     app.include_router(public_router, prefix="/api/v1")
     app.include_router(admin_benchmark_rollout_router, prefix="/api/v1")
+    app.include_router(admin_inference_routes_router, prefix="/api/v1")
     app.include_router(admin_quarantine_router, prefix="/api/v1")
     app.include_router(admin_validation_retry_router, prefix="/api/v1")
     app.include_router(admin_scoring_readiness_router, prefix="/api/v1")
+    app.include_router(admin_screener_review_settings_router, prefix="/api/v1")
     app.include_router(admin_copy_review_router, prefix="/api/v1")
+    app.include_router(admin_miner_fees_router, prefix="/api/v1")
 
     # Serve the public dashboard SPA same-origin at ``/`` so the platform is the
     # transparency front door (its ``/api/v1/public/*`` calls need no CORS). The
@@ -259,18 +290,29 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
                     name=f"dashboard_{entity_kind}",
                 )
 
-            if _DASHBOARD_IMAGE.is_file():
+            if _DASHBOARD_ASSETS.is_dir():
+                # Vite emits content-hashed bundles under dist/assets/ (safe to
+                # cache forever); files copied through from public/assets/ (the
+                # og:image PNG) keep their names, so they get a day, not a year.
+                _hashed = re.compile(r"-[A-Za-z0-9_-]{8,}\.[a-z0-9]+$")
 
                 @app.get(
-                    "/assets/paperditto-512.png",
+                    "/assets/{asset_path:path}",
                     include_in_schema=False,
                     response_class=FileResponse,
                 )
-                async def dashboard_image() -> FileResponse:
-                    return FileResponse(
-                        _DASHBOARD_IMAGE,
-                        media_type="image/png",
-                        headers={"Cache-Control": "public, max-age=86400"},
+                async def dashboard_asset(asset_path: str) -> FileResponse:
+                    resolved = (_DASHBOARD_ASSETS / asset_path).resolve()
+                    if not (
+                        resolved.is_relative_to(_DASHBOARD_ASSETS.resolve())
+                        and resolved.is_file()
+                    ):
+                        raise HTTPException(status_code=404)
+                    cache = (
+                        "public, max-age=31536000, immutable"
+                        if _hashed.search(resolved.name)
+                        else "public, max-age=86400"
                     )
+                    return FileResponse(resolved, headers={"Cache-Control": cache})
 
     return app

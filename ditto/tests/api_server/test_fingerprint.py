@@ -14,6 +14,7 @@ import ditto.api_server.fingerprint as fingerprint_module
 from ditto.api_server.fingerprint import (
     _EMBED_INPUT_MAX_CHARS,
     _FP_VERSION,
+    _MAX_MEMBERS,
     _MINHASH_K,
     _PROMPT_VERSION,
     _extract_string_literals,
@@ -252,12 +253,11 @@ class TestComputeContentFingerprint:
         assert compute_content_fingerprint(buf.getvalue()) is not None
 
     def test_member_flood_is_bounded(self) -> None:
-        # Hundreds of thousands of directory headers must not be walked to the end
-        # (the CPU-DoS the per-file cap missed). Returns None fast once the member
-        # cap trips — we assert on the result, the timeout guards the runtime.
+        # One member past the limit proves the CPU-DoS guard trips at its boundary;
+        # generating substantially more headers only makes the test itself slow.
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            for i in range(100000):
+            for i in range(_MAX_MEMBERS + 1):
                 di = tarfile.TarInfo(name=f"d{i}/")
                 di.type = tarfile.DIRTYPE
                 tar.addfile(di)

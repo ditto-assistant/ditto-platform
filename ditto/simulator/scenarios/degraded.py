@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.db.models import ScreeningAttempt, ValidatorTicket
 
 if TYPE_CHECKING:
@@ -71,6 +71,8 @@ async def apply(ctx: ScenarioContext) -> None:
                 agent_id=phantom.agent_id,
                 validator_hotkey=f.ss58_hotkey("validator:validator-4"),
                 status=TicketStatus.EXPIRED,
+                purpose=TicketPurpose.CANONICAL_QUORUM,
+                purpose_revision=1,
                 issued_at=f.hours_ago(5),
                 deadline=f.hours_ago(3),
                 bench_version=2,
@@ -135,6 +137,8 @@ async def apply(ctx: ScenarioContext) -> None:
                     agent_id=starved.agent_id,
                     validator_hotkey=f.ss58_hotkey(f"validator:{name}"),
                     status=TicketStatus.EXPIRED,
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
+                    purpose_revision=1,
                     issued_at=issued_at,
                     deadline=issued_at + timedelta(hours=2),
                     bench_version=2,

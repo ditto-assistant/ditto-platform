@@ -29,7 +29,7 @@ from sqlalchemy import text
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.onchain_seed import derive_seed
 from ditto.db.models import (
     Agent,
@@ -724,6 +724,8 @@ class Fabric:
                     agent_id=agent.agent_id,
                     validator_hotkey=self.ss58_hotkey(f"validator:{validator_name}"),
                     status=TicketStatus.ISSUED,
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
+                    purpose_revision=1,
                     issued_at=self.minutes_ago(10 + i),
                     deadline=self.minutes_from_now(50 - i),
                     bench_version=bench_version,
@@ -751,6 +753,8 @@ class Fabric:
                         agent_id=agent.agent_id,
                         validator_hotkey=hotkey,
                         status=TicketStatus.SCORED,
+                        purpose=TicketPurpose.CANONICAL_QUORUM,
+                        purpose_revision=1,
                         issued_at=issued_at,
                         deadline=deadline,
                         bench_version=bench_version,
@@ -855,6 +859,8 @@ class Fabric:
                         agent_id=agent.agent_id,
                         validator_hotkey=hotkey,
                         status=TicketStatus.SCORED,
+                        purpose=TicketPurpose.CANONICAL_QUORUM,
+                        purpose_revision=1,
                         issued_at=issued_at,
                         deadline=deadline,
                         bench_version=bench_version,

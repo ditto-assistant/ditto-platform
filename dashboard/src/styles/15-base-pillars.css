@@ -1,0 +1,68 @@
+/* ── About / "what the benchmark tests" ─────────────────── */
+.about {
+  margin-top: 30px;
+}
+.about > p.lead {
+  color: var(--text-dim);
+  font-size: 13.5px;
+  margin: 0 0 16px;
+  max-width: 78ch;
+}
+.about .pillars {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+.about .pillar {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+.about .pillar h2 {
+  margin: 0 0 6px;
+  font-size: 13.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.about .pillar h2 .tag {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+.about .pillar.tool h2 .tag {
+  color: var(--tool);
+  border: 1px solid color-mix(in oklab, var(--tool) 42%, transparent);
+  background: color-mix(in oklab, var(--tool) 12%, transparent);
+}
+.about .pillar.mem h2 .tag {
+  color: var(--memory);
+  border: 1px solid color-mix(in oklab, var(--memory) 42%, transparent);
+  background: color-mix(in oklab, var(--memory) 12%, transparent);
+}
+.about .pillar p {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.about .note {
+  margin-top: 14px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  line-height: 1.55;
+  max-width: 82ch;
+}
+.about .note b {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+@media (max-width: 720px) {
+  .about .pillars {
+    grid-template-columns: 1fr;
+  }
+}

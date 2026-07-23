@@ -63,6 +63,7 @@ async def _upsert(
     progress: dict | None,
     *,
     reported_at: datetime,
+    capacity: dict | None = None,
 ) -> tuple[ValidatorHeartbeat, bool]:
     async with session.begin():
         return await upsert_validator_heartbeat(
@@ -78,6 +79,7 @@ async def _upsert(
             reported_at=reported_at,
             seen_at=reported_at,
             signature="ab" * 64,
+            benchmark_capacity=capacity,
         )
 
 
@@ -158,3 +160,50 @@ async def test_same_run_monotonic_progress_is_accepted(
     )
     assert accepted
     assert _stored(row).completed == 90
+
+
+async def test_newer_capacity_cannot_regress_secondary_slot_progress(
+    session: AsyncSession,
+) -> None:
+    agent_id = await _seed_agent(session)
+    second_agent = await _seed_agent(session)
+    base = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+
+    def capacity(completed: int) -> dict:
+        return {
+            "configured_slots": 2,
+            "healthy_slots": ["slot-0", "slot-1"],
+            "admission": "accepting",
+            "active": [
+                {
+                    "slot_id": "slot-1",
+                    "agent_id": str(second_agent),
+                    "bench_version": 5,
+                    "progress": _progress(
+                        "running_benchmark",
+                        completed=completed,
+                        total=114,
+                        run_token="c" * 16,
+                    ),
+                }
+            ],
+        }
+
+    await _upsert(
+        session,
+        agent_id,
+        None,
+        reported_at=base,
+        capacity=capacity(9),
+    )
+    row, accepted = await _upsert(
+        session,
+        agent_id,
+        None,
+        reported_at=base + timedelta(seconds=1),
+        capacity=capacity(5),
+    )
+    assert accepted
+    assert row.benchmark_capacity is not None
+    assert row.benchmark_capacity["active"][0]["progress"]["completed"] == 9
+    assert row.seen_at == base + timedelta(seconds=1)

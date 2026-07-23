@@ -40,7 +40,7 @@ from ditto.api_models.stack_health import (
     ValidatorComponentHealth,
     ValidatorStackHealth,
 )
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import (
@@ -473,6 +473,84 @@ class TestPublicChainWeights:
         assert response.status_code == 503
 
 
+class TestPublicBenchmarkTimeline:
+    async def test_returns_release_events_and_finalized_memory_highs(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        first_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.41, 0.42, 0.43],
+            details={"bench_version": 2},
+            base_time=datetime(2026, 7, 8, tzinfo=UTC),
+        )
+        second_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.71, 0.72, 0.73],
+            details={"bench_version": 2},
+            base_time=datetime(2026, 7, 9, tzinfo=UTC),
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=datetime(2026, 7, 18, 14, 30, tzinfo=UTC),
+                    activated_at=datetime(2026, 7, 18, 16, 0, tzinfo=UTC),
+                )
+            )
+            for agent_id, recorded_at in (
+                (UUID(first_id), datetime(2026, 7, 8, tzinfo=UTC)),
+                (UUID(second_id), datetime(2026, 7, 9, tzinfo=UTC)),
+            ):
+                scores = list(
+                    await session.scalars(
+                        select(Score).where(Score.agent_id == agent_id)
+                    )
+                )
+                for index, score in enumerate(scores):
+                    score.created_at = recorded_at + timedelta(minutes=index)
+                    score.updated_at = recorded_at + timedelta(minutes=index)
+        await _seed_k3(
+            session_maker,
+            miner="5" + "A" * 47,
+            composites=[0.51, 0.52],
+            details={"bench_version": 3},
+            base_time=datetime(2026, 7, 19, tzinfo=UTC),
+        )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/bench/timeline")
+
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "public, max-age=300"
+        body = response.json()
+        assert body["metric"] == "memory_mean"
+        assert body["score_quorum"] == 3
+        assert [release["bench_version"] for release in body["releases"]] == [
+            2,
+            3,
+            4,
+            5,
+            6,
+        ]
+        assert body["releases"][0]["released_at"] == "2026-07-07T00:00:00Z"
+        assert body["releases"][1]["released_at"] == "2026-07-18T14:30:00Z"
+        assert body["releases"][1]["activated_at"] == "2026-07-18T16:00:00Z"
+        assert [point["agent_id"] for point in body["points"]] == [
+            first_id,
+            second_id,
+        ]
+        assert [point["memory_mean"] for point in body["points"]] == [0.42, 0.72]
+
+
 class TestPublicLeaderboard:
     async def test_distinguishes_raw_rank_one_from_koth_emissions_champion(
         self,
@@ -511,8 +589,14 @@ class TestPublicLeaderboard:
         assert body["entries"][0]["rank"] == 1
         assert body["emissions"]["raw_leader_agent_id"] == raw_leader_id
         assert body["emissions"]["champion_agent_id"] == incumbent_id
-        assert body["emissions"]["margin"] == pytest.approx(0.02)
+        assert body["emissions"]["margin"] == pytest.approx(0.007)
         assert body["emissions"]["dethrone_z"] == pytest.approx(1.64)
+        assert body["emissions"]["band_decay_min_bench_version"] == 6
+        assert body["emissions"]["band_decay_start_composite"] == pytest.approx(0.60)
+        assert body["emissions"]["band_decay_rate"] == pytest.approx(2.0)
+        assert body["emissions"]["rank_shares"] == pytest.approx(
+            [0.65, 0.14, 0.10, 0.07, 0.04]
+        )
         decision = body["emissions"]["raw_leader_decision"]
         assert decision["challenger_lead"] == pytest.approx(0.05)
         assert decision["required_lead"] == pytest.approx(
@@ -526,16 +610,62 @@ class TestPublicLeaderboard:
                 "agent_id": incumbent_id,
                 "miner_hotkey": _MINER_A,
                 "raw_rank": 2,
-                "share_of_miner_pool": 0.9,
+                "share_of_miner_pool": pytest.approx(0.65 / 0.79),
+                "shared_seed_confirmations": 0,
             },
             {
                 "role": "tail",
                 "agent_id": raw_leader_id,
                 "miner_hotkey": _MINER_B,
                 "raw_rank": 1,
-                "share_of_miner_pool": pytest.approx(0.1),
+                "share_of_miner_pool": pytest.approx(0.14 / 0.79),
+                "shared_seed_confirmations": 0,
             },
         ]
+
+    async def test_leaderboard_surfaces_shared_seed_confirmation_depth(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        champion_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.90, 0.90, 0.90],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.80, 0.80, 0.80],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        # The champion accumulated three champion-anchored shared-seed rescores.
+        async with session_maker() as s, s.begin():
+            await append_confirmation_scores(
+                s,
+                rows=[
+                    ConfirmationSeedScore(
+                        UUID(champion_id), "5V1", seed, 0.90, f"r{seed}", None
+                    )
+                    for seed in (100, 200, 300)
+                ],
+                bench_version=DEFAULT_BENCH_VERSION,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+        recipients = {r["agent_id"]: r for r in body["emissions"]["recipients"]}
+        assert recipients[champion_id]["shared_seed_confirmations"] == 3
 
     async def test_marks_deregistered_scores_retained_but_emission_ineligible(
         self,
@@ -2261,6 +2391,7 @@ class TestPublicActivity:
     ) -> None:
         """love-v8's v3 and v4 scores are one score in each era, not two."""
         await _seed_top_five_floor(session_maker, fifth_place=0.80, bench_version=4)
+        now = datetime.now(UTC)
         agent_id = UUID(
             await _seed_agent(
                 session_maker,
@@ -2268,9 +2399,9 @@ class TestPublicActivity:
                 status=AgentStatus.EVALUATING,
                 name="love-v8",
                 screening_policy_version=SCREENING_POLICY_VERSION,
+                created_at=now - timedelta(hours=2),
             )
         )
-        now = datetime.now(UTC)
         async with session_maker() as session, session.begin():
             session.add(
                 BenchmarkRollout(
@@ -2281,6 +2412,50 @@ class TestPublicActivity:
                     cohort_size=5,
                     created_at=now - timedelta(hours=1),
                     activated_at=now,
+                )
+            )
+            deadline = now + timedelta(minutes=30)
+            session.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_MINER_A,
+                    software_version="1.2.3",
+                    protocol_version=4,
+                    code_digest="ab" * 32,
+                    state="running_benchmark",
+                    active_agent_id=agent_id,
+                    benchmark_progress={
+                        "stage": "running_benchmark",
+                        "completed": 10,
+                        "total": 119,
+                        "ticket_deadline": deadline.isoformat(),
+                    },
+                    benchmark_progress_reported=True,
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                )
+            )
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=_MINER_A,
+                    bench_version=3,
+                    status=TicketStatus.ISSUED,
+                    issued_at=now - timedelta(seconds=1),
+                    deadline=deadline,
+                )
+            )
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey="5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    bench_version=4,
+                    status=TicketStatus.EXPIRED,
+                    issued_at=now - timedelta(minutes=30),
+                    deadline=now - timedelta(minutes=15),
+                    retry_after=now - timedelta(minutes=5),
+                    attempt_count=2,
+                    manual_retry_grants=1,
                 )
             )
             for bench_version, validator, composite in (
@@ -2311,9 +2486,13 @@ class TestPublicActivity:
             for entry in activity_body["entries"]
             if entry["agent_id"] == str(agent_id)
         )
-        assert activity["status"] == "waiting_validator"
+        assert activity["status"] == "not_queued"
         assert activity["score_count"] == 1
         assert activity["provisional_composite"] == pytest.approx(0.391897)
+        assert activity["validator_queue_rank"] is None
+        assert activity["retry_state"] is None
+        assert activity_body["status_counts"]["not_queued"] == 1
+        assert [work["bench_version"] for work in activity["active_benchmarks"]] == [3]
 
         operations = (await client.get("/api/v1/public/operations")).json()
         operations_entry = next(
@@ -2322,15 +2501,17 @@ class TestPublicActivity:
             if entry["agent_id"] == str(agent_id)
         )
         assert operations["active_bench_version"] == 4
-        assert operations_entry["status"] == "waiting_validator"
+        assert operations_entry["status"] == "not_queued"
         assert operations_entry["score_count"] == 1
         assert operations_entry["provisional_composite"] == pytest.approx(0.391897)
+        assert operations_entry["validator_queue_rank"] is None
+        assert operations["activity"]["status_counts"]["not_queued"] == 1
 
         pipeline = (
             await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
         ).json()
         assert pipeline["active_bench_version"] == 4
-        assert pipeline["status"] == "waiting_validator"
+        assert pipeline["status"] == "not_queued"
         assert pipeline["score_count"] == 1
         assert pipeline["score_floor"] == pytest.approx(0.80)
         scores_by_version = {
@@ -2339,6 +2520,11 @@ class TestPublicActivity:
         }
         assert scores_by_version[3] == pytest.approx(0.391235)
         assert scores_by_version[4] == pytest.approx(0.391897)
+        running_by_version = {
+            attempt["bench_version"]: attempt["actively_running"]
+            for attempt in pipeline["validation_attempts"]
+        }
+        assert running_by_version[3] is True
 
     async def test_retry_state_surfaces_exhausted_and_cooling_submissions(
         self,
@@ -2490,6 +2676,7 @@ class TestPublicActivity:
         ]
         assert all(response.status_code == 200 for response in responses)
         public_progress_keys = {
+            "slot_id",
             "agent_id",
             "agent_name",
             "bench_version",
@@ -2891,8 +3078,11 @@ class TestPublicActivity:
                     agent_id=agent_id,
                     validator_hotkey=_MINER_B,
                     status=TicketStatus.EXPIRED,
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
                     issued_at=now - timedelta(hours=2),
                     deadline=now - timedelta(hours=1),
+                    failure_reason="sandbox_oom",
+                    failed_at=now - timedelta(hours=1),
                 )
             )
         _install_db(app, session_maker)
@@ -2903,6 +3093,119 @@ class TestPublicActivity:
         assert body["provisional_scores"][0]["composite"] == pytest.approx(0.52)
         assert body["validation_attempts"][0]["status"] == "expired"
         assert body["validation_attempts"][0]["bench_version"] == 2
+        assert body["validation_attempts"][0]["purpose"] == "canonical_quorum"
+        assert body["validation_attempts"][0]["failure_reason"] == "sandbox_oom"
+        assert body["validation_attempts"][0]["failed_at"] is not None
+
+    async def test_pipeline_separates_canonical_quorum_from_continual_retests(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        agent_id = UUID(
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.91, 0.92, 0.93],
+                status=AgentStatus.SCORED,
+                details={"bench_version": 2},
+            )
+        )
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            canonical = list(
+                await session.scalars(
+                    select(Score)
+                    .where(Score.agent_id == agent_id)
+                    .order_by(Score.validator_hotkey)
+                )
+            )
+            for score in canonical:
+                score.created_at = now - timedelta(hours=1)
+            completed_validator = canonical[0].validator_hotkey
+            pending_validator = canonical[1].validator_hotkey
+            replacement_validator = canonical[2].validator_hotkey
+            await append_confirmation_scores(
+                session,
+                rows=[
+                    ConfirmationSeedScore(
+                        agent_id=agent_id,
+                        validator_hotkey=completed_validator,
+                        seed=111,
+                        composite=0.94,
+                        run_id="confirmation-run",
+                        signature="ab" * 64,
+                    ),
+                    ConfirmationSeedScore(
+                        agent_id=agent_id,
+                        validator_hotkey=completed_validator,
+                        seed=222,
+                        composite=0.95,
+                        run_id="confirmation-run",
+                        signature="ab" * 64,
+                    ),
+                ],
+                bench_version=2,
+                created_at=now,
+            )
+            session.add_all(
+                [
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        validator_hotkey=completed_validator,
+                        status=TicketStatus.SCORED,
+                        purpose=TicketPurpose.CONTINUAL_RETEST,
+                        issued_at=now - timedelta(minutes=10),
+                        deadline=now - timedelta(minutes=5),
+                        bench_version=2,
+                    ),
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        validator_hotkey=pending_validator,
+                        status=TicketStatus.ISSUED,
+                        purpose=TicketPurpose.CONTINUAL_RETEST,
+                        issued_at=now,
+                        deadline=now + timedelta(minutes=30),
+                        bench_version=2,
+                    ),
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        validator_hotkey=replacement_validator,
+                        status=TicketStatus.ISSUED,
+                        purpose=TicketPurpose.CANONICAL_QUORUM,
+                        issued_at=now,
+                        deadline=now + timedelta(minutes=30),
+                        bench_version=2,
+                    ),
+                ]
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")).json()
+
+        assert body["score_count"] == body["quorum"] == 3
+        assert len(body["provisional_scores"]) == 3
+        assert [
+            (score["seed"], score["composite"]) for score in body["confirmation_scores"]
+        ] == [
+            ("111", pytest.approx(0.94)),
+            ("222", pytest.approx(0.95)),
+        ]
+        assert all("run_id" not in score for score in body["confirmation_scores"])
+        assert {
+            attempt["validator_hotkey"]: attempt["purpose"]
+            for attempt in body["validation_attempts"]
+        } == {
+            completed_validator: "continual_retest",
+            pending_validator: "continual_retest",
+            replacement_validator: "canonical_quorum",
+        }
 
     async def test_pipeline_keeps_mixed_benchmark_quorums_separate(
         self,
@@ -3536,19 +3839,25 @@ class TestBenchConfig:
     """GET /public/bench/config exposes the frozen-model + grading setup."""
 
     async def test_config_shape_and_defaults(
-        self, client: httpx.AsyncClient, monkeypatch
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch,
     ) -> None:
+        _install_db(app, session_maker)
         monkeypatch.delenv("STORAGE_PUBLIC_BUCKET", raising=False)
         resp = await client.get("/api/v1/public/bench/config")
         assert resp.status_code == 200
         assert "max-age=300" in resp.headers["Cache-Control"]
         body = resp.json()
-        assert body["bench_version"] >= 2
+        assert body["bench_version"] == DEFAULT_BENCH_VERSION
         h = body["harness"]
         assert h["locked"] is True
         assert h["canonical_id"] == "qwen/qwen3-32b"
         assert h["serving"] == "Qwen/Qwen3-32B-TEE"
         assert h["thinking"] is False
+        assert h["reasoning_effort"] is None
         assert body["grading"]["judge_free"] is True
         assert "dittobench-datagen" in body["grading"]["grader"]
         assert "dataset_sha256" in body["dataset"]["reproduce"]
@@ -3559,9 +3868,45 @@ class TestBenchConfig:
         )
         assert body["ledger_path"] == "/api/v1/scoring/scores"
 
-    async def test_mirror_template_from_env(
-        self, client: httpx.AsyncClient, monkeypatch
+    async def test_open_v7_rollout_keeps_active_v6_harness_authoritative(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch,
     ) -> None:
+        _install_db(app, session_maker)
+        monkeypatch.delenv("BENCH_HARNESS_MODEL_ID", raising=False)
+        monkeypatch.delenv("BENCH_HARNESS_SERVING", raising=False)
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=DEFAULT_BENCH_VERSION,
+                    desired_version=7,
+                    status="collecting",
+                    cohort_size=5,
+                    created_at=datetime.now(UTC),
+                )
+            )
+
+        body = (await client.get("/api/v1/public/bench/config")).json()
+
+        assert body["bench_version"] == DEFAULT_BENCH_VERSION
+        assert body["desired_bench_version"] == 7
+        assert body["harness"]["canonical_id"] == "qwen/qwen3-32b"
+        assert body["harness"]["serving"] == "Qwen/Qwen3-32B-TEE"
+        assert body["harness"]["thinking"] is False
+        assert body["harness"]["reasoning_effort"] is None
+
+    async def test_mirror_template_from_env(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch,
+    ) -> None:
+        _install_db(app, session_maker)
         monkeypatch.setenv("STORAGE_PUBLIC_BUCKET", "ditto-platform-public-dev")
         body = (await client.get("/api/v1/public/bench/config")).json()
         assert body["public_mirror_url_template"] == (
@@ -3732,9 +4077,15 @@ def test_bench_glossary_explains_every_v5_category_and_metric() -> None:
     metrics = {m["key"] for m in bg.metric_entries()}
     # bench_version changelog is present, newest first, complete per version.
     versions = bg.version_entries()
-    assert [v["version"] for v in versions] == [6, 5, 4, 3, 2]
+    assert [v["version"] for v in versions] == [7, 6, 5, 4, 3, 2]
     for v in versions:
         assert v["title"] and v["summary"] and v["epoch"]
+
+    v7 = versions[0]
+    assert v7["title"] == "GPT-OSS inference contract"
+    assert "openai/gpt-oss-20b" in v7["summary"]
+    assert "medium" in v7["summary"]
+    assert any("Same generated questions" in item for item in v7["highlights"])
 
     for key in (
         "composite",

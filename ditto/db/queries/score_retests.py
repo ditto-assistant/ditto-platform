@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.db.models import Agent, Score, ScoreAuditEntry, ValidatorTicket
 from ditto.db.queries.audit import (
     EVENT_SCORE_INVALIDATED,
@@ -108,6 +108,7 @@ async def activate_next_score_retest(
     now: datetime,
     supports_version: Callable[[int], bool],
     validator_running_benchmark: bool = False,
+    slot_id: str = "slot-0",
 ) -> ValidatorTicket | None:
     """Resume the active re-test or promote the oldest runnable queued item.
 
@@ -120,16 +121,37 @@ async def activate_next_score_retest(
         session, validator_hotkey=validator_hotkey
     )
 
-    issued = await session.scalar(
-        select(ValidatorTicket)
-        .where(
-            ValidatorTicket.validator_hotkey == validator_hotkey,
-            ValidatorTicket.status == TicketStatus.ISSUED,
-        )
-        .limit(1)
-        .with_for_update()
+    issued_rows = list(
+        (
+            await session.scalars(
+                select(ValidatorTicket)
+                .where(
+                    ValidatorTicket.validator_hotkey == validator_hotkey,
+                    ValidatorTicket.status == TicketStatus.ISSUED,
+                )
+                .with_for_update()
+            )
+        ).all()
     )
+    issued = next(
+        (
+            ticket
+            for ticket in issued_rows
+            if ticket.purpose == TicketPurpose.CANONICAL_QUORUM
+            and ticket.purpose_revision > 0
+            if (lifecycle := latest.get(ticket.agent_id)) is not None
+            and lifecycle.event == EVENT_SCORE_RETEST_REQUESTED
+        ),
+        None,
+    )
+    # Retests remain serialized behind every live ticket for this validator.
+    # Parallel ordinary capacity must not let a replacement jump the existing
+    # recovery queue or displace the public canonical score early.
+    if issued_rows and issued is None:
+        return None
     if issued is not None:
+        if issued.slot_id != slot_id:
+            return None
         lifecycle = latest.get(issued.agent_id)
         if (
             lifecycle is not None
@@ -196,6 +218,10 @@ async def activate_next_score_retest(
         assert ticket is not None
         deadline = now + REPLACEMENT_TICKET_TTL
         ticket.status = TicketStatus.ISSUED
+        ticket.purpose = TicketPurpose.CANONICAL_QUORUM
+        ticket.purpose_revision += 1
+        ticket.legacy_completion_allowed = False
+        ticket.slot_id = slot_id
         ticket.issued_at = now
         ticket.deadline = deadline
         ticket.attempt_count += 1

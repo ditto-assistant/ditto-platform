@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Literal
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_server.datapipeline import DatasetGenerator
+from ditto.api_server.inference_routing import (
+    AGGREGATE_CALIBRATION_SAMPLES,
+    AGGREGATE_PROVIDER,
+    aggregate_profile_revision,
+    benchmark_model,
+)
 from ditto.db.models import (
     Agent,
     BenchmarkDataset,
@@ -20,8 +26,10 @@ from ditto.db.models import (
     Score,
 )
 from ditto.db.queries.benchmark_rollout import (
-    MAX_RESCORE_COHORT_SIZE,
+    MAX_PERSISTED_RESCORE_COHORT_SIZE,
+    RESCORE_COHORT_SIZE,
     DatasetPin,
+    InferenceActivationRequirements,
     RolloutSnapshotMember,
     append_rollout_member,
     historical_rescore_cohort,
@@ -30,6 +38,31 @@ from ditto.db.queries.benchmark_rollout import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ditto.api_server.config import InferenceProxyConfig
+
+
+def inference_activation_requirements(
+    config: InferenceProxyConfig | None, *, bench_version: int
+) -> InferenceActivationRequirements | None:
+    """Snapshot live process configuration without exposing provider secrets."""
+    if config is None:
+        return None
+    model = benchmark_model(bench_version)
+    return InferenceActivationRequirements(
+        enabled=config.enabled,
+        provider_key_configured=bool(config.openrouter_api_key),
+        model=model,
+        routing_mode=config.routing_mode,  # type: ignore[arg-type]
+        reviewed_manifest_sha256=config.reviewed_calibration_manifest_sha256,
+        aggregate_provider=AGGREGATE_PROVIDER,
+        aggregate_profile_revision=aggregate_profile_revision(model),
+        aggregate_calibration_samples=AGGREGATE_CALIBRATION_SAMPLES,
+        route_observation_max_age=timedelta(
+            seconds=max(60, config.discovery_interval_seconds)
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -51,11 +84,11 @@ class PendingQualification:
 async def _rollout_rescore_cohort(
     session: AsyncSession, *, rollout: BenchmarkRollout
 ) -> list[RolloutSnapshotMember]:
-    """Preserve already-frozen members, then fill to the historical top 25.
+    """Preserve already-frozen members, then fill new rollouts to the top ten.
 
-    Early rollout code could append a newly risen hybrid-top-five member. Those
-    durable rows and their accepted scores are never deleted, but they also
-    must not expand the corrected cohort past 25.
+    Older deployments created cohorts as large as 25. Those durable rows and
+    their accepted scores are never deleted; only rollouts that have not
+    already crossed the new bound are filled to ten.
     """
     existing = (
         (
@@ -68,7 +101,7 @@ async def _rollout_rescore_cohort(
         .scalars()
         .all()
     )
-    if len(existing) > MAX_RESCORE_COHORT_SIZE:
+    if len(existing) > MAX_PERSISTED_RESCORE_COHORT_SIZE:
         raise RuntimeError("existing benchmark rollout exceeds the top-25 bound")
     cohort = [
         RolloutSnapshotMember(
@@ -78,15 +111,19 @@ async def _rollout_rescore_cohort(
         )
         for member in existing
     ]
+    if len(existing) >= RESCORE_COHORT_SIZE:
+        return cohort
     seen = {member.agent_id for member in cohort}
     for member in await historical_rescore_cohort(
-        session, source_version=rollout.from_version
+        session,
+        source_version=rollout.from_version,
+        limit=RESCORE_COHORT_SIZE,
     ):
         if member.agent_id in seen:
             continue
         cohort.append(member)
         seen.add(member.agent_id)
-        if len(cohort) == MAX_RESCORE_COHORT_SIZE:
+        if len(cohort) == RESCORE_COHORT_SIZE:
             break
     return cohort
 
@@ -195,7 +232,7 @@ async def qualification_candidate(
 async def rolling_qualification_blockers(
     session: AsyncSession, *, generator_run_size: str | None
 ) -> list[dict[str, str]]:
-    """Describe inherited top-25 agents that automatic qualification cannot add."""
+    """Describe inherited top-ten agents that automatic qualification cannot add."""
     rollout = await open_rollout(session)
     if rollout is None:
         return []
@@ -235,9 +272,13 @@ async def ensure_rolling_qualification(
 
 
 async def refresh_rolling_qualification(
-    session: AsyncSession, *, generator: DatasetGenerator, now: datetime
+    session: AsyncSession,
+    *,
+    generator: DatasetGenerator,
+    now: datetime,
+    inference_config: InferenceProxyConfig | None = None,
 ) -> int:
-    """Converge the frozen inherited top-25 cohort and try activation.
+    """Converge the frozen inherited top-ten cohort and try activation.
 
     Dataset rendering deliberately happens between transactions: the generator
     is a network service and must never run while holding rollout/agent locks.
@@ -338,5 +379,12 @@ async def refresh_rolling_qualification(
                 now=now,
                 audit_context={"seed_source": candidate.seed_source},
             )
-        await maybe_activate_rollout(session, rollout, now=now)
+        await maybe_activate_rollout(
+            session,
+            rollout,
+            now=now,
+            inference_requirements=inference_activation_requirements(
+                inference_config, bench_version=rollout.desired_version
+            ),
+        )
     return appended

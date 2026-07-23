@@ -75,7 +75,8 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
     composite, tool_mean, memory_mean, first_seen, n,
     median_ms, bench_version, dataset_sha256, models, per_category,
     integrity, tokens } ], emissions: { champion_agent_id, recipients,
-    raw_leader_decision, margin, dethrone_z, champion_share, tail_size } }`.
+    raw_leader_decision, margin, dethrone_z, champion_share, rank_shares,
+    tail_size } }`.
   Entries are best-per-payment-coldkey and ranked by raw finalized composite.
   Different names and hotkeys under one coldkey compete for one position; the
   best eligible generation wins and its hotkey remains the weight destination.
@@ -85,8 +86,9 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   fallback. `?bench_version=2` provides a historical single-version view and
   intentionally returns `emissions: null`. In the default view, `emissions` is a
   public-safe, read-only projection of the validator's frozen first-seen KOTH
-  fold over finalized authoritative entries: the 2% incumbent margin, the
-  statistical band, the 90% champion share, and the participation tail. It is
+  fold over finalized authoritative entries: the fixed 0.007 composite-point
+  incumbent hysteresis, the
+  statistical band, and the 65% / 14% / 10% / 7% / 4% ranked distribution. It is
   `null` when no eligible entry exists. Validators still compute and submit their
   own authoritative weight vectors. The provenance block (`models` =
   generator/judge/judge_audit/harness, `bench_version`, `dataset_sha256`,
@@ -127,6 +129,22 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   seed provenance, and version-pinned reproduction / hash-verification commands.
   It does **not** associate a provisional number with a validator identity and
   never returns signatures, leases, run ids, secrets, or scorer internals.
+  Finalized top-five agents may also carry `confirmation_scores`: completed,
+  append-only shared-seed retest results with composite, exact decimal seed,
+  public validator hotkey, benchmark version, and acceptance time. These rows
+  are explicitly separate from `provisional_scores` and never change the fixed
+  three-score canonical median. Each validation attempt has an additive
+  `purpose` (`canonical_quorum`, `continual_retest`, or the bounded rolling-
+  deployment state `legacy_unclassified`) so the operations UI can report extra
+  maintenance work without presenting it as a fourth quorum slot or guessing
+  about an old-writer lease. Unclassified in-flight leases drain and are
+  reissued with an explicit purpose; neither score endpoint consumes them.
+  A bounded migration allowance lets leases from old replicas finish during
+  rolling overlap; the authenticated new score endpoint classifies such a lease
+  as it consumes it. Purpose-aware writers explicitly disable the allowance and
+  bind a positive revision. A database-side guard converts old-writer reissues
+  to unclassified, while revision-zero leases without the transition allowance
+  cannot be scored.
   `final_composite` remains null until three independent scores reach quorum and
   the submission is in a finalized public state; the leaderboard and emission
   eligibility rules are unchanged. On-chain provenance is claimed only when the

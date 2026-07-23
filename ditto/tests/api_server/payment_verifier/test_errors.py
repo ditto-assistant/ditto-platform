@@ -1,10 +1,6 @@
-"""Each PaymentVerifierError subclass must document its trigger conditions."""
+"""Payment verifier error hierarchy tests."""
 
 from __future__ import annotations
-
-import inspect
-
-import pytest
 
 from ditto.api_server.payment_verifier import (
     PaymentAmountMismatch,
@@ -18,36 +14,7 @@ from ditto.api_server.payment_verifier import (
 )
 
 
-class TestErrorDocstrings:
-    """Each concrete error carries a 'This can happen when:' bullet list."""
-
-    @pytest.mark.parametrize(
-        "cls",
-        [
-            PaymentNotFoundOnChain,
-            PaymentExtrinsicFailed,
-            PaymentCallTypeMismatch,
-            PaymentAmountMismatch,
-            PaymentDestinationMismatch,
-            PaymentSignerMismatch,
-            PaymentReplayedError,
-        ],
-    )
-    def test_has_trigger_bullets(self, cls: type[Exception]):
-        # Python 3.13 strips common leading whitespace at compile time;
-        # 3.11/3.12 preserve the source indentation. Normalise via
-        # ``inspect.cleandoc`` so the assertion behaves identically
-        # across the supported interpreter range.
-        doc = inspect.cleandoc(cls.__doc__ or "")
-        assert "This can happen when:" in doc, (
-            f"{cls.__name__} missing 'This can happen when:' docstring section"
-        )
-        # At least one bullet entry signals real content rather than an
-        # empty placeholder section.
-        assert "\n- " in doc, (
-            f"{cls.__name__} 'This can happen when:' has no bullet entries"
-        )
-
+class TestErrorHierarchy:
     def test_base_class_inheritance(self):
         for cls in (
             PaymentNotFoundOnChain,

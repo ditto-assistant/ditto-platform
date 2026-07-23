@@ -1,0 +1,208 @@
+/* App shell: sidebar rail + main column. Structural rules; main's themed
+       .sidebar/.nav-item/.page-title rules below refine colour, font, radius. */
+.layout {
+  display: flex;
+  align-items: stretch;
+  min-height: 100vh;
+}
+.sidebar {
+  flex: 0 0 240px;
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  height: 100vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 22px 16px 20px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+.main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.sidebar .brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.sidebar .brand .sub {
+  color: var(--text-dim);
+}
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 11px;
+  border-radius: 10px;
+  color: var(--text-dim);
+  text-decoration: none;
+  border: 1px solid transparent;
+  transition:
+    background 0.12s,
+    border-color 0.12s,
+    color 0.12s;
+}
+.nav-item:hover {
+  color: var(--text);
+}
+.nav-item .ni-icon {
+  width: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.nav-item .ni-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.nav-item .ni-label {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.nav-item .ni-desc {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.ic {
+  width: 1em;
+  height: 1em;
+  flex: none;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vertical-align: -0.14em;
+}
+.nav-item .ni-icon .ic {
+  width: 17px;
+  height: 17px;
+}
+.btn .ic {
+  width: 15px;
+  height: 15px;
+}
+.github-mark {
+  fill: currentColor;
+  stroke: none;
+}
+.banner .ic {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+a .ic.ext {
+  width: 12px;
+  height: 12px;
+  opacity: 0.7;
+  margin-left: 2px;
+}
+.side-theme {
+  margin-top: 4px;
+}
+/* In the vertical sidebar the four options wrap to a 2x2 grid so "Time"
+       can't overflow the 240px rail; the mobile top bar keeps the compact row. */
+.side-theme .theme-switch {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+}
+.side-theme .theme-option {
+  justify-content: center;
+  min-width: 0;
+}
+.side-theme .theme-option span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.side-foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.side-foot .btn {
+  justify-content: center;
+}
+.page {
+  display: none;
+}
+.page.active {
+  display: block;
+}
+
+.sidebar {
+  flex-basis: 248px;
+  gap: 24px;
+  padding: 26px 18px 20px;
+  border-color: var(--border);
+  background: var(--bg-elev);
+  backdrop-filter: none;
+}
+.sidebar .brand {
+  gap: 10px;
+  padding: 0 6px 8px;
+}
+.sidebar .brand .brand-name {
+  font-family: var(--display);
+  font-size: 18px;
+  font-weight: 400;
+  line-height: 1.05;
+  letter-spacing: -0.01em;
+}
+.sidebar .brand .mark {
+  width: 42px;
+  height: 42px;
+}
+.sidebar .brand .sub {
+  margin-top: 4px;
+  font-size: 11px;
+}
+.sidebar .bench-badge {
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.nav {
+  gap: 2px;
+}
+.nav-item {
+  gap: 10px;
+  padding: 10px 11px;
+  border-radius: 4px;
+  color: var(--text-dim);
+}
+.nav-item:hover {
+  background: var(--bg-elev-2);
+}
+.nav-item.active {
+  background: var(--bg-elev-2);
+  border-color: var(--border);
+  color: var(--text);
+}
+.nav-item.active .ni-icon {
+  color: var(--accent);
+}
+.nav-item .ni-label {
+  font-size: 13px;
+  letter-spacing: 0;
+}
+.nav-item .ni-desc {
+  margin-top: 1px;
+  color: var(--text-faint);
+  font-size: 11px;
+}

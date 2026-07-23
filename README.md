@@ -52,8 +52,8 @@ dependency-light `ditto-screening-protocol` package, pinned to an exact commit.
 | `GET /health` | Liveness + DB/chain readiness + build commit |
 | `GET /metrics` | Prometheus metrics |
 | `GET /api/v1/upload/eval-pricing` | Quote the upload fee in rao (CoinGecko TAO/USD oracle) |
-| `POST /api/v1/upload/check` | Pre-payment dry-run validation (signature, registration, size) |
-| `POST /api/v1/upload/agent` | Verified submission: re-check payment on chain → store tarball → write `agents` + `evaluation_payments` atomically |
+| `POST /api/v1/upload/check` | Pre-payment validation (signature, registration, size, accidental identical-upload detection) |
+| `POST /api/v1/upload/agent` | Verified submission: assign payment/credit → store unique tarball → write `agents` + `evaluation_payments` atomically; an accidental paid identical upload becomes a reusable credit |
 | `GET /api/v1/retrieval/agent-by-hotkey` | Look up a miner's latest agent |
 | `GET /api/v1/retrieval/agent/{id}/status` | Poll a submission's lifecycle status |
 
@@ -95,8 +95,8 @@ it remains platform-operated, and validators do not run it.
 ### Planned (scoring + ops)
 
 Weight/score aggregation (`/scoring/*`) and `/admin/*`. See
-[`PROJECT.md`](https://github.com/ditto-assistant/ditto-subnet/blob/main/PROJECT.md) in `ditto-subnet`
-for the evaluation/scoring design.
+[`docs/VALIDATOR.md`](https://github.com/ditto-assistant/ditto-subnet/blob/main/docs/VALIDATOR.md)
+in `ditto-subnet` for validator scoring design and operations.
 
 ---
 
@@ -236,11 +236,12 @@ so a supervisor restarts cleanly.
 
 ```sh
 make test                 # fast unit suite (default markers excluded)
-make test-integration     # requires the live Docker stack (make stack-up)
+make test-integration     # serial; requires the live Docker stack (make stack-up)
 ```
 
 Test markers (`slow`, `integration`, `localnet`, `e2e`) are excluded by default;
-CI runs `ruff`, `mypy`, and `pytest` on every PR and on `main`.
+the unit suite uses all available CPU cores through `pytest-xdist`. CI runs
+`ruff`, `mypy`, and `pytest` on every PR and on `main`.
 
 ---
 

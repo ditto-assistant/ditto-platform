@@ -45,7 +45,7 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # GitHub Environment selects the per-env DITTO_UPLOAD_PAYMENT_ADDRESS secret
     # (and enables optional required-reviewer gating on prod).
     environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}

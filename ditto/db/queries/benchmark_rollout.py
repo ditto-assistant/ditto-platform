@@ -17,7 +17,7 @@ from ditto.api_models.benchmark_contract import (
     benchmark_contract,
     latest_benchmark_contract,
 )
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
     ValidatorStackIdentity,
@@ -28,6 +28,8 @@ from ditto.db.models import (
     BenchmarkRollout,
     BenchmarkRolloutAudit,
     BenchmarkRolloutMember,
+    InferenceProviderRoute,
+    InferenceRoutingPolicy,
     Score,
     ValidatorHeartbeat,
     ValidatorTicket,
@@ -49,7 +51,12 @@ LEGACY_BENCH_VERSION = 2
 # This is discovery metadata only: it no longer opens or selects a rollout.
 CANARY_BENCH_VERSION = latest_benchmark_contract().version
 PRIORITY_COHORT_SIZE = 5
-MAX_RESCORE_COHORT_SIZE = 25
+# New benchmark transitions rescore only the inherited top ten. The database
+# still permits older 11-25-member rollout snapshots so historical audit rows
+# remain readable and an in-flight rollout created by an older deployment can
+# finish without destructive member deletion.
+RESCORE_COHORT_SIZE = 10
+MAX_PERSISTED_RESCORE_COHORT_SIZE = 25
 SCORING_QUORUM = 3
 # How many agents must hold a COMPLETE, ranked desired-version quorum before
 # the desired version may take over. Two gates enforce it against the same count
@@ -95,6 +102,135 @@ class DatasetPin:
     run_size: str
     seed_block: int | None = None
     seed_block_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class InferenceActivationRequirements:
+    """Live process state required before v7 may become authoritative."""
+
+    enabled: bool
+    provider_key_configured: bool
+    model: str
+    routing_mode: Literal["aggregate_throughput", "adaptive"]
+    reviewed_manifest_sha256: str | None
+    aggregate_provider: str | None = None
+    aggregate_profile_revision: str | None = None
+    aggregate_calibration_samples: int | None = None
+    route_observation_max_age: timedelta = timedelta(minutes=5)
+
+
+_INFERENCE_ACTIVATION_REQUIREMENTS_SESSION_KEY = (
+    "ditto_inference_activation_requirements"
+)
+
+
+def bind_inference_activation_requirements(
+    session: AsyncSession,
+    requirements: InferenceActivationRequirements | None,
+) -> None:
+    """Bind the live process readiness snapshot to every authority read."""
+    session.info[_INFERENCE_ACTIVATION_REQUIREMENTS_SESSION_KEY] = requirements
+
+
+async def inference_activation_ready(
+    session: AsyncSession,
+    *,
+    bench_version: int,
+    now: datetime,
+    requirements: InferenceActivationRequirements | None,
+) -> bool:
+    """Require live proxy readiness and an exact, recently proven v7 route."""
+    if bench_version < 7:
+        return True
+    if (
+        requirements is None
+        or not requirements.enabled
+        or not requirements.provider_key_configured
+        or requirements.reviewed_manifest_sha256 is None
+    ):
+        return False
+    cutoff = now - requirements.route_observation_max_age
+    route_statement = (
+        select(InferenceProviderRoute)
+        .join(
+            InferenceRoutingPolicy,
+            InferenceRoutingPolicy.model == InferenceProviderRoute.model,
+        )
+        .where(
+            InferenceProviderRoute.model == requirements.model,
+            InferenceProviderRoute.status == "healthy",
+            InferenceProviderRoute.calibration_status == "eligible",
+            InferenceProviderRoute.calibration_manifest_sha256
+            == requirements.reviewed_manifest_sha256,
+            InferenceProviderRoute.last_observed_at.is_not(None),
+            InferenceProviderRoute.last_observed_at >= cutoff,
+            InferenceProviderRoute.calibration_tool_accuracy
+            >= InferenceRoutingPolicy.min_tool_accuracy,
+            InferenceProviderRoute.calibration_composite
+            >= InferenceRoutingPolicy.min_composite,
+        )
+    )
+    if requirements.routing_mode == "aggregate_throughput":
+        if (
+            requirements.aggregate_provider is None
+            or requirements.aggregate_profile_revision is None
+            or requirements.aggregate_calibration_samples is None
+        ):
+            return False
+        route_statement = route_statement.where(
+            InferenceProviderRoute.provider == requirements.aggregate_provider,
+            InferenceProviderRoute.profile_revision
+            == requirements.aggregate_profile_revision,
+            InferenceProviderRoute.calibration_sample_count
+            == requirements.aggregate_calibration_samples,
+        )
+    elif requirements.routing_mode == "adaptive":
+        route_statement = route_statement.where(
+            InferenceRoutingPolicy.enabled.is_(True),
+            InferenceProviderRoute.calibration_sample_count
+            >= InferenceRoutingPolicy.min_calibration_samples,
+            InferenceProviderRoute.ewma_error_rate
+            <= InferenceRoutingPolicy.max_error_rate,
+            InferenceProviderRoute.ewma_timeout_rate
+            <= InferenceRoutingPolicy.max_timeout_rate,
+        )
+    else:
+        return False
+    routes = list(await session.scalars(route_statement))
+    routes = [
+        route
+        for route in routes
+        if route.cooldown_until is None or route.cooldown_until <= now
+    ]
+    if not routes:
+        return False
+    route_identities = {(route.provider, route.profile_revision) for route in routes}
+    for heartbeat in list(await session.scalars(select(ValidatorHeartbeat))):
+        if heartbeat.protocol_version < 11 or not heartbeat_supports_version(
+            heartbeat, now=now, version=bench_version
+        ):
+            continue
+        try:
+            capabilities = ValidatorCapabilities.model_validate_json(
+                json.dumps(heartbeat.capabilities)
+            )
+        except ValidationError:
+            continue
+        scorer = capabilities.scorer_benchmarks
+        calibration = scorer.v7_calibration if scorer is not None else None
+        if (
+            calibration is None
+            or not capabilities.ticket_inference
+            or calibration.manifest_sha256 != requirements.reviewed_manifest_sha256
+        ):
+            continue
+        if any(
+            route.model == requirements.model
+            and (route.provider, route.profile_revision) in route_identities
+            for route in calibration.supported_routes
+        ):
+            return True
+    return False
 
 
 async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]:
@@ -183,7 +319,7 @@ async def historical_rescore_cohort(
     session: AsyncSession,
     *,
     source_version: int,
-    limit: int = MAX_RESCORE_COHORT_SIZE,
+    limit: int = RESCORE_COHORT_SIZE,
 ) -> list[RolloutSnapshotMember]:
     """Freeze the prior-era rescore cohort without admitting the whole ledger.
 
@@ -193,10 +329,10 @@ async def historical_rescore_cohort(
     explicit "combine two previous benchmark iterations" fallback, not an
     unbounded backfill of every legacy submission.
     """
-    if limit < PRIORITY_COHORT_SIZE or limit > MAX_RESCORE_COHORT_SIZE:
+    if limit < PRIORITY_COHORT_SIZE or limit > RESCORE_COHORT_SIZE:
         raise ValueError(
             f"rollout cohort limit must be between {PRIORITY_COHORT_SIZE} "
-            f"and {MAX_RESCORE_COHORT_SIZE}"
+            f"and {RESCORE_COHORT_SIZE}"
         )
     versions = list(
         await session.scalars(
@@ -391,6 +527,18 @@ async def active_bench_version(session: AsyncSession) -> int:
             len(priority_ids) == PRIORITY_COHORT_SIZE
             and ready >= MIN_DESIRED_AUTHORITY_AGENTS
         ):
+            if (
+                open_transition.desired_version >= 7
+                and not await inference_activation_ready(
+                    session,
+                    bench_version=open_transition.desired_version,
+                    now=datetime.now(UTC),
+                    requirements=session.info.get(
+                        _INFERENCE_ACTIVATION_REQUIREMENTS_SESSION_KEY
+                    ),
+                )
+            ):
+                return await persisted_active_bench_version(session)
             return open_transition.desired_version
     return await persisted_active_bench_version(session)
 
@@ -626,6 +774,7 @@ async def select_active_bench_version(
     actor: str,
     reason: str,
     now: datetime,
+    inference_requirements: InferenceActivationRequirements | None = None,
 ) -> BenchmarkRollout:
     """Select a fully qualified historical contract as active authority.
 
@@ -664,6 +813,15 @@ async def select_active_bench_version(
     readiness = await authority_selection_state(session, bench_version=bench_version)
     if not readiness["ready"]:
         raise RolloutConflictError(str(readiness["blocked_reason"]))
+    if not await inference_activation_ready(
+        session,
+        bench_version=bench_version,
+        now=now,
+        requirements=inference_requirements,
+    ):
+        raise RolloutConflictError(
+            "benchmark inference is not live on the exact reviewed route"
+        )
     await _audit(
         session,
         rollout,
@@ -721,8 +879,8 @@ async def create_rollout_snapshot(
             f"{conflicting.desired_version} is still {conflicting.status}; only one "
             "benchmark rollout may be open at a time"
         )
-    if not PRIORITY_COHORT_SIZE <= len(members) <= MAX_RESCORE_COHORT_SIZE:
-        raise ValueError("a benchmark rollout requires between five and 25 members")
+    if not PRIORITY_COHORT_SIZE <= len(members) <= RESCORE_COHORT_SIZE:
+        raise ValueError("a benchmark rollout requires between five and ten members")
     if len({m.agent_id for m in members}) != len(members):
         raise ValueError("benchmark rollout agents must be distinct")
     if len({m.miner_hotkey for m in members}) != len(members):
@@ -839,6 +997,8 @@ def heartbeat_supports_version(
     # validator that can advertise a post-v2 benchmark is already >= 8.
     if heartbeat.protocol_version < 8:
         return False
+    if version >= 7 and heartbeat.protocol_version < 12:
+        return False
     seen_at = (
         heartbeat.seen_at.replace(tzinfo=UTC)
         if heartbeat.seen_at.tzinfo is None
@@ -858,6 +1018,12 @@ def heartbeat_supports_version(
         scorer is None
         or scorer.status != "fresh_verified"
         or version not in scorer.supported_bench_versions
+    ):
+        return False
+    if version >= 7 and (
+        not capabilities.ticket_inference
+        or not capabilities.signed_score_quorum
+        or scorer.v7_calibration is None
     ):
         return False
     if (
@@ -881,6 +1047,7 @@ async def issue_rollout_ticket(
     ttl: timedelta,
     artifact_mode: Literal["legacy", "prefer_screened", "screened_only"] = "legacy",
     validator_running_benchmark: bool = False,
+    slot_id: str = "slot-0",
 ) -> ValidatorTicket | None:
     """Issue one cohort lease, balanced one score per agent per coverage round."""
     # Retained as a keyword-compatible parameter for mixed platform callers;
@@ -913,8 +1080,11 @@ async def issue_rollout_ticket(
         .where(
             BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
             ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.bench_version == rollout.desired_version,
             ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.purpose == TicketPurpose.CANONICAL_QUORUM,
+            ValidatorTicket.purpose_revision > 0,
             ValidatorTicket.deadline > now,
         )
         .limit(1)
@@ -957,6 +1127,16 @@ async def issue_rollout_ticket(
         )
         .exists()
     )
+    already_ticketed = (
+        select(ValidatorTicket.agent_id)
+        .where(
+            ValidatorTicket.agent_id == BenchmarkRolloutMember.agent_id,
+            ValidatorTicket.bench_version == rollout.desired_version,
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.status.in_((TicketStatus.ISSUED, TicketStatus.SCORED)),
+        )
+        .exists()
+    )
     priority_count_rows = (
         await session.execute(
             select(
@@ -990,6 +1170,7 @@ async def issue_rollout_ticket(
             Agent.screening_policy_version >= contract.minimum_screening_policy_version,
             complete_screened_image,
             ~already_scored,
+            ~already_ticketed,
             score_count + occupied_count < SCORING_QUORUM,
         )
     )
@@ -1013,18 +1194,24 @@ async def issue_rollout_ticket(
     # version lease. Preserve genuinely running work, but an idle/polling
     # validator must not keep resuming that lower-priority lease ahead of the
     # target-version cohort. The database allows only one issued ticket per
-    # validator across all benchmark versions, so release any non-resumable
+    # validator slot across all benchmark versions, so release any non-resumable
     # lease only after proving that eligible rollout work exists.
     competing_ticket = await session.scalar(
         select(ValidatorTicket)
         .where(
             ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.status == TicketStatus.ISSUED,
         )
         .limit(1)
         .with_for_update()
     )
     if competing_ticket is not None:
+        if (
+            competing_ticket.purpose != TicketPurpose.CANONICAL_QUORUM
+            or competing_ticket.purpose_revision <= 0
+        ):
+            return None
         if validator_running_benchmark:
             return None
         competing_ticket.status = TicketStatus.EXPIRED
@@ -1040,7 +1227,10 @@ async def issue_rollout_ticket(
             agent_id=member.agent_id,
             bench_version=rollout.desired_version,
             validator_hotkey=validator_hotkey,
+            slot_id=slot_id,
             status=TicketStatus.ISSUED,
+            purpose=TicketPurpose.CANONICAL_QUORUM,
+            purpose_revision=1,
             issued_at=now,
             deadline=now + ttl,
             attempt_count=1,
@@ -1049,6 +1239,10 @@ async def issue_rollout_ticket(
         session.add(ticket)
     else:
         ticket.status = TicketStatus.ISSUED
+        ticket.purpose = TicketPurpose.CANONICAL_QUORUM
+        ticket.purpose_revision += 1
+        ticket.legacy_completion_allowed = False
+        ticket.slot_id = slot_id
         ticket.issued_at = now
         ticket.deadline = now + ttl
         ticket.attempt_count += 1
@@ -1058,7 +1252,11 @@ async def issue_rollout_ticket(
 
 
 async def maybe_activate_rollout(
-    session: AsyncSession, rollout: BenchmarkRollout, *, now: datetime
+    session: AsyncSession,
+    rollout: BenchmarkRollout,
+    *,
+    now: datetime,
+    inference_requirements: InferenceActivationRequirements | None = None,
 ) -> bool:
     """Activate after every frozen cohort member reaches desired quorum."""
     # A superseded (or already activated) rollout is terminal and must never be
@@ -1118,6 +1316,13 @@ async def maybe_activate_rollout(
         agent_ids=member_ids,
     )
     if ranked_cohort_agents != len(member_ids):
+        return False
+    if not await inference_activation_ready(
+        session,
+        bench_version=rollout.desired_version,
+        now=now,
+        requirements=inference_requirements,
+    ):
         return False
     rollout.status = "activated"
     rollout.activated_at = now

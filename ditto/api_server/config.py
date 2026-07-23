@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlparse
 
 from ditto.api_server.datapipeline import (
@@ -53,6 +53,48 @@ class ValidatorCompatibilityConfig:
     minimum_software_version: str | None
     minimum_protocol_version: int
     heartbeat_max_age_seconds: int
+
+
+@dataclass(frozen=True)
+class InferenceProxyConfig:
+    """Platform-owned OpenRouter proxy and ticket budget limits."""
+
+    enabled: bool
+    required: bool
+    public_base_url: str
+    openrouter_api_key: str | None
+    upstream_url: str
+    allowed_models: tuple[str, ...]
+    provider: str
+    routing_mode: str
+    request_budget: int
+    token_budget: int
+    per_ticket_concurrency: int
+    per_validator_concurrency: int
+    global_concurrency: int
+    per_ticket_requests_per_minute: int
+    per_validator_requests_per_minute: int
+    global_requests_per_minute: int
+    request_body_bytes: int
+    response_body_bytes: int
+    timeout_seconds: float
+    max_output_tokens: int
+    discovery_url_template: str = (
+        "https://openrouter.ai/api/v1/models/{model}/endpoints"
+    )
+    discovery_interval_seconds: int = 300
+    route_speed_weight: float = 0.65
+    route_cost_weight: float = 0.25
+    route_exploration_weight: float = 0.10
+    route_ewma_alpha: float = 0.20
+    route_min_tool_accuracy: float = 0.55
+    route_min_composite: float = 0.15
+    route_min_calibration_samples: int = 60
+    route_exploration_ticket_budget: int = 3
+    route_max_error_rate: float = 0.25
+    route_max_timeout_rate: float = 0.15
+    route_cooldown_seconds: int = 30
+    reviewed_calibration_manifest_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +160,32 @@ class ApiServerConfig:
     validator_compatibility: ValidatorCompatibilityConfig
     """Validator release and heartbeat requirements for scoring tickets."""
 
+    inference_proxy: InferenceProxyConfig = field(
+        default_factory=lambda: InferenceProxyConfig(
+            enabled=False,
+            required=False,
+            public_base_url="http://localhost:8000",
+            openrouter_api_key=None,
+            upstream_url="https://openrouter.ai/api/v1/chat/completions",
+            allowed_models=("qwen/qwen3-32b", "openai/gpt-oss-20b"),
+            provider="nebius",
+            routing_mode="aggregate_throughput",
+            request_budget=1024,
+            token_budget=4_000_000,
+            per_ticket_concurrency=8,
+            per_validator_concurrency=24,
+            global_concurrency=72,
+            per_ticket_requests_per_minute=240,
+            per_validator_requests_per_minute=960,
+            global_requests_per_minute=2880,
+            request_body_bytes=256 << 10,
+            response_body_bytes=2 << 20,
+            timeout_seconds=90.0,
+            max_output_tokens=8192,
+        )
+    )
+    """Dark-launchable, platform-owned ticket inference proxy."""
+
     admin_api_token: str | None = None
     """Bearer token for private Backroom/operator administration endpoints."""
 
@@ -133,6 +201,29 @@ class ApiServerConfig:
     ``ditto:wandb-url`` meta tag (``DITTO_DASHBOARD_WANDB_URL``), e.g.
     ``https://wandb.ai/<entity>/ditto-sn118``. The committed HTML ships a bare
     default so the link still resolves before the project exists."""
+
+    top5_backoff_base: int = 2
+    """Base interval, in tempos (1 tempo = 360 blocks ≈ 72 min), between top-5
+    shared-seed rescore rounds while the champion's reign is fresh
+    (``TOP5_RESCORE_BACKOFF_BASE``). The gap grows as an exponential backoff over
+    the reign -- ``min(base * 2**floor(reign_tempos / K), cap)`` -- so a fresh or
+    contested king is rescored densely and a settled leader sparsely. Set ``0``
+    to disable the lane entirely. Platform-authoritative (the subnet just retries
+    and swallows not-due rejections), so this is not a cross-repo consensus knob;
+    every validator still gets the same due decision because the platform is the
+    single arbiter."""
+
+    top5_backoff_doubling_tempos: int = 20
+    """How many reign-tempos the interval holds at ``base`` before each doubling
+    (``K`` in the backoff; ``TOP5_RESCORE_BACKOFF_K``). At the default ``20`` the
+    densest rounds are front-loaded across the first ~20 tempos (~24 h), matching
+    the king-source-reveal window (#277/#278) so the crown is hardened on the most
+    shared seeds exactly as the code becomes public."""
+
+    top5_backoff_cap: int = 8
+    """Ceiling on the round interval in tempos (``TOP5_RESCORE_BACKOFF_CAP``). The
+    backoff never reaches zero rate: a champion whose interval flatlines at the
+    cap is itself the signal that the field has gone stagnant."""
 
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -194,6 +285,137 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
         raise ApiServerConfigError(
             "validator compatibility protocol and heartbeat age must be integers"
         ) from error
+    inference_enabled = (
+        os.environ.get("DITTO_INFERENCE_PROXY_ENABLED", "false").strip().lower()
+        in _TRUTHY
+    )
+    try:
+        inference_proxy = InferenceProxyConfig(
+            enabled=inference_enabled,
+            required=(
+                os.environ.get("DITTO_INFERENCE_PROXY_REQUIRED", "false")
+                .strip()
+                .lower()
+                in _TRUTHY
+            ),
+            public_base_url=os.environ.get(
+                "DITTO_INFERENCE_PUBLIC_BASE_URL", "http://localhost:8000"
+            ).rstrip("/"),
+            openrouter_api_key=os.environ.get("OPENROUTER_API_KEY") or None,
+            upstream_url=os.environ.get(
+                "DITTO_INFERENCE_UPSTREAM_URL",
+                "https://openrouter.ai/api/v1/chat/completions",
+            ),
+            allowed_models=tuple(
+                model.strip()
+                for model in os.environ.get(
+                    "DITTO_INFERENCE_ALLOWED_MODELS",
+                    "qwen/qwen3-32b,openai/gpt-oss-20b",
+                ).split(",")
+                if model.strip()
+            ),
+            provider=os.environ.get("DITTO_INFERENCE_PROVIDER", "nebius").strip(),
+            routing_mode=os.environ.get(
+                "DITTO_INFERENCE_ROUTING_MODE", "aggregate_throughput"
+            ).strip(),
+            request_budget=int(
+                os.environ.get("DITTO_INFERENCE_REQUEST_BUDGET", "1024")
+            ),
+            token_budget=int(os.environ.get("DITTO_INFERENCE_TOKEN_BUDGET", "4000000")),
+            per_ticket_concurrency=int(
+                os.environ.get("DITTO_INFERENCE_TICKET_CONCURRENCY", "8")
+            ),
+            per_validator_concurrency=int(
+                os.environ.get("DITTO_INFERENCE_VALIDATOR_CONCURRENCY", "24")
+            ),
+            global_concurrency=int(
+                os.environ.get("DITTO_INFERENCE_GLOBAL_CONCURRENCY", "72")
+            ),
+            per_ticket_requests_per_minute=int(
+                os.environ.get("DITTO_INFERENCE_TICKET_RPM", "240")
+            ),
+            per_validator_requests_per_minute=int(
+                os.environ.get("DITTO_INFERENCE_VALIDATOR_RPM", "960")
+            ),
+            global_requests_per_minute=int(
+                os.environ.get("DITTO_INFERENCE_GLOBAL_RPM", "2880")
+            ),
+            request_body_bytes=int(
+                os.environ.get("DITTO_INFERENCE_REQUEST_BODY_BYTES", str(256 << 10))
+            ),
+            response_body_bytes=int(
+                os.environ.get("DITTO_INFERENCE_RESPONSE_BODY_BYTES", str(2 << 20))
+            ),
+            timeout_seconds=float(
+                os.environ.get("DITTO_INFERENCE_TIMEOUT_SECONDS", "90")
+            ),
+            max_output_tokens=int(
+                os.environ.get("DITTO_INFERENCE_MAX_OUTPUT_TOKENS", "8192")
+            ),
+            discovery_url_template=os.environ.get(
+                "DITTO_INFERENCE_DISCOVERY_URL_TEMPLATE",
+                "https://openrouter.ai/api/v1/models/{model}/endpoints",
+            ),
+            discovery_interval_seconds=int(
+                os.environ.get("DITTO_INFERENCE_DISCOVERY_INTERVAL_SECONDS", "300")
+            ),
+            route_speed_weight=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_SPEED_WEIGHT", "0.65")
+            ),
+            route_cost_weight=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_COST_WEIGHT", "0.25")
+            ),
+            route_exploration_weight=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_EXPLORATION_WEIGHT", "0.10")
+            ),
+            route_ewma_alpha=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_EWMA_ALPHA", "0.20")
+            ),
+            route_min_tool_accuracy=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_MIN_TOOL_ACCURACY", "0.55")
+            ),
+            route_min_composite=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_MIN_COMPOSITE", "0.15")
+            ),
+            route_min_calibration_samples=int(
+                os.environ.get("DITTO_INFERENCE_ROUTE_MIN_CALIBRATION_SAMPLES", "60")
+            ),
+            route_exploration_ticket_budget=int(
+                os.environ.get("DITTO_INFERENCE_ROUTE_EXPLORATION_TICKETS", "3")
+            ),
+            route_max_error_rate=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_MAX_ERROR_RATE", "0.25")
+            ),
+            route_max_timeout_rate=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_MAX_TIMEOUT_RATE", "0.15")
+            ),
+            route_cooldown_seconds=int(
+                os.environ.get("DITTO_INFERENCE_ROUTE_COOLDOWN_SECONDS", "30")
+            ),
+            reviewed_calibration_manifest_sha256=(
+                os.environ.get("DITTO_INFERENCE_REVIEWED_CALIBRATION_MANIFEST_SHA256")
+                or None
+            ),
+        )
+    except ValueError as error:
+        raise ApiServerConfigError("inference proxy limits must be numeric") from error
+
+    try:
+        top5_backoff_base = int(os.environ.get("TOP5_RESCORE_BACKOFF_BASE", "2"))
+        top5_backoff_doubling_tempos = int(
+            os.environ.get("TOP5_RESCORE_BACKOFF_K", "20")
+        )
+        top5_backoff_cap = int(os.environ.get("TOP5_RESCORE_BACKOFF_CAP", "8"))
+    except ValueError as error:
+        raise ApiServerConfigError(
+            "TOP5_RESCORE_BACKOFF_BASE / _K / _CAP must be integer tempos"
+        ) from error
+    if top5_backoff_base < 0:
+        raise ApiServerConfigError("TOP5_RESCORE_BACKOFF_BASE must be non-negative")
+    if top5_backoff_doubling_tempos < 1:
+        raise ApiServerConfigError("TOP5_RESCORE_BACKOFF_K must be >= 1")
+    if top5_backoff_cap < max(1, top5_backoff_base):
+        raise ApiServerConfigError("TOP5_RESCORE_BACKOFF_CAP must be >= max(1, base)")
 
     return ApiServerConfig(
         host=host,
@@ -217,9 +439,13 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
             minimum_protocol_version=minimum_validator_protocol,
             heartbeat_max_age_seconds=validator_heartbeat_max_age,
         ),
+        inference_proxy=inference_proxy,
         admin_api_token=os.environ.get("DITTO_ADMIN_API_TOKEN") or None,
         dashboard_enabled=dashboard_enabled,
         dashboard_wandb_url=dashboard_wandb_url,
+        top5_backoff_base=top5_backoff_base,
+        top5_backoff_doubling_tempos=top5_backoff_doubling_tempos,
+        top5_backoff_cap=top5_backoff_cap,
     )
 
 
@@ -301,4 +527,122 @@ def check_config(config: ApiServerConfig) -> None:
     ):
         raise ApiServerConfigError(
             "DITTO_MIN_VALIDATOR_SOFTWARE_VERSION must be a stable X.Y.Z release"
+        )
+    inference = config.inference_proxy
+    if inference.routing_mode not in {"aggregate_throughput", "adaptive"}:
+        raise ApiServerConfigError(
+            "DITTO_INFERENCE_ROUTING_MODE must be aggregate_throughput or adaptive"
+        )
+    if inference.enabled and inference.openrouter_api_key is None:
+        raise ApiServerConfigError(
+            "OPENROUTER_API_KEY is required when the inference proxy is enabled"
+        )
+    if inference.required and not inference.enabled:
+        raise ApiServerConfigError(
+            "inference proxy must be enabled before it can be required"
+        )
+    if not inference.allowed_models or len(inference.allowed_models) > 4:
+        raise ApiServerConfigError("inference model allowlist must contain 1-4 models")
+    upstream = urlparse(inference.upstream_url)
+    if (
+        upstream.scheme != "https"
+        or upstream.hostname != "openrouter.ai"
+        or upstream.path != "/api/v1/chat/completions"
+    ):
+        raise ApiServerConfigError(
+            "inference upstream must be OpenRouter chat completions"
+        )
+    public_base = urlparse(inference.public_base_url)
+    if public_base.scheme not in {"http", "https"} or not public_base.netloc:
+        raise ApiServerConfigError("inference public base URL must be absolute")
+    limits = (
+        inference.request_budget,
+        inference.token_budget,
+        inference.per_ticket_concurrency,
+        inference.per_validator_concurrency,
+        inference.global_concurrency,
+        inference.per_ticket_requests_per_minute,
+        inference.per_validator_requests_per_minute,
+        inference.global_requests_per_minute,
+        inference.request_body_bytes,
+        inference.response_body_bytes,
+        inference.max_output_tokens,
+    )
+    if any(value < 1 for value in limits):
+        raise ApiServerConfigError("inference proxy limits must be positive")
+    if inference.discovery_interval_seconds < 30:
+        raise ApiServerConfigError(
+            "inference provider discovery interval must be at least 30 seconds"
+        )
+    if "{model}" not in inference.discovery_url_template:
+        raise ApiServerConfigError("inference discovery URL must contain {model}")
+    discovery = urlparse(inference.discovery_url_template.replace("{model}", "model"))
+    if discovery.scheme != "https" or discovery.hostname != "openrouter.ai":
+        raise ApiServerConfigError("inference discovery must use OpenRouter HTTPS")
+    route_weights = (
+        inference.route_speed_weight,
+        inference.route_cost_weight,
+        inference.route_exploration_weight,
+    )
+    if any(weight < 0 for weight in route_weights) or sum(route_weights) <= 0:
+        raise ApiServerConfigError(
+            "inference route weights must be non-negative and non-zero"
+        )
+    if not 0 < inference.route_ewma_alpha <= 1:
+        raise ApiServerConfigError("inference route EWMA alpha must be in (0, 1]")
+    if not 0 <= inference.route_min_tool_accuracy <= 1:
+        raise ApiServerConfigError(
+            "inference route tool-accuracy floor must be in [0, 1]"
+        )
+    if not 0 <= inference.route_min_composite <= 1:
+        raise ApiServerConfigError("inference route composite floor must be in [0, 1]")
+    if inference.route_min_calibration_samples < 1:
+        raise ApiServerConfigError(
+            "inference route calibration sample floor must be positive"
+        )
+    if inference.route_exploration_ticket_budget < 0:
+        raise ApiServerConfigError(
+            "inference route exploration budget cannot be negative"
+        )
+    if not 0 <= inference.route_max_error_rate <= 1:
+        raise ApiServerConfigError("inference route error ceiling must be in [0, 1]")
+    if not 0 <= inference.route_max_timeout_rate <= 1:
+        raise ApiServerConfigError("inference route timeout ceiling must be in [0, 1]")
+    if inference.route_cooldown_seconds < 1:
+        raise ApiServerConfigError("inference route cooldown must be positive")
+    if inference.reviewed_calibration_manifest_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", inference.reviewed_calibration_manifest_sha256
+    ):
+        raise ApiServerConfigError(
+            "reviewed inference calibration manifest must be lowercase sha256"
+        )
+    if not (
+        inference.per_ticket_concurrency
+        <= inference.per_validator_concurrency
+        <= inference.global_concurrency
+        <= 128
+    ):
+        raise ApiServerConfigError(
+            "inference concurrency must be ordered ticket <= validator <= global <= 128"
+        )
+    if not (
+        inference.per_ticket_requests_per_minute
+        <= inference.per_validator_requests_per_minute
+        <= inference.global_requests_per_minute
+        <= 100_000
+    ):
+        raise ApiServerConfigError(
+            "inference request rates must be ordered ticket <= validator <= global"
+        )
+    if (
+        inference.request_budget > 4096
+        or inference.token_budget > 10_000_000
+        or inference.request_body_bytes > 1 << 20
+        or inference.response_body_bytes > 8 << 20
+        or inference.max_output_tokens > 32_768
+    ):
+        raise ApiServerConfigError("inference proxy limit exceeds its safety bound")
+    if not 1 <= inference.timeout_seconds <= 120:
+        raise ApiServerConfigError(
+            "inference timeout must be between 1 and 120 seconds"
         )

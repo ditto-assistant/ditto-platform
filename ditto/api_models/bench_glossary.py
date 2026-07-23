@@ -699,7 +699,7 @@ def metric_entries() -> list[dict]:
 BENCH_VERSIONS: list[dict] = [
     {
         "version": 2,
-        "epoch": "2026-01-01",
+        "epoch": "2026-07-07",
         "title": "Launch contract",
         "summary": (
             "The first on-chain scoring contract, frozen since scoring began. Its "
@@ -710,7 +710,7 @@ BENCH_VERSIONS: list[dict] = [
     },
     {
         "version": 3,
-        "epoch": "2026-07-01",
+        "epoch": "2026-07-18",
         "title": "Anti-gaming release",
         "summary": (
             "Hardens the suite against gaming: dump-guard grading, needle gating, "
@@ -725,7 +725,7 @@ BENCH_VERSIONS: list[dict] = [
     },
     {
         "version": 4,
-        "epoch": "2026-08-01",
+        "epoch": "2026-07-19",
         "title": "False-positive corrections",
         "summary": (
             "Not a new benchmark: v3 with scoring false positives corrected, so "
@@ -740,7 +740,7 @@ BENCH_VERSIONS: list[dict] = [
     },
     {
         "version": 5,
-        "epoch": "2026-09-01",
+        "epoch": "2026-07-21",
         "title": "Conversational grounding, coverage & efficiency",
         "summary": (
             "Closes the 'Aurora-9' hole where a phrase-list router that dumps memory "
@@ -759,7 +759,7 @@ BENCH_VERSIONS: list[dict] = [
     },
     {
         "version": 6,
-        "epoch": "2026-10-01",
+        "epoch": "2026-07-21",
         "title": "Memory-as-data & the complexity suite",
         "summary": (
             "Keeps the v5 suite and adds four complexity classes that reward the "
@@ -772,6 +772,25 @@ BENCH_VERSIONS: list[dict] = [
             "Multi-query fan-out: answerable only by intersecting two sub-queries",
             "Non-verbatim / computed answers (unit conversion; answer in no message)",
             "Passive cross-session consolidation (earliest fact of an evolving topic)",
+        ],
+    },
+    {
+        "version": 7,
+        "epoch": "2026-07-22",
+        "title": "GPT-OSS inference contract",
+        "summary": (
+            "Keeps the v6 generated suite and deterministic scoring rules, while "
+            "changing the frozen inference contract to OpenRouter-served "
+            "openai/gpt-oss-20b with medium reasoning. Scores remain comparable "
+            "only within their own benchmark version."
+        ),
+        "highlights": [
+            "Same generated questions, seed derivation, run identity, and scoring "
+            "math as v6",
+            "Canonical model changes from qwen/qwen3-32b to openai/gpt-oss-20b",
+            "Reasoning effort is locked to medium",
+            "Ticket-scoped platform inference with throughput-ordered healthy "
+            "provider fallback",
         ],
     },
 ]

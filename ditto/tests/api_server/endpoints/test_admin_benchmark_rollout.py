@@ -243,8 +243,8 @@ async def test_control_discovery_is_authenticated_read_only_and_dynamic(
     body = response.json()
     assert body["active_version"] == 2
     assert body["status"] == "inactive"
-    assert body["available_target_versions"] == [3, 4, 5, 6]
-    assert [contract["version"] for contract in body["contracts"]] == [2, 3, 4, 5, 6]
+    assert body["available_target_versions"] == [3, 4, 5, 6, 7]
+    assert [contract["version"] for contract in body["contracts"]] == [2, 3, 4, 5, 6, 7]
     assert all(
         contract["capable_validator_count"] == 0 for contract in body["contracts"]
     )
@@ -274,12 +274,12 @@ async def test_start_requires_full_guard_payload_and_exact_confirmation(
     assert "START BENCHMARK V4" in wrong.json()["message"]
 
     unsupported = await client.post(
-        "/api/v1/admin/benchmark-rollout/7",
+        "/api/v1/admin/benchmark-rollout/8",
         headers=_HEADERS,
         json={
             "reason": "attempt an unshipped contract",
             "actor": "backroom:test",
-            "confirmation": "START BENCHMARK V7",
+            "confirmation": "START BENCHMARK V8",
             "expected_active_version": 2,
         },
     )

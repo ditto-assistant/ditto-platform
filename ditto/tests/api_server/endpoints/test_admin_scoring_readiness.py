@@ -65,6 +65,7 @@ async def _seed(
     policy_version: int = SCREENING_POLICY_VERSION,
     with_image: bool = True,
     with_dataset: bool = True,
+    historical: bool = False,
 ) -> UUID:
     agent_id = uuid4()
     async with maker() as session, session.begin():
@@ -74,6 +75,7 @@ async def _seed(
                 from_version=2,
                 desired_version=active_version,
                 status="activated",
+                created_at=_T0 - timedelta(hours=2),
                 activated_at=_T0 - timedelta(hours=1),
             )
         )
@@ -98,7 +100,7 @@ async def _seed(
                 sha256=agent_id.hex * 2,
                 status=status,
                 screening_policy_version=policy_version,
-                created_at=_T0 - timedelta(days=1),
+                created_at=(_T0 - timedelta(days=1) if historical else _T0),
                 **image,
             )
         )
@@ -134,6 +136,19 @@ async def test_fully_ready_v4_agent_is_leaseable(
     assert body["active_bench_version"] == 4
     assert body["has_versioned_dataset"] is True
     assert body["screened_image"]["complete"] is True
+
+
+async def test_historical_nonmember_is_not_leaseable_even_with_dataset(
+    app: FastAPI, client: httpx.AsyncClient, sr_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id = await _seed(sr_maker, historical=True)
+    _install(app, sr_maker)
+
+    body = await _get(client, agent_id)
+
+    assert body["leaseable"] is False
+    assert body["has_versioned_dataset"] is True
+    assert any("historical submission" in reason for reason in body["blocking_reasons"])
 
 
 async def test_missing_screened_image_blocks_and_names_fields(

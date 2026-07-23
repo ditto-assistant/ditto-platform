@@ -32,6 +32,10 @@ from ditto.api_server.dependencies import get_chain_client, get_session
 from ditto.api_server.middleware.error_envelope import ERROR_CODE_VALIDATOR_AUTH
 from ditto.chain.models import NeuronInfo
 from ditto.db.models import Agent, Base
+from ditto.db.queries.confirmation_scores import (
+    ConfirmationSeedScore,
+    append_confirmation_scores,
+)
 from ditto.db.queries.scores import upsert_score
 
 _KEYPAIR = bittensor.Keypair.create_from_uri("//Alice")
@@ -141,6 +145,10 @@ async def _seed_scored(
             n=20,
             generated_at=datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
             signature="ab" * 64,
+            details={
+                "ticket_deadline": "2026-06-08T13:00:00+00:00",
+                "transcript_sha256": "cd" * 32,
+            },
         )
 
 
@@ -172,10 +180,23 @@ class TestScoringLedger:
         assert body["entries"][0]["composite"] == pytest.approx(0.9)
         assert body["entries"][0]["signature"] == "ab" * 64
         assert body["entries"][0]["bench_version"] == 2
-        # n rides the wire so the validator's eligibility floor can bite: a run
+        assert body["entries"][0]["score_proofs"] == [
+            {
+                "validator_hotkey": _VALIDATOR_HOTKEY,
+                "run_id": "run_1",
+                "composite": 0.9,
+                "seed": 42,
+                "bench_version": 2,
+                "ticket_deadline": "2026-06-08T13:00:00Z",
+                "transcript_sha256": "cd" * 32,
+                "signature": "ab" * 64,
+            }
+        ]
+        # n rides the wire so the validator's eligibility floor can bite (a run
         # below MIN_ELIGIBLE_CASES is dropped from the fold rather than shadowing
         # a real full run.
         assert body["entries"][0]["n"] == 20
+        assert len(body["entries"][0]["score_proofs"]) == 1
 
     async def test_empty_ledger(
         self,
@@ -492,3 +513,69 @@ def test_ledger_stderr_prefers_stashed_then_quorum() -> None:
     # Neither -> None (band stays inert / flat margin).
     assert _ledger_stderr(None, [0.8]) is None
     assert _ledger_stderr(None, []) is None
+
+
+class TestScoringLedgerConfirmationHistory:
+    async def test_exposes_raw_append_only_confirmation_records(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        aid = uuid4()
+        async with session_maker() as s, s.begin():
+            s.add(
+                Agent(
+                    agent_id=aid,
+                    miner_hotkey=_MINER,
+                    name="agent",
+                    sha256="ab" * 32,
+                    size_bytes=524288,
+                    status=AgentStatus.SCORED,
+                    created_at=datetime.now(UTC),
+                )
+            )
+            await s.flush()
+            await upsert_score(
+                s,
+                agent_id=aid,
+                validator_hotkey=_VALIDATOR_HOTKEY,
+                run_id="run_1",
+                seed=42,
+                composite=0.9,
+                tool_mean=0.9,
+                memory_mean=0.9,
+                median_ms=500,
+                n=20,
+                generated_at=datetime(2026, 6, 8, tzinfo=UTC),
+                signature="ab" * 64,
+            )
+            # Two validators on seed 100, one on seed 200 (bench_version 2 = active).
+            await append_confirmation_scores(
+                s,
+                rows=[
+                    ConfirmationSeedScore(aid, "5V1", 100, 0.80, "r1", "ab" * 64),
+                    ConfirmationSeedScore(aid, "5V2", 100, 0.84, "r2", "cd" * 64),
+                    ConfirmationSeedScore(aid, "5V1", 200, 0.70, "r3", None),
+                ],
+                bench_version=2,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        resp = await client.get("/api/v1/scoring/scores", headers=_ledger_headers())
+        assert resp.status_code == 200
+        entry = resp.json()["entries"][0]
+        history = entry["confirmation_history"]
+        # Raw per-(validator, seed) records, NOT pre-aggregated (3 rows, not 2).
+        assert len(history) == 3
+        assert {(h["seed"], h["validator_hotkey"]) for h in history} == {
+            (100, "5V1"),
+            (100, "5V2"),
+            (200, "5V1"),
+        }
+        assert {h["bench_version"] for h in history} == {2}

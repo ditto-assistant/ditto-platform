@@ -15,6 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from ditto.api_models.agent_status import SCOREABLE_AGENT_STATUSES
+from ditto.api_models.benchmark_capacity import BenchmarkCapacity
 from ditto.api_models.benchmark_progress import (
     BenchmarkProgress,
     BenchmarkProgressStage,
@@ -137,6 +138,32 @@ def _validate_same_lease_progress(
         )
 
 
+def _reconcile_capacity_progress(
+    previous: dict | None, incoming: dict | None
+) -> dict | None:
+    """Keep every same-lease slot monotonic while holding the heartbeat row lock."""
+    if not isinstance(previous, dict) or not isinstance(incoming, dict):
+        return incoming
+    try:
+        previous_capacity = BenchmarkCapacity.model_validate(previous)
+        incoming_capacity = BenchmarkCapacity.model_validate(incoming)
+    except ValidationError:
+        return incoming
+    previous_slots = {slot.slot_id: slot for slot in previous_capacity.active}
+    reconciled = []
+    for slot in incoming_capacity.active:
+        prior = previous_slots.get(slot.slot_id)
+        if prior is not None and prior.agent_id == slot.agent_id:
+            try:
+                _validate_same_lease_progress(prior.progress, slot.progress)
+            except HeartbeatProgressRegressionError:
+                slot = prior
+        reconciled.append(slot)
+    return incoming_capacity.model_copy(update={"active": reconciled}).model_dump(
+        mode="json"
+    )
+
+
 async def upsert_validator_heartbeat(
     session: AsyncSession,
     *,
@@ -154,6 +181,7 @@ async def upsert_validator_heartbeat(
     capabilities: dict | None = None,
     stack: dict | None = None,
     stack_health: dict | None = None,
+    benchmark_capacity: dict | None = None,
 ) -> tuple[ValidatorHeartbeat, bool]:
     """Persist only a strictly newer heartbeat; return ``(row, accepted)``."""
     row = await session.scalar(
@@ -180,6 +208,7 @@ async def upsert_validator_heartbeat(
             "capabilities": capabilities,
             "stack": stack,
             "stack_health": stack_health,
+            "benchmark_capacity": benchmark_capacity,
             "reported_at": reported_at,
             "seen_at": seen_at,
             "signature": signature,
@@ -270,6 +299,9 @@ async def upsert_validator_heartbeat(
     row.capabilities = capabilities
     row.stack = stack
     row.stack_health = stack_health
+    row.benchmark_capacity = _reconcile_capacity_progress(
+        row.benchmark_capacity if not is_new else None, benchmark_capacity
+    )
     if benchmark_progress is not None and not keep_stored_progress:
         row.benchmark_progress = benchmark_progress
         row.benchmark_progress_reported = True
@@ -405,6 +437,7 @@ async def upsert_screener_heartbeat(
     active_agent_id: UUID | None,
     screening_progress: dict | None,
     system_metrics: dict | None,
+    review_settings: dict | None,
     reported_at: datetime,
     seen_at: datetime,
     signature: str,
@@ -436,8 +469,9 @@ async def upsert_screener_heartbeat(
         {
             "system_metrics": system_metrics,
             "screening_progress": screening_progress,
+            "review_settings": review_settings,
         }
-        if screening_progress is not None
+        if screening_progress is not None or review_settings is not None
         else system_metrics
     )
     row.reported_at = reported_at

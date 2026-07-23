@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -51,6 +51,9 @@ class UploadCheckRequest(BaseModel):
     signature: Annotated[str, Field(pattern=_SIGNATURE_HEX_PATTERN)]
     """Hex sr25519 signature over ``f"{hotkey}:{sha256}"``."""
 
+    allow_identical_rescore: bool = False
+    """Explicitly permit buying another seed for byte-identical source."""
+
 
 class UploadCheckResponse(BaseModel):
     """Returned by ``POST /upload/check``.
@@ -69,14 +72,23 @@ class UploadCheckResponse(BaseModel):
     messages: list[str]
     """Parallel array of human-readable failure reasons. Empty when ``ok``."""
 
+    payment_required: bool = True
+    """False when an existing same-owner artifact makes payment unnecessary."""
+
+    identical_agent_id: UUID | None = None
+    """Existing same-owner submission when identical bytes were detected."""
+
+    identical_agent_status: AgentStatus | None = None
+    """Current lifecycle state of :attr:`identical_agent_id`."""
+
 
 class UploadAgentResponse(BaseModel):
     """Returned by ``POST /upload/agent`` on a successful upload.
 
-    The endpoint's only positive output: the server-generated
-    ``agent_id`` plus the lifecycle state the row was inserted at. The
-    retrieval endpoints (next PR) expose anything else the miner CLI
-    might want to poll for.
+    A new artifact returns its server-generated identity. An accidental
+    byte-identical upload returns the existing identity plus a reusable payment
+    credit disposition, so the miner can fund different source without paying
+    again.
     """
 
     agent_id: UUID
@@ -93,6 +105,12 @@ class UploadAgentResponse(BaseModel):
     ]
 
     status: AgentStatus
-    """Initial lifecycle state. Always ``uploaded`` immediately after a
-    successful upload; the screener PR moves this to ``screening``
-    shortly after."""
+    """Lifecycle state of the returned agent."""
+
+    payment_disposition: Literal["consumed", "credit_consumed", "reusable_credit"] = (
+        "consumed"
+    )
+    """Whether this proof funded the returned agent or remains reusable."""
+
+    credit_for_agent_id: UUID | None = None
+    """Existing identical submission that caused a reusable credit."""

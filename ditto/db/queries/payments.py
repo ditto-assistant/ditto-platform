@@ -60,7 +60,11 @@ async def get_miner_coldkeys_for_agents(
             EvaluationPayment.agent_id.in_(agent_ids)
         )
     )
-    return dict(rows.tuples().all())
+    return {
+        agent_id: miner_coldkey
+        for agent_id, miner_coldkey in rows.tuples().all()
+        if agent_id is not None
+    }
 
 
 async def get_agent_for_payment_proof(
@@ -87,17 +91,67 @@ async def get_agent_for_payment_proof(
     )
 
 
+async def get_evaluation_payment_for_proof(
+    session: AsyncSession,
+    *,
+    block_hash: str,
+    extrinsic_index: int,
+    for_update: bool = False,
+) -> EvaluationPayment | None:
+    """Return the replay-protection row for a proof, including open credits."""
+    stmt = select(EvaluationPayment).where(
+        EvaluationPayment.block_hash == block_hash,
+        EvaluationPayment.extrinsic_index == extrinsic_index,
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    return await session.scalar(stmt)
+
+
+async def get_same_owner_agent_by_sha(
+    session: AsyncSession, *, miner_coldkey: str, sha256: str
+) -> Agent | None:
+    """Return the earliest paid submission with identical bytes for one owner."""
+    return await session.scalar(
+        select(Agent)
+        .join(EvaluationPayment, EvaluationPayment.agent_id == Agent.agent_id)
+        .where(
+            EvaluationPayment.miner_coldkey == miner_coldkey,
+            Agent.sha256 == sha256,
+        )
+        .order_by(Agent.created_at.asc(), Agent.agent_id.asc())
+        .limit(1)
+    )
+
+
+async def get_same_hotkey_agent_by_sha(
+    session: AsyncSession, *, miner_hotkey: str, sha256: str
+) -> Agent | None:
+    """Cheap pre-payment duplicate check before coldkey proof is available."""
+    result = await session.execute(
+        select(Agent)
+        .join(EvaluationPayment, EvaluationPayment.agent_id == Agent.agent_id)
+        .where(Agent.miner_hotkey == miner_hotkey, Agent.sha256 == sha256)
+        .order_by(Agent.created_at.asc(), Agent.agent_id.asc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none() if result is not None else None
+
+
 async def insert_evaluation_payment(
     session: AsyncSession,
     *,
     verified: VerifiedPayment,
-    agent_id: UUID,
+    agent_id: UUID | None = None,
+    credit_for_agent_id: UUID | None = None,
 ) -> None:
     """Insert one ``evaluation_payments`` row inside the caller's transaction.
 
-    Caller wraps this together with :func:`insert_agent` in one
-    ``async with session.begin():`` block so both rows commit atomically.
-    A PK violation on the payment insert rolls the agent insert back.
+    Exactly one destination is required: ``agent_id`` assigns the proof to a
+    new evaluation, while ``credit_for_agent_id`` records why an identical paid
+    upload became a reusable credit. The caller wraps assignment together with
+    :func:`insert_agent` in one ``async with session.begin():`` block so both
+    rows commit atomically. A PK violation rolls the agent insert back.
 
     Raises:
         PaymentReplayedError: Composite-PK collision on
@@ -105,18 +159,24 @@ async def insert_evaluation_payment(
             this to HTTP 402 + error code 3207. Closes threat-model row
             P1 (replay same payment proof twice).
         DbIntegrityError: Any other constraint violation
-            (UNIQUE ``(agent_id)``, the composite FK to ``agents``, or
-            either CHECK constraint). These all indicate a programmer
+            (UNIQUE ``(agent_id)``, an agent FK, or a CHECK constraint).
+            These all indicate a programmer
             bug rather than a miner action; the envelope catch-all
             maps to HTTP 500.
     """
+    if (agent_id is None) == (credit_for_agent_id is None):
+        raise ValueError(
+            "exactly one of agent_id or credit_for_agent_id must be supplied"
+        )
     row = EvaluationPayment(
         block_hash=verified.block_hash,
         extrinsic_index=verified.extrinsic_index,
         agent_id=agent_id,
+        credit_for_agent_id=credit_for_agent_id,
         miner_hotkey=verified.miner_hotkey,
         miner_coldkey=verified.miner_coldkey,
         amount_rao=verified.amount_rao,
+        tao_usd_rate=verified.tao_usd_rate,
         dest_address=verified.dest_address,
         timestamp=verified.block_timestamp,
     )
@@ -146,3 +206,20 @@ async def insert_evaluation_payment(
         raise DbIntegrityError(
             f"evaluation_payments insert violated constraint: {e.orig}"
         ) from e
+
+
+async def consume_evaluation_credit(
+    session: AsyncSession,
+    *,
+    payment: EvaluationPayment,
+    agent_id: UUID,
+    miner_hotkey: str,
+) -> None:
+    """Atomically bind a locked available payment credit to a new agent."""
+    if payment.agent_id is not None or payment.credit_for_agent_id is None:
+        raise PaymentReplayedError("payment credit is no longer available")
+    if payment.miner_hotkey != miner_hotkey:
+        raise PaymentReplayedError("payment credit belongs to a different hotkey")
+    payment.agent_id = agent_id
+    payment.credit_for_agent_id = None
+    await session.flush()

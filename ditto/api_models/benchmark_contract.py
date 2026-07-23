@@ -31,6 +31,10 @@ _CONTRACTS = {
     # screener floor and verified-archive requirement as v5; shipping the
     # contract makes it an operator rollout target without activating it.
     6: BenchmarkContract(6, 9, True),
+    # v7 changes the consensus inference model to OpenRouter-served GPT-OSS
+    # 20B and rotates the generated surface. Capability advertisement remains
+    # separately gated on reviewed provider-specific starter-kit baselines.
+    7: BenchmarkContract(7, 9, True),
 }
 
 

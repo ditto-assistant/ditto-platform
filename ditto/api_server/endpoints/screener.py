@@ -27,7 +27,10 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated
@@ -55,7 +58,15 @@ from ditto.api_models import (
     ScreenResultResponse,
 )
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.screener import (
+    SCREENING_POLICY_VERSION,
+    ShadowReviewObservationRequest,
+    ShadowReviewObservationResponse,
+)
+from ditto.api_models.screener_review_settings import (
+    EffectiveScreenerReviewSettings,
+    ScreenerReviewSettings,
+)
 from ditto.api_models.system_health import system_metrics_signing_token
 from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
 from ditto.api_server.datapipeline import DatasetGenerator
@@ -83,6 +94,8 @@ from ditto.db.models import (
     BenchmarkRollout,
     BenchmarkRolloutMember,
     ScreenedImageUpload,
+    ScreenerReviewSettingsRevision,
+    ScreenerShadowReview,
     ScreeningAttempt,
     ScreeningQuarantine,
 )
@@ -119,6 +132,7 @@ _SCREENED_IMAGE_PART_SIZE = 64 * 1024**2
 _SCREENING_LEASE_TTL = timedelta(minutes=70)
 _HEARTBEAT_MAX_SKEW_SECONDS = 300
 _HEARTBEAT_MAX_BYTES = 4096
+_INSTANCE_ID_PATTERN = r"^[a-zA-Z0-9._-]{1,63}$"
 # instance_id stored for pre-v3 (no per-instance identity) heartbeats. Distinct
 # from any real GCE instance name, so upgraded workers never collide with it.
 _LEGACY_INSTANCE_ID = "legacy"
@@ -234,6 +248,138 @@ async def require_screener(
 ScreenerDep = Annotated[str, Depends(require_screener)]
 
 
+def _review_settings_checksum(settings: ScreenerReviewSettings) -> str:
+    payload = json.dumps(
+        settings.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+@router.get("/review-settings", response_model=EffectiveScreenerReviewSettings)
+async def effective_review_settings(
+    response: Response,
+    _screener_hotkey: ScreenerDep,
+    session: SessionDep,
+    instance_id: Annotated[str, Query(pattern=_INSTANCE_ID_PATTERN)],
+) -> EffectiveScreenerReviewSettings:
+    """Return the exact-instance override or global settings revision."""
+    rows = list(
+        await session.scalars(
+            select(ScreenerReviewSettingsRevision)
+            .where(ScreenerReviewSettingsRevision.scope.in_((instance_id, "*")))
+            .order_by(ScreenerReviewSettingsRevision.revision.desc())
+        )
+    )
+    latest_by_scope: dict[str, ScreenerReviewSettingsRevision] = {}
+    for candidate in rows:
+        latest_by_scope.setdefault(candidate.scope, candidate)
+    exact = latest_by_scope.get(instance_id)
+    row = (
+        exact
+        if exact is not None and exact.settings.get("mode") != "inherit"
+        else latest_by_scope.get("*")
+    )
+    if row is None:
+        settings = ScreenerReviewSettings()
+        result = EffectiveScreenerReviewSettings(
+            revision=0,
+            scope="builtin-default",
+            settings=settings,
+            checksum=_review_settings_checksum(settings),
+        )
+    else:
+        result = EffectiveScreenerReviewSettings(
+            revision=row.revision,
+            scope=row.scope,
+            settings=ScreenerReviewSettings.model_validate_json(
+                json.dumps(row.settings)
+            ),
+            checksum=row.checksum,
+        )
+    response.headers["Cache-Control"] = "private, no-cache"
+    response.headers["ETag"] = f'"{result.revision}-{result.checksum}"'
+    return result
+
+
+@router.post(
+    "/agent/{agent_id}/shadow-review",
+    response_model=ShadowReviewObservationResponse,
+)
+async def submit_shadow_review(
+    agent_id: UUID,
+    payload: ShadowReviewObservationRequest,
+    screener_hotkey: ScreenerDep,
+    session: SessionDep,
+) -> ShadowReviewObservationResponse:
+    """Persist attempt-owned telemetry without mutating submission state."""
+    async with session.begin():
+        attempt = await get_screening_attempt(
+            session, attempt_id=payload.attempt_id, for_update=True
+        )
+        if (
+            attempt is None
+            or attempt.agent_id != agent_id
+            or attempt.screener_hotkey != screener_hotkey
+            or attempt.status != "running"
+            or attempt.build_only
+        ):
+            raise AgentNotScreenableError(
+                "shadow review does not match an active screening attempt"
+            )
+        deadline = attempt.deadline
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        if datetime.now(UTC) > deadline:
+            raise AgentNotScreenableError("shadow review arrived after lease expiry")
+        agent = await get_agent_by_id(session, agent_id=agent_id, for_update=True)
+        if agent is None:
+            raise AgentNotFoundError(f"no agent with id={agent_id}")
+        if agent.sha256.lower() != payload.artifact_sha256:
+            raise AgentNotScreenableError(
+                "shadow review artifact does not match the claimed submission"
+            )
+        settings = await session.get(
+            ScreenerReviewSettingsRevision, payload.settings_revision
+        )
+        if (
+            settings is None
+            or settings.scope != payload.settings_scope
+            or settings.checksum != payload.settings_checksum
+            or settings.settings.get("mode") != "shadow"
+        ):
+            raise AgentNotScreenableError(
+                "shadow review does not match an applied shadow revision"
+            )
+        values = {
+            "agent_id": agent_id,
+            "screener_hotkey": screener_hotkey,
+            "artifact_sha256": payload.artifact_sha256,
+            "settings_revision": payload.settings_revision,
+            "settings_scope": payload.settings_scope,
+            "settings_checksum": payload.settings_checksum,
+            "disposition": payload.disposition,
+            "risk_level": payload.risk_level,
+            "categories": list(payload.categories),
+            "finding_digest": payload.finding_digest,
+            "resolution_basis": payload.resolution_basis,
+            "clearance_path": payload.clearance_path,
+            "critic_disposition": payload.critic_disposition,
+            "adjudicator_disposition": payload.adjudicator_disposition,
+            "response_models": list(payload.response_models),
+            "response_providers": list(payload.response_providers),
+            "usage": payload.usage.model_dump(mode="json"),
+        }
+        existing = await session.get(ScreenerShadowReview, payload.attempt_id)
+        if existing is not None:
+            if any(getattr(existing, key) != value for key, value in values.items()):
+                raise AgentNotScreenableError(
+                    "shadow review conflicts with the stored attempt observation"
+                )
+            return ShadowReviewObservationResponse(accepted=True)
+        session.add(ScreenerShadowReview(attempt_id=payload.attempt_id, **values))
+    return ShadowReviewObservationResponse(accepted=True)
+
+
 def _heartbeat_signing_message(payload: ScreenerHeartbeatRequest) -> bytes:
     """Canonical versioned heartbeat bytes mirrored by ``ditto-screener``."""
     if payload.protocol_version == 1:
@@ -249,6 +395,27 @@ def _heartbeat_signing_message(payload: ScreenerHeartbeatRequest) -> bytes:
         if payload.progress is not None
         else "-"
     )
+    if payload.protocol_version >= 4:
+        assert payload.review_settings is not None
+        review = payload.review_settings
+        review_token = ",".join(
+            (
+                str(review.revision),
+                review.scope,
+                review.mode,
+                review.checksum,
+                review.source,
+            )
+        )
+        return (
+            "ditto-screener-heartbeat:v4:"
+            f"{payload.screener_hotkey}:{payload.software_version}:"
+            f"{payload.protocol_version}:{payload.policy_version}:{payload.state}:"
+            f"{payload.active_agent_id or ''}:{payload.instance_id}:"
+            f"{progress}:"
+            f"{system_metrics_signing_token(payload.system_metrics)}:"
+            f"{review_token}:{payload.timestamp}"
+        ).encode()
     if payload.protocol_version >= 3:
         # v3 signs the per-instance identity (the fleet shares one hotkey).
         # instance_id is required for v3 (validated on the request model).
@@ -337,6 +504,11 @@ async def heartbeat(
             system_metrics=(
                 request_body.system_metrics.model_dump(mode="json")
                 if request_body.system_metrics is not None
+                else None
+            ),
+            review_settings=(
+                request_body.review_settings.model_dump(mode="json")
+                if request_body.review_settings is not None
                 else None
             ),
             reported_at=reported_at,
@@ -869,6 +1041,58 @@ async def screened_image_upload_abort(
     return ScreenedImageAbortResponse(aborted=True)
 
 
+_RUST_CONTRACT_DIAGNOSTIC_RE = re.compile(r"^error\[(SCR-RUST-\d{3})\]:", re.IGNORECASE)
+_RUST_CONTRACT_PUBLIC_REASONS = {
+    "SCR-RUST-001": (
+        "archive contains an unsafe path. Remove absolute paths, parent traversals, "
+        "backslashes, and drive-prefixed entries."
+    ),
+    "SCR-RUST-002": (
+        "archive contains a duplicate path. Package each path exactly once."
+    ),
+    "SCR-RUST-003": (
+        "archive contains a link or special file. Package only regular files and "
+        "directories."
+    ),
+    "SCR-RUST-004": (
+        "archive expands beyond the safety limit. Remove generated assets and build "
+        "output before packaging."
+    ),
+    "SCR-RUST-005": (
+        "Dockerfile is missing from the archive root. Package the crate contents so "
+        "Dockerfile is at the top level."
+    ),
+    "SCR-RUST-006": (
+        "Cargo.toml is missing from the archive root. Package the crate contents, not "
+        "the directory containing the crate."
+    ),
+    "SCR-RUST-007": (
+        "no Rust source file was found under src/. Include at least one .rs source "
+        "file below src/."
+    ),
+    "SCR-RUST-008": (
+        "Cargo.toml could not be read. Recreate the archive from a readable UTF-8 "
+        "crate manifest."
+    ),
+    "SCR-RUST-009": (
+        "Cargo.toml is not valid UTF-8 TOML. Run cargo metadata locally and fix the "
+        "first manifest error."
+    ),
+    "SCR-RUST-010": (
+        "Cargo.toml has no [package] table. Submit a runnable Rust package rather "
+        "than a virtual workspace."
+    ),
+    "SCR-RUST-011": (
+        "archive is not a readable gzip-compressed tar. Recreate it as a .tar.gz "
+        "archive and retry."
+    ),
+    "SCR-RUST-012": (
+        "Dockerfile is not valid UTF-8 text. Commit a readable UTF-8 Dockerfile that "
+        "builds the crate."
+    ),
+}
+
+
 def _public_screening_reason(detail: str, reason_code: str | None = None) -> str:
     """Map untrusted screener detail to a stable, public-safe failure category.
 
@@ -878,6 +1102,21 @@ def _public_screening_reason(detail: str, reason_code: str | None = None) -> str
     """
     if reason_code == "exact-cross-miner-duplicate":
         return "Artifact is an exact duplicate of another miner submission"
+    if reason_code == "rust-harness-contract":
+        match = _RUST_CONTRACT_DIAGNOSTIC_RE.match(detail.strip())
+        if match is not None:
+            diagnostic_code = match.group(1).upper()
+            public_detail = _RUST_CONTRACT_PUBLIC_REASONS.get(diagnostic_code)
+            if public_detail is not None:
+                return (
+                    f"Rust harness contract failed ({diagnostic_code}): {public_detail}"
+                )
+        return (
+            "Submission does not satisfy the Rust harness contract. Rebuild the "
+            "archive as a readable .tar.gz containing only regular files and "
+            "directories, with Dockerfile and Cargo.toml at the archive root and "
+            "Rust source under src/."
+        )
     normalized = detail.strip().casefold()
     if "no dockerfile at tarball root" in normalized:
         return "Dockerfile missing from archive root"

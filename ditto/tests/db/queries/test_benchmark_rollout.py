@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
@@ -12,7 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ditto.api_models.admin_quarantine import AdminBenchmarkQualificationRequest
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.benchmark_rollout import (
     ensure_rolling_qualification,
     refresh_rolling_qualification,
@@ -39,6 +40,8 @@ from ditto.db.models import (
     BenchmarkRolloutAudit,
     BenchmarkRolloutMember,
     EvaluationPayment,
+    InferenceProviderRoute,
+    InferenceRoutingPolicy,
     Score,
     ValidatorHeartbeat,
     ValidatorTicket,
@@ -47,16 +50,19 @@ from ditto.db.queries.benchmark_rollout import (
     CANARY_BENCH_VERSION,
     MIN_DESIRED_AUTHORITY_AGENTS,
     DatasetPin,
+    InferenceActivationRequirements,
     RolloutConflictError,
     RolloutSnapshotMember,
     active_bench_version,
     append_rollout_member,
+    bind_inference_activation_requirements,
     create_rollout_snapshot,
     heartbeat_supports_version,
     historical_rescore_cohort,
     issue_rollout_ticket,
     maybe_activate_rollout,
     open_rollout,
+    persisted_active_bench_version,
     rolling_top_five,
     rollout_state,
     select_active_bench_version,
@@ -96,10 +102,10 @@ async def test_admin_status_read_does_not_start_rollout() -> None:
         assert count == 0
 
         control = await get_rollout_control(None, session)
-        assert control["available_target_versions"] == [3, 4, 5, 6]
+        assert control["available_target_versions"] == [3, 4, 5, 6, 7]
         contracts = control["contracts"]
         assert isinstance(contracts, list)
-        assert [item["version"] for item in contracts] == [2, 3, 4, 5, 6]
+        assert [item["version"] for item in contracts] == [2, 3, 4, 5, 6, 7]
         assert control["status"] == "inactive"
         count = await session.scalar(select(func.count(BenchmarkRollout.rollout_id)))
         assert count == 0
@@ -115,6 +121,8 @@ def _capabilities(now: datetime) -> tuple[dict, dict]:
         "full_stack_managed": False,
         "stack_updater": False,
         "sandbox_egress_restricted": True,
+        "ticket_inference": True,
+        "signed_score_quorum": True,
         "executor_isolation": "privileged_dind",
         "scorer_benchmarks": {
             "status": "fresh_verified",
@@ -122,6 +130,16 @@ def _capabilities(now: datetime) -> tuple[dict, dict]:
             "observed_at": int(now.timestamp()),
             "software_version": "1.3.0",
             "source_revision": revision,
+            "v7_calibration": {
+                "manifest_sha256": "c" * 64,
+                "supported_routes": [
+                    {
+                        "provider": "Groq",
+                        "profile_revision": "openrouter-route-test-v1",
+                        "model": "openai/gpt-oss-20b",
+                    }
+                ],
+            },
         },
     }
     components = {
@@ -148,7 +166,61 @@ def _capabilities(now: datetime) -> tuple[dict, dict]:
     return capabilities, stack
 
 
+def _add_ready_v7_route(session, now: datetime) -> None:
+    session.add(
+        InferenceRoutingPolicy(
+            model="openai/gpt-oss-20b",
+            enabled=True,
+            speed_weight=0.65,
+            cost_weight=0.25,
+            exploration_weight=0.10,
+            exploration_ticket_budget=3,
+            min_tool_accuracy=0.55,
+            min_composite=0.15,
+            min_calibration_samples=20,
+            max_error_rate=0.25,
+            max_timeout_rate=0.15,
+            cooldown_seconds=30,
+            ewma_alpha=0.20,
+            updated_at=now,
+        )
+    )
+    session.add(
+        InferenceProviderRoute(
+            model="openai/gpt-oss-20b",
+            provider="Groq",
+            profile_revision="openrouter-route-test-v1",
+            status="healthy",
+            calibration_status="eligible",
+            calibration_tool_accuracy=0.65,
+            calibration_composite=0.20,
+            calibration_sample_count=60,
+            calibration_manifest_sha256="c" * 64,
+            ewma_error_rate=0,
+            ewma_timeout_rate=0,
+            sample_count=60,
+            selected_ticket_count=0,
+            exploration_ticket_count=0,
+            discovered_at=now,
+            last_observed_at=now,
+            updated_at=now,
+        )
+    )
+
+
+def _activation_requirements() -> InferenceActivationRequirements:
+    return InferenceActivationRequirements(
+        enabled=True,
+        provider_key_configured=True,
+        model="openai/gpt-oss-20b",
+        routing_mode="adaptive",
+        reviewed_manifest_sha256="c" * 64,
+    )
+
+
 async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRollout]:
+    bind_inference_activation_requirements(session, _activation_requirements())
+    _add_ready_v7_route(session, now)
     agent_ids = [uuid4() for _ in range(5)]
     members = []
     pins = {}
@@ -211,7 +283,7 @@ async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRo
             ValidatorHeartbeat(
                 validator_hotkey=hotkey,
                 software_version="1.0.0",
-                protocol_version=8,
+                protocol_version=12,
                 code_digest="d" * 64,
                 state="polling",
                 first_seen_at=now,
@@ -235,7 +307,7 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> 
     expected_v4: list[UUID] = []
     expected_v3: list[UUID] = []
     async with maker() as session, session.begin():
-        for version, count in ((4, 10), (3, 20), (2, 5)):
+        for version, count in ((4, 6), (3, 10), (2, 5)):
             for rank in range(count):
                 agent_id = uuid4()
                 session.add(
@@ -269,7 +341,7 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> 
                     )
                 if version == 4:
                     expected_v4.append(agent_id)
-                elif version == 3 and rank < 15:
+                elif version == 3 and rank < 4:
                     expected_v3.append(agent_id)
         await session.flush()
 
@@ -278,7 +350,7 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> 
             *expected_v4,
             *expected_v3,
         ]
-        assert len(cohort) == 25
+        assert len(cohort) == 10
         assert not any("v2" in member.miner_hotkey for member in cohort)
     await engine.dispose()
 
@@ -425,6 +497,36 @@ async def test_rollout_idles_validator_until_fleet_finishes_priority_five() -> N
     await engine.dispose()
 
 
+async def test_parallel_rollout_slots_stay_distinct_inside_frozen_priority_five() -> (
+    None
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        priority_ids, _rollout = await _seed_rollout(session, now)
+        slot0 = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            slot_id="slot-0",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        slot1 = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            slot_id="slot-1",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert slot0 is not None and slot1 is not None
+        assert slot0.agent_id != slot1.agent_id
+        assert {slot0.agent_id, slot1.agent_id}.issubset(set(priority_ids))
+    await engine.dispose()
+
+
 async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
@@ -469,7 +571,7 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
         assert heartbeat_supports_version(heartbeat, now=now)
         heartbeat.protocol_version = 7
         assert not heartbeat_supports_version(heartbeat, now=now)
-        heartbeat.protocol_version = 8
+        heartbeat.protocol_version = 12
 
         for validator_index, hotkey in enumerate(("validator-a", "validator-b")):
             for agent_index in range(5):
@@ -547,7 +649,14 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
             )
             ticket.status = TicketStatus.SCORED
             await session.flush()
-            activations.append(await maybe_activate_rollout(session, rollout, now=now))
+            activations.append(
+                await maybe_activate_rollout(
+                    session,
+                    rollout,
+                    now=now,
+                    inference_requirements=_activation_requirements(),
+                )
+            )
             if agent_index == 0:
                 # Agent 0 has a complete desired-version quorum, but it is one
                 # of MIN_DESIRED_AUTHORITY_AGENTS, so the threshold gate keeps
@@ -797,7 +906,7 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists()
             ValidatorHeartbeat(
                 validator_hotkey="validator-d",
                 software_version="1.0.0",
-                protocol_version=8,
+                protocol_version=12,
                 code_digest="d" * 64,
                 state="polling",
                 first_seen_at=now,
@@ -851,6 +960,58 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists()
             is None
         )
         assert no_target_source_ticket.status == TicketStatus.ISSUED
+    await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "purpose",
+    [TicketPurpose.CONTINUAL_RETEST, TicketPurpose.LEGACY_UNCLASSIFIED],
+)
+async def test_rollout_does_not_serve_or_preempt_noncanonical_lease(
+    purpose: TicketPurpose,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        _, rollout = await _seed_rollout(session, now)
+        ordinary_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=ordinary_id,
+                miner_hotkey=f"ordinary-{purpose}",
+                name=f"ordinary-{purpose}",
+                sha256="fa" * 32,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=9,
+                created_at=now,
+            )
+        )
+        lease = ValidatorTicket(
+            agent_id=ordinary_id,
+            bench_version=2,
+            validator_hotkey="validator-a",
+            status=TicketStatus.ISSUED,
+            purpose=purpose,
+            purpose_revision=(0 if purpose == TicketPurpose.LEGACY_UNCLASSIFIED else 1),
+            issued_at=now,
+            deadline=now + timedelta(minutes=90),
+        )
+        session.add(lease)
+        await session.flush()
+
+        issued = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+
+        assert issued is None
+        assert lease.status == TicketStatus.ISSUED
+        assert lease.bench_version != rollout.desired_version
     await engine.dispose()
 
 
@@ -1432,7 +1593,7 @@ async def test_capable_validator_cannot_automatically_seed_rollout_work() -> Non
             ValidatorHeartbeat(
                 validator_hotkey="validator-auto",
                 software_version="1.0.0",
-                protocol_version=8,
+                protocol_version=12,
                 code_digest="d" * 64,
                 state="polling",
                 first_seen_at=now,
@@ -1443,6 +1604,7 @@ async def test_capable_validator_cannot_automatically_seed_rollout_work() -> Non
                 stack=stack,
             )
         )
+        _add_ready_v7_route(session, now)
 
     generator = AsyncMock()
     generator.generate.return_value = "e" * 64
@@ -1579,7 +1741,7 @@ async def test_rollout_start_requires_one_capable_validator_and_matches_telemetr
                 ValidatorHeartbeat(
                     validator_hotkey=f"validator-{index}",
                     software_version="1.0.0",
-                    protocol_version=8,
+                    protocol_version=12,
                     code_digest="d" * 64,
                     state="polling",
                     first_seen_at=now,
@@ -1590,6 +1752,7 @@ async def test_rollout_start_requires_one_capable_validator_and_matches_telemetr
                     stack=stack,
                 )
             )
+        _add_ready_v7_route(session, now)
         await session.flush()
 
         telemetry = await rollout_state(session, now=now)
@@ -1610,11 +1773,50 @@ async def test_rollout_start_requires_one_capable_validator_and_matches_telemetr
     await engine.dispose()
 
 
+async def test_v7_rollout_start_requires_route_and_manifest_intersection() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    capabilities, stack = _capabilities(now)
+    capabilities["scorer_benchmarks"]["v7_calibration"]["manifest_sha256"] = "d" * 64
+    async with maker() as session, session.begin():
+        session.add(
+            ValidatorHeartbeat(
+                validator_hotkey="validator-mismatched-manifest",
+                software_version="1.0.0",
+                protocol_version=12,
+                code_digest="d" * 64,
+                state="polling",
+                first_seen_at=now,
+                reported_at=now,
+                seen_at=now,
+                signature="ab" * 64,
+                capabilities=capabilities,
+                stack=stack,
+            )
+        )
+        _add_ready_v7_route(session, now)
+        await session.flush()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await _require_rollout_start_capacity(
+                session, now=now, desired_version=CANARY_BENCH_VERSION
+            )
+        assert exc_info.value.status_code == 409
+        assert "exact route and manifest match" in str(exc_info.value.detail)
+    await engine.dispose()
+
+
 def _heartbeat(
     hotkey: str, now: datetime, *, versions: list[int], protocol_version: int = 8
 ) -> ValidatorHeartbeat:
     capabilities, stack = _capabilities(now)
     capabilities["scorer_benchmarks"]["supported_bench_versions"] = versions
+    if 7 not in versions:
+        capabilities["scorer_benchmarks"].pop("v7_calibration", None)
+        capabilities["ticket_inference"] = False
     return ValidatorHeartbeat(
         validator_hotkey=hotkey,
         software_version="1.0.0",
@@ -1643,6 +1845,8 @@ async def test_capability_gate_is_parameterised_per_bench_version() -> None:
     # Both are gated by the same fixed protocol-8 wire floor.
     stale = _heartbeat("old", now, versions=[2, 4], protocol_version=7)
     assert not heartbeat_supports_version(stale, now=now, version=4)
+    legacy_v7 = _heartbeat("legacy-v7", now, versions=[2, 7], protocol_version=10)
+    assert not heartbeat_supports_version(legacy_v7, now=now, version=7)
 
 
 async def test_second_rollout_while_one_is_open_raises_conflict_not_integrity() -> None:
@@ -1831,6 +2035,7 @@ async def test_operator_can_select_fully_qualified_superseded_authority() -> Non
             actor="operator",
             reason="restore the completed contract",
             now=now + timedelta(minutes=1),
+            inference_requirements=_activation_requirements(),
         )
 
         assert selected.rollout_id == rollout.rollout_id
@@ -1845,6 +2050,36 @@ async def test_operator_can_select_fully_qualified_superseded_authority() -> Non
         assert audit is not None
         assert audit.payload["previous_active_version"] == 2
         assert audit.payload["bench_version"] == CANARY_BENCH_VERSION
+    await engine.dispose()
+
+
+async def test_operator_cannot_select_v7_after_proxy_key_rollback() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
+        rollout.status = "superseded"
+        await session.flush()
+
+        with pytest.raises(
+            RolloutConflictError,
+            match="inference is not live on the exact reviewed route",
+        ):
+            await select_active_bench_version(
+                session,
+                bench_version=CANARY_BENCH_VERSION,
+                actor="operator",
+                reason="must remain fail closed",
+                now=now + timedelta(minutes=1),
+                inference_requirements=replace(
+                    _activation_requirements(), provider_key_configured=False
+                ),
+            )
+
+        assert await active_bench_version(session) == 2
     await engine.dispose()
 
 
@@ -2028,7 +2263,15 @@ async def test_activation_requires_five_ranked_desired_quorum_agents() -> None:
                 )
                 == MIN_DESIRED_AUTHORITY_AGENTS - 1
             )
-            assert await maybe_activate_rollout(session, rollout, now=now) is False
+            assert (
+                await maybe_activate_rollout(
+                    session,
+                    rollout,
+                    now=now,
+                    inference_requirements=_activation_requirements(),
+                )
+                is False
+            )
             assert rollout.status == "collecting"
             assert await active_bench_version(session) == 2
         await engine.dispose()
@@ -2105,7 +2348,15 @@ async def test_activation_refused_when_only_ranked_quorum_count_is_short(
             _converged_top_five,
         )
         assert len(await rolling_top_five(session)) == MIN_DESIRED_AUTHORITY_AGENTS - 1
-        assert await maybe_activate_rollout(session, rollout, now=now) is False
+        assert (
+            await maybe_activate_rollout(
+                session,
+                rollout,
+                now=now,
+                inference_requirements=_activation_requirements(),
+            )
+            is False
+        )
         assert rollout.status == "collecting"
     await engine.dispose()
 
@@ -2127,7 +2378,15 @@ async def test_activation_at_five_ranked_quorums_keeps_a_full_emission_set() -> 
             )
             == MIN_DESIRED_AUTHORITY_AGENTS
         )
-        assert await maybe_activate_rollout(session, rollout, now=now) is True
+        assert (
+            await maybe_activate_rollout(
+                session,
+                rollout,
+                now=now,
+                inference_requirements=_activation_requirements(),
+            )
+            is True
+        )
         assert rollout.status == "activated"
         assert await active_bench_version(session) == CANARY_BENCH_VERSION
         assert await open_rollout(session) is None
@@ -2137,6 +2396,59 @@ async def test_activation_at_five_ranked_quorums_keeps_a_full_emission_set() -> 
         assert {row.agent_id for row in ledger} == set(agent_ids)
         assert {row.bench_version for row in ledger} == {CANARY_BENCH_VERSION}
         assert all(row.eligible for row in ledger)
+    await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("requirements", "stale_route"),
+    [
+        (replace(_activation_requirements(), enabled=False), False),
+        (
+            replace(_activation_requirements(), provider_key_configured=False),
+            False,
+        ),
+        (
+            replace(
+                _activation_requirements(),
+                reviewed_manifest_sha256="d" * 64,
+            ),
+            False,
+        ),
+        (_activation_requirements(), True),
+    ],
+    ids=("proxy-disabled", "provider-key-removed", "manifest-drift", "stale-route"),
+)
+async def test_v7_top_five_authority_requires_live_exact_inference_route(
+    requirements: InferenceActivationRequirements, stale_route: bool
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
+        if stale_route:
+            route = await session.get(
+                InferenceProviderRoute,
+                (
+                    "openai/gpt-oss-20b",
+                    "Groq",
+                    "openrouter-route-test-v1",
+                ),
+            )
+            assert route is not None
+            route.last_observed_at = now - timedelta(minutes=6)
+        bind_inference_activation_requirements(session, requirements)
+        assert await active_bench_version(session) == 2
+        assert not await maybe_activate_rollout(
+            session,
+            rollout,
+            now=now,
+            inference_requirements=requirements,
+        )
+        assert rollout.status == "collecting"
+        assert await persisted_active_bench_version(session) == 2
     await engine.dispose()
 
 

@@ -80,6 +80,16 @@ class ScreenerProgress(BaseModel):
     started_at: Annotated[int, Field(ge=0)]
 
 
+class ScreenerReviewSettingsStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    revision: Annotated[int, Field(ge=0)]
+    scope: Annotated[str, Field(pattern=r"^(?:bootstrap|\*|[a-zA-Z0-9._-]{1,63})$")]
+    mode: Literal["off", "shadow", "enforce"]
+    checksum: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    source: Literal["platform", "cache", "bootstrap"]
+
+
 class ScreenerHeartbeatRequest(BaseModel):
     """Dedicated screener identity, work, and optional host-health report."""
 
@@ -95,6 +105,7 @@ class ScreenerHeartbeatRequest(BaseModel):
     instance_id: Annotated[str, Field(pattern=_INSTANCE_ID_PATTERN)] | None = None
     progress: ScreenerProgress | None = None
     system_metrics: SystemMetrics | None = None
+    review_settings: ScreenerReviewSettingsStatus | None = None
     timestamp: Annotated[int, Field(ge=0)]
     signature: Annotated[str, Field(pattern=_SIGNATURE_HEX_PATTERN)]
 
@@ -118,6 +129,14 @@ class ScreenerHeartbeatRequest(BaseModel):
             raise ValueError("progress start is outside the bounded job window")
         return self
 
+    @model_validator(mode="after")
+    def validate_review_settings(self) -> ScreenerHeartbeatRequest:
+        if self.protocol_version >= 4 and self.review_settings is None:
+            raise ValueError("heartbeat protocol v4 requires review settings status")
+        if self.protocol_version < 4 and self.review_settings is not None:
+            raise ValueError("review settings status requires heartbeat protocol v4")
+        return self
+
 
 class ScreenerHeartbeatResponse(BaseModel):
     """Acknowledgement that a signed screener heartbeat was persisted."""
@@ -126,12 +145,64 @@ class ScreenerHeartbeatResponse(BaseModel):
     seen_at: datetime
 
 
+class ShadowReviewUsage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    input_tokens: Annotated[int, Field(ge=0)]
+    output_tokens: Annotated[int, Field(ge=0)]
+    cached_input_tokens: Annotated[int, Field(ge=0)]
+    reasoning_tokens: Annotated[int, Field(ge=0)]
+    estimated_cost_usd: Annotated[float, Field(ge=0, le=25)]
+    reported_cost_usd: Annotated[float, Field(ge=0, le=25)] | None = None
+
+
+class ShadowReviewObservationRequest(BaseModel):
+    """Bounded, non-authoritative observation for an active attempt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    attempt_id: UUID
+    artifact_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    settings_revision: Annotated[int, Field(ge=1)]
+    settings_scope: Annotated[str, Field(pattern=r"^(?:\*|[a-zA-Z0-9._-]{1,63})$")]
+    settings_checksum: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    disposition: Literal["safe", "violation", "inconclusive", "retryable_infra"]
+    risk_level: Literal["low", "medium", "high"] | None = None
+    categories: tuple[Annotated[str, Field(max_length=64)], ...] = ()
+    finding_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = None
+    resolution_basis: Annotated[str, Field(max_length=80)] | None = None
+    clearance_path: Annotated[str, Field(max_length=100)] | None = None
+    critic_disposition: Annotated[str, Field(max_length=80)] | None = None
+    adjudicator_disposition: Annotated[str, Field(max_length=80)] | None = None
+    response_models: tuple[Annotated[str, Field(max_length=100)], ...] = ()
+    response_providers: tuple[Annotated[str, Field(max_length=100)], ...] = ()
+    usage: ShadowReviewUsage
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> ShadowReviewObservationRequest:
+        if len(self.categories) > 8:
+            raise ValueError("shadow review has too many categories")
+        if len(self.response_models) > 8 or len(self.response_providers) > 8:
+            raise ValueError("shadow review has too many provider stages")
+        if self.disposition in {"safe", "violation"} and self.risk_level is None:
+            raise ValueError("decisive shadow review requires a risk level")
+        return self
+
+
+class ShadowReviewObservationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    accepted: bool
+
+
 __all__ = [
     "SCREENING_POLICY_VERSION",
     "ScreenerQueueItem",
     "ScreenerQueueResponse",
     "ScreenerHeartbeatRequest",
     "ScreenerHeartbeatResponse",
+    "ShadowReviewObservationRequest",
+    "ShadowReviewObservationResponse",
     "ScreenerProgress",
     "ScreenerProgressStage",
     "ScreenerRuntimeState",

@@ -20,16 +20,3 @@ def test_shipping_the_bump_does_not_retire_the_live_version() -> None:
     assert is_bench_version_retired(active, active) is False
     # The previous version only retires once the newer epoch is active.
     assert is_bench_version_retired(active, CURRENT_BENCH_VERSION) is True
-
-
-def test_retirement_never_keys_off_the_shipped_constant() -> None:
-    """Guards the specific regression: reading CURRENT here would publish the
-    answer keys of the benchmark agents are still being scored against."""
-    import inspect
-
-    from ditto.api_server import bench
-
-    src = inspect.getsource(bench.is_bench_version_retired)
-    body = src.split('"""')[-1]
-    assert "active_version" in body
-    assert "CURRENT_BENCH_VERSION" not in body

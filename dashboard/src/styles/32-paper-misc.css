@@ -1,0 +1,153 @@
+.winner-name .badge,
+.bv,
+.prov,
+#d-bench {
+  border-radius: 3px;
+}
+.bar {
+  background: var(--bg-elev-2);
+  border-color: var(--border);
+}
+
+.stage {
+  background: var(--bg-elev-2);
+}
+
+.about {
+  margin-top: 30px;
+}
+.about > p.lead {
+  color: var(--text-dim);
+  font-size: 14px;
+}
+.about .pillars {
+  gap: 0;
+  border: 1px solid var(--border);
+}
+.about .pillar {
+  padding: 20px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--bg-elev);
+}
+.about .pillar:last-child {
+  border-right: 0;
+}
+.about .pillar h2 {
+  font-family: var(--display);
+  font-size: 17px;
+  font-weight: 400;
+}
+.about .pillar p {
+  color: var(--text-dim);
+}
+.benchmark-reference {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+.bench-disclosure {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-elev);
+}
+.bench-disclosure > summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 54px;
+  padding: 12px 16px;
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+}
+.bench-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+.bench-disclosure-icon {
+  margin-left: auto;
+  color: var(--text-faint);
+  font: 500 17px/1 var(--mono);
+}
+.bench-disclosure-icon::before {
+  content: "+";
+}
+.bench-disclosure[open] > summary {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev-2);
+}
+.bench-disclosure[open] .bench-disclosure-icon::before {
+  content: "−";
+}
+.bench-disclosure > summary:hover strong {
+  color: var(--accent);
+}
+.bench-disclosure-title {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.bench-disclosure-title strong {
+  font-size: 13.5px;
+}
+.bench-disclosure-title span {
+  color: var(--text-faint);
+  font: 10.5px/1.4 var(--mono);
+}
+.bench-disclosure .tag {
+  margin-left: auto;
+}
+.bench-disclosure .tag + .bench-disclosure-icon {
+  margin-left: 0;
+}
+.bench-disclosure-body {
+  padding: 16px 18px 18px;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.bench-disclosure-body > :first-child {
+  margin-top: 0;
+}
+.bench-disclosure-body > :last-child {
+  margin-bottom: 0;
+}
+.bench-disclosure-body ul {
+  margin: 0;
+  padding-left: 18px;
+  line-height: 1.7;
+}
+footer {
+  border-color: var(--border);
+}
+footer a {
+  color: var(--accent);
+}
+
+.modal-back {
+  background: color-mix(in oklch, var(--text) 58%, transparent);
+}
+.modal {
+  border-radius: 6px;
+  border-color: var(--border-strong);
+  background: var(--bg-elev);
+  box-shadow: 0 12px 36px color-mix(in oklch, var(--text) 28%, transparent);
+}
+.modal h3,
+.stat-head {
+  font-family: var(--display);
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.modal h3 {
+  font-size: 21px;
+}
+.stat-head {
+  color: var(--text);
+  font-size: 17px;
+}
+.split .seg {
+  border-radius: 3px;
+}

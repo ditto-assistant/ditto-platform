@@ -11,6 +11,7 @@ cover the dispatch + the actual row write.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -31,7 +32,9 @@ from ditto.db.models import Agent, EvaluationPayment
 from ditto.db.queries.agents import insert_agent
 from ditto.db.queries.payments import (
     _PAYMENT_REPLAY_CONSTRAINT,
+    consume_evaluation_credit,
     get_agent_for_payment_proof,
+    get_evaluation_payment_for_proof,
     insert_evaluation_payment,
 )
 
@@ -43,6 +46,7 @@ def _make_verified(**overrides: Any) -> VerifiedPayment:
         "miner_hotkey": "5HKAlphaHotkey",
         "miner_coldkey": "5CKAlphaColdkey",
         "amount_rao": 5_000_000_000,
+        "tao_usd_rate": Decimal("400"),
         "dest_address": "5DestAddress",
         "block_timestamp": datetime(2026, 5, 19, 12, 0, tzinfo=UTC),
     }
@@ -116,6 +120,7 @@ class TestInsertEvaluationPaymentHappyPath:
         ).scalar_one()
         assert row.agent_id == agent_id
         assert row.amount_rao == verified.amount_rao
+        assert row.tao_usd_rate == verified.tao_usd_rate
         assert row.dest_address == verified.dest_address
         assert row.miner_coldkey == verified.miner_coldkey
 
@@ -136,6 +141,71 @@ class TestInsertEvaluationPaymentHappyPath:
             )
             is None
         )
+
+    async def test_identical_payment_becomes_reusable_credit(
+        self, session: AsyncSession
+    ) -> None:
+        source_id = uuid4()
+        target_id = uuid4()
+        verified = _make_verified()
+        credit = _make_verified(block_hash="0xcredit", extrinsic_index=4)
+        async with session.begin():
+            await insert_agent(
+                session,
+                agent_id=source_id,
+                miner_hotkey=verified.miner_hotkey,
+                name="source",
+                sha256="aa" * 32,
+                size_bytes=10,
+            )
+            await insert_evaluation_payment(
+                session, verified=verified, agent_id=source_id
+            )
+            await insert_evaluation_payment(
+                session, verified=credit, credit_for_agent_id=source_id
+            )
+
+        assert (
+            await get_agent_for_payment_proof(
+                session,
+                block_hash=credit.block_hash,
+                extrinsic_index=credit.extrinsic_index,
+            )
+            is None
+        )
+        await session.rollback()
+
+        async with session.begin():
+            await insert_agent(
+                session,
+                agent_id=target_id,
+                miner_hotkey=credit.miner_hotkey,
+                name="target",
+                sha256="bb" * 32,
+                size_bytes=11,
+            )
+            payment = await get_evaluation_payment_for_proof(
+                session,
+                block_hash=credit.block_hash,
+                extrinsic_index=credit.extrinsic_index,
+                for_update=True,
+            )
+            assert payment is not None
+            await consume_evaluation_credit(
+                session,
+                payment=payment,
+                agent_id=target_id,
+                miner_hotkey=credit.miner_hotkey,
+            )
+
+        consumed = await get_evaluation_payment_for_proof(
+            session,
+            block_hash=credit.block_hash,
+            extrinsic_index=credit.extrinsic_index,
+        )
+        assert consumed is not None
+        assert consumed.agent_id == target_id
+        assert consumed.credit_for_agent_id is None
 
 
 class TestInsertEvaluationPaymentReplayDispatch:

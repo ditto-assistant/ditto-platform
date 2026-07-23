@@ -19,19 +19,28 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
-from sqlalchemy import case, func, literal, select
+from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy.orm import aliased
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.db.models import (
     Agent,
     BenchmarkDataset,
     BenchmarkRollout,
+    EvaluationPayment,
     Score,
     ValidatorTicket,
+)
+from ditto.db.queries.audit import (
+    EVENT_SCORE_RETEST_REQUESTED,
+    get_latest_score_retest_event,
+)
+from ditto.db.queries.benchmark_admission import (
+    activated_rollout_for_version,
+    benchmark_admission_predicate,
 )
 from ditto.db.queries.scores import SCORING_QUORUM, list_eligible_ledger
 
@@ -187,6 +196,7 @@ async def issue_ticket(
     submitted_at_or_after: datetime | None = None,
     fifo_start_at: datetime | None = None,
     completion_first: bool = False,
+    slot_id: str = "slot-0",
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
@@ -194,10 +204,12 @@ async def issue_ticket(
     has fewer than :data:`SCORING_QUORUM` live tickets and (b) this validator
     does not already hold a live or scored ticket for. Candidates with the
     strongest bounded set of 2-of-3 provisional contenders comes first. The
-    remaining candidates are normally ordered by least total coverage (accepted
-    scores plus live assignments), then never-attempted work, then submission
-    age. ``completion_first`` instead makes benchmark-era FIFO primary so the
-    oldest submission reaches quorum before the next submission is opened. A
+    remaining candidates prioritize the bounded 2-of-3 contender lane and then
+    1-of-3 submissions before uncovered work. Live assignments are spread
+    within each lane. This advances settled work toward quorum without letting
+    an unbounded completion backlog starve new miners. ``completion_first``
+    instead makes benchmark-era FIFO primary so the oldest submission reaches
+    quorum before the next submission is opened. A
     2-of-3 submission that can no longer reach this era's emission set sorts
     behind every other candidate rather than being withheld, so it still
     finalizes once the queue drains. A prior expired row is reissued only after
@@ -211,27 +223,36 @@ async def issue_ticket(
     if session.get_bind().dialect.name == "postgresql":
         await session.execute(
             select(
-                func.pg_advisory_xact_lock(func.hashtextextended(validator_hotkey, 0))
+                func.pg_advisory_xact_lock(
+                    func.hashtextextended(f"{validator_hotkey}:{slot_id}", 0)
+                )
             )
         )
     await expire_overdue_tickets(session, now=now)
     if bench_version is None:
         raise ValueError("benchmark version is required for ticket issuance")
+    activated_rollout = await activated_rollout_for_version(
+        session, bench_version=bench_version
+    )
     if fifo_start_at is None:
-        fifo_start_at = await session.scalar(
-            select(BenchmarkRollout.created_at)
-            .where(BenchmarkRollout.desired_version == bench_version)
-            .order_by(BenchmarkRollout.created_at.desc())
-            .limit(1)
+        fifo_start_at = (
+            activated_rollout.created_at
+            if activated_rollout is not None
+            else await session.scalar(
+                select(BenchmarkRollout.created_at)
+                .where(BenchmarkRollout.desired_version == bench_version)
+                .order_by(BenchmarkRollout.created_at.desc())
+                .limit(1)
+            )
         )
     contract = benchmark_contract(bench_version)
     requires_screened = (
         contract.requires_screened_image or artifact_mode == "screened_only"
     )
 
-    # A validator executes one benchmark at a time. Polling again (including
-    # after a process restart) must resume that still-live lease instead of
-    # allocating unrelated work and leaving the first ticket stranded.
+    # A validator slot executes one benchmark at a time. Polling the same slot
+    # again (including after a process restart) must resume that still-live
+    # lease instead of allocating unrelated work and leaving it stranded.
     complete_screened_image = (
         Agent.screened_image_sha256.is_not(None)
         & Agent.screened_image_size_bytes.is_not(None)
@@ -243,13 +264,21 @@ async def issue_ticket(
     eligible_screened_image = complete_screened_image & (
         Agent.screening_policy_version >= contract.minimum_screening_policy_version
     )
+    rollout_admitted = None
+    if activated_rollout is not None:
+        rollout_admitted = benchmark_admission_predicate(
+            rollout=activated_rollout, bench_version=bench_version
+        )
     existing_statement = (
         select(ValidatorTicket)
         .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
         .where(
             ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.bench_version == bench_version,
             ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.purpose == TicketPurpose.CANONICAL_QUORUM,
+            ValidatorTicket.purpose_revision > 0,
             ValidatorTicket.deadline > now,
         )
         .order_by(ValidatorTicket.issued_at.asc(), ValidatorTicket.agent_id.asc())
@@ -258,6 +287,8 @@ async def issue_ticket(
     )
     if requires_screened:
         existing_statement = existing_statement.where(eligible_screened_image)
+    if rollout_admitted is not None:
+        existing_statement = existing_statement.where(rollout_admitted)
     existing = await session.scalar(existing_statement)
     if existing is not None:
         return existing
@@ -265,6 +296,7 @@ async def issue_ticket(
         select(ValidatorTicket)
         .where(
             ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.status == TicketStatus.ISSUED,
             ValidatorTicket.deadline > now,
         )
@@ -272,6 +304,14 @@ async def issue_ticket(
         .with_for_update()
     )
     if incompatible_existing is not None:
+        if (
+            incompatible_existing.purpose != TicketPurpose.CANONICAL_QUORUM
+            or incompatible_existing.purpose_revision <= 0
+        ):
+            # Continual and deployment-transition leases own this slot until
+            # their deadline. A canonical claim must neither serve nor cancel
+            # work from another authorization lane.
+            return None
         if validator_running_benchmark:
             # Never revoke work a fresh signed heartbeat says is active.
             return None
@@ -285,8 +325,10 @@ async def issue_ticket(
 
     # Scoped to the era this ticket is for: a v2 fifth place says nothing about
     # whether a v4 two-score maximum is still in contention.
-    score_continuation_floor = await get_score_continuation_floor(
-        session, bench_version=bench_version
+    score_continuation_floor = (
+        None
+        if completion_first
+        else await get_score_continuation_floor(session, bench_version=bench_version)
     )
 
     # Agents this validator must not receive right now: live/scored tickets,
@@ -344,7 +386,6 @@ async def issue_ticket(
         .correlate(Agent)
         .scalar_subquery()
     )
-    total_coverage = accepted_score_count + live_assignment_count
     provisional_composite = func.coalesce(
         (
             select(func.avg(Score.composite))
@@ -435,6 +476,14 @@ async def issue_ticket(
         .correlate(contender)
         .scalar_subquery()
     )
+    contender_payment = aliased(EvaluationPayment)
+    contender_owner = case(
+        (
+            contender_payment.miner_coldkey.is_not(None),
+            literal("coldkey:") + contender_payment.miner_coldkey,
+        ),
+        else_=literal("hotkey:") + contender.miner_hotkey,
+    )
     contender_per_miner = (
         select(
             contender.agent_id.label("agent_id"),
@@ -442,7 +491,7 @@ async def issue_ticket(
             contender_provisional_composite.label("provisional_composite"),
             func.row_number()
             .over(
-                partition_by=contender.miner_hotkey,
+                partition_by=contender_owner,
                 order_by=(
                     contender_provisional_composite.desc(),
                     contender.created_at.asc(),
@@ -450,6 +499,10 @@ async def issue_ticket(
                 ),
             )
             .label("miner_rank"),
+        )
+        .outerjoin(
+            contender_payment,
+            contender_payment.agent_id == contender.agent_id,
         )
         .where(
             contender.status == AgentStatus.EVALUATING,
@@ -473,6 +526,14 @@ async def issue_ticket(
         (Agent.agent_id.in_(top_provisional_contenders), 0),
         else_=1,
     )
+    one_score_completion_lane = case(
+        (accepted_score_count == 1, 0),
+        else_=1,
+    )
+    overflow_two_score_lane = case(
+        (recorded_score_count >= SCORING_QUORUM - 1, 1),
+        else_=0,
+    )
     # Lock one candidate Agent row before counting its tickets. The recount is a
     # separate statement after the lock is acquired, so under Postgres READ
     # COMMITTED it sees any ticket committed by the previous lock holder.
@@ -482,8 +543,9 @@ async def issue_ticket(
         candidate = select(Agent.agent_id).where(
             Agent.status == AgentStatus.EVALUATING,
             Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
-            Agent.agent_id.not_in(already_mine),
         )
+        if not completion_first:
+            candidate = candidate.where(Agent.agent_id.not_in(already_mine))
         if bench_version != 2:
             versioned_dataset = (
                 select(BenchmarkDataset.agent_id)
@@ -496,6 +558,8 @@ async def issue_ticket(
             candidate = candidate.where(versioned_dataset)
         if requires_screened:
             candidate = candidate.where(eligible_screened_image)
+        if rollout_admitted is not None:
+            candidate = candidate.where(rollout_admitted)
         if submitted_at_or_after is not None:
             candidate = candidate.where(Agent.created_at >= submitted_at_or_after)
         if skipped:
@@ -510,14 +574,11 @@ async def issue_ticket(
         )
         queue_order = (
             (
-                below_floor_lane.asc(),
-                case(
-                    (complete_screened_image, 0),
-                    else_=(0 if artifact_mode == "legacy" else 1),
-                ).asc(),
+                # Keep the fresh-submission lane independent of the ordinary
+                # queue's contender, coverage, artifact, and continuation-floor
+                # priorities. Age is the contract; UUID is only a stable tie.
                 fifo_age.asc(),
                 Agent.agent_id.asc(),
-                had_prior_ticket.asc(),
             )
             if completion_first
             else (
@@ -527,7 +588,16 @@ async def issue_ticket(
                     else_=(0 if artifact_mode == "legacy" else 1),
                 ).asc(),
                 contender_lane.asc(),
-                total_coverage.asc(),
+                # One accepted result is real progress toward the public 3-of-3
+                # settlement contract. Advance those rows before opening a
+                # wider one-score backlog. The separately bounded contender
+                # lane above owns strong 2-of-3 work.
+                one_score_completion_lane.asc(),
+                # Keep the existing bounded-contender guarantee: a two-score
+                # row outside the top contender set must not turn the whole
+                # backlog into an unbounded completion lane.
+                overflow_two_score_lane.asc(),
+                live_assignment_count.asc(),
                 had_prior_ticket.asc(),
                 covered_lane_score.desc(),
                 fifo_age.asc(),
@@ -537,13 +607,12 @@ async def issue_ticket(
         candidate = (
             # The ordinary queue first finishes the bounded set of strongest
             # 2-of-3 provisional contenders, one best submission per miner,
-            # then round-robins the rest of the scoreable backlog. A
-            # live evaluator counts as one
-            # unit of coverage just like an accepted score, so an agent cannot
-            # jump from zero coverage to three concurrent validators while
-            # another eligible agent remains uncovered. Within one coverage
-            # round, never-attempted work precedes this validator's cooled-down
-            # retry. Within any accepted-score coverage round, prefer the
+            # then advances 1-of-3 rows toward quorum before opening uncovered
+            # work. Live assignments are spread only within the same progress
+            # lane, so completed evidence is not treated as equivalent to
+            # speculative in-flight work. Within one lane, never-attempted
+            # work precedes this validator's cooled-down retry. Within any
+            # accepted-score coverage round, prefer the
             # highest provisional composite so the likely emission winner
             # advances first. Submission age and UUID remain stable ties. The
             # fresh-submission lane uses queue_order's FIFO-first alternative
@@ -556,6 +625,160 @@ async def issue_ticket(
         agent_id = (await session.execute(candidate)).scalar_one_or_none()
         if agent_id is None:
             return None
+
+        # One paid owner may have many generations, but only one generation may
+        # occupy validator capacity at a time. Serialize by the immutable
+        # payment-time coldkey (legacy rows fall back to hotkey), then re-check
+        # for an issued sibling after taking the lock. Accepted scores are
+        # history, not occupied capacity, but they keep the first progressing
+        # generation selected until it settles. The post-lock checks close the
+        # race where two platform replicas select different agents for the same
+        # owner before either ticket exists.
+        owner_row = (
+            await session.execute(
+                select(Agent.miner_hotkey, EvaluationPayment.miner_coldkey)
+                .outerjoin(
+                    EvaluationPayment,
+                    EvaluationPayment.agent_id == Agent.agent_id,
+                )
+                .where(Agent.agent_id == agent_id)
+            )
+        ).one()
+        owner_hotkey, owner_coldkey = owner_row
+        linked_coldkeys = {
+            coldkey
+            for coldkey in (
+                await session.scalars(
+                    select(EvaluationPayment.miner_coldkey)
+                    .where(
+                        EvaluationPayment.miner_hotkey == owner_hotkey,
+                        EvaluationPayment.miner_coldkey.is_not(None),
+                    )
+                    .distinct()
+                )
+            ).all()
+            if coldkey is not None
+        }
+        if owner_coldkey is not None:
+            linked_coldkeys.add(owner_coldkey)
+        linked_hotkeys = {owner_hotkey}
+        if linked_coldkeys:
+            linked_hotkeys.update(
+                (
+                    await session.scalars(
+                        select(EvaluationPayment.miner_hotkey)
+                        .where(EvaluationPayment.miner_coldkey.in_(linked_coldkeys))
+                        .distinct()
+                    )
+                ).all()
+            )
+        if session.get_bind().dialect.name == "postgresql":
+            # A legacy row inherits every payment-time coldkey previously
+            # observed for its hotkey. Lock those identities in sorted order,
+            # so it also serializes with a paid generation submitted after a
+            # hotkey rotation. A truly unlinked legacy row falls back to its
+            # hotkey. The canonical ordering prevents multi-key deadlocks.
+            owner_lock_keys = (
+                [f"coldkey:{coldkey}" for coldkey in sorted(linked_coldkeys)]
+                if linked_coldkeys
+                else [f"hotkey:{owner_hotkey}"]
+            )
+            for owner_lock_key in owner_lock_keys:
+                await session.execute(
+                    select(
+                        func.pg_advisory_xact_lock(
+                            func.hashtextextended(owner_lock_key, 0)
+                        )
+                    )
+                )
+        sibling_agent = aliased(Agent)
+        sibling_payment = aliased(EvaluationPayment)
+        same_owner = (
+            or_(
+                sibling_payment.miner_coldkey.in_(linked_coldkeys),
+                and_(
+                    sibling_payment.miner_coldkey.is_(None),
+                    sibling_agent.miner_hotkey.in_(linked_hotkeys),
+                ),
+            )
+            if linked_coldkeys
+            else and_(
+                sibling_payment.miner_coldkey.is_(None),
+                sibling_agent.miner_hotkey == owner_hotkey,
+            )
+        )
+        live_sibling_count = await session.scalar(
+            select(func.count())
+            .select_from(ValidatorTicket)
+            .join(sibling_agent, sibling_agent.agent_id == ValidatorTicket.agent_id)
+            .outerjoin(
+                sibling_payment,
+                sibling_payment.agent_id == sibling_agent.agent_id,
+            )
+            .where(
+                sibling_agent.agent_id != agent_id,
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.deadline > now,
+                same_owner,
+            )
+        )
+        if (live_sibling_count or 0) > 0:
+            skipped.append(agent_id)
+            continue
+
+        # Keep one current-era generation selected across the gaps between its
+        # leases. Otherwise a validator that already scored the selected row
+        # can open a sibling after the last lease becomes SCORED, and that new
+        # lease diverts every eligible validator away from finishing the first
+        # generation. Historical overlaps converge deterministically on the
+        # generation whose accepted/live progress began first. Expired-only
+        # attempts do not pin an owner, so failed work can still drain.
+        owner_progress_started_at = (
+            select(func.min(ValidatorTicket.issued_at))
+            .where(
+                ValidatorTicket.agent_id == sibling_agent.agent_id,
+                ValidatorTicket.bench_version == bench_version,
+                (
+                    (ValidatorTicket.status == TicketStatus.SCORED)
+                    | (
+                        (ValidatorTicket.status == TicketStatus.ISSUED)
+                        & (ValidatorTicket.deadline > now)
+                    )
+                ),
+            )
+            .correlate(sibling_agent)
+            .scalar_subquery()
+        )
+        selected_owner_agent_id = await session.scalar(
+            select(sibling_agent.agent_id)
+            .outerjoin(
+                sibling_payment,
+                sibling_payment.agent_id == sibling_agent.agent_id,
+            )
+            .where(
+                sibling_agent.status == AgentStatus.EVALUATING,
+                same_owner,
+                owner_progress_started_at.is_not(None),
+                (
+                    benchmark_admission_predicate(
+                        rollout=activated_rollout,
+                        bench_version=bench_version,
+                        agent=sibling_agent,
+                    )
+                    if activated_rollout is not None
+                    else literal(True)
+                ),
+            )
+            .order_by(
+                owner_progress_started_at.asc(),
+                sibling_agent.created_at.asc(),
+                sibling_agent.agent_id.asc(),
+            )
+            .limit(1)
+        )
+        if selected_owner_agent_id is not None and selected_owner_agent_id != agent_id:
+            skipped.append(agent_id)
+            continue
         occupied = await session.scalar(
             select(func.count()).where(
                 ValidatorTicket.agent_id == agent_id,
@@ -563,9 +786,56 @@ async def issue_ticket(
                 ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES),
             )
         )
-        if (occupied or 0) < SCORING_QUORUM:
-            break
-        skipped.append(agent_id)
+        if (occupied or 0) >= SCORING_QUORUM:
+            skipped.append(agent_id)
+            continue
+        if completion_first:
+            # Completion-first admission is global, not per validator slot.
+            # Every slot waits on the same FIFO head. Once the row lock is
+            # acquired, re-check this validator against fresh committed state.
+            # A sibling slot waits while this validator owns the head; a
+            # validator that can no longer score the head advances to the next
+            # FIFO candidate instead of idling behind impossible work.
+            same_validator_blocking_status = await session.scalar(
+                select(ValidatorTicket.status)
+                .where(
+                    ValidatorTicket.agent_id == agent_id,
+                    ValidatorTicket.validator_hotkey == validator_hotkey,
+                    ValidatorTicket.bench_version == bench_version,
+                    (
+                        ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES)
+                        | (
+                            (ValidatorTicket.status == TicketStatus.EXPIRED)
+                            & (
+                                (ValidatorTicket.retry_after > now)
+                                | (
+                                    ValidatorTicket.attempt_count
+                                    >= (
+                                        MAX_ATTEMPTS_PER_VERSION
+                                        + ValidatorTicket.manual_retry_grants
+                                        + ValidatorTicket.infra_retry_grants
+                                    )
+                                )
+                            )
+                        )
+                    ),
+                )
+                .limit(1)
+            )
+            if same_validator_blocking_status == TicketStatus.ISSUED:
+                # A sibling slot must not advance while this validator already
+                # owns the FIFO head. Let another validator fill the remaining
+                # quorum slots first.
+                return None
+            if same_validator_blocking_status is not None:
+                # This validator cannot contribute another score to the FIFO
+                # head (it already scored it, is cooling down, or exhausted its
+                # retry budget). Keeping it parked here can idle the entire
+                # fleet when every remaining scorer is similarly ineligible.
+                # Preserve FIFO among work this validator can actually claim.
+                skipped.append(agent_id)
+                continue
+        break
 
     ticket = await session.get(
         ValidatorTicket, (agent_id, bench_version, validator_hotkey)
@@ -574,7 +844,10 @@ async def issue_ticket(
         ticket = ValidatorTicket(
             agent_id=agent_id,
             validator_hotkey=validator_hotkey,
+            slot_id=slot_id,
             status=TicketStatus.ISSUED,
+            purpose=TicketPurpose.CANONICAL_QUORUM,
+            purpose_revision=1,
             issued_at=now,
             deadline=now + ttl,
             bench_version=bench_version,
@@ -587,9 +860,121 @@ async def issue_ticket(
         # The composite PK preserves one validator slot per agent. Reuse the
         # expired row with a fresh lease rather than inserting a duplicate.
         ticket.status = TicketStatus.ISSUED
+        ticket.purpose = TicketPurpose.CANONICAL_QUORUM
+        ticket.purpose_revision += 1
+        ticket.legacy_completion_allowed = False
+        ticket.slot_id = slot_id
         ticket.issued_at = now
         ticket.deadline = now + ttl
         ticket.attempt_count += 1
+        ticket.retry_after = None
+    await session.flush()
+    return ticket
+
+
+async def issue_confirmation_ticket(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    validator_hotkey: str,
+    now: datetime,
+    ttl: timedelta,
+    bench_version: int,
+) -> ValidatorTicket | None:
+    """Reissue this validator's existing quorum slot for top-five maintenance.
+
+    The caller has already proven that ``agent_id`` is the one bounded KOTH
+    confirmation target.  Reusing the existing composite-key row keeps score
+    submission on the dedicated append-only endpoint. A validator with unrelated
+    live work receives no confirmation
+    ticket, so this maintenance run cannot interrupt queue scoring.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        await session.execute(
+            select(
+                func.pg_advisory_xact_lock(func.hashtextextended(validator_hotkey, 0))
+            )
+        )
+    await expire_overdue_tickets(session, now=now)
+    existing_live = await session.scalar(
+        select(ValidatorTicket)
+        .where(
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    if existing_live is not None:
+        return (
+            existing_live
+            if existing_live.agent_id == agent_id
+            and existing_live.bench_version == bench_version
+            and existing_live.purpose == TicketPurpose.CONTINUAL_RETEST
+            and existing_live.purpose_revision > 0
+            else None
+        )
+
+    agent = await session.scalar(
+        select(Agent).where(Agent.agent_id == agent_id).with_for_update()
+    )
+    if agent is None or agent.status not in {AgentStatus.SCORED, AgentStatus.LIVE}:
+        return None
+    # Confirmation replaces one member of the existing k=3 quorum; it must not
+    # create a fourth scorer and change consensus cardinality.
+    prior_score = await session.scalar(
+        select(Score).where(
+            Score.agent_id == agent_id,
+            Score.bench_version == bench_version,
+            Score.validator_hotkey == validator_hotkey,
+        )
+    )
+    if prior_score is None:
+        return None
+    latest_retest = await get_latest_score_retest_event(
+        session,
+        agent_id=agent_id,
+        validator_hotkey=validator_hotkey,
+    )
+    if (
+        latest_retest is not None
+        and latest_retest.event == EVENT_SCORE_RETEST_REQUESTED
+    ):
+        # An operator-authorized canonical replacement owns this validator/agent
+        # lifecycle until it is completed or released. Continual maintenance
+        # must never repurpose its expired mutable row.
+        return None
+
+    ticket = await session.get(
+        ValidatorTicket, (agent_id, bench_version, validator_hotkey)
+    )
+    if ticket is None:
+        ticket = ValidatorTicket(
+            agent_id=agent_id,
+            validator_hotkey=validator_hotkey,
+            status=TicketStatus.ISSUED,
+            purpose=TicketPurpose.CONTINUAL_RETEST,
+            purpose_revision=1,
+            issued_at=now,
+            deadline=now + ttl,
+            bench_version=bench_version,
+            attempt_count=1,
+            manual_retry_grants=0,
+            retry_after=None,
+        )
+        session.add(ticket)
+    else:
+        same_version = ticket.bench_version == bench_version
+        ticket.status = TicketStatus.ISSUED
+        ticket.purpose = TicketPurpose.CONTINUAL_RETEST
+        ticket.purpose_revision += 1
+        ticket.legacy_completion_allowed = False
+        ticket.issued_at = now
+        ticket.deadline = now + ttl
+        ticket.bench_version = bench_version
+        ticket.attempt_count = ticket.attempt_count + 1 if same_version else 1
+        ticket.manual_retry_grants = ticket.manual_retry_grants if same_version else 0
         ticket.retry_after = None
     await session.flush()
     return ticket
@@ -603,6 +988,7 @@ async def get_open_ticket(
     now: datetime,
     deadline: datetime,
     bench_version: int | None = 2,
+    slot_id: str | None = None,
     for_update: bool = False,
 ) -> ValidatorTicket | None:
     """Return the validator's live ticket matching the signed lease.
@@ -619,6 +1005,8 @@ async def get_open_ticket(
     )
     if bench_version is not None:
         statement = statement.where(ValidatorTicket.bench_version == bench_version)
+    if slot_id is not None:
+        statement = statement.where(ValidatorTicket.slot_id == slot_id)
     if for_update:
         statement = statement.with_for_update()
     ticket = await session.scalar(statement)

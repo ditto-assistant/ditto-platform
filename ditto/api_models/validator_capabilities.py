@@ -10,6 +10,8 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_valida
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _REVISION_PATTERN = r"^[0-9a-f]{40}$"
 _VERSION_PATTERN = r"^[0-9A-Za-z][0-9A-Za-z._+/-]{0,63}$"
+_PROFILE_PATTERN = r"^[0-9A-Za-z][0-9A-Za-z._+/-]{0,127}$"
+_SHA256_PATTERN = r"^[0-9a-f]{64}$"
 
 ComponentProvenance = Literal["signed_descriptor", "committed_pin", "local_unverified"]
 ExecutorIsolation = Literal[
@@ -25,6 +27,37 @@ SupportedBenchVersions = Annotated[
 ]
 
 
+class InferenceCalibrationRoute(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    provider: Annotated[str, Field(min_length=1, max_length=120)]
+    profile_revision: Annotated[str, Field(pattern=_PROFILE_PATTERN)]
+    model: Annotated[str, Field(min_length=1, max_length=120)]
+
+
+InferenceCalibrationRoutes = Annotated[
+    tuple[InferenceCalibrationRoute, ...],
+    BeforeValidator(lambda value: tuple(value) if isinstance(value, list) else value),
+]
+
+
+class V7InferenceCalibration(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    manifest_sha256: Annotated[str, Field(pattern=_SHA256_PATTERN)]
+    supported_routes: InferenceCalibrationRoutes
+
+    @model_validator(mode="after")
+    def routes_are_nonempty_unique_and_sorted(self) -> V7InferenceCalibration:
+        identities = tuple(
+            (route.provider, route.profile_revision, route.model)
+            for route in self.supported_routes
+        )
+        if not identities or tuple(sorted(set(identities))) != identities:
+            raise ValueError("v7 inference routes must be nonempty, unique, and sorted")
+        return self
+
+
 class ScorerBenchmarkCapability(BaseModel):
     """Identity-bound benchmark support observed from the scorer sidecar."""
 
@@ -35,6 +68,7 @@ class ScorerBenchmarkCapability(BaseModel):
     observed_at: Annotated[int | None, Field(ge=0)] = None
     software_version: Annotated[str | None, Field(pattern=_VERSION_PATTERN)] = None
     source_revision: Annotated[str | None, Field(pattern=_REVISION_PATTERN)] = None
+    v7_calibration: V7InferenceCalibration | None = None
 
     @model_validator(mode="after")
     def support_matches_verified_identity(self) -> ScorerBenchmarkCapability:
@@ -60,6 +94,13 @@ class ScorerBenchmarkCapability(BaseModel):
             raise ValueError(
                 "benchmark versions above v2 require a fresh verified scorer identity"
             )
+        # Heartbeat protocol v10 predates the v7 calibration payload. A source
+        # stack may observe a newer scorer that advertises v7 while the
+        # validator still emits that legacy envelope, so the protocol-aware
+        # requirement belongs to ValidatorHeartbeatRequest. Keep rejecting the
+        # inverse contradiction at this protocol-agnostic layer.
+        if self.v7_calibration is not None and 7 not in versions:
+            raise ValueError("v7 inference calibration requires benchmark v7 support")
         return self
 
 
@@ -74,6 +115,8 @@ class ValidatorCapabilities(BaseModel):
     full_stack_managed: bool
     stack_updater: bool
     sandbox_egress_restricted: bool
+    ticket_inference: bool = Field(default=False, exclude_if=lambda value: not value)
+    signed_score_quorum: bool = Field(default=False, exclude_if=lambda value: not value)
     executor_isolation: ExecutorIsolation
     scorer_benchmarks: ScorerBenchmarkCapability | None = Field(
         default=None, exclude_if=lambda value: value is None
@@ -91,6 +134,12 @@ class ValidatorCapabilities(BaseModel):
             )
         if self.stack_updater and not self.full_stack_managed:
             raise ValueError("stack updater requires a managed full stack")
+        if (
+            self.scorer_benchmarks is not None
+            and self.scorer_benchmarks.v7_calibration is not None
+            and not self.ticket_inference
+        ):
+            raise ValueError("v7 calibration requires ticket inference")
         return self
 
 

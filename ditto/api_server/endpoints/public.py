@@ -40,6 +40,7 @@ import statistics
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from datetime import time as datetime_time
 from typing import Annotated, Any, Literal, cast
 from uuid import UUID, uuid4
 
@@ -65,6 +66,9 @@ from ditto.api_models import (
     PublicBenchGlossaryResponse,
     PublicBenchIntegrity,
     PublicBenchmarkProgress,
+    PublicBenchmarkRelease,
+    PublicBenchmarkTimelinePoint,
+    PublicBenchmarkTimelineResponse,
     PublicBenchRolloutResponse,
     PublicBenchVersionDoc,
     PublicCaseResult,
@@ -73,6 +77,7 @@ from ditto.api_models import (
     PublicChainWeight,
     PublicChainWeightsResponse,
     PublicCompositeBreakdown,
+    PublicConfirmationScore,
     PublicDatasetReveal,
     PublicDethroneDecision,
     PublicEmissionRecipient,
@@ -109,6 +114,7 @@ from ditto.api_models import (
 )
 from ditto.api_models import bench_glossary as bench_glossary_data
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_capacity import BenchmarkCapacity
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.public import (
     FleetAvailability,
@@ -142,9 +148,13 @@ from ditto.api_server.endpoints.screener import GeneratorDep
 from ditto.api_server.endpoints.upload import _verify_signature
 from ditto.api_server.endpoints.validator import SessionDep, StorageDep
 from ditto.api_server.koth import (
+    KOTH_BAND_DECAY_MIN_BENCH_VERSION,
+    KOTH_BAND_DECAY_RATE,
+    KOTH_BAND_DECAY_START_COMPOSITE,
     KOTH_CHAMPION_SHARE,
     KOTH_DETHRONE_Z,
     KOTH_MARGIN,
+    KOTH_RANK_SHARES,
     KOTH_TAIL_SIZE,
     KothEntry,
     project_koth,
@@ -155,6 +165,8 @@ from ditto.db.models import (
     Agent,
     AthReview,
     BenchmarkDataset,
+    BenchmarkRollout,
+    ConfirmationScore,
     Score,
     ScreeningDispute,
     ScreeningQuarantine,
@@ -162,7 +174,19 @@ from ditto.db.models import (
 )
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
-from ditto.db.queries.benchmark_rollout import active_bench_version, rollout_state
+from ditto.db.queries.benchmark_admission import (
+    admitted_agent_ids,
+    agent_is_admitted,
+)
+from ditto.db.queries.benchmark_rollout import (
+    active_bench_version,
+    open_rollout,
+    rollout_state,
+)
+from ditto.db.queries.confirmation_scores import (
+    confirmation_composites_by_seed,
+    confirmation_depths,
+)
 from ditto.db.queries.heartbeats import (
     ActiveValidatorAssignment,
     ActiveValidatorWork,
@@ -183,6 +207,7 @@ from ditto.db.queries.scores import (
     get_score_counts,
     get_submission_scores,
     list_eligible_ledger,
+    list_memory_leader_timeline,
     list_miner_composite_history,
     list_provisional_ledger,
     list_public_submissions,
@@ -206,6 +231,7 @@ router = APIRouter(prefix="/public", tags=["public"])
 # The ledger only moves when a sweep records a new best score, so a short shared
 # cache is safe and shields the DB from dashboard/CDN traffic.
 _CACHE_CONTROL = "public, max-age=30"
+_TIMELINE_CACHE_CONTROL = "public, max-age=300"
 _REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 1.0
 _REGISTRATION_CACHE_TTL_SECONDS = 15.0
 _REGISTRATION_FAILURE_CACHE_TTL_SECONDS = 5.0
@@ -215,6 +241,13 @@ _TRANSCRIPT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # Historical reproduction must fail closed: only benchmark epochs whose exact
 # generator release is known get a copyable command. Add a mapping deliberately
 # when a future epoch pins its generator; never point an old score at ``latest``.
+
+
+def _timeline_utc(value: datetime) -> datetime:
+    """Normalize SQLite-naive and Postgres-aware rollout timestamps to UTC."""
+
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
 
 # The exact generator release each benchmark version's reproduction commands
 # pin. v0.8.0 is the tag cut from dittobench-datagen's anti-gaming branch at
@@ -250,6 +283,7 @@ _PUBLIC_ACTIVITY_STATUSES = frozenset(
         "waiting_validator",
         "evaluating",
         "below_score_floor",
+        "not_queued",
         "under_review",
         "rejected",
         "scored",
@@ -464,6 +498,7 @@ def _public_benchmark_progress(
     if progress is None:
         return PublicBenchmarkProgress(
             agent_id=work.agent.agent_id,
+            slot_id=work.ticket.slot_id,
             agent_name=work.agent.name,
             bench_version=work.ticket.bench_version,
             started_at=started_at,
@@ -487,6 +522,7 @@ def _public_benchmark_progress(
         )
     return PublicBenchmarkProgress(
         agent_id=work.agent.agent_id,
+        slot_id=work.ticket.slot_id,
         agent_name=work.agent.name,
         bench_version=work.ticket.bench_version,
         started_at=started_at,
@@ -924,8 +960,12 @@ def _public_koth_emissions(
     rows: list[LedgerRow],
     *,
     stderrs: dict[UUID, float | None],
+    confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
+    confirmation_depth: dict[UUID, int] | None = None,
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
+    by_seed = confirmation_by_seed or {}
+    depths = confirmation_depth or {}
     candidates: list[LedgerRow] = []
     for row in rows:
         if row.eligible and row.composite > 0.0:
@@ -935,6 +975,19 @@ def _public_koth_emissions(
     fold_entries = []
     for raw_rank, row in enumerate(candidates, start=1):
         details = row.details if isinstance(row.details, dict) else {}
+        merged_confirmations: dict[int, float] = {}
+        legacy_seeds = _confirmation_seeds(details)
+        legacy_composites = _confirmation_composites(details)
+        if legacy_seeds is not None and legacy_composites is not None:
+            merged_confirmations.update(
+                zip(legacy_seeds, legacy_composites, strict=False)
+            )
+        merged_confirmations.update(by_seed.get(row.agent_id, {}))
+        confirmations = (
+            sorted(merged_confirmations.items())
+            if len(merged_confirmations) >= 2
+            else None
+        )
         fold_entries.append(
             KothEntry(
                 miner_hotkey=row.miner_hotkey,
@@ -942,15 +995,16 @@ def _public_koth_emissions(
                 composite=row.composite,
                 first_seen=row.first_seen,
                 raw_rank=raw_rank,
+                bench_version=row.bench_version,
                 composite_stderr=stderrs.get(row.agent_id),
                 confirmation_composites=(
-                    tuple(values)
-                    if (values := _confirmation_composites(details)) is not None
+                    tuple(composite for _seed, composite in confirmations)
+                    if confirmations is not None
                     else None
                 ),
                 confirmation_seeds=(
-                    tuple(seeds)
-                    if (seeds := _confirmation_seeds(details)) is not None
+                    tuple(seed for seed, _composite in confirmations)
+                    if confirmations is not None
                     else None
                 ),
             )
@@ -959,16 +1013,17 @@ def _public_koth_emissions(
     projection = project_koth(fold_entries)
     if projection is None:
         return None
-    tail_share = (
-        (1.0 - KOTH_CHAMPION_SHARE) / len(projection.tail) if projection.tail else 0.0
-    )
+    recipient_shares = KOTH_RANK_SHARES[: 1 + len(projection.tail)]
+    share_total = sum(recipient_shares)
+    normalized_shares = tuple(share / share_total for share in recipient_shares)
     recipients = [
         PublicEmissionRecipient(
             role="champion",
             agent_id=projection.champion.agent_id,
             miner_hotkey=projection.champion.miner_hotkey,
             raw_rank=projection.champion.raw_rank,
-            share_of_miner_pool=KOTH_CHAMPION_SHARE,
+            share_of_miner_pool=normalized_shares[0],
+            shared_seed_confirmations=depths.get(projection.champion.agent_id, 0),
         )
     ]
     recipients.extend(
@@ -977,15 +1032,20 @@ def _public_koth_emissions(
             agent_id=entry.agent_id,
             miner_hotkey=entry.miner_hotkey,
             raw_rank=entry.raw_rank,
-            share_of_miner_pool=tail_share,
+            share_of_miner_pool=normalized_shares[index],
+            shared_seed_confirmations=depths.get(entry.agent_id, 0),
         )
-        for entry in projection.tail
+        for index, entry in enumerate(projection.tail, start=1)
     )
     decision = projection.raw_leader_decision
     return PublicKothEmissions(
         margin=KOTH_MARGIN,
         dethrone_z=KOTH_DETHRONE_Z,
+        band_decay_min_bench_version=KOTH_BAND_DECAY_MIN_BENCH_VERSION,
+        band_decay_start_composite=KOTH_BAND_DECAY_START_COMPOSITE,
+        band_decay_rate=KOTH_BAND_DECAY_RATE,
         champion_share=KOTH_CHAMPION_SHARE,
+        rank_shares=KOTH_RANK_SHARES,
         tail_size=KOTH_TAIL_SIZE,
         champion_agent_id=projection.champion.agent_id,
         champion_miner_hotkey=projection.champion.miner_hotkey,
@@ -1004,6 +1064,93 @@ def _public_koth_emissions(
             else None
         ),
         recipients=recipients,
+    )
+
+
+@router.get("/bench/timeline", response_model=PublicBenchmarkTimelineResponse)
+async def benchmark_timeline(
+    response: Response,
+    session: SessionDep,
+) -> PublicBenchmarkTimelineResponse:
+    """Running best finalized miner memory score across benchmark v2-v6."""
+
+    response.headers["Cache-Control"] = _TIMELINE_CACHE_CONTROL
+    version_docs = [
+        entry
+        for entry in bench_glossary_data.version_entries()
+        if 2 <= int(entry["version"]) <= 6
+    ]
+    rollout_rows = (
+        await session.execute(
+            select(
+                BenchmarkRollout.desired_version,
+                BenchmarkRollout.created_at,
+                BenchmarkRollout.activated_at,
+            )
+            .where(
+                BenchmarkRollout.desired_version.in_(
+                    [int(entry["version"]) for entry in version_docs]
+                ),
+                BenchmarkRollout.status == "activated",
+            )
+            .order_by(
+                BenchmarkRollout.desired_version,
+                BenchmarkRollout.created_at,
+            )
+        )
+    ).all()
+    rollout_by_version = {int(row.desired_version): row for row in rollout_rows}
+    releases = [
+        PublicBenchmarkRelease(
+            bench_version=int(entry["version"]),
+            released_at=(
+                _timeline_utc(rollout_by_version[int(entry["version"])].created_at)
+                if int(entry["version"]) in rollout_by_version
+                else datetime.combine(
+                    datetime.fromisoformat(str(entry["epoch"])).date(),
+                    datetime_time.min,
+                    tzinfo=UTC,
+                )
+            ),
+            activated_at=(
+                _timeline_utc(
+                    cast(
+                        datetime,
+                        rollout_by_version[int(entry["version"])].activated_at,
+                    )
+                )
+                if int(entry["version"]) in rollout_by_version
+                and rollout_by_version[int(entry["version"])].activated_at is not None
+                else None
+            ),
+            title=str(entry["title"]),
+        )
+        for entry in version_docs
+    ]
+    releases.sort(key=lambda entry: entry.bench_version)
+    released_at = {entry.bench_version: entry.released_at for entry in releases}
+    points = await list_memory_leader_timeline(
+        session,
+        bench_versions=[entry.bench_version for entry in releases],
+        not_before_by_version=released_at,
+    )
+    return PublicBenchmarkTimelineResponse(
+        generated_at=datetime.now(UTC),
+        score_quorum=SCORING_QUORUM,
+        releases=releases,
+        points=[
+            PublicBenchmarkTimelinePoint(
+                recorded_at=point.recorded_at,
+                bench_version=point.bench_version,
+                agent_id=point.agent_id,
+                agent_name=point.agent_name,
+                miner_hotkey=point.miner_hotkey,
+                memory_mean=point.memory_mean,
+                composite=point.composite,
+                score_count=point.score_count,
+            )
+            for point in points
+        ],
     )
 
 
@@ -1055,6 +1202,21 @@ async def leaderboard(
         for row in ledger_rows
         if score_counts.get(row.agent_id, 0) >= SCORING_QUORUM
     ]
+    finalized_ids = [row.agent_id for row in finalized_rows]
+    if bench_version is None:
+        confirmation_by_seed = await confirmation_composites_by_seed(
+            session,
+            agent_ids=finalized_ids,
+            bench_version=active_version,
+        )
+        confirmation_depth = await confirmation_depths(
+            session,
+            agent_ids=finalized_ids,
+            bench_version=active_version,
+        )
+    else:
+        confirmation_by_seed = {}
+        confirmation_depth = {}
     finalized_miners = {row.miner_hotkey for row in finalized_rows}
     provisional_candidates = [
         (row, score_counts.get(row.agent_id, 0))
@@ -1190,7 +1352,12 @@ async def leaderboard(
         emissions=(
             None
             if bench_version is not None
-            else _public_koth_emissions(finalized_rows, stderrs=fold_stderrs)
+            else _public_koth_emissions(
+                finalized_rows,
+                stderrs=fold_stderrs,
+                confirmation_by_seed=confirmation_by_seed,
+                confirmation_depth=confirmation_depth,
+            )
         ),
     )
 
@@ -1262,10 +1429,14 @@ def _validator_heartbeats_response(
     now: datetime,
 ) -> PublicValidatorHeartbeatsResponse:
     """Reconcile platform leases and signed heartbeat claims without conflating them."""
-    assignment_by_hotkey = {
-        assignment.ticket.validator_hotkey: assignment for assignment in assignments
-    }
-    active_by_hotkey = {work.heartbeat.validator_hotkey: work for work in active_work}
+    assignments_by_hotkey: dict[str, list[ActiveValidatorAssignment]] = {}
+    for assignment_row in assignments:
+        assignments_by_hotkey.setdefault(
+            assignment_row.ticket.validator_hotkey, []
+        ).append(assignment_row)
+    active_by_hotkey: dict[str, list[ActiveValidatorWork]] = {}
+    for work in active_work:
+        active_by_hotkey.setdefault(work.heartbeat.validator_hotkey, []).append(work)
     entries = []
     for row in rows:
         seen_at = cast(datetime, _aware(row.seen_at))
@@ -1273,8 +1444,34 @@ def _validator_heartbeats_response(
         online, availability, health = _fleet_classification(
             state=row.state, seen_at=seen_at, now=now, metrics=metrics
         )
-        assignment = assignment_by_hotkey.get(row.validator_hotkey)
-        synchronized_work = active_by_hotkey.get(row.validator_hotkey)
+        validator_assignments = assignments_by_hotkey.get(row.validator_hotkey, [])
+        synchronized_works = active_by_hotkey.get(row.validator_hotkey, [])
+        capacity = None
+        if row.protocol_version >= 10:
+            with contextlib.suppress(ValidationError):
+                capacity = BenchmarkCapacity.model_validate(row.benchmark_capacity)
+        if capacity is not None:
+            by_identity = {
+                (item.ticket.slot_id, item.agent.agent_id): item
+                for item in validator_assignments
+            }
+            synchronized_works = []
+            for slot in capacity.active:
+                item = by_identity.get((slot.slot_id, slot.agent_id))
+                if item is None or slot.progress.ticket_deadline != _aware(
+                    item.ticket.deadline
+                ):
+                    continue
+                synchronized_works.append(
+                    ActiveValidatorWork(
+                        heartbeat=row,
+                        ticket=item.ticket,
+                        agent=item.agent,
+                        progress=slot.progress,
+                    )
+                )
+        assignment = validator_assignments[0] if validator_assignments else None
+        synchronized_work = synchronized_works[0] if synchronized_works else None
         capabilities = None
         stack = None
         if row.protocol_version >= 7:
@@ -1328,6 +1525,25 @@ def _validator_heartbeats_response(
             if synchronized_work is not None
             else None
         )
+        active_benchmarks = [
+            _public_benchmark_progress(work, now) for work in synchronized_works
+        ]
+        active_benchmarks.sort(key=lambda progress: progress.slot_id)
+        active_by_slot = {work.ticket.slot_id: work for work in synchronized_works}
+        assigned_benchmarks = [
+            _public_benchmark_progress(
+                active_by_slot.get(item.ticket.slot_id)
+                or ActiveValidatorWork(
+                    heartbeat=row,
+                    ticket=item.ticket,
+                    agent=item.agent,
+                    progress=None,
+                ),
+                now,
+            )
+            for item in validator_assignments
+        ]
+        assigned_benchmarks.sort(key=lambda progress: progress.slot_id)
         entries.append(
             PublicValidatorHeartbeat(
                 validator_hotkey=row.validator_hotkey,
@@ -1348,6 +1564,11 @@ def _validator_heartbeats_response(
                     else None
                 ),
                 active_benchmark=active_benchmark,
+                configured_slots=(capacity.configured_slots if capacity else 1),
+                healthy_slots=(capacity.healthy_slots if capacity else ["slot-0"]),
+                admission=(capacity.admission if capacity else "accepting"),
+                active_benchmarks=active_benchmarks,
+                assigned_benchmarks=assigned_benchmarks,
                 first_seen_at=_aware(row.first_seen_at),
                 reported_at=cast(datetime, _aware(row.reported_at)),
                 seen_at=seen_at,
@@ -1652,6 +1873,7 @@ def _public_activity_status(
     score_count: int = 0,
     highest_composite: float | None = None,
     score_continuation_floor: float | None = None,
+    benchmark_admitted: bool = True,
 ) -> str:
     """Collapse internal moderation detail into stable public lifecycle labels."""
     needs_rescreen = (
@@ -1667,6 +1889,12 @@ def _public_activity_status(
     if status in (AgentStatus.UPLOADED, AgentStatus.SCREENING_FAILED) or needs_rescreen:
         return "waiting_screening"
     if status in (AgentStatus.SCREENING_PASSED, AgentStatus.EVALUATING):
+        if (
+            not benchmark_admitted
+            and not has_active_validation
+            and not has_live_assignment
+        ):
+            return "not_queued"
         if (
             status == AgentStatus.EVALUATING
             and not has_live_assignment
@@ -1695,6 +1923,8 @@ def _public_activity_response(
     query: str | None,
     score_continuation_floor: float | None,
     active_assignment_agent_ids: set[UUID],
+    active_bench_version: int | None = None,
+    benchmark_admitted_agent_ids: set[UUID] | None = None,
     retry_states: dict[UUID, AgentRetryState] | None = None,
     duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
     ath_review_opened_at: dict[UUID, datetime] | None = None,
@@ -1707,8 +1937,14 @@ def _public_activity_response(
         active_by_agent.setdefault(work.agent.agent_id, []).append(
             _public_benchmark_progress(work, now)
         )
-    active_agent_ids = set(active_by_agent)
+    active_agent_ids = {
+        work.agent.agent_id
+        for work in active_work
+        if active_bench_version is None
+        or work.ticket.bench_version == active_bench_version
+    }
     retry_by_agent = retry_states or {}
+    admitted = benchmark_admitted_agent_ids
 
     def public_status(row: Any) -> str:
         return _public_activity_status(
@@ -1720,6 +1956,7 @@ def _public_activity_response(
             score_count=row.score_count,
             highest_composite=row.highest_composite,
             score_continuation_floor=score_continuation_floor,
+            benchmark_admitted=(admitted is None or row.agent.agent_id in admitted),
         )
 
     projected = [(row, public_status(row)) for row in rows]
@@ -1841,12 +2078,14 @@ def _public_activity_response(
                 quorum=SCORING_QUORUM,
                 retry_state=(
                     retry_by_agent[row.agent.agent_id].state
-                    if row.agent.agent_id in retry_by_agent
+                    if row_status in ("waiting_validator", "below_score_floor")
+                    and row.agent.agent_id in retry_by_agent
                     else None
                 ),
                 retry_after=(
                     retry_by_agent[row.agent.agent_id].earliest_retry_after
-                    if row.agent.agent_id in retry_by_agent
+                    if row_status in ("waiting_validator", "below_score_floor")
+                    and row.agent.agent_id in retry_by_agent
                     else None
                 ),
                 screening_policy_version=row.agent.screening_policy_version,
@@ -1963,6 +2202,11 @@ async def activity(
     now = datetime.now(UTC)
     active_version = await active_bench_version(session)
     rows, _ = await list_public_activity(session, bench_version=active_version)
+    admitted = await admitted_agent_ids(
+        session,
+        bench_version=active_version,
+        agent_ids=[row.agent.agent_id for row in rows],
+    )
     ath_opened_at: dict[UUID, datetime] = {}
     ath_composite: dict[UUID, float] = {}
     if review == "ath":
@@ -1982,8 +2226,12 @@ async def activity(
             session, bench_version=active_version
         ),
         active_assignment_agent_ids={
-            assignment.agent.agent_id for assignment in assignments
+            assignment.agent.agent_id
+            for assignment in assignments
+            if assignment.ticket.bench_version == active_version
         },
+        active_bench_version=active_version,
+        benchmark_admitted_agent_ids=admitted,
         retry_states=await classify_agent_retry_states(
             session, agents=[row.agent for row in rows], now=now
         ),
@@ -2007,6 +2255,11 @@ async def operations(
     benchmark_rollout = await rollout_state(session, now=now)
     active_version = cast(int, benchmark_rollout["active_version"])
     activity_rows, _ = await list_public_activity(session, bench_version=active_version)
+    admitted = await admitted_agent_ids(
+        session,
+        bench_version=active_version,
+        agent_ids=[row.agent.agent_id for row in activity_rows],
+    )
     heartbeat_rows = await list_validator_heartbeats(session)
     assignments = await list_active_validator_assignments(session, now=now)
     active_work = await list_active_validator_work(
@@ -2024,8 +2277,12 @@ async def operations(
             session, bench_version=active_version
         ),
         active_assignment_agent_ids={
-            assignment.agent.agent_id for assignment in assignments
+            assignment.agent.agent_id
+            for assignment in assignments
+            if assignment.ticket.bench_version == active_version
         },
+        active_bench_version=active_version,
+        benchmark_admitted_agent_ids=admitted,
         retry_states=await classify_agent_retry_states(
             session, agents=[row.agent for row in activity_rows], now=now
         ),
@@ -2216,6 +2473,18 @@ async def agent_pipeline(
     canonical_scores = [
         score for score in accepted_scores if score.bench_version == canonical_version
     ]
+    confirmation_scores = list(
+        await session.scalars(
+            select(ConfirmationScore)
+            .where(ConfirmationScore.agent_id == agent_id)
+            .order_by(
+                ConfirmationScore.bench_version,
+                ConfirmationScore.created_at,
+                ConfirmationScore.validator_hotkey,
+                ConfirmationScore.seed,
+            )
+        )
+    )
     # Dataset provenance is PER BENCH VERSION. The agent row carries only the
     # version it was first pinned at, so pairing every score with it published the
     # v2 digest alongside a v3 score -- next to a verification_command that
@@ -2241,6 +2510,9 @@ async def agent_pipeline(
     score_continuation_floor = await get_score_continuation_floor(
         session, bench_version=canonical_version
     )
+    benchmark_admitted = await agent_is_admitted(
+        session, bench_version=canonical_version, agent_id=agent_id
+    )
     dispute = await session.scalar(
         select(ScreeningDispute).where(ScreeningDispute.agent_id == agent_id)
     )
@@ -2251,9 +2523,12 @@ async def agent_pipeline(
             agent.status,
             screening_policy_version=agent.screening_policy_version,
             has_active_attempt=running_attempt is not None,
-            has_active_validation=bool(active_work),
+            has_active_validation=any(
+                work.ticket.bench_version == canonical_version for work in active_work
+            ),
             has_live_assignment=any(
                 ticket.status == TicketStatus.ISSUED
+                and ticket.bench_version == canonical_version
                 and cast(datetime, _aware(ticket.deadline)) > now
                 for ticket in tickets
             ),
@@ -2264,6 +2539,7 @@ async def agent_pipeline(
                 else None
             ),
             score_continuation_floor=score_continuation_floor,
+            benchmark_admitted=benchmark_admitted,
         ),
         active_bench_version=canonical_version,
         score_count=len(canonical_scores),
@@ -2333,6 +2609,16 @@ async def agent_pipeline(
             )
             for score in accepted_scores
         ],
+        confirmation_scores=[
+            PublicConfirmationScore(
+                composite=score.composite,
+                seed=str(score.seed),
+                validator_hotkey=score.validator_hotkey,
+                bench_version=score.bench_version,
+                accepted_at=score.created_at,
+            )
+            for score in confirmation_scores
+        ],
         final_composite=(
             statistics.median(score.composite for score in canonical_scores)
             if len(canonical_scores) >= SCORING_QUORUM
@@ -2367,6 +2653,7 @@ async def agent_pipeline(
             PublicValidationAttempt(
                 validator_hotkey=ticket.validator_hotkey,
                 status=ticket.status.value,
+                purpose=ticket.purpose,
                 issued_at=ticket.issued_at,
                 deadline=ticket.deadline,
                 bench_version=ticket.bench_version,
@@ -2383,6 +2670,11 @@ async def agent_pipeline(
                     in active_by_ticket
                     else None
                 ),
+                failure_reason=cast(
+                    Literal["infrastructure", "scoring_error", "sandbox_oom"] | None,
+                    ticket.failure_reason,
+                ),
+                failed_at=ticket.failed_at,
             )
             for ticket in tickets
         ],
@@ -2600,15 +2892,27 @@ async def bench_corpus(
 
 
 @router.get("/bench/config", response_model=PublicBenchConfigResponse)
-async def bench_config(response: Response) -> PublicBenchConfigResponse:
-    """The current benchmark setup: frozen model, judge-free grading, seeds.
+async def bench_config(
+    response: Response, session: SessionDep
+) -> PublicBenchConfigResponse:
+    """The active or operator-selected benchmark setup.
 
     The harness model is a consensus parameter: every scoring validator runs
     the same frozen open-weight artifact through a model-pinning gateway, so
-    model choice is not a miner lever and k=3 scores are comparable. The
-    ``BENCH_*`` env overrides exist for coordinated fleet bumps only.
+    model choice is not a miner lever and k=3 scores are comparable. Shipping
+    support for a future contract does not publish it here: the Backroom rollout
+    target selects it. The ``BENCH_*`` env overrides exist for coordinated fleet
+    bumps only.
     """
     response.headers["Cache-Control"] = "public, max-age=300"
+    active_version = await active_bench_version(session)
+    rollout = await open_rollout(session)
+    desired_version = rollout.desired_version if rollout is not None else None
+    v7_or_newer = active_version >= 7
+    default_model = "openai/gpt-oss-20b" if v7_or_newer else "qwen/qwen3-32b"
+    default_serving = (
+        "OpenRouter dynamic provider route" if v7_or_newer else "Qwen/Qwen3-32B-TEE"
+    )
     public_bucket = os.environ.get("STORAGE_PUBLIC_BUCKET", "")
     mirror = (
         f"https://storage.googleapis.com/{public_bucket}/scored/{{agent_id}}.json"
@@ -2621,16 +2925,30 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
         else None
     )
     return PublicBenchConfigResponse(
-        bench_version=CURRENT_BENCH_VERSION,
+        bench_version=active_version,
+        desired_bench_version=desired_version,
         harness=BenchHarnessConfig(
             locked=True,
-            canonical_id=os.environ.get("BENCH_HARNESS_MODEL_ID", "qwen/qwen3-32b"),
-            serving=os.environ.get("BENCH_HARNESS_SERVING", "Qwen/Qwen3-32B-TEE"),
-            thinking=os.environ.get("BENCH_HARNESS_THINKING", "false") == "true",
+            canonical_id=os.environ.get("BENCH_HARNESS_MODEL_ID", default_model),
+            serving=os.environ.get("BENCH_HARNESS_SERVING", default_serving),
+            thinking=(
+                True
+                if v7_or_newer
+                else os.environ.get("BENCH_HARNESS_THINKING", "false") == "true"
+            ),
+            reasoning_effort="medium" if v7_or_newer else None,
             enforcement=(
-                "model-pinning relay forces the model field and holds the "
-                "upstream key outside the sandbox; sandbox egress is deny-all "
-                "(no other model is reachable)"
+                (
+                    "ticket-scoped platform proxy forces the model and medium "
+                    "reasoning effort and holds the upstream key outside the "
+                    "sandbox; sandbox egress is deny-all"
+                )
+                if v7_or_newer
+                else (
+                    "model-pinning relay forces the model field and holds the "
+                    "upstream key outside the sandbox; sandbox egress is deny-all "
+                    "(no other model is reachable)"
+                )
             ),
         ),
         grading=BenchGradingConfig(

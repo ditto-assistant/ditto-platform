@@ -19,6 +19,7 @@ from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.retry_state import RetryState
 from ditto.api_models.screener import ScreenerProgressStage, ScreenerRuntimeState
 from ditto.api_models.stack_health import ValidatorStackHealth
+from ditto.api_models.ticket_status import TicketPurpose
 from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
@@ -27,6 +28,38 @@ from ditto.api_models.validator_capabilities import (
 
 _SS58_PATTERN = r"^[1-9A-HJ-NP-Za-km-z]{47,48}$"
 _SIGNATURE_HEX_PATTERN = r"^[0-9a-fA-F]{128}$"
+
+
+class PublicBenchmarkRelease(BaseModel):
+    """One immutable DittoBench contract release shown on the timeline."""
+
+    bench_version: Annotated[int, Field(ge=1)]
+    released_at: datetime
+    activated_at: datetime | None = None
+    title: str
+
+
+class PublicBenchmarkTimelinePoint(BaseModel):
+    """A new best finalized miner memory median within one benchmark era."""
+
+    recorded_at: datetime
+    bench_version: Annotated[int, Field(ge=1)]
+    agent_id: UUID
+    agent_name: str
+    miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    memory_mean: Annotated[float, Field(ge=0.0, le=1.0)]
+    composite: Annotated[float, Field(gt=0.0, le=1.0)]
+    score_count: Annotated[int, Field(ge=3)]
+
+
+class PublicBenchmarkTimelineResponse(BaseModel):
+    """Historical top-miner memory progress and benchmark release events."""
+
+    generated_at: datetime
+    metric: Literal["memory_mean"] = "memory_mean"
+    score_quorum: Annotated[int, Field(ge=1)]
+    releases: list[PublicBenchmarkRelease]
+    points: list[PublicBenchmarkTimelinePoint]
 
 
 class PublicCategoryStat(BaseModel):
@@ -621,6 +654,20 @@ class PublicEmissionRecipient(BaseModel):
             ),
         ),
     ]
+    shared_seed_confirmations: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description=(
+                "Shared-seed confirmation depth: distinct champion-anchored CRN "
+                "seeds this top-5 agent has been re-scored on by the continual "
+                "top-5 rescore lane. Grows while the agent holds its emission-set "
+                "spot; a longer-reigning champion accumulates more, and its median "
+                "band widens accordingly. Zero until the lane has run."
+            ),
+        ),
+    ] = 0
 
 
 class PublicDethroneDecision(BaseModel):
@@ -637,9 +684,35 @@ class PublicDethroneDecision(BaseModel):
 class PublicKothEmissions(BaseModel):
     """Current read-only projection of the validator's KOTH weight fold."""
 
-    margin: Annotated[float, Field(ge=0.0, le=1.0)]
+    margin: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Base composite-point lead before versioned high-score band scaling."
+            ),
+        ),
+    ]
     dethrone_z: Annotated[float, Field(ge=0.0)]
+    band_decay_min_bench_version: Annotated[
+        int,
+        Field(ge=1, description="First benchmark version using high-score decay."),
+    ]
+    band_decay_start_composite: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Incumbent composite above which the band begins shrinking.",
+        ),
+    ]
+    band_decay_rate: Annotated[
+        float,
+        Field(gt=0.0, description="Exponential high-score band decay rate."),
+    ]
     champion_share: Annotated[float, Field(gt=0.0, le=1.0)]
+    rank_shares: tuple[Annotated[float, Field(gt=0.0, le=1.0)], ...]
     tail_size: Annotated[int, Field(ge=0)]
     champion_agent_id: UUID
     champion_miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
@@ -1021,6 +1094,7 @@ class PublicBenchmarkProgress(BaseModel):
     """Ticket-validated and coarsened public benchmark progress allowlist."""
 
     agent_id: UUID
+    slot_id: str = "slot-0"
     agent_name: str
     bench_version: Annotated[
         int, Field(ge=1, description="DittoBench contract bound to this ticket.")
@@ -1299,15 +1373,36 @@ class CreateScreeningDisputeResponse(BaseModel):
 
 
 class PublicValidationAttempt(BaseModel):
-    """One validator ticket contributing toward the three-score quorum."""
+    """One validator ticket for either quorum scoring or continual retesting."""
 
     validator_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
     status: Annotated[str, Field(pattern=r"^(issued|scored|expired)$")]
+    purpose: TicketPurpose = TicketPurpose.LEGACY_UNCLASSIFIED
     issued_at: datetime
     deadline: datetime
     bench_version: Annotated[int, Field(ge=1)]
     actively_running: bool = False
     benchmark_progress: PublicBenchmarkProgress | None = None
+    failure_reason: Literal["infrastructure", "scoring_error", "sandbox_oom"] | None = (
+        None
+    )
+    failed_at: datetime | None = None
+
+
+class PublicConfirmationScore(BaseModel):
+    """One append-only shared-seed score from a continual top-five retest."""
+
+    composite: Annotated[float, Field(ge=0.0, le=1.0)]
+    seed: Annotated[
+        str,
+        Field(
+            pattern=r"^\d+$",
+            description="Exact decimal shared seed, encoded without JS rounding.",
+        ),
+    ]
+    validator_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    bench_version: Annotated[int, Field(ge=1)]
+    accepted_at: datetime
 
 
 class PublicProvisionalScore(BaseModel):
@@ -1457,6 +1552,7 @@ class PublicSubmissionPipeline(BaseModel):
         ),
     ]
     provisional_scores: list[PublicProvisionalScore] = Field(default_factory=list)
+    confirmation_scores: list[PublicConfirmationScore] = Field(default_factory=list)
     final_composite: Annotated[
         float | None,
         Field(
@@ -1752,6 +1848,11 @@ class PublicValidatorHeartbeat(BaseModel):
     assignment_state: ValidatorAssignmentState
     active_agent_id: UUID | None = None
     active_benchmark: PublicBenchmarkProgress | None = None
+    configured_slots: Annotated[int, Field(ge=1, le=8)] = 1
+    healthy_slots: list[str] = Field(default_factory=lambda: ["slot-0"])
+    admission: Literal["accepting", "draining", "paused"] = "accepting"
+    active_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
+    assigned_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
     first_seen_at: datetime | None = None
     reported_at: datetime
     seen_at: datetime
@@ -1874,10 +1975,20 @@ class BenchHarnessConfig(BaseModel):
         description="Canonical locked model id (docs + score reports)."
     )
     serving: str = Field(
-        description="The exact served artifact (fleet standard: Chutes TEE)."
+        description=(
+            "The serving route for the locked model; providers may be selected "
+            "dynamically."
+        )
     )
     thinking: bool = Field(
-        description="Locked hybrid-reasoning mode; false fleet-wide."
+        description="Whether the benchmark model's locked reasoning mode is enabled."
+    )
+    reasoning_effort: Literal["low", "medium", "high"] | None = Field(
+        default=None,
+        description=(
+            "Locked provider-independent reasoning effort, or null when reasoning "
+            "is disabled for the benchmark version."
+        ),
     )
     enforcement: str = Field(description="How the lock is enforced around the sandbox.")
 
@@ -1939,7 +2050,7 @@ class PublicBenchVersionDoc(BaseModel):
     """What one immutable bench_version is and what it changed vs the previous one."""
 
     version: int
-    epoch: Annotated[str, Field(description="Dataset reference date (YYYY-MM-DD).")]
+    epoch: Annotated[str, Field(description="Contract publication date (YYYY-MM-DD).")]
     title: Annotated[str, Field(description="Short name of the release.")]
     summary: Annotated[
         str, Field(description="One-paragraph description of the version.")
@@ -1982,6 +2093,13 @@ class PublicBenchConfigResponse(BaseModel):
     """
 
     bench_version: int
+    desired_bench_version: int | None = Field(
+        default=None,
+        description=(
+            "A newer contract currently collecting qualification scores, or null. "
+            "bench_version and harness always describe the active scoring authority."
+        ),
+    )
     harness: BenchHarnessConfig
     grading: BenchGradingConfig
     dataset: BenchDatasetConfig

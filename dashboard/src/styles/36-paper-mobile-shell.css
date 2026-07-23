@@ -1,0 +1,119 @@
+/* Narrow viewports: the rail becomes a top bar. Row 1 is the brand plus the
+       compact Refresh/telemetry footer; the nav is a horizontal scroll strip;
+       the theme switch sits after the nav (never above it) as a compact row. */
+@media (max-width: 960px) {
+  .layout {
+    display: block;
+    overflow-x: clip;
+  }
+  .board {
+    overflow-x: auto;
+  }
+  /* Keep the sticky shell above page content and search results, but below
+         the modal backdrop (40) and dialog (50). */
+  .sidebar {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    height: auto;
+    flex: none;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    padding: 12px 16px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .sidebar .brand {
+    flex: 1 1 auto;
+    min-width: 0;
+    order: 0;
+    padding: 0;
+  }
+  .sidebar .brand .mark {
+    width: 34px;
+    height: 34px;
+  }
+  /* Footer moves onto row 1, right of the brand: Refresh plus compact
+         telemetry and GitHub source links. */
+  .side-foot {
+    order: 1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    margin-top: 0;
+  }
+  .side-foot .btn {
+    min-height: 34px;
+  }
+  #wandb-link,
+  #github-link {
+    padding-inline: 9px;
+  }
+  #wandb-link .btn-label,
+  #github-link .btn-label {
+    display: none;
+  }
+  .nav {
+    order: 2;
+    flex-basis: 100%;
+    width: 100%;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    gap: 4px;
+    margin-top: 2px;
+  }
+  .nav-item {
+    flex: 0 0 auto;
+    padding: 7px 11px;
+    border-radius: 8px;
+  }
+  .nav-item .ni-desc {
+    display: none;
+  }
+  /* After the nav, full-width, so its buttons sit on their own compact row. */
+  .side-theme {
+    order: 3;
+    flex: 1 0 100%;
+    width: 100%;
+    min-width: 0;
+    margin-top: 0;
+  }
+  .side-theme .theme-switch {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    width: 100%;
+  }
+}
+@media (max-width: 720px) {
+  /* Keep the four theme options in one compact row (36px targets) rather than
+         a tall full-width 2x2 grid, and drop the long brand subtitle. */
+  .side-theme .theme-option {
+    min-height: 36px;
+    padding: 6px;
+  }
+  .sidebar .brand .sub {
+    display: none;
+  }
+  .ath-intro,
+  .ath-review-main {
+    grid-template-columns: 1fr;
+  }
+  .ath-metrics {
+    grid-template-columns: 1fr;
+  }
+  .ath-metric {
+    min-height: 68px;
+  }
+  .ath-review-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .ath-hold-reason {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}

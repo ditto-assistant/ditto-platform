@@ -28,7 +28,9 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_capacity import BenchmarkCapacity
 from ditto.api_models.benchmark_progress import BenchmarkProgress
+from ditto.api_models.inference import InferenceGrantOffer
 from ditto.api_models.stack_health import ValidatorStackHealth
 from ditto.api_models.system_health import SystemMetrics
 from ditto.api_models.upload import (
@@ -131,6 +133,7 @@ class JobRequest(BaseModel):
     validator_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Claiming validator hotkey.")
     ]
+    slot_id: Annotated[str | None, Field(pattern=r"^slot-[0-7]$")] = None
     nonce: Annotated[UUID, Field(description="One-time claim nonce.")]
     requested_at: Annotated[
         datetime, Field(description="UTC time at which the claim was signed.")
@@ -151,6 +154,55 @@ class JobRequest(BaseModel):
         return value
 
 
+class Top5ConfirmationJobRequest(BaseModel):
+    """Fresh signed claim for a member of the top-5 shared-seed rescore lane.
+
+    Covers the whole emission set (champion + participation tail). The
+    validator claims one ticket per set member it wants to rescore this round,
+    each anchored to the current champion so the platform can rebuild the same
+    emission set and validate that ``member_agent_id`` is either the champion or
+    a current tail entrant, and that ``champion_agent_id`` is the reigning
+    incumbent (the CRN seed anchor both sides derive identically).
+    """
+
+    validator_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Claiming validator hotkey.")
+    ]
+    champion_agent_id: Annotated[
+        UUID, Field(description="Current KOTH incumbent (the CRN seed anchor).")
+    ]
+    member_agent_id: Annotated[
+        UUID,
+        Field(description="Emission-set member (champion or tail) to rescore."),
+    ]
+    nonce: Annotated[UUID, Field(description="One-time claim nonce.")]
+    requested_at: Annotated[
+        datetime, Field(description="UTC time at which the claim was signed.")
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            pattern=_SIGNATURE_HEX_PATTERN,
+            description="sr25519 signature over the canonical top-5 claim.",
+        ),
+    ]
+
+    @field_validator("requested_at")
+    @classmethod
+    def requested_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("requested_at must include a timezone")
+        return value
+
+
+class ConfirmationDatasetPin(BaseModel):
+    """One platform-generated dataset used by a continual confirmation lease."""
+
+    seed: Annotated[int, Field(ge=0)]
+    dataset_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    run_size: Annotated[str, Field(min_length=1)]
+
+
 class JobResponse(BaseModel):
     """Returned by ``POST /validator/job`` when a ticket is issued.
 
@@ -158,13 +210,14 @@ class JobResponse(BaseModel):
     the platform issues at most three per agent (the k=3 pool) and answers 204
     (no body) when there is no work. The validator fetches the tarball via
     ``/artifact`` and scores it against the platform-pinned dataset: ``seed`` +
-    ``dataset_sha256`` identify the exact dataset all k=3 validators score (the
-    scoring API regenerates it from ``seed`` and rejects a hash mismatch), and
+    ``dataset_sha256`` identify the exact dataset for this validator's quorum
+    run (the scoring API regenerates it and rejects a hash mismatch), and
     ``run_size`` is the generator profile to use. These are null only for agents
     promoted before the data-pipeline split, or when generation is disabled.
     """
 
     agent_id: Annotated[UUID, Field(description="Agent this ticket is for.")]
+    slot_id: Annotated[str, Field(pattern=r"^slot-[0-7]$")] = "slot-0"
     miner_hotkey: Annotated[str, Field(description="Submitting miner's SS58 hotkey.")]
     sha256: Annotated[
         str, Field(description="SHA-256 of the uploaded tarball, lowercase hex.")
@@ -177,11 +230,16 @@ class JobResponse(BaseModel):
         int | None,
         Field(
             default=None,
-            description="Platform-pinned dataset seed all k=3 validators score "
-            "against (regenerable, comparable). Null if unset (pre-split / "
-            "generation disabled).",
+            description="Post-commit block-derived dataset seed for this "
+            "validator's quorum run. Distinct validator hotkeys receive distinct "
+            "seeds; retries by the same validator retain the same seed.",
         ),
     ] = None
+    seed_scope: Literal["agent", "validator"] = Field(
+        default="agent",
+        description="Inputs used by the on-chain seed derivation. Validator "
+        "scope additionally binds the ticket holder's hotkey.",
+    )
     dataset_sha256: Annotated[
         str | None,
         Field(
@@ -210,7 +268,8 @@ class JobResponse(BaseModel):
         Field(
             default=None,
             description="Hash of ``dataset_seed_block``. Lets the validator "
-            "independently re-derive ``seed = derive_seed(block_hash, agent_id)`` "
+            "independently re-derive ``seed = derive_validator_seed(block_hash, "
+            "agent_id, validator_hotkey)`` "
             "and refuse a ticket whose seed the platform could have chosen "
             "(anti-grind, prod hardening P2). Null for pre-derivation agents.",
         ),
@@ -227,6 +286,11 @@ class JobResponse(BaseModel):
         int | None, Field(default=None, ge=0)
     ] = None
     requires_screened_image: bool | None = None
+    confirmation_datasets: list[ConfirmationDatasetPin] = Field(
+        default_factory=list,
+        description="Exact shared-seed datasets pinned for a continual retest lease.",
+    )
+    inference: InferenceGrantOffer | None = None
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -246,6 +310,7 @@ class JobResponse(BaseModel):
 FailJobReason = Literal[
     "infrastructure",
     "scoring_error",
+    "sandbox_oom",
 ]
 """Coarse reason a validator hands a leased ticket back for reissue.
 
@@ -254,10 +319,13 @@ branches on it: ``infrastructure`` earns a bounded compensating grant plus an
 escalating cooldown, so a validator-side outage neither spends the agent's
 genuine attempt budget nor hammers the failing provider; ``scoring_error`` is
 the agent's own failure and consumes an attempt with an immediate reissue.
-``infrastructure`` maps to the validator's ``ValidatorInfrastructureError``
-sweep-ending branch; ``scoring_error`` maps to its ``DittobenchError`` /
-``PlatformError`` scoring-failure branch. These values are the wire contract
-shared verbatim with ditto-subnet (which emits them).
+``sandbox_oom`` is an observed sandbox memory exhaustion: it consumes the
+failed attempt, records a public-safe telemetry signal, and applies the normal
+agent-failure cooldown so another eligible harness runs next. ``infrastructure``
+maps to the validator's ``ValidatorInfrastructureError`` sweep-ending branch;
+``scoring_error`` maps to other ``DittobenchError`` scoring failures. These
+values are the wire contract shared verbatim with ditto-subnet (which emits
+them).
 """
 
 
@@ -398,6 +466,15 @@ class ValidatorHeartbeatRequest(BaseModel):
             description="Signed per-component runtime health under v9.",
         ),
     ] = None
+    benchmark_capacity: Annotated[
+        BenchmarkCapacity | None,
+        Field(
+            default=None,
+            description=(
+                "Signed bounded slot capacity and progress under protocols v10-v11."
+            ),
+        ),
+    ] = None
     timestamp: Annotated[
         int, Field(ge=0, description="Validator-reported Unix timestamp (UTC).")
     ]
@@ -436,6 +513,59 @@ class ValidatorHeartbeatRequest(BaseModel):
             raise ValueError(
                 "per-component stack health requires heartbeat protocol v9"
             )
+        if self.protocol_version >= 10:
+            if self.benchmark_capacity is None:
+                raise ValueError("heartbeat protocol v10 requires benchmark capacity")
+            primary = (
+                sorted(self.benchmark_capacity.active, key=lambda slot: slot.slot_id)[0]
+                if self.benchmark_capacity.active
+                else None
+            )
+            if primary is None:
+                if (
+                    self.active_agent_id is not None
+                    or self.benchmark_progress is not None
+                ):
+                    raise ValueError(
+                        "idle v10 capacity cannot carry legacy active work"
+                    )
+            elif (
+                self.state != "running_benchmark"
+                or self.active_agent_id != primary.agent_id
+                or self.benchmark_progress != primary.progress
+            ):
+                raise ValueError(
+                    "v10 legacy active fields must mirror the first active slot"
+                )
+            if (
+                self.protocol_version >= 11
+                and self.capabilities is not None
+                and self.capabilities.scorer_benchmarks is not None
+                and 7 in self.capabilities.scorer_benchmarks.supported_bench_versions
+                and (
+                    not self.capabilities.ticket_inference
+                    or self.capabilities.scorer_benchmarks.v7_calibration is None
+                )
+            ):
+                raise ValueError(
+                    "heartbeat v11 requires exact v7 inference calibration identity"
+                )
+            if self.protocol_version >= 12 and (
+                self.capabilities is None or not self.capabilities.signed_score_quorum
+            ):
+                raise ValueError(
+                    "heartbeat v12 requires signed score quorum verification"
+                )
+            if (
+                self.capabilities is not None
+                and self.capabilities.signed_score_quorum
+                and self.protocol_version < 12
+            ):
+                raise ValueError(
+                    "signed score quorum verification requires heartbeat protocol v12"
+                )
+        elif self.benchmark_capacity is not None:
+            raise ValueError("benchmark capacity requires heartbeat protocol v10")
         return self
 
 
@@ -805,6 +935,60 @@ class SubmitScoreRequest(BaseModel):
     )
 
 
+class ConfirmationScoreRecord(BaseModel):
+    """One append-only shared-seed confirmation score for a top-5 agent.
+
+    Each row is one ``(validator_hotkey, bench_version, seed)`` confirmation the
+    continual top-5 rescore lane produced for this agent (immutable,
+    INSERT-idempotent on the platform's ``ConfirmationScore`` ledger — never
+    updated). The KOTH fold groups these by ``seed`` to reconstruct the agent's
+    per-seed composite map (paired lower-median), so a longer-reigning champion
+    simply accumulates more rows and its band widens. Mirrors the shape of a
+    signed score receipt (``seed`` + ``composite`` + the producing validator);
+    the exact platform exposure is reconciled against ditto-platform #280.
+    """
+
+    seed: Annotated[int, Field(ge=0, description="Champion-anchored CRN seed.")]
+    composite: Annotated[
+        float, Field(ge=0.0, le=1.0, description="Composite scored on this seed.")
+    ]
+    validator_hotkey: Annotated[
+        str, Field(description="SS58 hotkey of the validator that scored this seed.")
+    ]
+    bench_version: Annotated[
+        int,
+        Field(ge=1, description="Major bench version the seed family is scoped to."),
+    ]
+    signature: Annotated[
+        str | None,
+        Field(
+            default=None, description="Validator's hex sr25519 signature, if stored."
+        ),
+    ] = None
+
+
+class LedgerScoreProof(BaseModel):
+    """One validator-signed score receipt backing a ledger median."""
+
+    validator_hotkey: Annotated[str, Field(description="Scoring validator hotkey.")]
+    run_id: Annotated[str, Field(description="Signature-bound scoring run id.")]
+    composite: Annotated[float, Field(ge=0.0, le=1.0)]
+    seed: int
+    bench_version: Annotated[int | None, Field(default=None, ge=1)] = None
+    ticket_deadline: Annotated[
+        datetime | None,
+        Field(default=None, description="Signature-bound ticket lease deadline."),
+    ] = None
+    transcript_sha256: Annotated[
+        str | None,
+        Field(default=None, description="Signature-bound transcript digest."),
+    ] = None
+    signature: Annotated[
+        str | None,
+        Field(default=None, description="Hex sr25519 signature for this receipt."),
+    ] = None
+
+
 class LedgerEntry(BaseModel):
     """One miner's best eligible score, returned by ``GET /scoring/scores``.
 
@@ -874,6 +1058,16 @@ class LedgerEntry(BaseModel):
             description="Validator's hex sr25519 signature, if stored.",
         ),
     ]
+    score_proofs: Annotated[
+        list[LedgerScoreProof],
+        Field(
+            default_factory=list,
+            description=(
+                "All validator-signed receipts backing the platform median. "
+                "Validators verify these independently before folding weights."
+            ),
+        ),
+    ]
     composite_stderr: Annotated[
         float | None,
         Field(
@@ -884,7 +1078,7 @@ class LedgerEntry(BaseModel):
                 "score report carried one. The validator's KOTH fold uses it for "
                 "the measurement-uncertainty indifference band (dethrone only when "
                 "a challenger's lead exceeds z*sqrt(se_c^2 + se_champ^2)); absent "
-                "means the fold falls back to the flat relative margin. "
+                "means the fold falls back to the fixed composite-point margin. "
                 "Additive-optional, mirroring bench_version."
             ),
         ),
@@ -918,6 +1112,22 @@ class LedgerEntry(BaseModel):
             ),
         ),
     ]
+    confirmation_history: Annotated[
+        list[ConfirmationScoreRecord] | None,
+        Field(
+            default=None,
+            description=(
+                "Append-only shared-seed confirmation scores for this agent from "
+                "the continual top-5 rescore lane (ditto-platform #280), one row "
+                "per ``(validator_hotkey, bench_version, seed)`` — immutable and "
+                "accumulating over the agent's reign. Supersedes the in-row "
+                "``confirmation_composites``/``confirmation_seeds`` arrays as the "
+                "fold's paired-evidence source: the KOTH fold groups these by "
+                "seed. Additive-optional: absent means the fold falls back to the "
+                "legacy in-row arrays (then the unpaired band)."
+            ),
+        ),
+    ] = None
     status: Annotated[
         AgentStatus, Field(description="Agent lifecycle state (always ``scored``).")
     ]

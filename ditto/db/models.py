@@ -8,6 +8,7 @@ hydrate into typed objects. Models and migrations must stay in sync.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import (
@@ -21,6 +22,7 @@ from sqlalchemy import (
     Index,
     Integer,
     MetaData,
+    Numeric,
     PrimaryKeyConstraint,
     Text,
     UniqueConstraint,
@@ -35,7 +37,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TIMESTAMP
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 
 # Per-case detail is a JSON blob: JSONB on Postgres (indexable, compact),
 # plain JSON on the SQLite unit-test fallback. The variant keeps one model
@@ -346,6 +348,7 @@ class ScreenedImageUpload(Base):
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
+
     expires_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )
@@ -695,10 +698,12 @@ class EvaluationPayment(Base):
 
     The composite primary key ``(block_hash, extrinsic_index)`` is the
     replay-protection mechanism: the same on-chain payment proof cannot
-    be inserted twice. ``UNIQUE (agent_id)`` enforces the 1:1 invariant
-    (one upload = one payment). The composite FK on
-    ``(agent_id, miner_hotkey)`` documents the ownership invariant in
-    DDL so future endpoints can't silently break it.
+    be inserted twice. An assigned row has ``agent_id`` set; a payment made for
+    an accidental byte-identical upload instead has ``credit_for_agent_id`` set
+    until it is atomically consumed by a different artifact. The XOR constraint
+    makes those states exclusive. ``UNIQUE (agent_id)`` preserves one payment
+    per evaluated upload, while the composite FK on ``(agent_id, miner_hotkey)``
+    documents the ownership invariant in DDL.
     """
 
     __tablename__ = "evaluation_payments"
@@ -709,8 +714,18 @@ class EvaluationPayment(Base):
     extrinsic_index: Mapped[int] = mapped_column(Integer, nullable=False)
     """Zero-based index of the extrinsic within the block. PK part 2."""
 
-    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
-    """FK to ``agents.agent_id``. The agent this payment funds. ``UNIQUE``."""
+    agent_id: Mapped[UUID | None] = mapped_column(SaUUID(as_uuid=True), nullable=True)
+    """FK to ``agents.agent_id`` when the payment has funded an evaluation.
+
+    ``NULL`` means the payment is a reusable credit created after an accidental
+    byte-identical upload. The proof remains replay-protected by this row and is
+    atomically assigned when the miner submits a different artifact.
+    """
+
+    credit_for_agent_id: Mapped[UUID | None] = mapped_column(
+        SaUUID(as_uuid=True), nullable=True
+    )
+    """Earlier same-owner agent whose identical artifact created this credit."""
 
     miner_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
     """Signer hotkey on the payment extrinsic. FK-bound to ``agents.miner_hotkey``."""
@@ -720,6 +735,9 @@ class EvaluationPayment(Base):
 
     amount_rao: Mapped[int] = mapped_column(BigInteger, nullable=False)
     """Payment amount in rao (1 TAO = 1e9 rao)."""
+
+    tao_usd_rate: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    """TAO/USD oracle rate used at verification; null only for legacy rows."""
 
     dest_address: Mapped[str] = mapped_column(Text, nullable=False)
     """SS58 address that received the payment."""
@@ -747,12 +765,31 @@ class EvaluationPayment(Base):
             ondelete="RESTRICT",
             name="evaluation_payments_agent_id_miner_hotkey_fkey",
         ),
+        ForeignKeyConstraint(
+            ["credit_for_agent_id"],
+            ["agents.agent_id"],
+            ondelete="RESTRICT",
+            name="evaluation_payments_credit_for_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "(agent_id IS NOT NULL) <> (credit_for_agent_id IS NOT NULL)",
+            name="evaluation_payments_assignment_xor_credit",
+        ),
         CheckConstraint("amount_rao > 0", name="evaluation_payments_amount_rao_check"),
+        CheckConstraint(
+            "tao_usd_rate IS NULL OR tao_usd_rate > 0",
+            name="evaluation_payments_tao_usd_rate_positive",
+        ),
         CheckConstraint(
             "extrinsic_index >= 0",
             name="evaluation_payments_extrinsic_index_check",
         ),
         Index("evaluation_payments_miner_hotkey_idx", "miner_hotkey"),
+        Index(
+            "evaluation_payments_available_credit_idx",
+            "miner_hotkey",
+            postgresql_where=text("agent_id IS NULL"),
+        ),
     )
 
 
@@ -870,6 +907,93 @@ class Score(Base):
             "validator_hotkey",
             postgresql_include=["updated_at"],
         ),
+        Index(
+            "scores_bench_timeline_idx",
+            "bench_version",
+            "agent_id",
+            "updated_at",
+            "validator_hotkey",
+            postgresql_include=["memory_mean", "composite", "n"],
+        ),
+    )
+
+
+class ConfirmationScore(Base):
+    """One append-only shared-seed rescore result: a top-5 confirmation ledger row.
+
+    The continual top-5 shared-seed rescore lane
+    (``docs/top5-rescore-lane.md``) re-scores each emission-set member on the
+    **champion-anchored** CRN seed set. Unlike :class:`Score` (the authoritative
+    k=3 record, one upserted row per validator), this ledger is **append-only**:
+    one immutable row per ``(agent_id, validator_hotkey, bench_version, seed)``,
+    inserted with ``ON CONFLICT DO NOTHING`` and **never UPDATEd or deleted**. The
+    longer a champion reigns, the more rows accumulate — the record grows
+    monotonically and every seed's score is kept forever (auditable, no
+    destructive read-modify-write).
+
+    The KOTH fold (and its ``koth.py`` platform mirror) read the paired evidence
+    from this history — grouped by seed, lower-median across validators — so
+    "more seeds" is just "more rows to median over". The authoritative k=3
+    ``scores`` table is untouched: no 4th ticket, no 4th ``Score`` PK row, no
+    change to finalization. This ledger is a separate, additive store.
+    """
+
+    __tablename__ = "confirmation_scores"
+
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """FK to ``agents.agent_id``. Unique-key part 1."""
+
+    validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    """SS58 hotkey of the reporting validator. Unique-key part 2."""
+
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Benchmark semantics this signed rescore was produced under. Unique-key
+    part 3 — the champion-anchored seed set is keyed on the major version."""
+
+    seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    """The champion-anchored CRN seed the member was re-scored on. Unique-key
+    part 4 — a validator contributes at most one composite per seed, immutably."""
+
+    composite: Mapped[float] = mapped_column(Float, nullable=False)
+    """Aggregate score in [0, 1] on this seed's dataset (as reported)."""
+
+    run_id: Mapped[str] = mapped_column(Text, nullable=False)
+    """Scoring-engine run identifier for this seed's benchmark run."""
+
+    signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """The reporting validator's sr25519 signature over the parent score payload,
+    hex encoded, so the ledger row is self-verifying alongside the k=3 receipt."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """When this immutable row was appended (UTC). Never updated."""
+
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "agent_id",
+            "bench_version",
+            "validator_hotkey",
+            "seed",
+            name="confirmation_scores_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="CASCADE",
+            name="confirmation_scores_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "composite >= 0 AND composite <= 1",
+            name="confirmation_scores_composite_range_check",
+        ),
+        CheckConstraint(
+            "bench_version > 0", name="confirmation_scores_bench_version_positive"
+        ),
+        CheckConstraint("seed >= 0", name="confirmation_scores_seed_check"),
+        Index("confirmation_scores_agent_version_idx", "agent_id", "bench_version"),
     )
 
 
@@ -923,6 +1047,8 @@ class BenchmarkRollout(Base):
             "desired_version > from_version", name="benchmark_rollout_forward"
         ),
         CheckConstraint(
+            # Retain the historical storage bound for rollout snapshots created
+            # before new transitions were narrowed to ten members.
             "cohort_size BETWEEN 5 AND 25",
             name="benchmark_rollout_bounded_members",
         ),
@@ -1021,6 +1147,9 @@ class ValidatorHeartbeat(Base):
     capabilities: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     stack: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     stack_health: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    benchmark_capacity: Mapped[dict | None] = mapped_column(
+        _JSON_VARIANT, nullable=True
+    )
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )
@@ -1142,6 +1271,120 @@ class ScreenerHeartbeat(Base):
     )
 
 
+class ScreenerReviewSettingsRevision(Base):
+    """Append-only, operator-audited L2/L3 settings revision."""
+
+    __tablename__ = "screener_review_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope = '*' OR length(scope) BETWEEN 1 AND 63",
+            name="screener_review_settings_scope_check",
+        ),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="screener_review_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="screener_review_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="screener_review_settings_actor_check",
+        ),
+        Index(
+            "screener_review_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="screener_review_settings_scope_parent_key",
+        ),
+    )
+
+
+class ScreenerShadowReview(Base):
+    """Non-authoritative L2/L3 telemetry bound to one live attempt."""
+
+    __tablename__ = "screener_shadow_reviews"
+
+    attempt_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    screener_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    artifact_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    settings_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    settings_scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings_checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    disposition: Mapped[str] = mapped_column(Text, nullable=False)
+    risk_level: Mapped[str | None] = mapped_column(Text, nullable=True)
+    categories: Mapped[list] = mapped_column(_JSON_VARIANT, nullable=False)
+    finding_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolution_basis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    clearance_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    critic_disposition: Mapped[str | None] = mapped_column(Text, nullable=True)
+    adjudicator_disposition: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_models: Mapped[list] = mapped_column(_JSON_VARIANT, nullable=False)
+    response_providers: Mapped[list] = mapped_column(_JSON_VARIANT, nullable=False)
+    usage: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["attempt_id"],
+            ["screening_attempts.attempt_id"],
+            ondelete="CASCADE",
+            name="screener_shadow_reviews_attempt_id_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="CASCADE",
+            name="screener_shadow_reviews_agent_id_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["settings_revision"],
+            ["screener_review_settings_revisions.revision"],
+            ondelete="RESTRICT",
+            name="screener_shadow_reviews_settings_revision_fkey",
+        ),
+        CheckConstraint(
+            "length(artifact_sha256) = 64",
+            name="screener_shadow_reviews_artifact_sha_check",
+        ),
+        CheckConstraint(
+            "length(settings_checksum) = 64",
+            name="screener_shadow_reviews_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "disposition IN ('safe', 'violation', 'inconclusive', 'retryable_infra')",
+            name="screener_shadow_reviews_disposition_check",
+        ),
+        CheckConstraint(
+            "risk_level IS NULL OR risk_level IN ('low', 'medium', 'high')",
+            name="screener_shadow_reviews_risk_check",
+        ),
+        Index("screener_shadow_reviews_created_idx", "created_at"),
+        Index("screener_shadow_reviews_agent_idx", "agent_id", "created_at"),
+    )
+
+
 class ValidatorTicket(Base):
     """One validator's evaluation ticket for one agent (a k=3 scoring grant).
 
@@ -1172,6 +1415,11 @@ class ValidatorTicket(Base):
     validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
     """SS58 hotkey of the ticket-holding validator. PK part 2 (distinctness)."""
 
+    slot_id: Mapped[str] = mapped_column(
+        Text, nullable=False, default="slot-0", server_default="slot-0"
+    )
+    """Heartbeat-v10 execution slot holding this live lease."""
+
     status: Mapped[TicketStatus] = mapped_column(
         Enum(
             TicketStatus,
@@ -1183,6 +1431,32 @@ class ValidatorTicket(Base):
         server_default=text("'issued'"),
     )
     """Current state: ``issued`` -> ``scored`` | ``expired``."""
+
+    purpose: Mapped[TicketPurpose] = mapped_column(
+        Text,
+        nullable=False,
+        default=TicketPurpose.CANONICAL_QUORUM,
+        server_default=text("'legacy_unclassified'"),
+    )
+    """Why the current lease was issued; old-writer leases remain unclassified."""
+
+    purpose_revision: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("0"),
+    )
+    """Positive only when a purpose-aware writer classified this lease."""
+
+    legacy_completion_allowed: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        # Old application replicas omit this column during the bounded rolling
+        # transition. Purpose-aware writers always send the Python default.
+        server_default=text("true"),
+    )
+    """Bounded migration-only allowance for leases already live at cutover."""
 
     issued_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
@@ -1196,6 +1470,18 @@ class ValidatorTicket(Base):
 
     bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     """Benchmark version whose retry budget this ticket consumes."""
+
+    seed: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    """Block-hash-derived dataset seed assigned to this validator run."""
+
+    dataset_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Digest of the dataset rendered from :attr:`seed`."""
+
+    seed_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    """Finalized chain block used for the validator-specific seed."""
+
+    seed_block_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Hash used to independently re-derive the validator-specific seed."""
 
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     """Number of leases issued to this validator for this agent/version."""
@@ -1222,6 +1508,14 @@ class ValidatorTicket(Base):
         TIMESTAMP(timezone=True), nullable=True
     )
     """Earliest time this validator may retry an expired ticket."""
+
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Latest signed public-safe failure class reported for this ticket."""
+
+    failed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    """When :attr:`failure_reason` was reported. Preserved across reissue."""
 
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
@@ -1257,6 +1551,16 @@ class ValidatorTicket(Base):
             name="validator_tickets_bench_version_positive",
         ),
         CheckConstraint(
+            "purpose IN ("
+            "'legacy_unclassified', 'canonical_quorum', 'continual_retest'"
+            ")",
+            name="validator_tickets_purpose_valid",
+        ),
+        CheckConstraint(
+            "purpose_revision >= 0",
+            name="validator_tickets_purpose_revision_nonnegative",
+        ),
+        CheckConstraint(
             "attempt_count > 0",
             name="validator_tickets_attempt_count_positive",
         ),
@@ -1268,6 +1572,16 @@ class ValidatorTicket(Base):
             "infra_retry_grants >= 0",
             name="validator_tickets_infra_retry_grants_nonnegative",
         ),
+        CheckConstraint(
+            "failure_reason IS NULL OR failure_reason IN "
+            "('infrastructure', 'scoring_error', 'sandbox_oom')",
+            name="validator_tickets_failure_reason",
+        ),
+        CheckConstraint(
+            "slot_id IN ('slot-0', 'slot-1', 'slot-2', 'slot-3', "
+            "'slot-4', 'slot-5', 'slot-6', 'slot-7')",
+            name="validator_tickets_slot_id",
+        ),
         # The expiry sweep and the live-slot count both scan open tickets only;
         # a partial index keeps those hot paths off the full table.
         Index(
@@ -1276,12 +1590,311 @@ class ValidatorTicket(Base):
             postgresql_where=text("status = 'issued'"),
         ),
         Index(
-            "validator_tickets_one_issued_per_validator_idx",
+            "validator_tickets_one_issued_per_validator_slot_idx",
             "validator_hotkey",
+            "slot_id",
             unique=True,
             postgresql_where=text("status = 'issued'"),
             sqlite_where=text("status = 'issued'"),
         ),
+    )
+
+
+class InferenceGrant(Base):
+    """One ticket-scoped platform inference capability."""
+
+    __tablename__ = "inference_grants"
+
+    grant_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    slot_id: Mapped[str] = mapped_column(Text, nullable=False)
+    ticket_deadline: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    bearer_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    broker_public_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    allowed_models: Mapped[list[str]] = mapped_column(_JSON_VARIANT, nullable=False)
+    route_provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    route_profile: Mapped[str | None] = mapped_column(Text, nullable=True)
+    route_quantization: Mapped[str | None] = mapped_column(Text, nullable=True)
+    route_prompt_price_per_token: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    route_completion_price_per_token: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    request_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    token_budget: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    request_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    prompt_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    completion_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    cost_microusd: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    active_requests: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["agent_id", "bench_version", "validator_hotkey"],
+            [
+                "validator_tickets.agent_id",
+                "validator_tickets.bench_version",
+                "validator_tickets.validator_hotkey",
+            ],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "agent_id",
+            "bench_version",
+            "validator_hotkey",
+            "ticket_deadline",
+            name="inference_grants_ticket_lease",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'active', 'revoked', 'exhausted')",
+            name="inference_grants_status",
+        ),
+        CheckConstraint("request_budget > 0", name="inference_grants_request_budget"),
+        CheckConstraint("token_budget > 0", name="inference_grants_token_budget"),
+        CheckConstraint(
+            "active_requests >= 0", name="inference_grants_active_requests"
+        ),
+        Index("inference_grants_expiry_idx", "expires_at"),
+    )
+
+
+class InferenceProviderRoute(Base):
+    """Discovered OpenRouter route plus platform-observed serving quality."""
+
+    __tablename__ = "inference_provider_routes"
+
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    profile_revision: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="discovered")
+    calibration_status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="shadow"
+    )
+    context_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quantization: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prompt_price_per_token: Mapped[float | None] = mapped_column(Float, nullable=True)
+    completion_price_per_token: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    ewma_tokens_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ewma_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ewma_error_rate: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default=text("0")
+    )
+    ewma_timeout_rate: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default=text("0")
+    )
+    ewma_tool_accuracy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ewma_composite: Mapped[float | None] = mapped_column(Float, nullable=True)
+    calibration_tool_accuracy: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    calibration_composite: Mapped[float | None] = mapped_column(Float, nullable=True)
+    calibration_sample_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    calibration_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    calibration_manifest_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    calibrated_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    ewma_cost_microusd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sample_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    selected_ticket_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    exploration_ticket_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    last_selected_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    cooldown_until: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    discovered_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    last_observed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint("model", "provider", "profile_revision"),
+        UniqueConstraint("profile_revision", name="inference_provider_profile_key"),
+        CheckConstraint(
+            "status IN ('discovered', 'healthy', 'degraded', 'offline')",
+            name="inference_provider_route_status",
+        ),
+        CheckConstraint(
+            "calibration_status IN ('shadow', 'eligible', 'disabled')",
+            name="inference_provider_calibration_status",
+        ),
+        CheckConstraint(
+            "ewma_error_rate >= 0 AND ewma_error_rate <= 1",
+            name="inference_provider_error_rate",
+        ),
+        CheckConstraint(
+            "ewma_timeout_rate >= 0 AND ewma_timeout_rate <= 1",
+            name="inference_provider_timeout_rate",
+        ),
+        CheckConstraint(
+            "calibration_revision >= 0",
+            name="inference_provider_calibration_revision",
+        ),
+        Index(
+            "inference_provider_routes_selection_idx",
+            "model",
+            "calibration_status",
+            "status",
+        ),
+    )
+
+
+class InferenceRoutingPolicy(Base):
+    """Audited operator-tunable policy for one benchmark model."""
+
+    __tablename__ = "inference_routing_policies"
+
+    model: Mapped[str] = mapped_column(Text, primary_key=True)
+    revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    speed_weight: Mapped[float] = mapped_column(Float, nullable=False)
+    cost_weight: Mapped[float] = mapped_column(Float, nullable=False)
+    exploration_weight: Mapped[float] = mapped_column(Float, nullable=False)
+    exploration_ticket_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    min_tool_accuracy: Mapped[float] = mapped_column(Float, nullable=False)
+    min_composite: Mapped[float] = mapped_column(Float, nullable=False)
+    min_calibration_samples: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_error_rate: Mapped[float] = mapped_column(Float, nullable=False)
+    max_timeout_rate: Mapped[float] = mapped_column(Float, nullable=False)
+    cooldown_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    ewma_alpha: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "speed_weight >= 0 AND cost_weight >= 0 AND exploration_weight >= 0",
+            name="inference_routing_policy_weights",
+        ),
+        CheckConstraint(
+            "speed_weight + cost_weight + exploration_weight > 0",
+            name="inference_routing_policy_nonzero_weights",
+        ),
+        CheckConstraint(
+            "min_tool_accuracy >= 0 AND min_tool_accuracy <= 1 "
+            "AND min_composite >= 0 AND min_composite <= 1",
+            name="inference_routing_policy_quality",
+        ),
+        CheckConstraint(
+            "max_error_rate >= 0 AND max_error_rate <= 1 "
+            "AND max_timeout_rate >= 0 AND max_timeout_rate <= 1 "
+            "AND ewma_alpha > 0 AND ewma_alpha <= 1",
+            name="inference_routing_policy_reliability",
+        ),
+        CheckConstraint(
+            "exploration_ticket_budget >= 0 AND min_calibration_samples > 0 "
+            "AND cooldown_seconds >= 1 AND revision >= 0",
+            name="inference_routing_policy_bounds",
+        ),
+    )
+
+
+class InferenceRoutingAudit(Base):
+    """Append-only operator history for inference policy and route decisions."""
+
+    __tablename__ = "inference_routing_audit"
+
+    audit_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    profile_revision: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+
+    __table_args__ = (Index("inference_routing_audit_history_idx", "recorded_at"),)
+
+
+class InferenceRequest(Base):
+    """Replay ledger and bounded accounting for one proxy request."""
+
+    __tablename__ = "inference_requests"
+
+    grant_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    nonce: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="started")
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    upstream_provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    timed_out: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint("grant_id", "nonce"),
+        ForeignKeyConstraint(
+            ["grant_id"], ["inference_grants.grant_id"], ondelete="CASCADE"
+        ),
+        CheckConstraint(
+            "status IN ('started', 'completed', 'failed', 'canceled')",
+            name="inference_requests_status",
+        ),
+        CheckConstraint(
+            "reserved_tokens > 0", name="inference_requests_reserved_tokens"
+        ),
+        CheckConstraint("generation > 0", name="inference_requests_generation"),
+        Index("inference_requests_started_idx", "started_at"),
     )
 
 
