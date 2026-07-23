@@ -13,6 +13,7 @@ export interface GlossaryCategory {
 }
 
 export interface GlossaryMetric {
+  key?: string;
   label?: string;
   description?: string;
 }
@@ -45,6 +46,10 @@ export interface BenchConfigPayload {
   harness: BenchHarnessConfig;
   public_mirror_url_template?: string | null;
   ledger_path?: string;
+  desired_bench_version?: number | null;
+  dataset?: Record<string, unknown>;
+  grading?: Record<string, unknown>;
+  generated_at?: string;
   public_transcript_url_template?: string | null;
   public_transcript_telemetry_url_template?: string | null;
 }
@@ -64,9 +69,14 @@ export interface TimelineMinerPoint {
   bench_version?: number | string;
   agent_name?: string | null;
   agent_id?: string;
+  hermes_memory_mean?: number | string | null;
+  openclaw_memory_mean?: number | string | null;
 }
 
 export interface TimelinePayload {
   releases?: TimelineRelease[];
   points?: TimelineMinerPoint[];
+  metric?: string;
+  score_quorum?: number;
+  generated_at?: string;
 }

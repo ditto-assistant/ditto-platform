@@ -130,9 +130,13 @@ export interface OperationsPayload {
 
 export interface HealthPayload {
   miners?: number;
+  scored_miners?: number | null;
   scored_agents?: number | null;
   total_scores?: number | null;
+  scores_24h?: number | null;
+  avg_latency_ms?: number | null;
   last_scored_at?: string | null;
+  generated_at?: string;
 }
 
 // ── Validator names (/public/validator-names) ────────────────

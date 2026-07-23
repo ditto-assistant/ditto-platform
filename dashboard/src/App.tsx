@@ -2,6 +2,7 @@ import { Match, Switch, createEffect, createSignal, onCleanup, onMount } from "s
 import type { JSX } from "solid-js";
 
 import { EntityPanel } from "./components/EntityPanel";
+import { GlobalSearch } from "./components/search/GlobalSearch";
 import { Sidebar } from "./components/shell/Sidebar";
 import { useEndpoint } from "./data/useEndpoint";
 import { REFRESH_MS } from "./lib/config";
@@ -13,27 +14,27 @@ import { ReviewsPage } from "./pages/ReviewsPage";
 import { SubmissionsPage } from "./pages/SubmissionsPage";
 import { currentPage, initRouteListeners, syncFromLocation } from "./stores/routeStore";
 import type {
-  ActivityPayload,
   AthSnapshot,
   BenchConfigPayload,
   GlossaryPayload,
   HealthPayload,
-  LeaderboardPayload,
   OperationsPayload,
+  RolloutState,
+  TimelinePayload,
 } from "./types";
 
 export default function App(): JSX.Element {
   const health = useEndpoint<HealthPayload>("/public/health");
-  const leaderboard = useEndpoint<LeaderboardPayload>("/public/leaderboard");
   const operations = useEndpoint<OperationsPayload>("/public/operations");
-  const activity = useEndpoint<ActivityPayload>("/public/activity?limit=100&page=1");
   const reviews = useEndpoint<AthSnapshot>(
     "/public/activity?review=ath&status=under_review&limit=100&page=1",
   );
   const glossary = useEndpoint<GlossaryPayload>("/public/bench/glossary");
   const benchConfig = useEndpoint<BenchConfigPayload>("/public/bench/config");
+  const rollout = useEndpoint<RolloutState>("/public/bench/rollout");
+  const timeline = useEndpoint<TimelinePayload>("/public/bench/timeline");
   const [lastRefresh, setLastRefresh] = createSignal(new Date());
-  const resources = [health, leaderboard, operations, activity, reviews, glossary, benchConfig];
+  const resources = [health, operations, reviews, glossary, benchConfig, rollout, timeline];
 
   const refreshAll = () => {
     resources.forEach((resource) => resource.refresh());
@@ -63,26 +64,29 @@ export default function App(): JSX.Element {
             <h1>{PAGES[currentPage()].title}</h1>
             <p>{PAGES[currentPage()].sub}</p>
           </div>
-          <span class="live-indicator">
-            <i /> Live data
-          </span>
+          <div class="page-actions">
+            <GlobalSearch />
+            <span class="live-indicator">
+              <i /> Live data
+            </span>
+          </div>
         </header>
         <div class="page-content">
           <Switch>
             <Match when={currentPage() === "overview"}>
-              <OverviewPage health={health} leaderboard={leaderboard} />
+              <OverviewPage health={health} rollout={rollout} />
             </Match>
             <Match when={currentPage() === "operations"}>
               <OperationsPage resource={operations} />
             </Match>
             <Match when={currentPage() === "submissions"}>
-              <SubmissionsPage resource={activity} />
+              <SubmissionsPage />
             </Match>
             <Match when={currentPage() === "reviews"}>
               <ReviewsPage resource={reviews} />
             </Match>
             <Match when={currentPage() === "benchmark"}>
-              <BenchmarkPage glossary={glossary} config={benchConfig} />
+              <BenchmarkPage glossary={glossary} config={benchConfig} timeline={timeline} />
             </Match>
           </Switch>
         </div>

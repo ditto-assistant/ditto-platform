@@ -5,6 +5,8 @@ import { getJSON } from "../lib/api";
 import { fx, shortKey } from "../lib/format";
 import { closeEntityRoute, entityRoute } from "../stores/routeStore";
 import type { LeaderboardPayload, OperationsPayload, PipelinePayload } from "../types";
+import type { FleetEntry } from "../types";
+import { AgentEvidence } from "./evidence/AgentEvidence";
 import { ErrorState } from "./ui/States";
 import { StatusChip } from "./ui/StatusChip";
 
@@ -20,14 +22,27 @@ export function EntityPanel(): JSX.Element {
     () => entityRoute()?.key || "",
     async () => getJSON<PipelinePayload | LeaderboardPayload | OperationsPayload>(path()),
   );
-  const agentPipeline = () =>
-    entityRoute()?.kind === "agent" ? (payload() as PipelinePayload | undefined) : undefined;
+  const agentPipeline = () => (entityRoute()?.kind === "agent" ? payload() : undefined);
   const minerEntry = () =>
     entityRoute()?.kind === "miner"
       ? (payload() as LeaderboardPayload | undefined)?.entries?.find(
           (entry) => entry.miner_hotkey === entityRoute()?.id,
         )
       : undefined;
+  const workerEntry = (): FleetEntry | undefined => {
+    const current = entityRoute();
+    if (!current || (current.kind !== "validator" && current.kind !== "screener")) return undefined;
+    const operations = payload() as OperationsPayload | undefined;
+    const entries =
+      current.kind === "validator"
+        ? operations?.validators?.validators
+        : operations?.validators?.screeners;
+    return entries?.find(
+      (entry) =>
+        (current.kind === "validator" ? entry.validator_hotkey : entry.screener_hotkey) ===
+        current.id,
+    );
+  };
   return (
     <Show when={entityRoute()}>
       {(current) => (
@@ -60,31 +75,11 @@ export function EntityPanel(): JSX.Element {
             </Show>
             <Show when={agentPipeline()}>
               {(detail) => (
-                <dl class="detail-grid">
-                  <div>
-                    <dt>Status</dt>
-                    <dd>
-                      <StatusChip status={detail().status} />
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Score quorum</dt>
-                    <dd>
-                      {detail().score_count ?? 0}/{detail().quorum ?? 3}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Bench version</dt>
-                    <dd>v{detail().active_bench_version ?? "—"}</dd>
-                  </div>
-                  <div>
-                    <dt>Attempts</dt>
-                    <dd>
-                      {detail().validation_attempts?.length ?? 0} validation ·{" "}
-                      {detail().screening_attempts?.length ?? 0} screening
-                    </dd>
-                  </div>
-                </dl>
+                <AgentEvidence
+                  agentId={current().id}
+                  detail={detail()}
+                  refresh={() => void refetch()}
+                />
               )}
             </Show>
             <Show when={minerEntry()}>
@@ -109,6 +104,56 @@ export function EntityPanel(): JSX.Element {
                     </dd>
                   </div>
                 </dl>
+              )}
+            </Show>
+            <Show when={workerEntry()}>
+              {(entry) => (
+                <div class="pipeline-detail">
+                  <dl class="detail-grid">
+                    <div>
+                      <dt>Availability</dt>
+                      <dd>
+                        <StatusChip status={entry().availability || entry().health} />
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>State</dt>
+                      <dd>{entry().state || "—"}</dd>
+                    </div>
+                    <div>
+                      <dt>Software</dt>
+                      <dd>{entry().software_version || "—"}</dd>
+                    </div>
+                    <div>
+                      <dt>Protocol</dt>
+                      <dd>{entry().protocol_version ?? "—"}</dd>
+                    </div>
+                    <div>
+                      <dt>Assignment</dt>
+                      <dd>{entry().active_agent_name || entry().assigned_agent_name || "None"}</dd>
+                    </div>
+                    <div>
+                      <dt>Admission</dt>
+                      <dd>
+                        <StatusChip status={entry().admission || entry().assignment_state} />
+                      </dd>
+                    </div>
+                  </dl>
+                  <section class="pipeline-section">
+                    <h4>Managed stack</h4>
+                    <pre>
+                      <code>
+                        {JSON.stringify(entry().stack || entry().stack_health || {}, null, 2)}
+                      </code>
+                    </pre>
+                  </section>
+                  <section class="pipeline-section">
+                    <h4>Capabilities</h4>
+                    <pre>
+                      <code>{JSON.stringify(entry().capabilities || {}, null, 2)}</code>
+                    </pre>
+                  </section>
+                </div>
               )}
             </Show>
             <Show

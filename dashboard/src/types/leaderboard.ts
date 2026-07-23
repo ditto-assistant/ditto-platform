@@ -155,6 +155,7 @@ export interface LeaderboardPayload {
   selection_mode?: string;
   generated_at?: string;
   emissions?: EmissionsFold | null;
+  count?: number;
 }
 
 // ── Benchmark rollout (/public/bench/rollout) ────────────────
@@ -176,6 +177,10 @@ export interface RolloutState {
   cohort_size?: number | null;
   cohort_ready_count?: number | null;
   members?: RolloutMember[];
+  blocked_reason?: string | null;
+  qualification_blockers?: string[];
+  qualification_converged?: boolean;
+  canary_capable_validator_count?: number | null;
 }
 
 // ── Chain weights (/public/weights) ──────────────────────────

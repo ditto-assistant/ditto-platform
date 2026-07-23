@@ -1,91 +1,121 @@
-import { For, Show } from "solid-js";
+import { For, Show, createMemo, createSignal } from "solid-js";
 import type { JSX } from "solid-js";
 
-import { PipelineTable } from "../components/PipelineTable";
-import { EntityButton } from "../components/ui/EntityButton";
+import { FleetTable } from "../components/operations/FleetTable";
+import { PipelineAtlas } from "../components/operations/PipelineAtlas";
 import { EmptyState, ErrorState } from "../components/ui/States";
-import { StatusChip } from "../components/ui/StatusChip";
 import type { ResourceState } from "../data/useEndpoint";
-import { pct, shortKey } from "../lib/format";
+import { relTime } from "../lib/format";
 import type { FleetEntry, OperationsPayload } from "../types";
 
-function FleetList(props: {
-  title: string;
-  entries: FleetEntry[];
-  kind: "validator" | "screener";
-}): JSX.Element {
-  return (
-    <section class="fleet-section">
-      <div class="section-head">
-        <h2>{props.title}</h2>
-        <span class="hint">{props.entries.length} reporting</span>
-      </div>
-      <div class="fleet-list">
-        <For
-          each={props.entries}
-          fallback={
-            <EmptyState
-              title={`No ${props.kind}s reporting`}
-              detail="Workers appear when their signed heartbeat is fresh."
-            />
-          }
-        >
-          {(entry) => {
-            const key = () =>
-              props.kind === "validator" ? entry.validator_hotkey : entry.screener_hotkey;
-            return (
-              <article class="fleet-row">
-                <div>
-                  <EntityButton kind={props.kind} id={key()} class="row-title">
-                    <span title={key()}>{shortKey(key()) || "Unknown worker"}</span>
-                  </EntityButton>
-                  <small>{entry.software_version || "Version not reported"}</small>
-                </div>
-                <div class="fleet-state">
-                  <StatusChip status={entry.availability || entry.state} />
-                  <span>
-                    {entry.active_agent_name ||
-                      entry.active_benchmark?.agent_name ||
-                      "No active assignment"}
-                  </span>
-                </div>
-                <div class="fleet-metrics">
-                  <span>
-                    CPU {entry.system_metrics ? pct(entry.system_metrics.cpu_percent / 100) : "—"}
-                  </span>
-                  <span>
-                    Memory{" "}
-                    {entry.system_metrics ? pct(entry.system_metrics.memory_percent / 100) : "—"}
-                  </span>
-                </div>
-              </article>
-            );
-          }}
-        </For>
-      </div>
-    </section>
-  );
-}
+type FleetKind = "validator" | "screener";
 
 export function OperationsPage(props: { resource: ResourceState<OperationsPayload> }): JSX.Element {
+  const [kind, setKind] = createSignal<FleetKind>("validator");
   const validators = () => props.resource.data()?.validators.validators || [];
   const screeners = () => props.resource.data()?.validators.screeners || [];
+  const fleet = () => (kind() === "validator" ? validators() : screeners());
   const activity = () => props.resource.data()?.activity?.entries || [];
+  const statusCounts = createMemo(() => {
+    const result: Record<string, number> = {
+      healthy: 0,
+      warning: 0,
+      stale: 0,
+      offline: 0,
+      paused: 0,
+      unknown: 0,
+    };
+    fleet().forEach((entry: FleetEntry) => {
+      const state = entry.availability || entry.health || "unknown";
+      result[state] = (result[state] || 0) + 1;
+    });
+    return result;
+  });
   return (
     <>
       <Show when={props.resource.error()}>
         <ErrorState error={props.resource.error()} retry={props.resource.refresh} />
       </Show>
       <Show when={!props.resource.error()}>
+        <section class="operations-snapshot">
+          <div>
+            <span>Active benchmark</span>
+            <strong>v{props.resource.data()?.active_bench_version ?? "—"}</strong>
+          </div>
+          <div>
+            <span>Rollout target</span>
+            <strong>v{props.resource.data()?.desired_bench_version ?? "—"}</strong>
+          </div>
+          <div>
+            <span>Pipeline records</span>
+            <strong>{activity().length}</strong>
+          </div>
+          <div>
+            <span>Snapshot</span>
+            <strong>{relTime(props.resource.data()?.generated_at)}</strong>
+          </div>
+        </section>
         <section>
           <div class="section-head">
-            <h2>Live pipeline</h2>
+            <div>
+              <h2>Live pipeline</h2>
+              <p>
+                Reconciled view from upload through screening, validator assignment, evaluation, and
+                accepted scores.
+              </p>
+            </div>
             <span class="hint">Refreshes every 30 seconds</span>
           </div>
-          <PipelineTable entries={activity()} loading={props.resource.loading()} />
+          <PipelineAtlas entries={activity()} />
         </section>
-        <FleetList title="Validator fleet" entries={validators()} kind="validator" />
-        <FleetList title="Screener fleet" entries={screeners()} kind="screener" />
+        <section class="fleet-section">
+          <div class="section-head">
+            <div>
+              <h2>Worker fleet</h2>
+              <p>
+                Signed heartbeat, assignment, stack identity, capability, and system-health
+                evidence.
+              </p>
+            </div>
+            <div class="activity-filter-list">
+              <button
+                class="activity-filter"
+                aria-pressed={kind() === "validator"}
+                onClick={() => setKind("validator")}
+              >
+                Validators {validators().length}
+              </button>
+              <button
+                class="activity-filter"
+                aria-pressed={kind() === "screener"}
+                onClick={() => setKind("screener")}
+              >
+                Screeners {screeners().length}
+              </button>
+            </div>
+          </div>
+          <div class="fleet-summary">
+            <For each={Object.entries(statusCounts())}>
+              {([status, count]) => (
+                <div>
+                  <span>{status}</span>
+                  <strong>{count}</strong>
+                </div>
+              )}
+            </For>
+          </div>
+          <Show
+            when={fleet().length}
+            fallback={
+              <EmptyState
+                title={`No ${kind()}s reporting`}
+                detail="Workers appear once their signed heartbeat is fresh."
+              />
+            }
+          >
+            <FleetTable entries={fleet()} kind={kind()} />
+          </Show>
+        </section>
       </Show>
     </>
   );

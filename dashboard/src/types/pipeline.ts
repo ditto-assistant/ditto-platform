@@ -34,6 +34,7 @@ interface ActivityPayloadBase<E> {
   total_pages?: number;
   total?: number;
   count?: number;
+  page_size?: number;
   generated_at?: string;
 }
 
