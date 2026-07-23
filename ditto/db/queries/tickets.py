@@ -30,7 +30,6 @@ from ditto.db.models import (
     Agent,
     BenchmarkDataset,
     BenchmarkRollout,
-    BenchmarkRolloutMember,
     EvaluationPayment,
     Score,
     ValidatorTicket,
@@ -38,6 +37,10 @@ from ditto.db.models import (
 from ditto.db.queries.audit import (
     EVENT_SCORE_RETEST_REQUESTED,
     get_latest_score_retest_event,
+)
+from ditto.db.queries.benchmark_admission import (
+    activated_rollout_for_version,
+    benchmark_admission_predicate,
 )
 from ditto.db.queries.scores import SCORING_QUORUM, list_eligible_ledger
 
@@ -228,14 +231,8 @@ async def issue_ticket(
     await expire_overdue_tickets(session, now=now)
     if bench_version is None:
         raise ValueError("benchmark version is required for ticket issuance")
-    activated_rollout = await session.scalar(
-        select(BenchmarkRollout)
-        .where(
-            BenchmarkRollout.desired_version == bench_version,
-            BenchmarkRollout.status == "activated",
-        )
-        .order_by(BenchmarkRollout.activated_at.desc())
-        .limit(1)
+    activated_rollout = await activated_rollout_for_version(
+        session, bench_version=bench_version
     )
     if fifo_start_at is None:
         fifo_start_at = (
@@ -269,33 +266,8 @@ async def issue_ticket(
     )
     rollout_admitted = None
     if activated_rollout is not None:
-        # A dataset row is not admission evidence: routine policy rescreens can
-        # regenerate it for historical submissions. New-era submissions,
-        # frozen rollout members, and explicitly audited operator recoveries
-        # are the only paths allowed to consume current validator capacity.
-        rollout_member = (
-            select(BenchmarkRolloutMember.agent_id)
-            .where(
-                BenchmarkRolloutMember.rollout_id == activated_rollout.rollout_id,
-                BenchmarkRolloutMember.agent_id == Agent.agent_id,
-            )
-            .correlate(Agent)
-            .exists()
-        )
-        operator_admission = (
-            select(ValidatorTicket.agent_id)
-            .where(
-                ValidatorTicket.agent_id == Agent.agent_id,
-                ValidatorTicket.bench_version == bench_version,
-                ValidatorTicket.manual_retry_grants > 0,
-            )
-            .correlate(Agent)
-            .exists()
-        )
-        rollout_admitted = or_(
-            Agent.created_at >= activated_rollout.created_at,
-            rollout_member,
-            operator_admission,
+        rollout_admitted = benchmark_admission_predicate(
+            rollout=activated_rollout, bench_version=bench_version
         )
     existing_statement = (
         select(ValidatorTicket)

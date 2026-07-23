@@ -26,6 +26,7 @@ from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
 from ditto.db.models import Agent, BenchmarkDataset
+from ditto.db.queries.benchmark_admission import agent_is_admitted
 from ditto.db.queries.benchmark_rollout import active_bench_version
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -80,6 +81,9 @@ async def scoring_readiness(
             )
         )
     )
+    benchmark_admitted = await agent_is_admitted(
+        session, bench_version=active_version, agent_id=agent_id
+    )
 
     blocking: list[str] = []
     if agent.status != AgentStatus.EVALUATING:
@@ -108,6 +112,11 @@ async def scoring_readiness(
         blocking.append(
             f"no v{active_version} benchmark dataset has been generated "
             "for this agent yet"
+        )
+    if not benchmark_admitted:
+        blocking.append(
+            f"historical submission is not admitted to the active v{active_version} "
+            "validator queue"
         )
 
     return AgentScoringReadiness(

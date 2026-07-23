@@ -2388,6 +2388,7 @@ class TestPublicActivity:
     ) -> None:
         """love-v8's v3 and v4 scores are one score in each era, not two."""
         await _seed_top_five_floor(session_maker, fifth_place=0.80, bench_version=4)
+        now = datetime.now(UTC)
         agent_id = UUID(
             await _seed_agent(
                 session_maker,
@@ -2395,9 +2396,9 @@ class TestPublicActivity:
                 status=AgentStatus.EVALUATING,
                 name="love-v8",
                 screening_policy_version=SCREENING_POLICY_VERSION,
+                created_at=now - timedelta(hours=2),
             )
         )
-        now = datetime.now(UTC)
         async with session_maker() as session, session.begin():
             session.add(
                 BenchmarkRollout(
@@ -2408,6 +2409,37 @@ class TestPublicActivity:
                     cohort_size=5,
                     created_at=now - timedelta(hours=1),
                     activated_at=now,
+                )
+            )
+            deadline = now + timedelta(minutes=30)
+            session.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_MINER_A,
+                    software_version="1.2.3",
+                    protocol_version=4,
+                    code_digest="ab" * 32,
+                    state="running_benchmark",
+                    active_agent_id=agent_id,
+                    benchmark_progress={
+                        "stage": "running_benchmark",
+                        "completed": 10,
+                        "total": 119,
+                        "ticket_deadline": deadline.isoformat(),
+                    },
+                    benchmark_progress_reported=True,
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                )
+            )
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=_MINER_A,
+                    bench_version=3,
+                    status=TicketStatus.ISSUED,
+                    issued_at=now - timedelta(seconds=1),
+                    deadline=deadline,
                 )
             )
             for bench_version, validator, composite in (
@@ -2438,9 +2470,13 @@ class TestPublicActivity:
             for entry in activity_body["entries"]
             if entry["agent_id"] == str(agent_id)
         )
-        assert activity["status"] == "waiting_validator"
+        assert activity["status"] == "not_queued"
         assert activity["score_count"] == 1
         assert activity["provisional_composite"] == pytest.approx(0.391897)
+        assert activity["validator_queue_rank"] is None
+        assert activity["retry_state"] is None
+        assert activity_body["status_counts"]["not_queued"] == 1
+        assert [work["bench_version"] for work in activity["active_benchmarks"]] == [3]
 
         operations = (await client.get("/api/v1/public/operations")).json()
         operations_entry = next(
@@ -2449,15 +2485,17 @@ class TestPublicActivity:
             if entry["agent_id"] == str(agent_id)
         )
         assert operations["active_bench_version"] == 4
-        assert operations_entry["status"] == "waiting_validator"
+        assert operations_entry["status"] == "not_queued"
         assert operations_entry["score_count"] == 1
         assert operations_entry["provisional_composite"] == pytest.approx(0.391897)
+        assert operations_entry["validator_queue_rank"] is None
+        assert operations["activity"]["status_counts"]["not_queued"] == 1
 
         pipeline = (
             await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
         ).json()
         assert pipeline["active_bench_version"] == 4
-        assert pipeline["status"] == "waiting_validator"
+        assert pipeline["status"] == "not_queued"
         assert pipeline["score_count"] == 1
         assert pipeline["score_floor"] == pytest.approx(0.80)
         scores_by_version = {
@@ -2466,6 +2504,11 @@ class TestPublicActivity:
         }
         assert scores_by_version[3] == pytest.approx(0.391235)
         assert scores_by_version[4] == pytest.approx(0.391897)
+        running_by_version = {
+            attempt["bench_version"]: attempt["actively_running"]
+            for attempt in pipeline["validation_attempts"]
+        }
+        assert running_by_version[3] is True
 
     async def test_retry_state_surfaces_exhausted_and_cooling_submissions(
         self,
