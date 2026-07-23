@@ -147,6 +147,7 @@ from ditto.api_server.koth import (
     KOTH_CHAMPION_SHARE,
     KOTH_DETHRONE_Z,
     KOTH_MARGIN,
+    KOTH_RANK_SHARES,
     KOTH_TAIL_SIZE,
     KothEntry,
     project_koth,
@@ -989,16 +990,16 @@ def _public_koth_emissions(
     projection = project_koth(fold_entries)
     if projection is None:
         return None
-    tail_share = (
-        (1.0 - KOTH_CHAMPION_SHARE) / len(projection.tail) if projection.tail else 0.0
-    )
+    recipient_shares = KOTH_RANK_SHARES[: 1 + len(projection.tail)]
+    share_total = sum(recipient_shares)
+    normalized_shares = tuple(share / share_total for share in recipient_shares)
     recipients = [
         PublicEmissionRecipient(
             role="champion",
             agent_id=projection.champion.agent_id,
             miner_hotkey=projection.champion.miner_hotkey,
             raw_rank=projection.champion.raw_rank,
-            share_of_miner_pool=KOTH_CHAMPION_SHARE,
+            share_of_miner_pool=normalized_shares[0],
             shared_seed_confirmations=depths.get(projection.champion.agent_id, 0),
         )
     ]
@@ -1008,16 +1009,17 @@ def _public_koth_emissions(
             agent_id=entry.agent_id,
             miner_hotkey=entry.miner_hotkey,
             raw_rank=entry.raw_rank,
-            share_of_miner_pool=tail_share,
+            share_of_miner_pool=normalized_shares[index],
             shared_seed_confirmations=depths.get(entry.agent_id, 0),
         )
-        for entry in projection.tail
+        for index, entry in enumerate(projection.tail, start=1)
     )
     decision = projection.raw_leader_decision
     return PublicKothEmissions(
         margin=KOTH_MARGIN,
         dethrone_z=KOTH_DETHRONE_Z,
         champion_share=KOTH_CHAMPION_SHARE,
+        rank_shares=KOTH_RANK_SHARES,
         tail_size=KOTH_TAIL_SIZE,
         champion_agent_id=projection.champion.agent_id,
         champion_miner_hotkey=projection.champion.miner_hotkey,

@@ -17,9 +17,10 @@ from typing import Literal
 from uuid import UUID
 
 # Frozen consensus constants from ditto-subnet/ditto/validator/config.py.
-KOTH_MARGIN = 0.005
+KOTH_MARGIN = 0.007
 KOTH_TAIL_SIZE = 4
-KOTH_CHAMPION_SHARE = 0.9
+KOTH_RANK_SHARES = (0.65, 0.14, 0.10, 0.07, 0.04)
+KOTH_CHAMPION_SHARE = KOTH_RANK_SHARES[0]
 KOTH_DETHRONE_Z = 1.64
 
 # One tempo = 360 blocks (~72 min at 12 s/block); mirrors the subnet worker's

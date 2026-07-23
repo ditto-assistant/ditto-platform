@@ -511,8 +511,11 @@ class TestPublicLeaderboard:
         assert body["entries"][0]["rank"] == 1
         assert body["emissions"]["raw_leader_agent_id"] == raw_leader_id
         assert body["emissions"]["champion_agent_id"] == incumbent_id
-        assert body["emissions"]["margin"] == pytest.approx(0.005)
+        assert body["emissions"]["margin"] == pytest.approx(0.007)
         assert body["emissions"]["dethrone_z"] == pytest.approx(1.64)
+        assert body["emissions"]["rank_shares"] == pytest.approx(
+            [0.65, 0.14, 0.10, 0.07, 0.04]
+        )
         decision = body["emissions"]["raw_leader_decision"]
         assert decision["challenger_lead"] == pytest.approx(0.05)
         assert decision["required_lead"] == pytest.approx(
@@ -526,7 +529,7 @@ class TestPublicLeaderboard:
                 "agent_id": incumbent_id,
                 "miner_hotkey": _MINER_A,
                 "raw_rank": 2,
-                "share_of_miner_pool": 0.9,
+                "share_of_miner_pool": pytest.approx(0.65 / 0.79),
                 "shared_seed_confirmations": 0,
             },
             {
@@ -534,7 +537,7 @@ class TestPublicLeaderboard:
                 "agent_id": raw_leader_id,
                 "miner_hotkey": _MINER_B,
                 "raw_rank": 1,
-                "share_of_miner_pool": pytest.approx(0.1),
+                "share_of_miner_pool": pytest.approx(0.14 / 0.79),
                 "shared_seed_confirmations": 0,
             },
         ]

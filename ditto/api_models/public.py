@@ -665,6 +665,7 @@ class PublicKothEmissions(BaseModel):
     ]
     dethrone_z: Annotated[float, Field(ge=0.0)]
     champion_share: Annotated[float, Field(gt=0.0, le=1.0)]
+    rank_shares: tuple[Annotated[float, Field(gt=0.0, le=1.0)], ...]
     tail_size: Annotated[int, Field(ge=0)]
     champion_agent_id: UUID
     champion_miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]

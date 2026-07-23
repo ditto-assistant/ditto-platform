@@ -8,6 +8,10 @@ and be suppressible via config.
 
 from __future__ import annotations
 
+import json
+import re
+import subprocess
+
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -650,6 +654,9 @@ class TestDashboard:
         assert "data.desired_bench_version" in body
         assert "data.benchmark_rollout_status" in body
         assert "function renderBenchBadge()" in body
+        assert "activeBench || currentBench" in body
+        assert "return Number(activeBench) || Number(currentBench) || null" in body
+        assert "Math.max(Number(currentBench)" not in body
         assert '" → v" + desired + " rollout"' in body
         assert 'getJSON("/public/validators")' not in body
         assert 'getJSON("/public/activity?page=1&limit=200")' not in body
@@ -664,6 +671,83 @@ class TestDashboard:
         assert "Heartbeat stale" in body
         assert "<b>Platform</b>" in body
         assert "<b>Heartbeat</b>" in body
+
+    async def test_benchmark_authority_state_never_promotes_rollout_target(
+        self,
+    ) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        match = re.search(
+            r"(function benchmarkAuthorityState\(.*?\n    \})"
+            r"\n\n    function renderBenchBadge",
+            body,
+            re.DOTALL,
+        )
+        assert match is not None
+        cases = [
+            [6, 7, "collecting"],
+            [6, 7, "blocked_ineligible"],
+            [6, 7, "activated"],
+            [6, None, "inactive"],
+        ]
+        script = (
+            match.group(1)
+            + "\nconsole.log(JSON.stringify("
+            + json.dumps(cases)
+            + ".map(function (args) { "
+            + "return benchmarkAuthorityState.apply(null, args); })));"
+        )
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert json.loads(result.stdout) == [
+            {"active": 6, "desired": 7, "rolling": True},
+            {"active": 6, "desired": 7, "rolling": True},
+            {"active": 6, "desired": 7, "rolling": False},
+            {"active": 6, "desired": 6, "rolling": False},
+        ]
+
+    async def test_leaderboard_state_separates_active_desired_and_history(
+        self,
+    ) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        match = re.search(
+            r"(function leaderboardBenchState\(.*?\n    \})"
+            r"\n\n    function renderBenchBadge",
+            body,
+            re.DOTALL,
+        )
+        assert match is not None
+        cases = [
+            ["authoritative", 7, 6, 7, None],
+            ["authoritative", 7, 6, 7, 7],
+            ["historical", 5, 6, 7, None],
+            ["authoritative", 6, None, None, 6],
+        ]
+        script = (
+            match.group(1)
+            + "\nconsole.log(JSON.stringify("
+            + json.dumps(cases)
+            + ".map(function (args) { "
+            + "return leaderboardBenchState.apply(null, args); })));"
+        )
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert json.loads(result.stdout) == [
+            {"active": 6, "desired": 7, "selected": 6},
+            {"active": 6, "desired": 7, "selected": 6},
+            {"active": 6, "desired": 7, "selected": 5},
+            {"active": None, "desired": None, "selected": 6},
+        ]
+        assert "currentBench = data.desired_bench_version" not in body
 
     async def test_includes_accessible_benchmark_progress(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))

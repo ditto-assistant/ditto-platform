@@ -36,7 +36,7 @@ DESCRIPTION = (
 # The ranked field: (index, median composite, age in days, n cases,
 # validator-name triple, pinned per-score median latency in ms).
 #
-# KOTH math (fixed margin = 0.005 composite points; statistical lead from the
+# KOTH math (fixed margin = 0.007 composite points; statistical lead from the
 # ±(0.012/0.015) quorum jitter ~= 0.018): index 1 is
 # the oldest eligible entry at 0.850, index 2 leads raw rank #1 at 0.862 but
 # its 0.012 lead does not clear the required lead, so the incumbent keeps the
