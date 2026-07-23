@@ -2514,6 +2514,11 @@ async def agent_pipeline(
                     in active_by_ticket
                     else None
                 ),
+                failure_reason=cast(
+                    Literal["infrastructure", "scoring_error", "sandbox_oom"] | None,
+                    ticket.failure_reason,
+                ),
+                failed_at=ticket.failed_at,
             )
             for ticket in tickets
         ],

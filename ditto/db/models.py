@@ -1501,6 +1501,14 @@ class ValidatorTicket(Base):
     )
     """Earliest time this validator may retry an expired ticket."""
 
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Latest signed public-safe failure class reported for this ticket."""
+
+    failed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    """When :attr:`failure_reason` was reported. Preserved across reissue."""
+
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=False,
@@ -1555,6 +1563,11 @@ class ValidatorTicket(Base):
         CheckConstraint(
             "infra_retry_grants >= 0",
             name="validator_tickets_infra_retry_grants_nonnegative",
+        ),
+        CheckConstraint(
+            "failure_reason IS NULL OR failure_reason IN "
+            "('infrastructure', 'scoring_error', 'sandbox_oom')",
+            name="validator_tickets_failure_reason",
         ),
         CheckConstraint(
             "slot_id IN ('slot-0', 'slot-1', 'slot-2', 'slot-3', "

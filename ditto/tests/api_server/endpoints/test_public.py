@@ -2944,6 +2944,8 @@ class TestPublicActivity:
                     purpose=TicketPurpose.CANONICAL_QUORUM,
                     issued_at=now - timedelta(hours=2),
                     deadline=now - timedelta(hours=1),
+                    failure_reason="sandbox_oom",
+                    failed_at=now - timedelta(hours=1),
                 )
             )
         _install_db(app, session_maker)
@@ -2955,6 +2957,8 @@ class TestPublicActivity:
         assert body["validation_attempts"][0]["status"] == "expired"
         assert body["validation_attempts"][0]["bench_version"] == 2
         assert body["validation_attempts"][0]["purpose"] == "canonical_quorum"
+        assert body["validation_attempts"][0]["failure_reason"] == "sandbox_oom"
+        assert body["validation_attempts"][0]["failed_at"] is not None
 
     async def test_pipeline_separates_canonical_quorum_from_continual_retests(
         self,

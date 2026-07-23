@@ -5513,6 +5513,15 @@
       return labels[status] || [String(status || "Unknown").replace(/_/g, " "), ""];
     }
 
+    function validatorFailureLabel(reason) {
+      var labels = {
+        sandbox_oom: "Sandbox out of memory",
+        infrastructure: "Validator infrastructure failure",
+        scoring_error: "Scoring run failed"
+      };
+      return labels[reason] || "";
+    }
+
     function screeningAttemptLabel(attempt) {
       var resolutions = {
         release: ["Released from quarantine", "good"],
@@ -6108,6 +6117,8 @@
         if (a.purpose === "continual_retest" && a.status === "expired") {
           label = ["Retest expired", "warn"];
         }
+        var failureLabel = validatorFailureLabel(a.failure_reason);
+        if (!a.actively_running && failureLabel) label = [failureLabel + " · deferred", "warn"];
         var continual = a.purpose === "continual_retest";
         var canonical = a.purpose === "canonical_quorum";
         var purposeLabel = continual
@@ -6126,6 +6137,7 @@
         else if (a.status === "issued") meta += " has this assignment";
         else if (a.status === "expired") meta += " did not submit a score";
         else meta += " submitted a score";
+        if (failureLabel) meta += " · reported " + failureLabel.toLowerCase();
         if (a.deadline && (a.actively_running || a.status === "issued")) {
           meta += " · score due " + new Date(a.deadline).toLocaleString();
         } else if (a.deadline && a.status === "expired") {
@@ -6139,7 +6151,7 @@
             entityAnchor("validator", a.validator_hotkey, "Validator " + shortKey(a.validator_hotkey)) +
             esc(meta.slice((purposeLabel + "Validator " + shortKey(a.validator_hotkey)).length)) +
           '</div>' + benchmark + '</div>' +
-          '<div class="attempt-time" title="' + esc(a.issued_at) + '">' + relTime(a.issued_at) + '</div></div>';
+          '<div class="attempt-time" title="' + esc(a.failed_at || a.issued_at) + '">' + relTime(a.failed_at || a.issued_at) + '</div></div>';
       }
       var validation = benchmarkCohorts(pipeline).map(function (cohort) {
         var attempts = cohort.attempts.map(renderValidationAttempt).join("");

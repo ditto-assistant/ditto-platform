@@ -170,6 +170,7 @@ from ditto.db.queries.scores import (
 )
 from ditto.db.queries.tickets import (
     MAX_INFRA_RETRY_GRANTS,
+    RETRY_COOLDOWN,
     get_open_ticket,
     infra_retry_backoff,
     issue_confirmation_ticket,
@@ -1998,6 +1999,8 @@ async def fail_job(
             # next request_job mints a fresh lease instead of resuming this one.
             ticket.status = TicketStatus.EXPIRED
             ticket.deadline = now
+            ticket.failure_reason = payload.reason
+            ticket.failed_at = now
             if payload.reason == "infrastructure":
                 # Not the agent's fault: bump the (bounded) infra grant that
                 # offsets the coming attempt_count++, so an outage never spends
@@ -2009,6 +2012,12 @@ async def fail_job(
                 ticket.retry_after = now + infra_retry_backoff(
                     ticket.infra_retry_grants
                 )
+            elif payload.reason == "sandbox_oom":
+                # The sandbox, rather than validator-owned infrastructure,
+                # exhausted its memory allowance. Preserve the failed attempt
+                # and defer this artifact so the validator immediately advances
+                # to another eligible harness instead of reclaiming it.
+                ticket.retry_after = now + RETRY_COOLDOWN
             else:
                 # A scoring_error is the agent's own failure: consume the budget
                 # and reissue immediately for another validator/attempt.

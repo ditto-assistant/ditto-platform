@@ -1336,6 +1336,10 @@ class PublicValidationAttempt(BaseModel):
     bench_version: Annotated[int, Field(ge=1)]
     actively_running: bool = False
     benchmark_progress: PublicBenchmarkProgress | None = None
+    failure_reason: Literal["infrastructure", "scoring_error", "sandbox_oom"] | None = (
+        None
+    )
+    failed_at: datetime | None = None
 
 
 class PublicConfirmationScore(BaseModel):
