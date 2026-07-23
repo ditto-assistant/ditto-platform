@@ -21,6 +21,12 @@ class InferenceGrantOffer(BaseModel):
     request_budget: Annotated[int, Field(ge=1)]
     token_budget: Annotated[int, Field(ge=1)]
     expires_at: datetime
+    provider: Annotated[str, Field(min_length=1, max_length=128)] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    profile_revision: Annotated[str, Field(min_length=1, max_length=128)] | None = (
+        Field(default=None, exclude_if=lambda value: value is None)
+    )
 
     @field_validator("expires_at")
     @classmethod
@@ -56,6 +62,15 @@ class InferenceExchangeResponse(BaseModel):
     proxy_url: str
     expires_at: datetime
     generation: Annotated[int, Field(ge=1)]
+    provider: Annotated[str, Field(min_length=1, max_length=128)] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    profile_revision: Annotated[str, Field(min_length=1, max_length=128)] | None = (
+        Field(default=None, exclude_if=lambda value: value is None)
+    )
+    model: Annotated[str, Field(min_length=1, max_length=128)] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @field_validator("expires_at")
     @classmethod

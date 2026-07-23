@@ -66,6 +66,7 @@ class InferenceProxyConfig:
     upstream_url: str
     allowed_models: tuple[str, ...]
     provider: str
+    routing_mode: str
     request_budget: int
     token_budget: int
     per_ticket_concurrency: int
@@ -78,6 +79,22 @@ class InferenceProxyConfig:
     response_body_bytes: int
     timeout_seconds: float
     max_output_tokens: int
+    discovery_url_template: str = (
+        "https://openrouter.ai/api/v1/models/{model}/endpoints"
+    )
+    discovery_interval_seconds: int = 300
+    route_speed_weight: float = 0.65
+    route_cost_weight: float = 0.25
+    route_exploration_weight: float = 0.10
+    route_ewma_alpha: float = 0.20
+    route_min_tool_accuracy: float = 0.55
+    route_min_composite: float = 0.15
+    route_min_calibration_samples: int = 60
+    route_exploration_ticket_budget: int = 3
+    route_max_error_rate: float = 0.25
+    route_max_timeout_rate: float = 0.15
+    route_cooldown_seconds: int = 30
+    reviewed_calibration_manifest_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -150,8 +167,9 @@ class ApiServerConfig:
             public_base_url="http://localhost:8000",
             openrouter_api_key=None,
             upstream_url="https://openrouter.ai/api/v1/chat/completions",
-            allowed_models=("qwen/qwen3-32b",),
+            allowed_models=("qwen/qwen3-32b", "openai/gpt-oss-20b"),
             provider="nebius",
+            routing_mode="aggregate_throughput",
             request_budget=1024,
             token_budget=4_000_000,
             per_ticket_concurrency=8,
@@ -291,11 +309,15 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
             allowed_models=tuple(
                 model.strip()
                 for model in os.environ.get(
-                    "DITTO_INFERENCE_ALLOWED_MODELS", "qwen/qwen3-32b"
+                    "DITTO_INFERENCE_ALLOWED_MODELS",
+                    "qwen/qwen3-32b,openai/gpt-oss-20b",
                 ).split(",")
                 if model.strip()
             ),
             provider=os.environ.get("DITTO_INFERENCE_PROVIDER", "nebius").strip(),
+            routing_mode=os.environ.get(
+                "DITTO_INFERENCE_ROUTING_MODE", "aggregate_throughput"
+            ).strip(),
             request_budget=int(
                 os.environ.get("DITTO_INFERENCE_REQUEST_BUDGET", "1024")
             ),
@@ -329,6 +351,50 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
             ),
             max_output_tokens=int(
                 os.environ.get("DITTO_INFERENCE_MAX_OUTPUT_TOKENS", "8192")
+            ),
+            discovery_url_template=os.environ.get(
+                "DITTO_INFERENCE_DISCOVERY_URL_TEMPLATE",
+                "https://openrouter.ai/api/v1/models/{model}/endpoints",
+            ),
+            discovery_interval_seconds=int(
+                os.environ.get("DITTO_INFERENCE_DISCOVERY_INTERVAL_SECONDS", "300")
+            ),
+            route_speed_weight=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_SPEED_WEIGHT", "0.65")
+            ),
+            route_cost_weight=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_COST_WEIGHT", "0.25")
+            ),
+            route_exploration_weight=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_EXPLORATION_WEIGHT", "0.10")
+            ),
+            route_ewma_alpha=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_EWMA_ALPHA", "0.20")
+            ),
+            route_min_tool_accuracy=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_MIN_TOOL_ACCURACY", "0.55")
+            ),
+            route_min_composite=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_MIN_COMPOSITE", "0.15")
+            ),
+            route_min_calibration_samples=int(
+                os.environ.get("DITTO_INFERENCE_ROUTE_MIN_CALIBRATION_SAMPLES", "60")
+            ),
+            route_exploration_ticket_budget=int(
+                os.environ.get("DITTO_INFERENCE_ROUTE_EXPLORATION_TICKETS", "3")
+            ),
+            route_max_error_rate=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_MAX_ERROR_RATE", "0.25")
+            ),
+            route_max_timeout_rate=float(
+                os.environ.get("DITTO_INFERENCE_ROUTE_MAX_TIMEOUT_RATE", "0.15")
+            ),
+            route_cooldown_seconds=int(
+                os.environ.get("DITTO_INFERENCE_ROUTE_COOLDOWN_SECONDS", "30")
+            ),
+            reviewed_calibration_manifest_sha256=(
+                os.environ.get("DITTO_INFERENCE_REVIEWED_CALIBRATION_MANIFEST_SHA256")
+                or None
             ),
         )
     except ValueError as error:
@@ -463,6 +529,10 @@ def check_config(config: ApiServerConfig) -> None:
             "DITTO_MIN_VALIDATOR_SOFTWARE_VERSION must be a stable X.Y.Z release"
         )
     inference = config.inference_proxy
+    if inference.routing_mode not in {"aggregate_throughput", "adaptive"}:
+        raise ApiServerConfigError(
+            "DITTO_INFERENCE_ROUTING_MODE must be aggregate_throughput or adaptive"
+        )
     if inference.enabled and inference.openrouter_api_key is None:
         raise ApiServerConfigError(
             "OPENROUTER_API_KEY is required when the inference proxy is enabled"
@@ -500,6 +570,52 @@ def check_config(config: ApiServerConfig) -> None:
     )
     if any(value < 1 for value in limits):
         raise ApiServerConfigError("inference proxy limits must be positive")
+    if inference.discovery_interval_seconds < 30:
+        raise ApiServerConfigError(
+            "inference provider discovery interval must be at least 30 seconds"
+        )
+    if "{model}" not in inference.discovery_url_template:
+        raise ApiServerConfigError("inference discovery URL must contain {model}")
+    discovery = urlparse(inference.discovery_url_template.replace("{model}", "model"))
+    if discovery.scheme != "https" or discovery.hostname != "openrouter.ai":
+        raise ApiServerConfigError("inference discovery must use OpenRouter HTTPS")
+    route_weights = (
+        inference.route_speed_weight,
+        inference.route_cost_weight,
+        inference.route_exploration_weight,
+    )
+    if any(weight < 0 for weight in route_weights) or sum(route_weights) <= 0:
+        raise ApiServerConfigError(
+            "inference route weights must be non-negative and non-zero"
+        )
+    if not 0 < inference.route_ewma_alpha <= 1:
+        raise ApiServerConfigError("inference route EWMA alpha must be in (0, 1]")
+    if not 0 <= inference.route_min_tool_accuracy <= 1:
+        raise ApiServerConfigError(
+            "inference route tool-accuracy floor must be in [0, 1]"
+        )
+    if not 0 <= inference.route_min_composite <= 1:
+        raise ApiServerConfigError("inference route composite floor must be in [0, 1]")
+    if inference.route_min_calibration_samples < 1:
+        raise ApiServerConfigError(
+            "inference route calibration sample floor must be positive"
+        )
+    if inference.route_exploration_ticket_budget < 0:
+        raise ApiServerConfigError(
+            "inference route exploration budget cannot be negative"
+        )
+    if not 0 <= inference.route_max_error_rate <= 1:
+        raise ApiServerConfigError("inference route error ceiling must be in [0, 1]")
+    if not 0 <= inference.route_max_timeout_rate <= 1:
+        raise ApiServerConfigError("inference route timeout ceiling must be in [0, 1]")
+    if inference.route_cooldown_seconds < 1:
+        raise ApiServerConfigError("inference route cooldown must be positive")
+    if inference.reviewed_calibration_manifest_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", inference.reviewed_calibration_manifest_sha256
+    ):
+        raise ApiServerConfigError(
+            "reviewed inference calibration manifest must be lowercase sha256"
+        )
     if not (
         inference.per_ticket_concurrency
         <= inference.per_validator_concurrency

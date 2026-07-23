@@ -1522,6 +1522,15 @@ class InferenceGrant(Base):
     broker_public_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     allowed_models: Mapped[list[str]] = mapped_column(_JSON_VARIANT, nullable=False)
+    route_provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    route_profile: Mapped[str | None] = mapped_column(Text, nullable=True)
+    route_quantization: Mapped[str | None] = mapped_column(Text, nullable=True)
+    route_prompt_price_per_token: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    route_completion_price_per_token: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
     request_budget: Mapped[int] = mapped_column(Integer, nullable=False)
     token_budget: Mapped[int] = mapped_column(BigInteger, nullable=False)
     request_count: Mapped[int] = mapped_column(
@@ -1579,6 +1588,177 @@ class InferenceGrant(Base):
     )
 
 
+class InferenceProviderRoute(Base):
+    """Discovered OpenRouter route plus platform-observed serving quality."""
+
+    __tablename__ = "inference_provider_routes"
+
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    profile_revision: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="discovered")
+    calibration_status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="shadow"
+    )
+    context_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quantization: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prompt_price_per_token: Mapped[float | None] = mapped_column(Float, nullable=True)
+    completion_price_per_token: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    ewma_tokens_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ewma_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ewma_error_rate: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default=text("0")
+    )
+    ewma_timeout_rate: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default=text("0")
+    )
+    ewma_tool_accuracy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ewma_composite: Mapped[float | None] = mapped_column(Float, nullable=True)
+    calibration_tool_accuracy: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    calibration_composite: Mapped[float | None] = mapped_column(Float, nullable=True)
+    calibration_sample_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    calibration_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    calibration_manifest_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    calibrated_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    ewma_cost_microusd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sample_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    selected_ticket_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    exploration_ticket_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    last_selected_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    cooldown_until: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    discovered_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    last_observed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint("model", "provider", "profile_revision"),
+        UniqueConstraint("profile_revision", name="inference_provider_profile_key"),
+        CheckConstraint(
+            "status IN ('discovered', 'healthy', 'degraded', 'offline')",
+            name="inference_provider_route_status",
+        ),
+        CheckConstraint(
+            "calibration_status IN ('shadow', 'eligible', 'disabled')",
+            name="inference_provider_calibration_status",
+        ),
+        CheckConstraint(
+            "ewma_error_rate >= 0 AND ewma_error_rate <= 1",
+            name="inference_provider_error_rate",
+        ),
+        CheckConstraint(
+            "ewma_timeout_rate >= 0 AND ewma_timeout_rate <= 1",
+            name="inference_provider_timeout_rate",
+        ),
+        CheckConstraint(
+            "calibration_revision >= 0",
+            name="inference_provider_calibration_revision",
+        ),
+        Index(
+            "inference_provider_routes_selection_idx",
+            "model",
+            "calibration_status",
+            "status",
+        ),
+    )
+
+
+class InferenceRoutingPolicy(Base):
+    """Audited operator-tunable policy for one benchmark model."""
+
+    __tablename__ = "inference_routing_policies"
+
+    model: Mapped[str] = mapped_column(Text, primary_key=True)
+    revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    speed_weight: Mapped[float] = mapped_column(Float, nullable=False)
+    cost_weight: Mapped[float] = mapped_column(Float, nullable=False)
+    exploration_weight: Mapped[float] = mapped_column(Float, nullable=False)
+    exploration_ticket_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    min_tool_accuracy: Mapped[float] = mapped_column(Float, nullable=False)
+    min_composite: Mapped[float] = mapped_column(Float, nullable=False)
+    min_calibration_samples: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_error_rate: Mapped[float] = mapped_column(Float, nullable=False)
+    max_timeout_rate: Mapped[float] = mapped_column(Float, nullable=False)
+    cooldown_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    ewma_alpha: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "speed_weight >= 0 AND cost_weight >= 0 AND exploration_weight >= 0",
+            name="inference_routing_policy_weights",
+        ),
+        CheckConstraint(
+            "speed_weight + cost_weight + exploration_weight > 0",
+            name="inference_routing_policy_nonzero_weights",
+        ),
+        CheckConstraint(
+            "min_tool_accuracy >= 0 AND min_tool_accuracy <= 1 "
+            "AND min_composite >= 0 AND min_composite <= 1",
+            name="inference_routing_policy_quality",
+        ),
+        CheckConstraint(
+            "max_error_rate >= 0 AND max_error_rate <= 1 "
+            "AND max_timeout_rate >= 0 AND max_timeout_rate <= 1 "
+            "AND ewma_alpha > 0 AND ewma_alpha <= 1",
+            name="inference_routing_policy_reliability",
+        ),
+        CheckConstraint(
+            "exploration_ticket_budget >= 0 AND min_calibration_samples > 0 "
+            "AND cooldown_seconds >= 1 AND revision >= 0",
+            name="inference_routing_policy_bounds",
+        ),
+    )
+
+
+class InferenceRoutingAudit(Base):
+    """Append-only operator history for inference policy and route decisions."""
+
+    __tablename__ = "inference_routing_audit"
+
+    audit_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    profile_revision: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+
+    __table_args__ = (Index("inference_routing_audit_history_idx", "recorded_at"),)
+
+
 class InferenceRequest(Base):
     """Replay ledger and bounded accounting for one proxy request."""
 
@@ -1595,6 +1775,9 @@ class InferenceRequest(Base):
         BigInteger, nullable=False, default=0
     )
     cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    upstream_provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    timed_out: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     started_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )

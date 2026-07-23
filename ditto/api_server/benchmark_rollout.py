@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Literal
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_server.datapipeline import DatasetGenerator
+from ditto.api_server.inference_routing import (
+    AGGREGATE_CALIBRATION_SAMPLES,
+    AGGREGATE_PROVIDER,
+    aggregate_profile_revision,
+    benchmark_model,
+)
 from ditto.db.models import (
     Agent,
     BenchmarkDataset,
@@ -23,6 +29,7 @@ from ditto.db.queries.benchmark_rollout import (
     MAX_PERSISTED_RESCORE_COHORT_SIZE,
     RESCORE_COHORT_SIZE,
     DatasetPin,
+    InferenceActivationRequirements,
     RolloutSnapshotMember,
     append_rollout_member,
     historical_rescore_cohort,
@@ -31,6 +38,31 @@ from ditto.db.queries.benchmark_rollout import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ditto.api_server.config import InferenceProxyConfig
+
+
+def inference_activation_requirements(
+    config: InferenceProxyConfig | None, *, bench_version: int
+) -> InferenceActivationRequirements | None:
+    """Snapshot live process configuration without exposing provider secrets."""
+    if config is None:
+        return None
+    model = benchmark_model(bench_version)
+    return InferenceActivationRequirements(
+        enabled=config.enabled,
+        provider_key_configured=bool(config.openrouter_api_key),
+        model=model,
+        routing_mode=config.routing_mode,  # type: ignore[arg-type]
+        reviewed_manifest_sha256=config.reviewed_calibration_manifest_sha256,
+        aggregate_provider=AGGREGATE_PROVIDER,
+        aggregate_profile_revision=aggregate_profile_revision(model),
+        aggregate_calibration_samples=AGGREGATE_CALIBRATION_SAMPLES,
+        route_observation_max_age=timedelta(
+            seconds=max(60, config.discovery_interval_seconds)
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -240,7 +272,11 @@ async def ensure_rolling_qualification(
 
 
 async def refresh_rolling_qualification(
-    session: AsyncSession, *, generator: DatasetGenerator, now: datetime
+    session: AsyncSession,
+    *,
+    generator: DatasetGenerator,
+    now: datetime,
+    inference_config: InferenceProxyConfig | None = None,
 ) -> int:
     """Converge the frozen inherited top-ten cohort and try activation.
 
@@ -343,5 +379,12 @@ async def refresh_rolling_qualification(
                 now=now,
                 audit_context={"seed_source": candidate.seed_source},
             )
-        await maybe_activate_rollout(session, rollout, now=now)
+        await maybe_activate_rollout(
+            session,
+            rollout,
+            now=now,
+            inference_requirements=inference_activation_requirements(
+                inference_config, bench_version=rollout.desired_version
+            ),
+        )
     return appended

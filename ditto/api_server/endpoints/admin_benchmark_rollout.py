@@ -2,30 +2,46 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.benchmark_contract import (
     benchmark_contract,
     benchmark_contracts,
 )
+from ditto.api_models.validator_capabilities import ValidatorCapabilities
 from ditto.api_server.benchmark_rollout import (
+    inference_activation_requirements,
     qualification_candidate,
     refresh_rolling_qualification,
 )
 from ditto.api_server.datapipeline import DataPipelineError, DatasetGenerator
 from ditto.api_server.dependencies import get_dataset_generator, get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
+from ditto.api_server.inference_routing import (
+    AGGREGATE_CALIBRATION_SAMPLES,
+    AGGREGATE_PROVIDER,
+    aggregate_profile_revision,
+    benchmark_model,
+)
+from ditto.db.models import (
+    InferenceProviderRoute,
+    InferenceRoutingPolicy,
+    ValidatorHeartbeat,
+)
 from ditto.db.queries.benchmark_rollout import (
     DatasetPin,
     RolloutConflictError,
     active_bench_version,
     authority_selection_state,
     create_rollout_snapshot,
+    heartbeat_supports_version,
     historical_rescore_cohort,
     rollout_for_desired_version,
     rollout_state,
@@ -111,7 +127,12 @@ def _generator_unavailable(target: int, exc: DataPipelineError) -> HTTPException
 
 
 async def _require_rollout_start_capacity(
-    session: AsyncSession, *, now: datetime, desired_version: int
+    session: AsyncSession,
+    *,
+    now: datetime,
+    desired_version: int,
+    routing_mode: str = "adaptive",
+    reviewed_manifest_sha256: str | None = None,
 ) -> dict[str, object]:
     """Fail closed until one independently verified target scorer is online."""
     state = await rollout_state(session, now=now, capability_version=desired_version)
@@ -125,6 +146,94 @@ async def _require_rollout_start_capacity(
                 "v8 scorer validators"
             ),
         )
+    if desired_version >= 7:
+        model = benchmark_model(desired_version)
+        route_statement = (
+            select(InferenceProviderRoute)
+            .join(
+                InferenceRoutingPolicy,
+                InferenceRoutingPolicy.model == InferenceProviderRoute.model,
+            )
+            .where(
+                InferenceProviderRoute.model == model,
+                (
+                    InferenceRoutingPolicy.enabled.is_(True)
+                    if routing_mode == "adaptive"
+                    else InferenceProviderRoute.provider == AGGREGATE_PROVIDER
+                ),
+                (
+                    InferenceProviderRoute.profile_revision
+                    == aggregate_profile_revision(model)
+                    if routing_mode == "aggregate_throughput"
+                    else InferenceProviderRoute.provider.is_not(None)
+                ),
+                InferenceProviderRoute.status.in_(("discovered", "healthy")),
+                InferenceProviderRoute.calibration_status == "eligible",
+                InferenceProviderRoute.calibration_tool_accuracy
+                >= InferenceRoutingPolicy.min_tool_accuracy,
+                InferenceProviderRoute.calibration_composite
+                >= InferenceRoutingPolicy.min_composite,
+                (
+                    InferenceProviderRoute.calibration_sample_count
+                    == AGGREGATE_CALIBRATION_SAMPLES
+                    if routing_mode == "aggregate_throughput"
+                    else InferenceProviderRoute.calibration_sample_count
+                    >= InferenceRoutingPolicy.min_calibration_samples
+                ),
+                InferenceProviderRoute.calibration_manifest_sha256.is_not(None),
+            )
+        )
+        if reviewed_manifest_sha256 is not None:
+            route_statement = route_statement.where(
+                InferenceProviderRoute.calibration_manifest_sha256
+                == reviewed_manifest_sha256
+            )
+        calibrated_routes = list(await session.scalars(route_statement))
+        if not calibrated_routes:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"benchmark v{desired_version} rollout requires at least one "
+                    "healthy reviewed inference calibration"
+                ),
+            )
+        heartbeats = list(await session.scalars(select(ValidatorHeartbeat)))
+        matching_identity = False
+        for heartbeat in heartbeats:
+            if not heartbeat_supports_version(
+                heartbeat, now=now, version=desired_version
+            ):
+                continue
+            try:
+                capabilities = ValidatorCapabilities.model_validate_json(
+                    json.dumps(heartbeat.capabilities)
+                )
+            except ValidationError:
+                continue
+            scorer = capabilities.scorer_benchmarks
+            calibration = scorer.v7_calibration if scorer is not None else None
+            if calibration is None:
+                continue
+            supported = {
+                (route.model, route.provider, route.profile_revision)
+                for route in calibration.supported_routes
+            }
+            if any(
+                row.calibration_manifest_sha256 == calibration.manifest_sha256
+                and (row.model, row.provider, row.profile_revision) in supported
+                for row in calibrated_routes
+            ):
+                matching_identity = True
+                break
+        if not matching_identity:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"benchmark v{desired_version} rollout requires a capable "
+                    "validator whose exact route and manifest match an eligible "
+                    "inference calibration"
+                ),
+            )
     return state
 
 
@@ -234,6 +343,7 @@ async def select_active_contract(
     session: SessionDep,
     desired_version: str,
     payload: AdminActiveContractRequest,
+    request: Request = None,  # type: ignore[assignment]
 ) -> dict[str, object]:
     """Select a fully qualified superseded contract as weight authority."""
     target = _parse_desired_version(desired_version)
@@ -254,6 +364,14 @@ async def select_active_contract(
             actor=payload.actor,
             reason=payload.reason,
             now=datetime.now(UTC),
+            inference_requirements=inference_activation_requirements(
+                (
+                    request.app.state.config.inference_proxy
+                    if request is not None
+                    else None
+                ),
+                bench_version=target,
+            ),
         )
     except RolloutConflictError as exc:
         await session.rollback()
@@ -269,6 +387,7 @@ async def start_rollout(
     generator: GeneratorDep,
     desired_version: str,
     payload: AdminRolloutStartRequest,
+    request: Request = None,  # type: ignore[assignment]
 ) -> dict[str, object]:
     """Seed the bounded historical rescore cohort and target datasets."""
     target = _parse_desired_version(desired_version)
@@ -315,13 +434,53 @@ async def start_rollout(
         # admin POST exists to report whether the action succeeded, so it surfaces.
         try:
             await refresh_rolling_qualification(
-                session, generator=generator, now=datetime.now(UTC)
+                session,
+                generator=generator,
+                now=datetime.now(UTC),
+                inference_config=(
+                    request.app.state.config.inference_proxy
+                    if request is not None
+                    else None
+                ),
             )
         except DataPipelineError as exc:
             raise _generator_unavailable(target, exc) from exc
         return await rollout_state(session, capability_version=target)
     now = datetime.now(UTC)
-    await _require_rollout_start_capacity(session, now=now, desired_version=target)
+    inference_config = (
+        request.app.state.config.inference_proxy if request is not None else None
+    )
+    if (
+        target >= 7
+        and inference_config is not None
+        and (
+            not inference_config.enabled
+            or inference_config.openrouter_api_key is None
+            or inference_config.reviewed_calibration_manifest_sha256 is None
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"benchmark v{target} rollout requires the enabled platform "
+                "inference proxy and a deployed reviewed calibration manifest"
+            ),
+        )
+    await _require_rollout_start_capacity(
+        session,
+        now=now,
+        desired_version=target,
+        routing_mode=(
+            inference_config.routing_mode
+            if inference_config is not None
+            else "adaptive"
+        ),
+        reviewed_manifest_sha256=(
+            inference_config.reviewed_calibration_manifest_sha256
+            if target >= 7 and inference_config is not None
+            else None
+        ),
+    )
     members = await historical_rescore_cohort(session, source_version=from_version)
     if len(members) < 5:
         raise HTTPException(

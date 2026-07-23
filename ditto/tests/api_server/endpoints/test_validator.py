@@ -50,7 +50,9 @@ from ditto.api_models.system_health import (
 )
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator_capabilities import (
+    InferenceCalibrationRoute,
     ScorerBenchmarkCapability,
+    V7InferenceCalibration,
     ValidatorCapabilities,
     ValidatorStackIdentity,
     validator_identity_signing_token,
@@ -267,6 +269,33 @@ def test_scorer_benchmark_capability_is_conservative_unless_fresh_verified() -> 
     )
     assert verified.supported_bench_versions == (2, 3)
 
+    with pytest.raises(ValueError, match="requires exact inference calibration"):
+        ScorerBenchmarkCapability(
+            status="fresh_verified",
+            supported_bench_versions=(2, 7),
+            observed_at=1784020800,
+            software_version="1.3.0",
+            source_revision="a" * 40,
+        )
+    calibrated = ScorerBenchmarkCapability(
+        status="fresh_verified",
+        supported_bench_versions=(2, 7),
+        observed_at=1784020800,
+        software_version="1.3.0",
+        source_revision="a" * 40,
+        v7_calibration=V7InferenceCalibration(
+            manifest_sha256="b" * 64,
+            supported_routes=(
+                InferenceCalibrationRoute(
+                    provider="Groq",
+                    profile_revision="openrouter-route-groq-v1",
+                    model="openai/gpt-oss-20b",
+                ),
+            ),
+        ),
+    )
+    assert calibrated.v7_calibration is not None
+
 
 def _sign(message: str) -> str:
     return _KEYPAIR.sign(message.encode()).hex()
@@ -431,8 +460,9 @@ def _heartbeat_payload(
             typed_capacity = BenchmarkCapacity.model_validate_json(
                 json.dumps(benchmark_capacity)
             )
+            domain = "v11" if protocol_version >= 11 else "v10"
             message = (
-                f"ditto-validator-heartbeat:v10:{hotkey}:0.1.0:{protocol_version}:"
+                f"ditto-validator-heartbeat:{domain}:{hotkey}:0.1.0:{protocol_version}:"
                 f"{code_digest}:{state}:{active_agent_id or ''}:"
                 f"{system_metrics_signing_token(metrics)}:"
                 f"{benchmark_progress_signing_token(progress)}:"
@@ -4528,6 +4558,8 @@ def _install_chain_with_block(app: FastAPI, *, block_number: int) -> None:
 
 async def _seed_top5_emission_set(
     maker: async_sessionmaker[AsyncSession],
+    *,
+    bench_version: int = 2,
 ) -> list[UUID]:
     composites = [0.90, 0.88, 0.86, 0.84, 0.82, 0.80]
     agent_ids = [
@@ -4547,7 +4579,7 @@ async def _seed_top5_emission_set(
                 session.add(
                     Score(
                         agent_id=agent_id,
-                        bench_version=2,
+                        bench_version=bench_version,
                         validator_hotkey=keypair.ss58_address,
                         run_id=f"top5-{agent_id}-{index}",
                         signature=None,
@@ -4618,6 +4650,109 @@ def _top5_score_payload(
 
 
 class TestTop5ConfirmationLane:
+    async def test_v7_job_includes_ticket_scoped_inference_offer(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker, bench_version=7)
+        champion, member = agent_ids[0], agent_ids[1]
+        now = datetime.now(UTC)
+        profile = "openrouter-route-a471cd87ae7df5b9-v1"
+        capabilities = {
+            **_V7_CAPABILITIES,
+            "ticket_inference": True,
+            "scorer_benchmarks": {
+                "status": "fresh_verified",
+                "supported_bench_versions": [2, 7],
+                "observed_at": int(now.timestamp()),
+                "software_version": "1.3.0",
+                "source_revision": "2" * 40,
+                "v7_calibration": {
+                    "manifest_sha256": "c" * 64,
+                    "supported_routes": (
+                        {
+                            "provider": "openrouter",
+                            "profile_revision": profile,
+                            "model": "openai/gpt-oss-20b",
+                        },
+                    ),
+                },
+            },
+        }
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=11,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=6,
+                    desired_version=7,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now,
+                    activated_at=now,
+                )
+            )
+            for agent_id in agent_ids:
+                agent = await session.get(Agent, agent_id)
+                assert agent is not None
+                agent.screening_policy_version = 9
+                agent.screened_image_sha256 = "12" * 32
+                agent.screened_image_size_bytes = 123
+                agent.screened_image_id = "sha256:" + "34" * 32
+                agent.screened_image_ref = f"ditto-screen/{agent_id}:latest"
+                agent.screened_image_upload_id = uuid4()
+                agent.screened_image_verified_at = now
+
+        grant_id = uuid4()
+        grant = MagicMock(
+            grant_id=grant_id,
+            allowed_models=["openai/gpt-oss-20b"],
+            request_budget=1203,
+            token_budget=3_000_000,
+            expires_at=now + timedelta(minutes=90),
+            route_provider="openrouter",
+            route_profile=profile,
+        )
+        ensure = AsyncMock(return_value=grant)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.ensure_inference_grant", ensure
+        )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=0)
+        app.state.config = replace(
+            app.state.config,
+            top5_backoff_base=2,
+            inference_proxy=replace(
+                app.state.config.inference_proxy,
+                enabled=True,
+                openrouter_api_key="test-only",
+            ),
+        )
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["bench_version"] == 7
+        assert body["slot_id"] == "slot-0"
+        assert body["minimum_screening_policy_version"] == 9
+        assert body["requires_screened_image"] is True
+        assert body["inference"]["grant_id"] == str(grant_id)
+        assert body["inference"]["profile_revision"] == profile
+        ensure.assert_awaited_once()
+
     async def test_appends_evidence_without_replacing_canonical_score(
         self,
         app: FastAPI,
