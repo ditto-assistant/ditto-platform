@@ -163,7 +163,11 @@ from ditto.db.models import (
 )
 from ditto.db.queries.agents import list_public_activity
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
-from ditto.db.queries.benchmark_rollout import active_bench_version, rollout_state
+from ditto.db.queries.benchmark_rollout import (
+    active_bench_version,
+    open_rollout,
+    rollout_state,
+)
 from ditto.db.queries.confirmation_scores import (
     confirmation_composites_by_seed,
     confirmation_depths,
@@ -2700,15 +2704,27 @@ async def bench_corpus(
 
 
 @router.get("/bench/config", response_model=PublicBenchConfigResponse)
-async def bench_config(response: Response) -> PublicBenchConfigResponse:
-    """The current benchmark setup: frozen model, judge-free grading, seeds.
+async def bench_config(
+    response: Response, session: SessionDep
+) -> PublicBenchConfigResponse:
+    """The active or operator-selected benchmark setup.
 
     The harness model is a consensus parameter: every scoring validator runs
     the same frozen open-weight artifact through a model-pinning gateway, so
-    model choice is not a miner lever and k=3 scores are comparable. The
-    ``BENCH_*`` env overrides exist for coordinated fleet bumps only.
+    model choice is not a miner lever and k=3 scores are comparable. Shipping
+    support for a future contract does not publish it here: the Backroom rollout
+    target selects it. The ``BENCH_*`` env overrides exist for coordinated fleet
+    bumps only.
     """
     response.headers["Cache-Control"] = "public, max-age=300"
+    active_version = await active_bench_version(session)
+    rollout = await open_rollout(session)
+    desired_version = rollout.desired_version if rollout is not None else None
+    v7_or_newer = active_version >= 7
+    default_model = "openai/gpt-oss-20b" if v7_or_newer else "qwen/qwen3-32b"
+    default_serving = (
+        "OpenRouter dynamic provider route" if v7_or_newer else "Qwen/Qwen3-32B-TEE"
+    )
     public_bucket = os.environ.get("STORAGE_PUBLIC_BUCKET", "")
     mirror = (
         f"https://storage.googleapis.com/{public_bucket}/scored/{{agent_id}}.json"
@@ -2721,16 +2737,30 @@ async def bench_config(response: Response) -> PublicBenchConfigResponse:
         else None
     )
     return PublicBenchConfigResponse(
-        bench_version=CURRENT_BENCH_VERSION,
+        bench_version=active_version,
+        desired_bench_version=desired_version,
         harness=BenchHarnessConfig(
             locked=True,
-            canonical_id=os.environ.get("BENCH_HARNESS_MODEL_ID", "qwen/qwen3-32b"),
-            serving=os.environ.get("BENCH_HARNESS_SERVING", "Qwen/Qwen3-32B-TEE"),
-            thinking=os.environ.get("BENCH_HARNESS_THINKING", "false") == "true",
+            canonical_id=os.environ.get("BENCH_HARNESS_MODEL_ID", default_model),
+            serving=os.environ.get("BENCH_HARNESS_SERVING", default_serving),
+            thinking=(
+                True
+                if v7_or_newer
+                else os.environ.get("BENCH_HARNESS_THINKING", "false") == "true"
+            ),
+            reasoning_effort="medium" if v7_or_newer else None,
             enforcement=(
-                "model-pinning relay forces the model field and holds the "
-                "upstream key outside the sandbox; sandbox egress is deny-all "
-                "(no other model is reachable)"
+                (
+                    "ticket-scoped platform proxy forces the model and medium "
+                    "reasoning effort and holds the upstream key outside the "
+                    "sandbox; sandbox egress is deny-all"
+                )
+                if v7_or_newer
+                else (
+                    "model-pinning relay forces the model field and holds the "
+                    "upstream key outside the sandbox; sandbox egress is deny-all "
+                    "(no other model is reachable)"
+                )
             ),
         ),
         grading=BenchGradingConfig(
