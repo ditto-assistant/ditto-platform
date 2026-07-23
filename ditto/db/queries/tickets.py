@@ -30,6 +30,7 @@ from ditto.db.models import (
     Agent,
     BenchmarkDataset,
     BenchmarkRollout,
+    BenchmarkRolloutMember,
     EvaluationPayment,
     Score,
     ValidatorTicket,
@@ -227,12 +228,25 @@ async def issue_ticket(
     await expire_overdue_tickets(session, now=now)
     if bench_version is None:
         raise ValueError("benchmark version is required for ticket issuance")
+    activated_rollout = await session.scalar(
+        select(BenchmarkRollout)
+        .where(
+            BenchmarkRollout.desired_version == bench_version,
+            BenchmarkRollout.status == "activated",
+        )
+        .order_by(BenchmarkRollout.activated_at.desc())
+        .limit(1)
+    )
     if fifo_start_at is None:
-        fifo_start_at = await session.scalar(
-            select(BenchmarkRollout.created_at)
-            .where(BenchmarkRollout.desired_version == bench_version)
-            .order_by(BenchmarkRollout.created_at.desc())
-            .limit(1)
+        fifo_start_at = (
+            activated_rollout.created_at
+            if activated_rollout is not None
+            else await session.scalar(
+                select(BenchmarkRollout.created_at)
+                .where(BenchmarkRollout.desired_version == bench_version)
+                .order_by(BenchmarkRollout.created_at.desc())
+                .limit(1)
+            )
         )
     contract = benchmark_contract(bench_version)
     requires_screened = (
@@ -253,6 +267,36 @@ async def issue_ticket(
     eligible_screened_image = complete_screened_image & (
         Agent.screening_policy_version >= contract.minimum_screening_policy_version
     )
+    rollout_admitted = None
+    if activated_rollout is not None:
+        # A dataset row is not admission evidence: routine policy rescreens can
+        # regenerate it for historical submissions. New-era submissions,
+        # frozen rollout members, and explicitly audited operator recoveries
+        # are the only paths allowed to consume current validator capacity.
+        rollout_member = (
+            select(BenchmarkRolloutMember.agent_id)
+            .where(
+                BenchmarkRolloutMember.rollout_id == activated_rollout.rollout_id,
+                BenchmarkRolloutMember.agent_id == Agent.agent_id,
+            )
+            .correlate(Agent)
+            .exists()
+        )
+        operator_admission = (
+            select(ValidatorTicket.agent_id)
+            .where(
+                ValidatorTicket.agent_id == Agent.agent_id,
+                ValidatorTicket.bench_version == bench_version,
+                ValidatorTicket.manual_retry_grants > 0,
+            )
+            .correlate(Agent)
+            .exists()
+        )
+        rollout_admitted = or_(
+            Agent.created_at >= activated_rollout.created_at,
+            rollout_member,
+            operator_admission,
+        )
     existing_statement = (
         select(ValidatorTicket)
         .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
@@ -271,6 +315,8 @@ async def issue_ticket(
     )
     if requires_screened:
         existing_statement = existing_statement.where(eligible_screened_image)
+    if rollout_admitted is not None:
+        existing_statement = existing_statement.where(rollout_admitted)
     existing = await session.scalar(existing_statement)
     if existing is not None:
         return existing
@@ -540,6 +586,8 @@ async def issue_ticket(
             candidate = candidate.where(versioned_dataset)
         if requires_screened:
             candidate = candidate.where(eligible_screened_image)
+        if rollout_admitted is not None:
+            candidate = candidate.where(rollout_admitted)
         if submitted_at_or_after is not None:
             candidate = candidate.where(Agent.created_at >= submitted_at_or_after)
         if skipped:
