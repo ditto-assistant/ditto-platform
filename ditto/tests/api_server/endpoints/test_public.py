@@ -436,7 +436,10 @@ class TestPublicChainWeights:
         response = await client.get("/api/v1/public/weights")
 
         assert response.status_code == 200
-        assert response.headers["cache-control"] == "public, max-age=30"
+        assert (
+            response.headers["cache-control"]
+            == "public, max-age=30, stale-while-revalidate=120"
+        )
         body = response.json()
         assert body["netuid"] == 118
         assert body["block"] == 8_639_503
@@ -530,7 +533,10 @@ class TestPublicBenchmarkTimeline:
         response = await client.get("/api/v1/public/bench/timeline")
 
         assert response.status_code == 200
-        assert response.headers["cache-control"] == "public, max-age=300"
+        assert (
+            response.headers["cache-control"]
+            == "public, max-age=300, stale-while-revalidate=3600"
+        )
         body = response.json()
         assert body["metric"] == "memory_mean"
         assert body["score_quorum"] == 3
@@ -945,7 +951,10 @@ class TestPublicLeaderboard:
 
         resp = await client.get("/api/v1/public/leaderboard")
         assert resp.status_code == 200
-        assert resp.headers["Cache-Control"] == "public, max-age=30"
+        assert (
+            resp.headers["Cache-Control"]
+            == "public, max-age=30, stale-while-revalidate=120"
+        )
         body = resp.json()
         assert body["selection_mode"] == "authoritative"
         assert body["active_bench_version"] == DEFAULT_BENCH_VERSION
@@ -973,6 +982,33 @@ class TestPublicLeaderboard:
         assert historical["entries"] == body["entries"]
         assert historical["emissions"] is None
         assert historical["available_bench_versions"] == [DEFAULT_BENCH_VERSION]
+
+    async def test_settled_bench_version_board_caches_longer_than_the_live_one(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+
+        live = await client.get("/api/v1/public/leaderboard")
+        pinned_live = await client.get(
+            f"/api/v1/public/leaderboard?bench_version={DEFAULT_BENCH_VERSION}"
+        )
+        settled = await client.get(
+            f"/api/v1/public/leaderboard?bench_version={DEFAULT_BENCH_VERSION - 1}"
+        )
+
+        live_window = "public, max-age=30, stale-while-revalidate=120"
+        assert live.headers["Cache-Control"] == live_window
+        # The version still in play is not history, even pinned explicitly.
+        assert pinned_live.headers["Cache-Control"] == live_window
+        # A version the rollout has moved past is finished work, so a reload of
+        # the timeline's per-contract boards costs no requests.
+        assert (
+            settled.headers["Cache-Control"]
+            == "public, max-age=3600, stale-while-revalidate=86400"
+        )
 
     async def test_exposes_advisory_calibration(
         self,
@@ -1131,7 +1167,10 @@ class TestPublicHealth:
 
         resp = await client.get("/api/v1/public/health")
         assert resp.status_code == 200
-        assert resp.headers["Cache-Control"] == "public, max-age=30"
+        assert (
+            resp.headers["Cache-Control"]
+            == "public, max-age=30, stale-while-revalidate=120"
+        )
         body = resp.json()
         assert body["miners"] == 3
         assert body["scored_miners"] == 2
@@ -1388,7 +1427,10 @@ class TestPublicFleet:
         response = await client.get("/api/v1/public/validator-names")
 
         assert response.status_code == 200
-        assert response.headers["Cache-Control"] == "public, max-age=30"
+        assert (
+            response.headers["Cache-Control"]
+            == "public, max-age=30, stale-while-revalidate=120"
+        )
         body = response.json()
         assert set(body) == {
             "generated_at",
@@ -3308,7 +3350,10 @@ class TestPublicSubmissionScores:
 
         resp = await client.get(f"/api/v1/public/agent/{agent_id}/scores")
         assert resp.status_code == 200
-        assert resp.headers["Cache-Control"] == "public, max-age=30"
+        assert (
+            resp.headers["Cache-Control"]
+            == "public, max-age=30, stale-while-revalidate=120"
+        )
         body = resp.json()
         assert body["agent_id"] == agent_id
         assert body["miner_hotkey"] == _MINER_A
@@ -3788,7 +3833,10 @@ class TestPublicAudit:
 
         resp = await client.get("/api/v1/public/audit")
         assert resp.status_code == 200
-        assert resp.headers["Cache-Control"] == "public, max-age=30"
+        assert (
+            resp.headers["Cache-Control"]
+            == "public, max-age=30, stale-while-revalidate=120"
+        )
         body = resp.json()
         assert body["count"] == 3
         assert body["genesis_hash"] == GENESIS_HASH
