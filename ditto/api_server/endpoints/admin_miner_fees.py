@@ -39,7 +39,7 @@ async def get_miner_fee_summary(
     totals = (
         await session.execute(
             select(
-                func.count(EvaluationPayment.agent_id),
+                func.count(EvaluationPayment.block_hash),
                 func.coalesce(func.sum(EvaluationPayment.amount_rao), 0),
                 func.coalesce(priced_count, 0),
                 func.coalesce(func.sum(_usd_value()), 0),
@@ -55,7 +55,7 @@ async def get_miner_fee_summary(
         await session.execute(
             select(
                 day,
-                func.count(EvaluationPayment.agent_id),
+                func.count(EvaluationPayment.block_hash),
                 func.sum(EvaluationPayment.amount_rao),
                 priced_count,
                 func.coalesce(func.sum(_usd_value()), 0),
