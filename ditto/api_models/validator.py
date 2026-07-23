@@ -298,6 +298,7 @@ class JobResponse(BaseModel):
 FailJobReason = Literal[
     "infrastructure",
     "scoring_error",
+    "sandbox_oom",
 ]
 """Coarse reason a validator hands a leased ticket back for reissue.
 
@@ -306,10 +307,13 @@ branches on it: ``infrastructure`` earns a bounded compensating grant plus an
 escalating cooldown, so a validator-side outage neither spends the agent's
 genuine attempt budget nor hammers the failing provider; ``scoring_error`` is
 the agent's own failure and consumes an attempt with an immediate reissue.
-``infrastructure`` maps to the validator's ``ValidatorInfrastructureError``
-sweep-ending branch; ``scoring_error`` maps to its ``DittobenchError`` /
-``PlatformError`` scoring-failure branch. These values are the wire contract
-shared verbatim with ditto-subnet (which emits them).
+``sandbox_oom`` is an observed sandbox memory exhaustion: it consumes the
+failed attempt, records a public-safe telemetry signal, and applies the normal
+agent-failure cooldown so another eligible harness runs next. ``infrastructure``
+maps to the validator's ``ValidatorInfrastructureError`` sweep-ending branch;
+``scoring_error`` maps to other ``DittobenchError`` scoring failures. These
+values are the wire contract shared verbatim with ditto-subnet (which emits
+them).
 """
 
 

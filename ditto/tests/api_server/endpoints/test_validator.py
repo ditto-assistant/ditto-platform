@@ -80,6 +80,7 @@ from ditto.db.models import (
     Base,
     BenchmarkDataset,
     BenchmarkRollout,
+    BenchmarkRolloutMember,
     Score,
     ScreenerHeartbeat,
     ValidatorHeartbeat,
@@ -1480,9 +1481,10 @@ class TestHeartbeat:
 
         now = datetime.now(UTC)
         async with session_maker() as session, session.begin():
+            rollout_id = uuid4()
             session.add(
                 BenchmarkRollout(
-                    rollout_id=uuid4(),
+                    rollout_id=rollout_id,
                     from_version=2,
                     desired_version=3,
                     status="collecting",
@@ -2596,15 +2598,25 @@ class TestRequestJob:
             agent.screened_image_ref = f"ditto-screen/{agent_id}:latest"
             agent.screened_image_upload_id = uuid4()
             agent.screened_image_verified_at = now
+            rollout_id = uuid4()
             session.add(
                 BenchmarkRollout(
-                    rollout_id=uuid4(),
+                    rollout_id=rollout_id,
                     from_version=bench_version - 1,
                     desired_version=bench_version,
                     status="activated",
                     cohort_size=5,
                     created_at=now,
                     activated_at=now,
+                )
+            )
+            session.add(
+                BenchmarkRolloutMember(
+                    rollout_id=rollout_id,
+                    agent_id=agent_id,
+                    position=1,
+                    frozen_miner_hotkey=agent.miner_hotkey,
+                    frozen_composite=0.0,
                 )
             )
             session.add(
@@ -3226,6 +3238,45 @@ class TestFailJob:
             assert (retry_after - now) <= timedelta(minutes=31)
 
         # The agent is in cooldown, so request_job does not immediately re-lease it.
+        reissued = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+        assert reissued.status_code == 204, reissued.text
+
+    async def test_sandbox_oom_is_recorded_and_defers_same_harness(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(agent_id, reason="sandbox_oom"),
+        )
+        assert failed.status_code == 200, failed.text
+        assert failed.json()["reopened"] is True
+
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.status == TicketStatus.EXPIRED
+            assert ticket.failure_reason == "sandbox_oom"
+            assert ticket.failed_at is not None
+            assert ticket.retry_after is not None
+            now = datetime.now(UTC)
+            retry_after = ticket.retry_after
+            if retry_after.tzinfo is None:
+                retry_after = retry_after.replace(tzinfo=UTC)
+            assert retry_after - now > timedelta(hours=5)
+
+        # With no other agent seeded, the failed harness is not immediately
+        # reclaimed. A validator can advance to other eligible work instead.
         reissued = await client.post(
             "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
         )

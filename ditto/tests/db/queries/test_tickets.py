@@ -16,6 +16,7 @@ from ditto.db.models import (
     Agent,
     BenchmarkDataset,
     BenchmarkRollout,
+    BenchmarkRolloutMember,
     EvaluationPayment,
     Score,
     ValidatorTicket,
@@ -326,9 +327,10 @@ class TestIssueTicket:
         lower_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         higher_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
         async with session.begin():
+            rollout_id = uuid4()
             session.add(
                 BenchmarkRollout(
-                    rollout_id=uuid4(),
+                    rollout_id=rollout_id,
                     from_version=2,
                     desired_version=3,
                     status="activated",
@@ -367,6 +369,15 @@ class TestIssueTicket:
                         run_size="full",
                     )
                 )
+                session.add(
+                    BenchmarkRolloutMember(
+                        rollout_id=rollout_id,
+                        agent_id=agent_id,
+                        position=1 if agent_id == higher_id else 2,
+                        frozen_miner_hotkey=f"5Miner-{agent_id}",
+                        frozen_composite=0.5,
+                    )
+                )
 
         async with session.begin():
             ticket = await issue_ticket(
@@ -379,6 +390,117 @@ class TestIssueTicket:
 
         assert ticket is not None
         assert ticket.agent_id == lower_id
+
+    async def test_activated_era_skips_old_nonmember_with_backfilled_dataset(
+        self, session: AsyncSession
+    ) -> None:
+        rollout_started = _NOW - timedelta(minutes=5)
+        old = await _seed_evaluating(
+            session,
+            created_at=rollout_started - timedelta(days=1),
+            name="old-nonmember",
+            screened=True,
+        )
+        fresh = await _seed_evaluating(
+            session,
+            created_at=rollout_started + timedelta(minutes=1),
+            name="fresh",
+            screened=True,
+        )
+        async with session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=rollout_started,
+                    activated_at=rollout_started,
+                )
+            )
+            for agent_id in (old, fresh):
+                session.add(
+                    BenchmarkDataset(
+                        agent_id=agent_id,
+                        bench_version=3,
+                        seed=123,
+                        sha256="ef" * 32,
+                        run_size="full",
+                    )
+                )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5EraAdmission",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=3,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == fresh
+        assert ticket.agent_id != old
+
+    async def test_activated_era_expires_idle_old_nonmember_lease(
+        self, session: AsyncSession
+    ) -> None:
+        rollout_started = _NOW - timedelta(minutes=5)
+        old = await _seed_evaluating(
+            session,
+            created_at=rollout_started - timedelta(days=1),
+            name="leased-old-nonmember",
+            screened=True,
+        )
+        async with session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=rollout_started,
+                    activated_at=rollout_started,
+                )
+            )
+            session.add(
+                BenchmarkDataset(
+                    agent_id=old,
+                    bench_version=3,
+                    seed=123,
+                    sha256="ef" * 32,
+                    run_size="full",
+                )
+            )
+            session.add(
+                ValidatorTicket(
+                    agent_id=old,
+                    validator_hotkey="5EraAdmission",
+                    bench_version=3,
+                    slot_id="slot-0",
+                    status=TicketStatus.ISSUED,
+                    issued_at=_NOW - timedelta(minutes=1),
+                    deadline=_NOW + _TTL,
+                )
+            )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5EraAdmission",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=3,
+                validator_running_benchmark=False,
+            )
+
+        assert ticket is None
+        expired = await session.get(ValidatorTicket, (old, 3, "5EraAdmission"))
+        assert expired is not None
+        assert expired.status == TicketStatus.EXPIRED
+        assert expired.deadline.replace(tzinfo=UTC) == _NOW
 
     async def test_screened_only_skips_source_only_agent(
         self, session: AsyncSession
