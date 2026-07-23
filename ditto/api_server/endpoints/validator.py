@@ -126,6 +126,7 @@ from ditto.db.models import (
     Agent,
     AthReview,
     BenchmarkDataset,
+    BenchmarkRollout,
     InferenceGrant,
     Score,
     ValidatorHeartbeat,
@@ -141,12 +142,14 @@ from ditto.db.queries.audit import (
     append_audit_entry,
     get_latest_score_retest_event,
 )
+from ditto.db.queries.benchmark_admission import activated_rollout_for_version
 from ditto.db.queries.benchmark_rollout import (
     LEGACY_BENCH_VERSION,
     active_bench_version,
     heartbeat_supports_version,
     issue_rollout_ticket,
     open_rollout,
+    rollout_cohort_complete,
 )
 from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
@@ -328,6 +331,132 @@ async def _fresh_submission_lane_due(
     )
     return int(completed_since_rollout or 0) % _LANE_CYCLE_SIZE in (
         _FRESH_SUBMISSION_SLOTS
+    )
+
+
+async def _issue_source_backfill_ticket(
+    session: AsyncSession,
+    *,
+    rollout: BenchmarkRollout,
+    heartbeat: ValidatorHeartbeat | None,
+    validator_hotkey: str,
+    now: datetime,
+    artifact_mode: Literal["legacy", "prefer_screened", "screened_only"],
+    validator_running_benchmark: bool,
+    slot_id: str,
+    resume_only: bool = False,
+) -> ValidatorTicket | None:
+    """Use otherwise-idle capacity after the inherited cohort settles."""
+    if heartbeat is None or not heartbeat_supports_version(
+        heartbeat, now=now, version=rollout.from_version
+    ):
+        return None
+    if not await rollout_cohort_complete(
+        session, rollout=rollout, cohort_size=rollout.cohort_size
+    ):
+        return None
+    is_postgresql = session.get_bind().dialect.name == "postgresql"
+    if is_postgresql:
+        # Keep the same first lock as issue_ticket. Reacquiring it below is
+        # transaction-local and safe. The row lock after it makes the
+        # resume-vs-new decision stable against concurrent score submission.
+        await session.execute(
+            select(
+                func.pg_advisory_xact_lock(
+                    func.hashtextextended(f"{validator_hotkey}:{slot_id}", 0)
+                )
+            )
+        )
+    existing = await session.scalar(
+        select(ValidatorTicket)
+        .where(
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.slot_id == slot_id,
+            ValidatorTicket.bench_version == rollout.from_version,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
+        )
+        .with_for_update()
+    )
+    if existing is not None:
+        return await issue_ticket(
+            session,
+            validator_hotkey=validator_hotkey,
+            now=now,
+            ttl=_TICKET_TTL,
+            bench_version=rollout.from_version,
+            artifact_mode=artifact_mode,
+            validator_running_benchmark=validator_running_benchmark,
+            slot_id=slot_id,
+        )
+    if resume_only:
+        return None
+    if is_postgresql:
+        acquired_fleet_lock = await session.scalar(
+            select(
+                func.pg_try_advisory_xact_lock(
+                    func.hashtextextended(f"source-backfill:{rollout.rollout_id}", 0)
+                )
+            )
+        )
+        if not acquired_fleet_lock:
+            # A desired-version allocation earlier in this transaction may
+            # retain a per-owner lock. Never wait here while a source allocator
+            # holds the fleet lock and waits for that owner; yield this poll and
+            # let the validator retry instead of creating a lock-order cycle.
+            return None
+    # The fleet lock above serializes this new-admission decision with the
+    # ticket write. Capacity=1 remains useful for draining v6, while a
+    # multi-validator v7 fleet keeps at least one desired-version slot free.
+    desired_slots = 0
+    heartbeats = (await session.scalars(select(ValidatorHeartbeat))).all()
+    for candidate in heartbeats:
+        supports_source = heartbeat_supports_version(
+            candidate, now=now, version=rollout.from_version
+        )
+        supports_desired = heartbeat_supports_version(
+            candidate, now=now, version=rollout.desired_version
+        )
+        if not supports_source and not supports_desired:
+            continue
+        if candidate.protocol_version >= 10:
+            try:
+                capacity = BenchmarkCapacity.model_validate(
+                    candidate.benchmark_capacity
+                )
+            except ValidationError:
+                continue
+            slot_count = (
+                len(capacity.healthy_slots) if capacity.admission == "accepting" else 0
+            )
+        else:
+            slot_count = 1
+        if supports_desired:
+            desired_slots += slot_count
+    max_active_backfills = max(1, desired_slots - 1)
+    active_backfills = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(ValidatorTicket)
+            .where(
+                ValidatorTicket.bench_version == rollout.from_version,
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.deadline > now,
+            )
+        )
+        or 0
+    )
+    if active_backfills >= max_active_backfills:
+        return None
+    return await issue_ticket(
+        session,
+        validator_hotkey=validator_hotkey,
+        now=now,
+        ttl=_TICKET_TTL,
+        bench_version=rollout.from_version,
+        artifact_mode=artifact_mode,
+        validator_running_benchmark=validator_running_benchmark,
+        slot_id=slot_id,
     )
 
 
@@ -1146,6 +1275,11 @@ async def request_job(
         heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
         canonical_version = await active_bench_version(session)
         rollout = await open_rollout(session)
+        source_backfill_rollout = rollout
+        if source_backfill_rollout is None and canonical_version >= 7:
+            source_backfill_rollout = await activated_rollout_for_version(
+                session, bench_version=canonical_version
+            )
         target_version = (
             rollout.desired_version if rollout is not None else canonical_version
         )
@@ -1154,6 +1288,7 @@ async def request_job(
         )
         heartbeat_capabilities: ValidatorCapabilities | None = None
         v7_calibration = None
+        target_inference_ready = True
         if inference_required:
             try:
                 heartbeat_capabilities = ValidatorCapabilities.model_validate_json(
@@ -1162,19 +1297,20 @@ async def request_job(
                     )
                 )
             except ValidationError:
-                return Response(status_code=204)
+                target_inference_ready = False
             if (
-                heartbeat_capabilities.scorer_benchmarks is not None
+                heartbeat_capabilities is not None
+                and heartbeat_capabilities.scorer_benchmarks is not None
                 and target_version >= 7
             ):
                 v7_calibration = heartbeat_capabilities.scorer_benchmarks.v7_calibration
-            if (
+            if heartbeat_capabilities is None or (
                 heartbeat is None
                 or heartbeat.protocol_version < (11 if target_version >= 7 else 10)
                 or not heartbeat_capabilities.ticket_inference
                 or (target_version >= 7 and v7_calibration is None)
             ):
-                return Response(status_code=204)
+                target_inference_ready = False
         slot_id = payload.slot_id or "slot-0"
         slot_running_benchmark = validator_state == "running_benchmark"
         if heartbeat is not None and heartbeat.protocol_version >= 10:
@@ -1201,7 +1337,8 @@ async def request_job(
                 return Response(status_code=204)
         if rollout is not None:
             fresh_lane_due = (
-                heartbeat is not None
+                target_inference_ready
+                and heartbeat is not None
                 and heartbeat_supports_version(
                     heartbeat, now=now, version=rollout.desired_version
                 )
@@ -1230,16 +1367,20 @@ async def request_job(
                 else None
             )
             if ticket is None:
-                ticket = await issue_rollout_ticket(
-                    session,
-                    validator_hotkey=payload.validator_hotkey,
-                    now=now,
-                    ttl=_TICKET_TTL,
-                    artifact_mode=artifact_mode,
-                    validator_running_benchmark=slot_running_benchmark,
-                    slot_id=slot_id,
+                ticket = (
+                    await issue_rollout_ticket(
+                        session,
+                        validator_hotkey=payload.validator_hotkey,
+                        now=now,
+                        ttl=_TICKET_TTL,
+                        artifact_mode=artifact_mode,
+                        validator_running_benchmark=slot_running_benchmark,
+                        slot_id=slot_id,
+                    )
+                    if target_inference_ready
+                    else None
                 )
-            if ticket is None and not fresh_lane_due:
+            if ticket is None and not fresh_lane_due and target_inference_ready:
                 ticket = await issue_ticket(
                     session,
                     validator_hotkey=payload.validator_hotkey,
@@ -1295,10 +1436,25 @@ async def request_job(
                     Agent.screened_image_upload_id.is_not(None),
                     Agent.screened_image_verified_at.is_not(None),
                 )
-            if rollout is not None:
+            if rollout is not None and slot_running_benchmark:
                 ticket = await session.scalar(live_ticket_statement)
         if ticket is None:
-            if rollout is None:
+            if rollout is None and source_backfill_rollout is not None:
+                # Resume under the helper's canonical slot->row lock order.
+                # Restrict this early pass to an existing lease so new source
+                # work remains behind active-era ordinary issuance below.
+                ticket = await _issue_source_backfill_ticket(
+                    session,
+                    rollout=source_backfill_rollout,
+                    heartbeat=heartbeat,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                    artifact_mode=artifact_mode,
+                    validator_running_benchmark=slot_running_benchmark,
+                    slot_id=slot_id,
+                    resume_only=True,
+                )
+            if ticket is None and rollout is None:
                 stale_ticket = await session.scalar(
                     select(ValidatorTicket)
                     .where(
@@ -1326,20 +1482,18 @@ async def request_job(
                     stale_ticket.retry_after = now
                     await session.flush()
             heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
-            if rollout is not None:
-                # During a transition only the rollout tail and submissions
-                # received since that transition may consume capacity. Do not
-                # leak into manual retests or retired source-era work.
-                return Response(status_code=204)
-            if ticket is None:
+            if ticket is None and rollout is None:
                 # Any post-legacy benchmark needs a fresh, identity-matched
                 # scorer for THAT version. Keyed on the legacy floor, not on the
                 # canary: an activated v3 still gates a v3-incapable validator
                 # out once the canary has moved on to v4.
-                gated = canonical_version > LEGACY_BENCH_VERSION and (
-                    heartbeat is None
-                    or not heartbeat_supports_version(
-                        heartbeat, now=now, version=canonical_version
+                gated = (inference_required and not target_inference_ready) or (
+                    canonical_version > LEGACY_BENCH_VERSION
+                    and (
+                        heartbeat is None
+                        or not heartbeat_supports_version(
+                            heartbeat, now=now, version=canonical_version
+                        )
                     )
                 )
                 ticket = (
@@ -1356,6 +1510,27 @@ async def request_job(
                         slot_id=slot_id,
                     )
                 )
+            if ticket is None and source_backfill_rollout is not None:
+                # Once the inherited top ten is fully established on the new
+                # benchmark, an otherwise-idle compatible slot may help settle
+                # the retired era. Desired-version cohort, fresh FIFO, retest,
+                # and ordinary work all had first claim above. Reusing
+                # issue_ticket preserves its bounded 2/3 contender, then 1/3,
+                # then 0/3 ordering and every duplicate/owner/slot guard for
+                # this low-priority second queue. Keep doing so after activation
+                # until the source-era backlog is empty.
+                ticket = await _issue_source_backfill_ticket(
+                    session,
+                    rollout=source_backfill_rollout,
+                    heartbeat=heartbeat,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                    artifact_mode=artifact_mode,
+                    validator_running_benchmark=slot_running_benchmark,
+                    slot_id=slot_id,
+                )
+            if ticket is None and rollout is not None:
+                return Response(status_code=204)
         if ticket is not None:
             agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
             # issue_ticket selected this agent from ``agents``, so it exists.
@@ -1392,25 +1567,40 @@ async def request_job(
                         detail="ticket seed does not match its validator identity",
                     )
             contract = benchmark_contract(ticket.bench_version)
-            inference_grant = await ensure_inference_grant(
-                session,
-                ticket=ticket,
-                config=request.app.state.config.inference_proxy,
-                supported_profiles=(
-                    tuple(
-                        route.profile_revision
-                        for route in v7_calibration.supported_routes
-                    )
-                    if ticket.bench_version >= 7 and v7_calibration is not None
-                    else None
-                ),
-                calibration_manifest_sha256=(
-                    v7_calibration.manifest_sha256
-                    if ticket.bench_version >= 7 and v7_calibration is not None
-                    else None
-                ),
+            historical_source_ticket = (
+                source_backfill_rollout is not None
+                and ticket.bench_version == source_backfill_rollout.from_version
             )
-            if inference_required and inference_grant is None:
+            ticket_inference_required = ticket.bench_version >= 7 or (
+                not historical_source_ticket
+                and (
+                    request.app.state.config.inference_proxy.required
+                    and ticket.bench_version == canonical_version
+                )
+            )
+            inference_grant = (
+                await ensure_inference_grant(
+                    session,
+                    ticket=ticket,
+                    config=request.app.state.config.inference_proxy,
+                    supported_profiles=(
+                        tuple(
+                            route.profile_revision
+                            for route in v7_calibration.supported_routes
+                        )
+                        if v7_calibration is not None
+                        else None
+                    ),
+                    calibration_manifest_sha256=(
+                        v7_calibration.manifest_sha256
+                        if v7_calibration is not None
+                        else None
+                    ),
+                )
+                if ticket_inference_required
+                else None
+            )
+            if ticket_inference_required and inference_grant is None:
                 raise HTTPException(
                     status_code=503,
                     detail="ticket inference capability is unavailable",
@@ -2642,6 +2832,9 @@ async def submit_score(
             replacement_scores = await list_scores_for_agent(
                 session, agent_id=agent_id, bench_version=ticket.bench_version
             )
+            replacement_dataset = await session.get(
+                BenchmarkDataset, (agent_id, ticket.bench_version)
+            )
             replacement_median = statistics.median(
                 score.composite for score in replacement_scores
             )
@@ -2658,10 +2851,26 @@ async def submit_score(
                     "validator_hotkeys": sorted(
                         score.validator_hotkey for score in replacement_scores
                     ),
-                    "dataset_seed": agent.dataset_seed,
-                    "dataset_sha256": agent.dataset_sha256,
-                    "dataset_seed_block": agent.dataset_seed_block,
-                    "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+                    "dataset_seed": (
+                        replacement_dataset.seed
+                        if replacement_dataset is not None
+                        else agent.dataset_seed
+                    ),
+                    "dataset_sha256": (
+                        replacement_dataset.sha256
+                        if replacement_dataset is not None
+                        else agent.dataset_sha256
+                    ),
+                    "dataset_seed_block": (
+                        replacement_dataset.seed_block
+                        if replacement_dataset is not None
+                        else agent.dataset_seed_block
+                    ),
+                    "dataset_seed_block_hash": (
+                        replacement_dataset.seed_block_hash
+                        if replacement_dataset is not None
+                        else agent.dataset_seed_block_hash
+                    ),
                     "status": agent.status.value,
                     "replacement_request_id": replacement_event.payload["request_id"],
                     "replaced_run_id": replacement_event.payload["run_id"],
@@ -2673,6 +2882,7 @@ async def submit_score(
                 agent=agent,
                 scores=replacement_scores,
                 median=replacement_median,
+                dataset=replacement_dataset,
             )
         # Persist the crate's structural (AST) fingerprint from the report, so it
         # is available for the gate here and for future cross-miner comparison.
@@ -2696,7 +2906,14 @@ async def submit_score(
             )
             if len(agent_scores) >= SCORING_QUORUM:
                 median_composite = statistics.median(s.composite for s in agent_scores)
-                eligible = await list_eligible_ledger(session)
+                finalized_dataset = await session.get(
+                    BenchmarkDataset, (agent_id, ticket.bench_version)
+                )
+                # Historical backfill finalizes against its own frozen era.
+                # Never compare a v6 artifact to the active v7 anti-copy pool.
+                eligible = await list_eligible_ledger(
+                    session, bench_version=ticket.bench_version
+                )
                 miner_coldkey = await get_miner_coldkey_for_agent(
                     session, agent_id=agent_id
                 )
@@ -2854,10 +3071,26 @@ async def submit_score(
                             # Published so the feed is unambiguous about which
                             # entries were observational.
                             "enforced": TRANSFORM_AUDIT_ENFORCE,
-                            "dataset_seed": agent.dataset_seed,
-                            "dataset_sha256": agent.dataset_sha256,
-                            "dataset_seed_block": agent.dataset_seed_block,
-                            "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+                            "dataset_seed": (
+                                finalized_dataset.seed
+                                if finalized_dataset is not None
+                                else agent.dataset_seed
+                            ),
+                            "dataset_sha256": (
+                                finalized_dataset.sha256
+                                if finalized_dataset is not None
+                                else agent.dataset_sha256
+                            ),
+                            "dataset_seed_block": (
+                                finalized_dataset.seed_block
+                                if finalized_dataset is not None
+                                else agent.dataset_seed_block
+                            ),
+                            "dataset_seed_block_hash": (
+                                finalized_dataset.seed_block_hash
+                                if finalized_dataset is not None
+                                else agent.dataset_seed_block_hash
+                            ),
                             "score_count": len(agent_scores),
                         },
                         recorded_at=audit_now,
@@ -2874,15 +3107,32 @@ async def submit_score(
                     payload={
                         "miner_hotkey": agent.miner_hotkey,
                         "median_composite": median_composite,
+                        "bench_version": ticket.bench_version,
                         "quorum": SCORING_QUORUM,
                         "score_count": len(agent_scores),
                         "validator_hotkeys": sorted(
                             s.validator_hotkey for s in agent_scores
                         ),
-                        "dataset_seed": agent.dataset_seed,
-                        "dataset_sha256": agent.dataset_sha256,
-                        "dataset_seed_block": agent.dataset_seed_block,
-                        "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+                        "dataset_seed": (
+                            finalized_dataset.seed
+                            if finalized_dataset is not None
+                            else agent.dataset_seed
+                        ),
+                        "dataset_sha256": (
+                            finalized_dataset.sha256
+                            if finalized_dataset is not None
+                            else agent.dataset_sha256
+                        ),
+                        "dataset_seed_block": (
+                            finalized_dataset.seed_block
+                            if finalized_dataset is not None
+                            else agent.dataset_seed_block
+                        ),
+                        "dataset_seed_block_hash": (
+                            finalized_dataset.seed_block_hash
+                            if finalized_dataset is not None
+                            else agent.dataset_seed_block_hash
+                        ),
                         "status": agent.status.value,
                     },
                     recorded_at=audit_now,
@@ -2894,7 +3144,75 @@ async def submit_score(
                 # failure logs and never fails the score write. Idempotent by
                 # key, so a retried request republishes identical content.
                 await _publish_finalized_run(
-                    storage, agent=agent, scores=agent_scores, median=median_composite
+                    storage,
+                    agent=agent,
+                    scores=agent_scores,
+                    median=median_composite,
+                    dataset=finalized_dataset,
+                )
+        elif existing_score is None and agent.status in {
+            AgentStatus.SCORED,
+            AgentStatus.LIVE,
+        }:
+            # Rollout members were already finalized in the source era, so the
+            # global agent status must not transition again when their desired-
+            # version quorum arrives. Still emit the version-scoped final audit
+            # and mirror exactly when the third distinct score establishes that
+            # era's canonical median.
+            migrated_scores = await list_scores_for_agent(
+                session, agent_id=agent_id, bench_version=ticket.bench_version
+            )
+            if len(migrated_scores) >= SCORING_QUORUM:
+                migrated_dataset = await session.get(
+                    BenchmarkDataset, (agent_id, ticket.bench_version)
+                )
+                migrated_median = statistics.median(
+                    score.composite for score in migrated_scores
+                )
+                await append_audit_entry(
+                    session,
+                    agent_id=agent_id,
+                    validator_hotkey=None,
+                    event=EVENT_FINALIZED,
+                    payload={
+                        "miner_hotkey": agent.miner_hotkey,
+                        "median_composite": migrated_median,
+                        "bench_version": ticket.bench_version,
+                        "quorum": SCORING_QUORUM,
+                        "score_count": len(migrated_scores),
+                        "validator_hotkeys": sorted(
+                            score.validator_hotkey for score in migrated_scores
+                        ),
+                        "dataset_seed": (
+                            migrated_dataset.seed
+                            if migrated_dataset is not None
+                            else agent.dataset_seed
+                        ),
+                        "dataset_sha256": (
+                            migrated_dataset.sha256
+                            if migrated_dataset is not None
+                            else agent.dataset_sha256
+                        ),
+                        "dataset_seed_block": (
+                            migrated_dataset.seed_block
+                            if migrated_dataset is not None
+                            else agent.dataset_seed_block
+                        ),
+                        "dataset_seed_block_hash": (
+                            migrated_dataset.seed_block_hash
+                            if migrated_dataset is not None
+                            else agent.dataset_seed_block_hash
+                        ),
+                        "status": agent.status.value,
+                    },
+                    recorded_at=audit_now,
+                )
+                await _publish_finalized_run(
+                    storage,
+                    agent=agent,
+                    scores=migrated_scores,
+                    median=migrated_median,
+                    dataset=migrated_dataset,
                 )
         # Consume the ticket (one ticket, one score); the slot stays occupied.
         await mark_ticket_scored(
@@ -2951,8 +3269,9 @@ async def _publish_finalized_run(
     agent: Agent,
     scores: Sequence[Score],
     median: float,
+    dataset: BenchmarkDataset | None = None,
 ) -> None:
-    """Mirror a finalized run to the public bucket (``scored/{agent_id}.json``).
+    """Mirror a finalized run to version-addressed and current public keys.
 
     The record carries everything an offline verifier needs: the dataset pin
     (seed, sha256, seed block), the k=3 signed scores with their full details
@@ -2966,16 +3285,28 @@ async def _publish_finalized_run(
     """
     if storage.public_bucket is None:
         return
+    bench_version = scores[0].bench_version if scores else None
     record = {
         "agent_id": str(agent.agent_id),
         "miner_hotkey": agent.miner_hotkey,
         "status": agent.status.value,
         "median_composite": median,
-        "dataset_seed": agent.dataset_seed,
-        "dataset_sha256": agent.dataset_sha256,
-        "dataset_run_size": agent.dataset_run_size,
-        "dataset_seed_block": agent.dataset_seed_block,
-        "dataset_seed_block_hash": agent.dataset_seed_block_hash,
+        "bench_version": bench_version,
+        "dataset_seed": dataset.seed if dataset is not None else agent.dataset_seed,
+        "dataset_sha256": (
+            dataset.sha256 if dataset is not None else agent.dataset_sha256
+        ),
+        "dataset_run_size": (
+            dataset.run_size if dataset is not None else agent.dataset_run_size
+        ),
+        "dataset_seed_block": (
+            dataset.seed_block if dataset is not None else agent.dataset_seed_block
+        ),
+        "dataset_seed_block_hash": (
+            dataset.seed_block_hash
+            if dataset is not None
+            else agent.dataset_seed_block_hash
+        ),
         "scores": [
             {
                 "validator_hotkey": sc.validator_hotkey,
@@ -3010,15 +3341,26 @@ async def _publish_finalized_run(
         ],
     }
     body = json.dumps(record, sort_keys=True, default=str).encode()
-    try:
-        await storage.put_object(
-            key=f"scored/{agent.agent_id}.json",
-            body=body,
-            content_type="application/json",
-            bucket=storage.public_bucket,
-        )
-    except Exception:  # noqa: BLE001 - additive mirror, never fail the write
-        logger.exception("public mirror publish failed for agent %s", agent.agent_id)
+    keys = (
+        [f"scored/{agent.agent_id}/v{bench_version}.json"]
+        if bench_version is not None
+        else []
+    )
+    keys.append(f"scored/{agent.agent_id}.json")
+    for key in keys:
+        try:
+            await storage.put_object(
+                key=key,
+                body=body,
+                content_type="application/json",
+                bucket=storage.public_bucket,
+            )
+        except Exception:  # noqa: BLE001 - additive mirror, never fail the write
+            logger.exception(
+                "public mirror publish failed for agent %s key %s",
+                agent.agent_id,
+                key,
+            )
 
 
 # Transcript artifacts are content-addressed in the public bucket so a record

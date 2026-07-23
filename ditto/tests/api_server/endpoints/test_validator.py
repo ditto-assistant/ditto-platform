@@ -67,6 +67,7 @@ from ditto.api_server.dependencies import (
 from ditto.api_server.endpoints.validator import (
     _fresh_submission_lane_due,
     _heartbeat_signing_message,
+    _issue_source_backfill_ticket,
 )
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_AGENT_NOT_EVALUATABLE,
@@ -2469,7 +2470,9 @@ class TestArtifact:
     ) -> None:
         _install_db(app, session_maker)
         _install_chain(app)
-        _install_storage(app)
+        storage = _install_storage(app)
+        storage.public_bucket = "ditto-public"
+        storage.put_object = AsyncMock()
         agent_id = uuid4()
         response = await client.get(
             f"/api/v1/validator/agent/{agent_id}/artifact",
@@ -2522,6 +2525,313 @@ class TestArtifact:
 
 
 class TestRequestJob:
+    async def test_source_backfill_waits_for_top_ten_then_reuses_v6_allocator(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = datetime.now(UTC)
+        rollout = MagicMock(from_version=6, desired_version=7, cohort_size=10)
+        heartbeat = MagicMock()
+        session = AsyncMock()
+        session.get_bind = MagicMock(
+            return_value=MagicMock(dialect=MagicMock(name="sqlite"))
+        )
+        complete = AsyncMock(side_effect=(False, True))
+        issued = MagicMock()
+        issue = AsyncMock(return_value=issued)
+        supports_version = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.heartbeat_supports_version",
+            supports_version,
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.rollout_cohort_complete", complete
+        )
+        monkeypatch.setattr("ditto.api_server.endpoints.validator.issue_ticket", issue)
+
+        blocked = await _issue_source_backfill_ticket(
+            session,
+            rollout=rollout,
+            heartbeat=heartbeat,
+            validator_hotkey="validator-a",
+            now=now,
+            artifact_mode="screened_only",
+            validator_running_benchmark=False,
+            slot_id="slot-1",
+        )
+        assert blocked is None
+        issue.assert_not_awaited()
+
+        ticket = await _issue_source_backfill_ticket(
+            session,
+            rollout=rollout,
+            heartbeat=heartbeat,
+            validator_hotkey="validator-a",
+            now=now,
+            artifact_mode="screened_only",
+            validator_running_benchmark=False,
+            slot_id="slot-1",
+        )
+        assert ticket is issued
+        supports_version.assert_any_call(heartbeat, now=now, version=6)
+        issue.assert_awaited_once_with(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+            bench_version=6,
+            artifact_mode="screened_only",
+            validator_running_benchmark=False,
+            slot_id="slot-1",
+        )
+
+    async def test_activated_v7_capacity_one_backfills_and_reserves_fleet_slot(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        cohort = (await _seed_top5_emission_set(session_maker, bench_version=7))[:5]
+        source_agent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="waiting-v6",
+            created_at=now - timedelta(days=1),
+        )
+        capabilities = {
+            **_V7_CAPABILITIES,
+            "require_screened_image": True,
+            "source_build_fallback": False,
+            "ticket_inference": True,
+            "signed_score_quorum": True,
+            "scorer_benchmarks": {
+                "status": "fresh_verified",
+                "supported_bench_versions": [6, 7],
+                "observed_at": int(now.timestamp()),
+                "software_version": "1.2.2",
+                "source_revision": "2" * 40,
+                "v7_calibration": {
+                    "manifest_sha256": "c" * 64,
+                    "supported_routes": [
+                        {
+                            "provider": "openrouter",
+                            "profile_revision": "openrouter-route-test-v1",
+                            "model": "openai/gpt-oss-20b",
+                        }
+                    ],
+                },
+            },
+        }
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=12,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+        )
+        source_only_capabilities = {
+            **capabilities,
+            "ticket_inference": False,
+            "scorer_benchmarks": {
+                "status": "fresh_verified",
+                "supported_bench_versions": [6],
+                "observed_at": int(now.timestamp()),
+                "software_version": "1.2.2",
+                "source_revision": "2" * 40,
+            },
+        }
+        await _seed_validator_heartbeat(
+            session_maker,
+            keypair=_DAVE,
+            protocol_version=12,
+            capabilities=source_only_capabilities,
+            stack=_V7_STACK,
+        )
+        rollout_id = uuid4()
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=rollout_id,
+                    from_version=6,
+                    desired_version=7,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now - timedelta(hours=1),
+                    activated_at=now,
+                )
+            )
+            for position, agent_id in enumerate(cohort, start=1):
+                session.add(
+                    BenchmarkRolloutMember(
+                        rollout_id=rollout_id,
+                        agent_id=agent_id,
+                        position=position,
+                        frozen_miner_hotkey=f"5TopMiner{position - 1}",
+                        frozen_composite=1 - position / 100,
+                    )
+                )
+            agent = await session.get(Agent, source_agent)
+            assert agent is not None
+            agent.screened_image_sha256 = "12" * 32
+            agent.screened_image_size_bytes = 123
+            agent.screened_image_id = "sha256:" + "34" * 32
+            agent.screened_image_ref = f"ditto-screen/{source_agent}:latest"
+            agent.screened_image_upload_id = uuid4()
+            agent.screened_image_verified_at = now
+            session.add(
+                BenchmarkDataset(
+                    agent_id=source_agent,
+                    bench_version=6,
+                    seed=8675309,
+                    sha256="cd" * 32,
+                    run_size="full",
+                )
+            )
+            session.add(
+                ValidatorTicket(
+                    agent_id=source_agent,
+                    bench_version=6,
+                    validator_hotkey=_DAVE.ss58_address,
+                    status=TicketStatus.SCORED,
+                    issued_at=now - timedelta(minutes=10),
+                    deadline=now - timedelta(minutes=5),
+                    attempt_count=1,
+                )
+            )
+            session.add(
+                Score(
+                    agent_id=source_agent,
+                    bench_version=6,
+                    validator_hotkey=_DAVE.ss58_address,
+                    run_id="historical-v6-1",
+                    signature="aa",
+                    seed=8675309,
+                    composite=0.71,
+                    tool_mean=0.7,
+                    memory_mean=0.7,
+                    median_ms=100,
+                    n=114,
+                    details={"bench_version": 6},
+                    generated_at=now,
+                )
+            )
+            for hotkey in (_VALIDATOR_HOTKEY, _DAVE.ss58_address):
+                heartbeat = await session.get(ValidatorHeartbeat, hotkey)
+                assert heartbeat is not None
+                heartbeat.benchmark_capacity = {
+                    "configured_slots": 1,
+                    "healthy_slots": ["slot-0"],
+                    "admission": "accepting",
+                    "active": [],
+                }
+
+        _install_db(app, session_maker)
+        _install_chain(app, extra_keypairs=(_DAVE,))
+        storage = _install_storage(app)
+        storage.public_bucket = "ditto-public"
+        storage.put_object = AsyncMock()
+
+        ineligible_source_only = await client.post(
+            "/api/v1/validator/job",
+            headers={"X-Validator-Hotkey": _DAVE.ss58_address},
+            json=_job_payload(_DAVE, slot_id="slot-0"),
+        )
+        assert ineligible_source_only.status_code == 204
+
+        primary = await client.post(
+            "/api/v1/validator/job",
+            headers=_AUTH_HEADER,
+            json=_job_payload(slot_id="slot-0"),
+        )
+        assert primary.status_code == 200, primary.text
+        assert primary.json()["agent_id"] == str(source_agent)
+        assert primary.json()["bench_version"] == 6
+        assert primary.json()["slot_id"] == "slot-0"
+        assert primary.json()["inference"] is None
+
+        capped = await client.post(
+            "/api/v1/validator/job",
+            headers={"X-Validator-Hotkey": _DAVE.ss58_address},
+            json=_job_payload(_DAVE, slot_id="slot-0"),
+        )
+        assert capped.status_code == 204
+
+        resumed = await client.post(
+            "/api/v1/validator/job",
+            headers=_AUTH_HEADER,
+            json=_job_payload(slot_id="slot-0"),
+        )
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["agent_id"] == str(source_agent)
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket, (source_agent, 6, _VALIDATOR_HOTKEY)
+            )
+            assert ticket is not None
+            assert ticket.status == TicketStatus.ISSUED
+            assert ticket.attempt_count == 1
+
+        deadline = datetime.fromisoformat(primary.json()["deadline"])
+        async with session_maker() as session, session.begin():
+            for index, keypair in enumerate((_KEYPAIRS[1],), start=2):
+                session.add(
+                    ValidatorTicket(
+                        agent_id=source_agent,
+                        bench_version=6,
+                        validator_hotkey=keypair.ss58_address,
+                        status=TicketStatus.SCORED,
+                        issued_at=now - timedelta(minutes=5),
+                        deadline=deadline,
+                        attempt_count=1,
+                    )
+                )
+                session.add(
+                    Score(
+                        agent_id=source_agent,
+                        bench_version=6,
+                        validator_hotkey=keypair.ss58_address,
+                        run_id=f"historical-v6-{index}",
+                        signature="aa",
+                        seed=8675309,
+                        composite=0.7 + index / 100,
+                        tool_mean=0.7,
+                        memory_mean=0.7,
+                        median_ms=100,
+                        n=114,
+                        details={"bench_version": 6},
+                        generated_at=now,
+                    )
+                )
+
+        finalized = await client.post(
+            f"/api/v1/validator/agent/{source_agent}/score",
+            json=_score_payload(
+                source_agent,
+                run_id="historical-v6-3",
+                ticket_deadline=deadline,
+                bench_version=6,
+                n=114,
+                details={"bench_version": 6},
+            ),
+        )
+        assert finalized.status_code == 200, finalized.text
+        assert finalized.json()["status"] == AgentStatus.SCORED
+        from ditto.db.queries.scores import list_eligible_ledger
+
+        async with session_maker() as session:
+            active_v7 = await list_eligible_ledger(session, bench_version=7)
+            historical_v6 = await list_eligible_ledger(session, bench_version=6)
+        assert source_agent not in {row.agent_id for row in active_v7}
+        assert source_agent in {row.agent_id for row in historical_v6}
+        assert [
+            awaited.kwargs["key"] for awaited in storage.put_object.await_args_list
+        ] == [
+            f"scored/{source_agent}/v6.json",
+            f"scored/{source_agent}.json",
+        ]
+        record = json.loads(storage.put_object.await_args.kwargs["body"])
+        assert record["bench_version"] == 6
+        assert record["dataset_sha256"] == "cd" * 32
+
     async def test_fresh_submission_lane_uses_three_of_four_completed_jobs(
         self, session_maker: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -4373,10 +4683,13 @@ class TestPublicMirror:
         await _score_to_quorum(
             client, agent_id, maker=session_maker, run_id="run_pub", composite=0.5
         )
-        storage.put_object.assert_awaited_once()
-        kwargs = storage.put_object.await_args.kwargs
+        assert storage.put_object.await_count == 2
+        versioned, current = storage.put_object.await_args_list
+        assert versioned.kwargs["key"] == f"scored/{agent_id}/v2.json"
+        kwargs = current.kwargs
         assert kwargs["bucket"] == "ditto-public"
         assert kwargs["key"] == f"scored/{agent_id}.json"
+        assert versioned.kwargs["body"] == kwargs["body"]
         record = json.loads(kwargs["body"])
         assert record["median_composite"] == 0.5
         assert len(record["scores"]) == 3
@@ -4399,6 +4712,77 @@ class TestPublicMirror:
             client, agent_id, maker=session_maker, run_id="run_nopub", composite=0.5
         )
         storage.put_object.assert_not_awaited()
+
+    async def test_migrated_scored_agent_publishes_new_version_at_quorum(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+        storage.public_bucket = "ditto-public"
+        storage.put_object = AsyncMock()
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.SCORED)
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkDataset(
+                    agent_id=agent_id,
+                    bench_version=7,
+                    seed=8675309,
+                    sha256="cd" * 32,
+                    run_size="full",
+                )
+            )
+
+        for index, keypair in enumerate(_KEYPAIRS):
+            await _seed_ticket(
+                session_maker, agent_id, keypair=keypair, bench_version=7
+            )
+            response = await client.post(
+                f"/api/v1/validator/agent/{agent_id}/score",
+                json=_score_payload(
+                    agent_id,
+                    keypair=keypair,
+                    run_id=f"run_v7_{index}",
+                    bench_version=7,
+                    n=206,
+                    details={"bench_version": 7},
+                ),
+            )
+            assert response.status_code == 200, response.text
+
+        assert storage.put_object.await_count == 2
+        assert [
+            awaited.kwargs["key"] for awaited in storage.put_object.await_args_list
+        ] == [f"scored/{agent_id}/v7.json", f"scored/{agent_id}.json"]
+        record = json.loads(storage.put_object.await_args.kwargs["body"])
+        assert record["bench_version"] == 7
+        assert record["dataset_sha256"] == "cd" * 32
+        assert len(record["scores"]) == 3
+
+    async def test_versioned_publish_failure_does_not_block_current_alias(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+        storage.public_bucket = "ditto-public"
+        storage.put_object = AsyncMock(side_effect=(RuntimeError("versioned"), None))
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+
+        await _score_to_quorum(
+            client, agent_id, maker=session_maker, run_id="run_alias", composite=0.5
+        )
+
+        assert storage.put_object.await_count == 2
+        assert storage.put_object.await_args_list[-1].kwargs["key"] == (
+            f"scored/{agent_id}.json"
+        )
 
 
 class TestTranscriptPublication:

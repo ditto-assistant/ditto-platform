@@ -1039,6 +1039,68 @@ def heartbeat_supports_version(
     )
 
 
+async def rollout_cohort_complete(
+    session: AsyncSession,
+    *,
+    rollout: BenchmarkRollout,
+    cohort_size: int,
+) -> bool:
+    """Return whether every ranked member through ``cohort_size`` has quorum."""
+    member_ids = set(
+        await session.scalars(
+            select(BenchmarkRolloutMember.agent_id).where(
+                BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutMember.position <= cohort_size,
+            )
+        )
+    )
+    if len(member_ids) != cohort_size:
+        return False
+    # Raw row counts are insufficient: smoke-profile and zero-composite scores
+    # cannot rank or activate a benchmark. Keep this gate byte-for-byte aligned
+    # with rollout activation and the authoritative ledger definition.
+    from ditto.db.queries.scores import count_ranked_quorum_agents
+
+    return (
+        await count_ranked_quorum_agents(
+            session,
+            bench_version=rollout.desired_version,
+            agent_ids=member_ids,
+        )
+        == cohort_size
+    )
+
+
+async def rollout_cohort_score_complete(
+    session: AsyncSession,
+    *,
+    rollout: BenchmarkRollout,
+    cohort_size: int,
+) -> bool:
+    """Return whether every ranked member has the frozen raw 3/3 barrier."""
+    count_rows = (
+        await session.execute(
+            select(
+                BenchmarkRolloutMember.agent_id,
+                func.count(Score.validator_hotkey),
+            )
+            .outerjoin(
+                Score,
+                (Score.agent_id == BenchmarkRolloutMember.agent_id)
+                & (Score.bench_version == rollout.desired_version),
+            )
+            .where(
+                BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutMember.position <= cohort_size,
+            )
+            .group_by(BenchmarkRolloutMember.agent_id)
+        )
+    ).all()
+    return len(count_rows) == cohort_size and all(
+        int(count) >= SCORING_QUORUM for _, count in count_rows
+    )
+
+
 async def issue_rollout_ticket(
     session: AsyncSession,
     *,
@@ -1137,29 +1199,10 @@ async def issue_rollout_ticket(
         )
         .exists()
     )
-    priority_count_rows = (
-        await session.execute(
-            select(
-                BenchmarkRolloutMember.agent_id,
-                func.count(Score.validator_hotkey),
-            )
-            .outerjoin(
-                Score,
-                (Score.agent_id == BenchmarkRolloutMember.agent_id)
-                & (Score.bench_version == rollout.desired_version),
-            )
-            .where(
-                BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
-                BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE,
-            )
-            .group_by(BenchmarkRolloutMember.agent_id)
-        )
-    ).all()
-    priority_counts: dict[UUID, int] = {
-        agent_id: int(count) for agent_id, count in priority_count_rows
-    }
-    priority_complete = len(priority_counts) == PRIORITY_COHORT_SIZE and all(
-        count >= SCORING_QUORUM for count in priority_counts.values()
+    priority_complete = await rollout_cohort_score_complete(
+        session,
+        rollout=rollout,
+        cohort_size=PRIORITY_COHORT_SIZE,
     )
     member_statement = (
         select(BenchmarkRolloutMember)
