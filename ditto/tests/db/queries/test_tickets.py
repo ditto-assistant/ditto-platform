@@ -1320,6 +1320,112 @@ class TestIssueTicket:
         assert ticket is not None
         assert ticket.agent_id == newer
 
+    async def test_completion_first_mixed_fleet_keeps_making_progress(
+        self, session: AsyncSession
+    ) -> None:
+        """One unclaimable FIFO head must not idle the whole validator fleet."""
+        oldest = await _seed_evaluating(session, created_at=_NOW, name="oldest")
+        newer = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="newer",
+        )
+        async with session.begin():
+            session.add_all(
+                [
+                    ValidatorTicket(
+                        agent_id=oldest,
+                        validator_hotkey="5AlreadyScored",
+                        status=TicketStatus.SCORED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                        bench_version=2,
+                        attempt_count=1,
+                    ),
+                    ValidatorTicket(
+                        agent_id=oldest,
+                        validator_hotkey="5CoolingDown",
+                        status=TicketStatus.EXPIRED,
+                        issued_at=_NOW - timedelta(hours=2),
+                        deadline=_NOW - timedelta(hours=1),
+                        bench_version=2,
+                        attempt_count=1,
+                        retry_after=_NOW + timedelta(hours=1),
+                    ),
+                    ValidatorTicket(
+                        agent_id=oldest,
+                        validator_hotkey="5Exhausted",
+                        status=TicketStatus.EXPIRED,
+                        issued_at=_NOW - timedelta(hours=2),
+                        deadline=_NOW - timedelta(hours=1),
+                        bench_version=2,
+                        attempt_count=MAX_ATTEMPTS_PER_VERSION,
+                        retry_after=None,
+                    ),
+                ]
+            )
+
+        claims: dict[str, UUID] = {}
+        async with session.begin():
+            for validator in (
+                "5AlreadyScored",
+                "5CoolingDown",
+                "5Exhausted",
+                "5Eligible",
+            ):
+                ticket = await issue_ticket(
+                    session,
+                    validator_hotkey=validator,
+                    now=_NOW,
+                    ttl=_TTL,
+                    completion_first=True,
+                )
+                assert ticket is not None
+                claims[validator] = ticket.agent_id
+
+        assert claims == {
+            "5AlreadyScored": newer,
+            "5CoolingDown": newer,
+            "5Exhausted": newer,
+            "5Eligible": oldest,
+        }
+
+    async def test_completion_first_advances_past_head_at_full_quorum(
+        self, session: AsyncSession
+    ) -> None:
+        """A saturated FIFO head does not hide later claimable work."""
+        oldest = await _seed_evaluating(session, created_at=_NOW, name="oldest")
+        newer = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="newer",
+        )
+        async with session.begin():
+            for index in range(SCORING_QUORUM):
+                session.add(
+                    ValidatorTicket(
+                        agent_id=oldest,
+                        validator_hotkey=f"5Head-{index}",
+                        status=TicketStatus.ISSUED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                        bench_version=2,
+                        attempt_count=1,
+                    )
+                )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5Next",
+                now=_NOW,
+                ttl=_TTL,
+                completion_first=True,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == newer
+
     async def test_accepted_score_precedes_uncovered_work_despite_live_assignment(
         self, session: AsyncSession
     ) -> None:
