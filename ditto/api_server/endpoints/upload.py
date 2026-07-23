@@ -69,7 +69,11 @@ from ditto.db.models import AgentStatus
 from ditto.db.queries.agents import insert_agent
 from ditto.db.queries.bans import is_hotkey_banned
 from ditto.db.queries.payments import (
+    consume_evaluation_credit,
     get_agent_for_payment_proof,
+    get_evaluation_payment_for_proof,
+    get_same_hotkey_agent_by_sha,
+    get_same_owner_agent_by_sha,
     insert_evaluation_payment,
 )
 
@@ -87,6 +91,7 @@ ERROR_CODE_BAD_SIGNATURE = 1100
 ERROR_CODE_HOTKEY_NOT_REGISTERED = 1101
 ERROR_CODE_TARBALL_TOO_LARGE = 1102
 ERROR_CODE_HOTKEY_BANNED = 1103
+ERROR_CODE_IDENTICAL_SUBMISSION = 1104
 
 DEFAULT_MAX_TARBALL_SIZE_BYTES = 20 * 1024 * 1024
 
@@ -174,7 +179,8 @@ async def check(
 
     # 1. Signature over UTF-8 bytes of "{hotkey}:{sha256}".
     payload = f"{body.hotkey}:{body.sha256}".encode()
-    if not _verify_signature(body.hotkey, payload, body.signature):
+    signature_valid = _verify_signature(body.hotkey, payload, body.signature)
+    if not signature_valid:
         codes.append(ERROR_CODE_BAD_SIGNATURE)
         messages.append("signature did not verify against the hotkey")
 
@@ -198,14 +204,46 @@ async def check(
 
     # 4. Hotkey-level ban. Reported here (dry run) so a banned miner learns it
     #    before spending TAO; /upload/agent enforces it as a hard 403.
-    if await is_hotkey_banned(session, hotkey=body.hotkey):
+    banned = await is_hotkey_banned(session, hotkey=body.hotkey)
+    if banned:
         codes.append(ERROR_CODE_HOTKEY_BANNED)
         messages.append("hotkey is banned from submitting")
 
-    return UploadCheckResponse(ok=not codes, error_codes=codes, messages=messages)
+    # 5. Stop the common accidental duplicate before the miner pays. A second
+    # independently seeded run remains available, but it must be explicit.
+    duplicate = None
+    if (
+        signature_valid
+        and registered
+        and not banned
+        and not body.allow_identical_rescore
+    ):
+        duplicate = await get_same_hotkey_agent_by_sha(
+            session, miner_hotkey=body.hotkey, sha256=body.sha256
+        )
+        if duplicate:
+            codes.append(ERROR_CODE_IDENTICAL_SUBMISSION)
+            messages.append(
+                "identical artifact already submitted; no payment is required. "
+                "Set allow_identical_rescore=true only to purchase another seed."
+            )
+
+    return UploadCheckResponse(
+        ok=not codes,
+        error_codes=codes,
+        messages=messages,
+        payment_required=not codes,
+        identical_agent_id=duplicate.agent_id if duplicate else None,
+        identical_agent_status=duplicate.status if duplicate else None,
+    )
 
 
-@router.post("/agent", response_model=UploadAgentResponse, status_code=200)
+@router.post(
+    "/agent",
+    response_model=UploadAgentResponse,
+    response_model_exclude_defaults=True,
+    status_code=200,
+)
 async def upload_agent(
     request: Request,
     agent_tar: Annotated[UploadFile, File(description="gzipped tarball, <=20 MB")],
@@ -224,6 +262,7 @@ async def upload_agent(
     storage: StorageDep,
     embedder: EmbedderDep,
     session: SessionDep,
+    allow_identical_rescore: Annotated[bool, Form()] = False,
 ) -> UploadAgentResponse:
     """Full upload submission with proof of payment.
 
@@ -237,17 +276,20 @@ async def upload_agent(
     3. Hotkey registered on the configured netuid (1 Pylon call;
        400 if absent, 503 if chain unreachable).
     4. Stream tar bytes: size cap (413) + sha256 re-verify (400).
-    5. Return the original response when this exact authenticated upload already
-       consumed the proof. Reusing a proof for different upload data remains a
+    5. Resolve the proof as an idempotent retry or an available duplicate-upload
+       credit. Reusing an assigned proof for different upload data remains a
        3207 replay rejection.
-    6. PaymentVerifier.verify_payment (4 chain calls; 3201-3206 on
-       payment-side rejection, 503 if chain unreachable).
-    7. ``agent_id = uuid4()``.
-    8. ``storage.put_object`` (orphan blob is cheap on DB failure;
+    6. For a fresh proof, run ``PaymentVerifier.verify_payment`` (4 chain calls;
+       3201-3206 on payment rejection, 503 if chain unreachable).
+    7. Detect byte-identical source under the immutable payment-time coldkey.
+       Unless explicitly opted into another seed, preserve the fresh proof as a
+       reusable credit and return the original agent without storing a new one.
+    8. ``agent_id = uuid4()`` and ``storage.put_object`` (an orphan blob is cheap
+       on DB failure;
        orphan agent rows would break the state machine), then compute the
        content fingerprint (best-effort; ``None`` on an unreadable tarball).
-    9. Atomic DB tx: ``insert_agent`` + ``insert_evaluation_payment``
-       (3207 surfaces here when the PK rejects a replayed proof).
+    9. Atomic DB tx: insert the agent and either assign a fresh proof or consume
+       the locked credit (3207 surfaces if another request won the proof race).
     10. Return ``UploadAgentResponse``.
     """
     netuid = request.app.state.config.chain.netuid
@@ -330,6 +372,18 @@ async def upload_agent(
             )
         raise PaymentReplayedError("payment proof already used by a different upload")
 
+    payment_record = await get_evaluation_payment_for_proof(
+        session,
+        block_hash=payment_block_hash,
+        extrinsic_index=payment_extrinsic_index,
+    )
+    if payment_record and payment_record.agent_id is not None:
+        raise PaymentReplayedError("payment proof already used by a different upload")
+    if payment_record and payment_record.miner_hotkey != hotkey:
+        raise PaymentReplayedError("payment credit belongs to a different hotkey")
+    using_credit = bool(payment_record)
+    credit_owner_coldkey = payment_record.miner_coldkey if payment_record else None
+
     # The replay lookup autobegan a read transaction. Release that pooled
     # connection before the slow chain/storage/fingerprint work below.
     if session.in_transaction():
@@ -342,20 +396,69 @@ async def upload_agent(
     # unchanged. A bare ChainError surfaces when one of the verifier's
     # four chain reads cannot reach Pylon, which we treat as a 503 to
     # match the shipped /upload/check pattern around chain.is_registered.
-    try:
-        verified = await verifier.verify_payment(
-            PaymentProof(
-                block_hash=payment_block_hash,
-                block_number=payment_block_number,
-                extrinsic_index=payment_extrinsic_index,
-            ),
-            expected_hotkey=hotkey,
+    verified = None
+    if using_credit:
+        assert credit_owner_coldkey is not None
+        owner_coldkey = credit_owner_coldkey
+    else:
+        try:
+            verified = await verifier.verify_payment(
+                PaymentProof(
+                    block_hash=payment_block_hash,
+                    block_number=payment_block_number,
+                    extrinsic_index=payment_extrinsic_index,
+                ),
+                expected_hotkey=hotkey,
+            )
+        except ChainError as e:
+            logger.warning(f"chain unreachable during /upload/agent verify: {e}")
+            raise HTTPException(
+                status_code=503, detail="chain unavailable; retry shortly"
+            ) from e
+        owner_coldkey = verified.miner_coldkey
+
+    duplicate = await get_same_owner_agent_by_sha(
+        session, miner_coldkey=owner_coldkey, sha256=sha256
+    )
+    if duplicate and not allow_identical_rescore:
+        if not using_credit:
+            assert verified is not None
+            if session.in_transaction():
+                rollback_result = session.rollback()
+                if inspect.isawaitable(rollback_result):
+                    await rollback_result
+            try:
+                async with session.begin():
+                    await insert_evaluation_payment(
+                        session,
+                        verified=verified,
+                        credit_for_agent_id=duplicate.agent_id,
+                    )
+            except PaymentReplayedError:
+                raced = await get_evaluation_payment_for_proof(
+                    session,
+                    block_hash=payment_block_hash,
+                    extrinsic_index=payment_extrinsic_index,
+                )
+                if not (
+                    raced and raced.agent_id is None and raced.miner_hotkey == hotkey
+                ):
+                    raise
+        assert duplicate.version is not None
+        return UploadAgentResponse(
+            agent_id=duplicate.agent_id,
+            version=duplicate.version,
+            status=duplicate.status,
+            payment_disposition="reusable_credit",
+            credit_for_agent_id=duplicate.agent_id,
         )
-    except ChainError as e:
-        logger.warning(f"chain unreachable during /upload/agent verify: {e}")
-        raise HTTPException(
-            status_code=503, detail="chain unavailable; retry shortly"
-        ) from e
+
+    # The duplicate lookup autobegan a read transaction. Do not pin a pooled
+    # connection while uploading to storage and computing fingerprints.
+    if session.in_transaction():
+        rollback_result = session.rollback()
+        if inspect.isawaitable(rollback_result):
+            await rollback_result
 
     # 7. Server-generated identity. The CLI cannot pre-supply it.
     agent_id = uuid.uuid4()
@@ -422,9 +525,26 @@ async def upload_agent(
                 code_embedding=code_embedding,
                 code_embed_model=code_embed_model,
             )
-            await insert_evaluation_payment(
-                session, verified=verified, agent_id=agent_id
-            )
+            if using_credit:
+                locked_credit = await get_evaluation_payment_for_proof(
+                    session,
+                    block_hash=payment_block_hash,
+                    extrinsic_index=payment_extrinsic_index,
+                    for_update=True,
+                )
+                if locked_credit is None:
+                    raise PaymentReplayedError("payment credit disappeared")
+                await consume_evaluation_credit(
+                    session,
+                    payment=locked_credit,
+                    agent_id=agent_id,
+                    miner_hotkey=hotkey,
+                )
+            else:
+                assert verified is not None
+                await insert_evaluation_payment(
+                    session, verified=verified, agent_id=agent_id
+                )
     except PaymentReplayedError:
         # A concurrent identical retry may have passed the first lookup before
         # the winning request committed. The transaction context has rolled this
@@ -449,10 +569,14 @@ async def upload_agent(
 
     logger.info(
         f"upload accepted hotkey={hotkey} agent_id={agent_id} version={version} "
-        f"amount_rao={verified.amount_rao} block_hash={verified.block_hash}"
+        f"payment={'credit' if using_credit else 'fresh'} "
+        f"block_hash={payment_block_hash}"
     )
     return UploadAgentResponse(
-        agent_id=agent_id, version=version, status=AgentStatus.UPLOADED
+        agent_id=agent_id,
+        version=version,
+        status=AgentStatus.UPLOADED,
+        payment_disposition="credit_consumed" if using_credit else "consumed",
     )
 
 

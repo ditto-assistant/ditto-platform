@@ -21,6 +21,7 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.endpoints.upload import (
     ERROR_CODE_BAD_SIGNATURE,
     ERROR_CODE_HOTKEY_NOT_REGISTERED,
+    ERROR_CODE_IDENTICAL_SUBMISSION,
     ERROR_CODE_TARBALL_TOO_LARGE,
     MAX_TARBALL_SIZE_BYTES,
 )
@@ -166,6 +167,41 @@ class TestUploadCheck:
         assert result["ok"] is True
         assert result["error_codes"] == []
         assert result["messages"] == []
+        assert result["payment_required"] is True
+
+    async def test_identical_artifact_stops_payment_unless_rescore_is_explicit(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        override_get_chain_client(app)
+        duplicate_id = uuid4()
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_same_hotkey_agent_by_sha",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    agent_id=duplicate_id,
+                    status=AgentStatus.SCORED,
+                )
+            ),
+        )
+        body = _signed_request_body()
+
+        blocked = await client.post("/api/v1/upload/check", json=body)
+        allowed = await client.post(
+            "/api/v1/upload/check",
+            json={**body, "allow_identical_rescore": True},
+        )
+
+        assert blocked.status_code == 200
+        blocked_body = blocked.json()
+        assert blocked_body["ok"] is False
+        assert ERROR_CODE_IDENTICAL_SUBMISSION in blocked_body["error_codes"]
+        assert blocked_body["payment_required"] is False
+        assert blocked_body["identical_agent_id"] == str(duplicate_id)
+        assert allowed.json()["ok"] is True
+        assert allowed.json()["payment_required"] is True
 
     async def test_banned_hotkey_returns_1103(
         self,
@@ -445,6 +481,78 @@ def _wire_full_stack(app: FastAPI) -> dict[str, MagicMock]:
 
 
 class TestUploadAgentHappyPath:
+    async def test_identical_paid_upload_returns_reusable_credit(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        deps = _wire_full_stack(app)
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        _override_payment_verifier(
+            app, verified=_make_verified_payment(miner_hotkey=kp.ss58_address)
+        )
+        duplicate_id = uuid4()
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_same_owner_agent_by_sha",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    agent_id=duplicate_id,
+                    version=2,
+                    status=AgentStatus.SCORED,
+                )
+            ),
+        )
+        data, files = _upload_agent_form(keypair=kp)
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "agent_id": str(duplicate_id),
+            "version": 2,
+            "status": "scored",
+            "payment_disposition": "reusable_credit",
+            "credit_for_agent_id": str(duplicate_id),
+        }
+        deps["storage"].put_object.assert_not_awaited()
+        credit_row = deps["session"].add.call_args.args[0]
+        assert credit_row.agent_id is None
+        assert credit_row.credit_for_agent_id == duplicate_id
+
+    async def test_available_credit_funds_a_different_artifact(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        deps = _wire_full_stack(app)
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        credit = SimpleNamespace(
+            agent_id=None,
+            credit_for_agent_id=uuid4(),
+            miner_hotkey=kp.ss58_address,
+            miner_coldkey="5Coldkey",
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_evaluation_payment_for_proof",
+            AsyncMock(side_effect=[credit, credit]),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_same_owner_agent_by_sha",
+            AsyncMock(return_value=None),
+        )
+        data, files = _upload_agent_form(keypair=kp, sha256=_GOOD_TAR_SHA)
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["payment_disposition"] == "credit_consumed"
+        deps["verifier"].verify_payment.assert_not_awaited()
+        deps["storage"].put_object.assert_awaited_once()
+        assert str(credit.agent_id) == response.json()["agent_id"]
+        assert credit.credit_for_agent_id is None
+
     async def test_returns_agent_id_and_uploaded_status(
         self, app: FastAPI, client: httpx.AsyncClient
     ):

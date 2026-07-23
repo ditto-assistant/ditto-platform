@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
@@ -15,6 +16,7 @@ from ditto.db.models import (
     Agent,
     BenchmarkDataset,
     BenchmarkRollout,
+    EvaluationPayment,
     Score,
     ValidatorTicket,
 )
@@ -47,7 +49,7 @@ async def _seed_evaluating(
     async with session.begin():
         agent = Agent(
             agent_id=aid,
-            miner_hotkey="5Miner",
+            miner_hotkey=f"5Miner-{name}",
             name=name,
             sha256="ab" * 32,
             status=AgentStatus.EVALUATING,
@@ -169,6 +171,68 @@ async def _seed_two_scores_below_floor(
 
 
 class TestIssueTicket:
+    async def test_same_coldkey_finishes_one_generation_before_next(
+        self, session: AsyncSession
+    ) -> None:
+        first = await _seed_evaluating(session, created_at=_NOW, name="owner-first")
+        second = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="owner-second",
+        )
+        async with session.begin():
+            for index, agent_id in enumerate((first, second)):
+                agent = await session.get(Agent, agent_id)
+                assert agent is not None
+                session.add(
+                    EvaluationPayment(
+                        block_hash=f"0xowner-{index}",
+                        extrinsic_index=index,
+                        agent_id=agent_id,
+                        miner_hotkey=agent.miner_hotkey,
+                        miner_coldkey="5SharedColdkey",
+                        amount_rao=1,
+                        tao_usd_rate=Decimal("1"),
+                        dest_address="5Destination",
+                        timestamp=_NOW,
+                    )
+                )
+
+        claimed: list[UUID] = []
+        async with session.begin():
+            for index in range(SCORING_QUORUM):
+                ticket = await issue_ticket(
+                    session,
+                    validator_hotkey=f"5OwnerValidator-{index}",
+                    now=_NOW,
+                    ttl=_TTL,
+                )
+                assert ticket is not None
+                claimed.append(ticket.agent_id)
+            blocked = await issue_ticket(
+                session,
+                validator_hotkey="5OwnerValidator-blocked",
+                now=_NOW,
+                ttl=_TTL,
+            )
+
+        assert claimed == [first] * SCORING_QUORUM
+        assert blocked is None
+
+        async with session.begin():
+            first_agent = await session.get(Agent, first)
+            assert first_agent is not None
+            first_agent.status = AgentStatus.SCORED
+            next_ticket = await issue_ticket(
+                session,
+                validator_hotkey="5OwnerValidator-next",
+                now=_NOW,
+                ttl=_TTL,
+            )
+
+        assert next_ticket is not None
+        assert next_ticket.agent_id == second
+
     async def test_fresh_lane_excludes_pre_rollout_backlog(
         self, session: AsyncSession
     ) -> None:
