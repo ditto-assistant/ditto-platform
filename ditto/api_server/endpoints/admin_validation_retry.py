@@ -44,7 +44,7 @@ from ditto.api_models.admin_validation_retry import (
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.retry_state import RETRY_STATE_ORDER, RetryState
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
 from ditto.db.models import (
@@ -1102,6 +1102,9 @@ async def replace_validator_score_after_infrastructure_failure(
         now = datetime.now(UTC)
         deadline = now + REPLACEMENT_TICKET_TTL
         ticket.status = TicketStatus.ISSUED
+        ticket.purpose = TicketPurpose.CANONICAL_QUORUM
+        ticket.purpose_revision += 1
+        ticket.legacy_completion_allowed = False
         ticket.issued_at = now
         ticket.deadline = deadline
         ticket.attempt_count += 1

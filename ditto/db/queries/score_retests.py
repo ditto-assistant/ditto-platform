@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.db.models import Agent, Score, ScoreAuditEntry, ValidatorTicket
 from ditto.db.queries.audit import (
     EVENT_SCORE_INVALIDATED,
@@ -137,6 +137,8 @@ async def activate_next_score_retest(
         (
             ticket
             for ticket in issued_rows
+            if ticket.purpose == TicketPurpose.CANONICAL_QUORUM
+            and ticket.purpose_revision > 0
             if (lifecycle := latest.get(ticket.agent_id)) is not None
             and lifecycle.event == EVENT_SCORE_RETEST_REQUESTED
         ),
@@ -216,6 +218,9 @@ async def activate_next_score_retest(
         assert ticket is not None
         deadline = now + REPLACEMENT_TICKET_TTL
         ticket.status = TicketStatus.ISSUED
+        ticket.purpose = TicketPurpose.CANONICAL_QUORUM
+        ticket.purpose_revision += 1
+        ticket.legacy_completion_allowed = False
         ticket.slot_id = slot_id
         ticket.issued_at = now
         ticket.deadline = deadline

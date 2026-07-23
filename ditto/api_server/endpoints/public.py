@@ -73,6 +73,7 @@ from ditto.api_models import (
     PublicChainWeight,
     PublicChainWeightsResponse,
     PublicCompositeBreakdown,
+    PublicConfirmationScore,
     PublicDatasetReveal,
     PublicDethroneDecision,
     PublicEmissionRecipient,
@@ -156,6 +157,7 @@ from ditto.db.models import (
     Agent,
     AthReview,
     BenchmarkDataset,
+    ConfirmationScore,
     Score,
     ScreeningDispute,
     ScreeningQuarantine,
@@ -2320,6 +2322,18 @@ async def agent_pipeline(
     canonical_scores = [
         score for score in accepted_scores if score.bench_version == canonical_version
     ]
+    confirmation_scores = list(
+        await session.scalars(
+            select(ConfirmationScore)
+            .where(ConfirmationScore.agent_id == agent_id)
+            .order_by(
+                ConfirmationScore.bench_version,
+                ConfirmationScore.created_at,
+                ConfirmationScore.validator_hotkey,
+                ConfirmationScore.seed,
+            )
+        )
+    )
     # Dataset provenance is PER BENCH VERSION. The agent row carries only the
     # version it was first pinned at, so pairing every score with it published the
     # v2 digest alongside a v3 score -- next to a verification_command that
@@ -2437,6 +2451,16 @@ async def agent_pipeline(
             )
             for score in accepted_scores
         ],
+        confirmation_scores=[
+            PublicConfirmationScore(
+                composite=score.composite,
+                seed=str(score.seed),
+                validator_hotkey=score.validator_hotkey,
+                bench_version=score.bench_version,
+                accepted_at=score.created_at,
+            )
+            for score in confirmation_scores
+        ],
         final_composite=(
             statistics.median(score.composite for score in canonical_scores)
             if len(canonical_scores) >= SCORING_QUORUM
@@ -2471,6 +2495,7 @@ async def agent_pipeline(
             PublicValidationAttempt(
                 validator_hotkey=ticket.validator_hotkey,
                 status=ticket.status.value,
+                purpose=ticket.purpose,
                 issued_at=ticket.issued_at,
                 deadline=ticket.deadline,
                 bench_version=ticket.bench_version,

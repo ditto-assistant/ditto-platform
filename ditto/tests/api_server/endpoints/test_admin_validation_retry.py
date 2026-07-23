@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import (
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.dependencies import get_session
 from ditto.db.models import (
     Agent,
@@ -350,6 +350,11 @@ async def test_replace_one_validators_score_and_reissue_same_ticket(
         agent = await session.get(Agent, agent_id)
         assert agent is not None
         agent.status = AgentStatus.SCORED
+        ticket = await session.get(
+            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-1")
+        )
+        assert ticket is not None
+        ticket.purpose = TicketPurpose.CONTINUAL_RETEST
 
     detail = await client.get(
         f"/api/v1/admin/validation-retries/{agent_id}/validators/validator-1",
@@ -404,6 +409,7 @@ async def test_replace_one_validators_score_and_reissue_same_ticket(
         "validator-2",
     }
     assert ticket is not None and ticket.status == TicketStatus.ISSUED
+    assert ticket.purpose == TicketPurpose.CANONICAL_QUORUM
     assert ticket.attempt_count == 2
     assert audit is not None
     assert audit.payload["actor"] == "operator"

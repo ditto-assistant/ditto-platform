@@ -25,7 +25,7 @@ from sqlalchemy.orm import aliased
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.db.models import (
     Agent,
     BenchmarkDataset,
@@ -33,6 +33,10 @@ from ditto.db.models import (
     EvaluationPayment,
     Score,
     ValidatorTicket,
+)
+from ditto.db.queries.audit import (
+    EVENT_SCORE_RETEST_REQUESTED,
+    get_latest_score_retest_event,
 )
 from ditto.db.queries.scores import SCORING_QUORUM, list_eligible_ledger
 
@@ -257,6 +261,8 @@ async def issue_ticket(
             ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.bench_version == bench_version,
             ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.purpose == TicketPurpose.CANONICAL_QUORUM,
+            ValidatorTicket.purpose_revision > 0,
             ValidatorTicket.deadline > now,
         )
         .order_by(ValidatorTicket.issued_at.asc(), ValidatorTicket.agent_id.asc())
@@ -280,6 +286,14 @@ async def issue_ticket(
         .with_for_update()
     )
     if incompatible_existing is not None:
+        if (
+            incompatible_existing.purpose != TicketPurpose.CANONICAL_QUORUM
+            or incompatible_existing.purpose_revision <= 0
+        ):
+            # Continual and deployment-transition leases own this slot until
+            # their deadline. A canonical claim must neither serve nor cancel
+            # work from another authorization lane.
+            return None
         if validator_running_benchmark:
             # Never revoke work a fresh signed heartbeat says is active.
             return None
@@ -706,6 +720,8 @@ async def issue_ticket(
             validator_hotkey=validator_hotkey,
             slot_id=slot_id,
             status=TicketStatus.ISSUED,
+            purpose=TicketPurpose.CANONICAL_QUORUM,
+            purpose_revision=1,
             issued_at=now,
             deadline=now + ttl,
             bench_version=bench_version,
@@ -718,6 +734,9 @@ async def issue_ticket(
         # The composite PK preserves one validator slot per agent. Reuse the
         # expired row with a fresh lease rather than inserting a duplicate.
         ticket.status = TicketStatus.ISSUED
+        ticket.purpose = TicketPurpose.CANONICAL_QUORUM
+        ticket.purpose_revision += 1
+        ticket.legacy_completion_allowed = False
         ticket.slot_id = slot_id
         ticket.issued_at = now
         ticket.deadline = now + ttl
@@ -762,7 +781,14 @@ async def issue_confirmation_ticket(
         .with_for_update()
     )
     if existing_live is not None:
-        return existing_live if existing_live.agent_id == agent_id else None
+        return (
+            existing_live
+            if existing_live.agent_id == agent_id
+            and existing_live.bench_version == bench_version
+            and existing_live.purpose == TicketPurpose.CONTINUAL_RETEST
+            and existing_live.purpose_revision > 0
+            else None
+        )
 
     agent = await session.scalar(
         select(Agent).where(Agent.agent_id == agent_id).with_for_update()
@@ -780,6 +806,19 @@ async def issue_confirmation_ticket(
     )
     if prior_score is None:
         return None
+    latest_retest = await get_latest_score_retest_event(
+        session,
+        agent_id=agent_id,
+        validator_hotkey=validator_hotkey,
+    )
+    if (
+        latest_retest is not None
+        and latest_retest.event == EVENT_SCORE_RETEST_REQUESTED
+    ):
+        # An operator-authorized canonical replacement owns this validator/agent
+        # lifecycle until it is completed or released. Continual maintenance
+        # must never repurpose its expired mutable row.
+        return None
 
     ticket = await session.get(
         ValidatorTicket, (agent_id, bench_version, validator_hotkey)
@@ -789,6 +828,8 @@ async def issue_confirmation_ticket(
             agent_id=agent_id,
             validator_hotkey=validator_hotkey,
             status=TicketStatus.ISSUED,
+            purpose=TicketPurpose.CONTINUAL_RETEST,
+            purpose_revision=1,
             issued_at=now,
             deadline=now + ttl,
             bench_version=bench_version,
@@ -800,6 +841,9 @@ async def issue_confirmation_ticket(
     else:
         same_version = ticket.bench_version == bench_version
         ticket.status = TicketStatus.ISSUED
+        ticket.purpose = TicketPurpose.CONTINUAL_RETEST
+        ticket.purpose_revision += 1
+        ticket.legacy_completion_allowed = False
         ticket.issued_at = now
         ticket.deadline = now + ttl
         ticket.bench_version = bench_version

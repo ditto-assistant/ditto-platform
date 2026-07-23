@@ -5339,7 +5339,18 @@
         return attempt.status === "issued" &&
           benchmarkVersionKey(attempt.bench_version) === benchmarkVersionKey(e.active_bench_version);
       }).length;
-      if (count >= quorum) return "Validation complete. The canonical result uses the median of " + quorum + " independent scores.";
+      if (count >= quorum) {
+        var retests = retestAttemptCounts((e.validation_attempts || []).filter(function (attempt) {
+          return benchmarkVersionKey(attempt.bench_version) === benchmarkVersionKey(e.active_bench_version);
+        }));
+        var retestCopy = [];
+        if (retests.running) retestCopy.push(retests.running + " running");
+        if (retests.assigned) retestCopy.push(retests.assigned + " assigned");
+        return "Canonical validation complete. The official result uses the median of " + quorum +
+          " independent scores." + (retestCopy.length
+            ? " Continual top-five retesting: " + retestCopy.join(", ") + "."
+            : "");
+      }
       if (e.status === "below_score_floor") {
         var provisionalScores = e.provisional_scores || [];
         var scoreFloor = Number(e.score_floor);
@@ -5454,7 +5465,7 @@
       var labels = {
         running: ["Running", "progress"], passed: ["Passed", "good"],
         rejected: ["Rejected", "bad"], failed: ["Could not complete", "warn"],
-        expired: [role === "validator" ? "Failed · reissued" : "Expired", "warn"], issued: ["Score pending", "progress"],
+        expired: [role === "validator" ? "Assignment expired" : "Expired", "warn"], issued: ["Score pending", "progress"],
         scored: ["Score submitted", "good"]
       };
       return labels[status] || [String(status || "Unknown").replace(/_/g, " "), ""];
@@ -5602,15 +5613,58 @@
         '<span class="pipeline-preliminary-progress">' + esc(cohort.scores.length) + ' of ' + esc(quorum) + '</span></dd></div>';
     }
 
+    function retestAttemptCounts(attempts) {
+      var retests = attempts.filter(function (attempt) {
+        return attempt.purpose === "continual_retest";
+      });
+      return {
+        running: retests.filter(function (attempt) { return attempt.actively_running; }).length,
+        assigned: retests.filter(function (attempt) {
+          return attempt.status === "issued" && !attempt.actively_running;
+        }).length,
+        expired: retests.filter(function (attempt) { return attempt.status === "expired"; }).length
+      };
+    }
+
     function cohortProgressSummary(cohort, quorum) {
-      var running = cohort.attempts.filter(function (attempt) { return attempt.actively_running; }).length;
-      var pending = cohort.attempts.filter(function (attempt) {
-        return attempt.status === "issued" && !attempt.actively_running;
+      var retests = retestAttemptCounts(cohort.attempts);
+      var summary = Math.min(cohort.scores.length, quorum) + " of " + quorum + " quorum inputs";
+      var canonicalRunning = cohort.attempts.filter(function (attempt) {
+        return attempt.purpose === "canonical_quorum" && attempt.actively_running;
       }).length;
-      var summary = cohort.scores.length + " of " + quorum + " scores received";
-      if (running) summary += " · " + running + " running";
-      if (pending) summary += " · " + pending + " pending";
+      var canonicalAssigned = cohort.attempts.filter(function (attempt) {
+        return attempt.purpose === "canonical_quorum" &&
+          attempt.status === "issued" && !attempt.actively_running;
+      }).length;
+      var transitioning = cohort.attempts.filter(function (attempt) {
+        return attempt.purpose === "legacy_unclassified" && attempt.status === "issued";
+      }).length;
+      function retestState(count, state) {
+        return count + " " + (count === 1 ? "retest" : "retests") + " " + state;
+      }
+      if (canonicalRunning) summary += " · " + canonicalRunning + " scoring";
+      if (canonicalAssigned) summary += " · " + canonicalAssigned + " assigned";
+      if (transitioning) summary += " · " + transitioning + " legacy lease draining";
+      if (retests.running) summary += " · " + retestState(retests.running, "running");
+      if (retests.assigned) summary += " · " + retestState(retests.assigned, "assigned");
+      if (retests.expired) summary += " · " + retestState(retests.expired, "expired");
       return summary;
+    }
+
+    function confirmationCohorts(pipeline) {
+      var cohorts = {};
+      (pipeline.confirmation_scores || []).forEach(function (score) {
+        var key = benchmarkVersionKey(score.bench_version);
+        if (!cohorts[key]) cohorts[key] = [];
+        cohorts[key].push(score);
+      });
+      return Object.keys(cohorts).sort(function (a, b) {
+        if (a === "unknown") return 1;
+        if (b === "unknown") return -1;
+        return Number(b) - Number(a);
+      }).map(function (key) {
+        return { key: key, scores: cohorts[key] };
+      });
     }
 
     function cohortMedian(scores) {
@@ -5734,7 +5788,7 @@
       var deprioritized = pipeline.status === "below_score_floor";
       var cohorts = benchmarkCohorts(pipeline).filter(function (cohort) { return cohort.scores.length; });
       function renderScore(score, index, complete) {
-        var label = complete ? "Accepted score " + (index + 1) : "Provisional score " + (index + 1);
+        var label = complete ? "Quorum input " + (index + 1) : "Provisional score " + (index + 1);
         var benchLabel = score.bench_version == null ? "Bench version unknown" : "Bench v" + score.bench_version;
         var accepted = score.accepted_at ? relTime(score.accepted_at) : "Accepted";
         var seedSource = score.seed_source === "on_chain"
@@ -5785,15 +5839,58 @@
         var median = complete ? cohortMedian(cohort.scores) : null;
         return '<div class="benchmark-cohort">' +
           '<div class="benchmark-cohort-heading"><h5>' + esc(benchmarkVersionLabel(cohort.key)) + '</h5>' +
-            '<span class="benchmark-cohort-summary">' + esc(cohort.scores.length) + ' of ' + esc(quorum) + ' scores received</span></div>' +
+            '<span class="benchmark-cohort-summary">Canonical quorum · ' + esc(Math.min(cohort.scores.length, quorum)) + ' of ' + esc(quorum) + '</span></div>' +
           '<p class="accepted-score-note">' + esc(note) + ' Every seed is fixed only after submission commitment, so it makes the completed evaluation reproducible without allowing the already-submitted artifact to be retuned.</p>' +
           '<div class="accepted-score-list">' + rows + '</div>' +
-          (median == null ? "" : '<p class="accepted-score-final">' + esc(benchmarkVersionLabel(cohort.key)) + ' aggregate: ' + fx(median) + ' · median of ' + quorum + '</p>') +
+          (median == null ? "" : '<p class="accepted-score-final">' + esc(benchmarkVersionLabel(cohort.key)) + ' official aggregate: ' + fx(median) + ' · canonical median of ' + quorum + '</p>') +
         '</div>';
       }).join("");
       return '<section class="pipeline-section" aria-labelledby="pipeline-accepted-scores">' +
-        '<div class="pipeline-section-heading"><h4 id="pipeline-accepted-scores">Accepted scores</h4></div>' +
+        '<div class="pipeline-section-heading"><h4 id="pipeline-accepted-scores">Accepted validator scores</h4></div>' +
         (groups || '<p class="pipeline-detail-state">No validator score has been accepted yet.</p>') +
+      '</section>';
+    }
+
+    function renderConfirmationScores(pipeline) {
+      var cohorts = confirmationCohorts(pipeline);
+      var activeVersion = Number(pipeline.active_bench_version);
+      var currentAttempts = (pipeline.validation_attempts || []).filter(function (attempt) {
+        return Number(attempt.bench_version) === activeVersion;
+      });
+      var counts = retestAttemptCounts(currentAttempts);
+      if (!cohorts.length && !counts.running && !counts.assigned && !counts.expired) return "";
+      var state = [];
+      if (counts.running) state.push(counts.running + " running");
+      if (counts.assigned) state.push(counts.assigned + " assigned");
+      if (counts.expired) state.push(counts.expired + " expired");
+      var rows = cohorts.map(function (cohort) {
+        var seedScores = cohort.scores.slice().sort(function (a, b) {
+          var left = String(a.seed);
+          var right = String(b.seed);
+          return left.length - right.length || left.localeCompare(right);
+        }).map(function (score) {
+          return '<div class="accepted-score">' +
+            '<div><span class="accepted-score-value">' + fx(score.composite) + '</span>' +
+              '<span class="accepted-score-label"><span class="bench-version-badge">' +
+                esc(benchmarkVersionLabel(benchmarkVersionKey(score.bench_version))) +
+              '</span>Accepted shared seed <code>' + esc(score.seed) + '</code> · ' +
+                entityAnchor("validator", score.validator_hotkey, "Validator " + shortKey(score.validator_hotkey)) +
+                (score.accepted_at ? " · " + relTime(score.accepted_at) : "") + '</span></div>' +
+          '</div>';
+        }).join("");
+        return '<div class="benchmark-cohort">' +
+          '<div class="benchmark-cohort-heading"><h5>' + esc(benchmarkVersionLabel(cohort.key)) + '</h5>' +
+            '<span class="benchmark-cohort-summary">' + esc(cohort.scores.length) +
+              ' accepted seed ' + (cohort.scores.length === 1 ? "result" : "results") + '</span></div>' +
+          '<p class="accepted-score-note">Append-only shared-seed evidence. These results refine top-five confidence and do not replace the canonical median.</p>' +
+          '<div class="accepted-score-list">' + seedScores + '</div></div>';
+      }).join("");
+      return '<section class="pipeline-section" aria-labelledby="pipeline-confirmation-scores">' +
+        '<div class="pipeline-section-heading"><h4 id="pipeline-confirmation-scores">Continual top-five retests</h4>' +
+          (state.length ? '<span class="benchmark-cohort-summary">' + esc(state.join(" · ")) + '</span>' : "") +
+        '</div>' +
+        '<p class="accepted-score-note">Additional shared-seed runs are tracked separately from the fixed three-score canonical quorum.</p>' +
+        (rows || '<p class="pipeline-detail-state">No continual retest seed result has landed yet.</p>') +
       '</section>';
     }
 
@@ -5966,8 +6063,23 @@
       }).map(function (a) { return renderScreeningAttempt(a, true); }).join("");
       function renderValidationAttempt(a) {
         var label = attemptLabel(a.actively_running ? "running" : a.status, "validator");
-        var retryInfo = validatorRetryInfo(a.actively_running ? "running" : a.status);
-        var meta = "Validator " + shortKey(a.validator_hotkey);
+        if (a.purpose === "continual_retest" && a.status === "expired") {
+          label = ["Retest expired", "warn"];
+        }
+        var continual = a.purpose === "continual_retest";
+        var canonical = a.purpose === "canonical_quorum";
+        var purposeLabel = continual
+          ? "Continual retest · "
+          : canonical
+          ? "Canonical quorum · "
+          : a.status === "issued"
+          ? "Legacy lease draining · "
+          : "Legacy lease unclassified · ";
+        var retryInfo = canonical
+          ? validatorRetryInfo(a.actively_running ? "running" : a.status)
+          : "";
+        var meta = purposeLabel +
+          "Validator " + shortKey(a.validator_hotkey);
         if (a.actively_running) meta += " is running the benchmark";
         else if (a.status === "issued") meta += " has this assignment";
         else if (a.status === "expired") meta += " did not submit a score";
@@ -5981,7 +6093,10 @@
         var benchLabel = a.bench_version == null ? "Bench unknown" : "Bench v" + a.bench_version;
         return '<div class="attempt"><div><span class="bench-version-badge">' + esc(benchLabel) + '</span></div>' +
           '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(a.actively_running ? "Scoring now" : label[0]) + retryInfo + '</span></b>' +
-          '<div class="attempt-meta">' + entityAnchor("validator", a.validator_hotkey, "Validator " + shortKey(a.validator_hotkey)) + esc(meta.slice(("Validator " + shortKey(a.validator_hotkey)).length)) + '</div>' + benchmark + '</div>' +
+          '<div class="attempt-meta">' + esc(purposeLabel) +
+            entityAnchor("validator", a.validator_hotkey, "Validator " + shortKey(a.validator_hotkey)) +
+            esc(meta.slice((purposeLabel + "Validator " + shortKey(a.validator_hotkey)).length)) +
+          '</div>' + benchmark + '</div>' +
           '<div class="attempt-time" title="' + esc(a.issued_at) + '">' + relTime(a.issued_at) + '</div></div>';
       }
       var validation = benchmarkCohorts(pipeline).map(function (cohort) {
@@ -6003,6 +6118,7 @@
           '</div>' +
         '</section>' +
         renderAcceptedScores(pipeline) +
+        renderConfirmationScores(pipeline) +
         '<section class="pipeline-section" aria-labelledby="pipeline-validator-history">' +
           '<div class="pipeline-section-heading"><h4 id="pipeline-validator-history">Validator progress</h4></div>' +
           '<div class="benchmark-cohort-list">' +
@@ -6053,7 +6169,18 @@
       var scoreCount = current.score_count == null ? 0 : current.score_count;
       var quorum = current.quorum == null ? 3 : current.quorum;
       var currentCohort = pipelineCurrentCohort(current);
-      var validationLabel = currentCohort ? benchmarkVersionLabel(currentCohort.key) + " validation" : "Validation";
+      var validationLabel = currentCohort ? benchmarkVersionLabel(currentCohort.key) + " canonical quorum" : "Canonical quorum";
+      var retests = retestAttemptCounts(((pipeline && pipeline.validation_attempts) || []).filter(function (attempt) {
+        return !currentCohort || benchmarkVersionKey(attempt.bench_version) === currentCohort.key;
+      }));
+      var acceptedRetests = ((pipeline && pipeline.confirmation_scores) || []).filter(function (score) {
+        return !currentCohort || benchmarkVersionKey(score.bench_version) === currentCohort.key;
+      }).length;
+      var retestFact = [];
+      if (acceptedRetests) retestFact.push(acceptedRetests + " accepted seed " + (acceptedRetests === 1 ? "result" : "results"));
+      if (retests.running) retestFact.push(retests.running + " running");
+      if (retests.assigned) retestFact.push(retests.assigned + " assigned");
+      if (retests.expired) retestFact.push(retests.expired + " expired");
       return '<div class="pipeline-detail">' +
         renderScoreHeadline(pipeline) +
         '<div class="pipeline-summary">' +
@@ -6062,6 +6189,7 @@
             '<p class="pipeline-current-message">' + esc(validationDetail(current)) + '</p>' +
             '<dl class="pipeline-key-facts">' +
               '<div><dt>' + esc(validationLabel) + '</dt><dd>' + esc(scoreCount) + ' of ' + esc(quorum) + '</dd></div>' +
+              (retestFact.length ? '<div><dt>Continual retests</dt><dd>' + esc(retestFact.join(" · ")) + '</dd></div>' : "") +
               renderPreliminaryFact(currentCohort, quorum) +
               '<div><dt>Submitted</dt><dd>' + esc(new Date(e.submitted_at).toLocaleString()) + '</dd></div>' +
             '</dl>' +
