@@ -230,8 +230,19 @@ router = APIRouter(prefix="/public", tags=["public"])
 
 # The ledger only moves when a sweep records a new best score, so a short shared
 # cache is safe and shields the DB from dashboard/CDN traffic.
-_CACHE_CONTROL = "public, max-age=30"
-_TIMELINE_CACHE_CONTROL = "public, max-age=300"
+#
+# stale-while-revalidate is what makes a reload feel instant: past max-age the
+# client may paint the cached body immediately and refresh it in the background,
+# instead of showing empty panels for a round trip. The window is deliberately
+# short here, so a stale board is never more than a couple of minutes old.
+_CACHE_CONTROL = "public, max-age=30, stale-while-revalidate=120"
+_TIMELINE_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=3600"
+# A leaderboard pinned to a *settled* benchmark version is finished work: the
+# rollout has moved past it, so nothing routine writes to it again. It is still
+# not immutable (an ATH review or a score replacement can correct an old row),
+# so this is a long freshness window rather than `immutable`: a reload reuses it
+# with no request at all, and any correction lands within the hour.
+_SETTLED_BENCH_CACHE_CONTROL = "public, max-age=3600, stale-while-revalidate=86400"
 _REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 1.0
 _REGISTRATION_CACHE_TTL_SECONDS = 15.0
 _REGISTRATION_FAILURE_CACHE_TTL_SECONDS = 5.0
@@ -1166,13 +1177,27 @@ async def leaderboard(
     The selected generation's hotkey remains the on-chain weight destination.
     Legacy rows without payment provenance fall back to one position per hotkey.
     """
-    response.headers["Cache-Control"] = _CACHE_CONTROL
     from ditto.db.queries.benchmark_rollout import open_rollout
 
     active_version = await active_bench_version(session)
     rollout = await open_rollout(session)
     desired_version = rollout.desired_version if rollout is not None else active_version
     display_version = bench_version or desired_version
+    # A board explicitly pinned to a version the rollout has already moved past
+    # is settled history; the default (unpinned) board and the versions still in
+    # play keep the short live window. The dashboard's timeline fetches one board
+    # per contract, so this is what makes a reload of that chart free.
+    live_versions = {value for value in (active_version, desired_version) if value}
+    # An empty live set means the rollout state is unknown; fall back to the
+    # short window rather than let `all()` over nothing declare history settled.
+    settled_bench_version = (
+        bench_version is not None
+        and bool(live_versions)
+        and all(bench_version < value for value in live_versions)
+    )
+    response.headers["Cache-Control"] = (
+        _SETTLED_BENCH_CACHE_CONTROL if settled_bench_version else _CACHE_CONTROL
+    )
     ledger_rows = await list_eligible_ledger(
         session,
         include_fingerprints=False,
