@@ -2999,11 +2999,14 @@ class TestArtifact:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
         _install_db(app, session_maker)
         _install_chain(app)
-        _install_chain(app)
         storage = _install_storage(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = claim.json()["items"][0]["attempt_id"]
 
         response = await client.get(
-            f"/api/v1/screener/agent/{agent_id}/artifact", headers=_AUTH_HEADER
+            f"/api/v1/screener/agent/{agent_id}/artifact",
+            headers=_AUTH_HEADER,
+            params={"attempt_id": attempt_id},
         )
         assert response.status_code == 200
         body = response.json()
@@ -3014,6 +3017,86 @@ class TestArtifact:
             storage.presigned_get_url.await_args.kwargs["key"]
             == f"{agent_id}/agent.tar.gz"
         )
+
+    async def test_active_claim_without_attempt_query_still_allows_download(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_storage(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        assert claim.status_code == 200
+
+        response = await client.get(
+            f"/api/v1/screener/agent/{agent_id}/artifact", headers=_AUTH_HEADER
+        )
+        assert response.status_code == 200
+        assert response.json()["agent_id"] == str(agent_id)
+
+    async def test_without_active_attempt_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/screener/agent/{agent_id}/artifact", headers=_AUTH_HEADER
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+        storage.presigned_get_url.assert_not_awaited()
+
+    async def test_wrong_attempt_id_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_storage(app)
+        await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+
+        response = await client.get(
+            f"/api/v1/screener/agent/{agent_id}/artifact",
+            headers=_AUTH_HEADER,
+            params={"attempt_id": str(uuid4())},
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+
+    async def test_expired_attempt_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        async with session_maker() as session, session.begin():
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            assert attempt is not None
+            attempt.started_at = datetime.now(UTC) - timedelta(minutes=2)
+            attempt.deadline = datetime.now(UTC) - timedelta(minutes=1)
+
+        response = await client.get(
+            f"/api/v1/screener/agent/{agent_id}/artifact",
+            headers=_AUTH_HEADER,
+            params={"attempt_id": str(attempt_id)},
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+        storage.presigned_get_url.assert_not_awaited()
 
     async def test_unknown_agent_returns_404(
         self,
