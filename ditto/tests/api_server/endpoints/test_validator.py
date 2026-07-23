@@ -745,6 +745,8 @@ async def _seed_ticket(
     purpose: TicketPurpose = TicketPurpose.CANONICAL_QUORUM,
     purpose_revision: int = 1,
     legacy_completion_allowed: bool = False,
+    seed: int | None = None,
+    dataset_sha256: str | None = None,
 ) -> None:
     """Seat (or re-open) an issued ticket for a specific (agent, validator) so a
     score against that agent is accepted by the k=3 gate. Upserts so a test can
@@ -769,6 +771,8 @@ async def _seed_ticket(
                     legacy_completion_allowed=legacy_completion_allowed,
                     issued_at=issued,
                     deadline=deadline,
+                    seed=seed,
+                    dataset_sha256=dataset_sha256,
                 )
             )
         else:
@@ -779,6 +783,8 @@ async def _seed_ticket(
             existing.slot_id = slot_id
             existing.issued_at = issued
             existing.deadline = deadline
+            existing.seed = seed
+            existing.dataset_sha256 = dataset_sha256
 
 
 async def _seed_validator_heartbeat(
@@ -3481,6 +3487,63 @@ class TestSubmitScore:
         assert ticket.purpose == TicketPurpose.CANONICAL_QUORUM
         assert ticket.purpose_revision == 1
         assert ticket.legacy_completion_allowed is False
+
+    async def test_validator_ticket_binds_seed_and_dataset_digest(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        pinned_seed = 8675309
+        pinned_digest = "ab" * 32
+        await _seed_ticket(
+            session_maker,
+            agent_id,
+            seed=pinned_seed,
+            dataset_sha256=pinned_digest,
+        )
+
+        missing_digest = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id, seed=pinned_seed),
+        )
+        assert missing_digest.status_code == 409
+        assert "dataset digest" in missing_digest.text
+
+        wrong_digest = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(
+                agent_id,
+                seed=pinned_seed,
+                details={"dataset_sha256": "cd" * 32},
+            ),
+        )
+        assert wrong_digest.status_code == 409
+        assert "dataset digest" in wrong_digest.text
+
+        wrong_seed = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(
+                agent_id,
+                seed=pinned_seed + 1,
+                details={"dataset_sha256": pinned_digest},
+            ),
+        )
+        assert wrong_seed.status_code == 409
+        assert "score seed" in wrong_seed.text
+
+        accepted = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(
+                agent_id,
+                seed=pinned_seed,
+                details={"dataset_sha256": pinned_digest},
+            ),
+        )
+        assert accepted.status_code == 200, accepted.text
 
     @pytest.mark.parametrize("ticket_version", [3, 4])
     async def test_post_legacy_ticket_requires_explicit_bench_version_binding(

@@ -117,6 +117,7 @@ from ditto.api_server.koth import (
     project_koth,
     top5_round_is_due,
 )
+from ditto.api_server.onchain_seed import derive_validator_seed
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
@@ -532,6 +533,15 @@ def _reported_transcript_sha256(report: ScoreReport) -> str | None:
     """
     details = report.details if isinstance(report.details, dict) else {}
     value = details.get("transcript_sha256")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _reported_dataset_sha256(report: ScoreReport) -> str | None:
+    """Return the canonical dataset digest declared by the scorer, if any."""
+    details = report.details if isinstance(report.details, dict) else {}
+    value = details.get("dataset_sha256")
     if isinstance(value, str) and value:
         return value
     return None
@@ -1351,6 +1361,34 @@ async def request_job(
             dataset = await session.get(
                 BenchmarkDataset, (agent.agent_id, ticket.bench_version)
             )
+            seed_block = (
+                dataset.seed_block if dataset is not None else agent.dataset_seed_block
+            )
+            seed_block_hash = (
+                dataset.seed_block_hash
+                if dataset is not None
+                else agent.dataset_seed_block_hash
+            )
+            # Give each of the three quorum validators an independent dataset.
+            # The post-commit block hash keeps the seed unpredictable; binding
+            # the validator hotkey makes it distinct and publicly reproducible.
+            # Persist the pin on the ticket so retries cannot rotate datasets.
+            if seed_block_hash is not None and generator.run_size is not None:
+                expected_seed = derive_validator_seed(
+                    seed_block_hash, agent.agent_id, payload.validator_hotkey
+                )
+                if ticket.seed is None:
+                    ticket.seed = expected_seed
+                    ticket.dataset_sha256 = await generator.generate(
+                        expected_seed, bench_version=ticket.bench_version
+                    )
+                    ticket.seed_block = seed_block
+                    ticket.seed_block_hash = seed_block_hash
+                elif ticket.seed != expected_seed:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="ticket seed does not match its validator identity",
+                    )
             contract = benchmark_contract(ticket.bench_version)
             inference_grant = await ensure_inference_grant(
                 session,
@@ -1381,23 +1419,24 @@ async def request_job(
                 miner_hotkey=agent.miner_hotkey,
                 sha256=agent.sha256,
                 deadline=ticket.deadline,
-                seed=dataset.seed if dataset is not None else agent.dataset_seed,
+                seed=(
+                    ticket.seed
+                    if ticket.seed is not None
+                    else (dataset.seed if dataset is not None else agent.dataset_seed)
+                ),
+                seed_scope="validator" if ticket.seed is not None else "agent",
                 dataset_sha256=(
-                    dataset.sha256 if dataset is not None else agent.dataset_sha256
+                    ticket.dataset_sha256
+                    if ticket.dataset_sha256 is not None
+                    else (
+                        dataset.sha256 if dataset is not None else agent.dataset_sha256
+                    )
                 ),
                 run_size=(
                     dataset.run_size if dataset is not None else agent.dataset_run_size
                 ),
-                dataset_seed_block=(
-                    dataset.seed_block
-                    if dataset is not None
-                    else agent.dataset_seed_block
-                ),
-                dataset_seed_block_hash=(
-                    dataset.seed_block_hash
-                    if dataset is not None
-                    else agent.dataset_seed_block_hash
-                ),
+                dataset_seed_block=ticket.seed_block or seed_block,
+                dataset_seed_block_hash=ticket.seed_block_hash or seed_block_hash,
                 bench_version=ticket.bench_version,
                 minimum_screening_policy_version=(
                     contract.minimum_screening_policy_version
@@ -2374,6 +2413,19 @@ async def submit_score(
             raise HTTPException(
                 status_code=409,
                 detail="score benchmark version does not match its ticket lease",
+            )
+        if ticket.seed is not None and report.seed != ticket.seed:
+            raise HTTPException(
+                status_code=409,
+                detail="score seed does not match its validator ticket",
+            )
+        if (
+            ticket.dataset_sha256 is not None
+            and _reported_dataset_sha256(report) != ticket.dataset_sha256
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="score dataset digest does not match its validator ticket",
             )
         existing_score = await session.get(
             Score, (agent_id, ticket.bench_version, payload.validator_hotkey)

@@ -202,8 +202,8 @@ class JobResponse(BaseModel):
     the platform issues at most three per agent (the k=3 pool) and answers 204
     (no body) when there is no work. The validator fetches the tarball via
     ``/artifact`` and scores it against the platform-pinned dataset: ``seed`` +
-    ``dataset_sha256`` identify the exact dataset all k=3 validators score (the
-    scoring API regenerates it from ``seed`` and rejects a hash mismatch), and
+    ``dataset_sha256`` identify the exact dataset for this validator's quorum
+    run (the scoring API regenerates it and rejects a hash mismatch), and
     ``run_size`` is the generator profile to use. These are null only for agents
     promoted before the data-pipeline split, or when generation is disabled.
     """
@@ -222,11 +222,16 @@ class JobResponse(BaseModel):
         int | None,
         Field(
             default=None,
-            description="Platform-pinned dataset seed all k=3 validators score "
-            "against (regenerable, comparable). Null if unset (pre-split / "
-            "generation disabled).",
+            description="Post-commit block-derived dataset seed for this "
+            "validator's quorum run. Distinct validator hotkeys receive distinct "
+            "seeds; retries by the same validator retain the same seed.",
         ),
     ] = None
+    seed_scope: Literal["agent", "validator"] = Field(
+        default="agent",
+        description="Inputs used by the on-chain seed derivation. Validator "
+        "scope additionally binds the ticket holder's hotkey.",
+    )
     dataset_sha256: Annotated[
         str | None,
         Field(
@@ -255,7 +260,8 @@ class JobResponse(BaseModel):
         Field(
             default=None,
             description="Hash of ``dataset_seed_block``. Lets the validator "
-            "independently re-derive ``seed = derive_seed(block_hash, agent_id)`` "
+            "independently re-derive ``seed = derive_validator_seed(block_hash, "
+            "agent_id, validator_hotkey)`` "
             "and refuse a ticket whose seed the platform could have chosen "
             "(anti-grind, prod hardening P2). Null for pre-derivation agents.",
         ),
