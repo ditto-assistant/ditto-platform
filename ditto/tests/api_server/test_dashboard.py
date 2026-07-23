@@ -963,6 +963,11 @@ class TestDashboardScoringTransparency:
         assert '<details class="bench-disclosure" id="bench-setup">' in body
         assert '<details class="bench-disclosure" id="bench-versions">' in body
         assert '<details class="bench-disclosure" id="bench-glossary">' in body
+        assert "the active version is highlighted" in body
+        assert "var activeVersion = Number(activeBench)" in body
+        assert "var rolloutVersion = Number(desiredBench)" in body
+        assert '<span class="ver-now">active</span>' in body
+        assert '<span class="ver-next">rollout</span>' in body
         assert "Memory cases contribute half of the unadjusted composite." in body
         assert "Tool-use cases contribute the other half" in body
         for heading in (

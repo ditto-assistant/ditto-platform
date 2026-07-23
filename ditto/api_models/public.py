@@ -1998,7 +1998,7 @@ class PublicBenchVersionDoc(BaseModel):
     """What one immutable bench_version is and what it changed vs the previous one."""
 
     version: int
-    epoch: Annotated[str, Field(description="Dataset reference date (YYYY-MM-DD).")]
+    epoch: Annotated[str, Field(description="Contract publication date (YYYY-MM-DD).")]
     title: Annotated[str, Field(description="Short name of the release.")]
     summary: Annotated[
         str, Field(description="One-paragraph description of the version.")

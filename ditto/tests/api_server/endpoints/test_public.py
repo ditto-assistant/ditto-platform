@@ -3933,9 +3933,15 @@ def test_bench_glossary_explains_every_v5_category_and_metric() -> None:
     metrics = {m["key"] for m in bg.metric_entries()}
     # bench_version changelog is present, newest first, complete per version.
     versions = bg.version_entries()
-    assert [v["version"] for v in versions] == [6, 5, 4, 3, 2]
+    assert [v["version"] for v in versions] == [7, 6, 5, 4, 3, 2]
     for v in versions:
         assert v["title"] and v["summary"] and v["epoch"]
+
+    v7 = versions[0]
+    assert v7["title"] == "GPT-OSS inference contract"
+    assert "openai/gpt-oss-20b" in v7["summary"]
+    assert "medium" in v7["summary"]
+    assert any("Same generated questions" in item for item in v7["highlights"])
 
     for key in (
         "composite",

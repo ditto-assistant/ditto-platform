@@ -488,10 +488,12 @@
     .ver-item { padding: 11px 0 12px; border-bottom: 1px solid color-mix(in oklab, var(--border) 52%, transparent); }
     .ver-item:last-child { border-bottom: none; }
     .ver-current { border-left: 2px solid var(--accent-2); padding-left: 12px; margin-left: -14px; }
+    .ver-rollout { border-left: 2px solid var(--warn); padding-left: 12px; margin-left: -14px; }
     .ver-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
     .ver-tag { font-family: var(--mono); font-size: 11px; font-weight: 800; color: var(--accent-2); border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent); border-radius: 5px; padding: 0 6px; }
     .ver-head b { font-size: 14px; color: var(--text); }
     .ver-now { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; color: var(--good); border: 1px solid color-mix(in oklab, var(--good) 45%, transparent); border-radius: 4px; padding: 0 5px; }
+    .ver-next { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn) 45%, transparent); border-radius: 4px; padding: 0 5px; }
     .ver-epoch { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
     .ver-sum { font-size: 13px; color: var(--text-dim); line-height: 1.55; margin-top: 5px; }
     .ver-hl { margin: 6px 0 0; padding-left: 18px; color: var(--text-dim); font-size: 12.5px; line-height: 1.6; }
@@ -2616,7 +2618,7 @@
       </details>
       <details class="bench-disclosure" id="bench-versions">
         <summary><span class="bench-disclosure-title"><strong>Version history</strong><span>What changed in each immutable benchmark contract</span></span><span class="bench-disclosure-icon" aria-hidden="true"></span></summary>
-        <div class="bench-disclosure-body"><p style="margin-bottom:10px">Each <code>bench_version</code> is an immutable contract; a scoring change ships as a new version rather than editing an old one. Newest first; the current version is highlighted.</p>
+        <div class="bench-disclosure-body"><p style="margin-bottom:10px">Each <code>bench_version</code> is an immutable contract; a scoring change ships as a new version rather than editing an old one. Newest first; the active version is highlighted, and an open rollout target is labeled separately.</p>
         <div id="bench-changelog"><p class="muted">Loading the benchmark changelog…</p></div>
         </div>
       </details>
@@ -7497,14 +7499,20 @@
       // Version changelog: every contract, newest first, with what it changed.
       var cl = document.getElementById("bench-changelog");
       if (cl && vers.length) {
+        var activeVersion = Number(activeBench) || Number(currentBench) || null;
+        var rolloutVersion = Number(desiredBench) || activeVersion;
+        var rolloutOpen = activeVersion && rolloutVersion > activeVersion &&
+          (benchmarkRolloutStatus === "collecting" || benchmarkRolloutStatus === "blocked_ineligible");
         cl.innerHTML = vers.map(function (v) {
-          var active = Number(v.version) === Number(cur);
+          var active = Number(v.version) === activeVersion;
+          var rollout = rolloutOpen && Number(v.version) === rolloutVersion;
           var hl = (v.highlights || []).map(function (h) {
             return '<li>' + esc(h) + '</li>';
           }).join("");
-          return '<div class="ver-item' + (active ? ' ver-current' : '') + '">' +
+          return '<div class="ver-item' + (active ? ' ver-current' : rollout ? ' ver-rollout' : '') + '">' +
             '<div class="ver-head"><span class="ver-tag">v' + v.version + '</span>' +
-            '<b>' + esc(v.title) + '</b>' + (active ? '<span class="ver-now">current</span>' : '') +
+            '<b>' + esc(v.title) + '</b>' +
+            (active ? '<span class="ver-now">active</span>' : rollout ? '<span class="ver-next">rollout</span>' : '') +
             '<span class="ver-epoch">' + esc(v.epoch) + '</span></div>' +
             '<div class="ver-sum">' + esc(v.summary) + '</div>' +
             (hl ? '<ul class="ver-hl">' + hl + '</ul>' : '') + '</div>';
