@@ -10,10 +10,9 @@ them; a chain-derived seed is instead:
   which is causally after the miner has already committed their submission
   (upload -> payment -> screening -> pass). The miner could not have known that
   block hash when they submitted, so they cannot pre-compute their dataset.
-* **Verifiable** — the derivation is a pure function of the pinned block hash and
-  the agent id. The platform stores the block ``(number, hash)`` on the agent, so
-  anyone can fetch that block from the chain, recompute the seed, and confirm it
-  matches the published ``dataset_seed``. The platform cannot fabricate a seed.
+* **Verifiable** — the derivation is a pure function of the pinned block hash,
+  agent id, and (for quorum scoring) validator hotkey. Anyone can fetch the
+  block, recompute the seed, and confirm the platform did not choose it.
 
 The seed stays in the non-negative int64 range every downstream consumer expects
 (``agents.dataset_seed`` / ``scores.seed`` columns, dittobench-api's regeneration
@@ -60,5 +59,15 @@ def derive_seed(block_hash: str, agent_id: UUID) -> int:
     """
     digest = hashlib.sha256(
         f"{normalize_block_hash(block_hash)}:{agent_id}".encode()
+    ).digest()
+    return int.from_bytes(digest[:8], "big") & _INT63_MASK
+
+
+def derive_validator_seed(
+    block_hash: str, agent_id: UUID, validator_hotkey: str
+) -> int:
+    """Derive the stable dataset seed for one validator's quorum run."""
+    digest = hashlib.sha256(
+        f"{normalize_block_hash(block_hash)}:{agent_id}:{validator_hotkey}".encode()
     ).digest()
     return int.from_bytes(digest[:8], "big") & _INT63_MASK

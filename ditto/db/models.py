@@ -1463,6 +1463,18 @@ class ValidatorTicket(Base):
     bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     """Benchmark version whose retry budget this ticket consumes."""
 
+    seed: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    """Block-hash-derived dataset seed assigned to this validator run."""
+
+    dataset_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Digest of the dataset rendered from :attr:`seed`."""
+
+    seed_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    """Finalized chain block used for the validator-specific seed."""
+
+    seed_block_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Hash used to independently re-derive the validator-specific seed."""
+
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     """Number of leases issued to this validator for this agent/version."""
 

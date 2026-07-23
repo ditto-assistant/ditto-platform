@@ -9,7 +9,11 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from ditto.api_server.onchain_seed import derive_seed, normalize_block_hash
+from ditto.api_server.onchain_seed import (
+    derive_seed,
+    derive_validator_seed,
+    normalize_block_hash,
+)
 
 _AGENT = UUID("550e8400-e29b-41d4-a716-446655440000")
 _AGENT_B = UUID("550e8400-e29b-41d4-a716-446655440001")
@@ -44,6 +48,22 @@ class TestDeriveSeed:
     def test_varies_by_agent(self) -> None:
         # Two agents pinned at the same block still get distinct datasets.
         assert derive_seed(_HASH, _AGENT) != derive_seed(_HASH, _AGENT_B)
+
+    def test_validator_binding_gives_quorum_members_distinct_seeds(self) -> None:
+        seeds = {
+            derive_validator_seed(_HASH, _AGENT, hotkey)
+            for hotkey in ("validator-a", "validator-b", "validator-c")
+        }
+        assert len(seeds) == 3
+
+    def test_validator_seed_is_stable_and_bound_to_all_inputs(self) -> None:
+        seed = derive_validator_seed(_HASH, _AGENT, "validator-a")
+        # Cross-repo vector pinned in ditto-subnet's independent verifier.
+        assert seed == 225366234910597484
+        assert seed == derive_validator_seed(_HASH, _AGENT, "validator-a")
+        assert seed != derive_validator_seed(_HASH, _AGENT_B, "validator-a")
+        assert seed != derive_validator_seed(_HASH, _AGENT, "validator-b")
+        assert 0 <= seed < (1 << 63)
 
 
 class TestNormalizeBlockHash:
