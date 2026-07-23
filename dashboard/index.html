@@ -1246,7 +1246,23 @@
     html[data-theme="dark"],
     html[data-theme="system"][data-system-theme="dark"],
     html[data-theme="time"][data-time-phase="night"] { color-scheme: dark; }
-    body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 15px; }
+    /* Ground: the ruled grid over corner washes that the marketing site uses on
+       the DittoBench board (landing-astro src/pages/dittobench.astro). The
+       geometry is copied as-is; the colours resolve through this dashboard's own
+       theme tokens, so it reads as ink-on-paper in the light themes and as faint
+       light rules over the night ground in dark. */
+    body {
+      background:
+        linear-gradient(90deg, color-mix(in oklch, var(--text) 5%, transparent) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
+        linear-gradient(0deg, color-mix(in oklch, var(--text) 4%, transparent) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
+        radial-gradient(circle at 16% 14%, color-mix(in oklch, var(--good) 20%, transparent), transparent 30rem),
+        radial-gradient(circle at 90% 12%, color-mix(in oklch, var(--gold) 28%, transparent), transparent 30rem),
+        var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 15px;
+      min-height: 100vh;
+    }
     .wrap { max-width: 1440px; padding: 24px 28px 72px; }
 
     /* App shell: sidebar rail + main column. Structural rules; main's themed
