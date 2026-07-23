@@ -671,7 +671,8 @@ async def issue_ticket(
             # validator that can no longer score the head advances to the next
             # FIFO candidate instead of idling behind impossible work.
             same_validator_blocking_status = await session.scalar(
-                select(ValidatorTicket.status).where(
+                select(ValidatorTicket.status)
+                .where(
                     ValidatorTicket.agent_id == agent_id,
                     ValidatorTicket.validator_hotkey == validator_hotkey,
                     ValidatorTicket.bench_version == bench_version,
@@ -692,7 +693,8 @@ async def issue_ticket(
                             )
                         )
                     ),
-                ).limit(1)
+                )
+                .limit(1)
             )
             if same_validator_blocking_status == TicketStatus.ISSUED:
                 # A sibling slot must not advance while this validator already
