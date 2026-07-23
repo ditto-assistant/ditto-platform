@@ -157,6 +157,7 @@ class TestDashboard:
         "path",
         [
             "/api/v1/public/leaderboard",
+            "/api/v1/public/bench/timeline",
             "/api/v1/public/weights",
             "/api/v1/public/activity",
             "/api/v1/public/operations",
@@ -408,41 +409,31 @@ class TestDashboard:
         assert 'id="third-party-harness-filter"' not in body
         assert '<details class="harness-comparison-method">' in body
         assert "Method and comparability caveats" in body
-        assert "Hermes Agent and OpenClaw reference runs" in body
-        assert "Both third-party references appear below on the same 0–1 scale" in body
+        assert "Hermes Agent and OpenClaw measured retrospectively" in body
         assert "var THIRD_PARTY_HARNESSES = [{" in body
-        assert "memoryMean: 0.3020833333333333" in body
-        assert "baselineMemoryMean: 0.2604166666666667" in body
-        assert 'baselineLabel: "Prior favorable Qwen run"' in body
-        assert 'model: "anthropic/claude-sonnet-4.6"' in body
-        assert "Hermes uses a different model from miners and OpenClaw" in body
-        assert "memoryCases: 96" in body
-        assert "totalCases: 206" in body
+        assert 'profile: "Native SessionDB session_search"' in body
+        assert 'model: "qwen/qwen3-32b"' in body
+        assert 'route: "OpenRouter · Nebius pinned"' in body
         assert 'seed: "3058240546919425205"' in body
-        assert "benchVersion: 6" in body
-        assert 'getJSON("/public/leaderboard?bench_version="' in body
-        assert "entry.finalized === true && entry.eligible !== false" in body
-        assert ".sort(function (a, b)" in body
-        assert ".slice(0, 5)" in body
-        assert '" · composite " + fx(composite)' in body
-        assert "<span>Memory</span><strong>" in body
-        assert "Top memory subscore:" in body
-        assert "shown on the leaderboard is its composite" in body
+        assert 'getJSON("/public/bench/timeline")' in body
+        assert 'class="memory-timeline-svg"' in body
+        assert 'class="timeline-path miner"' in body
+        assert 'class="timeline-release"' in body
+        assert 'class="timeline-data-details"' in body
+        assert "Exact timeline data" in body
         assert (
-            "Miner bars show memory subscores, not the leaderboard composite." in body
+            "Their points are positioned at each immutable contract's release date"
+            in body
         )
+        assert "v4 corrects v3 false positives" in body
         assert "Third-party harnesses never enter score rank, KOTH" in body
         assert "validator weights, or payouts." in body
-        assert "bad82ede7b19f3bb8dc1c03bb77f1bf33f9dab8f" in body
         assert 'subject: "OpenClaw 2026.7.1"' in body
-        assert "THIRD_PARTY_HARNESSES.map(function (evidence, index)" in body
-        assert "index === 0" in body
+        assert 'profile: "Native memory-core FTS · 20-result recall"' in body
+        assert "THIRD_PARTY_HARNESSES.map(function (evidence)" in body
         assert "Hermes Agent evidence ↗" not in body
         assert "esc(evidence.label) + ' evidence ↗</a>'" in body
-        assert "memoryMean: 0.4270833333333333" in body
-        assert "baselineMemoryMean: 0.3854166666666667" in body
-        assert 'baselineLabel: "Native 10-result baseline"' in body
-        assert "efbfeb36ad64ea3e1568de68d77018cbda2bd3db" in body
+        assert "memory-chart-row" not in body
 
     async def test_api_failures_do_not_render_sample_data(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))

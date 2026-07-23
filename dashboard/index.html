@@ -1540,88 +1540,44 @@
     }
     .harness-comparison-body { padding: 21px 22px 18px; }
     .harness-comparison-summary {
-      margin: 0 0 18px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px 18px;
+      margin: 0 0 16px;
       color: var(--text-dim);
       font-size: 12.5px;
     }
     .harness-comparison-summary strong { color: var(--text); font-variant-numeric: tabular-nums; }
-    .memory-chart { display: grid; gap: 11px; }
-    .memory-chart-row {
-      display: grid;
-      grid-template-columns: minmax(145px, 220px) minmax(180px, 1fr) 58px;
-      align-items: center;
-      gap: 13px;
-    }
-    .memory-chart-row.external-first {
-      margin-top: 5px;
-      padding-top: 16px;
-      border-top: 1px dashed var(--border-strong);
-    }
-    .memory-chart-name { min-width: 0; }
-    .memory-chart-name strong {
-      display: block;
-      overflow: hidden;
-      color: var(--text);
-      font-size: 12.5px;
-      font-weight: 700;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .memory-chart-name .entity-link { color: inherit; }
-    .memory-chart-name span {
-      display: block;
-      margin-top: 2px;
-      color: var(--text-faint);
-      font: 9.5px/1.35 var(--mono);
-      letter-spacing: .02em;
-      text-transform: uppercase;
-    }
-    .memory-chart-track {
-      position: relative;
-      height: 18px;
-      border: 1px solid var(--border);
-      background:
-        linear-gradient(90deg, transparent calc(25% - 1px), var(--border) 25%, transparent calc(25% + 1px), transparent calc(50% - 1px), var(--border) 50%, transparent calc(50% + 1px), transparent calc(75% - 1px), var(--border) 75%, transparent calc(75% + 1px)),
-        var(--bg-elev-2);
-      overflow: visible;
-    }
-    .memory-chart-fill { height: 100%; background: var(--memory); }
-    .memory-chart-row.external .memory-chart-fill {
-      background: repeating-linear-gradient(135deg, var(--accent) 0 5px, color-mix(in oklch, var(--accent) 38%, transparent) 5px 9px);
-    }
-    .memory-baseline-marker {
-      position: absolute;
-      top: -5px;
-      bottom: -5px;
-      width: 2px;
-      background: var(--text);
-      box-shadow: 0 0 0 1px var(--bg-elev);
-    }
-    .memory-chart-value {
-      display: flex;
-      flex-direction: column;
-      align-items: flex-end;
-      gap: 2px;
-      color: var(--text);
-      text-align: right;
-      font-variant-numeric: tabular-nums;
-    }
-    .memory-chart-value span {
-      color: var(--text-faint);
-      font: 700 8px/1 var(--mono);
-      letter-spacing: .04em;
-      text-transform: uppercase;
-    }
-    .memory-chart-value strong { font: 700 12px/1 var(--mono); }
-    .memory-chart-axis {
-      display: grid;
-      grid-template-columns: minmax(145px, 220px) minmax(180px, 1fr) 58px;
-      gap: 13px;
-      margin-top: -4px;
-      color: var(--text-faint);
-      font: 9px/1 var(--mono);
-    }
-    .memory-chart-axis-scale { display: flex; justify-content: space-between; }
+    .memory-timeline-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-bottom: 10px; color: var(--text-dim); font: 10.5px/1.4 var(--mono); }
+    .memory-timeline-legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .memory-timeline-legend i { display: inline-block; width: 25px; border-top: 3px solid var(--memory); }
+    .memory-timeline-legend .hermes i { border-color: var(--accent); border-top-style: dashed; }
+    .memory-timeline-legend .openclaw i { border-color: var(--good); border-top-style: dashed; }
+    .memory-timeline-frame { position: relative; border: 1px solid var(--border); background: var(--bg-elev-2); overflow-x: auto; overscroll-behavior-inline: contain; }
+    .memory-timeline-svg { display: block; width: 100%; min-width: 760px; height: auto; }
+    .timeline-grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+    .timeline-axis-label { fill: var(--text-faint); font: 10px var(--mono); }
+    .timeline-release { stroke: color-mix(in oklch, var(--text-faint) 72%, transparent); stroke-width: 1; stroke-dasharray: 4 5; vector-effect: non-scaling-stroke; }
+    .timeline-release-label { fill: var(--text-dim); font: 700 9.5px var(--mono); letter-spacing: .03em; cursor: help; }
+    .timeline-release-label:focus { outline: none; fill: var(--text); text-decoration: underline; }
+    .timeline-path { fill: none; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+    .timeline-path.miner { stroke: var(--memory); stroke-width: 3.5; }
+    .timeline-path.hermes { stroke: var(--accent); stroke-width: 2.5; stroke-dasharray: 7 5; }
+    .timeline-path.openclaw { stroke: var(--good); stroke-width: 2.5; stroke-dasharray: 3 5; }
+    .timeline-point { stroke: var(--bg-elev); stroke-width: 2; vector-effect: non-scaling-stroke; cursor: help; }
+    .timeline-point.miner { fill: var(--memory); }
+    .timeline-point.hermes { fill: var(--accent); }
+    .timeline-point.openclaw { fill: var(--good); }
+    .timeline-point:focus { outline: none; stroke: var(--text); stroke-width: 3.5; }
+    .memory-timeline-tooltip { position: absolute; z-index: 3; max-width: 270px; padding: 9px 11px; border: 1px solid var(--border-strong); border-radius: 3px; background: var(--bg); color: var(--text); box-shadow: var(--shadow); font: 11px/1.45 var(--mono); pointer-events: none; transform: translate(-50%, calc(-100% - 10px)); }
+    .memory-timeline-note { margin: 10px 0 0; color: var(--text-faint); font-size: 11px; line-height: 1.5; }
+    .timeline-data-details { margin-top: 13px; color: var(--text-dim); font-size: 11.5px; }
+    .timeline-data-details > summary { width: fit-content; color: var(--text); font-weight: 700; cursor: pointer; }
+    .timeline-data-table-wrap { margin-top: 10px; overflow-x: auto; }
+    .timeline-data-table { width: 100%; min-width: 620px; border-collapse: collapse; font: 10.5px/1.4 var(--mono); }
+    .timeline-data-table th, .timeline-data-table td { padding: 7px 9px; border-bottom: 1px solid var(--border); text-align: left; }
+    .timeline-data-table th { color: var(--text-faint); font-weight: 700; text-transform: uppercase; }
+    .timeline-data-table td:last-child, .timeline-data-table th:last-child { text-align: right; }
     .harness-comparison-method {
       margin-top: 20px;
       padding-top: 16px;
@@ -1658,11 +1614,6 @@
     @media (max-width: 720px) {
       .harness-comparison-head { display: block; padding: 18px; }
       .harness-comparison-body { padding: 18px; }
-      .memory-chart-row,
-      .memory-chart-axis { grid-template-columns: minmax(92px, 118px) minmax(110px, 1fr) 50px; gap: 9px; }
-      .memory-chart-name strong { font-size: 11.5px; }
-      .memory-chart-row.external .memory-chart-name strong { overflow: visible; white-space: normal; }
-      .memory-chart-name span { font-size: 8.5px; }
       .harness-comparison-method-body { display: block; }
       .harness-comparison-method a { display: inline-block; margin-top: 10px; }
       .harness-comparison-evidence-links { display: flex; flex-wrap: wrap; }
@@ -2575,11 +2526,11 @@
           <div class="harness-comparison-title">
             <div class="harness-comparison-kicker">Independent comparison <span class="reference-badge">Reference only · no emissions</span></div>
             <h2 id="harness-comparison-title">How far miners have taken memory</h2>
-            <p class="harness-comparison-lead"><span class="tip" tabindex="0" data-tooltip="This isolates memory performance. The public leaderboard ranks agents by the full composite, not this subscore alone.">Memory subscores only</span>. Top finalized DittoBench v6 miners are shown alongside Hermes Agent and OpenClaw reference runs measured against the same benchmark contract.</p>
+            <p class="harness-comparison-lead"><span class="tip" tabindex="0" data-tooltip="This isolates memory performance. The public leaderboard ranks agents by the full composite, not this subscore alone.">Memory subscores only</span>. Follow the best finalized miner as each benchmark era unfolds, with Hermes Agent and OpenClaw measured retrospectively on contracts v2 through v6.</p>
           </div>
         </div>
         <div class="harness-comparison-body">
-          <div id="harness-comparison-chart" class="harness-comparison-state">Loading finalized v6 memory subscores…</div>
+          <div id="harness-comparison-chart" class="harness-comparison-state">Loading the benchmark memory timeline…</div>
           <details class="harness-comparison-method">
             <summary>Method and comparability caveats</summary>
             <div class="harness-comparison-method-body">
@@ -3442,43 +3393,46 @@
       4: { composite: 0.429, method: "one full run, seed 20260719", run: "Run 5" }
     };
 
-    // Off-network comparison records. Adding OpenClaw or another third-party
-    // harness here automatically grows the filter; these records never enter
-    // the leaderboard data model or any ranking/emissions calculation.
+    // Off-network comparison records. Every point is one retained practice run
+    // measured now against an immutable historical contract, then positioned at
+    // that contract's release date. These records never enter the leaderboard,
+    // KOTH, validator weights, or payouts.
     var THIRD_PARTY_HARNESSES = [{
       id: "hermes",
       label: "Hermes Agent",
       subject: "Hermes Agent 0.19.0",
-      profile: "Native session_search · stronger-model upper bound",
-      benchVersion: 6,
-      memoryMean: 0.3020833333333333,
-      baselineMemoryMean: 0.2604166666666667,
-      baselineLabel: "Prior favorable Qwen run",
-      memoryCases: 96,
-      totalCases: 206,
+      profile: "Native SessionDB session_search",
       seed: "3058240546919425205",
-      datasetSha256: "f9b8e6eea10f20316a6fc82c2f6b0af0f0cf0bc3f263cf96a760e68cdaa3ea2d",
-      model: "anthropic/claude-sonnet-4.6",
-      provider: "OpenRouter",
-      evidenceUrl: "https://github.com/ditto-assistant/dittobench-api/blob/bad82ede7b19f3bb8dc1c03bb77f1bf33f9dab8f/docs/hermes-benchmark/README.md"
+      model: "qwen/qwen3-32b",
+      route: "OpenRouter · Nebius pinned",
+      measuredAt: "2026-07-23",
+      evidenceUrl: "https://github.com/ditto-assistant/dittobench-api/tree/beb8e1a5fb5a2c35f5c34ce33b422978504d611e/docs/third-party-benchmark-timeline",
+      points: [
+        { benchVersion: 2, memoryMean: 0.1111111111111111, memoryCorrect: 6, memoryCases: 54, runId: "7c20350e-7b64-4a19-8913-dc4b9cdeb164" },
+        { benchVersion: 3, memoryMean: 0.12796610169491526, memoryCorrect: 6, memoryCases: 59, runId: "b5ca5d5d-56cc-465e-ae38-56d72ffe397b" },
+        { benchVersion: 4, memoryMean: 0.17796610169491525, memoryCorrect: 10, memoryCases: 59, runId: "97570165-5e96-4d98-b053-7d5b36a28c90" },
+        { benchVersion: 5, memoryMean: 0.16907051041666668, memoryCorrect: 16, memoryCases: 96, runId: "31c7b01b-be22-4b28-b27d-9a82f299d0a3" },
+        { benchVersion: 6, memoryMean: 0.19791666666666666, memoryCorrect: 19, memoryCases: 96, runId: "c9230dd4-b5bd-4543-94a7-6cc5f2521161" }
+      ]
     }, {
       id: "openclaw",
       label: "OpenClaw",
       subject: "OpenClaw 2026.7.1",
-      profile: "Favorable native memory-core FTS",
-      benchVersion: 6,
-      memoryMean: 0.4270833333333333,
-      baselineMemoryMean: 0.3854166666666667,
-      baselineLabel: "Native 10-result baseline",
-      memoryCases: 96,
-      totalCases: 206,
+      profile: "Native memory-core FTS · 20-result recall",
       seed: "3058240546919425205",
-      datasetSha256: "f9b8e6eea10f20316a6fc82c2f6b0af0f0cf0bc3f263cf96a760e68cdaa3ea2d",
       model: "qwen/qwen3-32b",
-      provider: "OpenRouter",
-      evidenceUrl: "https://github.com/ditto-assistant/dittobench-api/blob/efbfeb36ad64ea3e1568de68d77018cbda2bd3db/docs/openclaw-benchmark/README.md"
+      route: "OpenRouter · Nebius pinned",
+      measuredAt: "2026-07-23",
+      evidenceUrl: "https://github.com/ditto-assistant/dittobench-api/tree/beb8e1a5fb5a2c35f5c34ce33b422978504d611e/docs/third-party-benchmark-timeline",
+      points: [
+        { benchVersion: 2, memoryMean: 0.3333333333333333, memoryCorrect: 18, memoryCases: 54, runId: "aff3b762-45cf-48e9-9293-9759352b4ab4" },
+        { benchVersion: 3, memoryMean: 0.3771186440677966, memoryCorrect: 22, memoryCases: 59, runId: "025956de-c312-4cd4-8a04-ca636ffc143a" },
+        { benchVersion: 4, memoryMean: 0.3559322033898305, memoryCorrect: 21, memoryCases: 59, runId: "37662b1a-fdd2-4135-a790-749750e33b46" },
+        { benchVersion: 5, memoryMean: 0.421875, memoryCorrect: 40, memoryCases: 96, runId: "bc4cf453-ddce-4e66-ab67-659280143d62" },
+        { benchVersion: 6, memoryMean: 0.3333333333333333, memoryCorrect: 32, memoryCases: 96, runId: "5fd141aa-25e6-476c-9cc4-1b4279ee6559" }
+      ]
     }];
-    var lastThirdPartyLeaderboardData = null;
+    var lastMemoryTimelineData = null;
 
     // Rank-movement baseline: the ranks from the viewer's last visit. Every
     // render compares against this snapshot (kept for the session) and then
@@ -3657,94 +3611,155 @@
       hasElapsedNodes = !!document.querySelector(".screener-progress-time[data-started-at], .benchmark-progress-time[data-started-at]");
     }
 
-    // ── Third-party harness comparison ───────────────────────
-    function memoryComparisonRow(entry, external, evidence, firstExternal) {
-      var score = external ? evidence.memoryMean : Number(entry.memory_mean);
-      var composite = external ? NaN : Number(entry.composite);
-      var label = external
-        ? esc(evidence.subject)
-        : entityAnchor("agent", entry.agent_id, agentName(entry.agent_name));
-      var context = external
-        ? "Third-party · " + esc(evidence.profile)
-        : "Miner · finalized " + esc(entry.score_count) + "/" + esc(entry.score_quorum) +
-          (Number.isFinite(composite) ? " · composite " + fx(composite) : "");
-      var hasBaseline = external && Number.isFinite(evidence.baselineMemoryMean);
-      var baseline = hasBaseline
-        ? '<span class="memory-baseline-marker" style="left:' + (evidence.baselineMemoryMean * 100).toFixed(4) +
-          '%" title="' + esc(evidence.baselineLabel || "Baseline") + ': ' + fx(evidence.baselineMemoryMean) + '" aria-hidden="true"></span>'
-        : "";
-      var aria = (external ? evidence.subject : agentName(entry.agent_name)) +
-        " memory subscore " + fx(score) +
-        (hasBaseline ? ", " + String(evidence.baselineLabel || "baseline").toLowerCase() +
-          " " + fx(evidence.baselineMemoryMean) :
-          (Number.isFinite(composite) ? ", leaderboard composite " + fx(composite) : ""));
-      return '<div class="memory-chart-row' + (external ? ' external' : '') + (firstExternal ? ' external-first' : '') + '" role="listitem" aria-label="' + esc(aria) + '">' +
-        '<div class="memory-chart-name"><strong>' + label + '</strong><span>' + context + '</span></div>' +
-        '<div class="memory-chart-track"><div class="memory-chart-fill" style="width:' + (score * 100).toFixed(4) + '%"></div>' + baseline + '</div>' +
-        '<div class="memory-chart-value"><span>Memory</span><strong>' + fx(score) + '</strong></div></div>';
+    // ── Historical miner + third-party memory timeline ───────
+    var TIMELINE_DATE = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+    function timelineDate(value) { return TIMELINE_DATE.format(new Date(value)); }
+    function releaseTime(release) { return Date.parse(release.released_at); }
+    function timelinePath(points, x, y) {
+      return points.map(function (point, index) {
+        return (index ? "L" : "M") + x(point.at).toFixed(2) + " " + y(point.score).toFixed(2);
+      }).join(" ");
+    }
+    function timelinePoint(point, series, x, y) {
+      var label = point.tooltip;
+      return '<circle class="timeline-point ' + series + '" cx="' + x(point.at).toFixed(2) + '" cy="' + y(point.score).toFixed(2) + '" r="5" tabindex="0" role="img" aria-label="' + esc(label) + '" data-timeline-tooltip="' + esc(label) + '"><title>' + esc(label) + '</title></circle>';
+    }
+    function bindTimelineTooltips(target) {
+      var frame = target.querySelector(".memory-timeline-frame");
+      var tooltip = target.querySelector(".memory-timeline-tooltip");
+      if (!frame || !tooltip) return;
+      function show(node) {
+        var pointRect = node.getBoundingClientRect();
+        var frameRect = frame.getBoundingClientRect();
+        tooltip.textContent = node.getAttribute("data-timeline-tooltip") || "";
+        tooltip.style.left = (pointRect.left - frameRect.left + frame.scrollLeft + pointRect.width / 2) + "px";
+        tooltip.style.top = (pointRect.top - frameRect.top + frame.scrollTop) + "px";
+        tooltip.hidden = false;
+      }
+      function hide() { tooltip.hidden = true; }
+      frame.querySelectorAll("[data-timeline-tooltip]").forEach(function (node) {
+        node.addEventListener("pointerenter", function () { show(node); });
+        node.addEventListener("pointerleave", hide);
+        node.addEventListener("focus", function () { show(node); });
+        node.addEventListener("blur", hide);
+      });
     }
 
-    function renderThirdPartyComparison(data) {
+    function renderMemoryTimeline(data) {
       var target = document.getElementById("harness-comparison-chart");
-      var benchVersion = THIRD_PARTY_HARNESSES[0].benchVersion;
-      var entries = (data && data.entries || []).filter(function (entry) {
-        return entry.finalized === true && entry.eligible !== false &&
-          Number(entry.bench_version) === benchVersion &&
-          Number.isFinite(Number(entry.memory_mean));
-      }).sort(function (a, b) {
-        return Number(b.memory_mean) - Number(a.memory_mean) ||
-          String(a.agent_id).localeCompare(String(b.agent_id));
-      }).slice(0, 5);
+      var releases = (data && data.releases || []).filter(function (release) {
+        return Number(release.bench_version) >= 2 && Number(release.bench_version) <= 6;
+      }).sort(function (a, b) { return Number(a.bench_version) - Number(b.bench_version); });
+      var minerPoints = (data && data.points || []).filter(function (point) {
+        return Number.isFinite(Number(point.memory_mean)) && Date.parse(point.recorded_at);
+      }).sort(function (a, b) { return Date.parse(a.recorded_at) - Date.parse(b.recorded_at); }).map(function (point) {
+        var name = agentName(point.agent_name);
+        return {
+          at: Date.parse(point.recorded_at), score: Number(point.memory_mean), version: Number(point.bench_version),
+          tooltip: "Top miner · " + name + " · v" + point.bench_version + " · memory " + fx(Number(point.memory_mean)) + " · finalized " + timelineDate(point.recorded_at),
+          source: name, measured: point.recorded_at, agentId: point.agent_id
+        };
+      });
 
       document.getElementById("harness-comparison-evidence").innerHTML = THIRD_PARTY_HARNESSES.map(function (evidence) {
         return '<a href="' + esc(evidence.evidenceUrl) + '" target="_blank" rel="noopener">' + esc(evidence.label) + ' evidence ↗</a>';
       }).join("");
-      var referenceMethods = THIRD_PARTY_HARNESSES.map(function (evidence) {
-        var baseline = Number.isFinite(evidence.baselineMemoryMean)
-          ? " Its white marker is the " + String(evidence.baselineLabel || "baseline").toLowerCase() +
-            " at " + fx(evidence.baselineMemoryMean) + "."
-          : "";
-        return evidence.subject + " is one off-network " + evidence.provider + " practice run on " +
-          evidence.model + " (" + evidence.memoryCases + " memory cases; " + evidence.totalCases +
-          " total; seed " + evidence.seed + ")." + baseline;
-      }).join(" ");
       document.getElementById("harness-comparison-method").textContent =
-        "Miner bars show memory subscores, not the leaderboard composite. They are live finalized 3-validator v" + benchVersion +
-        " medians. " + referenceMethods + " The reference runs share the benchmark version and dataset seed, but Hermes uses a different model from miners and OpenClaw, and both differ from miner aggregation and provider routing. Third-party harnesses never enter score rank, KOTH, validator weights, or payouts.";
+        "The miner line is the running high of finalized three-validator memory medians within each benchmark version; points use their actual scoring completion time. Hermes and OpenClaw are single-seed off-network practice runs measured on " +
+        THIRD_PARTY_HARNESSES[0].measuredAt + " with the same Qwen3-32B model, pinned OpenRouter/Nebius route, and seed. Their points are positioned at each immutable contract's release date for comparison, not presented as historical measurements. Version changes are not all monotonic difficulty increases: v4 corrects v3 false positives. Third-party harnesses never enter score rank, KOTH, validator weights, or payouts.";
 
-      if (!entries.length) {
+      if (!releases.length) {
         target.className = "harness-comparison-state";
-        target.textContent = "Finalized v" + benchVersion + " miner memory subscores are temporarily unavailable. No substitute miner data is shown.";
+        target.textContent = "Benchmark release history is temporarily unavailable. No substitute timeline is shown.";
         return;
       }
 
-      var best = Number(entries[0].memory_mean);
-      var bestComposite = Number(entries[0].composite);
+      var releaseByVersion = {};
+      releases.forEach(function (release) { releaseByVersion[Number(release.bench_version)] = release; });
+      var externalSeries = THIRD_PARTY_HARNESSES.map(function (evidence) {
+        return {
+          id: evidence.id,
+          evidence: evidence,
+          points: (evidence.points || []).filter(function (point) {
+            return releaseByVersion[Number(point.benchVersion)] && Number.isFinite(Number(point.memoryMean));
+          }).map(function (point) {
+            var release = releaseByVersion[Number(point.benchVersion)];
+            return {
+              at: releaseTime(release), score: Number(point.memoryMean), version: Number(point.benchVersion),
+              tooltip: evidence.subject + " · v" + point.benchVersion + " · memory " + fx(Number(point.memoryMean)) + " (" + point.memoryCorrect + "/" + point.memoryCases + ") · measured " + evidence.measuredAt,
+              source: evidence.subject, measured: evidence.measuredAt, runId: point.runId
+            };
+          }).sort(function (a, b) { return a.at - b.at || a.version - b.version; })
+        };
+      });
+      var allTimes = releases.map(releaseTime).concat(minerPoints.map(function (point) { return point.at; }));
+      var minTime = Math.min.apply(Math, allTimes);
+      var maxTime = Math.max.apply(Math, allTimes);
+      var timePad = Math.max((maxTime - minTime) * 0.035, 6 * 60 * 60 * 1000);
+      minTime -= timePad;
+      maxTime += timePad;
+      var width = 960, height = 430, left = 58, right = 26, top = 48, bottom = 55;
+      var plotWidth = width - left - right, plotHeight = height - top - bottom;
+      function x(value) { return left + (value - minTime) / (maxTime - minTime) * plotWidth; }
+      function y(value) { return top + (1 - value) * plotHeight; }
+
+      var svg = [];
+      [0, 0.25, 0.5, 0.75, 1].forEach(function (tick) {
+        svg.push('<line class="timeline-grid" x1="' + left + '" x2="' + (width - right) + '" y1="' + y(tick) + '" y2="' + y(tick) + '"></line>');
+        svg.push('<text class="timeline-axis-label" x="' + (left - 10) + '" y="' + (y(tick) + 3) + '" text-anchor="end">' + tick.toFixed(2).replace(/^0/, "") + '</text>');
+      });
+      var releaseLabelLastX = [];
+      releases.forEach(function (release) {
+        var at = releaseTime(release);
+        var releaseX = x(at), depth = 0;
+        while (depth < releaseLabelLastX.length && releaseX - releaseLabelLastX[depth] < 82) depth += 1;
+        var releaseTooltip = "DittoBench v" + release.bench_version + " · " + release.title + " · released " + timelineDate(release.released_at) + (release.activated_at ? " · activated " + timelineDate(release.activated_at) : "");
+        releaseLabelLastX[depth] = releaseX;
+        svg.push('<line class="timeline-release" x1="' + releaseX + '" x2="' + releaseX + '" y1="' + top + '" y2="' + (height - bottom) + '"></line>');
+        svg.push('<text class="timeline-release-label" x="' + (releaseX + 5) + '" y="' + (18 + depth * 13) + '" tabindex="0" role="img" aria-label="' + esc(releaseTooltip) + '" data-timeline-tooltip="' + esc(releaseTooltip) + '">v' + esc(release.bench_version) + ' · ' + esc(timelineDate(release.released_at)) + '<title>' + esc(releaseTooltip) + '</title></text>');
+      });
+      if (minerPoints.length > 1) svg.push('<path class="timeline-path miner" d="' + timelinePath(minerPoints, x, y) + '"></path>');
+      minerPoints.forEach(function (point) { svg.push(timelinePoint(point, "miner", x, y)); });
+      externalSeries.forEach(function (series) {
+        if (series.points.length > 1) svg.push('<path class="timeline-path ' + series.id + '" d="' + timelinePath(series.points, x, y) + '"></path>');
+        series.points.forEach(function (point) { svg.push(timelinePoint(point, series.id, x, y)); });
+      });
+      svg.push('<text class="timeline-axis-label" x="' + left + '" y="' + (height - 18) + '">' + esc(timelineDate(minTime)) + '</text>');
+      svg.push('<text class="timeline-axis-label" x="' + (width - right) + '" y="' + (height - 18) + '" text-anchor="end">' + esc(timelineDate(maxTime)) + '</text>');
+
+      var latestMiner = minerPoints.length ? minerPoints[minerPoints.length - 1] : null;
+      var latestReferences = externalSeries.map(function (series) { return series.points[series.points.length - 1]; }).filter(Boolean);
+      var rows = minerPoints.map(function (point) {
+        return { source: point.source, version: point.version, placed: timelineDate(point.at), measured: timelineDate(point.measured), score: point.score, agentId: point.agentId };
+      });
+      externalSeries.forEach(function (series) {
+        series.points.forEach(function (point) {
+          rows.push({ source: point.source, version: point.version, placed: timelineDate(point.at), measured: point.measured, score: point.score });
+        });
+      });
+      rows.sort(function (a, b) { return a.version - b.version || b.score - a.score || a.source.localeCompare(b.source); });
       target.className = "";
-      target.innerHTML = '<p class="harness-comparison-summary">Top memory subscore: <strong>' +
-        fx(best) + '</strong>' + (Number.isFinite(bestComposite)
-          ? '. The <strong>' + fx(bestComposite) + '</strong> shown on the leaderboard is its composite. '
-          : '. ') + 'Both third-party references appear below on the same 0–1 scale.</p>' +
-        '<div class="memory-chart" role="list" aria-label="Top finalized v' + benchVersion +
-        ' miner memory scores compared with Hermes Agent and OpenClaw">' +
-        entries.map(function (entry) { return memoryComparisonRow(entry, false, null, false); }).join("") +
-        THIRD_PARTY_HARNESSES.map(function (evidence, index) {
-          return memoryComparisonRow(null, true, evidence, index === 0);
-        }).join("") +
-        '<div class="memory-chart-axis" aria-hidden="true"><span></span><div class="memory-chart-axis-scale"><span>0</span><span>.25</span><span>.50</span><span>.75</span><span>1.0</span></div><span></span></div>' +
-        '</div>';
+      target.innerHTML = '<p class="harness-comparison-summary"><span><strong>' + minerPoints.length + '</strong> miner record points</span>' +
+        (latestMiner ? '<span>Latest record <strong>' + fx(latestMiner.score) + '</strong> on v' + latestMiner.version + '</span>' : '<span>Miner history is not yet available</span>') +
+        '<span><strong>' + latestReferences.length + '</strong> native reference series</span></p>' +
+        '<div class="memory-timeline-legend" aria-label="Timeline legend"><span><i></i>Best finalized miner</span><span class="hermes"><i></i>Hermes Agent</span><span class="openclaw"><i></i>OpenClaw</span></div>' +
+        '<div class="memory-timeline-frame" tabindex="0" role="region" aria-label="Memory-score timeline, horizontally scrollable on small screens"><svg class="memory-timeline-svg" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-labelledby="memory-timeline-title memory-timeline-desc"><title id="memory-timeline-title">Best miner memory score with Hermes and OpenClaw across DittoBench v2 through v6</title><desc id="memory-timeline-desc">A time series from zero to one. Vertical dashed lines mark benchmark releases. Third-party points are retrospective measurements aligned to those dates.</desc>' + svg.join("") + '</svg><div class="memory-timeline-tooltip" role="tooltip" hidden></div></div>' +
+        '<p class="memory-timeline-note">Release markers show contract dates. Third-party points were all measured on ' + esc(THIRD_PARTY_HARNESSES[0].measuredAt) + ' and are aligned to those dates; hover or focus a point for its exact condition.</p>' +
+        '<details class="timeline-data-details"><summary>Exact timeline data</summary><div class="timeline-data-table-wrap"><table class="timeline-data-table"><thead><tr><th>Series</th><th>Contract</th><th>Placed at</th><th>Measured</th><th>Memory</th></tr></thead><tbody>' +
+        rows.map(function (row) { return '<tr><td>' + (row.agentId ? entityAnchor("agent", row.agentId, row.source) : esc(row.source)) + '</td><td>v' + esc(row.version) + '</td><td>' + esc(row.placed) + '</td><td>' + esc(row.measured) + '</td><td>' + fx(row.score) + '</td></tr>'; }).join("") +
+        '</tbody></table></div></details>';
+      bindTimelineTooltips(target);
     }
 
-    function loadThirdPartyComparison() {
-      var benchVersion = THIRD_PARTY_HARNESSES[0].benchVersion;
-      getJSON("/public/leaderboard?bench_version=" + encodeURIComponent(benchVersion))
+    function loadMemoryTimeline() {
+      getJSON("/public/bench/timeline")
         .then(function (data) {
-          lastThirdPartyLeaderboardData = data;
-          renderThirdPartyComparison(data);
+          lastMemoryTimelineData = data;
+          renderMemoryTimeline(data);
         })
         .catch(function () {
-          if (lastThirdPartyLeaderboardData) renderThirdPartyComparison(lastThirdPartyLeaderboardData);
-          else renderThirdPartyComparison(null);
+          if (lastMemoryTimelineData) renderMemoryTimeline(lastMemoryTimelineData);
+          else renderMemoryTimeline(null);
         });
     }
 
@@ -7710,10 +7725,9 @@
         loadValidatorNames();
         loadScreeners();
       }
-      // Third-party comparisons are observational only and use a fixed benchmark
-      // version. They refresh independently from the current-rollout board so a
-      // future v7 switch cannot silently compare Hermes v6 with v7 miner scores.
-      loadThirdPartyComparison();
+      // The memory timeline is observational and refreshes independently from
+      // the current-rollout leaderboard. Its API is explicitly bounded to v2-v6.
+      loadMemoryTimeline();
       // bench/config is effectively static (max-age 300); refresh at most every
       // 5 minutes, but always on boot and on a manual refresh.
       if (manual || all || Date.now() - benchConfigAt >= 300000) loadBenchConfig();

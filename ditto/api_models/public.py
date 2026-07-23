@@ -30,6 +30,38 @@ _SS58_PATTERN = r"^[1-9A-HJ-NP-Za-km-z]{47,48}$"
 _SIGNATURE_HEX_PATTERN = r"^[0-9a-fA-F]{128}$"
 
 
+class PublicBenchmarkRelease(BaseModel):
+    """One immutable DittoBench contract release shown on the timeline."""
+
+    bench_version: Annotated[int, Field(ge=1)]
+    released_at: datetime
+    activated_at: datetime | None = None
+    title: str
+
+
+class PublicBenchmarkTimelinePoint(BaseModel):
+    """A new best finalized miner memory median within one benchmark era."""
+
+    recorded_at: datetime
+    bench_version: Annotated[int, Field(ge=1)]
+    agent_id: UUID
+    agent_name: str
+    miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    memory_mean: Annotated[float, Field(ge=0.0, le=1.0)]
+    composite: Annotated[float, Field(gt=0.0, le=1.0)]
+    score_count: Annotated[int, Field(ge=3)]
+
+
+class PublicBenchmarkTimelineResponse(BaseModel):
+    """Historical top-miner memory progress and benchmark release events."""
+
+    generated_at: datetime
+    metric: Literal["memory_mean"] = "memory_mean"
+    score_quorum: Annotated[int, Field(ge=1)]
+    releases: list[PublicBenchmarkRelease]
+    points: list[PublicBenchmarkTimelinePoint]
+
+
 class PublicCategoryStat(BaseModel):
     """One category's mean in a run's per-category breakdown (public)."""
 

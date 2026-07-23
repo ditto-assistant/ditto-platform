@@ -907,6 +907,14 @@ class Score(Base):
             "validator_hotkey",
             postgresql_include=["updated_at"],
         ),
+        Index(
+            "scores_bench_timeline_idx",
+            "bench_version",
+            "agent_id",
+            "updated_at",
+            "validator_hotkey",
+            postgresql_include=["memory_mean", "composite", "n"],
+        ),
     )
 
 

@@ -473,6 +473,84 @@ class TestPublicChainWeights:
         assert response.status_code == 503
 
 
+class TestPublicBenchmarkTimeline:
+    async def test_returns_release_events_and_finalized_memory_highs(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        first_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.41, 0.42, 0.43],
+            details={"bench_version": 2},
+            base_time=datetime(2026, 7, 8, tzinfo=UTC),
+        )
+        second_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.71, 0.72, 0.73],
+            details={"bench_version": 2},
+            base_time=datetime(2026, 7, 9, tzinfo=UTC),
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=datetime(2026, 7, 18, 14, 30, tzinfo=UTC),
+                    activated_at=datetime(2026, 7, 18, 16, 0, tzinfo=UTC),
+                )
+            )
+            for agent_id, recorded_at in (
+                (UUID(first_id), datetime(2026, 7, 8, tzinfo=UTC)),
+                (UUID(second_id), datetime(2026, 7, 9, tzinfo=UTC)),
+            ):
+                scores = list(
+                    await session.scalars(
+                        select(Score).where(Score.agent_id == agent_id)
+                    )
+                )
+                for index, score in enumerate(scores):
+                    score.created_at = recorded_at + timedelta(minutes=index)
+                    score.updated_at = recorded_at + timedelta(minutes=index)
+        await _seed_k3(
+            session_maker,
+            miner="5" + "A" * 47,
+            composites=[0.51, 0.52],
+            details={"bench_version": 3},
+            base_time=datetime(2026, 7, 19, tzinfo=UTC),
+        )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/bench/timeline")
+
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "public, max-age=300"
+        body = response.json()
+        assert body["metric"] == "memory_mean"
+        assert body["score_quorum"] == 3
+        assert [release["bench_version"] for release in body["releases"]] == [
+            2,
+            3,
+            4,
+            5,
+            6,
+        ]
+        assert body["releases"][0]["released_at"] == "2026-07-07T00:00:00Z"
+        assert body["releases"][1]["released_at"] == "2026-07-18T14:30:00Z"
+        assert body["releases"][1]["activated_at"] == "2026-07-18T16:00:00Z"
+        assert [point["agent_id"] for point in body["points"]] == [
+            first_id,
+            second_id,
+        ]
+        assert [point["memory_mean"] for point in body["points"]] == [0.42, 0.72]
+
+
 class TestPublicLeaderboard:
     async def test_distinguishes_raw_rank_one_from_koth_emissions_champion(
         self,
