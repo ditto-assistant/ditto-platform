@@ -52,8 +52,8 @@ dependency-light `ditto-screening-protocol` package, pinned to an exact commit.
 | `GET /health` | Liveness + DB/chain readiness + build commit |
 | `GET /metrics` | Prometheus metrics |
 | `GET /api/v1/upload/eval-pricing` | Quote the upload fee in rao (CoinGecko TAO/USD oracle) |
-| `POST /api/v1/upload/check` | Pre-payment dry-run validation (signature, registration, size) |
-| `POST /api/v1/upload/agent` | Verified submission: re-check payment on chain → store tarball → write `agents` + `evaluation_payments` atomically |
+| `POST /api/v1/upload/check` | Pre-payment validation (signature, registration, size, accidental identical-upload detection) |
+| `POST /api/v1/upload/agent` | Verified submission: assign payment/credit → store unique tarball → write `agents` + `evaluation_payments` atomically; an accidental paid identical upload becomes a reusable credit |
 | `GET /api/v1/retrieval/agent-by-hotkey` | Look up a miner's latest agent |
 | `GET /api/v1/retrieval/agent/{id}/status` | Poll a submission's lifecycle status |
 

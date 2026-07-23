@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
-from sqlalchemy import case, func, literal, select
+from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy.orm import aliased
 
 from ditto.api_models.agent_status import AgentStatus
@@ -30,6 +30,7 @@ from ditto.db.models import (
     Agent,
     BenchmarkDataset,
     BenchmarkRollout,
+    EvaluationPayment,
     Score,
     ValidatorTicket,
 )
@@ -443,6 +444,14 @@ async def issue_ticket(
         .correlate(contender)
         .scalar_subquery()
     )
+    contender_payment = aliased(EvaluationPayment)
+    contender_owner = case(
+        (
+            contender_payment.miner_coldkey.is_not(None),
+            literal("coldkey:") + contender_payment.miner_coldkey,
+        ),
+        else_=literal("hotkey:") + contender.miner_hotkey,
+    )
     contender_per_miner = (
         select(
             contender.agent_id.label("agent_id"),
@@ -450,7 +459,7 @@ async def issue_ticket(
             contender_provisional_composite.label("provisional_composite"),
             func.row_number()
             .over(
-                partition_by=contender.miner_hotkey,
+                partition_by=contender_owner,
                 order_by=(
                     contender_provisional_composite.desc(),
                     contender.created_at.asc(),
@@ -458,6 +467,10 @@ async def issue_ticket(
                 ),
             )
             .label("miner_rank"),
+        )
+        .outerjoin(
+            contender_payment,
+            contender_payment.agent_id == contender.agent_id,
         )
         .where(
             contender.status == AgentStatus.EVALUATING,
@@ -578,6 +591,68 @@ async def issue_ticket(
         agent_id = (await session.execute(candidate)).scalar_one_or_none()
         if agent_id is None:
             return None
+
+        # One paid owner may have many generations, but only one generation may
+        # occupy validator capacity at a time. Serialize by the immutable
+        # payment-time coldkey (legacy rows fall back to hotkey), then re-check
+        # for an evaluating sibling after taking the lock. The post-lock check
+        # closes the race where two platform replicas select different agents
+        # for the same owner before either ticket exists.
+        owner_row = (
+            await session.execute(
+                select(Agent.miner_hotkey, EvaluationPayment.miner_coldkey)
+                .outerjoin(
+                    EvaluationPayment,
+                    EvaluationPayment.agent_id == Agent.agent_id,
+                )
+                .where(Agent.agent_id == agent_id)
+            )
+        ).one()
+        owner_hotkey, owner_coldkey = owner_row
+        owner_key = (
+            f"coldkey:{owner_coldkey}"
+            if owner_coldkey is not None
+            else f"hotkey:{owner_hotkey}"
+        )
+        if session.get_bind().dialect.name == "postgresql":
+            await session.execute(
+                select(func.pg_advisory_xact_lock(func.hashtextextended(owner_key, 0)))
+            )
+        sibling_agent = aliased(Agent)
+        sibling_payment = aliased(EvaluationPayment)
+        same_owner = (
+            or_(
+                sibling_payment.miner_coldkey == owner_coldkey,
+                and_(
+                    sibling_payment.miner_coldkey.is_(None),
+                    sibling_agent.miner_hotkey == owner_hotkey,
+                ),
+            )
+            if owner_coldkey is not None
+            else and_(
+                sibling_payment.miner_coldkey.is_(None),
+                sibling_agent.miner_hotkey == owner_hotkey,
+            )
+        )
+        active_sibling_count = await session.scalar(
+            select(func.count())
+            .select_from(ValidatorTicket)
+            .join(sibling_agent, sibling_agent.agent_id == ValidatorTicket.agent_id)
+            .outerjoin(
+                sibling_payment,
+                sibling_payment.agent_id == sibling_agent.agent_id,
+            )
+            .where(
+                sibling_agent.agent_id != agent_id,
+                sibling_agent.status == AgentStatus.EVALUATING,
+                ValidatorTicket.bench_version == bench_version,
+                ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES),
+                same_owner,
+            )
+        )
+        if (active_sibling_count or 0) > 0:
+            skipped.append(agent_id)
+            continue
         occupied = await session.scalar(
             select(func.count()).where(
                 ValidatorTicket.agent_id == agent_id,

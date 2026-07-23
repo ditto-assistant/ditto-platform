@@ -698,10 +698,12 @@ class EvaluationPayment(Base):
 
     The composite primary key ``(block_hash, extrinsic_index)`` is the
     replay-protection mechanism: the same on-chain payment proof cannot
-    be inserted twice. ``UNIQUE (agent_id)`` enforces the 1:1 invariant
-    (one upload = one payment). The composite FK on
-    ``(agent_id, miner_hotkey)`` documents the ownership invariant in
-    DDL so future endpoints can't silently break it.
+    be inserted twice. An assigned row has ``agent_id`` set; a payment made for
+    an accidental byte-identical upload instead has ``credit_for_agent_id`` set
+    until it is atomically consumed by a different artifact. The XOR constraint
+    makes those states exclusive. ``UNIQUE (agent_id)`` preserves one payment
+    per evaluated upload, while the composite FK on ``(agent_id, miner_hotkey)``
+    documents the ownership invariant in DDL.
     """
 
     __tablename__ = "evaluation_payments"
@@ -712,8 +714,18 @@ class EvaluationPayment(Base):
     extrinsic_index: Mapped[int] = mapped_column(Integer, nullable=False)
     """Zero-based index of the extrinsic within the block. PK part 2."""
 
-    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
-    """FK to ``agents.agent_id``. The agent this payment funds. ``UNIQUE``."""
+    agent_id: Mapped[UUID | None] = mapped_column(SaUUID(as_uuid=True), nullable=True)
+    """FK to ``agents.agent_id`` when the payment has funded an evaluation.
+
+    ``NULL`` means the payment is a reusable credit created after an accidental
+    byte-identical upload. The proof remains replay-protected by this row and is
+    atomically assigned when the miner submits a different artifact.
+    """
+
+    credit_for_agent_id: Mapped[UUID | None] = mapped_column(
+        SaUUID(as_uuid=True), nullable=True
+    )
+    """Earlier same-owner agent whose identical artifact created this credit."""
 
     miner_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
     """Signer hotkey on the payment extrinsic. FK-bound to ``agents.miner_hotkey``."""
@@ -753,6 +765,16 @@ class EvaluationPayment(Base):
             ondelete="RESTRICT",
             name="evaluation_payments_agent_id_miner_hotkey_fkey",
         ),
+        ForeignKeyConstraint(
+            ["credit_for_agent_id"],
+            ["agents.agent_id"],
+            ondelete="RESTRICT",
+            name="evaluation_payments_credit_for_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "(agent_id IS NOT NULL) <> (credit_for_agent_id IS NOT NULL)",
+            name="evaluation_payments_assignment_xor_credit",
+        ),
         CheckConstraint("amount_rao > 0", name="evaluation_payments_amount_rao_check"),
         CheckConstraint(
             "tao_usd_rate IS NULL OR tao_usd_rate > 0",
@@ -763,6 +785,11 @@ class EvaluationPayment(Base):
             name="evaluation_payments_extrinsic_index_check",
         ),
         Index("evaluation_payments_miner_hotkey_idx", "miner_hotkey"),
+        Index(
+            "evaluation_payments_available_credit_idx",
+            "miner_hotkey",
+            postgresql_where=text("agent_id IS NULL"),
+        ),
     )
 
 
