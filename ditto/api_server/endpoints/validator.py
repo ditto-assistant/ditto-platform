@@ -88,6 +88,7 @@ from ditto.api_models.system_health import (
 )
 from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_models.upload import _SS58_PATTERN
+from ditto.api_models.validator import ConfirmationDatasetPin
 from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
     ValidatorStackIdentity,
@@ -1564,6 +1565,40 @@ async def _champion_anchored_seed_set(
     )
 
 
+async def _top5_confirmation_seed_plan(
+    session: AsyncSession,
+    *,
+    champion_agent_id: UUID,
+    member_agent_id: UUID,
+    canonical_version: int,
+) -> tuple[int, ...]:
+    """Mirror the validator's bounded next-seed plan from durable history."""
+    full = champion_anchored_seeds(
+        champion_agent_id,
+        version=canonical_version,
+        max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+    )
+    history = await confirmation_composites_by_seed(
+        session,
+        agent_ids=[champion_agent_id, member_agent_id],
+        bench_version=canonical_version,
+    )
+    champion_seeds = history.get(champion_agent_id, {})
+    covered = 0
+    for seed in full:
+        if seed not in champion_seeds:
+            break
+        covered += 1
+    target_depth = min(len(full), max(covered + 1, 3))
+    anchor = full[:target_depth]
+    member_seeds = history.get(member_agent_id, {})
+    missing = tuple(seed for seed in anchor if seed not in member_seeds)
+    if member_agent_id == champion_agent_id:
+        return missing
+    member_depth = sum(seed in member_seeds for seed in anchor)
+    return missing if member_depth >= target_depth - 1 else missing[:2]
+
+
 @router.post(
     "/top5-confirmation-job",
     response_model=JobResponse,
@@ -1581,6 +1616,7 @@ async def request_top5_confirmation_job(
     response: Response,
     chain: ChainDep,
     session: SessionDep,
+    generator: GeneratorDep,
     x_validator_hotkey: Annotated[str | None, Header()] = None,
 ) -> JobResponse:
     """Lease one current emission-set member for append-only shared-seed work."""
@@ -1691,6 +1727,34 @@ async def request_top5_confirmation_job(
                 status_code=409,
                 detail="top-5 shared-seed rescore round is not due at this block",
             )
+        confirmation_datasets: list[ConfirmationDatasetPin] = []
+        if canonical_version >= 3:
+            if generator.run_size is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="top-5 confirmation dataset generation is unavailable",
+                )
+            seeds = await _top5_confirmation_seed_plan(
+                session,
+                champion_agent_id=payload.champion_agent_id,
+                member_agent_id=payload.member_agent_id,
+                canonical_version=canonical_version,
+            )
+            if not seeds:
+                raise HTTPException(
+                    status_code=409,
+                    detail="the requested member has no pending confirmation seeds",
+                )
+            confirmation_datasets = [
+                ConfirmationDatasetPin(
+                    seed=seed,
+                    dataset_sha256=await generator.generate(
+                        seed, bench_version=canonical_version
+                    ),
+                    run_size=generator.run_size,
+                )
+                for seed in seeds
+            ]
         ticket = await issue_confirmation_ticket(
             session,
             agent_id=payload.member_agent_id,
@@ -1756,6 +1820,7 @@ async def request_top5_confirmation_job(
                 contract.minimum_screening_policy_version
             ),
             requires_screened_image=contract.requires_screened_image,
+            confirmation_datasets=confirmation_datasets,
             inference=(
                 _inference_grant_offer(
                     request=request,
