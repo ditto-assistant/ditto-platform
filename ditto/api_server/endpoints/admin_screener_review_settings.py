@@ -187,14 +187,6 @@ async def create_settings_revision(
     """Append one optimistic, idempotency-safe settings revision."""
     if not _SCOPE_RE.fullmatch(payload.scope):
         raise HTTPException(status_code=422, detail="invalid screener settings scope")
-    if payload.settings.mode == "enforce":
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "enforce is not activatable until screening verdicts bind the "
-                "attempt to a versioned reviewer settings revision and checksum"
-            ),
-        )
     if payload.settings.mode == "inherit" and payload.scope == "*":
         raise HTTPException(
             status_code=409,

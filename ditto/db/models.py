@@ -404,6 +404,10 @@ class ScreeningAttempt(Base):
     build_only: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    review_settings_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    review_settings_instance_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_settings_scope: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_settings_checksum: Mapped[str | None] = mapped_column(Text, nullable=True)
     """This attempt only rebuilds an already-adjudicated submission's missing
     prerequisites (screened image / dataset); the screener must NOT re-run the
     anti-cheat source review and cannot quarantine. Set when an EVALUATING agent
@@ -443,6 +447,17 @@ class ScreeningAttempt(Base):
         CheckConstraint(
             "reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 64",
             name="screening_attempts_reason_code_check",
+        ),
+        CheckConstraint(
+            "(review_settings_revision IS NULL "
+            "AND review_settings_instance_id IS NULL "
+            "AND review_settings_scope IS NULL "
+            "AND review_settings_checksum IS NULL) OR "
+            "(review_settings_revision > 0 "
+            "AND review_settings_instance_id IS NOT NULL "
+            "AND review_settings_scope IS NOT NULL "
+            "AND length(review_settings_checksum) = 64)",
+            name="screening_attempts_review_settings_binding_check",
         ),
         Index("screening_attempts_agent_started_idx", "agent_id", "started_at"),
         Index(
