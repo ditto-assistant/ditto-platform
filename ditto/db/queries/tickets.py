@@ -666,11 +666,12 @@ async def issue_ticket(
         if completion_first:
             # Completion-first admission is global, not per validator slot.
             # Every slot waits on the same FIFO head. Once the row lock is
-            # acquired, re-check this validator against fresh committed state:
-            # if another slot already owns or scored the head, this slot must
-            # stay idle instead of skipping ahead to a newer submission.
-            same_validator_blocked = await session.scalar(
-                select(func.count()).where(
+            # acquired, re-check this validator against fresh committed state.
+            # A sibling slot waits while this validator owns the head; a
+            # validator that can no longer score the head advances to the next
+            # FIFO candidate instead of idling behind impossible work.
+            same_validator_blocking_status = await session.scalar(
+                select(ValidatorTicket.status).where(
                     ValidatorTicket.agent_id == agent_id,
                     ValidatorTicket.validator_hotkey == validator_hotkey,
                     ValidatorTicket.bench_version == bench_version,
@@ -691,10 +692,21 @@ async def issue_ticket(
                             )
                         )
                     ),
-                )
+                ).limit(1)
             )
-            if same_validator_blocked:
+            if same_validator_blocking_status == TicketStatus.ISSUED:
+                # A sibling slot must not advance while this validator already
+                # owns the FIFO head. Let another validator fill the remaining
+                # quorum slots first.
                 return None
+            if same_validator_blocking_status is not None:
+                # This validator cannot contribute another score to the FIFO
+                # head (it already scored it, is cooling down, or exhausted its
+                # retry budget). Keeping it parked here can idle the entire
+                # fleet when every remaining scorer is similarly ineligible.
+                # Preserve FIFO among work this validator can actually claim.
+                skipped.append(agent_id)
+                continue
         break
 
     ticket = await session.get(
