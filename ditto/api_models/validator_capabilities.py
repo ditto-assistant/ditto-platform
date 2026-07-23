@@ -88,8 +88,13 @@ class ScorerBenchmarkCapability(BaseModel):
             raise ValueError(
                 "benchmark versions above v2 require a fresh verified scorer identity"
             )
-        if (7 in versions) != (self.v7_calibration is not None):
-            raise ValueError("v7 support requires exact inference calibration identity")
+        # Heartbeat protocol v10 predates the v7 calibration payload. A source
+        # stack may observe a newer scorer that advertises v7 while the
+        # validator still emits that legacy envelope, so the protocol-aware
+        # requirement belongs to ValidatorHeartbeatRequest. Keep rejecting the
+        # inverse contradiction at this protocol-agnostic layer.
+        if self.v7_calibration is not None and 7 not in versions:
+            raise ValueError("v7 inference calibration requires benchmark v7 support")
         return self
 
 

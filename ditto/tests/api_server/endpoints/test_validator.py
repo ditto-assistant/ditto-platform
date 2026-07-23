@@ -269,14 +269,14 @@ def test_scorer_benchmark_capability_is_conservative_unless_fresh_verified() -> 
     )
     assert verified.supported_bench_versions == (2, 3)
 
-    with pytest.raises(ValueError, match="requires exact inference calibration"):
-        ScorerBenchmarkCapability(
-            status="fresh_verified",
-            supported_bench_versions=(2, 7),
-            observed_at=1784020800,
-            software_version="1.3.0",
-            source_revision="a" * 40,
-        )
+    legacy_v7 = ScorerBenchmarkCapability(
+        status="fresh_verified",
+        supported_bench_versions=(2, 7),
+        observed_at=1784020800,
+        software_version="1.3.0",
+        source_revision="a" * 40,
+    )
+    assert legacy_v7.v7_calibration is None
     calibrated = ScorerBenchmarkCapability(
         status="fresh_verified",
         supported_bench_versions=(2, 7),
@@ -295,6 +295,16 @@ def test_scorer_benchmark_capability_is_conservative_unless_fresh_verified() -> 
         ),
     )
     assert calibrated.v7_calibration is not None
+
+    with pytest.raises(ValueError, match="calibration requires benchmark v7 support"):
+        ScorerBenchmarkCapability(
+            status="fresh_verified",
+            supported_bench_versions=(2, 6),
+            observed_at=1784020800,
+            software_version="1.3.0",
+            source_revision="a" * 40,
+            v7_calibration=calibrated.v7_calibration,
+        )
 
 
 def _sign(message: str) -> str:
@@ -1114,6 +1124,51 @@ class TestHeartbeat:
             "slot-1",
         ]
         assert public["active_benchmark"] == public["active_benchmarks"][0]
+
+    async def test_v10_accepts_v7_scorer_advertisement_without_v11_calibration(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A newer source scorer must not invalidate its legacy validator."""
+        _install_db(app, session_maker)
+        _install_chain(app)
+        capabilities = json.loads(json.dumps(_V9_CAPABILITIES))
+        capabilities["scorer_benchmarks"]["supported_bench_versions"] = [2, 7]
+        capacity = {
+            "configured_slots": 1,
+            "healthy_slots": ["slot-0"],
+            "admission": "accepting",
+            "active": [],
+        }
+
+        accepted = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=10,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert accepted.status_code == 200, accepted.text
+
+        rejected_v11 = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=11,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert rejected_v11.status_code == 422, rejected_v11.text
+        assert rejected_v11.json()["message"] == "request validation failed"
 
     async def test_malformed_stored_stack_health_is_omitted_publicly(
         self,
