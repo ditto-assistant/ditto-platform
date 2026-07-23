@@ -12,6 +12,8 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "f4b8a9137c2d"
+# Ticket dataset pins extend the ticket-purpose schema introduced immediately
+# downstack; keeping this linear avoids two production Alembic heads.
 down_revision: str | Sequence[str] | None = "c3a71f9d4e82"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
