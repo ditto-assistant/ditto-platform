@@ -1,29 +1,88 @@
-    .section-head { align-items: flex-end; margin: 34px 0 10px; }
-    .section-head h2 { font-family: var(--display); font-size: 21px; font-weight: 400; line-height: 1.1; letter-spacing: -0.01em; }
-    .section-head .hint { color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; }
+.section-head {
+  align-items: flex-end;
+  margin: 34px 0 10px;
+}
+.section-head h2 {
+  font-family: var(--display);
+  font-size: 21px;
+  font-weight: 400;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+}
+.section-head .hint {
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
 
-    /* Right-edge scroll hint: a subtle shadow at the container's right edge that
+/* Right-edge scroll hint: a subtle shadow at the container's right edge that
        fades out once the table is scrolled to the end. The cover layer scrolls
        with the content (background-attachment: local) and masks the shadow at
        the end; the shadow layer is pinned to the visible right edge. */
-    .board {
-      border-color: var(--border); border-radius: 4px; overflow-x: auto;
-      background:
-        linear-gradient(to right, transparent, var(--bg-elev) 80%) 100% 0 / 34px 100% no-repeat local,
-        radial-gradient(farthest-side at 100% 50%, color-mix(in oklch, var(--text) 14%, transparent), transparent) 100% 0 / 16px 100% no-repeat;
-      background-color: var(--bg-elev);
-    }
-    .board:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
-    table { min-width: 850px; }
-    thead th { padding: 11px 14px; border-color: var(--border); background: var(--bg-elev-2); color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em; }
-    tbody td { padding: 11px 14px; border-color: color-mix(in oklch, var(--border) 72%, transparent); font-size: 13px; }
-    tbody tr:hover,
-    tbody tr:focus-visible { background: color-mix(in oklch, var(--accent) 6%, var(--bg-elev)); }
-    tbody tr.champion { background: color-mix(in oklch, var(--gold) 8%, var(--bg-elev)); }
-    tbody tr.champion:hover { background: color-mix(in oklch, var(--gold) 13%, var(--bg-elev)); }
-    .tip { border-color: color-mix(in oklch, var(--text-dim) 55%, transparent); }
-    .rank { min-width: 25px; height: 25px; border-radius: 3px; background: var(--bg-elev-2); color: var(--text-dim); }
-    .rank.r1 { background: color-mix(in oklch, var(--gold) 14%, var(--bg-elev)); color: var(--rank-one-text); }
-    .rank.r2 { background: var(--bg-elev-2); color: var(--text-dim); }
-    .rank.r3 { background: color-mix(in oklch, #a85d35 11%, var(--bg-elev)); color: var(--rank-three-text); }
-
+.board {
+  border-color: var(--border);
+  border-radius: 4px;
+  overflow-x: auto;
+  background:
+    linear-gradient(to right, transparent, var(--bg-elev) 80%) 100% 0 / 34px 100% no-repeat local,
+    radial-gradient(
+        farthest-side at 100% 50%,
+        color-mix(in oklch, var(--text) 14%, transparent),
+        transparent
+      )
+      100% 0 / 16px 100% no-repeat;
+  background-color: var(--bg-elev);
+}
+.board:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+table {
+  min-width: 850px;
+}
+thead th {
+  padding: 11px 14px;
+  border-color: var(--border);
+  background: var(--bg-elev-2);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+}
+tbody td {
+  padding: 11px 14px;
+  border-color: color-mix(in oklch, var(--border) 72%, transparent);
+  font-size: 13px;
+}
+tbody tr:hover,
+tbody tr:focus-visible {
+  background: color-mix(in oklch, var(--accent) 6%, var(--bg-elev));
+}
+tbody tr.champion {
+  background: color-mix(in oklch, var(--gold) 8%, var(--bg-elev));
+}
+tbody tr.champion:hover {
+  background: color-mix(in oklch, var(--gold) 13%, var(--bg-elev));
+}
+.tip {
+  border-color: color-mix(in oklch, var(--text-dim) 55%, transparent);
+}
+.rank {
+  min-width: 25px;
+  height: 25px;
+  border-radius: 3px;
+  background: var(--bg-elev-2);
+  color: var(--text-dim);
+}
+.rank.r1 {
+  background: color-mix(in oklch, var(--gold) 14%, var(--bg-elev));
+  color: var(--rank-one-text);
+}
+.rank.r2 {
+  background: var(--bg-elev-2);
+  color: var(--text-dim);
+}
+.rank.r3 {
+  background: color-mix(in oklch, #a85d35 11%, var(--bg-elev));
+  color: var(--rank-three-text);
+}

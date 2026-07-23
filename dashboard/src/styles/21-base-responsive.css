@@ -1,50 +1,140 @@
-    @media (max-width: 800px) {
-      .pipeline-summary { grid-template-columns: 1fr; gap: var(--detail-space-xl); }
-      .pipeline-meta { padding-top: var(--detail-space-xl); border-top: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
-    }
-    @media (max-width: 560px) {
-      .modal { padding-inline: 20px; }
-      body.entity-page .modal { width: 100%; margin: 0; min-height: 100vh; border: 0; }
-      .modal .dhead { padding-right: 0; padding-top: 54px; }
-      .modal-actions { left: 20px; right: 20px; justify-content: space-between; }
-      .modal .dk { display: block; }
-      .modal .dk-label { display: block; margin-bottom: 2px; }
-      .pipeline-key-facts { display: grid; grid-template-columns: 1fr 1fr; gap: var(--detail-space-md); }
-      .pipeline-key-facts > div { min-width: 0; }
-      .attempt { grid-template-columns: 76px 1fr; gap: 12px; }
-      .attempt-time { grid-column: 2; }
-      .screening-review { grid-column: 1 / -1; padding: 13px; }
-      .screening-review-head { align-items: flex-start; flex-direction: column; gap: 3px; }
-      .screening-review-location { grid-template-columns: 1fr; gap: 2px; }
-      .accepted-score { grid-template-columns: 1fr; gap: var(--detail-space-sm); }
-      .run-telemetry-panel { width: calc(100vw - 72px); max-width: 100%; box-sizing: border-box; }
-      .run-telemetry-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .screening-dispute-wallets { grid-template-columns: 1fr; }
-      .retry-info::after,
-      .tip::after { width: min(240px, calc(100vw - 72px)); }
-      /* In the 2-col mobile stat grid the hidden "Subnet snapshot" h2 is child 1
+@media (max-width: 800px) {
+  .pipeline-summary {
+    grid-template-columns: 1fr;
+    gap: var(--detail-space-xl);
+  }
+  .pipeline-meta {
+    padding-top: var(--detail-space-xl);
+    border-top: 1px solid color-mix(in oklab, var(--border) 62%, transparent);
+  }
+}
+@media (max-width: 560px) {
+  .modal {
+    padding-inline: 20px;
+  }
+  body.entity-page .modal {
+    width: 100%;
+    margin: 0;
+    min-height: 100vh;
+    border: 0;
+  }
+  .modal .dhead {
+    padding-right: 0;
+    padding-top: 54px;
+  }
+  .modal-actions {
+    left: 20px;
+    right: 20px;
+    justify-content: space-between;
+  }
+  .modal .dk {
+    display: block;
+  }
+  .modal .dk-label {
+    display: block;
+    margin-bottom: 2px;
+  }
+  .pipeline-key-facts {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--detail-space-md);
+  }
+  .pipeline-key-facts > div {
+    min-width: 0;
+  }
+  .attempt {
+    grid-template-columns: 76px 1fr;
+    gap: 12px;
+  }
+  .attempt-time {
+    grid-column: 2;
+  }
+  .screening-review {
+    grid-column: 1 / -1;
+    padding: 13px;
+  }
+  .screening-review-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .screening-review-location {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+  .accepted-score {
+    grid-template-columns: 1fr;
+    gap: var(--detail-space-sm);
+  }
+  .run-telemetry-panel {
+    width: calc(100vw - 72px);
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .run-telemetry-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .screening-dispute-wallets {
+    grid-template-columns: 1fr;
+  }
+  .retry-info::after,
+  .tip::after {
+    width: min(240px, calc(100vw - 72px));
+  }
+  /* In the 2-col mobile stat grid the hidden "Subnet snapshot" h2 is child 1
          and the primary card (child 2) owns its full row, so right-column cards
          are the even children >= 4. Left-anchored bubbles on those cards run off
          the right viewport edge; anchor them right so the whole bubble stays on
          screen. */
-      .cards > .card:nth-child(2n+4) .tip::after { left: auto; right: 0; }
-    }
+  .cards > .card:nth-child(2n + 4) .tip::after {
+    left: auto;
+    right: 0;
+  }
+}
 
-    @media (max-width: 960px) {
-      .hide-md { display: none; }
-      .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-      .pipeline-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .pipeline-column:nth-child(3) { border-left: 0; border-top: 1px solid var(--border); }
-      .pipeline-column:nth-child(4) { border-top: 1px solid var(--border); }
-    }
-    @media (max-width: 720px) {
-      .cards { grid-template-columns: repeat(2, 1fr); }
-      .hide-sm { display: none; }
-      .stage-cell { min-width: 0; }
-      .brand .brand-name { font-size: 18px; }
-      .pipeline-overview { grid-template-columns: 1fr; }
-      .pipeline-column + .pipeline-column { border-left: 0; border-top: 1px solid var(--border); }
-      .fleet-head { align-items: flex-start; flex-wrap: wrap; }
-      .fleet-heading { flex: 1 1 100%; }
-    }
-
+@media (max-width: 960px) {
+  .hide-md {
+    display: none;
+  }
+  .cards {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .pipeline-overview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .pipeline-column:nth-child(3) {
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+  .pipeline-column:nth-child(4) {
+    border-top: 1px solid var(--border);
+  }
+}
+@media (max-width: 720px) {
+  .cards {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .hide-sm {
+    display: none;
+  }
+  .stage-cell {
+    min-width: 0;
+  }
+  .brand .brand-name {
+    font-size: 18px;
+  }
+  .pipeline-overview {
+    grid-template-columns: 1fr;
+  }
+  .pipeline-column + .pipeline-column {
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+  .fleet-head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .fleet-heading {
+    flex: 1 1 100%;
+  }
+}

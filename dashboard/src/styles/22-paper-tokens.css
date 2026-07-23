@@ -1,33 +1,32 @@
-    /* ── Ditto paper product system ───────────────────────────
+/* ── Ditto paper product system ───────────────────────────
        Shared with landing-astro and ditto-app: warm paper surfaces, sepia ink,
        brass/plum data accents, editorial headings, and compact app controls. */
-    :root {
-      --bg: #f3efe6;
-      --bg-elev: #fdfbf7;
-      --bg-elev-2: #e8e2d5;
-      --border: #d6ccb8;
-      --border-strong: #9f927e;
-      --text: #2d2822;
-      --text-dim: #625a4e;
-      --text-faint: #6b6356;
-      --accent: #5c4d3c;
-      --accent-2: #6d5873;
-      --gold: #9a692c;
-      --tool: #9a692c;
-      --memory: #6d5873;
-      --good: #356845;
-      --warn: #8a5a1f;
-      --danger: #a33d36;
-      --on-accent: #fdfbf7;
-      --focus: #5c4d3c;
-      --accent-hover: #433529;
-      --banner-text: #684215;
-      --banner-strong: #4d3010;
-      --rank-one-text: #754b18;
-      --rank-three-text: #814626;
-      --radius: 8px;
-      --display: Georgia, "Times New Roman", serif;
-      --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-      --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
-    }
-
+:root {
+  --bg: #f3efe6;
+  --bg-elev: #fdfbf7;
+  --bg-elev-2: #e8e2d5;
+  --border: #d6ccb8;
+  --border-strong: #9f927e;
+  --text: #2d2822;
+  --text-dim: #625a4e;
+  --text-faint: #6b6356;
+  --accent: #5c4d3c;
+  --accent-2: #6d5873;
+  --gold: #9a692c;
+  --tool: #9a692c;
+  --memory: #6d5873;
+  --good: #356845;
+  --warn: #8a5a1f;
+  --danger: #a33d36;
+  --on-accent: #fdfbf7;
+  --focus: #5c4d3c;
+  --accent-hover: #433529;
+  --banner-text: #684215;
+  --banner-strong: #4d3010;
+  --rank-one-text: #754b18;
+  --rank-three-text: #814626;
+  --radius: 8px;
+  --display: Georgia, "Times New Roman", serif;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+}

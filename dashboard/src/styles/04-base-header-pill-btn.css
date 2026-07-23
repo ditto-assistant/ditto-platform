@@ -1,43 +1,112 @@
-    /* ── Header ─────────────────────────────────────────────── */
-    header.top {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      flex-wrap: wrap;
-      margin-bottom: 8px;
-    }
-    .brand { display: flex; align-items: center; gap: 12px; }
-    .brand .mark {
-      width: 46px; height: 46px;
-      display: grid; place-items: center;
-      flex: 0 0 auto;
-    }
-    .brand .mark img { width: 100%; height: 100%; object-fit: contain; display: block; }
-    .brand .brand-name { font-size: 20px; margin: 0; letter-spacing: 0.2px; }
-    .brand .sub { color: var(--text-dim); font-size: 13px; margin-top: 1px; }
-    .spacer { flex: 1 1 auto; }
+/* ── Header ─────────────────────────────────────────────── */
+header.top {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.brand .mark {
+  width: 46px;
+  height: 46px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+}
+.brand .mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.brand .brand-name {
+  font-size: 20px;
+  margin: 0;
+  letter-spacing: 0.2px;
+}
+.brand .sub {
+  color: var(--text-dim);
+  font-size: 13px;
+  margin-top: 1px;
+}
+.spacer {
+  flex: 1 1 auto;
+}
 
-    .pill {
-      display: inline-flex; align-items: center; gap: 7px;
-      padding: 6px 12px; border-radius: 999px;
-      font-size: 12.5px; font-weight: 600;
-      border: 1px solid var(--border); background: var(--bg-elev);
-      color: var(--text-dim);
-    }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
-    .pill.live .dot { background: var(--good); box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.18); animation: pulse 2s infinite; }
-    .pill.error .dot { background: var(--danger); }
-    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--text-dim);
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+.pill.live .dot {
+  background: var(--good);
+  box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.18);
+  animation: pulse 2s infinite;
+}
+.pill.error .dot {
+  background: var(--danger);
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
 
-    .btn {
-      display: inline-flex; align-items: center; gap: 7px;
-      padding: 8px 14px; border-radius: 10px; cursor: pointer;
-      font-size: 13px; font-weight: 600; font-family: inherit;
-      border: 1px solid var(--border); background: var(--bg-elev); color: var(--text);
-      text-decoration: none; transition: border-color .15s, background .15s, transform .05s;
-    }
-    .btn:hover { border-color: var(--accent); background: var(--bg-elev-2); }
-    .btn:disabled { cursor: not-allowed; opacity: .45; border-color: var(--border); background: transparent; transform: none; }
-    .btn:active { transform: translateY(1px); }
-    .btn.ghost { background: transparent; }
-
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--text);
+  text-decoration: none;
+  transition:
+    border-color 0.15s,
+    background 0.15s,
+    transform 0.05s;
+}
+.btn:hover {
+  border-color: var(--accent);
+  background: var(--bg-elev-2);
+}
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+  border-color: var(--border);
+  background: transparent;
+  transform: none;
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn.ghost {
+  background: transparent;
+}

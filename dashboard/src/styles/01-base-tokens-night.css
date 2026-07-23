@@ -1,29 +1,30 @@
-    /* Palette aligned to the Ditto app's dark "night" theme (ditto-app
+/* Palette aligned to the Ditto app's dark "night" theme (ditto-app
        src/styles/variables.css): a deep blue-purple ground (hue 260) with a
        brass/gold accent (hue 75) and warm "bone" foreground. Colours are oklch
        to match the app exactly; translucent tints are derived with color-mix so
        there are no hand-tuned rgba triples to drift. */
-    :root {
-      --bg: oklch(18% 0.03 260);           /* night-ground */
-      --bg-elev: oklch(22% 0.032 260);     /* night-paper (cards/panels) */
-      --bg-elev-2: oklch(26% 0.028 260);   /* night-paper-accent */
-      --border: oklch(35% 0.03 260);
-      --border-strong: oklch(46% 0.035 260);
-      --text: oklch(94% 0.018 85);         /* bone */
-      --text-dim: oklch(79% 0.018 85);     /* secondary text, ~7:1 on panels */
-      --text-faint: oklch(70% 0.02 260);   /* captions/meta, kept at AA on panels */
-      --accent: oklch(76% 0.12 75);        /* brass (app primary) */
-      --accent-2: oklch(76% 0.09 210);     /* muted teal, the memory hue */
-      --gold: oklch(82% 0.12 82);
-      --tool: var(--accent);
-      --memory: var(--accent-2);
-      --good: oklch(78% 0.15 150);
-      --warn: oklch(80% 0.13 72);
-      --danger: oklch(71% 0.17 25);
-      --on-accent: oklch(16% 0.03 260);    /* text on a gold/teal fill */
-      --focus: oklch(84% 0.13 210);        /* high-visibility keyboard focus ring */
-      --radius: 12px;
-      --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
-      --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", "Roboto", "Oxygen", "Ubuntu", "Cantarell", "Fira Sans", "Helvetica Neue", sans-serif;
-    }
-
+:root {
+  --bg: oklch(18% 0.03 260); /* night-ground */
+  --bg-elev: oklch(22% 0.032 260); /* night-paper (cards/panels) */
+  --bg-elev-2: oklch(26% 0.028 260); /* night-paper-accent */
+  --border: oklch(35% 0.03 260);
+  --border-strong: oklch(46% 0.035 260);
+  --text: oklch(94% 0.018 85); /* bone */
+  --text-dim: oklch(79% 0.018 85); /* secondary text, ~7:1 on panels */
+  --text-faint: oklch(70% 0.02 260); /* captions/meta, kept at AA on panels */
+  --accent: oklch(76% 0.12 75); /* brass (app primary) */
+  --accent-2: oklch(76% 0.09 210); /* muted teal, the memory hue */
+  --gold: oklch(82% 0.12 82);
+  --tool: var(--accent);
+  --memory: var(--accent-2);
+  --good: oklch(78% 0.15 150);
+  --warn: oklch(80% 0.13 72);
+  --danger: oklch(71% 0.17 25);
+  --on-accent: oklch(16% 0.03 260); /* text on a gold/teal fill */
+  --focus: oklch(84% 0.13 210); /* high-visibility keyboard focus ring */
+  --radius: 12px;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans:
+    -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", "Roboto", "Oxygen", "Ubuntu",
+    "Cantarell", "Fira Sans", "Helvetica Neue", sans-serif;
+}

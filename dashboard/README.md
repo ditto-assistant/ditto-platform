@@ -98,10 +98,10 @@ telemetry remains in wandb (linked).
 
 Resolved in priority order:
 
-| What | Query string | Meta tag (bake in) | Default |
-| --- | --- | --- | --- |
-| API base | `?api=https://api.host/api/v1` | `<meta name="ditto:api-base">` | same-origin `/api/v1` |
-| wandb link | `?wandb=https://wandb.ai/org/ditto-sn118` | `<meta name="ditto:wandb-url">` | `https://wandb.ai/` |
+| What       | Query string                              | Meta tag (bake in)              | Default               |
+| ---------- | ----------------------------------------- | ------------------------------- | --------------------- |
+| API base   | `?api=https://api.host/api/v1`            | `<meta name="ditto:api-base">`  | same-origin `/api/v1` |
+| wandb link | `?wandb=https://wandb.ai/org/ditto-sn118` | `<meta name="ditto:wandb-url">` | `https://wandb.ai/`   |
 
 For a deployed dashboard the platform injects the wandb URL into the built
 HTML's meta tag at serve time (`DITTO_DASHBOARD_WANDB_URL`); the query string
@@ -130,7 +130,7 @@ never substitutes sample values for live subnet data.
 `dashboard/dist/` at `/` (see `factory.py`); `scripts/update.sh` builds it at
 deploy time, so on the deployed hosts it's already live:
 
-- dev  → `https://platform-api-dev.heyditto.ai/`
+- dev → `https://platform-api-dev.heyditto.ai/`
 - prod → `https://platform-api.heyditto.ai/`
 
 Same-origin means the SPA's `/api/v1/public/*` calls need no CORS and the wandb
@@ -138,7 +138,7 @@ link is injected from `DITTO_DASHBOARD_WANDB_URL` at serve time — no need to
 rebuild per environment. `DITTO_DASHBOARD_ENABLED=false` runs the API headless.
 
 **Alternative: host it yourself.** `dist/` is plain static files — upload to
-object storage (S3/MinIO/GCS) behind a CDN, or any static host. A *cross-origin*
+object storage (S3/MinIO/GCS) behind a CDN, or any static host. A _cross-origin_
 host would additionally require CORS on the API's `/public/*` routes (not
 currently enabled, since the default is same-origin). The API sets
 `Cache-Control: public, max-age=30` on the data; the SPA auto-refreshes on the

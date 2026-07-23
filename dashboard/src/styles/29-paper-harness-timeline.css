@@ -1,133 +1,297 @@
-    /* Third-party harnesses are deliberately kept outside the leaderboard.
+/* Third-party harnesses are deliberately kept outside the leaderboard.
        This comparison panel can grow by adding evidence records in JS without
        teaching ranking, KOTH, or emissions about off-network runs. */
-    .harness-comparison {
-      margin: 14px 0;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      background: var(--bg-elev);
-      overflow: hidden;
-    }
-    .harness-comparison-head {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 24px;
-      padding: 20px 22px 18px;
-      border-bottom: 1px solid var(--border);
-      background: color-mix(in oklch, var(--accent-2) 4%, var(--bg-elev));
-    }
-    .harness-comparison-title { min-width: 0; }
-    .harness-comparison-kicker {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 7px;
-      color: var(--accent-2);
-      font: 700 10px/1 var(--mono);
-      letter-spacing: .07em;
-      text-transform: uppercase;
-    }
-    .harness-comparison-kicker .reference-badge {
-      padding: 3px 6px;
-      border: 1px solid color-mix(in oklch, var(--accent-2) 42%, var(--border));
-      border-radius: 3px;
-      color: var(--accent-2);
-      background: color-mix(in oklch, var(--accent-2) 8%, transparent);
-    }
-    .harness-comparison h2 {
-      margin: 0;
-      font-family: var(--display);
-      font-size: 24px;
-      font-weight: 400;
-      line-height: 1.1;
-      letter-spacing: -0.01em;
-    }
-    .harness-comparison-lead {
-      max-width: 72ch;
-      margin: 8px 0 0;
-      color: var(--text-dim);
-      font-size: 13px;
-      line-height: 1.55;
-    }
-    .harness-comparison-body { padding: 21px 22px 18px; }
-    .harness-comparison-summary {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 7px 18px;
-      margin: 0 0 16px;
-      color: var(--text-dim);
-      font-size: 12.5px;
-    }
-    .harness-comparison-summary strong { color: var(--text); font-variant-numeric: tabular-nums; }
-    .memory-timeline-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-bottom: 10px; color: var(--text-dim); font: 10.5px/1.4 var(--mono); }
-    .memory-timeline-legend span { display: inline-flex; align-items: center; gap: 7px; }
-    .memory-timeline-legend i { display: inline-block; width: 25px; border-top: 3px solid var(--memory); }
-    .memory-timeline-legend .hermes i { border-color: var(--accent); border-top-style: dashed; }
-    .memory-timeline-legend .openclaw i { border-color: var(--good); border-top-style: dashed; }
-    .memory-timeline-frame { position: relative; border: 1px solid var(--border); background: var(--bg-elev-2); overflow-x: auto; overscroll-behavior-inline: contain; }
-    .memory-timeline-svg { display: block; width: 100%; min-width: 760px; height: auto; }
-    .timeline-grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
-    .timeline-axis-label { fill: var(--text-faint); font: 10px var(--mono); }
-    .timeline-release { stroke: color-mix(in oklch, var(--text-faint) 72%, transparent); stroke-width: 1; stroke-dasharray: 4 5; vector-effect: non-scaling-stroke; }
-    .timeline-release-label { fill: var(--text-dim); font: 700 9.5px var(--mono); letter-spacing: .03em; cursor: help; }
-    .timeline-release-label:focus { outline: none; fill: var(--text); text-decoration: underline; }
-    .timeline-path { fill: none; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
-    .timeline-path.miner { stroke: var(--memory); stroke-width: 3.5; }
-    .timeline-path.hermes { stroke: var(--accent); stroke-width: 2.5; stroke-dasharray: 7 5; }
-    .timeline-path.openclaw { stroke: var(--good); stroke-width: 2.5; stroke-dasharray: 3 5; }
-    .timeline-point { stroke: var(--bg-elev); stroke-width: 2; vector-effect: non-scaling-stroke; cursor: help; }
-    .timeline-point.miner { fill: var(--memory); }
-    .timeline-point.hermes { fill: var(--accent); }
-    .timeline-point.openclaw { fill: var(--good); }
-    .timeline-point:focus { outline: none; stroke: var(--text); stroke-width: 3.5; }
-    .memory-timeline-tooltip { position: absolute; z-index: 3; max-width: 270px; padding: 9px 11px; border: 1px solid var(--border-strong); border-radius: 3px; background: var(--bg); color: var(--text); box-shadow: var(--shadow); font: 11px/1.45 var(--mono); pointer-events: none; transform: translate(-50%, calc(-100% - 10px)); }
-    .memory-timeline-note { margin: 10px 0 0; color: var(--text-faint); font-size: 11px; line-height: 1.5; }
-    .timeline-data-details { margin-top: 13px; color: var(--text-dim); font-size: 11.5px; }
-    .timeline-data-details > summary { width: fit-content; color: var(--text); font-weight: 700; cursor: pointer; }
-    .timeline-data-table-wrap { margin-top: 10px; overflow-x: auto; }
-    .timeline-data-table { width: 100%; min-width: 620px; border-collapse: collapse; font: 10.5px/1.4 var(--mono); }
-    .timeline-data-table th, .timeline-data-table td { padding: 7px 9px; border-bottom: 1px solid var(--border); text-align: left; }
-    .timeline-data-table th { color: var(--text-faint); font-weight: 700; text-transform: uppercase; }
-    .timeline-data-table td:last-child, .timeline-data-table th:last-child { text-align: right; }
-    .harness-comparison-method {
-      margin-top: 20px;
-      padding-top: 16px;
-      border-top: 1px solid var(--border);
-      color: var(--text-dim);
-      font-size: 11.5px;
-      line-height: 1.55;
-    }
-    .harness-comparison-method > summary {
-      width: fit-content;
-      color: var(--text);
-      font-weight: 700;
-      cursor: pointer;
-    }
-    .harness-comparison-method > summary:hover { color: var(--accent); }
-    .harness-comparison-method-body {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 18px;
-      padding-top: 12px;
-    }
-    .harness-comparison-method p { max-width: 86ch; margin: 0; }
-    .harness-comparison-method a { flex: none; color: var(--accent); font-weight: 700; white-space: nowrap; }
-    .harness-comparison-evidence-links { display: flex; flex: none; gap: 12px; }
-    .harness-comparison-state {
-      padding: 28px 18px;
-      border: 1px dashed var(--border-strong);
-      color: var(--text-dim);
-      font-size: 12.5px;
-      text-align: center;
-    }
+.harness-comparison {
+  margin: 14px 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+.harness-comparison-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 20px 22px 18px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in oklch, var(--accent-2) 4%, var(--bg-elev));
+}
+.harness-comparison-title {
+  min-width: 0;
+}
+.harness-comparison-kicker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 7px;
+  color: var(--accent-2);
+  font: 700 10px/1 var(--mono);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.harness-comparison-kicker .reference-badge {
+  padding: 3px 6px;
+  border: 1px solid color-mix(in oklch, var(--accent-2) 42%, var(--border));
+  border-radius: 3px;
+  color: var(--accent-2);
+  background: color-mix(in oklch, var(--accent-2) 8%, transparent);
+}
+.harness-comparison h2 {
+  margin: 0;
+  font-family: var(--display);
+  font-size: 24px;
+  font-weight: 400;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+}
+.harness-comparison-lead {
+  max-width: 72ch;
+  margin: 8px 0 0;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.harness-comparison-body {
+  padding: 21px 22px 18px;
+}
+.harness-comparison-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 18px;
+  margin: 0 0 16px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+.harness-comparison-summary strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.memory-timeline-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin-bottom: 10px;
+  color: var(--text-dim);
+  font: 10.5px/1.4 var(--mono);
+}
+.memory-timeline-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.memory-timeline-legend i {
+  display: inline-block;
+  width: 25px;
+  border-top: 3px solid var(--memory);
+}
+.memory-timeline-legend .hermes i {
+  border-color: var(--accent);
+  border-top-style: dashed;
+}
+.memory-timeline-legend .openclaw i {
+  border-color: var(--good);
+  border-top-style: dashed;
+}
+.memory-timeline-frame {
+  position: relative;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+}
+.memory-timeline-svg {
+  display: block;
+  width: 100%;
+  min-width: 760px;
+  height: auto;
+}
+.timeline-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.timeline-axis-label {
+  fill: var(--text-faint);
+  font: 10px var(--mono);
+}
+.timeline-release {
+  stroke: color-mix(in oklch, var(--text-faint) 72%, transparent);
+  stroke-width: 1;
+  stroke-dasharray: 4 5;
+  vector-effect: non-scaling-stroke;
+}
+.timeline-release-label {
+  fill: var(--text-dim);
+  font: 700 9.5px var(--mono);
+  letter-spacing: 0.03em;
+  cursor: help;
+}
+.timeline-release-label:focus {
+  outline: none;
+  fill: var(--text);
+  text-decoration: underline;
+}
+.timeline-path {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.timeline-path.miner {
+  stroke: var(--memory);
+  stroke-width: 3.5;
+}
+.timeline-path.hermes {
+  stroke: var(--accent);
+  stroke-width: 2.5;
+  stroke-dasharray: 7 5;
+}
+.timeline-path.openclaw {
+  stroke: var(--good);
+  stroke-width: 2.5;
+  stroke-dasharray: 3 5;
+}
+.timeline-point {
+  stroke: var(--bg-elev);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+  cursor: help;
+}
+.timeline-point.miner {
+  fill: var(--memory);
+}
+.timeline-point.hermes {
+  fill: var(--accent);
+}
+.timeline-point.openclaw {
+  fill: var(--good);
+}
+.timeline-point:focus {
+  outline: none;
+  stroke: var(--text);
+  stroke-width: 3.5;
+}
+.memory-timeline-tooltip {
+  position: absolute;
+  z-index: 3;
+  max-width: 270px;
+  padding: 9px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  font: 11px/1.45 var(--mono);
+  pointer-events: none;
+  transform: translate(-50%, calc(-100% - 10px));
+}
+.memory-timeline-note {
+  margin: 10px 0 0;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.timeline-data-details {
+  margin-top: 13px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+.timeline-data-details > summary {
+  width: fit-content;
+  color: var(--text);
+  font-weight: 700;
+  cursor: pointer;
+}
+.timeline-data-table-wrap {
+  margin-top: 10px;
+  overflow-x: auto;
+}
+.timeline-data-table {
+  width: 100%;
+  min-width: 620px;
+  border-collapse: collapse;
+  font: 10.5px/1.4 var(--mono);
+}
+.timeline-data-table th,
+.timeline-data-table td {
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+.timeline-data-table th {
+  color: var(--text-faint);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.timeline-data-table td:last-child,
+.timeline-data-table th:last-child {
+  text-align: right;
+}
+.harness-comparison-method {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+.harness-comparison-method > summary {
+  width: fit-content;
+  color: var(--text);
+  font-weight: 700;
+  cursor: pointer;
+}
+.harness-comparison-method > summary:hover {
+  color: var(--accent);
+}
+.harness-comparison-method-body {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding-top: 12px;
+}
+.harness-comparison-method p {
+  max-width: 86ch;
+  margin: 0;
+}
+.harness-comparison-method a {
+  flex: none;
+  color: var(--accent);
+  font-weight: 700;
+  white-space: nowrap;
+}
+.harness-comparison-evidence-links {
+  display: flex;
+  flex: none;
+  gap: 12px;
+}
+.harness-comparison-state {
+  padding: 28px 18px;
+  border: 1px dashed var(--border-strong);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  text-align: center;
+}
 
-    @media (max-width: 720px) {
-      .harness-comparison-head { display: block; padding: 18px; }
-      .harness-comparison-body { padding: 18px; }
-      .harness-comparison-method-body { display: block; }
-      .harness-comparison-method a { display: inline-block; margin-top: 10px; }
-      .harness-comparison-evidence-links { display: flex; flex-wrap: wrap; }
-    }
-
+@media (max-width: 720px) {
+  .harness-comparison-head {
+    display: block;
+    padding: 18px;
+  }
+  .harness-comparison-body {
+    padding: 18px;
+  }
+  .harness-comparison-method-body {
+    display: block;
+  }
+  .harness-comparison-method a {
+    display: inline-block;
+    margin-top: 10px;
+  }
+  .harness-comparison-evidence-links {
+    display: flex;
+    flex-wrap: wrap;
+  }
+}

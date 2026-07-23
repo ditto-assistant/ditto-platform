@@ -1,11 +1,43 @@
-    /* ── Network snapshot ───────────────────────────────────── */
-    .cards { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 1px; margin: 22px 0; }
-    .card {
-      background: var(--bg-elev); border: 1px solid var(--border);
-      border-radius: var(--radius); padding: 16px 18px; position: relative; overflow: hidden;
-    }
-    .card .label { color: var(--text-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600; }
-    .card .value { font-size: 27px; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
-    .card .value small { font-size: 14px; color: var(--text-dim); font-weight: 500; }
-    .card .glow { position: absolute; right: -30px; top: -30px; width: 90px; height: 90px; border-radius: 50%; filter: blur(28px); opacity: 0.5; }
-
+/* ── Network snapshot ───────────────────────────────────── */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 1px;
+  margin: 22px 0;
+}
+.card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  position: relative;
+  overflow: hidden;
+}
+.card .label {
+  color: var(--text-dim);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  font-weight: 600;
+}
+.card .value {
+  font-size: 27px;
+  font-weight: 700;
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.card .value small {
+  font-size: 14px;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+.card .glow {
+  position: absolute;
+  right: -30px;
+  top: -30px;
+  width: 90px;
+  height: 90px;
+  border-radius: 50%;
+  filter: blur(28px);
+  opacity: 0.5;
+}

@@ -1,72 +1,344 @@
-    /* Drawer: redacted per-case results (collapsible). */
-    details.cases { margin-top: 14px; }
-    details.cases summary { cursor: pointer; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: var(--text-dim); padding: 6px 0; list-style: none; }
-    details.cases summary::-webkit-details-marker { display: none; }
-    details.cases summary::before { content: "▸ "; color: var(--text-faint); }
-    details.cases[open] summary::before { content: "▾ "; }
-    /* Drawer: collapsible plain-language glossary (metric + test-category help). */
-    details.gloss { margin-top: 14px; }
-    details.gloss summary { cursor: pointer; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: var(--text-dim); padding: 6px 0; list-style: none; }
-    details.gloss summary::-webkit-details-marker { display: none; }
-    details.gloss summary::before { content: "▸ "; color: var(--text-faint); }
-    details.gloss[open] summary::before { content: "▾ "; }
-    .gitem { padding: 7px 0; border-bottom: 1px solid color-mix(in oklab, var(--border) 52%, transparent); }
-    .gitem:last-child { border-bottom: none; }
-    .gterm { font-size: 13px; font-weight: 700; color: var(--text); }
-    .gdesc { font-size: 13px; color: var(--text-dim); line-height: 1.5; margin-top: 2px; }
-    /* Illustrative example under a category's purpose: a muted, quoted-looking line
+/* Drawer: redacted per-case results (collapsible). */
+details.cases {
+  margin-top: 14px;
+}
+details.cases summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 6px 0;
+  list-style: none;
+}
+details.cases summary::-webkit-details-marker {
+  display: none;
+}
+details.cases summary::before {
+  content: "▸ ";
+  color: var(--text-faint);
+}
+details.cases[open] summary::before {
+  content: "▾ ";
+}
+/* Drawer: collapsible plain-language glossary (metric + test-category help). */
+details.gloss {
+  margin-top: 14px;
+}
+details.gloss summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 6px 0;
+  list-style: none;
+}
+details.gloss summary::-webkit-details-marker {
+  display: none;
+}
+details.gloss summary::before {
+  content: "▸ ";
+  color: var(--text-faint);
+}
+details.gloss[open] summary::before {
+  content: "▾ ";
+}
+.gitem {
+  padding: 7px 0;
+  border-bottom: 1px solid color-mix(in oklab, var(--border) 52%, transparent);
+}
+.gitem:last-child {
+  border-bottom: none;
+}
+.gterm {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+.gdesc {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin-top: 2px;
+}
+/* Illustrative example under a category's purpose: a muted, quoted-looking line
        with a small "e.g." tag, so it reads as a concrete instance, not a definition. */
-    .gex { font-size: 12.5px; color: var(--text-dim); line-height: 1.5; margin-top: 5px; padding-left: 9px; border-left: 2px solid color-mix(in oklab, var(--accent-2) 34%, transparent); }
-    .gex-tag { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-faint); margin-right: 6px; }
-    /* Pointer from a run's detail view to the central Benchmark glossary. */
-    .gloss-link { margin-top: 16px; font-size: 12.5px; }
-    .gloss-link a { color: var(--accent-2); text-decoration: none; font-weight: 600; }
-    .gloss-link a:hover { text-decoration: underline; }
-    .gcat-head { font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: var(--text-faint); margin: 12px 0 2px; }
-    /* Version-history changelog items */
-    .ver-item { padding: 11px 0 12px; border-bottom: 1px solid color-mix(in oklab, var(--border) 52%, transparent); }
-    .ver-item:last-child { border-bottom: none; }
-    .ver-current { border-left: 2px solid var(--accent-2); padding-left: 12px; margin-left: -14px; }
-    .ver-rollout { border-left: 2px solid var(--warn); padding-left: 12px; margin-left: -14px; }
-    .ver-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
-    .ver-tag { font-family: var(--mono); font-size: 11px; font-weight: 800; color: var(--accent-2); border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent); border-radius: 5px; padding: 0 6px; }
-    .ver-head b { font-size: 14px; color: var(--text); }
-    .ver-now { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; color: var(--good); border: 1px solid color-mix(in oklab, var(--good) 45%, transparent); border-radius: 4px; padding: 0 5px; }
-    .ver-next { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn) 45%, transparent); border-radius: 4px; padding: 0 5px; }
-    .ver-epoch { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
-    .ver-sum { font-size: 13px; color: var(--text-dim); line-height: 1.55; margin-top: 5px; }
-    .ver-hl { margin: 6px 0 0; padding-left: 18px; color: var(--text-dim); font-size: 12.5px; line-height: 1.6; }
-    .crow { padding: 8px 0; border-bottom: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
-    .crow:last-child { border-bottom: none; }
-    .crow .cmain { display: flex; align-items: center; gap: 8px; }
-    .crow .cmain, .crow .cscore { justify-content: space-between; }
-    .crow .cscore { display: flex; align-items: center; gap: 10px; margin-top: 2px; }
-    .ckind { font-size: 11px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; border-radius: 4px; padding: 1px 5px; }
-    .ckind.tool { color: var(--tool); border: 1px solid color-mix(in oklab, var(--tool) 42%, transparent); }
-    .ckind.memory { color: var(--memory); border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent); }
-    .ccat { font-size: 12.5px; color: var(--text); flex: 1; }
-    .crow .pass { color: var(--good); font-weight: 700; }
-    .crow .fail { color: var(--danger); font-weight: 700; }
-    .cmeta { color: var(--text-dim); font-size: 13px; font-variant-numeric: tabular-nums; }
-    .cval { font-weight: 600; font-variant-numeric: tabular-nums; }
-    .cval.good { color: var(--good); } .cval.mid { color: var(--text); } .cval.low { color: var(--danger); }
-    .cnote { color: var(--text-faint); font-size: 13px; margin-top: 3px; font-style: italic; }
-    /* Per-case results grouped by category, each group collapsed by default. */
-    .coverview { font-size: 12.5px; color: var(--text-dim); padding: 8px 0 12px; }
-    .coverview .good { color: var(--good); font-weight: 700; }
-    .coverview .danger { color: var(--danger); font-weight: 700; }
-    .cgroup { border-bottom: 1px solid color-mix(in oklab, var(--border) 55%, transparent); }
-    .cgroup:last-child { border-bottom: none; }
-    .cgsum { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; padding: 9px 0; }
-    .cgsum::-webkit-details-marker { display: none; }
-    .cgsum::before { content: "▸"; color: var(--text-faint); font-size: 11px; width: 10px; flex: none; }
-    .cgroup[open] > .cgsum::before { content: "▾"; }
-    .cgname { flex: 1; font-size: 12.5px; color: var(--text); }
-    .cgtally { display: flex; align-items: center; gap: 10px; }
-    .tb { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .tb.good { color: var(--good); } .tb.danger { color: var(--danger); } .tb.muted { color: var(--text-faint); }
-    .cgmean { font-weight: 700; font-variant-numeric: tabular-nums; min-width: 36px; text-align: right; }
-    .cgmean.good { color: var(--good); } .cgmean.mid { color: var(--text); } .cgmean.low { color: var(--danger); }
-    .cgroup .crow { padding-left: 22px; }
-    .cgroup .crow:last-child { border-bottom: none; }
-
+.gex {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin-top: 5px;
+  padding-left: 9px;
+  border-left: 2px solid color-mix(in oklab, var(--accent-2) 34%, transparent);
+}
+.gex-tag {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-faint);
+  margin-right: 6px;
+}
+/* Pointer from a run's detail view to the central Benchmark glossary. */
+.gloss-link {
+  margin-top: 16px;
+  font-size: 12.5px;
+}
+.gloss-link a {
+  color: var(--accent-2);
+  text-decoration: none;
+  font-weight: 600;
+}
+.gloss-link a:hover {
+  text-decoration: underline;
+}
+.gcat-head {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin: 12px 0 2px;
+}
+/* Version-history changelog items */
+.ver-item {
+  padding: 11px 0 12px;
+  border-bottom: 1px solid color-mix(in oklab, var(--border) 52%, transparent);
+}
+.ver-item:last-child {
+  border-bottom: none;
+}
+.ver-current {
+  border-left: 2px solid var(--accent-2);
+  padding-left: 12px;
+  margin-left: -14px;
+}
+.ver-rollout {
+  border-left: 2px solid var(--warn);
+  padding-left: 12px;
+  margin-left: -14px;
+}
+.ver-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.ver-tag {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 800;
+  color: var(--accent-2);
+  border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent);
+  border-radius: 5px;
+  padding: 0 6px;
+}
+.ver-head b {
+  font-size: 14px;
+  color: var(--text);
+}
+.ver-now {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--good);
+  border: 1px solid color-mix(in oklab, var(--good) 45%, transparent);
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.ver-next {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--warn);
+  border: 1px solid color-mix(in oklab, var(--warn) 45%, transparent);
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.ver-epoch {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.ver-sum {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.55;
+  margin-top: 5px;
+}
+.ver-hl {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.crow {
+  padding: 8px 0;
+  border-bottom: 1px solid color-mix(in oklab, var(--border) 62%, transparent);
+}
+.crow:last-child {
+  border-bottom: none;
+}
+.crow .cmain {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.crow .cmain,
+.crow .cscore {
+  justify-content: space-between;
+}
+.crow .cscore {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 2px;
+}
+.ckind {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.ckind.tool {
+  color: var(--tool);
+  border: 1px solid color-mix(in oklab, var(--tool) 42%, transparent);
+}
+.ckind.memory {
+  color: var(--memory);
+  border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent);
+}
+.ccat {
+  font-size: 12.5px;
+  color: var(--text);
+  flex: 1;
+}
+.crow .pass {
+  color: var(--good);
+  font-weight: 700;
+}
+.crow .fail {
+  color: var(--danger);
+  font-weight: 700;
+}
+.cmeta {
+  color: var(--text-dim);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.cval {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.cval.good {
+  color: var(--good);
+}
+.cval.mid {
+  color: var(--text);
+}
+.cval.low {
+  color: var(--danger);
+}
+.cnote {
+  color: var(--text-faint);
+  font-size: 13px;
+  margin-top: 3px;
+  font-style: italic;
+}
+/* Per-case results grouped by category, each group collapsed by default. */
+.coverview {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  padding: 8px 0 12px;
+}
+.coverview .good {
+  color: var(--good);
+  font-weight: 700;
+}
+.coverview .danger {
+  color: var(--danger);
+  font-weight: 700;
+}
+.cgroup {
+  border-bottom: 1px solid color-mix(in oklab, var(--border) 55%, transparent);
+}
+.cgroup:last-child {
+  border-bottom: none;
+}
+.cgsum {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+}
+.cgsum::-webkit-details-marker {
+  display: none;
+}
+.cgsum::before {
+  content: "▸";
+  color: var(--text-faint);
+  font-size: 11px;
+  width: 10px;
+  flex: none;
+}
+.cgroup[open] > .cgsum::before {
+  content: "▾";
+}
+.cgname {
+  flex: 1;
+  font-size: 12.5px;
+  color: var(--text);
+}
+.cgtally {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.tb {
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.tb.good {
+  color: var(--good);
+}
+.tb.danger {
+  color: var(--danger);
+}
+.tb.muted {
+  color: var(--text-faint);
+}
+.cgmean {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  min-width: 36px;
+  text-align: right;
+}
+.cgmean.good {
+  color: var(--good);
+}
+.cgmean.mid {
+  color: var(--text);
+}
+.cgmean.low {
+  color: var(--danger);
+}
+.cgroup .crow {
+  padding-left: 22px;
+}
+.cgroup .crow:last-child {
+  border-bottom: none;
+}
