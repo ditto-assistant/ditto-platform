@@ -1,0 +1,44 @@
+/* Split from the original single-file dashboard stylesheet (dashboard/index.html
+ * at commit 2ce3151, lines 95-2160). ORDER IS LOAD-BEARING: files 01-21 are the
+ * base "night" layer, 22-36 the "paper" re-theme that redefines the same
+ * selectors at equal specificity — later import wins. Never reorder imports;
+ * add new rules to the matching section file.
+ */
+@import "./01-base-tokens-night.css";
+@import "./02-base-reset-a11y.css";
+@import "./03-base-body.css";
+@import "./04-base-header-pill-btn.css";
+@import "./05-base-banner.css";
+@import "./06-base-cards.css";
+@import "./07-base-section-strips.css";
+@import "./08-base-board-table.css";
+@import "./09-base-chips-badges.css";
+@import "./10-base-modal-stats.css";
+@import "./11-base-sha-trend-copy.css";
+@import "./12-base-bars-sparklines.css";
+@import "./13-base-drawers-cases.css";
+@import "./14-base-modal.css";
+@import "./15-base-pillars.css";
+@import "./16-base-footer-empty.css";
+@import "./17-base-pipeline.css";
+@import "./18-base-pager-filters.css";
+@import "./19-base-fleet.css";
+@import "./20-base-pipeline-detail.css";
+@import "./21-base-responsive.css";
+@import "./22-paper-tokens.css";
+@import "./23-paper-theme-modes.css";
+@import "./24-paper-shell.css";
+@import "./25-paper-header.css";
+@import "./26-paper-pill-btn.css";
+@import "./27-paper-search.css";
+@import "./28-paper-banner-cards.css";
+@import "./29-paper-harness-timeline.css";
+@import "./30-paper-board-table.css";
+@import "./31-paper-theme-switch.css";
+@import "./32-paper-misc.css";
+@import "./33-paper-responsive.css";
+@import "./34-paper-fleet-atlas.css";
+@import "./35-paper-ath.css";
+@import "./36-paper-mobile-shell.css";
+@import "./37-solid-app.css";
+@import "./38-parity.css";

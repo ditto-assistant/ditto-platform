@@ -25,6 +25,30 @@ jobs:
       - name: faircopy
         run: npm run lint:copy -- --format github
 
+  dashboard:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Vite+
+        run: curl -fsSL https://vite.plus | bash
+
+      - name: Install dependencies
+        working-directory: dashboard
+        run: source "$HOME/.vite-plus/env" && vp install
+
+      - name: Check
+        working-directory: dashboard
+        run: source "$HOME/.vite-plus/env" && vp check
+
+      - name: Test
+        working-directory: dashboard
+        run: source "$HOME/.vite-plus/env" && vp test
+
+      - name: build
+        working-directory: dashboard
+        run: source "$HOME/.vite-plus/env" && vp build
+
   lint-and-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:

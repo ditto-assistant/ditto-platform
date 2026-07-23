@@ -1,0 +1,42 @@
+.pill {
+  min-height: 32px;
+  padding: 5px 11px;
+  border-color: var(--border);
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.dot {
+  width: 7px;
+  height: 7px;
+}
+.pill.live .dot {
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--good) 18%, transparent);
+}
+.btn {
+  min-height: 34px;
+  padding: 7px 12px;
+  border-radius: 5px;
+  border-color: var(--border-strong);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 12px;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    transform 80ms ease;
+}
+.btn:hover {
+  border-color: var(--accent);
+  background: var(--accent-hover);
+}
+.btn.ghost {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--border);
+}
+.btn.ghost:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-elev-2);
+}

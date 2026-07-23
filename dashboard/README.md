@@ -1,9 +1,41 @@
 # Ditto SN118 public dashboard
 
-A single self-contained `index.html` — the public "front door" for Subnet 118.
-No build step, no framework, no external requests, **no secrets**. It reads the
-platform's public API and links out to wandb for the per-epoch deep dive.
-This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
+The public "front door" for Subnet 118 — a Vite+ + SolidJS + TypeScript SPA.
+No external requests at runtime, **no secrets**. It reads the platform's public
+API and links out to wandb for the per-epoch deep dive. This is Surface 3 in
+[`docs/public-telemetry.md`](../docs/public-telemetry.md).
+
+Built output is plain static files (`dist/`); the platform API serves them
+same-origin at `/`. The app was refactored from a single self-contained
+`index.html` (git history ≤ commit `2ce3151`) into modules — behavior and
+markup contract (routes, query params, CSS classes, ARIA) are unchanged.
+
+## Stack & layout
+
+- [SolidJS](https://solidjs.com) + strict TypeScript, managed by
+  [Vite+](https://viteplus.dev/) through the `vp` CLI.
+- Vite+, Rolldown, Vitest, Oxlint, and Oxfmt share `vite.config.ts`; npm is the
+  managed package-manager backend, but day-to-day commands use `vp`.
+
+```
+dashboard/
+  index.html          Vite entry: meta config tags + pre-paint theme bootstrap
+  src/
+    main.tsx          mounts <App/>, imports styles
+    App.tsx           small composition root and route switch
+    components/       shared UI, shell, tables, and entity details
+    pages/            one module per dashboard page
+    data/             reactive API resource helpers
+    lib/              config, API client, formatters, hash router (pure logic)
+    stores/           domain state: leaderboard, activity, operations, bench,
+                      ath, theme, route, poller (30s poll / 8s ops fast-poll)
+    components/       ui primitives, shell, global search, modal, drawer
+    pages/            Overview, Operations, Submissions, Reviews, Benchmark
+    styles/           the original stylesheet split into 36 ordered files —
+                      import order is load-bearing (see styles/index.css)
+    assets/           brand logo (was a base64 data URI in the monolith)
+  public/assets/      og:image PNG, copied verbatim into dist/assets/
+```
 
 ## What it shows
 
@@ -70,24 +102,29 @@ telemetry remains in wandb (linked).
 
 Resolved in priority order:
 
-| What | Query string | Meta tag (bake in) | Default |
-| --- | --- | --- | --- |
-| API base | `?api=https://api.host/api/v1` | `<meta name="ditto:api-base">` | same-origin `/api/v1` |
-| wandb link | `?wandb=https://wandb.ai/org/ditto-sn118` | `<meta name="ditto:wandb-url">` | `https://wandb.ai/` |
+| What       | Query string                              | Meta tag (bake in)              | Default               |
+| ---------- | ----------------------------------------- | ------------------------------- | --------------------- |
+| API base   | `?api=https://api.host/api/v1`            | `<meta name="ditto:api-base">`  | same-origin `/api/v1` |
+| wandb link | `?wandb=https://wandb.ai/org/ditto-sn118` | `<meta name="ditto:wandb-url">` | `https://wandb.ai/`   |
 
-For a deployed dashboard, edit the two `<meta>` tags in `index.html` so the
-defaults are correct and the query string is only needed for testing.
+For a deployed dashboard the platform injects the wandb URL into the built
+HTML's meta tag at serve time (`DITTO_DASHBOARD_WANDB_URL`); the query string
+is only needed for testing.
 
-## Run / preview
+## Develop / build
 
 ```sh
-# Preview the API-unavailable state:
-open dashboard/index.html            # or drag it into a browser
-
-# Against a locally-running API (make api-up):
-python -m http.server -d dashboard 8080
-# then visit http://localhost:8080/?api=http://localhost:8000/api/v1
+cd dashboard
+vp install
+vp dev       # dev server on :8080, proxies /api -> localhost:8000 (make api-up)
+vp check     # format + lint + type-check
+vp test      # Vitest suite
+vp build     # -> dist/
+vp preview   # serve the production build locally
 ```
+
+The runtime `?api=` override still works against any host:
+`http://localhost:8080/?api=http://localhost:8000/api/v1`.
 
 If the API can't be reached the page renders an explicit unavailable state. It
 never substitutes sample values for live subnet data.
@@ -95,18 +132,19 @@ never substitutes sample values for live subnet data.
 ## Deploy
 
 **Default (this repo): served by the platform, same-origin.** The API serves
-this file at `/` (see `factory.py`), so on the deployed hosts it's already live:
+`dashboard/dist/` at `/` (see `factory.py`); `scripts/update.sh` builds it at
+deploy time, so on the deployed hosts it's already live:
 
-- dev  → `https://platform-api-dev.heyditto.ai/`
+- dev → `https://platform-api-dev.heyditto.ai/`
 - prod → `https://platform-api.heyditto.ai/`
 
 Same-origin means the SPA's `/api/v1/public/*` calls need no CORS and the wandb
-link is injected from `DITTO_DASHBOARD_WANDB_URL` at serve time — no need to edit
-this file per environment. `DITTO_DASHBOARD_ENABLED=false` runs the API headless.
+link is injected from `DITTO_DASHBOARD_WANDB_URL` at serve time — no need to
+rebuild per environment. `DITTO_DASHBOARD_ENABLED=false` runs the API headless.
 
-**Alternative: host it yourself.** It's a plain static file — upload to object
-storage (S3/MinIO/GCS) behind a CDN, or any static host. A *cross-origin* host
-would additionally require CORS on the API's `/public/*` routes (not currently
-enabled, since the default is same-origin). The API sets
+**Alternative: host it yourself.** `dist/` is plain static files — upload to
+object storage (S3/MinIO/GCS) behind a CDN, or any static host. A _cross-origin_
+host would additionally require CORS on the API's `/public/*` routes (not
+currently enabled, since the default is same-origin). The API sets
 `Cache-Control: public, max-age=30` on the data; the SPA auto-refreshes on the
 same 30s cadence.
