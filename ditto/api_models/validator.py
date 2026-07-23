@@ -550,6 +550,20 @@ class ValidatorHeartbeatRequest(BaseModel):
                 raise ValueError(
                     "heartbeat v11 requires exact v7 inference calibration identity"
                 )
+            if self.protocol_version >= 12 and (
+                self.capabilities is None or not self.capabilities.signed_score_quorum
+            ):
+                raise ValueError(
+                    "heartbeat v12 requires signed score quorum verification"
+                )
+            if (
+                self.capabilities is not None
+                and self.capabilities.signed_score_quorum
+                and self.protocol_version < 12
+            ):
+                raise ValueError(
+                    "signed score quorum verification requires heartbeat protocol v12"
+                )
         elif self.benchmark_capacity is not None:
             raise ValueError("benchmark capacity requires heartbeat protocol v10")
         return self
@@ -953,6 +967,28 @@ class ConfirmationScoreRecord(BaseModel):
     ] = None
 
 
+class LedgerScoreProof(BaseModel):
+    """One validator-signed score receipt backing a ledger median."""
+
+    validator_hotkey: Annotated[str, Field(description="Scoring validator hotkey.")]
+    run_id: Annotated[str, Field(description="Signature-bound scoring run id.")]
+    composite: Annotated[float, Field(ge=0.0, le=1.0)]
+    seed: int
+    bench_version: Annotated[int | None, Field(default=None, ge=1)] = None
+    ticket_deadline: Annotated[
+        datetime | None,
+        Field(default=None, description="Signature-bound ticket lease deadline."),
+    ] = None
+    transcript_sha256: Annotated[
+        str | None,
+        Field(default=None, description="Signature-bound transcript digest."),
+    ] = None
+    signature: Annotated[
+        str | None,
+        Field(default=None, description="Hex sr25519 signature for this receipt."),
+    ] = None
+
+
 class LedgerEntry(BaseModel):
     """One miner's best eligible score, returned by ``GET /scoring/scores``.
 
@@ -1020,6 +1056,16 @@ class LedgerEntry(BaseModel):
         Field(
             default=None,
             description="Validator's hex sr25519 signature, if stored.",
+        ),
+    ]
+    score_proofs: Annotated[
+        list[LedgerScoreProof],
+        Field(
+            default_factory=list,
+            description=(
+                "All validator-signed receipts backing the platform median. "
+                "Validators verify these independently before folding weights."
+            ),
         ),
     ]
     composite_stderr: Annotated[
