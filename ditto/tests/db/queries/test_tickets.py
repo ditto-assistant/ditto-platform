@@ -1251,6 +1251,75 @@ class TestIssueTicket:
         assert slot1 is None
         assert await session.get(ValidatorTicket, (newer, 2, "5ParallelFinish")) is None
 
+    async def test_completion_first_advances_past_head_validator_already_scored(
+        self, session: AsyncSession
+    ) -> None:
+        oldest = await _seed_evaluating(session, created_at=_NOW, name="oldest")
+        newer = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="newer",
+        )
+        async with session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=oldest,
+                    validator_hotkey="5AlreadyScored",
+                    status=TicketStatus.SCORED,
+                    issued_at=_NOW,
+                    deadline=_NOW + _TTL,
+                    bench_version=2,
+                    attempt_count=1,
+                )
+            )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5AlreadyScored",
+                now=_NOW,
+                ttl=_TTL,
+                completion_first=True,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == newer
+
+    async def test_completion_first_advances_past_exhausted_head_retry(
+        self, session: AsyncSession
+    ) -> None:
+        oldest = await _seed_evaluating(session, created_at=_NOW, name="oldest")
+        newer = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=1),
+            name="newer",
+        )
+        async with session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=oldest,
+                    validator_hotkey="5Exhausted",
+                    status=TicketStatus.EXPIRED,
+                    issued_at=_NOW - timedelta(hours=2),
+                    deadline=_NOW - timedelta(hours=1),
+                    bench_version=2,
+                    attempt_count=MAX_ATTEMPTS_PER_VERSION,
+                    retry_after=None,
+                )
+            )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5Exhausted",
+                now=_NOW,
+                ttl=_TTL,
+                completion_first=True,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == newer
+
     async def test_accepted_score_precedes_uncovered_work_despite_live_assignment(
         self, session: AsyncSession
     ) -> None:
