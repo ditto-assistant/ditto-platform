@@ -115,7 +115,7 @@ def test_embedding_contract_is_exact_and_response_is_sanitized() -> None:
     public, prompt_tokens = _public_embedding_response(
         {
             "object": "list",
-            "model": model,
+            "model": "pplx-embed-v1-0.6b",
             "provider": "must-not-leak",
             "data": [
                 {"object": "embedding", "index": 0, "embedding": vector},
@@ -128,9 +128,31 @@ def test_embedding_contract_is_exact_and_response_is_sanitized() -> None:
         input_count=2,
     )
     assert prompt_tokens == 7
+    assert public["model"] == model
     assert public["usage"] == {"prompt_tokens": 7, "total_tokens": 7}
     assert "provider" not in public
     assert "cost" not in str(public)
+
+    for response_model in (
+        "Perplexity/pplx-embed-v1-0.6b",
+        "pplx-embed-v1-0.6b:latest",
+        "attacker/model",
+    ):
+        with pytest.raises(HTTPException, match="provider identity mismatch"):
+            _public_embedding_response(
+                {
+                    "object": "list",
+                    "model": response_model,
+                    "data": [
+                        {"object": "embedding", "index": 0, "embedding": vector},
+                        {"object": "embedding", "index": 1, "embedding": vector},
+                    ],
+                    "usage": {"prompt_tokens": 7, "total_tokens": 7},
+                },
+                model=model,
+                dimensions=768,
+                input_count=2,
+            )
 
 
 def test_output_token_alias_cannot_bypass_ticket_limit() -> None:

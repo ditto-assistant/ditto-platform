@@ -52,6 +52,8 @@ router = APIRouter(prefix="/inference", tags=["inference"])
 _EXCHANGE_MAX_AGE = timedelta(minutes=2)
 _PROXY_MAX_AGE = timedelta(seconds=30)
 _EMBEDDING_MAX_INPUTS = 256
+_PPLX_EMBED_CONTRACT_MODEL = "perplexity/pplx-embed-v1-0.6b"
+_PPLX_EMBED_RESPONSE_MODEL = "pplx-embed-v1-0.6b"
 
 
 def _exchange_message(payload: InferenceExchangeRequest) -> bytes:
@@ -483,7 +485,14 @@ def _validated_embedding_payload(
 def _public_embedding_response(
     payload: Any, *, model: str, dimensions: int, input_count: int
 ) -> tuple[dict[str, Any], int]:
-    if not isinstance(payload, dict) or payload.get("model") != model:
+    response_models = {model}
+    if model == _PPLX_EMBED_CONTRACT_MODEL:
+        # OpenRouter accepts the catalog-qualified model ID but Perplexity's
+        # response canonicalizes that exact reviewed model to its unqualified
+        # name. Keep the outbound contract frozen while accepting only this
+        # observed response alias.
+        response_models.add(_PPLX_EMBED_RESPONSE_MODEL)
+    if not isinstance(payload, dict) or payload.get("model") not in response_models:
         raise HTTPException(status_code=502, detail="provider identity mismatch")
     data = payload.get("data")
     usage = payload.get("usage")
