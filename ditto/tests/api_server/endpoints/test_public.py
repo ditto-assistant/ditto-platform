@@ -40,7 +40,7 @@ from ditto.api_models.stack_health import (
     ValidatorComponentHealth,
     ValidatorStackHealth,
 )
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import (
@@ -2938,6 +2938,7 @@ class TestPublicActivity:
                     agent_id=agent_id,
                     validator_hotkey=_MINER_B,
                     status=TicketStatus.EXPIRED,
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
                     issued_at=now - timedelta(hours=2),
                     deadline=now - timedelta(hours=1),
                 )
@@ -2950,6 +2951,117 @@ class TestPublicActivity:
         assert body["provisional_scores"][0]["composite"] == pytest.approx(0.52)
         assert body["validation_attempts"][0]["status"] == "expired"
         assert body["validation_attempts"][0]["bench_version"] == 2
+        assert body["validation_attempts"][0]["purpose"] == "canonical_quorum"
+
+    async def test_pipeline_separates_canonical_quorum_from_continual_retests(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        agent_id = UUID(
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.91, 0.92, 0.93],
+                status=AgentStatus.SCORED,
+                details={"bench_version": 2},
+            )
+        )
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            canonical = list(
+                await session.scalars(
+                    select(Score)
+                    .where(Score.agent_id == agent_id)
+                    .order_by(Score.validator_hotkey)
+                )
+            )
+            for score in canonical:
+                score.created_at = now - timedelta(hours=1)
+            completed_validator = canonical[0].validator_hotkey
+            pending_validator = canonical[1].validator_hotkey
+            replacement_validator = canonical[2].validator_hotkey
+            await append_confirmation_scores(
+                session,
+                rows=[
+                    ConfirmationSeedScore(
+                        agent_id=agent_id,
+                        validator_hotkey=completed_validator,
+                        seed=111,
+                        composite=0.94,
+                        run_id="confirmation-run",
+                        signature="ab" * 64,
+                    ),
+                    ConfirmationSeedScore(
+                        agent_id=agent_id,
+                        validator_hotkey=completed_validator,
+                        seed=222,
+                        composite=0.95,
+                        run_id="confirmation-run",
+                        signature="ab" * 64,
+                    ),
+                ],
+                bench_version=2,
+                created_at=now,
+            )
+            session.add_all(
+                [
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        validator_hotkey=completed_validator,
+                        status=TicketStatus.SCORED,
+                        purpose=TicketPurpose.CONTINUAL_RETEST,
+                        issued_at=now - timedelta(minutes=10),
+                        deadline=now - timedelta(minutes=5),
+                        bench_version=2,
+                    ),
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        validator_hotkey=pending_validator,
+                        status=TicketStatus.ISSUED,
+                        purpose=TicketPurpose.CONTINUAL_RETEST,
+                        issued_at=now,
+                        deadline=now + timedelta(minutes=30),
+                        bench_version=2,
+                    ),
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        validator_hotkey=replacement_validator,
+                        status=TicketStatus.ISSUED,
+                        purpose=TicketPurpose.CANONICAL_QUORUM,
+                        issued_at=now,
+                        deadline=now + timedelta(minutes=30),
+                        bench_version=2,
+                    ),
+                ]
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")).json()
+
+        assert body["score_count"] == body["quorum"] == 3
+        assert len(body["provisional_scores"]) == 3
+        assert [
+            (score["seed"], score["composite"]) for score in body["confirmation_scores"]
+        ] == [
+            ("111", pytest.approx(0.94)),
+            ("222", pytest.approx(0.95)),
+        ]
+        assert all("run_id" not in score for score in body["confirmation_scores"])
+        assert {
+            attempt["validator_hotkey"]: attempt["purpose"]
+            for attempt in body["validation_attempts"]
+        } == {
+            completed_validator: "continual_retest",
+            pending_validator: "continual_retest",
+            replacement_validator: "canonical_quorum",
+        }
 
     async def test_pipeline_keeps_mixed_benchmark_quorums_separate(
         self,

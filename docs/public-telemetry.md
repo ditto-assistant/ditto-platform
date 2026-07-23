@@ -127,6 +127,22 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   seed provenance, and version-pinned reproduction / hash-verification commands.
   It does **not** associate a provisional number with a validator identity and
   never returns signatures, leases, run ids, secrets, or scorer internals.
+  Finalized top-five agents may also carry `confirmation_scores`: completed,
+  append-only shared-seed retest results with composite, exact decimal seed,
+  public validator hotkey, benchmark version, and acceptance time. These rows
+  are explicitly separate from `provisional_scores` and never change the fixed
+  three-score canonical median. Each validation attempt has an additive
+  `purpose` (`canonical_quorum`, `continual_retest`, or the bounded rolling-
+  deployment state `legacy_unclassified`) so the operations UI can report extra
+  maintenance work without presenting it as a fourth quorum slot or guessing
+  about an old-writer lease. Unclassified in-flight leases drain and are
+  reissued with an explicit purpose; neither score endpoint consumes them.
+  A bounded migration allowance lets leases from old replicas finish during
+  rolling overlap; the authenticated new score endpoint classifies such a lease
+  as it consumes it. Purpose-aware writers explicitly disable the allowance and
+  bind a positive revision. A database-side guard converts old-writer reissues
+  to unclassified, while revision-zero leases without the transition allowance
+  cannot be scored.
   `final_composite` remains null until three independent scores reach quorum and
   the submission is in a finalized public state; the leaderboard and emission
   eligibility rules are unchanged. On-chain provenance is claimed only when the

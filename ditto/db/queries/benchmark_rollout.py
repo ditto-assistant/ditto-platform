@@ -17,7 +17,7 @@ from ditto.api_models.benchmark_contract import (
     benchmark_contract,
     latest_benchmark_contract,
 )
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
     ValidatorStackIdentity,
@@ -1081,6 +1081,8 @@ async def issue_rollout_ticket(
             ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.bench_version == rollout.desired_version,
             ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.purpose == TicketPurpose.CANONICAL_QUORUM,
+            ValidatorTicket.purpose_revision > 0,
             ValidatorTicket.deadline > now,
         )
         .limit(1)
@@ -1203,6 +1205,11 @@ async def issue_rollout_ticket(
         .with_for_update()
     )
     if competing_ticket is not None:
+        if (
+            competing_ticket.purpose != TicketPurpose.CANONICAL_QUORUM
+            or competing_ticket.purpose_revision <= 0
+        ):
+            return None
         if validator_running_benchmark:
             return None
         competing_ticket.status = TicketStatus.EXPIRED
@@ -1220,6 +1227,8 @@ async def issue_rollout_ticket(
             validator_hotkey=validator_hotkey,
             slot_id=slot_id,
             status=TicketStatus.ISSUED,
+            purpose=TicketPurpose.CANONICAL_QUORUM,
+            purpose_revision=1,
             issued_at=now,
             deadline=now + ttl,
             attempt_count=1,
@@ -1228,6 +1237,9 @@ async def issue_rollout_ticket(
         session.add(ticket)
     else:
         ticket.status = TicketStatus.ISSUED
+        ticket.purpose = TicketPurpose.CANONICAL_QUORUM
+        ticket.purpose_revision += 1
+        ticket.legacy_completion_allowed = False
         ticket.slot_id = slot_id
         ticket.issued_at = now
         ticket.deadline = now + ttl

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.db.models import (
     Agent,
     BenchmarkDataset,
@@ -19,6 +19,10 @@ from ditto.db.models import (
     EvaluationPayment,
     Score,
     ValidatorTicket,
+)
+from ditto.db.queries.audit import (
+    EVENT_SCORE_RETEST_REQUESTED,
+    append_audit_entry,
 )
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import (
@@ -171,6 +175,45 @@ async def _seed_two_scores_below_floor(
 
 
 class TestIssueTicket:
+    @pytest.mark.parametrize(
+        "purpose",
+        [TicketPurpose.CONTINUAL_RETEST, TicketPurpose.LEGACY_UNCLASSIFIED],
+    )
+    async def test_does_not_resume_or_expire_noncanonical_live_lease(
+        self, session: AsyncSession, purpose: TicketPurpose
+    ) -> None:
+        aid = await _seed_evaluating(session)
+        async with session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=aid,
+                    validator_hotkey="5V1",
+                    status=TicketStatus.ISSUED,
+                    purpose=purpose,
+                    purpose_revision=(
+                        0 if purpose == TicketPurpose.LEGACY_UNCLASSIFIED else 1
+                    ),
+                    issued_at=_NOW,
+                    deadline=_NOW + _TTL,
+                    bench_version=2,
+                )
+            )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5V1",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=2,
+            )
+
+        assert ticket is None
+        stored = await session.get(ValidatorTicket, (aid, 2, "5V1"))
+        assert stored is not None
+        assert stored.status == TicketStatus.ISSUED
+        assert stored.purpose == purpose
+
     async def test_same_coldkey_finishes_one_generation_before_next(
         self, session: AsyncSession
     ) -> None:
@@ -1535,8 +1578,109 @@ class TestIssueConfirmationTicket:
 
         assert ticket is not None
         assert ticket.status == TicketStatus.ISSUED
+        assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
+        assert ticket.purpose_revision == 2
         assert ticket.deadline == _NOW + _TTL
         assert ticket.attempt_count == 2
+
+    async def test_does_not_resume_a_canonical_live_lease_as_confirmation(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_scored(session)
+        async with session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=aid,
+                    validator_hotkey="5V1",
+                    status=TicketStatus.ISSUED,
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
+                    issued_at=_NOW,
+                    deadline=_NOW + _TTL,
+                    bench_version=2,
+                    attempt_count=1,
+                )
+            )
+        async with session.begin():
+            ticket = await issue_confirmation_ticket(
+                session,
+                agent_id=aid,
+                validator_hotkey="5V1",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=2,
+            )
+
+        assert ticket is None
+
+    async def test_does_not_resume_old_version_continual_lease(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_scored(session)
+        async with session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=aid,
+                    validator_hotkey="5V1",
+                    status=TicketStatus.ISSUED,
+                    purpose=TicketPurpose.CONTINUAL_RETEST,
+                    issued_at=_NOW,
+                    deadline=_NOW + _TTL,
+                    bench_version=2,
+                    attempt_count=1,
+                )
+            )
+        async with session.begin():
+            ticket = await issue_confirmation_ticket(
+                session,
+                agent_id=aid,
+                validator_hotkey="5V1",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=3,
+            )
+
+        assert ticket is None
+
+    async def test_does_not_take_over_expired_operator_replacement(
+        self, session: AsyncSession
+    ) -> None:
+        aid = await _seed_scored(session)
+        async with session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=aid,
+                    validator_hotkey="5V1",
+                    status=TicketStatus.ISSUED,
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
+                    issued_at=_NOW - _TTL,
+                    deadline=_NOW,
+                    bench_version=2,
+                    attempt_count=2,
+                )
+            )
+            await append_audit_entry(
+                session,
+                agent_id=aid,
+                validator_hotkey="5V1",
+                event=EVENT_SCORE_RETEST_REQUESTED,
+                payload={"bench_version": 2, "run_id": "accepted-5V1"},
+                recorded_at=_NOW - _TTL,
+            )
+        async with session.begin():
+            ticket = await issue_confirmation_ticket(
+                session,
+                agent_id=aid,
+                validator_hotkey="5V1",
+                now=_NOW + timedelta(seconds=1),
+                ttl=_TTL,
+                bench_version=2,
+            )
+
+        assert ticket is None
+        stored = await session.get(ValidatorTicket, (aid, 2, "5V1"))
+        assert stored is not None
+        assert stored.status == TicketStatus.EXPIRED
+        assert stored.purpose == TicketPurpose.CANONICAL_QUORUM
 
     async def test_does_not_interrupt_another_live_assignment(
         self, session: AsyncSession

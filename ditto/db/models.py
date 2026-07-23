@@ -37,7 +37,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TIMESTAMP
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 
 # Per-case detail is a JSON blob: JSONB on Postgres (indexable, compact),
 # plain JSON on the SQLite unit-test fallback. The variant keeps one model
@@ -1424,6 +1424,32 @@ class ValidatorTicket(Base):
     )
     """Current state: ``issued`` -> ``scored`` | ``expired``."""
 
+    purpose: Mapped[TicketPurpose] = mapped_column(
+        Text,
+        nullable=False,
+        default=TicketPurpose.CANONICAL_QUORUM,
+        server_default=text("'legacy_unclassified'"),
+    )
+    """Why the current lease was issued; old-writer leases remain unclassified."""
+
+    purpose_revision: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("0"),
+    )
+    """Positive only when a purpose-aware writer classified this lease."""
+
+    legacy_completion_allowed: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        # Old application replicas omit this column during the bounded rolling
+        # transition. Purpose-aware writers always send the Python default.
+        server_default=text("true"),
+    )
+    """Bounded migration-only allowance for leases already live at cutover."""
+
     issued_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=False,
@@ -1495,6 +1521,16 @@ class ValidatorTicket(Base):
         CheckConstraint(
             "bench_version > 0",
             name="validator_tickets_bench_version_positive",
+        ),
+        CheckConstraint(
+            "purpose IN ("
+            "'legacy_unclassified', 'canonical_quorum', 'continual_retest'"
+            ")",
+            name="validator_tickets_purpose_valid",
+        ),
+        CheckConstraint(
+            "purpose_revision >= 0",
+            name="validator_tickets_purpose_revision_nonnegative",
         ),
         CheckConstraint(
             "attempt_count > 0",

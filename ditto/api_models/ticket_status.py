@@ -31,3 +31,11 @@ class TicketStatus(StrEnum):
     ISSUED = "issued"
     SCORED = "scored"
     EXPIRED = "expired"
+
+
+class TicketPurpose(StrEnum):
+    """Authoritative reason the platform issued the current ticket lease."""
+
+    LEGACY_UNCLASSIFIED = "legacy_unclassified"
+    CANONICAL_QUORUM = "canonical_quorum"
+    CONTINUAL_RETEST = "continual_retest"

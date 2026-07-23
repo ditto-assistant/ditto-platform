@@ -86,7 +86,7 @@ from ditto.api_models.system_health import (
     SystemMetrics,
     system_metrics_signing_token,
 )
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
@@ -1266,6 +1266,8 @@ async def request_job(
                     ValidatorTicket.slot_id == slot_id,
                     ValidatorTicket.bench_version == canonical_version,
                     ValidatorTicket.status == TicketStatus.ISSUED,
+                    ValidatorTicket.purpose == TicketPurpose.CANONICAL_QUORUM,
+                    ValidatorTicket.purpose_revision > 0,
                     ValidatorTicket.deadline > now,
                 )
                 .order_by(ValidatorTicket.issued_at.asc())
@@ -1298,9 +1300,14 @@ async def request_job(
                     .with_for_update()
                 )
                 if stale_ticket is not None:
-                    if slot_running_benchmark:
+                    if (
+                        stale_ticket.purpose != TicketPurpose.CANONICAL_QUORUM
+                        or stale_ticket.purpose_revision <= 0
+                        or slot_running_benchmark
+                    ):
                         # The signed heartbeat says this exact worker is still
-                        # occupied; let it finish, but issue nothing else.
+                        # occupied, or another authorization lane owns the
+                        # lease; leave it untouched and issue nothing else.
                         return Response(status_code=204)
                     stale_ticket.status = TicketStatus.EXPIRED
                     stale_ticket.deadline = now
@@ -1806,6 +1813,23 @@ async def submit_top5_confirmation_score(
             raise HTTPException(
                 status_code=409, detail="confirmation lease is not open"
             )
+        legacy_completion = (
+            ticket.purpose == TicketPurpose.LEGACY_UNCLASSIFIED
+            and ticket.purpose_revision == 0
+            and ticket.legacy_completion_allowed
+        )
+        if not legacy_completion and (
+            ticket.purpose != TicketPurpose.CONTINUAL_RETEST
+            or ticket.purpose_revision <= 0
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="ticket is not authorized for continual retesting",
+            )
+        if legacy_completion:
+            ticket.purpose = TicketPurpose.CONTINUAL_RETEST
+            ticket.purpose_revision = 1
+            ticket.legacy_completion_allowed = False
         members = await _current_emission_set(
             session, canonical_version=canonical_version
         )
@@ -2317,6 +2341,23 @@ async def submit_score(
                     "(never issued, expired, or already scored)"
                 ),
             )
+        legacy_completion = (
+            ticket.purpose == TicketPurpose.LEGACY_UNCLASSIFIED
+            and ticket.purpose_revision == 0
+            and ticket.legacy_completion_allowed
+        )
+        if not legacy_completion and (
+            ticket.purpose != TicketPurpose.CANONICAL_QUORUM
+            or ticket.purpose_revision <= 0
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="ticket is not authorized for canonical scoring",
+            )
+        if legacy_completion:
+            ticket.purpose = TicketPurpose.CANONICAL_QUORUM
+            ticket.purpose_revision = 1
+            ticket.legacy_completion_allowed = False
         # Every post-legacy benchmark must be bound EXPLICITLY, not just the
         # current canary: a v3 ticket keeps this requirement after the canary
         # moves to v4, instead of silently falling through to the lenient branch.

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ditto.api_models.admin_quarantine import AdminBenchmarkQualificationRequest
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.benchmark_rollout import (
     ensure_rolling_qualification,
     refresh_rolling_qualification,
@@ -959,6 +959,58 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists()
             is None
         )
         assert no_target_source_ticket.status == TicketStatus.ISSUED
+    await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "purpose",
+    [TicketPurpose.CONTINUAL_RETEST, TicketPurpose.LEGACY_UNCLASSIFIED],
+)
+async def test_rollout_does_not_serve_or_preempt_noncanonical_lease(
+    purpose: TicketPurpose,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        _, rollout = await _seed_rollout(session, now)
+        ordinary_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=ordinary_id,
+                miner_hotkey=f"ordinary-{purpose}",
+                name=f"ordinary-{purpose}",
+                sha256="fa" * 32,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=9,
+                created_at=now,
+            )
+        )
+        lease = ValidatorTicket(
+            agent_id=ordinary_id,
+            bench_version=2,
+            validator_hotkey="validator-a",
+            status=TicketStatus.ISSUED,
+            purpose=purpose,
+            purpose_revision=(0 if purpose == TicketPurpose.LEGACY_UNCLASSIFIED else 1),
+            issued_at=now,
+            deadline=now + timedelta(minutes=90),
+        )
+        session.add(lease)
+        await session.flush()
+
+        issued = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+
+        assert issued is None
+        assert lease.status == TicketStatus.ISSUED
+        assert lease.bench_version != rollout.desired_version
     await engine.dispose()
 
 

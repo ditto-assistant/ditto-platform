@@ -19,6 +19,7 @@ from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.retry_state import RetryState
 from ditto.api_models.screener import ScreenerProgressStage, ScreenerRuntimeState
 from ditto.api_models.stack_health import ValidatorStackHealth
+from ditto.api_models.ticket_status import TicketPurpose
 from ditto.api_models.validator import ValidatorRuntimeState
 from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
@@ -1314,15 +1315,32 @@ class CreateScreeningDisputeResponse(BaseModel):
 
 
 class PublicValidationAttempt(BaseModel):
-    """One validator ticket contributing toward the three-score quorum."""
+    """One validator ticket for either quorum scoring or continual retesting."""
 
     validator_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
     status: Annotated[str, Field(pattern=r"^(issued|scored|expired)$")]
+    purpose: TicketPurpose = TicketPurpose.LEGACY_UNCLASSIFIED
     issued_at: datetime
     deadline: datetime
     bench_version: Annotated[int, Field(ge=1)]
     actively_running: bool = False
     benchmark_progress: PublicBenchmarkProgress | None = None
+
+
+class PublicConfirmationScore(BaseModel):
+    """One append-only shared-seed score from a continual top-five retest."""
+
+    composite: Annotated[float, Field(ge=0.0, le=1.0)]
+    seed: Annotated[
+        str,
+        Field(
+            pattern=r"^\d+$",
+            description="Exact decimal shared seed, encoded without JS rounding.",
+        ),
+    ]
+    validator_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    bench_version: Annotated[int, Field(ge=1)]
+    accepted_at: datetime
 
 
 class PublicProvisionalScore(BaseModel):
@@ -1472,6 +1490,7 @@ class PublicSubmissionPipeline(BaseModel):
         ),
     ]
     provisional_scores: list[PublicProvisionalScore] = Field(default_factory=list)
+    confirmation_scores: list[PublicConfirmationScore] = Field(default_factory=list)
     final_composite: Annotated[
         float | None,
         Field(

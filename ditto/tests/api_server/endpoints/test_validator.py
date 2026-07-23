@@ -48,7 +48,7 @@ from ditto.api_models.system_health import (
     SystemMetrics,
     system_metrics_signing_token,
 )
-from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_models.validator_capabilities import (
     InferenceCalibrationRoute,
     ScorerBenchmarkCapability,
@@ -742,6 +742,9 @@ async def _seed_ticket(
     bench_version: int = 2,
     issued_at: datetime | None = None,
     slot_id: str = "slot-0",
+    purpose: TicketPurpose = TicketPurpose.CANONICAL_QUORUM,
+    purpose_revision: int = 1,
+    legacy_completion_allowed: bool = False,
 ) -> None:
     """Seat (or re-open) an issued ticket for a specific (agent, validator) so a
     score against that agent is accepted by the k=3 gate. Upserts so a test can
@@ -761,12 +764,18 @@ async def _seed_ticket(
                     validator_hotkey=keypair.ss58_address,
                     slot_id=slot_id,
                     status=TicketStatus.ISSUED,
+                    purpose=purpose,
+                    purpose_revision=purpose_revision,
+                    legacy_completion_allowed=legacy_completion_allowed,
                     issued_at=issued,
                     deadline=deadline,
                 )
             )
         else:
             existing.status = TicketStatus.ISSUED
+            existing.purpose = purpose
+            existing.purpose_revision = purpose_revision
+            existing.legacy_completion_allowed = legacy_completion_allowed
             existing.slot_id = slot_id
             existing.issued_at = issued
             existing.deadline = deadline
@@ -3417,6 +3426,62 @@ class TestFailJob:
 
 
 class TestSubmitScore:
+    @pytest.mark.parametrize(
+        "purpose",
+        [TicketPurpose.CONTINUAL_RETEST, TicketPurpose.LEGACY_UNCLASSIFIED],
+    )
+    async def test_rejects_noncanonical_ticket_purpose(
+        self,
+        purpose: TicketPurpose,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, purpose=purpose)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id),
+        )
+
+        assert response.status_code == 409
+        assert "not authorized for canonical scoring" in response.text
+
+    async def test_accepts_grandfathered_inflight_canonical_lease(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(
+            session_maker,
+            agent_id,
+            purpose=TicketPurpose.LEGACY_UNCLASSIFIED,
+            purpose_revision=0,
+            legacy_completion_allowed=True,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id),
+        )
+
+        assert response.status_code == 200, response.text
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+            )
+        assert ticket is not None
+        assert ticket.purpose == TicketPurpose.CANONICAL_QUORUM
+        assert ticket.purpose_revision == 1
+        assert ticket.legacy_completion_allowed is False
+
     @pytest.mark.parametrize("ticket_version", [3, 4])
     async def test_post_legacy_ticket_requires_explicit_bench_version_binding(
         self,
@@ -4747,6 +4812,86 @@ def _top5_score_payload(
 
 
 class TestTop5ConfirmationLane:
+    @pytest.mark.parametrize(
+        "purpose",
+        [TicketPurpose.CANONICAL_QUORUM, TicketPurpose.LEGACY_UNCLASSIFIED],
+    )
+    async def test_rejects_nonconfirmation_ticket_purpose(
+        self,
+        purpose: TicketPurpose,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        deadline = datetime.now(UTC) + timedelta(minutes=30)
+        await _seed_ticket(
+            session_maker,
+            member,
+            deadline=deadline,
+            purpose=purpose,
+        )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=0)
+        seeds = list(champion_anchored_seeds(champion, version=2, max_seeds=16)[:2])
+
+        response = await client.post(
+            f"/api/v1/validator/agent/{member}/top5-confirmation-score",
+            json=_top5_score_payload(
+                member,
+                deadline=deadline,
+                seeds=seeds,
+                composites=[0.81, 0.83],
+            ),
+        )
+
+        assert response.status_code == 409
+        assert "not authorized for continual retesting" in response.text
+
+    async def test_accepts_grandfathered_inflight_confirmation_lease(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        deadline = datetime.now(UTC) + timedelta(minutes=30)
+        await _seed_ticket(
+            session_maker,
+            member,
+            deadline=deadline,
+            purpose=TicketPurpose.LEGACY_UNCLASSIFIED,
+            purpose_revision=0,
+            legacy_completion_allowed=True,
+        )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=0)
+        seeds = list(champion_anchored_seeds(champion, version=2, max_seeds=16)[:2])
+
+        response = await client.post(
+            f"/api/v1/validator/agent/{member}/top5-confirmation-score",
+            json=_top5_score_payload(
+                member,
+                deadline=deadline,
+                seeds=seeds,
+                composites=[0.81, 0.83],
+            ),
+        )
+
+        assert response.status_code == 200, response.text
+        async with session_maker() as session:
+            ticket = await session.get(ValidatorTicket, (member, 2, _VALIDATOR_HOTKEY))
+        assert ticket is not None
+        assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
+        assert ticket.purpose_revision == 1
+        assert ticket.legacy_completion_allowed is False
+
     async def test_v7_job_includes_ticket_scoped_inference_offer(
         self,
         app: FastAPI,
@@ -4894,6 +5039,7 @@ class TestTop5ConfirmationLane:
         assert canonical.run_id.startswith("top5-")
         assert confirmations == 2
         assert ticket is not None and ticket.status == TicketStatus.SCORED
+        assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
 
     async def test_rejects_member_outside_emission_set(
         self,

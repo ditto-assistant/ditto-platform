@@ -272,7 +272,7 @@ class TestDashboard:
         assert "openActivityModal" in body
         assert "scores received" in body
         assert "renderAcceptedScores" in body
-        assert "Accepted scores" in body
+        assert "Accepted validator scores" in body
         assert '"Bench v" + score.bench_version' in body
         assert '"Bench v" + a.bench_version' in body
         assert 'class="bench-version-badge"' in body
@@ -282,8 +282,19 @@ class TestDashboard:
         assert " preliminary</dt><dd>" in body
         assert 'class="pipeline-preliminary-value"' in body
         assert "function cohortProgressSummary(cohort, quorum)" in body
-        assert '" · " + running + " running"' in body
-        assert '" · " + pending + " pending"' in body
+        assert "function retestAttemptCounts(attempts)" in body
+        assert 'attempt.purpose === "continual_retest"' in body
+        assert '" of " + quorum + " quorum inputs"' in body
+        assert '" legacy lease draining"' in body
+        assert '"Legacy lease unclassified · "' in body
+        assert 'retestState(retests.running, "running")' in body
+        assert 'retestState(retests.assigned, "assigned")' in body
+        assert "function confirmationCohorts(pipeline)" in body
+        assert "function renderConfirmationScores(pipeline)" in body
+        assert "Continual top-five retests" in body
+        assert "Accepted validator scores" in body
+        assert "Canonical quorum" in body
+        assert "canonical median of" in body
         assert "benchmarkVersionKey(pipeline.active_bench_version)" in body
         assert "cohortMedian(cohort.scores)" in body
         assert "pipeline.score_count) + ' of ' + esc(pipeline.quorum)" not in body
@@ -295,7 +306,9 @@ class TestDashboard:
         assert "Provisional scores may change" in body
         assert "final median is authoritative" in body
         assert "No validator score has been accepted yet." in body
-        assert "esc(benchmarkVersionLabel(cohort.key)) + ' aggregate: '" in body
+        assert (
+            "esc(benchmarkVersionLabel(cohort.key)) + ' official aggregate: '" in body
+        )
         assert "median of " in body
         assert "score.reproduction_command" in body
         assert "score.verification_command" in body
@@ -341,13 +354,12 @@ class TestDashboard:
         assert "a.quarantine_resolved_at || a.finished_at || a.started_at" in body
         assert "Lease expired" not in body
         assert "System failure" not in body
-        assert 'role === "validator" ? "Failed · reissued" : "Expired"' in body
+        assert 'role === "validator" ? "Assignment expired" : "Expired"' in body
         assert "Validator took too long to post a score." in body
         assert "Another validator will score you soon." in body
         assert 'class="retry-info" role="img" tabindex="0"' in body
         assert 'data-tooltip="' in body
         assert "validatorRetryInfo(a.actively_running" in body
-        assert "Assignment expired" not in body
         assert 'failed: ["Could not complete", "warn"]' in body
         assert 'class="pipeline-summary"' in body
         assert 'class="pipeline-key-facts"' in body
