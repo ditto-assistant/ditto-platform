@@ -1631,7 +1631,7 @@ class TestPublicActivity:
         one_high_id = await _seed_k3(
             session_maker,
             miner=_VALIDATOR_C,
-            composites=[0.7],
+            composites=[0.95],
             status=AgentStatus.EVALUATING,
         )
         low_id = await _seed_k3(
@@ -1656,15 +1656,15 @@ class TestPublicActivity:
         response = await client.get("/api/v1/public/activity")
         by_id = {entry["agent_id"]: entry for entry in response.json()["entries"]}
 
-        assert by_id[high_id]["validator_queue_rank"] == 1
-        assert by_id[zero_id]["validator_queue_rank"] == 2
-        assert by_id[one_high_id]["validator_queue_rank"] == 3
+        assert by_id[one_high_id]["validator_queue_rank"] == 1
+        assert by_id[high_id]["validator_queue_rank"] == 2
+        assert by_id[zero_id]["validator_queue_rank"] == 3
         assert by_id[one_id]["validator_queue_rank"] == 4
         assert by_id[low_id]["validator_queue_rank"] == 5
         assert by_id[low_id]["status"] == "below_score_floor"
         assert by_id[zero_id]["provisional_composite"] is None
         assert by_id[one_id]["provisional_composite"] == pytest.approx(0.5)
-        assert by_id[one_high_id]["provisional_composite"] == pytest.approx(0.7)
+        assert by_id[one_high_id]["provisional_composite"] == pytest.approx(0.95)
         assert by_id[high_id]["provisional_composite"] == pytest.approx(0.85)
         assert by_id[low_id]["provisional_composite"] == pytest.approx(0.25)
 
