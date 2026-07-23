@@ -1792,6 +1792,8 @@ async def test_capability_gate_is_parameterised_per_bench_version() -> None:
     # Both are gated by the same fixed protocol-8 wire floor.
     stale = _heartbeat("old", now, versions=[2, 4], protocol_version=7)
     assert not heartbeat_supports_version(stale, now=now, version=4)
+    legacy_v7 = _heartbeat("legacy-v7", now, versions=[2, 7], protocol_version=10)
+    assert not heartbeat_supports_version(legacy_v7, now=now, version=7)
 
 
 async def test_second_rollout_while_one_is_open_raises_conflict_not_integrity() -> None:
