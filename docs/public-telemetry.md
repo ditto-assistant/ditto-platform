@@ -75,7 +75,8 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
     composite, tool_mean, memory_mean, first_seen, n,
     median_ms, bench_version, dataset_sha256, models, per_category,
     integrity, tokens } ], emissions: { champion_agent_id, recipients,
-    raw_leader_decision, margin, dethrone_z, champion_share, tail_size } }`.
+    raw_leader_decision, margin, dethrone_z, champion_share, rank_shares,
+    tail_size } }`.
   Entries are best-per-payment-coldkey and ranked by raw finalized composite.
   Different names and hotkeys under one coldkey compete for one position; the
   best eligible generation wins and its hotkey remains the weight destination.
@@ -85,8 +86,9 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   fallback. `?bench_version=2` provides a historical single-version view and
   intentionally returns `emissions: null`. In the default view, `emissions` is a
   public-safe, read-only projection of the validator's frozen first-seen KOTH
-  fold over finalized authoritative entries: the 2% incumbent margin, the
-  statistical band, the 90% champion share, and the participation tail. It is
+  fold over finalized authoritative entries: the fixed 0.007 composite-point
+  incumbent hysteresis, the
+  statistical band, and the 65% / 14% / 10% / 7% / 4% ranked distribution. It is
   `null` when no eligible entry exists. Validators still compute and submit their
   own authoritative weight vectors. The provenance block (`models` =
   generator/judge/judge_audit/harness, `bench_version`, `dataset_sha256`,

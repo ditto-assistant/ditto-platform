@@ -488,10 +488,12 @@
     .ver-item { padding: 11px 0 12px; border-bottom: 1px solid color-mix(in oklab, var(--border) 52%, transparent); }
     .ver-item:last-child { border-bottom: none; }
     .ver-current { border-left: 2px solid var(--accent-2); padding-left: 12px; margin-left: -14px; }
+    .ver-rollout { border-left: 2px solid var(--warn); padding-left: 12px; margin-left: -14px; }
     .ver-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
     .ver-tag { font-family: var(--mono); font-size: 11px; font-weight: 800; color: var(--accent-2); border: 1px solid color-mix(in oklab, var(--accent-2) 42%, transparent); border-radius: 5px; padding: 0 6px; }
     .ver-head b { font-size: 14px; color: var(--text); }
     .ver-now { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; color: var(--good); border: 1px solid color-mix(in oklab, var(--good) 45%, transparent); border-radius: 4px; padding: 0 5px; }
+    .ver-next { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn) 45%, transparent); border-radius: 4px; padding: 0 5px; }
     .ver-epoch { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
     .ver-sum { font-size: 13px; color: var(--text-dim); line-height: 1.55; margin-top: 5px; }
     .ver-hl { margin: 6px 0 0; padding-left: 18px; color: var(--text-dim); font-size: 12.5px; line-height: 1.6; }
@@ -2596,8 +2598,8 @@
           <li><b>Which runs rank.</b> Only runs that administer the <b>full</b> benchmark profile rank or earn emissions. Smaller practice profiles omit the hardest memory categories and their few remaining cases are easy to ace, so they are published as <b>provisional</b> and are never folded into weights. A run also needs the full 3-of-3 validator quorum before it is final; below that it is feedback, and its composite can still move.</li>
           <li><b>Scores compare only within one benchmark version.</b> A <code>bench_version</code> is an immutable generation contract: for a given seed it emits the same bytes forever and grades them the same way forever, which is what makes an old score auditable by anyone holding the seed. A correction to grading therefore cannot be applied to an existing version. It ships as a new one. Two composites from different versions are two different measurements, and the board never ranks them against each other.</li>
           <li><b>What v<span class="bv-desired">–</span> is.</b> <span id="bs-v4-copy">Version 4 is not a new benchmark. It is version 3 with a set of scoring false positives corrected: cases where the machinery penalised an agent for doing the right thing. The suite it administers is the same suite; what changed is that several ways of being <i>correct</i> no longer lose points. A leaking canary is charged once instead of twice, delete instructions are graded as acknowledgements rather than on whether they echoed a noun phrase, decimal durations parse ("1.5 years" was read as 15), and "used to" is treated as a temporal marker rather than a cessation phrase. Scores rise where an agent was being penalised for correct behaviour; the tests themselves are unchanged.</span></li>
-          <li><b>How emissions work.</b> The KOTH fold pays a champion and a tail: the champion takes <span id="ex-champion-share">a fixed share</span> of the miner pool, and up to <span id="ex-tail-size">a fixed number of</span> runners-up by composite split <span id="ex-tail-share">the remainder</span> equally. Only finalized, full-benchmark, currently-registered entries with a positive composite are eligible. The live values are shown on the leaderboard's emissions strip.</li>
-          <li><b>How the crown changes hands.</b> The fold runs in <b>first-seen</b> order, so the incumbent keeps the crown unless a challenger clearly beats it. Being marginally ahead on one dataset is not enough. A challenger dethrones only if its lead exceeds the <b>indifference band</b>, which is the larger of the flat relative <span id="ex-margin">incumbent margin</span> and the statistical band <code><span id="ex-dethrone-z">dethrone_z</span> × √(SE<sub>challenger</sub>² + SE<sub>champion</sub>²)</code> when both sides carry a standard error. A lead inside the band is not thrown away: both agents are re-scored on <b>shared confirmation seeds</b> and the next fold decides on the paired comparison, where per-dataset difficulty cancels. Dataset luck never decides emissions.</li>
+          <li><b>How emissions work.</b> The KOTH fold pays a champion and a ranked tail: the champion takes <span id="ex-champion-share">a fixed share</span> of the miner pool, and up to <span id="ex-tail-size">a fixed number of</span> runners-up by composite receive descending shares of <span id="ex-tail-share">the remainder</span>. Only finalized, full-benchmark, currently-registered entries with a positive composite are eligible. The live values are shown on the leaderboard's emissions strip.</li>
+          <li><b>How the crown changes hands.</b> The fold runs in <b>first-seen</b> order, so the incumbent keeps the crown unless a challenger clearly beats it. Being marginally ahead on one dataset is not enough. A challenger dethrones only if its lead exceeds the <b>indifference band</b>, which is the larger of the fixed <span id="ex-margin">composite-point hysteresis</span> and the statistical band <code><span id="ex-dethrone-z">dethrone_z</span> × √(SE<sub>challenger</sub>² + SE<sub>champion</sub>²)</code> when both sides carry a standard error. A lead inside the band is not thrown away: both agents are re-scored on <b>shared confirmation seeds</b> and the next fold decides on the paired comparison, where per-dataset difficulty cancels. Dataset luck never decides emissions.</li>
           <li><b>When weights move to a new version.</b> The whole ledger sits on one version at a time. Weights stay on the <b>active</b> version until at least <span class="quorum-needed">the required number of</span> agents hold a complete ranked quorum at the version being rolled out, and then the entire ledger flips at once. Ranking a partly-migrated pool would mix two incomparable scales; flipping early would leave the emission set (champion plus tail) short of recipients. Live progress is on the leaderboard's rollout strip.</li>
         </ul></div>
       </details>
@@ -2616,7 +2618,7 @@
       </details>
       <details class="bench-disclosure" id="bench-versions">
         <summary><span class="bench-disclosure-title"><strong>Version history</strong><span>What changed in each immutable benchmark contract</span></span><span class="bench-disclosure-icon" aria-hidden="true"></span></summary>
-        <div class="bench-disclosure-body"><p style="margin-bottom:10px">Each <code>bench_version</code> is an immutable contract; a scoring change ships as a new version rather than editing an old one. Newest first; the current version is highlighted.</p>
+        <div class="bench-disclosure-body"><p style="margin-bottom:10px">Each <code>bench_version</code> is an immutable contract; a scoring change ships as a new version rather than editing an old one. Newest first; the active version is highlighted, and an open rollout target is labeled separately.</p>
         <div id="bench-changelog"><p class="muted">Loading the benchmark changelog…</p></div>
         </div>
       </details>
@@ -3103,21 +3105,20 @@
     }
 
     // Consensus constants are read from the fold the API reports, never written
-    // into the copy. A percentage that drifts from emissions.margin is a lie
+    // into the copy. A point value that drifts from emissions.margin is a lie
     // about the rule miners are actually being judged by.
     // Trailing zeros on a consensus parameter read as false precision.
     function num(x) { return String(Number(x.toFixed(4))); }
 
     function marginText(margin) {
       if (!Number.isFinite(margin)) return "incumbent";
-      var v = margin * 100;
-      return (Math.abs(v - Math.round(v)) < 0.05 ? String(Math.round(v)) : v.toFixed(1)) + "%";
+      return num(margin) + " composite points";
     }
 
     // "Beat this to contend." The validator's rule (ditto/validator/weights.py
     // _beats) is: a challenger dethrones only if its lead over the champion
     // exceeds the indifference band, and the band is the LARGER of the flat
-    // relative margin and, when both sides carry a standard error,
+    // fixed composite-point margin and, when both sides carry a standard error,
     // dethrone_z * sqrt(se_challenger^2 + se_champion^2). Only the margin term
     // is knowable in advance, the statistical term depends on the challenger's
     // own measurement noise, which does not exist until it has been scored. So
@@ -3138,7 +3139,7 @@
         el.textContent = "";
         return;
       }
-      var floor = champComposite * (1 + margin);
+      var floor = champComposite + margin;
       var z = emissions.dethrone_z;
       var band = Number.isFinite(z) && z > 0
         ? " The band is the larger of that margin and " + num(z) +
@@ -3148,7 +3149,7 @@
       el.innerHTML =
         '<b>Beat this to contend:</b> <span class="beat">' + esc(fx(floor)) + '</span> composite. ' +
         esc("The champion holds " + fx(champComposite) + ", and a challenger must exceed it by more than the " +
-          marginText(margin) + " incumbent margin." + band +
+          marginText(margin) + " fixed hysteresis." + band +
           " A lead inside the band is not rejected: both agents are re-scored on shared confirmation seeds and the next fold decides on the paired comparison.");
       el.classList.add("show");
     }
@@ -3164,16 +3165,22 @@
         return;
       }
       var tailSize = Number.isFinite(emissions.tail_size) ? emissions.tail_size : null;
+      var rankShares = Array.isArray(emissions.rank_shares)
+        ? emissions.rank_shares.filter(Number.isFinite) : [];
+      var rankedCopy = rankShares.length
+        ? " Ranked shares: " + rankShares.map(pct).join(" / ") + "."
+        : "";
       tip.setAttribute("data-tooltip",
-        "Current KOTH role. The incumbent receives " + pct(emissions.champion_share) + " of the miner pool" +
+        "Current KOTH role. The base ranked schedule gives the incumbent " + pct(emissions.champion_share) + " of the miner pool" +
         (tailSize === 0
           ? "; there is no participation tail."
           : "; up to " + (tailSize == null ? "the configured number of" : tailSize) +
-            " participation-tail recipients split the remaining " + pct(1 - emissions.champion_share) + "."));
+            " participation-tail recipients receive descending shares of the remaining " + pct(1 - emissions.champion_share) + ".") +
+        rankedCopy);
       setText("ex-champion-share", pct(emissions.champion_share));
       setText("ex-tail-share", pct(1 - emissions.champion_share));
       if (tailSize != null) setText("ex-tail-size", String(tailSize));
-      if (Number.isFinite(emissions.margin)) setText("ex-margin", marginText(emissions.margin) + " incumbent margin");
+      if (Number.isFinite(emissions.margin)) setText("ex-margin", marginText(emissions.margin) + " hysteresis");
       if (Number.isFinite(emissions.dethrone_z) && emissions.dethrone_z > 0) setText("ex-dethrone-z", num(emissions.dethrone_z));
     }
 
@@ -3280,22 +3287,49 @@
     }
 
     function benchmarkDisplayVersion() {
-      return Math.max(Number(currentBench) || 0, Number(desiredBench) || 0) || null;
+      return Number(activeBench) || Number(currentBench) || null;
+    }
+
+    function benchmarkAuthorityState(activeValue, desiredValue, status) {
+      var active = Number(activeValue) || null;
+      var desired = Number(desiredValue) || active;
+      return {
+        active: active,
+        desired: desired,
+        rolling: !!(active && desired && desired > active &&
+          (status === "collecting" || status === "blocked_ineligible"))
+      };
+    }
+
+    function leaderboardBenchState(selectionMode, currentValue, activeValue, desiredValue, fallbackValue) {
+      var active = Number(activeValue) || null;
+      var desired = Number(desiredValue) || active;
+      var selected = selectionMode === "historical"
+        ? Number(currentValue) || null
+        : active;
+      return {
+        active: active,
+        desired: desired,
+        selected: selected || Number(currentValue) || Number(fallbackValue) || null
+      };
     }
 
     function renderBenchBadge() {
       var badge = document.getElementById("bench-badge");
-      var active = Number(currentBench) || null;
-      var desired = Number(desiredBench) || active;
-      var rolling = active && desired && desired > active &&
-        (benchmarkRolloutStatus === "collecting" || benchmarkRolloutStatus === "blocked_ineligible");
+      var authority = benchmarkAuthorityState(
+        activeBench || currentBench,
+        desiredBench,
+        benchmarkRolloutStatus
+      );
+      var active = authority.active;
+      var desired = authority.desired;
       if (!active) {
         badge.className = "bench-badge";
         badge.textContent = "";
         return;
       }
       badge.className = "bench-badge show";
-      badge.textContent = rolling
+      badge.textContent = authority.rolling
         ? "DittoBench v" + active + " → v" + desired + " rollout"
         : "DittoBench v" + active + (benchHasOlderRuns ? " · older runs marked" : "");
     }
@@ -3716,7 +3750,6 @@
 
     // ── Render ───────────────────────────────────────────────
     function render(data) {
-      activeBench = data.active_bench_version || activeBench;
       // History pills track every version that has ever been scored. Fall back
       // to the versions visible in this payload for an older API that does not
       // list them, so the pills never regress below what the board shows.
@@ -3777,7 +3810,16 @@
         .map(function (e) { return e.bench_version; })
         .filter(function (v) { return v != null; })
         .reduce(function (a, b) { return Math.max(a, b); }, 0);
-      currentBench = data.desired_bench_version || data.current_bench_version || maxBv || currentBench;
+      var benchState = leaderboardBenchState(
+        data.selection_mode,
+        data.current_bench_version,
+        data.active_bench_version,
+        data.desired_bench_version,
+        maxBv || currentBench
+      );
+      activeBench = benchState.active || activeBench;
+      desiredBench = benchState.desired || desiredBench || activeBench;
+      currentBench = benchState.selected || currentBench;
       // Reference-baseline card: only meaningful while the board runs the
       // bench_version the baseline was measured on; otherwise it would mislead.
       // Show the baseline for the version the board is actually showing, so a
@@ -3887,16 +3929,16 @@
         document.getElementById("emissions-title").innerHTML =
           '<span class="emission-badge champion"><span aria-hidden="true">●</span> KOTH champion</span> · ' +
           (championEntry ? entityAnchor("agent", championEntry.agent_id, championName) : esc(championName)) +
-          ' (' + esc(championRank) + ') receives ' + pct(emissions.champion_share) + ' of the miner pool.' +
+          ' (' + esc(championRank) + ') receives ' + pct(championRecipient && Number.isFinite(championRecipient.share_of_miner_pool) ? championRecipient.share_of_miner_pool : emissions.champion_share) + ' of the miner pool.' +
           (championConfirmations ? ' <span class="tip" title="Distinct champion-anchored seeds scored by the continual top-five lane.">· ' + esc(championConfirmations) + '</span>' : '');
         // Every consensus constant in this strip comes from the fold the API
-        // reports (margin, dethrone_z, champion_share, tail_size). Hardcoding
+        // reports (margin, dethrone_z, champion_share, rank_shares, tail_size). Hardcoding
         // any of them lets the copy drift from the rule actually being applied.
         var marginLabel = marginText(emissions.margin);
         var decision = emissions.raw_leader_decision;
         if (decision && rawLeaderEntry) {
           var method = decision.method === "paired" ? "paired-seed uncertainty band" :
-            decision.method === "unpaired" ? "statistical uncertainty band" : marginLabel + " incumbent margin";
+            decision.method === "unpaired" ? "statistical uncertainty band" : marginLabel + " fixed hysteresis";
           var contestNote = decision.method === "paired"
             ? " Both sides were scored on shared confirmation seeds, so this decision is a paired comparison: per-dataset difficulty cancels and cannot decide the crown."
             : " A lead inside the band is never left to dataset luck: validators re-score both agents on shared confirmation seeds and the next fold decides the contest on the paired comparison.";
@@ -7498,14 +7540,20 @@
       // Version changelog: every contract, newest first, with what it changed.
       var cl = document.getElementById("bench-changelog");
       if (cl && vers.length) {
+        var activeVersion = Number(activeBench) || Number(currentBench) || null;
+        var rolloutVersion = Number(desiredBench) || activeVersion;
+        var rolloutOpen = activeVersion && rolloutVersion > activeVersion &&
+          (benchmarkRolloutStatus === "collecting" || benchmarkRolloutStatus === "blocked_ineligible");
         cl.innerHTML = vers.map(function (v) {
-          var active = Number(v.version) === Number(cur);
+          var active = Number(v.version) === activeVersion;
+          var rollout = rolloutOpen && Number(v.version) === rolloutVersion;
           var hl = (v.highlights || []).map(function (h) {
             return '<li>' + esc(h) + '</li>';
           }).join("");
-          return '<div class="ver-item' + (active ? ' ver-current' : '') + '">' +
+          return '<div class="ver-item' + (active ? ' ver-current' : rollout ? ' ver-rollout' : '') + '">' +
             '<div class="ver-head"><span class="ver-tag">v' + v.version + '</span>' +
-            '<b>' + esc(v.title) + '</b>' + (active ? '<span class="ver-now">current</span>' : '') +
+            '<b>' + esc(v.title) + '</b>' +
+            (active ? '<span class="ver-now">active</span>' : rollout ? '<span class="ver-next">rollout</span>' : '') +
             '<span class="ver-epoch">' + esc(v.epoch) + '</span></div>' +
             '<div class="ver-sum">' + esc(v.summary) + '</div>' +
             (hl ? '<ul class="ver-hl">' + hl + '</ul>' : '') + '</div>';

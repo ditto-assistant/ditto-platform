@@ -652,9 +652,20 @@ class PublicDethroneDecision(BaseModel):
 class PublicKothEmissions(BaseModel):
     """Current read-only projection of the validator's KOTH weight fold."""
 
-    margin: Annotated[float, Field(ge=0.0, le=1.0)]
+    margin: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Fixed composite-point lead required before uncertainty can permit "
+                "a dethrone."
+            ),
+        ),
+    ]
     dethrone_z: Annotated[float, Field(ge=0.0)]
     champion_share: Annotated[float, Field(gt=0.0, le=1.0)]
+    rank_shares: tuple[Annotated[float, Field(gt=0.0, le=1.0)], ...]
     tail_size: Annotated[int, Field(ge=0)]
     champion_agent_id: UUID
     champion_miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
@@ -1988,7 +1999,7 @@ class PublicBenchVersionDoc(BaseModel):
     """What one immutable bench_version is and what it changed vs the previous one."""
 
     version: int
-    epoch: Annotated[str, Field(description="Dataset reference date (YYYY-MM-DD).")]
+    epoch: Annotated[str, Field(description="Contract publication date (YYYY-MM-DD).")]
     title: Annotated[str, Field(description="Short name of the release.")]
     summary: Annotated[
         str, Field(description="One-paragraph description of the version.")

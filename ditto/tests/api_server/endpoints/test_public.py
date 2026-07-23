@@ -511,8 +511,11 @@ class TestPublicLeaderboard:
         assert body["entries"][0]["rank"] == 1
         assert body["emissions"]["raw_leader_agent_id"] == raw_leader_id
         assert body["emissions"]["champion_agent_id"] == incumbent_id
-        assert body["emissions"]["margin"] == pytest.approx(0.02)
+        assert body["emissions"]["margin"] == pytest.approx(0.007)
         assert body["emissions"]["dethrone_z"] == pytest.approx(1.64)
+        assert body["emissions"]["rank_shares"] == pytest.approx(
+            [0.65, 0.14, 0.10, 0.07, 0.04]
+        )
         decision = body["emissions"]["raw_leader_decision"]
         assert decision["challenger_lead"] == pytest.approx(0.05)
         assert decision["required_lead"] == pytest.approx(
@@ -526,7 +529,7 @@ class TestPublicLeaderboard:
                 "agent_id": incumbent_id,
                 "miner_hotkey": _MINER_A,
                 "raw_rank": 2,
-                "share_of_miner_pool": 0.9,
+                "share_of_miner_pool": pytest.approx(0.65 / 0.79),
                 "shared_seed_confirmations": 0,
             },
             {
@@ -534,7 +537,7 @@ class TestPublicLeaderboard:
                 "agent_id": raw_leader_id,
                 "miner_hotkey": _MINER_B,
                 "raw_rank": 1,
-                "share_of_miner_pool": pytest.approx(0.1),
+                "share_of_miner_pool": pytest.approx(0.14 / 0.79),
                 "shared_seed_confirmations": 0,
             },
         ]
@@ -3933,9 +3936,15 @@ def test_bench_glossary_explains_every_v5_category_and_metric() -> None:
     metrics = {m["key"] for m in bg.metric_entries()}
     # bench_version changelog is present, newest first, complete per version.
     versions = bg.version_entries()
-    assert [v["version"] for v in versions] == [6, 5, 4, 3, 2]
+    assert [v["version"] for v in versions] == [7, 6, 5, 4, 3, 2]
     for v in versions:
         assert v["title"] and v["summary"] and v["epoch"]
+
+    v7 = versions[0]
+    assert v7["title"] == "GPT-OSS inference contract"
+    assert "openai/gpt-oss-20b" in v7["summary"]
+    assert "medium" in v7["summary"]
+    assert any("Same generated questions" in item for item in v7["highlights"])
 
     for key in (
         "composite",

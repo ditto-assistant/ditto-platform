@@ -774,6 +774,25 @@ BENCH_VERSIONS: list[dict] = [
             "Passive cross-session consolidation (earliest fact of an evolving topic)",
         ],
     },
+    {
+        "version": 7,
+        "epoch": "2026-07-22",
+        "title": "GPT-OSS inference contract",
+        "summary": (
+            "Keeps the v6 generated suite and deterministic scoring rules, while "
+            "changing the frozen inference contract to OpenRouter-served "
+            "openai/gpt-oss-20b with medium reasoning. Scores remain comparable "
+            "only within their own benchmark version."
+        ),
+        "highlights": [
+            "Same generated questions, seed derivation, run identity, and scoring "
+            "math as v6",
+            "Canonical model changes from qwen/qwen3-32b to openai/gpt-oss-20b",
+            "Reasoning effort is locked to medium",
+            "Ticket-scoped platform inference with throughput-ordered healthy "
+            "provider fallback",
+        ],
+    },
 ]
 
 
