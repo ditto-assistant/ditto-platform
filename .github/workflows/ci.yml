@@ -25,6 +25,27 @@ jobs:
       - name: faircopy
         run: npm run lint:copy -- --format github
 
+  dashboard:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        working-directory: dashboard
+        run: bun install --frozen-lockfile
+
+      - name: typecheck + lint + format + test
+        working-directory: dashboard
+        run: bun run check
+
+      - name: build
+        working-directory: dashboard
+        run: bun run build
+
   lint-and-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:

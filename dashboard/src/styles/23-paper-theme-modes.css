@@ -1,0 +1,64 @@
+    :root[data-theme="time"][data-time-phase="dawn"] {
+      --bg: oklch(96% .015 45);
+      --bg-elev: oklch(98% .01 45);
+      --bg-elev-2: oklch(93% .02 42);
+      --border: oklch(84% .035 45);
+      --border-strong: oklch(67% .045 45);
+      --accent: oklch(43% .055 45);
+      --accent-hover: oklch(34% .05 45);
+      --focus: oklch(43% .055 45);
+    }
+    :root[data-theme="time"][data-time-phase="morning"] {
+      --bg: oklch(98% .006 90);
+      --bg-elev: oklch(99% .004 90);
+      --bg-elev-2: oklch(95% .01 85);
+      --border: oklch(87% .018 85);
+      --border-strong: oklch(69% .028 80);
+    }
+    :root[data-theme="time"][data-time-phase="dusk"] {
+      --bg: oklch(94% .022 45);
+      --bg-elev: oklch(97% .016 42);
+      --bg-elev-2: oklch(91% .028 40);
+      --border: oklch(80% .045 42);
+      --border-strong: oklch(62% .055 40);
+      --accent: oklch(42% .07 50);
+      --accent-hover: oklch(33% .06 48);
+      --gold: oklch(55% .12 65);
+      --tool: var(--gold);
+      --focus: oklch(42% .07 50);
+    }
+    :root[data-theme="dark"],
+    :root[data-theme="system"][data-system-theme="dark"],
+    :root[data-theme="time"][data-time-phase="night"] {
+      --bg: oklch(19% .025 255);
+      --bg-elev: oklch(23% .028 255);
+      --bg-elev-2: oklch(27% .03 255);
+      --border: oklch(36% .02 255);
+      --border-strong: oklch(48% .025 255);
+      --text: oklch(92% .006 85);
+      --text-dim: oklch(79% .008 85);
+      --text-faint: oklch(72% .01 85);
+      --accent: oklch(74% .12 75);
+      --accent-hover: oklch(80% .115 75);
+      --accent-2: oklch(75% .1 340);
+      --gold: oklch(78% .12 75);
+      --tool: var(--accent);
+      --memory: var(--accent-2);
+      --good: oklch(75% .11 145);
+      --warn: oklch(76% .15 52);
+      --danger: oklch(72% .13 28);
+      --on-accent: oklch(19% .025 255);
+      --focus: oklch(80% .115 75);
+      --banner-text: oklch(86% .08 75);
+      --banner-strong: oklch(92% .08 75);
+      --rank-one-text: oklch(84% .1 75);
+      --rank-three-text: oklch(78% .08 45);
+    }
+
+    html { color-scheme: light; background: var(--bg); }
+    html[data-theme="dark"],
+    html[data-theme="system"][data-system-theme="dark"],
+    html[data-theme="time"][data-time-phase="night"] { color-scheme: dark; }
+    body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 15px; }
+    .wrap { max-width: 1440px; padding: 24px 28px 72px; }
+

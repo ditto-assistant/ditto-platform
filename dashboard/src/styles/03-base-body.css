@@ -1,0 +1,14 @@
+    body {
+      background:
+        radial-gradient(1200px 600px at 15% -10%, color-mix(in oklab, var(--accent) 12%, transparent), transparent 60%),
+        radial-gradient(1000px 500px at 100% 0%, color-mix(in oklab, var(--accent-2) 9%, transparent), transparent 55%),
+        var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      line-height: 1.55;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .wrap { max-width: 1220px; margin: 0 auto; padding: 28px 20px 80px; }
+

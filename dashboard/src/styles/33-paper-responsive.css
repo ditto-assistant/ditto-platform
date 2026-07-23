@@ -1,0 +1,43 @@
+    @media (max-width: 900px) {
+      .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    }
+    @media (max-width: 960px) {
+      .sidebar { padding: 14px 16px 10px; background: var(--bg-elev); }
+      .sidebar .brand { padding-bottom: 0; }
+      .nav-item { border-radius: 4px; }
+      .wrap { padding-top: 20px; }
+    }
+    @media (max-width: 720px) {
+      .wrap { padding-inline: 16px; }
+      header.top { gap: 8px; }
+      header.top .spacer { display: none; }
+      header.top .brand { flex: 1 0 100%; }
+      .global-search { order: 1; flex: 1 0 100%; min-width: 0; }
+      .search-popover { right: auto; left: 0; width: 100%; }
+      header.top .brand .sub { max-width: 28ch; }
+      header.top .bench-badge.show { display: block; width: fit-content; margin: 6px 0 0; }
+      header.top #status { order: 2; }
+      .cards { grid-template-columns: repeat(2, 1fr); }
+      .card.primary { grid-column: 1 / -1; grid-row: auto; min-height: 152px; }
+      .card.primary .value { font-size: 44px; }
+      .section-head { display: block; }
+      .section-head .hint { display: block; margin-top: 6px; line-height: 1.5; }
+      .emissions-strip.show { display: block; }
+      .emissions-recipients { margin-top: 8px; text-align: left; }
+      .chain-observation { margin-top: 10px; }
+      .pager { gap: 6px; padding-inline: 8px; }
+      .pager .btn { min-width: 84px; padding-inline: 9px; }
+      .page-status { min-width: 94px; }
+      .activity-filters { align-items: flex-start; flex-direction: column; padding: 12px; }
+      .activity-filter-list { width: 100%; }
+      .activity-filter { min-height: 44px; }
+      .activity-filter-meta { width: 100%; justify-content: space-between; }
+      .activity-filter-summary { white-space: normal; }
+      .activity-table-frame { min-width: 680px; }
+      .about .pillars { grid-template-columns: 1fr; }
+      .about .pillar { border-right: 0; border-bottom: 1px solid var(--border); }
+      .about .pillar:last-child { border-bottom: 0; }
+      .bench-disclosure > summary { align-items: flex-start; }
+      .bench-disclosure .tag { flex: none; }
+    }
+
