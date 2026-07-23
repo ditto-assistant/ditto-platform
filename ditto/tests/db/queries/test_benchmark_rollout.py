@@ -122,6 +122,7 @@ def _capabilities(now: datetime) -> tuple[dict, dict]:
         "stack_updater": False,
         "sandbox_egress_restricted": True,
         "ticket_inference": True,
+        "signed_score_quorum": True,
         "executor_isolation": "privileged_dind",
         "scorer_benchmarks": {
             "status": "fresh_verified",
@@ -282,7 +283,7 @@ async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRo
             ValidatorHeartbeat(
                 validator_hotkey=hotkey,
                 software_version="1.0.0",
-                protocol_version=11,
+                protocol_version=12,
                 code_digest="d" * 64,
                 state="polling",
                 first_seen_at=now,
@@ -570,7 +571,7 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
         assert heartbeat_supports_version(heartbeat, now=now)
         heartbeat.protocol_version = 7
         assert not heartbeat_supports_version(heartbeat, now=now)
-        heartbeat.protocol_version = 11
+        heartbeat.protocol_version = 12
 
         for validator_index, hotkey in enumerate(("validator-a", "validator-b")):
             for agent_index in range(5):
@@ -905,7 +906,7 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists()
             ValidatorHeartbeat(
                 validator_hotkey="validator-d",
                 software_version="1.0.0",
-                protocol_version=11,
+                protocol_version=12,
                 code_digest="d" * 64,
                 state="polling",
                 first_seen_at=now,
@@ -1592,7 +1593,7 @@ async def test_capable_validator_cannot_automatically_seed_rollout_work() -> Non
             ValidatorHeartbeat(
                 validator_hotkey="validator-auto",
                 software_version="1.0.0",
-                protocol_version=11,
+                protocol_version=12,
                 code_digest="d" * 64,
                 state="polling",
                 first_seen_at=now,
@@ -1740,7 +1741,7 @@ async def test_rollout_start_requires_one_capable_validator_and_matches_telemetr
                 ValidatorHeartbeat(
                     validator_hotkey=f"validator-{index}",
                     software_version="1.0.0",
-                    protocol_version=11,
+                    protocol_version=12,
                     code_digest="d" * 64,
                     state="polling",
                     first_seen_at=now,
@@ -1785,7 +1786,7 @@ async def test_v7_rollout_start_requires_route_and_manifest_intersection() -> No
             ValidatorHeartbeat(
                 validator_hotkey="validator-mismatched-manifest",
                 software_version="1.0.0",
-                protocol_version=11,
+                protocol_version=12,
                 code_digest="d" * 64,
                 state="polling",
                 first_seen_at=now,

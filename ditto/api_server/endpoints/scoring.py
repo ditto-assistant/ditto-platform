@@ -41,9 +41,9 @@ from ditto.api_server.endpoints.validator import (
     _assert_validator_permitted,
     _verify_signature,
 )
+from ditto.db.models import Score
 from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.confirmation_scores import confirmation_history_by_agent
-from ditto.db.models import Score
 from ditto.db.queries.scores import (
     list_eligible_ledger,
     quorum_composites,
