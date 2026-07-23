@@ -60,6 +60,7 @@ from ditto.api_models.validator_capabilities import (
 from ditto.api_server.config import ValidatorCompatibilityConfig
 from ditto.api_server.dependencies import (
     get_chain_client,
+    get_dataset_generator,
     get_session,
     get_storage_client,
 )
@@ -5083,6 +5084,13 @@ class TestTop5ConfirmationLane:
         )
         _install_db(app, session_maker)
         _install_chain_with_block(app, block_number=0)
+        generator = MagicMock(run_size="full")
+        generator.generate = AsyncMock(
+            side_effect=lambda seed, *, bench_version: hashlib.sha256(
+                f"{bench_version}:{seed}".encode()
+            ).hexdigest()
+        )
+        app.dependency_overrides[get_dataset_generator] = lambda: generator
         app.state.config = replace(
             app.state.config,
             top5_backoff_base=2,
@@ -5105,6 +5113,14 @@ class TestTop5ConfirmationLane:
         assert body["slot_id"] == "slot-0"
         assert body["minimum_screening_policy_version"] == 9
         assert body["requires_screened_image"] is True
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        expected_seeds = list(
+            champion_anchored_seeds(champion, version=7, max_seeds=16)[:2]
+        )
+        assert [pin["seed"] for pin in body["confirmation_datasets"]] == expected_seeds
+        assert all(pin["run_size"] == "full" for pin in body["confirmation_datasets"])
+        assert generator.generate.await_count == len(expected_seeds)
         assert body["inference"]["grant_id"] == str(grant_id)
         assert body["inference"]["profile_revision"] == profile
         ensure.assert_awaited_once()
