@@ -15,6 +15,7 @@ from ditto.api_server.endpoints.inference import (
     _locked_upstream_payload,
     _output_token_limit,
     _provider_preferences,
+    _provider_rejection_is_route_observable,
     _proxy_message,
     _public_provider_response,
     _upstream_provider,
@@ -147,6 +148,58 @@ def test_proxy_schema_allows_only_local_function_tools() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        {"temperature": float("nan")},
+        {"temperature": 2.01},
+        {"top_p": -0.01},
+        {"top_p": "fast"},
+        {"seed": True},
+        {"seed": 2**63},
+        {"stop": ["a", "b", "c", "d", "e"]},
+        {"stop": ["ok", 1]},
+        {"parallel_tool_calls": 1},
+        {"stream": "false"},
+        {"n": True},
+        {"n": 2},
+        {"best_of": 1},
+        {"tool_choice": {"type": "function", "function": {"name": ""}}},
+        {"tool_choice": {"type": "function", "function": {"name": "x", "x": 1}}},
+    ],
+)
+def test_proxy_schema_rejects_invalid_or_amplifying_scalar_controls(
+    parameter: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "model": "openai/gpt-oss-20b",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    payload.update(parameter)
+    with pytest.raises(HTTPException):
+        _validate_request_schema(payload)
+
+
+def test_proxy_schema_accepts_bounded_scalar_controls() -> None:
+    _validate_request_schema(
+        {
+            "model": "openai/gpt-oss-20b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "seed": -(2**63),
+            "stop": ["done"],
+            "parallel_tool_calls": False,
+            "stream": False,
+            "n": 1,
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "lookup"},
+            },
+        }
+    )
+
+
 def test_aggregate_route_is_speed_sorted_private_and_fallback_enabled() -> None:
     assert _provider_preferences(
         routing_mode="aggregate_throughput",
@@ -172,11 +225,20 @@ def test_v7_upstream_profile_pins_medium_reasoning_without_changing_v6() -> None
     v7 = _locked_upstream_payload(payload, model="openai/gpt-oss-20b", max_tokens=256)
     assert v7["model"] == "openai/gpt-oss-20b"
     assert v7["max_tokens"] == 256
+    assert v7["n"] == 1
+    assert v7["stream"] is False
     assert v7["reasoning"] == {"effort": "medium", "exclude": True}
     assert "max_completion_tokens" not in v7
 
     v6 = _locked_upstream_payload(payload, model="qwen/qwen3-32b", max_tokens=256)
     assert "reasoning" not in v6
+
+
+def test_caller_shape_rejections_do_not_cool_shared_provider_route() -> None:
+    assert not _provider_rejection_is_route_observable(400)
+    assert not _provider_rejection_is_route_observable(422)
+    for status_code in (401, 402, 403, 404, 408, 409, 429, 500, 503):
+        assert _provider_rejection_is_route_observable(status_code)
 
 
 def test_router_metadata_provider_is_trusted_but_never_returned_to_harness() -> None:

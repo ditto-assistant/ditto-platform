@@ -7,18 +7,30 @@ from collections.abc import AsyncIterator
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ditto.api_server.benchmark_rollout import inference_activation_requirements
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.embedding import Embedder
 from ditto.api_server.payment_verifier import PaymentVerifier
 from ditto.api_server.pricing import PriceOracle
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainClient
+from ditto.db.queries.benchmark_rollout import (
+    CANARY_BENCH_VERSION,
+    bind_inference_activation_requirements,
+)
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
     """Yield an :class:`AsyncSession` from the lifespan's session maker."""
     session_maker = request.app.state.session_maker
     async with session_maker() as session:
+        bind_inference_activation_requirements(
+            session,
+            inference_activation_requirements(
+                request.app.state.config.inference_proxy,
+                bench_version=CANARY_BENCH_VERSION,
+            ),
+        )
         yield session
 
 

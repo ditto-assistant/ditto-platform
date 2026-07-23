@@ -181,6 +181,7 @@ from ditto.db.queries.validator_auth import (
 )
 
 if TYPE_CHECKING:
+    from ditto.api_server.config import InferenceProxyConfig
     from ditto.chain import ChainClient
 
 logger = logging.getLogger(__name__)
@@ -369,7 +370,11 @@ _SCOREABLE_STATUSES = SCOREABLE_AGENT_STATUSES
 
 
 async def _refresh_qualification_if_due(
-    session: AsyncSession, *, generator: DatasetGenerator, now: datetime
+    session: AsyncSession,
+    *,
+    generator: DatasetGenerator,
+    now: datetime,
+    inference_config: InferenceProxyConfig | None = None,
 ) -> None:
     """Single-flight best-effort convergence for authenticated idle pollers."""
     global _qualification_refresh_due
@@ -380,7 +385,15 @@ async def _refresh_qualification_if_due(
     # into one refresh. Score/verdict triggers remain the immediate primary path.
     _qualification_refresh_due = monotonic_now + _QUALIFICATION_REFRESH_INTERVAL_SECONDS
     try:
-        await refresh_rolling_qualification(session, generator=generator, now=now)
+        if inference_config is None:
+            await refresh_rolling_qualification(session, generator=generator, now=now)
+        else:
+            await refresh_rolling_qualification(
+                session,
+                generator=generator,
+                now=now,
+                inference_config=inference_config,
+            )
     except Exception:
         logger.exception("automatic benchmark qualification refresh failed")
 
@@ -1396,7 +1409,12 @@ async def request_job(
     if job is None:
         # Only a fully authenticated, compatible, replay-checked idle poll can
         # trigger bounded convergence. The next poll sees any newly queued work.
-        await _refresh_qualification_if_due(session, generator=generator, now=now)
+        await _refresh_qualification_if_due(
+            session,
+            generator=generator,
+            now=now,
+            inference_config=request.app.state.config.inference_proxy,
+        )
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
     response.headers["Cache-Control"] = "no-store"
     logger.info(
@@ -2737,7 +2755,12 @@ async def submit_score(
     # Both a completed v3 quorum and a newly finalized v2 contender can change
     # the hybrid top five. This is a cheap no-op when no rollout is open.
     try:
-        await refresh_rolling_qualification(session, generator=generator, now=audit_now)
+        await refresh_rolling_qualification(
+            session,
+            generator=generator,
+            now=audit_now,
+            inference_config=request.app.state.config.inference_proxy,
+        )
     except Exception:
         # The score is already committed and remains canonical. Do not report a
         # false score failure because the independent v3 dataset renderer is

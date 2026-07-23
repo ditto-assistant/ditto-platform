@@ -290,6 +290,65 @@ def _validate_request_schema(payload: dict[str, Any]) -> None:
     unknown = set(payload) - _ALLOWED_REQUEST_FIELDS
     if unknown:
         raise HTTPException(status_code=400, detail="unsupported inference parameter")
+    for name in ("temperature", "top_p"):
+        value = payload.get(name)
+        if value is not None and (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+        ):
+            raise HTTPException(status_code=400, detail=f"invalid {name}")
+    temperature = payload.get("temperature")
+    if temperature is not None and not 0 <= temperature <= 2:
+        raise HTTPException(status_code=400, detail="invalid temperature")
+    top_p = payload.get("top_p")
+    if top_p is not None and not 0 <= top_p <= 1:
+        raise HTTPException(status_code=400, detail="invalid top_p")
+    seed = payload.get("seed")
+    if seed is not None and (
+        not isinstance(seed, int)
+        or isinstance(seed, bool)
+        or not -(2**63) <= seed < 2**63
+    ):
+        raise HTTPException(status_code=400, detail="invalid seed")
+    stop = payload.get("stop")
+    if stop is not None and not (
+        isinstance(stop, str)
+        or (
+            isinstance(stop, list)
+            and 1 <= len(stop) <= 4
+            and all(isinstance(item, str) for item in stop)
+        )
+    ):
+        raise HTTPException(status_code=400, detail="invalid stop")
+    for name in ("parallel_tool_calls", "stream"):
+        if name in payload and not isinstance(payload[name], bool):
+            raise HTTPException(status_code=400, detail=f"invalid {name}")
+    n = payload.get("n", 1)
+    if not isinstance(n, int) or isinstance(n, bool) or n != 1:
+        raise HTTPException(
+            status_code=400, detail="multiple completions are not supported"
+        )
+    if "best_of" in payload:
+        raise HTTPException(status_code=400, detail="best_of is not supported")
+    tool_choice = payload.get("tool_choice")
+    if tool_choice is not None:
+        valid_named_choice = (
+            isinstance(tool_choice, dict)
+            and set(tool_choice) == {"type", "function"}
+            and tool_choice.get("type") == "function"
+            and isinstance(tool_choice.get("function"), dict)
+            and set(tool_choice["function"]) == {"name"}
+            and isinstance(tool_choice["function"].get("name"), str)
+            and bool(tool_choice["function"]["name"])
+        )
+        valid_string_choice = isinstance(tool_choice, str) and tool_choice in {
+            "none",
+            "auto",
+            "required",
+        }
+        if not valid_string_choice and not valid_named_choice:
+            raise HTTPException(status_code=400, detail="invalid tool_choice")
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="messages must be non-empty")
@@ -381,6 +440,7 @@ def _locked_upstream_payload(
     upstream.pop("best_of", None)
     upstream["model"] = model
     upstream["max_tokens"] = max_tokens
+    upstream["n"] = 1
     upstream["stream"] = False
     reasoning = benchmark_reasoning(model)
     if reasoning is None:
@@ -388,6 +448,11 @@ def _locked_upstream_payload(
     else:
         upstream["reasoning"] = reasoning
     return upstream
+
+
+def _provider_rejection_is_route_observable(status_code: int) -> bool:
+    """Exclude caller-shape failures from shared provider-route health."""
+    return status_code >= 400 and status_code not in {400, 422}
 
 
 @router.post("/exchange", response_model=InferenceExchangeResponse)
@@ -505,10 +570,6 @@ async def proxy_chat_completions(
     if not isinstance(model, str) or model not in config.allowed_models:
         raise HTTPException(status_code=403, detail="model is not permitted")
     max_tokens = _output_token_limit(payload, config.max_output_tokens)
-    if payload.get("n", 1) != 1 or payload.get("best_of", 1) != 1:
-        raise HTTPException(
-            status_code=400, detail="multiple completions are not supported"
-        )
 
     session_maker = request.app.state.session_maker
     now = datetime.now(UTC)
@@ -590,10 +651,10 @@ async def proxy_chat_completions(
             },
         )
         raw = upstream.content
-        # Any provider-side rejection is route-health evidence. In particular,
-        # authentication, balance, and policy failures must cool a route instead
-        # of leaving it looking healthy merely because they are upstream 4xxs.
-        route_observable = upstream.status_code >= 400
+        # Authentication, balance, throttling, and availability failures are
+        # route-health evidence. A 400/422 can still be an unrecognized caller
+        # request-shape error and must not let one ticket cool the shared route.
+        route_observable = _provider_rejection_is_route_observable(upstream.status_code)
         if len(raw) > config.response_body_bytes:
             raise HTTPException(
                 status_code=502, detail="provider response is too large"

@@ -17,6 +17,7 @@ from ditto.api_models.benchmark_contract import (
 )
 from ditto.api_models.validator_capabilities import ValidatorCapabilities
 from ditto.api_server.benchmark_rollout import (
+    inference_activation_requirements,
     qualification_candidate,
     refresh_rolling_qualification,
 )
@@ -342,6 +343,7 @@ async def select_active_contract(
     session: SessionDep,
     desired_version: str,
     payload: AdminActiveContractRequest,
+    request: Request = None,  # type: ignore[assignment]
 ) -> dict[str, object]:
     """Select a fully qualified superseded contract as weight authority."""
     target = _parse_desired_version(desired_version)
@@ -362,6 +364,14 @@ async def select_active_contract(
             actor=payload.actor,
             reason=payload.reason,
             now=datetime.now(UTC),
+            inference_requirements=inference_activation_requirements(
+                (
+                    request.app.state.config.inference_proxy
+                    if request is not None
+                    else None
+                ),
+                bench_version=target,
+            ),
         )
     except RolloutConflictError as exc:
         await session.rollback()
@@ -424,7 +434,14 @@ async def start_rollout(
         # admin POST exists to report whether the action succeeded, so it surfaces.
         try:
             await refresh_rolling_qualification(
-                session, generator=generator, now=datetime.now(UTC)
+                session,
+                generator=generator,
+                now=datetime.now(UTC),
+                inference_config=(
+                    request.app.state.config.inference_proxy
+                    if request is not None
+                    else None
+                ),
             )
         except DataPipelineError as exc:
             raise _generator_unavailable(target, exc) from exc
