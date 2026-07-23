@@ -80,6 +80,7 @@ from ditto.db.models import (
     Base,
     BenchmarkDataset,
     BenchmarkRollout,
+    BenchmarkRolloutMember,
     Score,
     ScreenerHeartbeat,
     ValidatorHeartbeat,
@@ -1480,9 +1481,10 @@ class TestHeartbeat:
 
         now = datetime.now(UTC)
         async with session_maker() as session, session.begin():
+            rollout_id = uuid4()
             session.add(
                 BenchmarkRollout(
-                    rollout_id=uuid4(),
+                    rollout_id=rollout_id,
                     from_version=2,
                     desired_version=3,
                     status="collecting",
@@ -2596,15 +2598,25 @@ class TestRequestJob:
             agent.screened_image_ref = f"ditto-screen/{agent_id}:latest"
             agent.screened_image_upload_id = uuid4()
             agent.screened_image_verified_at = now
+            rollout_id = uuid4()
             session.add(
                 BenchmarkRollout(
-                    rollout_id=uuid4(),
+                    rollout_id=rollout_id,
                     from_version=bench_version - 1,
                     desired_version=bench_version,
                     status="activated",
                     cohort_size=5,
                     created_at=now,
                     activated_at=now,
+                )
+            )
+            session.add(
+                BenchmarkRolloutMember(
+                    rollout_id=rollout_id,
+                    agent_id=agent_id,
+                    position=1,
+                    frozen_miner_hotkey=agent.miner_hotkey,
+                    frozen_composite=0.0,
                 )
             )
             session.add(
