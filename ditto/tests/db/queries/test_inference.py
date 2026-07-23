@@ -35,6 +35,21 @@ def _config() -> InferenceProxyConfig:
         routing_mode="adaptive",
         request_budget=2,
         token_budget=100,
+        embedding_upstream_url="https://openrouter.ai/api/v1/embeddings",
+        embedding_model="perplexity/pplx-embed-v1-0.6b",
+        embedding_profile="dittobench-v7-openrouter-pplx-embed-v1-0.6b-768-v1",
+        embedding_provider="Perplexity",
+        embedding_dimensions=768,
+        embedding_request_budget=100_000,
+        embedding_token_budget=1_000_000_000,
+        embedding_per_ticket_concurrency=1,
+        embedding_per_validator_concurrency=8,
+        embedding_global_concurrency=32,
+        embedding_per_ticket_requests_per_minute=10_000,
+        embedding_per_validator_requests_per_minute=40_000,
+        embedding_global_requests_per_minute=100_000,
+        embedding_request_body_bytes=1 << 20,
+        embedding_response_body_bytes=16 << 20,
         per_ticket_concurrency=1,
         per_validator_concurrency=1,
         global_concurrency=1,
@@ -172,6 +187,46 @@ async def test_v7_grant_requires_and_binds_one_calibrated_dynamic_route(
         assert grant.route_profile == "openrouter-route-test-v1"
         assert route.selected_ticket_count == 1
         assert route.exploration_ticket_count == 1
+        activated = await activate_inference_grant(
+            session,
+            grant_id=grant.grant_id,
+            validator_hotkey=ticket.validator_hotkey,
+            broker_public_key="broker-key",
+            now=now,
+            config=config,
+        )
+        assert activated is not None
+        bearer = activated[1]
+        nonce = uuid4()
+        assert await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=nonce,
+            bearer=bearer,
+            model=config.embedding_model,
+            token_reservation=1_000_000,
+            now=now,
+            config=config,
+            request_kind="embedding",
+        )
+        assert await finish_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=nonce,
+            generation=grant.generation,
+            status="completed",
+            prompt_tokens=250_000,
+            completion_tokens=0,
+            cost_microusd=1_000,
+            usage_available=True,
+            now=now,
+            upstream_provider=config.embedding_provider,
+        )
+        assert grant.embedding_request_count == 1
+        assert grant.embedding_tokens == 250_000
+        assert grant.embedding_cost_microusd == 1_000
+        assert grant.request_count == 0
+        assert grant.prompt_tokens == 0
 
 
 @pytest.mark.asyncio

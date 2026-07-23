@@ -1644,6 +1644,24 @@ class InferenceGrant(Base):
     )
     request_budget: Mapped[int] = mapped_column(Integer, nullable=False)
     token_budget: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    embedding_model: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding_profile: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding_provider: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding_dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding_request_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding_token_budget: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    embedding_request_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    embedding_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    embedding_cost_microusd: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    embedding_active_requests: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     request_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
@@ -1692,6 +1710,22 @@ class InferenceGrant(Base):
         ),
         CheckConstraint("request_budget > 0", name="inference_grants_request_budget"),
         CheckConstraint("token_budget > 0", name="inference_grants_token_budget"),
+        CheckConstraint(
+            "embedding_request_budget > 0",
+            name="inference_grants_embedding_request_budget",
+        ),
+        CheckConstraint(
+            "embedding_token_budget > 0",
+            name="inference_grants_embedding_token_budget",
+        ),
+        CheckConstraint(
+            "embedding_dimensions = 768",
+            name="inference_grants_embedding_dimensions",
+        ),
+        CheckConstraint(
+            "embedding_active_requests >= 0",
+            name="inference_grants_embedding_active_requests",
+        ),
         CheckConstraint(
             "active_requests >= 0", name="inference_grants_active_requests"
         ),
@@ -1879,6 +1913,7 @@ class InferenceRequest(Base):
     nonce: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, default="started")
+    request_kind: Mapped[str] = mapped_column(Text, nullable=False, default="chat")
     model: Mapped[str] = mapped_column(Text, nullable=False)
     reserved_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
     prompt_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
@@ -1904,6 +1939,10 @@ class InferenceRequest(Base):
         CheckConstraint(
             "status IN ('started', 'completed', 'failed', 'canceled')",
             name="inference_requests_status",
+        ),
+        CheckConstraint(
+            "request_kind IN ('chat', 'embedding')",
+            name="inference_requests_kind",
         ),
         CheckConstraint(
             "reserved_tokens > 0", name="inference_requests_reserved_tokens"
