@@ -12,6 +12,7 @@ each validator to one row; finalization takes the median across the rows
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from statistics import median
@@ -32,7 +33,7 @@ from ditto.db.models import (
 from ditto.db.queries.agents import get_agent_by_id
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -151,6 +152,121 @@ class LedgerRow:
     per-case breakdown. The public leaderboard exposes a **safe subset** (never
     ``per_case``, which carries the answer key); validator-gated endpoints may
     read it whole. ``None`` for rows scored before details were persisted."""
+
+
+@dataclass(frozen=True)
+class MemoryLeaderTimelinePoint:
+    """One new all-time-high finalized memory score inside a benchmark era."""
+
+    recorded_at: datetime
+    bench_version: int
+    agent_id: UUID
+    agent_name: str
+    miner_hotkey: str
+    memory_mean: float
+    composite: float
+    score_count: int
+
+
+async def list_memory_leader_timeline(
+    session: AsyncSession,
+    *,
+    bench_versions: Sequence[int],
+    not_before_by_version: Mapping[int, datetime] | None = None,
+) -> list[MemoryLeaderTimelinePoint]:
+    """Return the running best finalized miner memory score for each version.
+
+    The score table stores one row per validator, so this read first rebuilds the
+    canonical quorum median for every full-size finalized submission. It then
+    emits only records that improve the best memory median seen so far within
+    that immutable benchmark version. Optional per-version cutoffs are applied
+    before the running-high reduction so pre-release rows cannot suppress a
+    legitimate record. Third-party reference runs are not stored here and
+    cannot enter this result.
+
+    Reduction stays in Python for identical SQLite/Postgres semantics and to
+    avoid dialect-specific percentile functions. The covering timeline index
+    keeps the bounded v2-v6 source read cheap as historical score eras grow.
+    """
+
+    versions = tuple(sorted({int(version) for version in bench_versions}))
+    if not versions:
+        return []
+
+    rows = (
+        await session.execute(
+            select(
+                Score.bench_version,
+                Score.agent_id,
+                Score.validator_hotkey,
+                Score.memory_mean,
+                Score.composite,
+                Score.updated_at,
+                Agent.name,
+                Agent.miner_hotkey,
+            )
+            .join(Agent, Agent.agent_id == Score.agent_id)
+            .where(
+                Score.bench_version.in_(versions),
+                Score.n >= MIN_ELIGIBLE_CASES,
+                Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE)),
+            )
+            .order_by(
+                Score.bench_version,
+                Score.agent_id,
+                Score.updated_at,
+                Score.validator_hotkey,
+            )
+        )
+    ).all()
+
+    grouped: dict[tuple[int, UUID], list[Any]] = defaultdict(list)
+    for row in rows:
+        grouped[(int(row.bench_version), row.agent_id)].append(row)
+
+    finalized: list[MemoryLeaderTimelinePoint] = []
+    for (bench_version, agent_id), score_rows in grouped.items():
+        if len({row.validator_hotkey for row in score_rows}) < SCORING_QUORUM:
+            continue
+        memory_mean = float(median(row.memory_mean for row in score_rows))
+        composite = float(median(row.composite for row in score_rows))
+        if composite <= 0.0:
+            continue
+        finalized.append(
+            MemoryLeaderTimelinePoint(
+                # A validator may replace its row with a new run. Plot the
+                # platform-controlled acceptance time of the current canonical
+                # value, not the row's original insert time.
+                recorded_at=max(_as_utc(row.updated_at) for row in score_rows),
+                bench_version=bench_version,
+                agent_id=agent_id,
+                agent_name=str(score_rows[0].name),
+                miner_hotkey=str(score_rows[0].miner_hotkey),
+                memory_mean=memory_mean,
+                composite=composite,
+                score_count=len(score_rows),
+            )
+        )
+
+    if not_before_by_version:
+        finalized = [
+            point
+            for point in finalized
+            if point.bench_version not in not_before_by_version
+            or point.recorded_at >= _as_utc(not_before_by_version[point.bench_version])
+        ]
+
+    finalized.sort(
+        key=lambda point: (point.recorded_at, point.bench_version, str(point.agent_id))
+    )
+    best_by_version: dict[int, float] = {}
+    timeline: list[MemoryLeaderTimelinePoint] = []
+    for point in finalized:
+        if point.memory_mean <= best_by_version.get(point.bench_version, -1.0):
+            continue
+        best_by_version[point.bench_version] = point.memory_mean
+        timeline.append(point)
+    return timeline
 
 
 def _emission_owner_key() -> ColumnElement[str]:

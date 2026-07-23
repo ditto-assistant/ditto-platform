@@ -40,6 +40,7 @@ import statistics
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from datetime import time as datetime_time
 from typing import Annotated, Any, Literal, cast
 from uuid import UUID, uuid4
 
@@ -65,6 +66,9 @@ from ditto.api_models import (
     PublicBenchGlossaryResponse,
     PublicBenchIntegrity,
     PublicBenchmarkProgress,
+    PublicBenchmarkRelease,
+    PublicBenchmarkTimelinePoint,
+    PublicBenchmarkTimelineResponse,
     PublicBenchRolloutResponse,
     PublicBenchVersionDoc,
     PublicCaseResult,
@@ -158,6 +162,7 @@ from ditto.db.models import (
     Agent,
     AthReview,
     BenchmarkDataset,
+    BenchmarkRollout,
     ConfirmationScore,
     Score,
     ScreeningDispute,
@@ -195,6 +200,7 @@ from ditto.db.queries.scores import (
     get_score_counts,
     get_submission_scores,
     list_eligible_ledger,
+    list_memory_leader_timeline,
     list_miner_composite_history,
     list_provisional_ledger,
     list_public_submissions,
@@ -218,6 +224,7 @@ router = APIRouter(prefix="/public", tags=["public"])
 # The ledger only moves when a sweep records a new best score, so a short shared
 # cache is safe and shields the DB from dashboard/CDN traffic.
 _CACHE_CONTROL = "public, max-age=30"
+_TIMELINE_CACHE_CONTROL = "public, max-age=300"
 _REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 1.0
 _REGISTRATION_CACHE_TTL_SECONDS = 15.0
 _REGISTRATION_FAILURE_CACHE_TTL_SECONDS = 5.0
@@ -227,6 +234,13 @@ _TRANSCRIPT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # Historical reproduction must fail closed: only benchmark epochs whose exact
 # generator release is known get a copyable command. Add a mapping deliberately
 # when a future epoch pins its generator; never point an old score at ``latest``.
+
+
+def _timeline_utc(value: datetime) -> datetime:
+    """Normalize SQLite-naive and Postgres-aware rollout timestamps to UTC."""
+
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
 
 # The exact generator release each benchmark version's reproduction commands
 # pin. v0.8.0 is the tag cut from dittobench-datagen's anti-gaming branch at
@@ -1038,6 +1052,93 @@ def _public_koth_emissions(
             else None
         ),
         recipients=recipients,
+    )
+
+
+@router.get("/bench/timeline", response_model=PublicBenchmarkTimelineResponse)
+async def benchmark_timeline(
+    response: Response,
+    session: SessionDep,
+) -> PublicBenchmarkTimelineResponse:
+    """Running best finalized miner memory score across benchmark v2-v6."""
+
+    response.headers["Cache-Control"] = _TIMELINE_CACHE_CONTROL
+    version_docs = [
+        entry
+        for entry in bench_glossary_data.version_entries()
+        if 2 <= int(entry["version"]) <= 6
+    ]
+    rollout_rows = (
+        await session.execute(
+            select(
+                BenchmarkRollout.desired_version,
+                BenchmarkRollout.created_at,
+                BenchmarkRollout.activated_at,
+            )
+            .where(
+                BenchmarkRollout.desired_version.in_(
+                    [int(entry["version"]) for entry in version_docs]
+                ),
+                BenchmarkRollout.status == "activated",
+            )
+            .order_by(
+                BenchmarkRollout.desired_version,
+                BenchmarkRollout.created_at,
+            )
+        )
+    ).all()
+    rollout_by_version = {int(row.desired_version): row for row in rollout_rows}
+    releases = [
+        PublicBenchmarkRelease(
+            bench_version=int(entry["version"]),
+            released_at=(
+                _timeline_utc(rollout_by_version[int(entry["version"])].created_at)
+                if int(entry["version"]) in rollout_by_version
+                else datetime.combine(
+                    datetime.fromisoformat(str(entry["epoch"])).date(),
+                    datetime_time.min,
+                    tzinfo=UTC,
+                )
+            ),
+            activated_at=(
+                _timeline_utc(
+                    cast(
+                        datetime,
+                        rollout_by_version[int(entry["version"])].activated_at,
+                    )
+                )
+                if int(entry["version"]) in rollout_by_version
+                and rollout_by_version[int(entry["version"])].activated_at is not None
+                else None
+            ),
+            title=str(entry["title"]),
+        )
+        for entry in version_docs
+    ]
+    releases.sort(key=lambda entry: entry.bench_version)
+    released_at = {entry.bench_version: entry.released_at for entry in releases}
+    points = await list_memory_leader_timeline(
+        session,
+        bench_versions=[entry.bench_version for entry in releases],
+        not_before_by_version=released_at,
+    )
+    return PublicBenchmarkTimelineResponse(
+        generated_at=datetime.now(UTC),
+        score_quorum=SCORING_QUORUM,
+        releases=releases,
+        points=[
+            PublicBenchmarkTimelinePoint(
+                recorded_at=point.recorded_at,
+                bench_version=point.bench_version,
+                agent_id=point.agent_id,
+                agent_name=point.agent_name,
+                miner_hotkey=point.miner_hotkey,
+                memory_mean=point.memory_mean,
+                composite=point.composite,
+                score_count=point.score_count,
+            )
+            for point in points
+        ],
     )
 
 
