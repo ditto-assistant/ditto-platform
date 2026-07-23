@@ -2550,7 +2550,7 @@
           <li><b>Scores compare only within one benchmark version.</b> A <code>bench_version</code> is an immutable generation contract: for a given seed it emits the same bytes forever and grades them the same way forever, which is what makes an old score auditable by anyone holding the seed. A correction to grading therefore cannot be applied to an existing version. It ships as a new one. Two composites from different versions are two different measurements, and the board never ranks them against each other.</li>
           <li><b>What v<span class="bv-desired">–</span> is.</b> <span id="bs-v4-copy">Version 4 is not a new benchmark. It is version 3 with a set of scoring false positives corrected: cases where the machinery penalised an agent for doing the right thing. The suite it administers is the same suite; what changed is that several ways of being <i>correct</i> no longer lose points. A leaking canary is charged once instead of twice, delete instructions are graded as acknowledgements rather than on whether they echoed a noun phrase, decimal durations parse ("1.5 years" was read as 15), and "used to" is treated as a temporal marker rather than a cessation phrase. Scores rise where an agent was being penalised for correct behaviour; the tests themselves are unchanged.</span></li>
           <li><b>How emissions work.</b> The KOTH fold pays a champion and a ranked tail: the champion takes <span id="ex-champion-share">a fixed share</span> of the miner pool, and up to <span id="ex-tail-size">a fixed number of</span> runners-up by composite receive descending shares of <span id="ex-tail-share">the remainder</span>. Only finalized, full-benchmark, currently-registered entries with a positive composite are eligible. The live values are shown on the leaderboard's emissions strip.</li>
-          <li><b>How the crown changes hands.</b> The fold runs in <b>first-seen</b> order, so the incumbent keeps the crown unless a challenger clearly beats it. Being marginally ahead on one dataset is not enough. A challenger dethrones only if its lead exceeds the <b>indifference band</b>, which is the larger of the fixed <span id="ex-margin">composite-point hysteresis</span> and the statistical band <code><span id="ex-dethrone-z">dethrone_z</span> × √(SE<sub>challenger</sub>² + SE<sub>champion</sub>²)</code> when both sides carry a standard error. A lead inside the band is not thrown away: both agents are re-scored on <b>shared confirmation seeds</b> and the next fold decides on the paired comparison, where per-dataset difficulty cancels. Dataset luck never decides emissions.</li>
+          <li><b>How the crown changes hands.</b> The fold runs in <b>first-seen</b> order, so the incumbent keeps the crown unless a challenger clearly beats it. Being marginally ahead on one dataset is not enough. A challenger dethrones only if its lead exceeds the <b>indifference band</b>, which starts as the larger of the fixed <span id="ex-margin">composite-point hysteresis</span> and the statistical band <code><span id="ex-dethrone-z">dethrone_z</span> × √(SE<sub>challenger</sub>² + SE<sub>champion</sub>²)</code> when both sides carry a standard error. From Bench v6 onward, the whole band shrinks smoothly above a 0.60 incumbent score so the crown remains contestable near the benchmark ceiling. A lead inside the band is not thrown away: both agents are re-scored on <b>shared confirmation seeds</b> and the next fold decides on the paired comparison, where per-dataset difficulty cancels. Dataset luck never decides emissions.</li>
           <li><b>When weights move to a new version.</b> The whole ledger sits on one version at a time. Weights stay on the <b>active</b> version until at least <span class="quorum-needed">the required number of</span> agents hold a complete ranked quorum at the version being rolled out, and then the entire ledger flips at once. Ranking a partly-migrated pool would mix two incomparable scales; flipping early would leave the emission set (champion plus tail) short of recipients. Live progress is on the leaderboard's rollout strip.</li>
         </ul></div>
       </details>
@@ -3066,6 +3066,20 @@
       return num(margin) + " composite points";
     }
 
+    function dethroneBandScale(emissions, championEntry, championComposite, challengerEntry) {
+      var minVersion = Number(emissions && emissions.band_decay_min_bench_version);
+      var start = Number(emissions && emissions.band_decay_start_composite);
+      var rate = Number(emissions && emissions.band_decay_rate);
+      var championVersion = Number(championEntry && championEntry.bench_version);
+      var challengerVersion = Number(challengerEntry && challengerEntry.bench_version);
+      var version = Number.isFinite(challengerVersion)
+        ? Math.min(championVersion, challengerVersion) : championVersion;
+      if (!Number.isFinite(version) || !Number.isFinite(minVersion) || version < minVersion ||
+          !Number.isFinite(start) || !Number.isFinite(rate) || rate <= 0) return 1;
+      var boundedChampion = Math.min(Math.max(championComposite, start), 1);
+      return Math.exp(-rate * (boundedChampion - start));
+    }
+
     // "Beat this to contend." The validator's rule (ditto/validator/weights.py
     // _beats) is: a challenger dethrones only if its lead over the champion
     // exceeds the indifference band, and the band is the LARGER of the flat
@@ -3090,17 +3104,20 @@
         el.textContent = "";
         return;
       }
-      var floor = champComposite + margin;
+      var scale = dethroneBandScale(emissions, championEntry, champComposite);
+      var effectiveMargin = margin * scale;
+      var floor = champComposite + effectiveMargin;
       var z = emissions.dethrone_z;
       var band = Number.isFinite(z) && z > 0
-        ? " The band is the larger of that margin and " + num(z) +
-          " × √(challenger SE² + champion SE²), so a challenger with noisier scores has to clear more than " +
+        ? " The band is " + (scale < 1 ? num(scale) + "× the larger" : "the larger") +
+          " of that base margin and " + num(z) +
+          " × √(challenger SE² + champion SE²), so a challenger with noisier scores may have to clear more than " +
           fx(floor) + ", this is a floor, not a guarantee."
         : " This is a floor: the fold takes the larger of the margin and the statistical uncertainty band.";
       el.innerHTML =
         '<b>Beat this to contend:</b> <span class="beat">' + esc(fx(floor)) + '</span> composite. ' +
         esc("The champion holds " + fx(champComposite) + ", and a challenger must exceed it by more than the " +
-          marginText(margin) + " fixed hysteresis." + band +
+          marginText(effectiveMargin) + (scale < 1 ? " effective v6+ hysteresis." : " fixed hysteresis.") + band +
           " A lead inside the band is not rejected: both agents are re-scored on shared confirmation seeds and the next fold decides on the paired comparison.");
       el.classList.add("show");
     }
@@ -3969,6 +3986,16 @@
         // reports (margin, dethrone_z, champion_share, rank_shares, tail_size). Hardcoding
         // any of them lets the copy drift from the rule actually being applied.
         var marginLabel = marginText(emissions.margin);
+        var bandScale = dethroneBandScale(
+          emissions,
+          championEntry,
+          championEntry && displayComposite(championEntry),
+          rawLeaderEntry
+        );
+        var effectiveBandNote = bandScale < 1
+          ? " Bench v" + Number(championEntry && championEntry.bench_version || 0) +
+            " applies the high-score curve, scaling the whole band to " + pct(bandScale) + " of its base width."
+          : "";
         var decision = emissions.raw_leader_decision;
         if (decision && rawLeaderEntry) {
           var method = decision.method === "paired" ? "paired-seed uncertainty band" :
@@ -3979,11 +4006,12 @@
           document.getElementById("emissions-reason").textContent =
             "Raw #1 " + agentName(rawLeaderEntry.agent_name) + " leads by " + fx(decision.challenger_lead) +
             " but must lead by more than " + fx(decision.required_lead) + " to dethrone the older incumbent. " +
-            "The fold uses the larger of the " + marginLabel + " protection margin and the " + method + "." + contestNote;
+            "The fold starts with the larger of the " + marginLabel + " protection margin and the " + method +
+            ", then applies the versioned band curve." + effectiveBandNote + contestNote;
         } else {
           document.getElementById("emissions-reason").textContent =
             "The raw score leader also wins the first-seen KOTH fold after the " + marginLabel +
-            " protection margin and statistical band are applied.";
+            " protection margin, statistical band, and versioned high-score curve are applied.";
         }
         renderDethroneFloor(emissions, championEntry);
         var tails = (emissions.recipients || []).filter(function (recipient) { return recipient.role === "tail"; });

@@ -690,12 +690,27 @@ class PublicKothEmissions(BaseModel):
             ge=0.0,
             le=1.0,
             description=(
-                "Fixed composite-point lead required before uncertainty can permit "
-                "a dethrone."
+                "Base composite-point lead before versioned high-score band scaling."
             ),
         ),
     ]
     dethrone_z: Annotated[float, Field(ge=0.0)]
+    band_decay_min_bench_version: Annotated[
+        int,
+        Field(ge=1, description="First benchmark version using high-score decay."),
+    ]
+    band_decay_start_composite: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Incumbent composite above which the band begins shrinking.",
+        ),
+    ]
+    band_decay_rate: Annotated[
+        float,
+        Field(gt=0.0, description="Exponential high-score band decay rate."),
+    ]
     champion_share: Annotated[float, Field(gt=0.0, le=1.0)]
     rank_shares: tuple[Annotated[float, Field(gt=0.0, le=1.0)], ...]
     tail_size: Annotated[int, Field(ge=0)]

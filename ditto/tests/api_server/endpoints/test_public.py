@@ -591,6 +591,9 @@ class TestPublicLeaderboard:
         assert body["emissions"]["champion_agent_id"] == incumbent_id
         assert body["emissions"]["margin"] == pytest.approx(0.007)
         assert body["emissions"]["dethrone_z"] == pytest.approx(1.64)
+        assert body["emissions"]["band_decay_min_bench_version"] == 6
+        assert body["emissions"]["band_decay_start_composite"] == pytest.approx(0.60)
+        assert body["emissions"]["band_decay_rate"] == pytest.approx(2.0)
         assert body["emissions"]["rank_shares"] == pytest.approx(
             [0.65, 0.14, 0.10, 0.07, 0.04]
         )

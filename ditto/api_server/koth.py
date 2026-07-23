@@ -18,6 +18,11 @@ from uuid import UUID
 
 # Frozen consensus constants from ditto-subnet/ditto/validator/config.py.
 KOTH_MARGIN = 0.007
+# Keep these values byte-for-byte aligned with ditto-subnet's consensus fold.
+# Bench v6+ shrinks the whole band; legacy/mixed comparisons remain unchanged.
+KOTH_BAND_DECAY_MIN_BENCH_VERSION = 6
+KOTH_BAND_DECAY_START_COMPOSITE = 0.60
+KOTH_BAND_DECAY_RATE = 2.0
 KOTH_TAIL_SIZE = 4
 KOTH_RANK_SHARES = (0.65, 0.14, 0.10, 0.07, 0.04)
 KOTH_CHAMPION_SHARE = KOTH_RANK_SHARES[0]
@@ -46,6 +51,7 @@ class KothEntry:
     composite: float
     first_seen: datetime
     raw_rank: int
+    bench_version: int = 1
     composite_stderr: float | None = None
     confirmation_composites: tuple[float, ...] | None = None
     confirmation_seeds: tuple[int, ...] | None = None
@@ -69,6 +75,21 @@ class KothProjection:
     tail: tuple[KothEntry, ...]
     raw_leader: KothEntry
     raw_leader_decision: DethroneDecision | None
+
+
+def _dethrone_band_scale(
+    challenger: KothEntry, champion: KothEntry, champion_composite: float
+) -> float:
+    """Mirror the validator's versioned high-score indifference-band decay."""
+    comparison_version = min(challenger.bench_version, champion.bench_version)
+    if comparison_version < KOTH_BAND_DECAY_MIN_BENCH_VERSION:
+        return 1.0
+    bounded_champion = min(
+        max(champion_composite, KOTH_BAND_DECAY_START_COMPOSITE), 1.0
+    )
+    return math.exp(
+        -KOTH_BAND_DECAY_RATE * (bounded_champion - KOTH_BAND_DECAY_START_COMPOSITE)
+    )
 
 
 def emission_set(projection: KothProjection | None) -> tuple[KothEntry, ...]:
@@ -249,7 +270,9 @@ def _dethrone_decision(challenger: KothEntry, champion: KothEntry) -> DethroneDe
         lead, champion_reference, standard_error = paired
         margin_lead = KOTH_MARGIN
         paired_statistical_lead = KOTH_DETHRONE_Z * standard_error
-        required = max(margin_lead, paired_statistical_lead)
+        required = max(margin_lead, paired_statistical_lead) * _dethrone_band_scale(
+            challenger, champion, champion_reference
+        )
         return DethroneDecision(
             challenger_lead=lead,
             required_lead=required,
@@ -275,7 +298,7 @@ def _dethrone_decision(challenger: KothEntry, champion: KothEntry) -> DethroneDe
     required = max(
         margin_lead,
         statistical_lead if statistical_lead is not None else margin_lead,
-    )
+    ) * _dethrone_band_scale(challenger, champion, champion_composite)
     return DethroneDecision(
         challenger_lead=lead,
         required_lead=required,
