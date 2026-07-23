@@ -436,6 +436,40 @@ class TestDashboard:
         # The kicker above the title was dropped.
         assert "Reference only · no emissions" not in body
 
+    async def test_overview_pairs_the_chart_with_a_filterable_board_rail(
+        self,
+    ) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+
+        overview_start = body.index(
+            '<section class="page active" data-page="overview">'
+        )
+        split_start = body.index('<div class="overview-split">')
+        rail_start = body.index('<aside class="board-rail"')
+        full_start = body.index('<details class="board-full">')
+        # Chart and rail share the split; the wide table follows it, collapsed.
+        assert overview_start < split_start < rail_start < full_start
+        assert '<div class="board" tabindex="0"' in body
+        assert body.index('<div class="board" tabindex="0"') > full_start
+
+        # The rail carries its own filter, and the filter drives both views.
+        assert 'id="board-filter"' in body
+        assert "function boardMatches(entry, needle)" in body
+        assert "boardView.query.trim().toLowerCase()" in body
+        assert "renderBoardRail(pageRows, rows, pageCount, needle)" in body
+        # A narrowed list rarely contains the page you were on.
+        assert "boardView.page = 1;" in body
+
+        # Rail rows resolve against lastEntries, the array openModal indexes.
+        assert 'data-rail-i="' in body
+        assert 'openModal(+hit.getAttribute("data-rail-i"))' in body
+        assert "lastEntries.indexOf(e)" in body
+
+        # The champion is a card, and only when the list is unfiltered page one.
+        assert 'class="rail-leader"' in body
+        assert "var champion = !needle && boardView.page === 1" in body
+
     async def test_memory_timeline_plots_the_field_and_crowns_the_champion(
         self,
     ) -> None:
