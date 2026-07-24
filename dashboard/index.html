@@ -2291,15 +2291,16 @@
     .champion-meta b { color: var(--text); font-weight: 700; }
 
     .snapshot { margin: 14px 0; }
-    .stat-ledger { margin: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-elev); overflow: hidden; }
-    .ledger-line { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding: 9px 16px; }
-    .ledger-line + .ledger-line { border-top: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
-    .ledger-label { color: var(--text-dim); font: 700 11px/1.4 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
-    .ledger-value { margin: 0; min-width: 0; font-family: var(--display); font-size: 19px; line-height: 1.2; font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere; }
-    .stat-ledger.secondary { margin-top: 10px; background: color-mix(in oklab, var(--bg-elev) 45%, transparent); }
-    .stat-ledger.secondary .ledger-line { padding-block: 7px; }
-    .stat-ledger.secondary .ledger-label { color: var(--text-faint); }
-    .stat-ledger.secondary .ledger-value { font-size: 14.5px; color: var(--text-dim); }
+    /* Stat tiles, not ledger rows: in the wide rail a label...value row leaves
+       a chasm between the pair. Same shared-1px-rule tile grid as the brand's
+       bench board — label on top, serif numeral under it. */
+    .stat-ledger { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; margin: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--border); overflow: hidden; }
+    .ledger-line { display: block; min-width: 0; padding: 11px 14px; background: var(--bg-elev); }
+    .ledger-label { display: block; color: var(--text-dim); font: 700 11px/1.4 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+    .ledger-value { margin: 4px 0 0; min-width: 0; font-family: var(--display); font-size: clamp(19px, 1.5vw, 24px); line-height: 1.1; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    @media (max-width: 720px) {
+      .stat-ledger { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
   </style>
 </head>
 <body>
@@ -2407,8 +2408,6 @@
         <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="All validator score records stored by the platform, including the independent scores that make up each finalized result.">Total scores</span></dt><dd class="ledger-value" id="h-scores">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Validators currently reporting heartbeat-capable software to the platform.">Validators</span></dt><dd class="ledger-value" id="h-validators">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label">Scored agents</dt><dd class="ledger-value" id="h-agents">–</dd></div>
-      </dl>
-      <dl class="stat-ledger secondary" aria-label="Additional snapshot stats">
         <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Distinct miners who have submitted to Subnet 118.">Miners total</span></dt><dd class="ledger-value" id="h-miners">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" id="c-baseline-tip" data-tooltip="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 25 seeds at run_size=full. Source: dittobench-api docs/BASELINES.md.">Reference baseline</span></dt><dd class="ledger-value" id="c-baseline">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top gap</span></dt><dd class="ledger-value" id="c-spread">–</dd></div>
