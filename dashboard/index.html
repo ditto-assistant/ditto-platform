@@ -258,7 +258,12 @@
     /* The board's filter row reuses the submissions pills (.activity-filter)
        and its band treatment, centered so it brackets the table with the pager.
        The toolbar carries the band so the tabs stay a clean pill group and the
-       text filter can sit beside them on the same rule. */
+       text filter can sit beside them on the same rule.
+       Sticky-left: the toolbar and pagers are block children of the
+       horizontally scrolling .board; without this they end at the first
+       viewport-width and scrolling right reveals a bare patch beside them
+       (same trick as td.empty .empty-msg). */
+    .board-toolbar, .board .pager { position: sticky; left: 0; }
     .board-toolbar { display: flex; align-items: center; justify-content: center; gap: 14px; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--border); background: color-mix(in oklab, var(--bg-elev-2) 38%, var(--bg-elev)); }
     .board-tabs { justify-content: center; }
     /* Narrowing the board in place is a different job from the shell's global
