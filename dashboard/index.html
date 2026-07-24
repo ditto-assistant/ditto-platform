@@ -211,6 +211,10 @@
     .emissions-summary { min-width: 0; flex: 1 1 auto; }
     .emissions-title { color: var(--text); font-size: 13px; font-weight: 750; }
     .emissions-title .entity-link { color: inherit; }
+    .emissions-why { margin-top: 4px; }
+    .emissions-why summary { cursor: pointer; color: var(--text-dim); font: 700 11px/1.5 var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+    .emissions-why summary:hover, .emissions-why summary:focus-visible { color: var(--text); }
+    .emissions-why[open] summary { margin-bottom: 2px; }
     .emissions-reason { margin-top: 3px; color: var(--text-dim); font-size: 12px; line-height: 1.5; }
     .emissions-threshold { display: none; margin-top: 7px; padding-top: 7px; border-top: 1px dashed var(--border); color: var(--text-dim); font-size: 12px; line-height: 1.5; }
     .emissions-threshold.show { display: block; }
@@ -227,7 +231,7 @@
     .chain-observation.show { display: flex; }
     .chain-badge {
       flex: 0 0 auto; margin-top: 1px; padding: 2px 6px; border: 1px solid color-mix(in oklab, var(--accent) 38%, var(--border));
-      border-radius: 999px; color: var(--accent); font: 700 9px/1.35 var(--mono); letter-spacing: .05em; text-transform: uppercase;
+      border-radius: 999px; color: var(--accent); font: 700 11px/1.35 var(--mono); letter-spacing: .05em; text-transform: uppercase;
     }
     .chain-weight-note { display: block; margin-top: 4px; color: var(--text-faint); font: 9.5px/1.35 var(--mono); white-space: nowrap; }
 
@@ -253,10 +257,18 @@
 
     /* The board's filter row reuses the submissions pills (.activity-filter)
        and its band treatment, centered so it brackets the table with the pager. */
+    /* Sticky-left: the tab strip and pagers are block children of the
+       horizontally scrolling .board, so without this they end at the first
+       viewport-width and scrolling right reveals a bare patch beside them
+       (same trick as td.empty .empty-msg). */
+    .board-tabs, .board .pager { position: sticky; left: 0; }
     .board-tabs { justify-content: center; padding: 12px 14px; border-bottom: 1px solid var(--border); background: color-mix(in oklab, var(--bg-elev-2) 38%, var(--bg-elev)); }
-    .leaderboard-version-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
+    .leaderboard-version-switch { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
     .leaderboard-version-switch .context { color: var(--text-dim); font-size: 12px; }
-    .leaderboard-version-switch .activity-filter-list { flex: 0 0 auto; }
+    /* One pill per shipped bench version: the list must be allowed to shrink
+       and wrap, or it pushes the row past the column and the page gains a
+       horizontal scrollbar. */
+    .leaderboard-version-switch .activity-filter-list { flex: 0 1 auto; min-width: 0; justify-content: flex-end; }
     @media (max-width: 640px) {
       .leaderboard-version-switch { align-items: flex-start; flex-direction: column; }
     }
@@ -1034,8 +1046,14 @@
     /* Shared CSS tooltip bubble: keyboard- and touch-accessible (reveals on
        :focus-visible), used by the circular .retry-info marker and the
        dotted-underline .tip terms on stat cards and table headers. */
+    /* Chips (gate/token/rollout/quorum/prov/rankmove) share the bubble via
+       .tip-chip: hover bubble for pointer users, aria-describedby text for
+       screen readers (wired by wireTips). They stay out of the tab order —
+       the row itself opens the full breakdown for keyboard users. */
+    .tip-chip { position: relative; cursor: help; }
     .retry-info::after,
-    .tip::after {
+    .tip::after,
+    .tip-chip::after {
       content: attr(data-tooltip);
       /* display:none until revealed (not just opacity:0): a hidden absolutely
          positioned box still contributes to its scroll container's scrollable
@@ -1059,11 +1077,12 @@
     /* The marker's bubble sits above it; the .tip bubble drops below the term so
        it is never clipped by the table's horizontal-scroll container. */
     .retry-info::after { left: -88px; bottom: calc(100% + 8px); }
-    .tip::after { left: 0; top: calc(100% + 8px); }
+    .tip::after, .tip-chip::after { left: 0; top: calc(100% + 8px); }
     .retry-info:hover::after,
     .retry-info:focus-visible::after,
-    .tip:hover::after,
-    .tip:focus-visible::after {
+    .tip[data-tooltip]:hover::after,
+    .tip[data-tooltip]:focus-visible::after,
+    .tip-chip[data-tooltip]:hover::after {
       display: block;
     }
     .retry-info:focus-visible,
@@ -1096,7 +1115,8 @@
       .run-telemetry-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .screening-dispute-wallets { grid-template-columns: 1fr; }
       .retry-info::after,
-      .tip::after { width: min(240px, calc(100vw - 72px)); }
+      .tip::after,
+      .tip-chip::after { width: min(240px, calc(100vw - 72px)); }
       /* In the 2-col mobile stat grid the hidden "Subnet snapshot" h2 is child 1
          and the primary card (child 2) owns its full row, so right-column cards
          are the even children >= 4. Left-anchored bubbles on those cards run off
@@ -1160,6 +1180,11 @@
       --ref-hermes: oklch(52% 0.17 75);
       --ref-openclaw: oklch(52% 0.17 270);
       --radius: 8px;
+      /* Ground-grid rule strength: how much of --text mixes into the body's
+         ruled lines (vertical, horizontal). Dark surfaces compress faint light
+         rules, so the night block raises these to stay equally noticeable. */
+      --grid-rule-v: 5%;
+      --grid-rule-h: 4%;
       /* Exponential ease-out only: decisive, no bounce. */
       --ease-out-quart: cubic-bezier(.25, 1, .5, 1);
       --ease-out-expo: cubic-bezier(.16, 1, .3, 1);
@@ -1230,6 +1255,8 @@
       --era-to: oklch(83% 0.105 340);
       --ref-hermes: oklch(66% 0.17 75);
       --ref-openclaw: oklch(66% 0.17 270);
+      --grid-rule-v: 8%;
+      --grid-rule-h: 6.5%;
     }
 
     html { color-scheme: light; background: var(--bg); }
@@ -1248,10 +1275,10 @@
          raw 16% is right again. */
       --wash-x: calc(240px + 16%);
       background:
-        linear-gradient(90deg, color-mix(in oklch, var(--text) 5%, transparent) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
-        linear-gradient(0deg, color-mix(in oklch, var(--text) 4%, transparent) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
-        radial-gradient(circle at var(--wash-x) 14%, color-mix(in oklch, var(--good) 20%, transparent), transparent 30rem),
-        radial-gradient(circle at 90% 12%, color-mix(in oklch, var(--gold) 28%, transparent), transparent 30rem),
+        linear-gradient(90deg, color-mix(in oklch, var(--text) var(--grid-rule-v), transparent) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
+        linear-gradient(0deg, color-mix(in oklch, var(--text) var(--grid-rule-h), transparent) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
+        radial-gradient(circle at var(--wash-x) 62%, color-mix(in oklch, var(--good) 20%, transparent), transparent 30rem),
+        radial-gradient(circle at 90% 60%, color-mix(in oklch, var(--gold) 28%, transparent), transparent 30rem),
         var(--bg);
       color: var(--text);
       font-family: var(--sans);
@@ -1700,7 +1727,7 @@
     }
     .board:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
     table { min-width: 850px; }
-    thead th { padding: 11px 14px; border-color: var(--border); background: var(--bg-elev-2); color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em; }
+    thead th { padding: 11px 14px; border-color: var(--border); background: var(--bg-elev-2); color: var(--text-dim); font-family: var(--mono); font-size: 11px; letter-spacing: .06em; }
     tbody td { padding: 11px 14px; border-color: color-mix(in oklch, var(--border) 72%, transparent); font-size: 13px; }
     tbody tr:hover,
     tbody tr:focus-visible { background: color-mix(in oklch, var(--accent) 6%, var(--bg-elev)); }
@@ -2221,6 +2248,121 @@
       .ath-review-head { align-items: flex-start; flex-direction: column; }
       .ath-hold-reason { grid-template-columns: 1fr; gap: 4px; }
     }
+
+    /* ── Overview split ──────────────────────────────────────
+       On wide screens the memory timeline + snapshot cards live in a sticky,
+       independently scrollable rail on the left; the leaderboard owns the
+       remaining width. Below the breakpoint both wrappers are inert blocks,
+       so the page stacks exactly as it did before the split. */
+    @media (min-width: 1181px) {
+      .overview-split { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 26px; align-items: start; }
+      /* The wrap's 72px bottom padding serves scrolling pages; the overview is
+         a fixed two-pane shell, so reclaim it for the columns. (If :has is
+         unsupported the columns just sit taller and sticky catches the rest.) */
+      .wrap:has(.page.active[data-page="overview"]) { padding-bottom: 20px; }
+      .overview-rail {
+        /* Budget the page's full vertical chrome (~108px resting offset above:
+           wrap padding + page header; 72px wrap padding below) so both columns
+           fit the viewport at rest and the page itself has nothing to scroll —
+           each column scrolls internally instead. Sticky remains only as a
+           fallback for states that grow the page (banner, wrapped header). */
+        position: sticky; top: 18px; max-height: calc(100vh - 136px);
+        overflow-y: auto; overscroll-behavior: contain;
+        scrollbar-width: thin; padding-right: 6px;
+      }
+      .overview-rail .harness-comparison { margin-top: 0; }
+      /* The board column scrolls the same way as the rail: two independent
+         viewport-height columns. Bare scroll container — no surface or frame
+         of its own; the champion box, strips, and board carry their own. */
+      .overview-main {
+        position: sticky; top: 18px; max-height: calc(100vh - 136px);
+        overflow-y: auto; overscroll-behavior: contain;
+        scrollbar-width: thin; padding-right: 6px;
+      }
+      .overview-main > :first-child { margin-top: 0; }
+      /* The board lives at roughly half the window in the split, so window-
+         width column hiding never fires on desktop. Mirror the responsive
+         semantics against the board's effective width instead: mid split
+         drops the same columns a mid window would; the secondary metric
+         columns return once the split gives the board a full-page's room.
+         The emissions strip stacks for the same reason. */
+      .overview-split .hide-md { display: none; }
+      .overview-split .emissions-strip.show { display: block; }
+      .overview-split .emissions-recipients { margin-top: 8px; text-align: left; }
+    }
+    @media (min-width: 1181px) and (max-width: 1919px) {
+      .overview-split .hide-sm { display: none; }
+      /* Every column except Model stays visible in the split (nth-child
+         selectors: Model at 4 is display:none but still counts). */
+      /* The remaining four columns must actually fit the half-width pane.
+         table-layout: fixed makes the table exactly container width — columns
+         obey the widths below and content ellipsizes/wraps inside its cell
+         instead of forcing a horizontal scroll. Cell min-widths that assume
+         the full-page table (identity 190px, metric 150px) are relaxed. */
+      .overview-split #board { table-layout: fixed; }
+      /* Tool and Memory stay visible at every split width. Percentage columns
+         that sum to 100: with table-layout fixed this is fully deterministic
+         at every pane width — no auto column to pool slack, no pixel sums to
+         overflow. Bars degrade to slivers before data ever disappears. */
+      .overview-split #board th[data-sort="tool"],
+      .overview-split #board th[data-sort="memory"],
+      .overview-split #board th[data-sort="latency"],
+      .overview-split #board th[data-sort="first_seen"],
+      .overview-split #board td.hide-sm:nth-child(6),
+      .overview-split #board td.hide-sm:nth-child(7),
+      .overview-split #board td.hide-sm:nth-child(8),
+      .overview-split #board td.hide-sm:nth-child(9) { display: table-cell; }
+      .overview-split #board th[data-sort="rank"] { width: 7% !important; }
+      .overview-split #board th[data-sort="name"] { width: 22% !important; }
+      .overview-split #board thead th:nth-child(3) { width: 14% !important; }
+      .overview-split #board th[data-sort="composite"] { width: 20% !important; }
+      .overview-split #board th[data-sort="tool"],
+      .overview-split #board th[data-sort="memory"] { width: 10.5% !important; }
+      .overview-split #board th[data-sort="latency"],
+      .overview-split #board th[data-sort="first_seen"] { width: 8% !important; }
+      .overview-split #board th, .overview-split #board td { padding-inline: 9px; }
+      .overview-split #board td { overflow: hidden; }
+      .overview-split #board .winner-identity { min-width: 0; }
+      .overview-split #board .metric { min-width: 0; }
+      .overview-split #board .chain-weight-note { white-space: normal; }
+      .overview-split #board .emission-badge { white-space: normal; }
+      /* The half-width pane can't fit context text + one pill per bench
+         version side by side; stack them like the mobile layout does. */
+      .overview-split .leaderboard-version-switch { align-items: flex-start; flex-direction: column; gap: 8px; }
+      .overview-split .leaderboard-version-switch .activity-filter-list { justify-content: flex-start; }
+    }
+
+    /* ── Overview: champion box + snapshot ledger ────────────
+       The reigning-KOTH box heads the leaderboard column; the snapshot ledger
+       replaces the card grid in the rail. Both are ruled-frame instruments:
+       mono-caps labels, display-serif values, 1px rules — no card chrome. */
+    /* The page's one gold moment: the same champion grammar the timeline
+       crown plate and rank-one rows already own (gold frame, ♛, gold-toned
+       numeral via the contrast-validated rank-one token), at full strength. */
+    .champion-box { margin: 0 0 18px; border: 1px solid color-mix(in oklch, var(--gold) 45%, var(--border)); border-radius: 4px; background: color-mix(in oklch, var(--gold) 5%, var(--bg-elev)); overflow: hidden; }
+    .champion-kicker { padding: 10px 16px; border-bottom: 1px solid color-mix(in oklch, var(--gold) 35%, var(--border)); background: color-mix(in oklch, var(--gold) 12%, var(--bg-elev)); color: var(--rank-one-text); font: 700 11px/1 var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+    .champion-kicker .crown { margin-right: 7px; font-size: 12px; }
+    .champion-body { padding: 16px 16px 14px; }
+    .champion-state { color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
+    .champion-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 18px; flex-wrap: wrap; }
+    .champion-score-label { margin-right: 9px; color: var(--text-dim); font: 700 11px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+    .champion-name { font-family: var(--display); font-size: clamp(22px, 2.2vw, 30px); line-height: 1.1; min-width: 0; overflow-wrap: anywhere; }
+    .champion-name .entity-link { color: inherit; }
+    .champion-score { font-family: var(--display); font-size: clamp(32px, 3vw, 44px); line-height: 1; font-variant-numeric: tabular-nums; color: var(--rank-one-text); }
+    .champion-meta { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--text-dim); font: 11px/1.6 var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+    .champion-meta b { color: var(--text); font-weight: 700; }
+
+    .snapshot { margin: 14px 0; }
+    /* Stat tiles, not ledger rows: in the wide rail a label...value row leaves
+       a chasm between the pair. Same shared-1px-rule tile grid as the brand's
+       bench board — label on top, serif numeral under it. */
+    .stat-ledger { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; margin: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--border); overflow: hidden; }
+    .ledger-line { display: block; min-width: 0; padding: 11px 14px; background: var(--bg-elev); }
+    .ledger-label { display: block; color: var(--text-dim); font: 700 11px/1.4 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+    .ledger-value { margin: 4px 0 0; min-width: 0; font-family: var(--display); font-size: clamp(19px, 1.5vw, 24px); line-height: 1.1; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    @media (max-width: 720px) {
+      .stat-ledger { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
   </style>
 </head>
 <body>
@@ -2298,6 +2440,8 @@
     </div>
 
     <section class="page active" data-page="overview">
+    <div class="overview-split">
+    <aside class="overview-rail" tabindex="0" role="region" aria-label="Memory timeline and subnet snapshot, scrolls separately from the leaderboard">
       <section class="harness-comparison" aria-labelledby="harness-comparison-title">
         <div class="harness-comparison-head">
           <div class="harness-comparison-title">
@@ -2317,23 +2461,33 @@
         </div>
       </section>
 
-    <section class="cards" id="cards" aria-labelledby="snapshot-title">
+    <section class="snapshot" id="cards" aria-labelledby="snapshot-title">
       <h2 class="visually-hidden" id="snapshot-title">Subnet snapshot</h2>
-      <div class="card primary"><div class="label">Miners total</div><div class="value" id="h-miners">–</div><div class="context">Distinct miners who have submitted to Subnet 118.</div></div>
-      <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="Distinct miners with at least one scored run on the board (provisional runs included).">Miners Scored</span></div><div class="value" id="c-miners">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="The highest composite among ranked full-benchmark runs. Start with 0.5 × tool mean + 0.5 × memory mean, apply the benchmark quality gates, then apply the v5 token-efficiency multiplier. Token efficiency can remove at most 10%. Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" id="c-baseline-tip" data-tooltip="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 25 seeds at run_size=full. Source: dittobench-api docs/BASELINES.md.">Reference Baseline</span></div><div class="value" id="c-baseline">–</div></div>
-      <div class="card"><div class="label"><span class="tip" tabindex="0" data-tooltip="All validator score records stored by the platform, including the independent scores that make up each finalized result.">Total scores</span></div><div class="value" id="h-scores">–</div></div>
-      <div class="card"><div class="label"><span class="tip" tabindex="0" data-tooltip="Validators currently reporting heartbeat-capable software to the platform.">Validators</span></div><div class="value" id="h-validators">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
-      <div class="card"><div class="label">Scored agents</div><div class="value" id="h-agents">–</div></div>
-      <div class="card"><div class="label">Last scored</div><div class="value" id="h-last">–</div></div>
+      <dl class="stat-ledger">
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Distinct miners with at least one scored run on the board (provisional runs included).">Miners scored</span></dt><dd class="ledger-value" id="c-miners">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="The highest composite among ranked full-benchmark runs. Start with 0.5 × tool mean + 0.5 × memory mean, apply the benchmark quality gates, then apply the v5 token-efficiency multiplier. Token efficiency can remove at most 10%. Provisional runs are excluded.">Top composite</span></dt><dd class="ledger-value" id="c-top">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median composite</span></dt><dd class="ledger-value" id="c-median">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="All validator score records stored by the platform, including the independent scores that make up each finalized result.">Total scores</span></dt><dd class="ledger-value" id="h-scores">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Validators currently reporting heartbeat-capable software to the platform.">Validators</span></dt><dd class="ledger-value" id="h-validators">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label">Scored agents</dt><dd class="ledger-value" id="h-agents">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Distinct miners who have submitted to Subnet 118.">Miners total</span></dt><dd class="ledger-value" id="h-miners">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" id="c-baseline-tip" data-tooltip="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 25 seeds at run_size=full. Source: dittobench-api docs/BASELINES.md.">Reference baseline</span></dt><dd class="ledger-value" id="c-baseline">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top gap</span></dt><dd class="ledger-value" id="c-spread">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label">Last scored</dt><dd class="ledger-value" id="h-last">–</dd></div>
+      </dl>
     </section>
+    </aside>
 
+    <div class="overview-main" tabindex="0" role="region" aria-label="Champion and leaderboard column, scrolls separately from the timeline rail">
+    <section class="champion-box" aria-labelledby="champion-box-kicker">
+      <div class="champion-kicker" id="champion-box-kicker"><span class="crown" aria-hidden="true">♛</span>KOTH · reigning champion</div>
+      <div class="champion-body" id="champion-body" role="status" aria-live="polite">
+        <div class="champion-state">Waiting for the emissions projection…</div>
+      </div>
+    </section>
     <div class="section-head">
       <h2 id="leaderboard-title">Leaderboard</h2>
-      <span class="hint" id="leaderboard-hint">raw score rank · KOTH emissions shown separately · click a row for detail</span>
+      <span class="hint" id="leaderboard-hint">raw score rank · KOTH emissions shown separately · open a row for tool &amp; memory detail</span>
     </div>
     <div class="leaderboard-version-switch">
       <span class="context" id="leaderboard-version-context">Current rollout drives validator weights.</span>
@@ -2345,8 +2499,11 @@
     <div class="emissions-strip" id="emissions-strip" role="status" aria-live="polite">
       <div class="emissions-summary">
         <div class="emissions-title" id="emissions-title"></div>
-        <div class="emissions-reason" id="emissions-reason"></div>
-        <div class="emissions-threshold" id="emissions-threshold"></div>
+        <details class="emissions-why" id="emissions-why" hidden>
+          <summary>How the crown is decided</summary>
+          <div class="emissions-reason" id="emissions-reason"></div>
+          <div class="emissions-threshold" id="emissions-threshold"></div>
+        </details>
       </div>
       <div class="emissions-recipients" id="emissions-recipients"></div>
       <div class="chain-observation" id="chain-observation">
@@ -2389,6 +2546,8 @@
         <span class="page-status" id="board-pinfo" aria-live="polite">Page 1 of 1</span>
         <button class="btn ghost" type="button" id="board-next">Next <span aria-hidden="true">&#8594;</span></button>
       </nav>
+    </div>
+    </div>
     </div>
 
     </section>
@@ -3936,10 +4095,14 @@
       var measured = Math.round((target.clientWidth || 960) - 2);
       timelineRenderedWidth = measured;
       var width = Math.max(300, Math.min(1200, measured || 960));
-      var narrow = width < 560, tight = width < 400;
+      // A sub-560px measure can mean a phone viewport or the desktop split's
+      // rail; only the phone deserves the tall portrait aspect. In the split,
+      // stay on the landscape branch so the rail chart never squares off.
+      var phoneViewport = !window.matchMedia("(min-width: 1181px)").matches;
+      var narrow = width < 560 && phoneViewport, tight = width < 400 && phoneViewport;
       var height = narrow
         ? Math.max(300, Math.round(width * 0.86))
-        : Math.max(340, Math.min(470, Math.round(width * 0.42)));
+        : Math.max(272, Math.min(376, Math.round(width * 0.34)));
       var left = tight ? 32 : narrow ? 40 : 58;
       var right = narrow ? 14 : 26;
       var top = narrow ? 22 : 30;
@@ -4110,7 +4273,7 @@
       target.innerHTML = '<p class="harness-comparison-summary">' +
         (fieldCount ? '<span><strong>' + fieldCount + '</strong> scored runs</span>' : "") +
         '<span><strong>' + minerPoints.length + '</strong> records</span>' +
-        (latestMiner ? '<span>Latest record <strong>' + fx(latestMiner.score) + '</strong> on v' + latestMiner.version + '</span>' : '<span>Miner history is not yet available</span>') +
+        (latestMiner ? '<span>Latest record <strong>' + fx(latestMiner.score) + '</strong> on <strong>v' + latestMiner.version + '</strong></span>' : '<span>Miner history is not yet available</span>') +
         '<span><strong>' + latestReferences.length + '</strong> native reference series</span></p>' +
         '<div class="memory-timeline-legend" aria-label="Timeline legend"><span class="legend-group">Best finalized miner' + eraLegend + '</span><span class="hermes"><i></i>Hermes Agent</span><span class="openclaw"><i></i>OpenClaw</span></div>' +
         '<div class="memory-timeline-frame" tabindex="0" role="region" aria-label="Memory-score timeline, horizontally scrollable on small screens"><svg class="memory-timeline-svg" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-labelledby="memory-timeline-title memory-timeline-desc"><title id="memory-timeline-title">Best miner memory score with Hermes and OpenClaw across DittoBench v' + eras[0].version + ' through v' + eras[eras.length - 1].version + '</title><desc id="memory-timeline-desc">Memory score from zero to one. Each benchmark contract occupies an equal band across the horizontal axis, coloured light to dark as the generations advance, with its records ordered left to right inside the band. A muted dashed connector crosses each contract boundary because every contract rescores from scratch. Third-party points are retrospective measurements placed in each contract band.</desc>' + svg.join("") + '</svg><div class="memory-timeline-tooltip" role="tooltip" hidden></div></div>' +
@@ -4186,6 +4349,46 @@
           if (lastMemoryTimelineData) renderMemoryTimeline(lastMemoryTimelineData);
           else renderMemoryTimeline(null);
         });
+    }
+
+    // The champion box repeats the emissions strip's headline identity on
+    // purpose (box = who reigns at a glance, strip = why). It re-renders only
+    // on content change so its aria-live region stays quiet across the 30s
+    // refresh ticks.
+    var lastChampionHtml = null;
+    var lastEmissionsSig = null;
+    function renderChampionBox(emissions, entries) {
+      var body = document.getElementById("champion-body");
+      if (!body) return;
+      var html;
+      if (emissions && emissions.champion_agent_id != null) {
+        var entry = entries.find(function (e) { return String(e.agent_id) === String(emissions.champion_agent_id); });
+        var name = (entry ? agentName(entry.agent_name) : shortKey(emissions.champion_miner_hotkey)) || "Unidentified champion";
+        var recipient = (emissions.recipients || []).find(function (r) { return r.role === "champion"; });
+        var share = recipient && Number.isFinite(recipient.share_of_miner_pool) ? recipient.share_of_miner_pool : emissions.champion_share;
+        var composite = entry ? displayComposite(entry) : null;
+        html =
+          '<div class="champion-row">' +
+            '<div class="champion-name">' + (entry ? entityAnchor("agent", entry.agent_id, name) : esc(name)) + '</div>' +
+            (composite != null ? '<div class="champion-score tip-chip" data-tooltip="Finalized composite — the headline score in [0,1] that drives rank."><span class="champion-score-label">Composite</span>' + fx(composite) + '</div>' : '') +
+          '</div>' +
+          '<div class="champion-meta">' +
+            (entry && entry.rank ? '<span>Raw rank <b>#' + esc(String(entry.rank)) + '</b></span>' : '') +
+            (Number.isFinite(share) ? '<span>Miner pool <b>' + pct(share) + '</b></span>' : '') +
+            (entry && entry.first_seen ? '<span>First seen <b>' + esc(relTime(entry.first_seen)) + '</b></span>' : '') +
+            (entry && entry.bench_version != null ? '<span>Bench <b>v' + esc(String(entry.bench_version)) + '</b></span>' : '') +
+          '</div>';
+      } else if (leaderboardVersionView !== "current") {
+        // Historical bench views carry no emissions projection; saying "no
+        // champion" there would misstate the live subnet.
+        html = '<div class="champion-state">Viewing the Bench v' + esc(String(leaderboardVersionView)) + ' archive. KOTH emissions apply to the current rollout — switch to Current rollout to see the reigning champion.</div>';
+      } else {
+        html = '<div class="champion-state">No reigning champion in the current pool — the KOTH fold has no eligible finalized run yet. Raw rank #1 leads the board below.</div>';
+      }
+      // Rewire tooltip descriptions here too: the board-row pass skips its
+      // rebuild (and its wireTips call) when the visible slice is unchanged,
+      // which can coincide with a champion change.
+      if (html !== lastChampionHtml) { body.innerHTML = html; lastChampionHtml = html; wireTips(); }
     }
 
     // ── Render ───────────────────────────────────────────────
@@ -4321,8 +4524,8 @@
         ? "ranked by settled v" + activeBench + " composite during the v" + data.desired_bench_version +
           " rollout · v" + data.desired_bench_version + " progress shown per row"
         : finalizedEntries.length
-        ? "authoritative per-agent score"
-        : "early accepted scores · ranked provisionally by composite";
+        ? "authoritative per-agent score · open a row for tool & memory detail"
+        : "early accepted scores · ranked provisionally by composite · open a row for detail";
       document.getElementById("leaderboard-version-context").textContent = historicalView
         ? "Historical Bench v" + data.current_bench_version + " standings. Current emissions remain on the rollout view."
         : rolloutSettledView
@@ -4359,6 +4562,16 @@
       });
       applyChainWeights(entries, lastChainWeights, emissions);
       var emissionsStrip = document.getElementById("emissions-strip");
+      // Signature-gate the strip: it is a polite live region, and re-assigning
+      // identical innerHTML every 30s tick makes screen readers re-announce a
+      // paragraph of KOTH math. Rebuild only when the fold actually changed.
+      // (The champion box below has the same gate via lastChampionHtml.)
+      var chainShown = document.getElementById("chain-observation").classList.contains("show");
+      var champForSig = emissions ? entries.find(function (entry) { return String(entry.agent_id) === String(emissions.champion_agent_id); }) : null;
+      var emissionsSig = JSON.stringify(emissions) + "|" + chainShown + "|" + leaderboardVersionView +
+        (champForSig ? "|" + displayComposite(champForSig) + "|" + (champForSig.rank || "") + "|" + agentName(champForSig.agent_name) : "");
+      if (emissionsSig !== lastEmissionsSig) {
+      lastEmissionsSig = emissionsSig;
       if (emissions) {
         var championEntry = entries.find(function (entry) { return String(entry.agent_id) === String(emissions.champion_agent_id); });
         var rawLeaderEntry = entries.find(function (entry) { return String(entry.agent_id) === String(emissions.raw_leader_agent_id); });
@@ -4377,7 +4590,7 @@
           '<span class="emission-badge champion"><span aria-hidden="true">●</span> KOTH champion</span> · ' +
           (championEntry ? entityAnchor("agent", championEntry.agent_id, championName) : esc(championName)) +
           ' (' + esc(championRank) + ') receives ' + pct(championRecipient && Number.isFinite(championRecipient.share_of_miner_pool) ? championRecipient.share_of_miner_pool : emissions.champion_share) + ' of the miner pool.' +
-          (championConfirmations ? ' <span class="tip" title="Distinct champion-anchored seeds scored by the continual top-five lane.">· ' + esc(championConfirmations) + '</span>' : '');
+          (championConfirmations ? ' <span class="tip" tabindex="0" data-tooltip="Distinct champion-anchored seeds scored by the continual top-five lane.">· ' + esc(championConfirmations) + '</span>' : '');
         // Every consensus constant in this strip comes from the fold the API
         // reports (margin, dethrone_z, champion_share, rank_shares, tail_size). Hardcoding
         // any of them lets the copy drift from the rule actually being applied.
@@ -4428,7 +4641,13 @@
         document.getElementById("emissions-recipients").textContent = "";
         renderDethroneFloor(null, null);
       }
+      }
       applyEmissionsCopy(emissions);
+      // The dethrone-math explainer collapses behind a disclosure so the table
+      // stays near the top; it only exists when there is a fold to explain.
+      var emissionsWhy = document.getElementById("emissions-why");
+      if (emissionsWhy) emissionsWhy.hidden = !emissions;
+      renderChampionBox(emissions, entries);
 
       // Rows
       renderBoardRows();
@@ -4518,22 +4737,24 @@
         var rankCls = (finalizedEntry && elig && activelyEligible && e.rank <= 3) ? " r" + e.rank : "";
         var kind = unrankedKind(e);
         var prov = kind === "zero"
-          ? '<span class="prov" title="This full run scored a composite of 0.000, so it is shown for transparency but is not ranked and not emission-eligible.">no score</span>'
+          ? '<span class="prov tip-chip" data-tooltip="This full run scored a composite of 0.000, so it is shown for transparency but is not ranked and not emission-eligible.">no score</span>'
           : kind === "provisional"
-          ? '<span class="prov" title="Provisional. It ran a smaller profile that did not administer the full benchmark, so it is shown for transparency but is not ranked and not emission-eligible.">provisional</span>'
+          ? '<span class="prov tip-chip" data-tooltip="Provisional. It ran a smaller profile that did not administer the full benchmark, so it is shown for transparency but is not ranked and not emission-eligible.">provisional</span>'
           : "";
         var rankCell = elig
           ? '<span class="rank' + rankCls + '">' + (finalizedEntry ? e.rank : "P" + e.rank) + '</span>' +
             (finalizedEntry ? rankMove(e.miner_hotkey, e.rank) : "")
-          : '<span class="rank prov-rank" title="Not ranked (' + (kind === "zero" ? "scored 0.000" : "provisional run") + ').">–</span>';
+          : '<span class="rank prov-rank tip-chip" data-tooltip="Not ranked (' + (kind === "zero" ? "scored 0.000" : "provisional run") + ').">–</span>';
         var displayAgentName = agentName(e.agent_name);
         var accessibleAgentName = agentLabel(e.agent_name, e.agent_version);
+        // Keep the row label to what identifies the row (rank, agent, score,
+        // KOTH role). UID, hotkey, and chain weight live in the cells and the
+        // run-detail modal; repeating them here made every row a ~40-word
+        // utterance when arrowing through the board.
         var rowLabel = (elig ? (finalizedEntry ? "Rank " : "Provisional rank ") + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
-          ", agent " + accessibleAgentName + ", miner UID " + (e.miner_uid == null ? "unavailable" : e.miner_uid) +
-          ", hotkey " + shortKey(e.miner_hotkey) + ", composite " + fx(displayComposite(e)) +
-          (emission ? ", KOTH " + emission.role + " receiving " + pct(emission.share_of_miner_pool) + " of the miner pool" : "") +
-          (chainWeight ? ", " + chainWeightLabel(chainWeight) : "") + ". Activate for run detail.";
-        var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge" title="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
+          ", agent " + accessibleAgentName + ", composite " + fx(displayComposite(e)) +
+          (emission ? ", KOTH " + emission.role : "") + ". Activate for run detail.";
+        var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge tip-chip" data-tooltip="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
           esc(e.score_count || 0) + ' of ' + esc(e.score_quorum || 3) + ' · provisional</span>';
         var registrationBadge = registered
           ? ""
@@ -4552,7 +4773,7 @@
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></span></span></td>' +
             '<td>' + (emission ? '<span class="emission-badge ' + esc(emission.role) + '"><span aria-hidden="true">●</span> ' +
               (emission.role === "champion" ? "Champion" : "Tail") + ' · ' + pct(emission.share_of_miner_pool) + '</span>' : '<span class="muted">–</span>') +
-              (chainWeight ? '<span class="chain-weight-note" title="How many validators most recently revealed this miner as their top choice, or assigned it any weight. Block ' + esc(lastChainWeights.block) + '; this can lag active commitments and is not final Yuma emissions.">' + esc(chainWeightLabel(chainWeight)) + '</span>' : '') + '</td>' +
+              (chainWeight ? '<span class="chain-weight-note tip-chip" data-tooltip="How many validators most recently revealed this miner as their top choice, or assigned it any weight. Block ' + esc(lastChainWeights.block) + '; this can lag active commitments and is not final Yuma emissions.">' + esc(chainWeightLabel(chainWeight)) + '</span>' : '') + '</td>' +
             modelCell(e) +
             compositeCell(e) +
             '<td class="hide-sm">' + bar("tool", e.tool_mean) + '</td>' +
@@ -4561,7 +4782,36 @@
             '<td class="num hide-sm muted">' + relTime(e.first_seen) + '</td>' +
           '</tr>';
       }).join("");
+      wireTips();
     }
+
+    // Screen-reader access for the CSS tooltip layer: every [data-tooltip]
+    // element (dotted .tip terms and .tip-chip score chips) gets a hidden
+    // description node wired via aria-describedby, so the bubble text is
+    // announced rather than only drawn. Rebuilt wholesale because board rows
+    // regenerate on every data change.
+    var tipDescSeq = 0;
+    function wireTips() {
+      var host = document.getElementById("tip-descs");
+      if (!host) {
+        host = document.createElement("div");
+        host.id = "tip-descs";
+        host.hidden = true;
+        document.body.appendChild(host);
+      }
+      host.textContent = "";
+      document.querySelectorAll("[data-tooltip]").forEach(function (el) {
+        var text = el.getAttribute("data-tooltip");
+        if (!text) return;
+        var id = "tipdesc-" + (++tipDescSeq);
+        var span = document.createElement("span");
+        span.id = id;
+        span.textContent = text;
+        host.appendChild(span);
+        el.setAttribute("aria-describedby", id);
+      });
+    }
+    wireTips();
 
     // Tab / sort / page controls. Each only re-renders the visible slice.
     document.querySelectorAll("[data-board-tab]").forEach(function (btn) {
@@ -4590,6 +4840,16 @@
         boardView.page = 1;
         writeBoardPage(false);
         renderBoardRows();
+      });
+      // The focusable tooltip term inside the header doubles as the keyboard
+      // sort control: it is the header's one tab stop, so Enter/Space there
+      // must do what a pointer click on the header does.
+      var sortTip = th.querySelector(".tip");
+      if (sortTip) sortTip.setAttribute("role", "button");
+      th.addEventListener("keydown", function (ev) {
+        if (ev.key !== "Enter" && ev.key !== " ") return;
+        ev.preventDefault();
+        th.click();
       });
     });
     (function () {
@@ -4762,7 +5022,7 @@
         "below the average. The largest gate is conversational sanity: leaking on a " +
         "greeting or missing a plain declarative floors it at 0.5. Consistency, canary " +
         "integrity, and wasteful tool use also count. Open the row for the full breakdown.";
-      return '<span class="gate-chip" title="' + esc(tip) + '">gates −' + (reduction * 100).toFixed(0) + '%</span>';
+      return '<span class="gate-chip tip-chip" data-tooltip="' + esc(tip) + '">gates −' + (reduction * 100).toFixed(0) + '%</span>';
     }
     function tokenPenaltyChip(e) {
       var b = e && e.composite_breakdown;
@@ -4773,7 +5033,7 @@
       var tip = penalized
         ? "Token efficiency reduced the pre-token composite by " + (penalty * 100).toFixed(1) + "%. The maximum is 10%."
         : "Token use stayed within the v5 budget, so token efficiency did not reduce this score. The maximum possible penalty is 10%.";
-      return '<span class="token-chip' + (penalized ? ' penalized' : '') + '" title="' + esc(tip) + '">' + esc(label) + '</span>';
+      return '<span class="token-chip tip-chip' + (penalized ? ' penalized' : '') + '" data-tooltip="' + esc(tip) + '">' + esc(label) + '</span>';
     }
     // Mid-rollout settlement state for the row: the agent's median on the
     // incoming benchmark version so far and how many of the 3 independent
@@ -4784,7 +5044,7 @@
       var count = Number(e.rollout_score_count) || 0;
       var vlabel = "v" + (desiredBench || benchmarkDisplayVersion());
       if (!count || e.rollout_composite == null) {
-        return '<span class="rollout-chip pending" title="No accepted ' + esc(vlabel) +
+        return '<span class="rollout-chip pending tip-chip" data-tooltip="No accepted ' + esc(vlabel) +
           ' score yet. This agent still ranks and earns on its settled score.">' +
           esc(vlabel) + ' pending · 0/' + quorum + '</span>';
       }
@@ -4793,7 +5053,7 @@
         ? esc(vlabel) + " reached quorum: this median is locked in and takes over when the " + esc(vlabel) + " rollout fully activates."
         : "Preliminary " + esc(vlabel) + " median from " + count + " of " + quorum +
           " scores. It can change until quorum and does not affect rank or weights yet.";
-      return '<span class="rollout-chip' + (settled ? " settled" : " partial") + '" title="' + tip + '">' +
+      return '<span class="rollout-chip tip-chip' + (settled ? " settled" : " partial") + '" data-tooltip="' + tip + '">' +
         esc(vlabel) + ' ' + fx(e.rollout_composite) + ' · ' + count + '/' + quorum +
         (settled ? ' settled' : '') + '</span>';
     }
@@ -4856,11 +5116,11 @@
     function rankMove(hotkey, currRank) {
       if (!(hotkey in prevRanks)) {
         return prevRanksHasData
-          ? '<span class="rankmove new" title="New since your last visit">NEW</span>' : "";
+          ? '<span class="rankmove new tip-chip" data-tooltip="New since your last visit">NEW</span>' : "";
       }
       var d = prevRanks[hotkey] - currRank;
-      if (d > 0) return '<span class="rankmove up" title="Up ' + d + ' since your last visit">▲' + d + '</span>';
-      if (d < 0) return '<span class="rankmove down" title="Down ' + (-d) + ' since your last visit">▼' + (-d) + '</span>';
+      if (d > 0) return '<span class="rankmove up tip-chip" data-tooltip="Up ' + d + ' since your last visit">▲' + d + '</span>';
+      if (d < 0) return '<span class="rankmove down tip-chip" data-tooltip="Down ' + (-d) + ' since your last visit">▼' + (-d) + '</span>';
       return "";
     }
 
@@ -5646,7 +5906,10 @@
           type: "submission",
           entry: entry,
           title: agentLabel(entry.name, entry.version),
-          detail: String(entry.agent_id || "").slice(0, 8) + " · " + stage[0] + " · " + relTime(entry.submitted_at),
+          detail: String(entry.agent_id || "").slice(0, 8) + " · " + stage[0] +
+            (entry.preserved_composite != null ? " · composite " + fx(Number(entry.preserved_composite))
+              : entry.provisional_composite != null ? " · provisional " + fx(Number(entry.provisional_composite)) : "") +
+            " · " + relTime(entry.submitted_at),
           text: [entry.name, agentVersionLabel(entry.version), entry.agent_id, entry.miner_hotkey, entry.status, stage[0], entry.review_reason, entry.screening_reason, entry.duplicate_of, entry.duplicate_name, agentVersionLabel(entry.duplicate_version)].map(searchText).join(" ")
         });
       });
