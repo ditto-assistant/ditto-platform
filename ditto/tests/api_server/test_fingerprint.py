@@ -321,6 +321,40 @@ class TestReferenceAwareFingerprints:
         )
         assert prompt_j < 0.75 and prompt_c < 0.95
 
+    def test_recent_official_revision_is_neutral_inside_modified_files(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Official updates shared by two forks are not miner-authored overlap.
+
+        Both submissions keep a recent official strategy block in the same file
+        and then add unrelated code.  This mirrors the false-positive shape that
+        motivated automatic reference refreshes without containing miner source.
+        """
+        recent_official = self._source("official_v_next", self._BASELINE_PROMPT)
+        _install_reference_fixture(monkeypatch, recent_official)
+        fork_a = _tar_gz(
+            {
+                "src/agent.rs": recent_official
+                + b"\n"
+                + self._source("independent_a", self._CUSTOM_A_PROMPT)
+            }
+        )
+        fork_b = _tar_gz(
+            {
+                "src/agent.rs": recent_official
+                + b"\n"
+                + self._source("independent_b", self._CUSTOM_B_PROMPT)
+            }
+        )
+
+        lexical_j, lexical_c = content_similarity(
+            compute_content_fingerprint(fork_a),
+            compute_content_fingerprint(fork_b),
+        )
+
+        assert lexical_j < 0.75
+        assert lexical_c < 0.95
+
     def test_small_block_theft_is_still_caught(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

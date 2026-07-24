@@ -2,11 +2,10 @@
 
 The platform compares only the submission-specific residue left after removing a
 canonical public starter-kit corpus. The packaged corpus contains every unique blob
-reachable from the official starter-kit `main` history at revision
-`959cd69a1a8d3b0defbfb8296518adb7d4f17c14`; its commit-set identity is
-`21dc06cd72aafefb56d0e89e8b3127280dda249ae26cb649ee855185121e9ce6`.
-`scripts/build_reference_fingerprints.py` regenerates the deterministic bundles and
-records both the requested ref and its resolved immutable revision.
+reachable from the official starter-kit `main` history. The committed
+`reference_manifest_v2.json` is the authoritative immutable revision and commit-set
+identity; `scripts/build_reference_fingerprints.py` regenerates the deterministic
+bundles and that manifest together.
 
 ## Active comparison policy
 
@@ -28,8 +27,12 @@ records both the requested ref and its resolved immutable revision.
   independent fork after lexical reference subtraction while preserving the
   measured structural value in operator evidence. Prompt overlap is advisory for
   the same convergence reason.
-- A lexical version or corpus mismatch is an explicit inconclusive review result.
-  It never silently falls through to structural or archive-size heuristics.
+- An algorithm-version mismatch is an explicit inconclusive review result. A
+  same-version corpus mismatch is skipped: it is expected while an official
+  starter-kit refresh is being backfilled and is not evidence of copying. Exact
+  bytes remain enforced before that check, and the gate continues checking other
+  same-corpus references instead of falling through to structural or archive-size
+  heuristics.
 - Size similarity is a legacy fallback only when both rows lack lexical and
   structural fingerprints. A valid negative, empty, or incompatible fingerprint
   is not overridden by similar size.
@@ -58,13 +61,13 @@ decision remain bulk-ineligible. The platform still exposes no bulk mutation.
 ## Metadata transition order
 
 The metadata backfill tool ships with the algorithm but must not be applied as part
-of this change. Rollout order is:
+of a code change. Rollout order for each reference refresh is:
 
 1. Land and deploy the durable ATH review migration/API so existing holds are
    snapshotted with legacy/original evidence (`d84b3a91f620`).
-2. Deploy the reference-aware algorithm and endpoint integration with the backfill
-   tool present but unused. Newly opened holds snapshot the v2 algorithm, revision,
-   corpus, and exclusion mode; legacy rows remain unchanged.
+2. Deploy the refreshed reference bundle with the backfill tool present but unused.
+   Newly uploaded artifacts carry the new corpus identity; a mixed-corpus pair does
+   not enter ATH review solely because the rollout is in progress.
 3. Run the fingerprint backfill without `--apply`, review aggregate counts, then
    separately authorize the metadata-only apply and a catch-up pass. The tool uses
    bounded batches, is idempotent on algorithm plus corpus identity, and updates
@@ -75,3 +78,12 @@ of this change. Rollout order is:
 The backfill never changes agent status, duplicate attribution, review reason,
 scores, public mirrors, or verdicts. This repository provides no bulk re-review,
 release, rejection, or ban operation for this transition.
+
+## Keeping the public reference current
+
+`.github/workflows/refresh-anti-copy-reference.yml` checks the official
+starter-kit `main` branch every day and on demand. When its deterministic bundles
+change, it updates the single `automation/starter-kit-reference` branch and opens
+or refreshes a reviewable platform PR. It does not merge or deploy automatically.
+This keeps ordinary starter-kit evolution visible before stale public scaffolding
+can dominate a miner-to-miner comparison again.
