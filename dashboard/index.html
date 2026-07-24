@@ -1136,6 +1136,11 @@
       --ref-hermes: oklch(52% 0.17 75);
       --ref-openclaw: oklch(52% 0.17 270);
       --radius: 8px;
+      /* Ground-grid rule strength: how much of --text mixes into the body's
+         ruled lines (vertical, horizontal). Dark surfaces compress faint light
+         rules, so the night block raises these to stay equally noticeable. */
+      --grid-rule-v: 5%;
+      --grid-rule-h: 4%;
       /* Exponential ease-out only: decisive, no bounce. */
       --ease-out-quart: cubic-bezier(.25, 1, .5, 1);
       --ease-out-expo: cubic-bezier(.16, 1, .3, 1);
@@ -1206,6 +1211,8 @@
       --era-to: oklch(83% 0.105 340);
       --ref-hermes: oklch(66% 0.17 75);
       --ref-openclaw: oklch(66% 0.17 270);
+      --grid-rule-v: 8%;
+      --grid-rule-h: 6.5%;
     }
 
     html { color-scheme: light; background: var(--bg); }
@@ -1224,8 +1231,8 @@
          raw 16% is right again. */
       --wash-x: calc(240px + 16%);
       background:
-        linear-gradient(90deg, color-mix(in oklch, var(--text) 5%, transparent) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
-        linear-gradient(0deg, color-mix(in oklch, var(--text) 4%, transparent) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
+        linear-gradient(90deg, color-mix(in oklch, var(--text) var(--grid-rule-v), transparent) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
+        linear-gradient(0deg, color-mix(in oklch, var(--text) var(--grid-rule-h), transparent) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
         radial-gradient(circle at var(--wash-x) 14%, color-mix(in oklch, var(--good) 20%, transparent), transparent 30rem),
         radial-gradient(circle at 90% 12%, color-mix(in oklch, var(--gold) 28%, transparent), transparent 30rem),
         var(--bg);
