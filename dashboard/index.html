@@ -211,6 +211,10 @@
     .emissions-summary { min-width: 0; flex: 1 1 auto; }
     .emissions-title { color: var(--text); font-size: 13px; font-weight: 750; }
     .emissions-title .entity-link { color: inherit; }
+    .emissions-why { margin-top: 4px; }
+    .emissions-why summary { cursor: pointer; color: var(--text-dim); font: 700 11px/1.5 var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+    .emissions-why summary:hover, .emissions-why summary:focus-visible { color: var(--text); }
+    .emissions-why[open] summary { margin-bottom: 2px; }
     .emissions-reason { margin-top: 3px; color: var(--text-dim); font-size: 12px; line-height: 1.5; }
     .emissions-threshold { display: none; margin-top: 7px; padding-top: 7px; border-top: 1px dashed var(--border); color: var(--text-dim); font-size: 12px; line-height: 1.5; }
     .emissions-threshold.show { display: block; }
@@ -2204,6 +2208,65 @@
       .ath-review-head { align-items: flex-start; flex-direction: column; }
       .ath-hold-reason { grid-template-columns: 1fr; gap: 4px; }
     }
+
+    /* ── Overview split ──────────────────────────────────────
+       On wide screens the memory timeline + snapshot cards live in a sticky,
+       independently scrollable rail on the left; the leaderboard owns the
+       remaining width. Below the breakpoint both wrappers are inert blocks,
+       so the page stacks exactly as it did before the split. */
+    @media (min-width: 1181px) {
+      .overview-split { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 26px; align-items: start; }
+      .overview-rail {
+        position: sticky; top: 18px; max-height: calc(100vh - 36px);
+        overflow-y: auto; overscroll-behavior: contain;
+        scrollbar-width: thin; padding-right: 2px;
+      }
+      .overview-rail .harness-comparison { margin-top: 0; }
+      .overview-main > :first-child { margin-top: 0; }
+      /* The board lives at roughly half the window in the split, so window-
+         width column hiding never fires on desktop. Mirror the responsive
+         semantics against the board's effective width instead: mid split
+         drops the same columns a mid window would; the secondary metric
+         columns return once the split gives the board a full-page's room.
+         The emissions strip stacks for the same reason. */
+      .overview-split .hide-md { display: none; }
+      .overview-split .emissions-strip.show { display: block; }
+      .overview-split .emissions-recipients { margin-top: 8px; text-align: left; }
+    }
+    @media (min-width: 1181px) and (max-width: 1919px) {
+      .overview-split .hide-sm { display: none; }
+      /* The Tool/Memory columns are hidden at these widths; keep the subscores
+         visible as a compact line in the composite cell so a miner tuning one
+         of them never loses sight of it on a laptop. */
+      .overview-split .tm-mini { display: inline-block; }
+    }
+    .tm-mini { display: none; margin-top: 2px; color: var(--text-dim); font: 700 11px/1.4 var(--mono); letter-spacing: .04em; font-variant-numeric: tabular-nums; }
+
+    /* ── Overview: champion box + snapshot ledger ────────────
+       The reigning-KOTH box heads the leaderboard column; the snapshot ledger
+       replaces the card grid in the rail. Both are ruled-frame instruments:
+       mono-caps labels, display-serif values, 1px rules — no card chrome. */
+    .champion-box { margin: 0 0 18px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-elev); overflow: hidden; }
+    .champion-kicker { padding: 10px 16px; border-bottom: 1px solid var(--border); background: color-mix(in oklch, var(--gold) 6%, var(--bg-elev)); color: var(--text-dim); font: 700 11px/1 var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+    .champion-body { padding: 14px 16px 13px; }
+    .champion-state { color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
+    .champion-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 18px; flex-wrap: wrap; }
+    .champion-name { font-family: var(--display); font-size: clamp(19px, 1.8vw, 25px); line-height: 1.12; min-width: 0; overflow-wrap: anywhere; }
+    .champion-name .entity-link { color: inherit; }
+    .champion-score { font-family: var(--display); font-size: clamp(25px, 2.4vw, 33px); line-height: 1; font-variant-numeric: tabular-nums; }
+    .champion-meta { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--text-dim); font: 11px/1.6 var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+    .champion-meta b { color: var(--text); font-weight: 700; }
+
+    .snapshot { margin: 14px 0; }
+    .stat-ledger { margin: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-elev); overflow: hidden; }
+    .ledger-line { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding: 9px 16px; }
+    .ledger-line + .ledger-line { border-top: 1px solid color-mix(in oklab, var(--border) 62%, transparent); }
+    .ledger-label { color: var(--text-dim); font: 700 11px/1.4 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+    .ledger-value { margin: 0; min-width: 0; font-family: var(--display); font-size: 19px; line-height: 1.2; font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere; }
+    .stat-ledger.secondary { margin-top: 10px; background: color-mix(in oklab, var(--bg-elev) 45%, transparent); }
+    .stat-ledger.secondary .ledger-line { padding-block: 7px; }
+    .stat-ledger.secondary .ledger-label { color: var(--text-faint); }
+    .stat-ledger.secondary .ledger-value { font-size: 14.5px; color: var(--text-dim); }
   </style>
 </head>
 <body>
@@ -2281,6 +2344,8 @@
     </div>
 
     <section class="page active" data-page="overview">
+    <div class="overview-split">
+    <aside class="overview-rail" tabindex="0" role="region" aria-label="Memory timeline and subnet snapshot, scrolls separately from the leaderboard">
       <section class="harness-comparison" aria-labelledby="harness-comparison-title">
         <div class="harness-comparison-head">
           <div class="harness-comparison-title">
@@ -2300,23 +2365,35 @@
         </div>
       </section>
 
-    <section class="cards" id="cards" aria-labelledby="snapshot-title">
+    <section class="snapshot" id="cards" aria-labelledby="snapshot-title">
       <h2 class="visually-hidden" id="snapshot-title">Subnet snapshot</h2>
-      <div class="card primary"><div class="label">Miners total</div><div class="value" id="h-miners">–</div><div class="context">Distinct miners who have submitted to Subnet 118.</div></div>
-      <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="Distinct miners with at least one scored run on the board (provisional runs included).">Miners Scored</span></div><div class="value" id="c-miners">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="The highest composite among ranked full-benchmark runs. Start with 0.5 × tool mean + 0.5 × memory mean, apply the benchmark quality gates, then apply the v5 token-efficiency multiplier. Token efficiency can remove at most 10%. Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" id="c-baseline-tip" data-tooltip="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 25 seeds at run_size=full. Source: dittobench-api docs/BASELINES.md.">Reference Baseline</span></div><div class="value" id="c-baseline">–</div></div>
-      <div class="card"><div class="label"><span class="tip" tabindex="0" data-tooltip="All validator score records stored by the platform, including the independent scores that make up each finalized result.">Total scores</span></div><div class="value" id="h-scores">–</div></div>
-      <div class="card"><div class="label"><span class="tip" tabindex="0" data-tooltip="Validators currently reporting heartbeat-capable software to the platform.">Validators</span></div><div class="value" id="h-validators">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
-      <div class="card"><div class="label">Scored agents</div><div class="value" id="h-agents">–</div></div>
-      <div class="card"><div class="label">Last scored</div><div class="value" id="h-last">–</div></div>
+      <dl class="stat-ledger">
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Distinct miners with at least one scored run on the board (provisional runs included).">Miners scored</span></dt><dd class="ledger-value" id="c-miners">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="The highest composite among ranked full-benchmark runs. Start with 0.5 × tool mean + 0.5 × memory mean, apply the benchmark quality gates, then apply the v5 token-efficiency multiplier. Token efficiency can remove at most 10%. Provisional runs are excluded.">Top composite</span></dt><dd class="ledger-value" id="c-top">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median composite</span></dt><dd class="ledger-value" id="c-median">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="All validator score records stored by the platform, including the independent scores that make up each finalized result.">Total scores</span></dt><dd class="ledger-value" id="h-scores">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Validators currently reporting heartbeat-capable software to the platform.">Validators</span></dt><dd class="ledger-value" id="h-validators">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label">Scored agents</dt><dd class="ledger-value" id="h-agents">–</dd></div>
+      </dl>
+      <dl class="stat-ledger secondary" aria-label="Additional snapshot stats">
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Distinct miners who have submitted to Subnet 118.">Miners total</span></dt><dd class="ledger-value" id="h-miners">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" id="c-baseline-tip" data-tooltip="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 25 seeds at run_size=full. Source: dittobench-api docs/BASELINES.md.">Reference baseline</span></dt><dd class="ledger-value" id="c-baseline">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top gap</span></dt><dd class="ledger-value" id="c-spread">–</dd></div>
+        <div class="ledger-line"><dt class="ledger-label">Last scored</dt><dd class="ledger-value" id="h-last">–</dd></div>
+      </dl>
     </section>
+    </aside>
 
+    <div class="overview-main">
+    <section class="champion-box" aria-labelledby="champion-box-kicker">
+      <div class="champion-kicker" id="champion-box-kicker">KOTH · reigning champion</div>
+      <div class="champion-body" id="champion-body" role="status" aria-live="polite">
+        <div class="champion-state">Waiting for the emissions projection…</div>
+      </div>
+    </section>
     <div class="section-head">
       <h2 id="leaderboard-title">Leaderboard</h2>
-      <span class="hint" id="leaderboard-hint">raw score rank · KOTH emissions shown separately · click a row for detail</span>
+      <span class="hint" id="leaderboard-hint">raw score rank · KOTH emissions shown separately · open a row for tool &amp; memory detail</span>
     </div>
     <div class="leaderboard-version-switch">
       <span class="context" id="leaderboard-version-context">Current rollout drives validator weights.</span>
@@ -2328,8 +2405,11 @@
     <div class="emissions-strip" id="emissions-strip" role="status" aria-live="polite">
       <div class="emissions-summary">
         <div class="emissions-title" id="emissions-title"></div>
-        <div class="emissions-reason" id="emissions-reason"></div>
-        <div class="emissions-threshold" id="emissions-threshold"></div>
+        <details class="emissions-why" id="emissions-why" hidden>
+          <summary>How the crown is decided</summary>
+          <div class="emissions-reason" id="emissions-reason"></div>
+          <div class="emissions-threshold" id="emissions-threshold"></div>
+        </details>
       </div>
       <div class="emissions-recipients" id="emissions-recipients"></div>
       <div class="chain-observation" id="chain-observation">
@@ -2372,6 +2452,8 @@
         <span class="page-status" id="board-pinfo" aria-live="polite">Page 1 of 1</span>
         <button class="btn ghost" type="button" id="board-next">Next <span aria-hidden="true">&#8594;</span></button>
       </nav>
+    </div>
+    </div>
     </div>
 
     </section>
@@ -4037,6 +4119,43 @@
         });
     }
 
+    // The champion box repeats the emissions strip's headline identity on
+    // purpose (box = who reigns at a glance, strip = why). It re-renders only
+    // on content change so its aria-live region stays quiet across the 30s
+    // refresh ticks.
+    var lastChampionHtml = null;
+    var lastEmissionsSig = null;
+    function renderChampionBox(emissions, entries) {
+      var body = document.getElementById("champion-body");
+      if (!body) return;
+      var html;
+      if (emissions && emissions.champion_agent_id != null) {
+        var entry = entries.find(function (e) { return String(e.agent_id) === String(emissions.champion_agent_id); });
+        var name = (entry ? agentName(entry.agent_name) : shortKey(emissions.champion_miner_hotkey)) || "Unidentified champion";
+        var recipient = (emissions.recipients || []).find(function (r) { return r.role === "champion"; });
+        var share = recipient && Number.isFinite(recipient.share_of_miner_pool) ? recipient.share_of_miner_pool : emissions.champion_share;
+        var composite = entry ? displayComposite(entry) : null;
+        html =
+          '<div class="champion-row">' +
+            '<div class="champion-name">' + (entry ? entityAnchor("agent", entry.agent_id, name) : esc(name)) + '</div>' +
+            (composite != null ? '<div class="champion-score tip-chip" data-tooltip="Finalized composite">' + fx(composite) + '</div>' : '') +
+          '</div>' +
+          '<div class="champion-meta">' +
+            (entry && entry.rank ? '<span>Raw rank <b>#' + esc(String(entry.rank)) + '</b></span>' : '') +
+            (Number.isFinite(share) ? '<span>Miner pool <b>' + pct(share) + '</b></span>' : '') +
+            (entry && entry.first_seen ? '<span>First seen <b>' + esc(relTime(entry.first_seen)) + '</b></span>' : '') +
+            (entry && entry.bench_version != null ? '<span>Bench <b>v' + esc(String(entry.bench_version)) + '</b></span>' : '') +
+          '</div>';
+      } else if (leaderboardVersionView !== "current") {
+        // Historical bench views carry no emissions projection; saying "no
+        // champion" there would misstate the live subnet.
+        html = '<div class="champion-state">Viewing the Bench v' + esc(String(leaderboardVersionView)) + ' archive. KOTH emissions apply to the current rollout — switch to Current rollout to see the reigning champion.</div>';
+      } else {
+        html = '<div class="champion-state">No reigning champion in the current pool — the KOTH fold has no eligible finalized run yet. Raw rank #1 leads the board below.</div>';
+      }
+      if (html !== lastChampionHtml) { body.innerHTML = html; lastChampionHtml = html; }
+    }
+
     // ── Render ───────────────────────────────────────────────
     function render(data) {
       // History pills track every version that has ever been scored. Fall back
@@ -4272,6 +4391,11 @@
         renderDethroneFloor(null, null);
       }
       applyEmissionsCopy(emissions);
+      // The dethrone-math explainer collapses behind a disclosure so the table
+      // stays near the top; it only exists when there is a fold to explain.
+      var emissionsWhy = document.getElementById("emissions-why");
+      if (emissionsWhy) emissionsWhy.hidden = !emissions;
+      renderChampionBox(emissions, entries);
 
       // Rows
       renderBoardRows();
