@@ -211,10 +211,11 @@ class TestDashboard:
         assert '"/public/agent/" + encodeURIComponent(agentId) + "/artifact"' in body
         assert 'cache: "no-store"' in body
         assert "Download submitted source" in body
-        assert "The 3/3 score quorum" in body
-        assert "Number(release.embargo_hours) || 24" in body
-        assert "privacy window" in body
-        assert "the original 3/3 timestamp still applies" in body
+        assert "This king's source" in body
+        assert "Number(release.embargo_hours) || 48" in body
+        assert "on-chain weights were set on this king" in body
+        assert "Awaiting that on-chain confirmation." in body
+        assert "its king reveal timing still applies" in body
         assert "function relTimeUntil(iso)" in body
         assert "relTimeUntil(release.available_at)" in body
         assert "relTime(release.available_at)" not in body

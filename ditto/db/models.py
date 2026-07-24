@@ -1563,14 +1563,16 @@ class ArtifactReleaseSettingsRevision(Base):
 
 
 class AgentKingship(Base):
-    """Write-once record of when an agent FIRST became the KOTH champion (king).
+    """King-reign ledger gating public source release, in two write-once stages.
 
-    Public source release is king-only: an agent's source is revealed only if it
-    has held the crown, and the embargo window is measured from
-    ``first_crowned_at`` -- the moment it first took the throne -- not from its
-    score quorum. The timestamp never moves once written, so even a brief reign
-    still releases that agent's source one window later. Written on the validator
-    score path (post-commit); the public release gate only reads it.
+    ``first_crowned_at`` marks that the agent was ever the KOTH champion
+    (eligibility). ``weight_confirmed_at`` marks the first time validators'
+    REVEALED on-chain weights (post commit-reveal) were seen set on this miner;
+    it is ``NULL`` until then. The public window is king-only and measured from
+    ``weight_confirmed_at`` -- so a genuine, on-chain-backed king reveals one
+    window later, while an agent that merely touched the crown off-chain waits
+    until the chain confirms it. Both timestamps are write-once and never move.
+    Written on the validator score path (post-commit); the gate only reads them.
     """
 
     __tablename__ = "agent_kingship"
@@ -1578,6 +1580,9 @@ class AgentKingship(Base):
     agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
     first_crowned_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    weight_confirmed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
     )
 
     __table_args__ = (

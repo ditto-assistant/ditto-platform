@@ -285,9 +285,20 @@ class PublicArtifactRelease(BaseModel):
         Field(
             default=None,
             description=(
-                "When this agent first became the KOTH king. Source release is "
-                "king-only and the embargo window is measured from this instant; "
-                "null for a submission that has never held the crown."
+                "When this agent first became the KOTH king (eligibility marker). "
+                "Null for a submission that has never held the crown."
+            ),
+        ),
+    ] = None
+    weight_confirmed_at: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description=(
+                "When validators' revealed on-chain weights (post commit-reveal) "
+                "were first seen set on this king. Source release is king-only and "
+                "the embargo window is measured from this instant; null while a "
+                "king still awaits on-chain confirmation."
             ),
         ),
     ] = None
