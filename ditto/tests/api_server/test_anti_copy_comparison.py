@@ -102,9 +102,7 @@ def test_adapter_returns_wire_safe_aggregate_copy_evidence() -> None:
         assert forbidden not in serialized
 
 
-def test_cross_corpus_pair_is_inconclusive_without_structural_or_size_fallback() -> (
-    None
-):
+def test_cross_corpus_pair_is_clear_without_structural_or_size_fallback() -> None:
     values = {f"{i:016x}" for i in range(12)}
     structural = _fp(values, version=1, corpus=None)
     reference = _row(
@@ -127,8 +125,9 @@ def test_cross_corpus_pair_is_inconclusive_without_structural_or_size_fallback()
 
     result = compare_anti_copy_pair(candidate=candidate, reference=reference)
 
-    assert result.current_decision == "inconclusive_review"
-    assert result.triggered_signal == "incompatible_fingerprint"
+    assert result.current_decision == "clear"
+    assert result.triggered is False
+    assert result.triggered_signal is None
     assert result.lexical.compatible is False
     assert result.lexical.jaccard is None
     assert result.bulk_eligible is False

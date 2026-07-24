@@ -113,6 +113,24 @@ def _fingerprint_versions_incompatible(a: dict | None, b: dict | None) -> bool:
     )
 
 
+def _fingerprint_corpora_incompatible(a: dict | None, b: dict | None) -> bool:
+    """Whether equal-version sketches subtract different reference corpora.
+
+    A corpus mismatch is transition metadata, not evidence that either submission
+    copied the other.  It commonly occurs while a refreshed official starter-kit
+    corpus is being backfilled.  The pair must be skipped rather than sent to ATH
+    review; exact-byte comparison still runs before this check and same-corpus
+    lexical comparisons remain active.
+    """
+    return bool(
+        a
+        and b
+        and a.get("v") is not None
+        and a.get("v") == b.get("v")
+        and a.get("corpus") != b.get("corpus")
+    )
+
+
 def _structural_note(
     structural_fingerprint: dict | None,
     e: LedgerRow,
@@ -271,6 +289,14 @@ def evaluate_duplicate_signals(
     #    of triggering until its sketches are reference-aware.
     for e in earlier_others:
         if abs(composite - e.composite) > score_tol:
+            continue
+        # A refreshed starter-kit corpus changes what is subtracted from the
+        # sketch.  During the bounded metadata backfill, old and new corpus IDs
+        # coexist.  That pair is incomparable, but incomparability is not copy
+        # evidence and must not itself create an operator hold.
+        if _fingerprint_corpora_incompatible(
+            content_fingerprint, e.content_fingerprint
+        ):
             continue
         if _fingerprint_versions_incompatible(
             content_fingerprint, e.content_fingerprint

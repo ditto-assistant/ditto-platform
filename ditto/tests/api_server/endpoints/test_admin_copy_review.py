@@ -637,7 +637,8 @@ async def test_incompatible_current_comparison_is_never_bulk_eligible(
     )
 
     assert response.status_code == 200
-    assert response.json()["current_decision"] == "inconclusive_review"
+    assert response.json()["current_decision"] == "clear"
+    assert response.json()["triggered"] is False
     assert response.json()["bulk_eligible"] is False
 
 

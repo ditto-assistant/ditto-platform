@@ -69,6 +69,7 @@ from ditto.api_server.endpoints.validator import (
     _heartbeat_signing_message,
     _issue_source_backfill_ticket,
 )
+from ditto.api_server.fingerprint import reference_corpus_provenance
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_AGENT_NOT_EVALUATABLE,
     ERROR_CODE_AGENT_NOT_FOUND,
@@ -4526,15 +4527,12 @@ class TestAntiCopyGate:
             assert held.status == AgentStatus.ATH_PENDING_REVIEW
             assert held.duplicate_of == incumbent
             assert "sha256" in (held.review_reason or "")
+            provenance = reference_corpus_provenance()
             assert review.algorithm_provenance == {
                 "snapshot": "score-finalization",
                 "algorithm_version": "reference-aware-v2",
-                "canonical_reference_revision": (
-                    "959cd69a1a8d3b0defbfb8296518adb7d4f17c14"
-                ),
-                "reference_corpus_id": (
-                    "21dc06cd72aafefb56d0e89e8b3127280dda249ae26cb649ee855185121e9ce6"
-                ),
+                "canonical_reference_revision": provenance["revision"],
+                "reference_corpus_id": provenance["corpus_id"],
                 "reference_exclusion_mode": "starter-kit-mainline-history",
                 "backfilled": False,
                 "opened_at_source": "agent_finalized_audit",

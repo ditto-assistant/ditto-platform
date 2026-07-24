@@ -629,6 +629,62 @@ class TestEvaluateAntidup:
         assert "comparison inconclusive" in (decision.reason or "")
         assert "lexical" in (decision.reason or "")
 
+    def test_reference_corpus_transition_does_not_create_a_hold(self) -> None:
+        incumbent_fp = _sk({f"{i:016x}" for i in range(30)})
+        incumbent_fp["corpus"] = "starter-history-before-refresh"
+        challenger_fp = _sk({f"{i:016x}" for i in range(30)})
+        challenger_fp["corpus"] = "starter-history-after-refresh"
+        incumbent = _entry(
+            composite=0.80,
+            size_bytes=500000,
+            content_fingerprint=incumbent_fp,
+        )
+
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            submitted_at=_CHALLENGER_SEEN,
+            miner_hotkey="5Independent",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=500100,
+            content_fingerprint=challenger_fp,
+            eligible=[incumbent],
+        )
+
+        assert decision.held is False
+
+    def test_corpus_transition_still_checks_same_corpus_references(self) -> None:
+        shared = {f"{i:016x}" for i in range(30)}
+        stale_fp = _sk(shared)
+        stale_fp["corpus"] = "starter-history-before-refresh"
+        current_fp = _sk(shared)
+        current_fp["corpus"] = "starter-history-after-refresh"
+        stale = _entry(
+            composite=0.80,
+            content_fingerprint=stale_fp,
+            first_seen=_FIRST_SEEN,
+        )
+        current = _entry(
+            composite=0.80,
+            content_fingerprint=current_fp,
+            first_seen=_FIRST_SEEN + timedelta(minutes=1),
+        )
+
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            submitted_at=_CHALLENGER_SEEN,
+            miner_hotkey="5Copier",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=None,
+            content_fingerprint=current_fp,
+            eligible=[stale, current],
+        )
+
+        assert decision.held is True
+        assert decision.duplicate_of == current.agent_id
+        assert "content near-duplicate" in (decision.reason or "")
+
     def test_cross_version_structural_fallback_is_not_used(self) -> None:
         legacy_content = _sk({f"a{i:015x}" for i in range(30)})
         legacy_content["v"] = 1
