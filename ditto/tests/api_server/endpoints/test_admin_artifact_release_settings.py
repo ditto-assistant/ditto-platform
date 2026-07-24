@@ -50,7 +50,7 @@ def _payload(hours: int, expected: int = 0) -> dict[str, object]:
     }
 
 
-async def test_defaults_to_24_then_shortens_with_audited_revisions(
+async def test_defaults_to_48_then_shortens_with_audited_revisions(
     app: FastAPI,
     client: httpx.AsyncClient,
     settings_maker: async_sessionmaker[AsyncSession],
@@ -63,7 +63,7 @@ async def test_defaults_to_24_then_shortens_with_audited_revisions(
     assert initial.json()["current"] == {
         "revision": 0,
         "parent_revision": 0,
-        "embargo_hours": 24,
+        "embargo_hours": 48,
         "reason": "Built-in privacy-first default",
         "actor": "platform",
         "created_at": None,
@@ -90,7 +90,7 @@ async def test_defaults_to_24_then_shortens_with_audited_revisions(
     assert [row["embargo_hours"] for row in current.json()["history"]] == [6, 12]
 
 
-async def test_rejects_increases_stale_writes_and_wrong_confirmation(
+async def test_lengthens_shortens_and_rejects_stale_or_wrong_confirmation(
     app: FastAPI,
     client: httpx.AsyncClient,
     settings_maker: async_sessionmaker[AsyncSession],
@@ -103,13 +103,30 @@ async def test_rejects_increases_stale_writes_and_wrong_confirmation(
     )
     revision = first.json()["revision"]
 
+    # Lengthening is now allowed, up to the 48-hour ceiling.
     increase = await client.post(
         "/api/v1/admin/artifact-release-settings",
         headers=_HEADERS,
         json=_payload(24, expected=revision),
     )
-    assert increase.status_code == 409
-    assert "only be shortened" in increase.text
+    assert increase.status_code == 200, increase.text
+    revision = increase.json()["revision"]
+
+    ceiling = await client.post(
+        "/api/v1/admin/artifact-release-settings",
+        headers=_HEADERS,
+        json=_payload(48, expected=revision),
+    )
+    assert ceiling.status_code == 200, ceiling.text
+    assert ceiling.json()["embargo_hours"] == 48
+
+    # One hour past the ceiling is rejected by the request contract.
+    over = await client.post(
+        "/api/v1/admin/artifact-release-settings",
+        headers=_HEADERS,
+        json=_payload(49, expected=ceiling.json()["revision"]),
+    )
+    assert over.status_code == 422
 
     stale = await client.post(
         "/api/v1/admin/artifact-release-settings",
@@ -119,7 +136,7 @@ async def test_rejects_increases_stale_writes_and_wrong_confirmation(
     assert stale.status_code == 409
     assert "refresh before applying" in stale.text
 
-    wrong = _payload(6, expected=revision)
+    wrong = _payload(6, expected=ceiling.json()["revision"])
     wrong["confirmation"] = "SET SOURCE EMBARGO 12 HOURS"
     confirmation = await client.post(
         "/api/v1/admin/artifact-release-settings",

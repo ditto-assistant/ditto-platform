@@ -75,7 +75,13 @@ async def create_settings_revision(
     _admin: AdminDep,
     session: SessionDep,
 ) -> RevisionModel:
-    """Shorten the global embargo with CAS and an append-only audit record."""
+    """Set the global embargo with CAS and an append-only audit record.
+
+    The window may be shortened or lengthened (up to the 48-hour ceiling).
+    Shortening still releases source earlier and cannot be reversed, so the
+    console surfaces that warning; the server only enforces the CAS revision
+    and the exact confirmation phrase.
+    """
     expected_confirmation = f"SET SOURCE EMBARGO {payload.embargo_hours} HOURS"
     if payload.confirmation != expected_confirmation:
         raise HTTPException(
@@ -85,25 +91,12 @@ async def create_settings_revision(
 
     latest = await latest_artifact_release_settings(session)
     actual_revision = latest.revision if latest is not None else 0
-    current_hours = (
-        latest.embargo_hours
-        if latest is not None
-        else DEFAULT_ARTIFACT_RELEASE_EMBARGO_HOURS
-    )
     if payload.expected_revision != actual_revision:
         raise HTTPException(
             status_code=409,
             detail=(
                 "artifact release settings changed; refresh before applying "
                 f"(expected {payload.expected_revision}, current {actual_revision})"
-            ),
-        )
-    if payload.embargo_hours >= current_hours:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "source embargo may only be shortened because increasing it cannot "
-                "restore privacy after disclosure"
             ),
         )
 

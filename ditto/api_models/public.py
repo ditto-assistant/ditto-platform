@@ -280,6 +280,17 @@ class PublicArtifactRelease(BaseModel):
     score_quorum: Annotated[int, Field(default=3, ge=1)] = 3
     embargo_hours: Annotated[int, Field(default=6, ge=1)] = 6
     finalized_at: datetime | None = None
+    crowned_at: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description=(
+                "When this agent first became the KOTH king. Source release is "
+                "king-only and the embargo window is measured from this instant; "
+                "null for a submission that has never held the crown."
+            ),
+        ),
+    ] = None
     available_at: datetime | None = None
     download_available: bool = False
 

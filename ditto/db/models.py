@@ -1540,7 +1540,7 @@ class ArtifactReleaseSettingsRevision(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "embargo_hours BETWEEN 6 AND 24",
+            "embargo_hours BETWEEN 6 AND 48",
             name="artifact_release_settings_embargo_hours_check",
         ),
         CheckConstraint(
@@ -1559,6 +1559,29 @@ class ArtifactReleaseSettingsRevision(Base):
             "parent_revision",
             name="artifact_release_settings_parent_revision_key",
         ),
+    )
+
+
+class AgentKingship(Base):
+    """Write-once record of when an agent FIRST became the KOTH champion (king).
+
+    Public source release is king-only: an agent's source is revealed only if it
+    has held the crown, and the embargo window is measured from
+    ``first_crowned_at`` -- the moment it first took the throne -- not from its
+    score quorum. The timestamp never moves once written, so even a brief reign
+    still releases that agent's source one window later. Written on the validator
+    score path (post-commit); the public release gate only reads it.
+    """
+
+    __tablename__ = "agent_kingship"
+
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    first_crowned_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="CASCADE"),
     )
 
 

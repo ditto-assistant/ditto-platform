@@ -164,6 +164,7 @@ from ditto.db.queries.heartbeats import (
     upsert_validator_heartbeat,
 )
 from ditto.db.queries.inference import ensure_inference_grant, revoke_ticket_inference
+from ditto.db.queries.king_reign import record_first_crowned
 from ditto.db.queries.payments import get_miner_coldkey_for_agent
 from ditto.db.queries.score_retests import activate_next_score_retest
 from ditto.db.queries.scores import (
@@ -3507,6 +3508,27 @@ async def submit_score(
         # false score failure because the independent v3 dataset renderer is
         # temporarily unavailable; the next score/verdict/admin retry converges.
         logger.exception("rolling benchmark qualification refresh failed")
+
+    # Record when the CURRENT KOTH champion first took the throne, so the
+    # king-only public source-release embargo can reveal its source one window
+    # later. This reads whoever is champion NOW (any committed score, including
+    # a confirmation-driven dethrone, can have changed it), not the submitter.
+    # Post-commit and best-effort: the score is already canonical, so a
+    # recording hiccup must never surface as a score failure, and the write-once
+    # timestamp is never moved by a later re-coronation.
+    try:
+        async with session.begin():
+            champion_members = await _current_emission_set(
+                session, canonical_version=await active_bench_version(session)
+            )
+            if champion_members:
+                await record_first_crowned(
+                    session,
+                    agent_id=champion_members[0].agent_id,
+                    now=audit_now,
+                )
+    except Exception:
+        logger.exception("king-reign recording failed")
 
     logger.info(
         "score recorded agent_id=%s validator=%s run_id=%s composite=%.3f status=%s",

@@ -60,6 +60,7 @@ from ditto.chain.models import (
 )
 from ditto.db.models import (
     Agent,
+    AgentKingship,
     ArtifactReleaseSettingsRevision,
     AthReview,
     Base,
@@ -3684,8 +3685,21 @@ async def _set_score_created_times(
             score.created_at = recorded_at
 
 
+async def _crown(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    agent_id: str,
+    first_crowned_at: datetime,
+) -> None:
+    """Mark an agent as having held the KOTH crown at ``first_crowned_at``."""
+    async with maker() as session, session.begin():
+        session.add(
+            AgentKingship(agent_id=UUID(agent_id), first_crowned_at=first_crowned_at)
+        )
+
+
 class TestPublicArtifactRelease:
-    async def test_default_retroactively_releases_cleared_submissions_after_24h(
+    async def test_default_releases_the_king_source_after_the_48h_reign_window(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -3703,10 +3717,16 @@ class TestPublicArtifactRelease:
                 session_maker,
                 agent_id=agent_id,
                 created_at=[
-                    now - timedelta(hours=26),
-                    now - timedelta(hours=25),
-                    now - timedelta(hours=24, minutes=1),
+                    now - timedelta(hours=50),
+                    now - timedelta(hours=49),
+                    now - timedelta(hours=48, minutes=1),
                 ],
+            )
+            # Both agents have held the crown for longer than the 48h window.
+            await _crown(
+                session_maker,
+                agent_id=agent_id,
+                first_crowned_at=now - timedelta(hours=48, minutes=1),
             )
         _install_db(app, session_maker)
         storage = AsyncMock()
@@ -3726,7 +3746,7 @@ class TestPublicArtifactRelease:
         }
         assert set(releases) == {first_id, second_id}
         assert all(release["status"] == "available" for release in releases.values())
-        assert all(release["embargo_hours"] == 24 for release in releases.values())
+        assert all(release["embargo_hours"] == 48 for release in releases.values())
         assert all(
             release["download_available"] is True for release in releases.values()
         )
@@ -3781,6 +3801,11 @@ class TestPublicArtifactRelease:
                 now - timedelta(minutes=5),
             ],
         )
+        await _crown(
+            session_maker,
+            agent_id=agent_id,
+            first_crowned_at=now - timedelta(hours=49),
+        )
         _install_db(app, session_maker)
         storage = AsyncMock()
         storage.presigned_get_url.return_value = "https://objects.example/source"
@@ -3811,6 +3836,12 @@ class TestPublicArtifactRelease:
                 now - timedelta(hours=7),
                 now - timedelta(hours=6, minutes=1),
             ],
+        )
+        # King since just over the shortened 6-hour window ago.
+        await _crown(
+            session_maker,
+            agent_id=agent_id,
+            first_crowned_at=now - timedelta(hours=6, minutes=1),
         )
         async with session_maker() as session, session.begin():
             session.add(
@@ -3862,6 +3893,12 @@ class TestPublicArtifactRelease:
                 now - timedelta(hours=2),
                 now - timedelta(hours=1),
             ],
+        )
+        # King only an hour ago, so still inside the 48h window: embargoed.
+        await _crown(
+            session_maker,
+            agent_id=embargoed_id,
+            first_crowned_at=now - timedelta(hours=1),
         )
         await _set_score_created_times(
             session_maker,
@@ -3933,8 +3970,94 @@ class TestPublicArtifactRelease:
         assert submissions["submissions"][0]["artifact_release"]["status"] == (
             "awaiting_quorum"
         )
+        # Never held the crown, so the source is king-only private (404), not a
+        # timed embargo (425).
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+        assert response.status_code == 404
+        storage.presigned_get_url.assert_not_awaited()
+
+    async def test_only_the_king_source_is_released(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        # A finalized submission that has never held the crown.
+        commoner_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        # A submission that briefly reigned 49h ago and has since lost the crown.
+        former_king_id = await _seed_k3(
+            session_maker, miner=_MINER_B, composites=[0.7, 0.8, 0.9]
+        )
+        await _crown(
+            session_maker,
+            agent_id=former_king_id,
+            first_crowned_at=now - timedelta(hours=49),
+        )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+        storage.presigned_get_url.return_value = "https://objects.example/source"
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        releases = {
+            entry["agent_id"]: entry["artifact_release"]
+            for entry in (await client.get("/api/v1/public/submissions")).json()[
+                "submissions"
+            ]
+        }
+        # The commoner's source is never released, even though it finalized 3/3.
+        assert releases[commoner_id]["status"] == "unavailable"
+        assert releases[commoner_id]["download_available"] is False
+        assert releases[commoner_id]["crowned_at"] is None
+        # The former king's brief reign still releases its source one window on.
+        assert releases[former_king_id]["status"] == "available"
+        assert releases[former_king_id]["download_available"] is True
+        assert releases[former_king_id]["crowned_at"] is not None
+
+        commoner = await client.get(f"/api/v1/public/agent/{commoner_id}/artifact")
+        assert commoner.status_code == 404
+        king = await client.get(f"/api/v1/public/agent/{former_king_id}/artifact")
+        assert king.status_code == 200
+        storage.presigned_get_url.assert_awaited_once()
+
+    async def test_king_source_is_embargoed_until_the_window_elapses(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.7, 0.8, 0.9]
+        )
+        # Crowned only an hour ago: still inside the default 48h window.
+        await _crown(
+            session_maker,
+            agent_id=agent_id,
+            first_crowned_at=now - timedelta(hours=1),
+        )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        release = (await client.get("/api/v1/public/submissions")).json()[
+            "submissions"
+        ][0]["artifact_release"]
+        assert release["status"] == "embargoed"
+        assert release["download_available"] is False
         response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
         assert response.status_code == 425
+        assert "embargoed until" in response.json()["message"]
         storage.presigned_get_url.assert_not_awaited()
 
 
