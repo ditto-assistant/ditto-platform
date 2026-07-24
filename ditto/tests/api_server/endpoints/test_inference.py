@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import bittensor
+import httpx
 import pytest
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -14,8 +15,10 @@ from ditto.api_server.endpoints.inference import (
     _exchange_message,
     _locked_upstream_payload,
     _output_token_limit,
+    _post_provider_with_retry,
     _provider_preferences,
     _provider_rejection_is_route_observable,
+    _ProviderCallError,
     _proxy_message,
     _public_embedding_response,
     _public_provider_response,
@@ -24,6 +27,56 @@ from ditto.api_server.endpoints.inference import (
     _validated_embedding_payload,
 )
 from ditto.api_server.endpoints.validator import _verify_signature
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_policy_retries_explicit_transient_statuses() -> None:
+    statuses = iter((503, 429, 200))
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(next(statuses), request=request)
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_provider_with_retry(
+            client,
+            "https://provider.example/v1/request",
+            payload={"model": "test"},
+            headers={},
+            sleep=no_sleep,
+        )
+
+    assert result.response.status_code == 200
+    assert result.attempts == 3
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_policy_does_not_repeat_ambiguous_read_timeout() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("provider response timed out", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(_ProviderCallError) as raised:
+            await _post_provider_with_retry(
+                client,
+                "https://provider.example/v1/request",
+                payload={"model": "test"},
+                headers={},
+            )
+
+    assert raised.value.attempts == 1
+    assert raised.value.timed_out is True
+    assert calls == 1
 
 
 def _exchange(keypair: bittensor.Keypair) -> InferenceExchangeRequest:

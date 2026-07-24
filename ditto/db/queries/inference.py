@@ -493,6 +493,7 @@ async def finish_inference_request(
     upstream_provider: str | None = None,
     timed_out: bool = False,
     latency_ms: int | None = None,
+    upstream_attempts: int = 0,
 ) -> bool:
     snapshot = await session.get(InferenceGrant, grant_id)
     if snapshot is None:
@@ -557,6 +558,7 @@ async def finish_inference_request(
     request.completion_tokens = completion_tokens
     request.cost_microusd = cost_microusd
     request.upstream_provider = upstream_provider
+    request.upstream_attempts = max(0, upstream_attempts)
     request.timed_out = timed_out
     request.latency_ms = latency_ms
     request.completed_at = now

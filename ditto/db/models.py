@@ -1960,6 +1960,9 @@ class InferenceRequest(Base):
     )
     cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     upstream_provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    upstream_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     timed_out: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     started_at: Mapped[datetime] = mapped_column(
@@ -1986,6 +1989,9 @@ class InferenceRequest(Base):
             "reserved_tokens > 0", name="inference_requests_reserved_tokens"
         ),
         CheckConstraint("generation > 0", name="inference_requests_generation"),
+        CheckConstraint(
+            "upstream_attempts >= 0", name="inference_requests_upstream_attempts"
+        ),
         Index("inference_requests_started_idx", "started_at"),
     )
 
