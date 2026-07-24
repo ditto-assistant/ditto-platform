@@ -222,6 +222,7 @@ from ditto.db.queries.screening import (
 from ditto.db.queries.tickets import (
     PROVISIONAL_CONTENDER_LANE_SIZE,
     get_score_continuation_floor,
+    get_score_priority_floors,
 )
 
 logger = logging.getLogger(__name__)
@@ -1947,6 +1948,7 @@ def _public_activity_response(
     requested_statuses: set[str],
     query: str | None,
     score_continuation_floor: float | None,
+    provisional_contender_floor: float | None,
     active_assignment_agent_ids: set[UUID],
     active_bench_version: int | None = None,
     benchmark_admitted_agent_ids: set[UUID] | None = None,
@@ -2005,6 +2007,13 @@ def _public_activity_response(
             if row_status != "below_score_floor"
             if 1 <= row.score_count < SCORING_QUORUM
             and row.provisional_composite is not None
+            and (
+                provisional_contender_floor is None
+                or (
+                    row.first_composite is not None
+                    and row.first_composite >= provisional_contender_floor
+                )
+            )
         ),
         key=lambda row: (
             -(row.provisional_composite or 0.0),
@@ -2242,6 +2251,10 @@ async def activity(
     if review == "ath":
         ath_opened_at, ath_composite = await _ath_review_public_snapshot(session, rows)
     assignments = await list_active_validator_assignments(session, now=now)
+    (
+        score_continuation_floor,
+        provisional_contender_floor,
+    ) = await get_score_priority_floors(session, bench_version=active_version)
     return _public_activity_response(
         rows=rows,
         active_work=await list_active_validator_work(
@@ -2252,9 +2265,8 @@ async def activity(
         limit=limit,
         requested_statuses=requested_statuses,
         query=q,
-        score_continuation_floor=await get_score_continuation_floor(
-            session, bench_version=active_version
-        ),
+        score_continuation_floor=score_continuation_floor,
+        provisional_contender_floor=provisional_contender_floor,
         active_assignment_agent_ids={
             assignment.agent.agent_id
             for assignment in assignments
@@ -2295,6 +2307,10 @@ async def operations(
     active_work = await list_active_validator_work(
         session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
     )
+    (
+        score_continuation_floor,
+        provisional_contender_floor,
+    ) = await get_score_priority_floors(session, bench_version=active_version)
     activity_snapshot = _public_activity_response(
         rows=activity_rows,
         active_work=active_work,
@@ -2303,9 +2319,8 @@ async def operations(
         limit=max(1, len(activity_rows)),
         requested_statuses=set(),
         query=None,
-        score_continuation_floor=await get_score_continuation_floor(
-            session, bench_version=active_version
-        ),
+        score_continuation_floor=score_continuation_floor,
+        provisional_contender_floor=provisional_contender_floor,
         active_assignment_agent_ids={
             assignment.agent.agent_id
             for assignment in assignments

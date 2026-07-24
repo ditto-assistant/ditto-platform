@@ -381,6 +381,22 @@ async def _seed_top_five_floor(
         )
 
 
+async def _seed_top_ten_floor(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    tenth_place: float = 0.60,
+    bench_version: int = DEFAULT_BENCH_VERSION,
+) -> None:
+    for rank, marker in enumerate("ABCDEFGHJK"):
+        composite = tenth_place + (9 - rank) * 0.01
+        await _seed_k3(
+            maker,
+            miner="5" + marker * 47,
+            composites=[composite, composite, composite],
+            details={"bench_version": bench_version},
+        )
+
+
 async def _seed_agent(
     maker: async_sessionmaker[AsyncSession],
     *,
@@ -1656,7 +1672,7 @@ class TestPublicActivity:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        await _seed_top_five_floor(session_maker, fifth_place=0.60)
+        await _seed_top_ten_floor(session_maker, tenth_place=0.60)
         zero_id = await _seed_agent(
             session_maker,
             miner=_MINER_A,

@@ -136,6 +136,46 @@ async def _seed_finalized_top_five(
                 )
 
 
+async def _seed_finalized_top_ten(
+    session: AsyncSession, *, tenth_place: float = 0.80
+) -> None:
+    """Establish ten ranked owners with ``tenth_place`` as the fast-lane floor."""
+    async with session.begin():
+        for rank in range(PROVISIONAL_CONTENDER_LANE_SIZE):
+            agent_id = uuid4()
+            composite = (
+                tenth_place + (PROVISIONAL_CONTENDER_LANE_SIZE - rank - 1) * 0.01
+            )
+            session.add(
+                Agent(
+                    agent_id=agent_id,
+                    miner_hotkey=f"5TopTen-{rank}",
+                    name=f"top-ten-{rank}",
+                    sha256=f"{rank + 200:064x}",
+                    status=AgentStatus.SCORED,
+                    screening_policy_version=SCREENING_POLICY_VERSION,
+                    created_at=_NOW - timedelta(days=2, minutes=rank),
+                )
+            )
+            for validator_index in range(SCORING_QUORUM):
+                session.add(
+                    Score(
+                        agent_id=agent_id,
+                        validator_hotkey=f"5TopTen-{rank}-{validator_index}",
+                        run_id=f"top-ten-{rank}-{validator_index}",
+                        signature=None,
+                        seed=123,
+                        composite=composite,
+                        tool_mean=composite,
+                        memory_mean=composite,
+                        median_ms=100,
+                        n=114,
+                        details=None,
+                        generated_at=_NOW,
+                    )
+                )
+
+
 async def _seed_two_scores_below_floor(
     session: AsyncSession, *, bench_version: int = 2
 ) -> UUID:
@@ -712,6 +752,79 @@ class TestIssueTicket:
         assert ticket is not None
         assert ticket.agent_id == fresh
 
+    async def test_below_top_ten_owner_history_does_not_pin_fresh_sibling(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_finalized_top_ten(session, tenth_place=0.80)
+        old = await _seed_evaluating(
+            session,
+            created_at=_NOW - timedelta(hours=2),
+            name="weak-old-generation",
+        )
+        fresh = await _seed_evaluating(
+            session,
+            created_at=_NOW - timedelta(hours=1),
+            name="fresh-generation",
+        )
+        async with session.begin():
+            for index, agent_id in enumerate((old, fresh)):
+                agent = await session.get(Agent, agent_id)
+                assert agent is not None
+                session.add(
+                    EvaluationPayment(
+                        block_hash=f"0xweak-owner-{index}",
+                        extrinsic_index=index,
+                        agent_id=agent_id,
+                        miner_hotkey=agent.miner_hotkey,
+                        miner_coldkey="5" + "C" * 47,
+                        amount_rao=1,
+                        tao_usd_rate=Decimal("1"),
+                        dest_address="5Destination",
+                        timestamp=_NOW,
+                    )
+                )
+            for index, composite in enumerate((0.10, 0.20)):
+                validator = f"5WeakOwnerScore-{index}"
+                session.add_all(
+                    [
+                        ValidatorTicket(
+                            agent_id=old,
+                            validator_hotkey=validator,
+                            status=TicketStatus.SCORED,
+                            issued_at=_NOW - timedelta(hours=1),
+                            deadline=_NOW,
+                            bench_version=2,
+                            attempt_count=1,
+                        ),
+                        Score(
+                            agent_id=old,
+                            validator_hotkey=validator,
+                            run_id=f"weak-owner-{index}",
+                            signature=None,
+                            seed=123,
+                            composite=composite,
+                            tool_mean=composite,
+                            memory_mean=composite,
+                            median_ms=100,
+                            n=114,
+                            details=None,
+                            generated_at=_NOW - timedelta(hours=1),
+                        ),
+                    ]
+                )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey="5FreshOwnerValidator",
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=2,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == fresh
+
     async def test_activated_era_expires_idle_old_nonmember_lease(
         self, session: AsyncSession
     ) -> None:
@@ -1268,47 +1381,96 @@ class TestIssueTicket:
         assert t2.agent_id == a1
         assert t2.agent_id != a2
 
-    async def test_prioritizes_one_score_completion_before_uncovered_work(
+    async def test_weak_first_score_does_not_precede_uncovered_work(
         self, session: AsyncSession
     ) -> None:
-        two_scores = await _seed_evaluating(
-            session, created_at=_NOW - timedelta(hours=2), name="two-scores"
-        )
-        one_score = await _seed_evaluating(
-            session, created_at=_NOW - timedelta(hours=1), name="one-score"
-        )
+        await _seed_finalized_top_ten(session, tenth_place=0.80)
         zero_scores = await _seed_evaluating(
-            session, created_at=_NOW, name="zero-scores"
+            session, created_at=_NOW - timedelta(hours=1), name="zero-scores"
         )
+        one_score = await _seed_evaluating(session, created_at=_NOW, name="one-score")
         async with session.begin():
-            for agent_id, validators in (
-                (two_scores, ("5A", "5B")),
-                (one_score, ("5C",)),
-            ):
-                for validator in validators:
-                    session.add(
-                        ValidatorTicket(
-                            agent_id=agent_id,
-                            validator_hotkey=validator,
-                            status=TicketStatus.SCORED,
-                            issued_at=_NOW,
-                            deadline=_NOW + _TTL,
-                            bench_version=2,
-                            attempt_count=1,
-                        )
-                    )
+            session.add_all(
+                [
+                    ValidatorTicket(
+                        agent_id=one_score,
+                        validator_hotkey="5Weak",
+                        status=TicketStatus.SCORED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                        bench_version=2,
+                        attempt_count=1,
+                    ),
+                    Score(
+                        agent_id=one_score,
+                        validator_hotkey="5Weak",
+                        run_id="weak-first-score",
+                        signature=None,
+                        seed=123,
+                        composite=0.05,
+                        tool_mean=0.05,
+                        memory_mean=0.05,
+                        median_ms=100,
+                        n=114,
+                        details=None,
+                        generated_at=_NOW,
+                    ),
+                ]
+            )
 
-        claimed: list[UUID] = []
         async with session.begin():
-            for _ in range(3):
-                ticket = await issue_ticket(
-                    session, validator_hotkey="5New", now=_NOW, ttl=_TTL
-                )
-                assert ticket is not None
-                ticket.status = TicketStatus.SCORED
-                claimed.append(ticket.agent_id)
+            ticket = await issue_ticket(
+                session, validator_hotkey="5New", now=_NOW, ttl=_TTL
+            )
 
-        assert claimed == [one_score, two_scores, zero_scores]
+        assert ticket is not None
+        assert ticket.agent_id == zero_scores
+
+    async def test_first_score_above_top_ten_floor_precedes_uncovered_work(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_finalized_top_ten(session, tenth_place=0.80)
+        zero_scores = await _seed_evaluating(
+            session, created_at=_NOW - timedelta(hours=1), name="zero-scores"
+        )
+        contender = await _seed_evaluating(session, created_at=_NOW, name="contender")
+        async with session.begin():
+            session.add_all(
+                [
+                    ValidatorTicket(
+                        agent_id=contender,
+                        validator_hotkey="5Strong",
+                        status=TicketStatus.SCORED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                        bench_version=2,
+                        attempt_count=1,
+                    ),
+                    Score(
+                        agent_id=contender,
+                        validator_hotkey="5Strong",
+                        run_id="strong-first-score",
+                        signature=None,
+                        seed=123,
+                        composite=0.90,
+                        tool_mean=0.90,
+                        memory_mean=0.90,
+                        median_ms=100,
+                        n=114,
+                        details=None,
+                        generated_at=_NOW,
+                    ),
+                ]
+            )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session, validator_hotkey="5New", now=_NOW, ttl=_TTL
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == contender
+        assert ticket.agent_id != zero_scores
 
     async def test_completion_lane_prioritizes_highest_provisional_score(
         self, session: AsyncSession
@@ -1871,7 +2033,7 @@ class TestIssueTicket:
         assert ticket is not None
         assert ticket.agent_id == newer
 
-    async def test_accepted_score_precedes_uncovered_work_despite_live_assignment(
+    async def test_uncovered_work_follows_noncontender_with_live_assignment(
         self, session: AsyncSession
     ) -> None:
         one_score = await _seed_evaluating(session, name="one-score")
@@ -1903,9 +2065,9 @@ class TestIssueTicket:
             )
 
         assert first is not None and first.agent_id == one_score
-        assert second is not None and second.agent_id == one_score
+        assert second is not None and second.agent_id == zero_scores
         assert first.agent_id != zero_scores
-        assert second.agent_id != zero_scores
+        assert second.agent_id != one_score
 
 
 class TestExpiry:
