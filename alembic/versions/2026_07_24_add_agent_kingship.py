@@ -27,9 +27,7 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.ForeignKeyConstraint(
-            ["agent_id"], ["agents.agent_id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("agent_id"),
     )
 

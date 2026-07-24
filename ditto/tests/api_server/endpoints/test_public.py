@@ -3694,9 +3694,7 @@ async def _crown(
     """Mark an agent as having held the KOTH crown at ``first_crowned_at``."""
     async with maker() as session, session.begin():
         session.add(
-            AgentKingship(
-                agent_id=UUID(agent_id), first_crowned_at=first_crowned_at
-            )
+            AgentKingship(agent_id=UUID(agent_id), first_crowned_at=first_crowned_at)
         )
 
 
