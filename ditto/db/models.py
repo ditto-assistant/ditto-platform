@@ -2388,3 +2388,68 @@ class ScoreAuditEntry(Base):
         UniqueConstraint("entry_hash", name="score_audit_log_entry_hash_key"),
         Index("score_audit_log_agent_id_idx", "agent_id"),
     )
+
+
+class EfficiencyBonusSettingsRevision(Base):
+    """Append-only, operator-audited relative-efficiency-bonus policy revision.
+
+    The hot-swappable successor to the ``DITTO_EFFICIENCY_BONUS_*`` boot env
+    (:class:`ditto.api_server.config.EfficiencyBonusConfig`): each row freezes a
+    full policy (both booleans + all eight numeric knobs) as JSON, and the
+    compute path reads the latest one at run time (short TTL) so a backroom
+    change lands with no redeploy. Rows are **append-only**: nothing UPDATEs or
+    deletes one, so the audit trail is complete. When no row exists the env seed
+    governs, so an untouched deployment is byte-identical to pre-change.
+
+    Scope is subnet-global (only ``*``); the column mirrors the other revision
+    tables' shape and leaves room for future per-board scoping. The frozen knobs
+    that reproduce a published bonus live on ``efficiency_cohort_snapshots``, not
+    here, so changing this policy never mutates an already-frozen snapshot.
+    """
+
+    __tablename__ = "efficiency_bonus_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope = '*' OR length(scope) BETWEEN 1 AND 63",
+            name="efficiency_bonus_settings_scope_check",
+        ),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="efficiency_bonus_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="efficiency_bonus_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="efficiency_bonus_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="efficiency_bonus_settings_actor_check",
+        ),
+        Index(
+            "efficiency_bonus_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="efficiency_bonus_settings_scope_parent_key",
+        ),
+    )

@@ -1404,7 +1404,14 @@ async def leaderboard(
     now = datetime.now(UTC)
     from ditto.db.queries.benchmark_rollout import open_rollout
 
-    efficiency_config = request.app.state.config.efficiency_bonus
+    # Resolve the hot-swappable efficiency-bonus policy (latest append-only
+    # revision overlaid on the env seed, short TTL) BEFORE ensure_efficiency_state
+    # opens its own transaction on this session — the resolver reads on an
+    # independent session so the request session stays pristine for that begin().
+    # A backroom flip therefore lands on the next leaderboard read with no restart.
+    efficiency_config = await request.app.state.efficiency_settings.resolve(
+        getattr(request.app.state, "session_maker", None)
+    )
     if efficiency_config.enabled and bench_version is None:
         # Materialize the current efficiency epoch (frozen cohort snapshot +
         # insert-once bonus rows) before any other read opens a transaction on

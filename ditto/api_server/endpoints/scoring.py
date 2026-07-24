@@ -315,8 +315,13 @@ async def scores(
         # surfaced to validators only behind the fold flag; with it off the
         # ledger is byte-identical to the pre-bonus wire shape, and the
         # subnet's weight fold must ship its own consensus change before any
-        # validator may consume these advisory fields.
-        efficiency_config = request.app.state.config.efficiency_bonus
+        # validator may consume these advisory fields. The enabled/fold state is
+        # read at compute time from the hot-swappable policy (latest revision,
+        # short TTL) so a backroom flip lands here with no restart; the
+        # `fold requires enabled` invariant is enforced by the resolver.
+        efficiency_config = await request.app.state.efficiency_settings.resolve(
+            getattr(request.app.state, "session_maker", None)
+        )
         if efficiency_config.enabled and efficiency_config.fold_enabled:
             bonus_rows = await get_bonus_rows(
                 session,

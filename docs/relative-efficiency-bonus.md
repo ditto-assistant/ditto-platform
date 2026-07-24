@@ -208,6 +208,49 @@ All are validated at boot (`check_config`); the process refuses to start with
 an out-of-range cap, `cohort_size < min_cohort`, `min_cohort < 2`, or fold
 exposure without the master switch.
 
+## Hot-swappable settings (no redeploy)
+
+The env knobs above are the **seed default**. All of them — both booleans and
+all eight numeric knobs — are also runtime-settable from backroom via an
+append-only revision table (`efficiency_bonus_settings_revisions`) behind
+`admin/efficiency-bonus-settings`, so an operator can enable / disable / fold
+the bonus and retune every knob **live, with no redeploy** (enable → watch the
+shadow → flip the fold → maybe roll back). Modeled on
+`admin_screener_review_settings` / `admin_benchmark_rollout`: optimistic
+concurrency (`expected_revision`), a typed confirmation string, and an
+actor/reason audit trail; the table is append-only, so every change is
+recoverable history.
+
+* **Read path.** The three compute points — `ensure_efficiency_state` and
+  `read_efficiency_board` (materialize + board read) and the validator fold in
+  `scoring.py` — resolve the *latest* revision at compute time through
+  `EfficiencyBonusSettingsResolver` (a short TTL cache,
+  `DITTO_EFFICIENCY_BONUS_SETTINGS_TTL_SECONDS`, default 5 s; the admin write
+  also invalidates the cache immediately). A backroom change therefore lands on
+  the next leaderboard / ledger read with no restart. The resolver reads on an
+  independent session, so it never disturbs the request transaction.
+* **Seed = byte-identical default.** With no revision written, the env seed
+  governs, so an untouched deployment is exactly the pre-change behavior
+  (default off).
+* **`fold requires enabled` is enforced at read time**, not only at boot: a
+  persisted `fold_enabled=true` with `enabled=false` folds nothing.
+* **Reproducibility is preserved.** The knobs that reproduce a published bonus
+  are frozen **in the epoch snapshot** (`efficiency_cohort_snapshots`:
+  `bonus_cap`, `deep_bonus_cap`, `deep_frontier_ratio`, `curve_version`,
+  `cohort_limit`, `n_min`, `quality_floor`, `memory_floor`, the reference
+  statistics, and the membership) at freeze time — so changing a setting mid
+  epoch never mutates an already-frozen snapshot or its insert-once bonuses,
+  exactly as changing an env knob never did. Only **future** epochs pick up the
+  new values.
+
+Backroom drives it through a dedicated MCP tool that wraps this endpoint
+(`set_efficiency_bonus_settings` → `POST /admin/efficiency-bonus-settings`),
+distinct from the product's `set_feature_flag_override` (which governs per-user
+consumer entitlements in `backend`, a different service). To enable the bonus:
+apply a revision with `enabled: true` (confirmation `APPLY EFFICIENCY BONUS
+ENABLED`). To fold it into validator weights (separately, later): apply a
+revision with `enabled: true, fold_enabled: true`.
+
 ## Activation lifecycle
 
 1. **Dark (today).** `DITTO_EFFICIENCY_BONUS_ENABLED=false`. Nothing is
@@ -220,10 +263,14 @@ exposure without the master switch.
    an active snapshot; every finalized qualified agent gets its insert-once
    bonus row; the leaderboard shows base / bonus / effective distinctly.
 4. **Fold (later, cross-repo).** After ditto-subnet ships a weight-fold
-   consensus change that consumes `effective_composite`, set
-   `DITTO_EFFICIENCY_BONUS_FOLD_ENABLED=true` so the ledger carries the
-   fields. Until both halves are done, emissions remain a pure function of
-   the base composite.
+   consensus change that consumes `effective_composite`, flip the fold on
+   (`fold_enabled: true` via the settings endpoint, or
+   `DITTO_EFFICIENCY_BONUS_FOLD_ENABLED=true` as the seed) so the ledger
+   carries the fields. Until both halves are done, emissions remain a pure
+   function of the base composite.
+
+Each of these transitions can be a live backroom settings change (no restart);
+the env vars remain the seed default for a fresh deployment.
 
 ### Operational runbook: enabling on v7
 
@@ -234,20 +281,21 @@ exposure without the master switch.
    `token_efficiency.formula_version == "v7-quality-only-v1"` with complete
    `token_usage` blocks.
 3. Pick the epoch's policy: leave defaults (`cap 5%`, `deep cap 10%`, `deep
-   frontier 0.5 x P25`, `N=25`, `N_min 8`, 24 h epochs) or set the env knobs.
-   Set static floors if the first epoch should already gate quality (e.g.
-   `QUALITY_FLOOR=0.3`). To run tier 1 only, set `DEEP_CAP` equal to `CAP`
-   (the ramp collapses to flat `cap` below P25 — bonuses never drop from
-   disabling tier 2 mid-flight because old snapshots keep their frozen
-   policy).
-4. Set `DITTO_EFFICIENCY_BONUS_ENABLED=true` and restart. The next
-   leaderboard read freezes the first snapshot.
+   frontier 0.5 x P25`, `N=25`, `N_min 8`, 24 h epochs) or set the knobs (env
+   seed, or a settings revision). Set static floors if the first epoch should
+   already gate quality (e.g. `quality_floor 0.3`). To run tier 1 only, set
+   `deep_cap` equal to `cap` (the ramp collapses to flat `cap` below P25 —
+   bonuses never drop from disabling tier 2 mid-flight because old snapshots
+   keep their frozen policy).
+4. Turn the master switch on — apply a settings revision with `enabled: true`
+   from backroom (no restart), or set `DITTO_EFFICIENCY_BONUS_ENABLED=true` as
+   the seed. The next leaderboard read freezes the first snapshot.
 5. Verify: `/public/leaderboard` → `efficiency.active`; when true, spot-check
    one entry's bonus against its snapshot via
    `/public/efficiency/snapshots/{id}` (P25/median + the entry's
    `token_total`).
-6. Leave `DITTO_EFFICIENCY_BONUS_FOLD_ENABLED=false` until the subnet-side
-   fold change is reviewed, shipped, and coordinated.
+6. Leave the fold off (`fold_enabled: false`) until the subnet-side fold change
+   is reviewed, shipped, and coordinated.
 
 Changing `cap` / floors / `N` mid-flight only affects **future** epochs'
 snapshots; frozen snapshots and assigned bonuses never move.
