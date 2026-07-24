@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Start the Ditto Platform API on a host:
-#   1. load .env
+#   1. load the Ansible-owned .env and optional deploy-owned .env.deploy
 #   2. sync dependencies
 #   3. bring up the Docker infra it needs and wait until healthy
 #   4. apply database migrations
@@ -25,8 +25,13 @@ fi
 command -v uv  >/dev/null 2>&1 || { echo "ERROR: uv not installed"  >&2; exit 1; }
 command -v pm2 >/dev/null 2>&1 || { echo "ERROR: pm2 not installed (npm i -g pm2)" >&2; exit 1; }
 
-# Export .env into the environment pm2 will inherit.
-set -a; . ./.env; set +a
+# Export the base environment, then let deploy-owned runtime values override it.
+set -a
+. ./.env
+if [ -f .env.deploy ]; then
+  . ./.env.deploy
+fi
+set +a
 
 echo "==> syncing dependencies"
 uv sync

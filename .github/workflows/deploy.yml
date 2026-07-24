@@ -18,20 +18,21 @@ name: Deploy
 #                             (gcp-platform output `platform_deploy_sa_email`)
 #   Per-Environment (`dev` and `prod` GitHub Environments):
 #     DITTO_UPLOAD_PAYMENT_ADDRESS  (secret) the env's SS58 upload-fee receive
-#       address. Injected into the VM's .env at deploy time (NOT stored in infra).
+#       address. Injected into the VM's mode-0600 .env.deploy at deploy time
+#       (NOT stored in infra).
 #       The `prod` environment is where you add required reviewers if you want a
 #       manual gate before prod deploys.
 #     DITTO_DASHBOARD_WANDB_URL     (variable, optional) public wandb project URL
 #       shown as the dashboard's "full telemetry" link, e.g.
-#       https://wandb.ai/<entity>/ditto-sn118. Upserted into .env by update.sh;
-#       unset just leaves the SPA's default link.
+#       https://wandb.ai/<entity>/ditto-sn118. Upserted into .env.deploy by
+#       update.sh; unset just leaves the SPA's default link.
 
 on:
   push:
     branches: [dev, main]
   # Manual redeploy without a code push — e.g. to pick up a changed repo
   # variable/secret (DITTO_DASHBOARD_WANDB_URL, DITTO_UPLOAD_PAYMENT_ADDRESS)
-  # into the VM .env. Target VM follows the branch it's dispatched on
+  # into the VM .env.deploy. Target VM follows the branch it's dispatched on
   # (main -> prod, anything else -> dev), same as the push path.
   workflow_dispatch:
 
@@ -89,15 +90,18 @@ jobs:
         # are on PATH (a bare `sudo -u deploy` uses a minimal secure_path and
         # would fail on `uv`/`pm2`). DITTO_UPLOAD_PAYMENT_ADDRESS is the env-scoped
         # GitHub secret (a public on-chain receive address); update.sh upserts it
-        # into the VM's .env before (re)starting. The optional Taostats API key is
-        # read on the VM from `platform-taostats-api-key` in Secret Manager via
-        # the attached runtime service account, never passed through this job.
+        # into the VM's .env.deploy before (re)starting. The workflow checks out
+        # the target first so the first deployment of an updater change executes
+        # the new script rather than the old process inode. The optional Taostats
+        # API key is read on the VM from `platform-taostats-api-key` in Secret
+        # Manager via the attached runtime service account, never passed through
+        # this job.
         run: |
           gcloud compute ssh "${{ steps.target.outputs.vm }}" \
             --zone "$GCP_ZONE" \
             --tunnel-through-iap \
             --quiet \
-            --command "sudo -iu deploy bash -lc 'cd /opt/ditto-platform && DITTO_DEPLOY_BRANCH=${{ steps.target.outputs.branch }} DITTO_UPLOAD_PAYMENT_ADDRESS=${{ secrets.DITTO_UPLOAD_PAYMENT_ADDRESS }} DITTO_DASHBOARD_WANDB_URL=${{ vars.DITTO_DASHBOARD_WANDB_URL }} ./scripts/update.sh'"
+            --command "sudo -iu deploy bash -lc 'cd /opt/ditto-platform && git fetch --prune origin && git checkout -fB ${{ steps.target.outputs.branch }} origin/${{ steps.target.outputs.branch }} && git reset --hard origin/${{ steps.target.outputs.branch }} && DITTO_DEPLOY_BRANCH=${{ steps.target.outputs.branch }} DITTO_UPLOAD_PAYMENT_ADDRESS=${{ secrets.DITTO_UPLOAD_PAYMENT_ADDRESS }} DITTO_DASHBOARD_WANDB_URL=${{ vars.DITTO_DASHBOARD_WANDB_URL }} ./scripts/update.sh'"
 
       - name: Health check
         # Hits the public Caddy endpoint, so it depends on public DNS + the VM's

@@ -1,8 +1,9 @@
 // pm2 process definition for the Ditto Platform API.
 //
 // The API is a long-lived host process; Postgres/MinIO/Pylon stay in Docker.
-// Env is loaded from .env by scripts/start.sh before pm2 starts (pm2 inherits
-// the parent environment), so this file does not re-parse .env.
+// Env is loaded from .env plus optional .env.deploy by scripts/start.sh or
+// scripts/update.sh before pm2 starts (pm2 inherits the parent environment), so
+// this file does not parse environment files itself.
 //
 //   pm2 start scripts/ecosystem.config.js --update-env
 //   pm2 logs ditto-api
