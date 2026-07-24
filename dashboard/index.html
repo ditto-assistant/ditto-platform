@@ -1051,9 +1051,9 @@
     .tip::after, .tip-chip::after { left: 0; top: calc(100% + 8px); }
     .retry-info:hover::after,
     .retry-info:focus-visible::after,
-    .tip:hover::after,
-    .tip:focus-visible::after,
-    .tip-chip:hover::after {
+    .tip[data-tooltip]:hover::after,
+    .tip[data-tooltip]:focus-visible::after,
+    .tip-chip[data-tooltip]:hover::after {
       display: block;
     }
     .retry-info:focus-visible,
@@ -4204,7 +4204,10 @@
       } else {
         html = '<div class="champion-state">No reigning champion in the current pool — the KOTH fold has no eligible finalized run yet. Raw rank #1 leads the board below.</div>';
       }
-      if (html !== lastChampionHtml) { body.innerHTML = html; lastChampionHtml = html; }
+      // Rewire tooltip descriptions here too: the board-row pass skips its
+      // rebuild (and its wireTips call) when the visible slice is unchanged,
+      // which can coincide with a champion change.
+      if (html !== lastChampionHtml) { body.innerHTML = html; lastChampionHtml = html; wireTips(); }
     }
 
     // ── Render ───────────────────────────────────────────────
@@ -4400,7 +4403,7 @@
           '<span class="emission-badge champion"><span aria-hidden="true">●</span> KOTH champion</span> · ' +
           (championEntry ? entityAnchor("agent", championEntry.agent_id, championName) : esc(championName)) +
           ' (' + esc(championRank) + ') receives ' + pct(championRecipient && Number.isFinite(championRecipient.share_of_miner_pool) ? championRecipient.share_of_miner_pool : emissions.champion_share) + ' of the miner pool.' +
-          (championConfirmations ? ' <span class="tip" title="Distinct champion-anchored seeds scored by the continual top-five lane.">· ' + esc(championConfirmations) + '</span>' : '');
+          (championConfirmations ? ' <span class="tip" tabindex="0" data-tooltip="Distinct champion-anchored seeds scored by the continual top-five lane.">· ' + esc(championConfirmations) + '</span>' : '');
         // Every consensus constant in this strip comes from the fold the API
         // reports (margin, dethrone_z, champion_share, rank_shares, tail_size). Hardcoding
         // any of them lets the copy drift from the rule actually being applied.
@@ -4557,11 +4560,13 @@
           : '<span class="rank prov-rank tip-chip" data-tooltip="Not ranked (' + (kind === "zero" ? "scored 0.000" : "provisional run") + ').">–</span>';
         var displayAgentName = agentName(e.agent_name);
         var accessibleAgentName = agentLabel(e.agent_name, e.agent_version);
+        // Keep the row label to what identifies the row (rank, agent, score,
+        // KOTH role). UID, hotkey, and chain weight live in the cells and the
+        // run-detail modal; repeating them here made every row a ~40-word
+        // utterance when arrowing through the board.
         var rowLabel = (elig ? (finalizedEntry ? "Rank " : "Provisional rank ") + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
-          ", agent " + accessibleAgentName + ", miner UID " + (e.miner_uid == null ? "unavailable" : e.miner_uid) +
-          ", hotkey " + shortKey(e.miner_hotkey) + ", composite " + fx(displayComposite(e)) +
-          (emission ? ", KOTH " + emission.role + " receiving " + pct(emission.share_of_miner_pool) + " of the miner pool" : "") +
-          (chainWeight ? ", " + chainWeightLabel(chainWeight) : "") + ". Activate for run detail.";
+          ", agent " + accessibleAgentName + ", composite " + fx(displayComposite(e)) +
+          (emission ? ", KOTH " + emission.role : "") + ". Activate for run detail.";
         var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge tip-chip" data-tooltip="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
           esc(e.score_count || 0) + ' of ' + esc(e.score_quorum || 3) + ' · provisional</span>';
         var registrationBadge = registered
