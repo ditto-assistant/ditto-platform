@@ -204,6 +204,25 @@ class TestDashboard:
         assert ">Score rank</span>" in body
         assert ">Emissions</span>" in body
         assert 'id="emissions-strip" role="status" aria-live="polite"' in body
+        assert "function artifactReleaseCopy(release)" in body
+        assert "function artifactReleaseNote(release)" in body
+        assert "function renderArtifactRelease(release, agentId)" in body
+        assert "function downloadArtifact(agentId, button)" in body
+        assert '"/public/agent/" + encodeURIComponent(agentId) + "/artifact"' in body
+        assert 'cache: "no-store"' in body
+        assert "Download submitted source" in body
+        assert "The 3/3 score quorum" in body
+        assert "Number(release.embargo_hours) || 24" in body
+        assert "privacy window" in body
+        assert "the original 3/3 timestamp still applies" in body
+        assert "function relTimeUntil(iso)" in body
+        assert "relTimeUntil(release.available_at)" in body
+        assert "relTime(release.available_at)" not in body
+        assert "window.location.assign(data.download_url)" in body
+        assert "Download started" in body
+        assert "Download opened" not in body
+        assert "public/king/artifact" not in body
+        assert "continuous 24-hour reign" not in body
         assert 'id="chain-observation"' in body
         assert 'getJSON("/public/weights")' in body
         assert "Commit-reveal can make this lag active commitments" in body
