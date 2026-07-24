@@ -433,6 +433,49 @@ class PublicLeaderboardEntry(BaseModel):
             description="Pre-efficiency v5 quality score, when present.",
         ),
     ] = None
+    efficiency_bonus: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=0.1,
+            description=(
+                "Frozen platform-side relative token-efficiency bonus fraction "
+                "(bench_version >= 7 only). Assigned once against the frozen "
+                "cohort snapshot of the epoch this submission finalized in and "
+                "never recomputed. Strictly additive: never negative, capped at "
+                "the epoch's frozen B_max. Null below bench_version 7, while "
+                "the bonus is disabled/inactive, or before assignment."
+            ),
+        ),
+    ] = None
+    effective_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.1,
+            description=(
+                "composite * (1 + efficiency_bonus): the platform-side ranking "
+                "score with the frozen bonus applied. The validator's composite "
+                "is never modified; this is a separate, derived field so the UI "
+                "can show provenance (base, bonus, effective) distinctly. Null "
+                "whenever efficiency_bonus is null."
+            ),
+        ),
+    ] = None
+    efficiency_snapshot_id: Annotated[
+        UUID | None,
+        Field(
+            default=None,
+            description=(
+                "Id of the frozen cohort snapshot the bonus was computed "
+                "against (the bonus_reference provenance pointer); resolvable "
+                "at /public/efficiency/snapshots/{snapshot_id}. Null whenever "
+                "efficiency_bonus is null."
+            ),
+        ),
+    ] = None
     composite_stderr: Annotated[
         float | None,
         Field(
@@ -773,6 +816,176 @@ class PublicKothEmissions(BaseModel):
     recipients: list[PublicEmissionRecipient] = Field(default_factory=list)
 
 
+class PublicEfficiencyStatus(BaseModel):
+    """Where the relative token-efficiency bonus stands for a displayed board.
+
+    Only present for bench_version >= 7 boards while the bonus feature is
+    enabled. ``active=false`` means the frozen cohort has not reached the
+    ``n_min`` activation gate (after lineage dedupe) — every bonus is zero and
+    entries carry null efficiency fields until a later epoch activates.
+    """
+
+    active: Annotated[
+        bool,
+        Field(description="Whether the governing frozen cohort awards bonuses."),
+    ]
+    bench_version: Annotated[int, Field(ge=7)]
+    run_size: Annotated[
+        str, Field(description="Generator profile of the cohort (ranked = full).")
+    ]
+    epoch_index: Annotated[
+        int,
+        Field(description="Efficiency epoch ordinal of the governing snapshot."),
+    ]
+    snapshot_id: Annotated[
+        UUID,
+        Field(
+            description=(
+                "Frozen cohort snapshot id; resolvable at "
+                "/public/efficiency/snapshots/{snapshot_id}."
+            )
+        ),
+    ]
+    cohort_size: Annotated[
+        int,
+        Field(ge=0, description="Deduped qualified cohort members at freeze time."),
+    ]
+    n_min: Annotated[
+        int, Field(ge=2, description="Activation gate on the deduped cohort size.")
+    ]
+    bonus_cap: Annotated[
+        float,
+        Field(
+            gt=0.0,
+            le=0.1,
+            description="Frozen tier-1 bonus fraction B_max (the value at P25).",
+        ),
+    ]
+    curve_version: Annotated[
+        int,
+        Field(
+            default=1,
+            ge=1,
+            description=(
+                "Frozen bonus-curve policy: 1 = single-tier (cap at/below "
+                "P25), 2 = two-tier (cap ramps to deep_bonus_cap between P25 "
+                "and the deep frontier, then saturates flat)."
+            ),
+        ),
+    ] = 1
+    deep_bonus_cap: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0.0,
+            le=0.1,
+            description=(
+                "Frozen tier-2 saturation cap (two-tier curve only): the flat "
+                "bonus at or below the deep frontier. Null under the "
+                "single-tier policy."
+            ),
+        ),
+    ] = None
+    deep_frontier_tokens: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            description=(
+                "The deep frontier in tokens (deep_frontier_ratio x P25): "
+                "usage at or below it earns the flat deep_bonus_cap — no "
+                "extra reward for racing further toward zero. Null while "
+                "inactive or under the single-tier policy."
+            ),
+        ),
+    ] = None
+    reference_p25_tokens: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            description=(
+                "Efficient-quartile frontier (nearest-rank P25 of the cohort's "
+                "audited chat token totals): the tier-1 full-bonus point. "
+                "Null while inactive."
+            ),
+        ),
+    ] = None
+    reference_median_tokens: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            description=(
+                "Cohort median of audited chat token totals: usage at or above "
+                "it earns zero bonus (linear in between). Null while inactive."
+            ),
+        ),
+    ] = None
+
+
+class PublicEfficiencyCohortMember(BaseModel):
+    """One frozen cohort entry, public-safe (no raw lineage digests)."""
+
+    agent_id: UUID
+    miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    composite: Annotated[float, Field(ge=0.0, le=1.0)]
+    memory_mean: Annotated[float, Field(ge=0.0, le=1.0)]
+    token_total: Annotated[
+        float,
+        Field(ge=0.0, description="Audited chat token total (quorum median)."),
+    ]
+    lineage_group: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Opaque ordinal of this entry's lineage within the snapshot. "
+                "The raw lineage digest (normalized-source / artifact hash) is "
+                "moderation-adjacent and never exposed."
+            ),
+        ),
+    ]
+    collapsed_agent_ids: Annotated[
+        list[UUID],
+        Field(
+            default_factory=list,
+            description=(
+                "Other qualified agents collapsed into this entry because they "
+                "shared its lineage (one lineage cannot define the frontier)."
+            ),
+        ),
+    ]
+
+
+class PublicEfficiencySnapshotResponse(BaseModel):
+    """One immutable frozen cohort snapshot — the full audit record a bonus is
+    reproducible from (membership, floors, reference statistics)."""
+
+    snapshot_id: UUID
+    bench_version: Annotated[int, Field(ge=7)]
+    run_size: str
+    epoch_index: int
+    active: bool
+    cohort_limit: Annotated[int, Field(ge=2)]
+    n_min: Annotated[int, Field(ge=2)]
+    bonus_cap: Annotated[float, Field(gt=0.0, le=0.1)]
+    curve_version: Annotated[int, Field(default=1, ge=1)] = 1
+    deep_bonus_cap: Annotated[float | None, Field(default=None, gt=0.0, le=0.1)] = None
+    deep_frontier_ratio: Annotated[
+        float | None, Field(default=None, gt=0.0, lt=1.0)
+    ] = None
+    quality_floor: Annotated[float, Field(ge=0.0, le=1.0)]
+    memory_floor: Annotated[float, Field(ge=0.0, le=1.0)]
+    reference_p25_tokens: Annotated[float | None, Field(default=None, ge=0.0)] = None
+    reference_median_tokens: Annotated[float | None, Field(default=None, ge=0.0)] = None
+    computed_at: datetime
+    members: Annotated[
+        list[PublicEfficiencyCohortMember],
+        Field(default_factory=list, description="Frozen deduped cohort entries."),
+    ]
+
+
 class PublicLeaderboardResponse(BaseModel):
     """Raw score standings plus the current KOTH emissions projection."""
 
@@ -848,6 +1061,19 @@ class PublicLeaderboardResponse(BaseModel):
             description=(
                 "Current KOTH fold over finalized, full-benchmark entries on the "
                 "current benchmark. Null when no entry can receive emissions."
+            ),
+        ),
+    ] = None
+    efficiency: Annotated[
+        PublicEfficiencyStatus | None,
+        Field(
+            default=None,
+            description=(
+                "Relative token-efficiency bonus status for this board. Null "
+                "below bench_version 7, while the feature is disabled, or "
+                "before the first cohort snapshot is frozen. active=false "
+                "means the frozen cohort has not reached its n_min activation "
+                "gate and every bonus is zero."
             ),
         ),
     ] = None

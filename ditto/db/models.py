@@ -1012,6 +1012,197 @@ class ConfirmationScore(Base):
     )
 
 
+class EfficiencyCohortSnapshot(Base):
+    """One frozen relative token-efficiency cohort (bench_version >= 7).
+
+    The platform-side relative bonus (:mod:`ditto.api_server.efficiency`)
+    freezes, once per efficiency epoch, the quality-qualified lineage-deduped
+    cohort for a ``(bench_version, run_size)`` board together with its robust
+    reference statistics (nearest-rank P25 frontier + median zero point) and
+    the quality floors in force. Rows are **append-only and immutable**: a new
+    epoch inserts a new row; nothing ever UPDATEs or deletes one, so every
+    published bonus stays reproducible from stored data alone. The
+    deterministic validator composite is never derived from or affected by
+    this table.
+    """
+
+    __tablename__ = "efficiency_cohort_snapshots"
+
+    snapshot_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    """Client-generated UUID; referenced by ``efficiency_bonuses`` rows."""
+
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Benchmark contract the cohort was drawn from (always >= 7)."""
+
+    run_size: Mapped[str] = mapped_column(Text, nullable=False)
+    """Generator profile of the cohort's runs (``full`` for ranked boards)."""
+
+    epoch_index: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    """Platform efficiency epoch ordinal (fixed UTC windows since the Unix
+    epoch; see :func:`ditto.api_server.efficiency.epoch_index_for`)."""
+
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    """Whether the cohort met ``n_min`` after lineage dedupe. Inactive
+    snapshots freeze the observation but award no bonus."""
+
+    cohort_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Top-N cap on cohort membership in force at freeze time."""
+
+    n_min: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Minimum deduped cohort size required for activation."""
+
+    bonus_cap: Mapped[float] = mapped_column(Float, nullable=False)
+    """Tier-1 maximum bonus fraction (``B_max``) frozen for this epoch: the
+    value the curve reaches at the P25 frontier."""
+
+    curve_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+    """Bonus-curve policy this snapshot was frozen under
+    (:data:`ditto.api_server.efficiency.CURVE_VERSION_SINGLE_TIER` /
+    ``CURVE_VERSION_TWO_TIER``). Stored so a historical snapshot reproduces
+    its bonuses under ITS policy forever, regardless of later curve changes."""
+
+    deep_bonus_cap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """Tier-2 saturation cap frozen for this epoch (two-tier curve only):
+    the flat bonus at or below the deep frontier. ``>= bonus_cap``, <= 0.10.
+    Null under the single-tier policy."""
+
+    deep_frontier_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """Deep frontier as a fraction of the P25 reference (two-tier curve
+    only), in (0, 1). Null under the single-tier policy."""
+
+    quality_floor: Mapped[float] = mapped_column(Float, nullable=False)
+    """Composite floor (``Q_min``) applied at freeze time."""
+
+    memory_floor: Mapped[float] = mapped_column(Float, nullable=False)
+    """Memory-mean floor (``M_min``) applied at freeze time, so a harness
+    cannot buy efficiency by sacrificing the memory half."""
+
+    reference_p25_tokens: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """Efficient-quartile frontier (nearest-rank P25 of cohort audited chat
+    token totals); null while inactive."""
+
+    reference_median_tokens: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """Cohort median of audited chat token totals (the zero-bonus point);
+    null while inactive."""
+
+    members: Mapped[list | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    """Frozen cohort membership: a list of ``{agent_id, miner_hotkey,
+    lineage_key, composite, memory_mean, token_total, collapsed_agent_ids}``
+    dicts, the full audit record a bonus is reproducible from. Lineage keys
+    are moderation-adjacent digests; public projections expose only opaque
+    group ordinals, never the raw keys."""
+
+    computed_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """When this immutable snapshot was frozen (UTC). Never updated."""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "bench_version",
+            "run_size",
+            "epoch_index",
+            name="efficiency_cohort_snapshots_epoch_key",
+        ),
+        CheckConstraint(
+            "bench_version >= 7",
+            name="efficiency_cohort_snapshots_bench_version_check",
+        ),
+        CheckConstraint(
+            "bonus_cap > 0 AND bonus_cap <= 0.1",
+            name="efficiency_cohort_snapshots_cap_check",
+        ),
+        CheckConstraint(
+            "deep_bonus_cap IS NULL OR "
+            "(deep_bonus_cap >= bonus_cap AND deep_bonus_cap <= 0.1)",
+            name="efficiency_cohort_snapshots_deep_cap_check",
+        ),
+        CheckConstraint(
+            "deep_frontier_ratio IS NULL OR "
+            "(deep_frontier_ratio > 0 AND deep_frontier_ratio < 1)",
+            name="efficiency_cohort_snapshots_deep_frontier_check",
+        ),
+        CheckConstraint(
+            "curve_version >= 1",
+            name="efficiency_cohort_snapshots_curve_version_check",
+        ),
+        CheckConstraint("n_min >= 2", name="efficiency_cohort_snapshots_n_min_check"),
+        Index(
+            "efficiency_cohort_snapshots_board_idx",
+            "bench_version",
+            "run_size",
+            "epoch_index",
+        ),
+    )
+
+
+class EfficiencyBonus(Base):
+    """One agent's frozen relative token-efficiency bonus (bench_version >= 7).
+
+    Insert-once per ``(agent_id, bench_version)``: assigned against the frozen
+    cohort snapshot of the epoch the submission finalized in (strictly-upside
+    zero rows included, so "no bonus" is as frozen as "5%") and **never
+    updated**, so a published effective score can never drift when later
+    submissions arrive. ``effective_composite = composite * (1 + bonus)`` is
+    derived at read time; the validator's composite is never modified.
+    """
+
+    __tablename__ = "efficiency_bonuses"
+
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """FK to ``agents.agent_id``. PK part 1."""
+
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Benchmark contract of the bonused board. PK part 2."""
+
+    snapshot_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """The frozen cohort snapshot this bonus was computed against (the
+    ``bonus_reference`` provenance pointer)."""
+
+    token_total: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """The audited chat token total the bonus was computed from (median of
+    the quorum's complete relay-metered totals); null when no quorum row
+    carried complete audited usage (bonus is then necessarily 0)."""
+
+    bonus: Mapped[float] = mapped_column(Float, nullable=False)
+    """The frozen additive bonus fraction in ``[0, 0.1]``; never negative."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """When this immutable row was assigned (UTC). Never updated."""
+
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "agent_id", "bench_version", name="efficiency_bonuses_pkey"
+        ),
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="CASCADE",
+            name="efficiency_bonuses_agent_id_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_id"],
+            ["efficiency_cohort_snapshots.snapshot_id"],
+            name="efficiency_bonuses_snapshot_id_fkey",
+        ),
+        CheckConstraint(
+            "bonus >= 0 AND bonus <= 0.1", name="efficiency_bonuses_bonus_range_check"
+        ),
+        CheckConstraint(
+            "bench_version >= 7", name="efficiency_bonuses_bench_version_check"
+        ),
+        Index("efficiency_bonuses_snapshot_idx", "snapshot_id"),
+    )
+
+
 class BenchmarkDataset(Base):
     """Immutable dataset pin for one agent and benchmark version."""
 

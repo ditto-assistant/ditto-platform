@@ -113,6 +113,67 @@ class InferenceProxyConfig:
 
 
 @dataclass(frozen=True)
+class EfficiencyBonusConfig:
+    """Platform-side relative token-efficiency bonus (bench_version >= 7).
+
+    See :mod:`ditto.api_server.efficiency` and
+    ``docs/relative-efficiency-bonus.md``. Everything is default-off: with
+    ``enabled=False`` no snapshot is computed, no bonus row is written, and
+    every API field stays null — v6-and-earlier behavior is byte-identical
+    either way because the bonus never applies below bench_version 7.
+    """
+
+    enabled: bool = False
+    """Master switch (``DITTO_EFFICIENCY_BONUS_ENABLED``). Turns on cohort
+    snapshotting, frozen bonus assignment, and public API exposure."""
+
+    fold_enabled: bool = False
+    """Expose ``effective_composite`` on the validator scoring ledger
+    (``DITTO_EFFICIENCY_BONUS_FOLD_ENABLED``). Default off: the validator
+    weight fold lives in ditto-subnet and must ship its own consensus change
+    before consuming the field; until then the ledger stays byte-identical."""
+
+    cap: float = 0.05
+    """Tier-1 maximum bonus fraction ``B_max`` (``DITTO_EFFICIENCY_BONUS_CAP``)
+    — the curve's value at the P25 frontier. Default 5%; hard ceiling 10%
+    enforced at boot and by DB check."""
+
+    deep_cap: float = 0.10
+    """Tier-2 saturation cap (``DITTO_EFFICIENCY_BONUS_DEEP_CAP``): the flat
+    bonus at or below the deep frontier. Bounded ``cap <= deep_cap <= 0.10``
+    at boot and by DB check, so the whole curve stays inside the agreed 5-10%
+    envelope."""
+
+    deep_frontier_ratio: float = 0.5
+    """Deep frontier as a fraction of P25
+    (``DITTO_EFFICIENCY_BONUS_DEEP_FRONTIER_RATIO``), in (0, 1). Below
+    ``ratio x P25`` the bonus saturates flat at ``deep_cap`` — deliberately
+    no extra reward for racing toward zero tokens."""
+
+    cohort_size: int = 25
+    """Top-N quality-qualified agents forming a cohort
+    (``DITTO_EFFICIENCY_BONUS_COHORT_SIZE``)."""
+
+    min_cohort: int = 8
+    """Activation gate ``N_min`` (``DITTO_EFFICIENCY_BONUS_MIN_COHORT``):
+    below this deduped cohort size no bonus is awarded (spec default 8)."""
+
+    epoch_hours: int = 24
+    """Length of one efficiency epoch in hours
+    (``DITTO_EFFICIENCY_BONUS_EPOCH_HOURS``); fixed UTC windows."""
+
+    quality_floor: float = 0.0
+    """Static composite floor ``Q_min`` fallback
+    (``DITTO_EFFICIENCY_BONUS_QUALITY_FLOOR``); superseded upward by the
+    previous active cohort's median composite once one exists."""
+
+    memory_floor: float = 0.0
+    """Static memory-mean floor ``M_min`` fallback
+    (``DITTO_EFFICIENCY_BONUS_MEMORY_FLOOR``); superseded upward by 0.8 x the
+    previous active cohort's median memory_mean once one exists."""
+
+
+@dataclass(frozen=True)
 class ApiServerConfig:
     """Resolved configuration for the API server process.
 
@@ -254,6 +315,11 @@ class ApiServerConfig:
     """Ceiling on the round interval in tempos (``TOP5_RESCORE_BACKOFF_CAP``). The
     backoff never reaches zero rate: a champion whose interval flatlines at the
     cap is itself the signal that the field has gone stagnant."""
+
+    efficiency_bonus: EfficiencyBonusConfig = field(
+        default_factory=EfficiencyBonusConfig
+    )
+    """Relative token-efficiency bonus knobs (bench_version >= 7); default-off."""
 
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -478,6 +544,38 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
         raise ApiServerConfigError("inference proxy limits must be numeric") from error
 
     try:
+        efficiency_bonus = EfficiencyBonusConfig(
+            enabled=(
+                os.environ.get("DITTO_EFFICIENCY_BONUS_ENABLED", "false")
+                .strip()
+                .lower()
+                in _TRUTHY
+            ),
+            fold_enabled=(
+                os.environ.get("DITTO_EFFICIENCY_BONUS_FOLD_ENABLED", "false")
+                .strip()
+                .lower()
+                in _TRUTHY
+            ),
+            cap=float(os.environ.get("DITTO_EFFICIENCY_BONUS_CAP", "0.05")),
+            deep_cap=float(os.environ.get("DITTO_EFFICIENCY_BONUS_DEEP_CAP", "0.10")),
+            deep_frontier_ratio=float(
+                os.environ.get("DITTO_EFFICIENCY_BONUS_DEEP_FRONTIER_RATIO", "0.5")
+            ),
+            cohort_size=int(os.environ.get("DITTO_EFFICIENCY_BONUS_COHORT_SIZE", "25")),
+            min_cohort=int(os.environ.get("DITTO_EFFICIENCY_BONUS_MIN_COHORT", "8")),
+            epoch_hours=int(os.environ.get("DITTO_EFFICIENCY_BONUS_EPOCH_HOURS", "24")),
+            quality_floor=float(
+                os.environ.get("DITTO_EFFICIENCY_BONUS_QUALITY_FLOOR", "0")
+            ),
+            memory_floor=float(
+                os.environ.get("DITTO_EFFICIENCY_BONUS_MEMORY_FLOOR", "0")
+            ),
+        )
+    except ValueError as error:
+        raise ApiServerConfigError("efficiency bonus knobs must be numeric") from error
+
+    try:
         top5_backoff_base = int(os.environ.get("TOP5_RESCORE_BACKOFF_BASE", "2"))
         top5_backoff_doubling_tempos = int(
             os.environ.get("TOP5_RESCORE_BACKOFF_K", "20")
@@ -523,6 +621,7 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
         top5_backoff_base=top5_backoff_base,
         top5_backoff_doubling_tempos=top5_backoff_doubling_tempos,
         top5_backoff_cap=top5_backoff_cap,
+        efficiency_bonus=efficiency_bonus,
     )
 
 
@@ -772,4 +871,39 @@ def check_config(config: ApiServerConfig) -> None:
     if not 1 <= inference.timeout_seconds <= 120:
         raise ApiServerConfigError(
             "inference timeout must be between 1 and 120 seconds"
+        )
+    efficiency = config.efficiency_bonus
+    if efficiency.fold_enabled and not efficiency.enabled:
+        raise ApiServerConfigError(
+            "efficiency bonus must be enabled before its fold exposure can be"
+        )
+    if not 0.0 < efficiency.cap <= 0.10:
+        raise ApiServerConfigError("DITTO_EFFICIENCY_BONUS_CAP must be in (0, 0.10]")
+    if not efficiency.cap <= efficiency.deep_cap <= 0.10:
+        raise ApiServerConfigError(
+            "DITTO_EFFICIENCY_BONUS_DEEP_CAP must satisfy cap <= deep_cap <= 0.10"
+        )
+    if not 0.0 < efficiency.deep_frontier_ratio < 1.0:
+        raise ApiServerConfigError(
+            "DITTO_EFFICIENCY_BONUS_DEEP_FRONTIER_RATIO must be in (0, 1)"
+        )
+    if efficiency.min_cohort < 2:
+        raise ApiServerConfigError(
+            "DITTO_EFFICIENCY_BONUS_MIN_COHORT must be at least 2"
+        )
+    if efficiency.cohort_size < efficiency.min_cohort:
+        raise ApiServerConfigError(
+            "DITTO_EFFICIENCY_BONUS_COHORT_SIZE must be at least the minimum cohort"
+        )
+    if efficiency.epoch_hours < 1:
+        raise ApiServerConfigError(
+            "DITTO_EFFICIENCY_BONUS_EPOCH_HOURS must be at least 1"
+        )
+    if not 0.0 <= efficiency.quality_floor <= 1.0:
+        raise ApiServerConfigError(
+            "DITTO_EFFICIENCY_BONUS_QUALITY_FLOOR must be in [0, 1]"
+        )
+    if not 0.0 <= efficiency.memory_floor <= 1.0:
+        raise ApiServerConfigError(
+            "DITTO_EFFICIENCY_BONUS_MEMORY_FLOOR must be in [0, 1]"
         )
