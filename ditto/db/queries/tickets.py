@@ -128,6 +128,30 @@ EMISSION_CONTENDER_COUNT = 5
 PROVISIONAL_CONTENDER_LANE_SIZE = 10
 
 
+async def get_score_priority_floors(
+    session: AsyncSession, *, bench_version: int | None = None
+) -> tuple[float | None, float | None]:
+    """Return finalized fifth-place and tenth-place floors for one benchmark era."""
+    eligible = [
+        row
+        for row in await list_eligible_ledger(
+            session, include_fingerprints=False, bench_version=bench_version
+        )
+        if row.eligible
+    ]
+    continuation = (
+        eligible[EMISSION_CONTENDER_COUNT - 1].composite
+        if len(eligible) >= EMISSION_CONTENDER_COUNT
+        else None
+    )
+    provisional = (
+        eligible[PROVISIONAL_CONTENDER_LANE_SIZE - 1].composite
+        if len(eligible) >= PROVISIONAL_CONTENDER_LANE_SIZE
+        else None
+    )
+    return continuation, provisional
+
+
 async def get_score_continuation_floor(
     session: AsyncSession, *, bench_version: int | None = None
 ) -> float | None:
@@ -146,16 +170,31 @@ async def get_score_continuation_floor(
     Returns ``None`` when the era does not yet have five eligible agents, which
     correctly disables the floor for a benchmark version still filling up.
     """
-    eligible = [
-        row
-        for row in await list_eligible_ledger(
-            session, include_fingerprints=False, bench_version=bench_version
-        )
-        if row.eligible
-    ]
-    if len(eligible) < EMISSION_CONTENDER_COUNT:
-        return None
-    return eligible[EMISSION_CONTENDER_COUNT - 1].composite
+    continuation, _ = await get_score_priority_floors(
+        session, bench_version=bench_version
+    )
+    return continuation
+
+
+async def get_provisional_contender_floor(
+    session: AsyncSession, *, bench_version: int | None = None
+) -> float | None:
+    """Return the finalized tenth-place score for provisional fast-lane admission.
+
+    A provisional submission is only a likely top-ten contender when its first
+    accepted score reaches the current finalized top ten.  Ranking the ten best
+    provisional rows against one another is not sufficient: when the whole
+    provisional pool is weak, that interpretation starves untouched submissions
+    without advancing a plausible leaderboard contender.
+
+    ``None`` means fewer than ten finalized owners exist in this benchmark era,
+    so there is not yet a meaningful top-ten boundary and the bounded lane keeps
+    its bootstrap behavior.
+    """
+    _, provisional = await get_score_priority_floors(
+        session, bench_version=bench_version
+    )
+    return provisional
 
 
 async def expire_overdue_tickets(session: AsyncSession, *, now: datetime) -> int:
@@ -204,11 +243,11 @@ async def issue_ticket(
     Sweeps overdue tickets first, then picks an ``evaluating`` agent that (a)
     has fewer than :data:`SCORING_QUORUM` live tickets and (b) this validator
     does not already hold a live or scored ticket for. Candidates in the
-    strongest bounded set of scored provisional contenders come first. The
-    remaining candidates advance 1-of-3 submissions before uncovered work,
-    with live assignments spread within each lane. ``completion_first`` instead
-    makes benchmark-era FIFO primary so the oldest submission reaches quorum
-    before the next submission is opened. A
+    bounded set whose first score can reach the finalized top ten comes first.
+    Other provisional rows do not outrank untouched submissions merely because
+    they already have a score. ``completion_first`` instead makes benchmark-era
+    FIFO primary so the oldest submission reaches quorum before the next
+    submission is opened. A
     2-of-3 submission that can no longer reach this era's emission set sorts
     behind every other candidate rather than being withheld, so it still
     finalizes once the queue drains. A prior expired row is reissued only after
@@ -324,10 +363,10 @@ async def issue_ticket(
 
     # Scoped to the era this ticket is for: a v2 fifth place says nothing about
     # whether a v4 two-score maximum is still in contention.
-    score_continuation_floor = (
-        None
+    score_continuation_floor, provisional_contender_floor = (
+        (None, None)
         if completion_first
-        else await get_score_continuation_floor(session, bench_version=bench_version)
+        else await get_score_priority_floors(session, bench_version=bench_version)
     )
 
     # Agents this validator must not receive right now: live/scored tickets,
@@ -363,16 +402,6 @@ async def issue_ticket(
         )
         .correlate(Agent)
         .exists()
-    )
-    accepted_score_count = (
-        select(func.count())
-        .where(
-            ValidatorTicket.agent_id == Agent.agent_id,
-            ValidatorTicket.bench_version == bench_version,
-            ValidatorTicket.status == TicketStatus.SCORED,
-        )
-        .correlate(Agent)
-        .scalar_subquery()
     )
     live_assignment_count = (
         select(func.count())
@@ -418,13 +447,6 @@ async def issue_ticket(
         ),
         0.0,
     )
-    covered_lane_score = case(
-        (
-            accepted_score_count >= 1,
-            provisional_composite,
-        ),
-        else_=0.0,
-    )
     # A median-of-three cannot be bounded safely after one score. Once two
     # scores exist, their maximum is the best final median the third score can
     # produce, so a submission whose strict upper bound sits below this era's
@@ -463,6 +485,17 @@ async def issue_ticket(
             Score.agent_id == contender.agent_id,
             Score.bench_version == bench_version,
         )
+        .correlate(contender)
+        .scalar_subquery()
+    )
+    contender_first_score = (
+        select(Score.composite)
+        .where(
+            Score.agent_id == contender.agent_id,
+            Score.bench_version == bench_version,
+        )
+        .order_by(Score.created_at.asc(), Score.validator_hotkey.asc())
+        .limit(1)
         .correlate(contender)
         .scalar_subquery()
     )
@@ -508,6 +541,11 @@ async def issue_ticket(
             contender.screening_policy_version >= SCREENING_POLICY_VERSION,
             contender_accepted_score_count.between(1, SCORING_QUORUM - 1),
             contender_recorded_score_count >= contender_accepted_score_count,
+            (
+                contender_first_score >= provisional_contender_floor
+                if provisional_contender_floor is not None
+                else literal(True)
+            ),
         )
         .subquery()
     )
@@ -528,10 +566,6 @@ async def issue_ticket(
     contender_lane_score = case(
         (Agent.agent_id.in_(top_provisional_contenders), provisional_composite),
         else_=0.0,
-    )
-    one_score_completion_lane = case(
-        (accepted_score_count == 1, 0),
-        else_=1,
     )
     overflow_two_score_lane = case(
         (recorded_score_count >= SCORING_QUORUM - 1, 1),
@@ -592,18 +626,12 @@ async def issue_ticket(
                 ).asc(),
                 contender_lane.asc(),
                 contender_lane_score.desc(),
-                # One accepted result is real progress toward the public 3-of-3
-                # settlement contract. Advance those rows before opening a
-                # wider one-score backlog. The separately bounded contender
-                # lane above owns strong 2-of-3 work.
-                one_score_completion_lane.asc(),
                 # Keep the existing bounded-contender guarantee: a two-score
                 # row outside the top contender set must not turn the whole
                 # backlog into an unbounded completion lane.
                 overflow_two_score_lane.asc(),
                 live_assignment_count.asc(),
                 had_prior_ticket.asc(),
-                covered_lane_score.desc(),
                 fifo_age.asc(),
                 Agent.agent_id.asc(),
             )
@@ -613,8 +641,9 @@ async def issue_ticket(
             # scored provisional contenders, one best submission per miner. A
             # stronger 1-of-3 candidate can therefore receive its second score
             # before a weaker 2-of-3 candidate receives its third. The remaining
-            # queue advances 1-of-3 rows before uncovered work. The fresh lane
-            # uses queue_order's FIFO-first alternative.
+            # queue gives untouched work a coverage opportunity before weak
+            # provisional rows. The fresh lane uses queue_order's FIFO-first
+            # alternative.
             candidate.order_by(*queue_order)
             .limit(1)
             .with_for_update(of=Agent, skip_locked=not completion_first)
@@ -746,6 +775,17 @@ async def issue_ticket(
             .correlate(sibling_agent)
             .scalar_subquery()
         )
+        owner_first_score = (
+            select(Score.composite)
+            .where(
+                Score.agent_id == sibling_agent.agent_id,
+                Score.bench_version == bench_version,
+            )
+            .order_by(Score.created_at.asc(), Score.validator_hotkey.asc())
+            .limit(1)
+            .correlate(sibling_agent)
+            .scalar_subquery()
+        )
         selected_owner_agent_id = await session.scalar(
             select(sibling_agent.agent_id)
             .outerjoin(
@@ -756,6 +796,11 @@ async def issue_ticket(
                 sibling_agent.status == AgentStatus.EVALUATING,
                 same_owner,
                 owner_progress_started_at.is_not(None),
+                (
+                    owner_first_score >= provisional_contender_floor
+                    if provisional_contender_floor is not None
+                    else literal(True)
+                ),
                 (
                     benchmark_admission_predicate(
                         rollout=activated_rollout,
