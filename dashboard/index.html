@@ -257,6 +257,11 @@
 
     /* The board's filter row reuses the submissions pills (.activity-filter)
        and its band treatment, centered so it brackets the table with the pager. */
+    /* Sticky-left: the tab strip and pagers are block children of the
+       horizontally scrolling .board, so without this they end at the first
+       viewport-width and scrolling right reveals a bare patch beside them
+       (same trick as td.empty .empty-msg). */
+    .board-tabs, .board .pager { position: sticky; left: 0; }
     .board-tabs { justify-content: center; padding: 12px 14px; border-bottom: 1px solid var(--border); background: color-mix(in oklab, var(--bg-elev-2) 38%, var(--bg-elev)); }
     .leaderboard-version-switch { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
     .leaderboard-version-switch .context { color: var(--text-dim); font-size: 12px; }
