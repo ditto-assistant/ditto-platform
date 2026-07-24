@@ -35,6 +35,7 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -164,7 +165,11 @@ from ditto.db.queries.heartbeats import (
     upsert_validator_heartbeat,
 )
 from ditto.db.queries.inference import ensure_inference_grant, revoke_ticket_inference
-from ditto.db.queries.king_reign import record_first_crowned
+from ditto.db.queries.king_reign import (
+    list_unconfirmed_kings,
+    record_first_crowned,
+    record_weight_confirmed,
+)
 from ditto.db.queries.payments import get_miner_coldkey_for_agent
 from ditto.db.queries.score_retests import activate_next_score_retest
 from ditto.db.queries.scores import (
@@ -477,6 +482,11 @@ _TICKET_TTL = timedelta(minutes=90)
 # the database for the same window, making replay rejection consistent across
 # every API replica without introducing another secret.
 _JOB_REQUEST_MAX_AGE = timedelta(minutes=2)
+# Throttle + timeout for the post-commit on-chain weight-confirmation sweep that
+# arms a king's public source-release window. Bounds how often the score path
+# reads the revealed weight matrix while any king still awaits confirmation.
+_KING_WEIGHT_CHECK_INTERVAL = timedelta(minutes=5)
+_KING_WEIGHT_CHECK_TIMEOUT_SECONDS = 5.0
 _QUALIFICATION_REFRESH_INTERVAL_SECONDS = 30.0
 _qualification_refresh_due = 0.0
 
@@ -1784,6 +1794,47 @@ async def _current_emission_set(
         completed_waves_only=completed_waves_only,
     )
     return emission_set(project_koth(entries))
+
+
+async def _confirm_king_onchain_weights(
+    app_state: Any,
+    chain: ChainClient,
+    session: AsyncSession,
+    *,
+    now: datetime,
+) -> None:
+    """Arm any ever-king's public window once the chain confirms its weights.
+
+    Reads the REVEALED weight matrix (post commit-reveal) and stamps
+    ``weight_confirmed_at`` for every ever-king miner that now has validator
+    weight set on it. Erring toward weights, not realized emission magnitude, so
+    a genuine king is never trapped private. Throttled via ``app_state`` so the
+    score path reads the chain at most once per interval while a king is pending;
+    once no king is unconfirmed, it does zero chain work. The caller wraps this
+    best-effort so a chain hiccup never fails an already-committed score.
+    """
+    last_checked = getattr(app_state, "king_weight_checked_at", None)
+    if last_checked is not None and (now - last_checked) < _KING_WEIGHT_CHECK_INTERVAL:
+        return
+    app_state.king_weight_checked_at = now
+    pending = await list_unconfirmed_kings(session)
+    # Release the read transaction so the (potentially multi-second) chain call
+    # never holds a DB transaction open, and so the write below can open its own.
+    await session.rollback()
+    if not pending:
+        return
+    netuid = app_state.config.chain.netuid
+    snapshot = await asyncio.wait_for(
+        chain.get_weights(netuid), timeout=_KING_WEIGHT_CHECK_TIMEOUT_SECONDS
+    )
+    weighted_hotkeys = {
+        weight.hotkey for vector in snapshot.vectors for weight in vector.weights
+    }
+    confirmed = [agent_id for agent_id, hotkey in pending if hotkey in weighted_hotkeys]
+    if confirmed:
+        async with session.begin():
+            for agent_id in confirmed:
+                await record_weight_confirmed(session, agent_id=agent_id, now=now)
 
 
 async def _champion_anchored_seed_set(
@@ -3529,6 +3580,19 @@ async def submit_score(
                 )
     except Exception:
         logger.exception("king-reign recording failed")
+
+    # Arm a king's public source-release window only once the chain agrees:
+    # confirm (post commit-reveal) that validators' REVEALED weights are set on
+    # the miner. Best-effort and post-commit: never fail an already-canonical
+    # score because a chain read hiccups.
+    try:
+        await _confirm_king_onchain_weights(
+            request.app.state, chain, session, now=audit_now
+        )
+    except (ChainError, TimeoutError):
+        logger.warning("king weight-confirmation chain read failed", exc_info=True)
+    except Exception:
+        logger.exception("king weight-confirmation failed")
 
     logger.info(
         "score recorded agent_id=%s validator=%s run_id=%s composite=%.3f status=%s",

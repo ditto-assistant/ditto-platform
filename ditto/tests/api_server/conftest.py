@@ -192,10 +192,14 @@ def override_get_chain_client(app: FastAPI, *, raises: Exception | None = None) 
             chain.get_latest_block = AsyncMock(side_effect=raises)
             chain.is_registered = AsyncMock(side_effect=raises)
             chain.get_registered_coldkey = AsyncMock(side_effect=raises)
+            chain.get_weights = AsyncMock(side_effect=raises)
         else:
             chain.get_latest_block = AsyncMock(return_value=MagicMock(number=42))
             chain.is_registered = AsyncMock(return_value=True)
             chain.get_registered_coldkey = AsyncMock(return_value="5Coldkey")
+            # Empty revealed weight matrix by default: the king-weight sweep on
+            # the score path finds nothing to confirm unless a test says otherwise.
+            chain.get_weights = AsyncMock(return_value=MagicMock(vectors=()))
         return chain
 
     app.dependency_overrides[get_chain_client] = _fake_chain
