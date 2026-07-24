@@ -1,7 +1,7 @@
 """widen public source-release embargo to 48h and adopt it as the default
 
 Revision ID: b3f9a1c72e40
-Revises: c6e9a1d47b20
+Revises: d5f1a8c62b93
 Create Date: 2026-07-24
 """
 
@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "b3f9a1c72e40"
-down_revision: str | None = "c6e9a1d47b20"
+down_revision: str | None = "d5f1a8c62b93"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
