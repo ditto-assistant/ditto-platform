@@ -31,7 +31,7 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.dependencies import get_chain_client, get_session
 from ditto.api_server.middleware.error_envelope import ERROR_CODE_VALIDATOR_AUTH
 from ditto.chain.models import NeuronInfo
-from ditto.db.models import Agent, Base
+from ditto.db.models import Agent, Base, ValidatorHeartbeat
 from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
@@ -180,6 +180,8 @@ class TestScoringLedger:
         assert body["entries"][0]["composite"] == pytest.approx(0.9)
         assert body["entries"][0]["signature"] == "ab" * 64
         assert body["entries"][0]["bench_version"] == 2
+        # No fleet capability evidence means the additive contract fails closed.
+        assert body["entries"][0]["continual_aggregate_method"] is None
         assert body["entries"][0]["score_proofs"] == [
             {
                 "validator_hotkey": _VALIDATOR_HOTKEY,
@@ -197,6 +199,63 @@ class TestScoringLedger:
         # a real full run.
         assert body["entries"][0]["n"] == 20
         assert len(body["entries"][0]["score_proofs"]) == 1
+
+    async def test_continual_mean_activates_globally_only_for_protocol_14_fleet(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_scored(session_maker, miner=_MINER, composite=0.9)
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add_all(
+                [
+                    ValidatorHeartbeat(
+                        validator_hotkey=_VALIDATOR_HOTKEY,
+                        software_version="0.28.0",
+                        protocol_version=14,
+                        code_digest="ab" * 32,
+                        state="idle",
+                        reported_at=now,
+                        seen_at=now,
+                        signature="cd" * 64,
+                    ),
+                    ValidatorHeartbeat(
+                        validator_hotkey=_MINER_B,
+                        software_version="0.27.0",
+                        protocol_version=13,
+                        code_digest="ef" * 32,
+                        state="idle",
+                        reported_at=now,
+                        seen_at=now,
+                        signature="12" * 64,
+                    ),
+                ]
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        mixed = await client.get("/api/v1/scoring/scores", headers=_ledger_headers())
+        assert mixed.status_code == 200
+        mixed_entry = mixed.json()["entries"][0]
+        assert mixed_entry["continual_aggregate_method"] is None
+        assert mixed_entry["confirmation_composites"] is None
+        assert mixed_entry["confirmation_seeds"] is None
+        assert mixed_entry["confirmation_history"] is None
+
+        async with session_maker() as session, session.begin():
+            legacy = await session.get(ValidatorHeartbeat, _MINER_B)
+            assert legacy is not None
+            legacy.protocol_version = 14
+            legacy.software_version = "0.28.0"
+
+        ready = await client.get("/api/v1/scoring/scores", headers=_ledger_headers())
+        assert ready.status_code == 200
+        assert (
+            ready.json()["entries"][0]["continual_aggregate_method"]
+            == "mean_after_quorum"
+        )
 
     async def test_empty_ledger(
         self,
@@ -527,6 +586,19 @@ class TestScoringLedgerConfirmationHistory:
 
         aid = uuid4()
         async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_HOTKEY,
+                    software_version="0.28.0",
+                    protocol_version=14,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                )
+            )
             s.add(
                 Agent(
                     agent_id=aid,

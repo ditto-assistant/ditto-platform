@@ -673,6 +673,19 @@ class TestPublicLeaderboard:
         )
         # A wave counts only after every emission-set member has the seed.
         async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_C,
+                    software_version="0.27.0",
+                    protocol_version=13,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                )
+            )
             await append_confirmation_scores(
                 s,
                 rows=[
@@ -692,9 +705,43 @@ class TestPublicLeaderboard:
             )
         _install_db(app, session_maker)
 
+        mixed = (await client.get("/api/v1/public/leaderboard")).json()
+        mixed_entries = {entry["agent_id"]: entry for entry in mixed["entries"]}
+        assert mixed["continual_aggregate_active"] is False
+        assert mixed_entries[tail_id]["official_composite"] == pytest.approx(0.80)
+        assert mixed_entries[tail_id]["aggregate_method"] == "canonical_median"
+        assert mixed_entries[tail_id]["completed_wave_count"] == 3
+        mixed_recipients = {
+            recipient["agent_id"]: recipient
+            for recipient in mixed["emissions"]["recipients"]
+        }
+        assert mixed_recipients[champion_id]["shared_seed_confirmations"] == 0
+
+        async with session_maker() as s, s.begin():
+            heartbeat = await s.get(ValidatorHeartbeat, _VALIDATOR_C)
+            assert heartbeat is not None
+            heartbeat.protocol_version = 14
+            heartbeat.software_version = "0.28.0"
+
         body = (await client.get("/api/v1/public/leaderboard")).json()
+        assert body["continual_aggregate_active"] is True
+        assert body["continual_aggregate_required_protocol"] == 14
         recipients = {r["agent_id"]: r for r in body["emissions"]["recipients"]}
+        entries = {entry["agent_id"]: entry for entry in body["entries"]}
         assert recipients[champion_id]["shared_seed_confirmations"] == 3
+        assert entries[champion_id]["composite"] == pytest.approx(0.90)
+        assert entries[champion_id]["official_composite"] == pytest.approx(0.90)
+        assert entries[champion_id]["aggregate_method"] == "continual_mean"
+        assert entries[champion_id]["aggregate_sample_count"] == 6
+        assert entries[champion_id]["completed_wave_count"] == 3
+        assert entries[champion_id]["initial_quorum_composites"] == pytest.approx(
+            [0.90, 0.90, 0.90]
+        )
+        assert entries[champion_id]["completed_wave_composites"] == pytest.approx(
+            [0.90, 0.90, 0.90]
+        )
+        assert entries[tail_id]["composite"] == pytest.approx(0.80)
+        assert entries[tail_id]["official_composite"] == pytest.approx(0.85)
 
     async def test_marks_deregistered_scores_retained_but_emission_ineligible(
         self,

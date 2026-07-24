@@ -320,6 +320,13 @@ class TestDashboard:
         assert "Accepted validator scores" in body
         assert "Canonical quorum" in body
         assert "canonical median of" in body
+        assert "Current leaderboard score" in body
+        assert "initial quorum aggregate" in body
+        assert "mean of the initial three scores" in body
+        assert "full cohort wave" in body
+        assert "continually adjusts up or down" in body
+        assert "function continualVarianceSvg(e)" in body
+        assert "Score observations: initial quorum" in body
         assert "benchmarkVersionKey(pipeline.active_bench_version)" in body
         assert "cohortMedian(cohort.scores)" in body
         assert "pipeline.score_count) + ' of ' + esc(pipeline.quorum)" not in body
@@ -331,9 +338,7 @@ class TestDashboard:
         assert "Provisional scores may change" in body
         assert "final median is authoritative" in body
         assert "No validator score has been accepted yet." in body
-        assert (
-            "esc(benchmarkVersionLabel(cohort.key)) + ' official aggregate: '" in body
-        )
+        assert "initial quorum aggregate: ' + fx(median)" in body
         assert "median of " in body
         assert "score.reproduction_command" in body
         assert "score.verification_command" in body

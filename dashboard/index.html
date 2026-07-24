@@ -2373,7 +2373,7 @@
             <th scope="col" class="sortable" data-sort="name"><span class="tip" tabindex="0" data-tooltip="The miner's best-scoring agent, with its current SN118 UID and on-chain hotkey below. Open either identity for details, or copy the hotkey.">Best-scoring agent</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" style="width:128px"><span class="tip" id="emissions-col-tip" tabindex="0" data-tooltip="Current KOTH role. The incumbent champion takes a fixed share of the miner pool; a participation tail splits the remainder.">Emissions</span></th>
             <th scope="col" class="hide-md sortable" data-sort="bench" style="width:180px"><span class="tip" tabindex="0" data-tooltip="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under. Sort to group runs by benchmark version.">Model</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" style="width:230px" class="sortable" data-sort="composite"><span class="tip" tabindex="0" data-tooltip="Headline score in [0,1]. The base is the equal-weight tool/memory average (½·tool + ½·memory); the benchmark quality gates then multiply it down (the 'gates −%' chip shows how much, mostly the conversational-sanity gate), and v5 token efficiency can remove at most 10% more (the 'token' chip). That is why the composite is not simply the tool/memory average. The band is ±1 standard error.">Composite</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" style="width:230px" class="sortable" data-sort="composite"><span class="tip" tabindex="0" data-tooltip="Current leaderboard score in [0,1]. It starts as the median of the first three accepted validator scores. After each full top-five cohort wave completes, it becomes the arithmetic mean of those original three scores plus one aggregate per completed wave, so continual retests can move it up or down. Partial waves never count.">Current score</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="hide-sm sortable" data-sort="tool" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="hide-sm sortable" data-sort="memory" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Memory subscore, not the overall composite used for rank. It is the mean across memory cases: did the agent recall and reason over stored facts across sessions, over time, and while resisting injected instructions?">Memory</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="num hide-sm sortable" data-sort="latency" style="width:96px"><span class="tip" tabindex="0" data-tooltip="Median per-case response time for the run, and how many cases were scored (a full benchmark is ~114 cases).">Latency</span><span class="sarrow" aria-hidden="true">▲</span></th>
@@ -3117,7 +3117,8 @@
     // the ordering stays on one comparable scale. Agents with no settled median
     // (first scored during the rollout) fall back to their authoritative value.
     function displayComposite(e) {
-      return rolloutSettledView && e.settled_composite != null ? e.settled_composite : e.composite;
+      if (rolloutSettledView && e.settled_composite != null) return e.settled_composite;
+      return e.official_composite != null ? e.official_composite : e.composite;
     }
 
     // Consensus constants are read from the fold the API reports, never written
@@ -4300,12 +4301,17 @@
       var notice = document.getElementById("leaderboard-notice");
       var inactive = entries.filter(function (e) { return e.registered === false; });
       var registrationUnknown = entries.filter(function (e) { return e.registered == null; });
+      var collectedContinualWaves = entries.some(function (e) {
+        return Number(e.completed_wave_count) > 0;
+      });
       // Chain unreachable for the whole snapshot: the notice above already
       // explains it once, so we suppress the identical per-row "registration
       // unknown" badge. Per-row badges still show when registration data exists
       // but a specific row is unregistered/dereg.
       chainRegistrationUnknown = entries.length > 0 && registrationUnknown.length === entries.length;
       var historicalView = data.selection_mode === "historical";
+      var continualPending = !historicalView && collectedContinualWaves &&
+        data.continual_aggregate_active !== true;
       title.textContent = historicalView
         ? "Bench v" + data.current_bench_version + " history"
         : finalizedEntries.length ? "Current rollout leaderboard" : (provisional.length ? "Provisional leaderboard" : "Current rollout leaderboard");
@@ -4323,7 +4329,7 @@
         ? "Rows rank by their settled v" + activeBench + " score while v" + data.desired_bench_version +
           " collects. Validator weights stay on v" + activeBench + " until the v" + data.desired_bench_version + " rollout fully activates."
         : "This pool drives validator weights.";
-      if (provisional.length || inactive.length || registrationUnknown.length) {
+      if (provisional.length || inactive.length || registrationUnknown.length || continualPending) {
         notice.classList.add("show");
         var notices = [];
         if (provisional.length) notices.push('<strong>Provisional standings.</strong> ' + provisional.length +
@@ -4333,6 +4339,7 @@
           ' scored hotkey' + (inactive.length === 1 ? ' is' : 's are') +
           ' not currently registered on SN118. Their submissions and scores are retained, but they are excluded from active weights and emissions until the same hotkey registers again.');
         if (registrationUnknown.length) notices.push('<strong>Registration unavailable.</strong> Current SN118 registration could not be confirmed. The deterministic KOTH fold remains visible, but actual chain eligibility and active-rank styling stay unknown until registration is confirmed.');
+        if (continualPending) notices.push('<strong>Continual score activation pending.</strong> Completed retest waves are preserved as observations, but rankings and weights remain on the canonical three-score median until every recently-live validator supports protocol ' + esc(data.continual_aggregate_required_protocol || 14) + '. The contract activates globally, never per validator.');
         notice.innerHTML = notices.join(' ');
       } else {
         notice.classList.remove("show");
@@ -4686,17 +4693,57 @@
       // The stashed stderr describes the authoritative composite; when the cell
       // shows the settled value instead (mid-rollout, agent already on the new
       // version) the band would be attached to the wrong number, drop it.
-      var band = v === e.composite ? errBand(v, e.composite_stderr) : "";
+      var band = v === e.composite && e.aggregate_method !== "continual_mean"
+        ? errBand(v, e.composite_stderr) : "";
       var row = '<div class="metric"><div class="barwrap">' + band +
         '<div class="bar composite" style="width:' + w.toFixed(1) + '%"></div></div>' +
         '<span class="mval">' + fx(v) + '</span></div>';
       var spark = sparkSvg(e.history);
+      var variance = continualVarianceSvg(e);
       var chip = rolloutChip(e);
+      var continualChip = continualScoreChip(e);
       var gateChip = qualityGateChip(e);
       var tokenChip = tokenPenaltyChip(e);
-      var line2 = (spark || chip || gateChip || tokenChip)
-        ? '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-height:16px">' + spark + chip + gateChip + tokenChip + '</div>' : "";
+      var line2 = (spark || variance || chip || continualChip || gateChip || tokenChip)
+        ? '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-height:16px">' + spark + variance + chip + continualChip + gateChip + tokenChip + '</div>' : "";
       return '<td><div class="cwrap">' + row + line2 + '</div></td>';
+    }
+
+    function continualVarianceSvg(e) {
+      if (!e || e.aggregate_method !== "continual_mean") return "";
+      var initial = (e.initial_quorum_composites || []).map(Number).filter(Number.isFinite);
+      var waves = (e.completed_wave_composites || []).map(Number).filter(Number.isFinite);
+      var samples = initial.concat(waves);
+      if (samples.length < 4) return "";
+      var x = function (value) { return 3 + Math.max(0, Math.min(1, value)) * 94; };
+      var low = Math.min.apply(null, samples);
+      var high = Math.max.apply(null, samples);
+      var mean = Number(e.official_composite);
+      var dots = initial.map(function (value) {
+        return '<circle cx="' + x(value).toFixed(1) + '" cy="8" r="2.1" fill="var(--muted)" />';
+      }).join("") + waves.map(function (value) {
+        return '<circle cx="' + x(value).toFixed(1) + '" cy="8" r="2.3" fill="var(--gold)" />';
+      }).join("");
+      var title = "Score observations: initial quorum " + initial.map(fx).join(", ") +
+        "; completed waves " + waves.map(fx).join(", ") +
+        "; range " + fx(low) + "–" + fx(high) + "; current mean " + fx(mean) + ".";
+      return '<svg class="spark tip" tabindex="0" role="img" aria-label="' + esc(title) +
+        '" data-tooltip="' + esc(title) + '" viewBox="0 0 100 16">' +
+        '<line x1="' + x(low).toFixed(1) + '" y1="8" x2="' + x(high).toFixed(1) +
+        '" y2="8" stroke="var(--border)" stroke-width="2" />' + dots +
+        '<line x1="' + x(mean).toFixed(1) + '" y1="2" x2="' + x(mean).toFixed(1) +
+        '" y2="14" stroke="var(--accent)" stroke-width="1.5" /></svg>';
+    }
+
+    function continualScoreChip(e) {
+      if (!e || e.aggregate_method !== "continual_mean") return "";
+      var waves = Number(e.completed_wave_count) || 0;
+      var samples = Number(e.aggregate_sample_count) || (3 + waves);
+      var title = "Current leaderboard score: arithmetic mean of the original three validator scores plus " +
+        waves + " completed cohort " + (waves === 1 ? "wave" : "waves") +
+        ". Partial waves do not count.";
+      return '<span class="rollout-chip settled tip" tabindex="0" data-tooltip="' + esc(title) + '">' +
+        esc(samples + "-sample mean · " + waves + (waves === 1 ? " wave" : " waves")) + '</span>';
     }
     // Why the composite is not simply the tool/memory average: the base IS that
     // average (½·tool + ½·memory), and the benchmark quality gates (chiefly the
@@ -4992,11 +5039,16 @@
       // into two columns. The full dataset hash and the free-form blocks (per-case
       // table, glossaries) render full width below the columns.
       function group(head, body) { return body ? '<div class="stat-group"><div class="stat-head">' + head + '</div>' + body + '</div>' : ""; }
+      var official = displayComposite(e);
+      var rolling = e.aggregate_method === "continual_mean";
       var overview =
         stat("Best-scoring agent", agentName(e.agent_name)) +
         stat("Submission", agentVersionLabel(e.agent_version)) +
-        stat("Composite", fx(e.composite) +
-          (e.composite_stderr != null ? "  ± " + fx(e.composite_stderr) + " SE" : "")) +
+        stat("Current leaderboard score", fx(official) +
+          (rolling
+            ? "  · mean of " + e.aggregate_sample_count + " scores (" + e.completed_wave_count + " completed " + (e.completed_wave_count === 1 ? "wave" : "waves") + ")"
+            : (e.composite_stderr != null ? "  ± " + fx(e.composite_stderr) + " SE" : "") + "  · canonical quorum median")) +
+        (rolling ? stat("Initial quorum median", fx(e.composite) + "  · first 3 accepted validator scores") : "") +
         stat("Tool mean", fx(e.tool_mean) + "  (" + pct(e.tool_mean) + ")") +
         stat("Memory mean", fx(e.memory_mean) + "  (" + pct(e.memory_mean) + ")") +
         (e.calibration_brier != null
@@ -6364,7 +6416,7 @@
             '<span class="benchmark-cohort-summary">Canonical quorum · ' + esc(Math.min(cohort.scores.length, quorum)) + ' of ' + esc(quorum) + '</span></div>' +
           '<p class="accepted-score-note">' + esc(note) + ' Every seed is fixed only after submission commitment, so it makes the completed evaluation reproducible without allowing the already-submitted artifact to be retuned.</p>' +
           '<div class="accepted-score-list">' + rows + '</div>' +
-          (median == null ? "" : '<p class="accepted-score-final">' + esc(benchmarkVersionLabel(cohort.key)) + ' official aggregate: ' + fx(median) + ' · canonical median of ' + quorum + '</p>') +
+          (median == null ? "" : '<p class="accepted-score-final">' + esc(benchmarkVersionLabel(cohort.key)) + ' initial quorum aggregate: ' + fx(median) + ' · canonical median of ' + quorum + '. Completed continual waves then move the current leaderboard score.</p>') +
         '</div>';
       }).join("");
       return '<section class="pipeline-section" aria-labelledby="pipeline-accepted-scores">' +
@@ -6375,6 +6427,9 @@
 
     function renderConfirmationScores(pipeline) {
       var cohorts = confirmationCohorts(pipeline);
+      var boardEntry = (lastEntries || []).find(function (entry) {
+        return entry.agent_id === pipeline.agent_id;
+      });
       var activeVersion = Number(pipeline.active_bench_version);
       var currentAttempts = (pipeline.validation_attempts || []).filter(function (attempt) {
         return Number(attempt.bench_version) === activeVersion;
@@ -6404,14 +6459,21 @@
           '<div class="benchmark-cohort-heading"><h5>' + esc(benchmarkVersionLabel(cohort.key)) + '</h5>' +
             '<span class="benchmark-cohort-summary">' + esc(cohort.scores.length) +
               ' accepted seed ' + (cohort.scores.length === 1 ? "result" : "results") + '</span></div>' +
-          '<p class="accepted-score-note">Append-only shared-seed evidence. These results refine top-five confidence and do not replace the canonical median.</p>' +
+          '<p class="accepted-score-note">Append-only shared-seed evidence. A seed changes the current leaderboard score only after every member of the same top-five cohort wave finishes it; partial waves remain visible evidence but do not count.</p>' +
           '<div class="accepted-score-list">' + seedScores + '</div></div>';
       }).join("");
+      var aggregate = boardEntry && boardEntry.aggregate_method === "continual_mean"
+        ? '<p class="accepted-score-final">Current leaderboard score: ' + fx(boardEntry.official_composite) +
+          ' · arithmetic mean of the initial three scores plus ' + esc(boardEntry.completed_wave_count) +
+          ' completed cohort ' + (boardEntry.completed_wave_count === 1 ? "wave" : "waves") +
+          ' (' + esc(boardEntry.aggregate_sample_count) + ' samples total).</p>'
+        : '<p class="accepted-score-note">No full cohort wave has completed for this agent yet, so the initial three-score median still drives its leaderboard position.</p>';
       return '<section class="pipeline-section" aria-labelledby="pipeline-confirmation-scores">' +
         '<div class="pipeline-section-heading"><h4 id="pipeline-confirmation-scores">Continual top-five retests</h4>' +
           (state.length ? '<span class="benchmark-cohort-summary">' + esc(state.join(" · ")) + '</span>' : "") +
         '</div>' +
-        '<p class="accepted-score-note">Additional shared-seed runs are tracked separately from the fixed three-score canonical quorum.</p>' +
+        aggregate +
+        '<p class="accepted-score-note">The initial quorum remains immutable provenance. The current leaderboard score continually adjusts up or down as full cohort waves complete.</p>' +
         (rows || '<p class="pipeline-detail-state">No continual retest seed result has landed yet.</p>') +
       '</section>';
     }
