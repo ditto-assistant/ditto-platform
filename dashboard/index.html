@@ -2274,14 +2274,19 @@
        The reigning-KOTH box heads the leaderboard column; the snapshot ledger
        replaces the card grid in the rail. Both are ruled-frame instruments:
        mono-caps labels, display-serif values, 1px rules — no card chrome. */
-    .champion-box { margin: 0 0 18px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-elev); overflow: hidden; }
-    .champion-kicker { padding: 10px 16px; border-bottom: 1px solid var(--border); background: color-mix(in oklch, var(--gold) 6%, var(--bg-elev)); color: var(--text-dim); font: 700 11px/1 var(--mono); letter-spacing: .07em; text-transform: uppercase; }
-    .champion-body { padding: 14px 16px 13px; }
+    /* The page's one gold moment: the same champion grammar the timeline
+       crown plate and rank-one rows already own (gold frame, ♛, gold-toned
+       numeral via the contrast-validated rank-one token), at full strength. */
+    .champion-box { margin: 0 0 18px; border: 1px solid color-mix(in oklch, var(--gold) 45%, var(--border)); border-radius: 4px; background: color-mix(in oklch, var(--gold) 5%, var(--bg-elev)); overflow: hidden; }
+    .champion-kicker { padding: 10px 16px; border-bottom: 1px solid color-mix(in oklch, var(--gold) 35%, var(--border)); background: color-mix(in oklch, var(--gold) 12%, var(--bg-elev)); color: var(--rank-one-text); font: 700 11px/1 var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+    .champion-kicker .crown { margin-right: 7px; font-size: 12px; }
+    .champion-body { padding: 16px 16px 14px; }
     .champion-state { color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
     .champion-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 18px; flex-wrap: wrap; }
-    .champion-name { font-family: var(--display); font-size: clamp(19px, 1.8vw, 25px); line-height: 1.12; min-width: 0; overflow-wrap: anywhere; }
+    .champion-score-label { margin-right: 9px; color: var(--text-dim); font: 700 11px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+    .champion-name { font-family: var(--display); font-size: clamp(22px, 2.2vw, 30px); line-height: 1.1; min-width: 0; overflow-wrap: anywhere; }
     .champion-name .entity-link { color: inherit; }
-    .champion-score { font-family: var(--display); font-size: clamp(25px, 2.4vw, 33px); line-height: 1; font-variant-numeric: tabular-nums; }
+    .champion-score { font-family: var(--display); font-size: clamp(32px, 3vw, 44px); line-height: 1; font-variant-numeric: tabular-nums; color: var(--rank-one-text); }
     .champion-meta { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--text-dim); font: 11px/1.6 var(--mono); letter-spacing: .05em; text-transform: uppercase; }
     .champion-meta b { color: var(--text); font-weight: 700; }
 
@@ -2414,7 +2419,7 @@
 
     <div class="overview-main" tabindex="0" role="region" aria-label="Champion and leaderboard column, scrolls separately from the timeline rail">
     <section class="champion-box" aria-labelledby="champion-box-kicker">
-      <div class="champion-kicker" id="champion-box-kicker">KOTH · reigning champion</div>
+      <div class="champion-kicker" id="champion-box-kicker"><span class="crown" aria-hidden="true">♛</span>KOTH · reigning champion</div>
       <div class="champion-body" id="champion-body" role="status" aria-live="polite">
         <div class="champion-state">Waiting for the emissions projection…</div>
       </div>
@@ -4170,7 +4175,7 @@
         html =
           '<div class="champion-row">' +
             '<div class="champion-name">' + (entry ? entityAnchor("agent", entry.agent_id, name) : esc(name)) + '</div>' +
-            (composite != null ? '<div class="champion-score tip-chip" data-tooltip="Finalized composite">' + fx(composite) + '</div>' : '') +
+            (composite != null ? '<div class="champion-score tip-chip" data-tooltip="Finalized composite — the headline score in [0,1] that drives rank."><span class="champion-score-label">Composite</span>' + fx(composite) + '</div>' : '') +
           '</div>' +
           '<div class="champion-meta">' +
             (entry && entry.rank ? '<span>Raw rank <b>#' + esc(String(entry.rank)) + '</b></span>' : '') +
