@@ -2267,6 +2267,21 @@
          visible as a compact line in the composite cell so a miner tuning one
          of them never loses sight of it on a laptop. */
       .overview-split .tm-mini { display: inline-block; }
+      /* The remaining four columns must actually fit the half-width pane.
+         table-layout: fixed makes the table exactly container width — columns
+         obey the widths below and content ellipsizes/wraps inside its cell
+         instead of forcing a horizontal scroll. Cell min-widths that assume
+         the full-page table (identity 190px, metric 150px) are relaxed. */
+      .overview-split #board { table-layout: fixed; }
+      .overview-split #board th[data-sort="rank"] { width: 54px !important; }
+      .overview-split #board thead th:nth-child(3) { width: 118px !important; }
+      .overview-split #board th[data-sort="composite"] { width: 172px !important; }
+      .overview-split #board th, .overview-split #board td { padding-inline: 9px; }
+      .overview-split #board td { overflow: hidden; }
+      .overview-split #board .winner-identity { min-width: 0; }
+      .overview-split #board .metric { min-width: 0; }
+      .overview-split #board .chain-weight-note { white-space: normal; }
+      .overview-split #board .emission-badge { white-space: normal; }
     }
     .tm-mini { display: none; margin-top: 2px; color: var(--text-dim); font: 700 11px/1.4 var(--mono); letter-spacing: .04em; font-variant-numeric: tabular-nums; }
 
