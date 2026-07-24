@@ -3875,7 +3875,11 @@
       var measured = Math.round((target.clientWidth || 960) - 2);
       timelineRenderedWidth = measured;
       var width = Math.max(300, Math.min(1200, measured || 960));
-      var narrow = width < 560, tight = width < 400;
+      // A sub-560px measure can mean a phone viewport or the desktop split's
+      // rail; only the phone deserves the tall portrait aspect. In the split,
+      // stay on the landscape branch so the rail chart never squares off.
+      var phoneViewport = !window.matchMedia("(min-width: 1181px)").matches;
+      var narrow = width < 560 && phoneViewport, tight = width < 400 && phoneViewport;
       var height = narrow
         ? Math.max(300, Math.round(width * 0.86))
         : Math.max(272, Math.min(376, Math.round(width * 0.34)));
