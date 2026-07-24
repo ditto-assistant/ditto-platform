@@ -14,6 +14,8 @@ import hashlib
 import json
 import math
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID
@@ -54,6 +56,62 @@ _PROXY_MAX_AGE = timedelta(seconds=30)
 _EMBEDDING_MAX_INPUTS = 256
 _PPLX_EMBED_CONTRACT_MODEL = "perplexity/pplx-embed-v1-0.6b"
 _PPLX_EMBED_RESPONSE_MODEL = "pplx-embed-v1-0.6b"
+_PROVIDER_MAX_ATTEMPTS = 3
+_PROVIDER_RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+@dataclass(frozen=True)
+class _ProviderResult:
+    response: httpx.Response
+    attempts: int
+
+
+class _ProviderCallError(Exception):
+    def __init__(self, *, attempts: int, timed_out: bool) -> None:
+        super().__init__("provider request failed")
+        self.attempts = attempts
+        self.timed_out = timed_out
+
+
+async def _post_provider_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> _ProviderResult:
+    """Run one logical provider request under the shared bounded retry policy.
+
+    Only connection establishment failures and explicit transient HTTP statuses
+    are safe to repeat here. A read failure is ambiguous: the provider may have
+    completed and billed the request, so the caller fails closed and lets the
+    validator retry the whole benchmark later instead of duplicating execution.
+    """
+    for attempt in range(1, _PROVIDER_MAX_ATTEMPTS + 1):
+        try:
+            response = await client.post(url, json=payload, headers=headers)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+            if attempt == _PROVIDER_MAX_ATTEMPTS:
+                raise _ProviderCallError(
+                    attempts=attempt,
+                    timed_out=isinstance(error, httpx.TimeoutException),
+                ) from error
+            await sleep(0.25 * (2 ** (attempt - 1)))
+            continue
+        except httpx.TimeoutException as error:
+            raise _ProviderCallError(attempts=attempt, timed_out=True) from error
+        except httpx.TransportError as error:
+            raise _ProviderCallError(attempts=attempt, timed_out=False) from error
+        if (
+            response.status_code in _PROVIDER_RETRY_STATUSES
+            and attempt < _PROVIDER_MAX_ATTEMPTS
+        ):
+            await response.aclose()
+            await sleep(0.25 * (2 ** (attempt - 1)))
+            continue
+        return _ProviderResult(response=response, attempts=attempt)
+    raise AssertionError("provider retry loop exhausted without a terminal result")
 
 
 def _exchange_message(payload: InferenceExchangeRequest) -> bytes:
@@ -734,10 +792,12 @@ async def proxy_chat_completions(
     timed_out = False
     route_observable = False
     upstream_provider: str | None = None
+    upstream_attempts = 0
     try:
-        upstream = await request.app.state.inference_client.post(
+        provider_result = await _post_provider_with_retry(
+            request.app.state.inference_client,
             config.upstream_url,
-            json=upstream_payload,
+            payload=upstream_payload,
             headers={
                 "Authorization": f"Bearer {config.openrouter_api_key}",
                 "Content-Type": "application/json",
@@ -747,6 +807,8 @@ async def proxy_chat_completions(
                 "X-OpenRouter-Metadata": "enabled",
             },
         )
+        upstream = provider_result.response
+        upstream_attempts = provider_result.attempts
         raw = upstream.content
         # Authentication, balance, throttling, and availability failures are
         # route-health evidence. A 400/422 can still be an unrecognized caller
@@ -803,16 +865,17 @@ async def proxy_chat_completions(
         public_response = _public_provider_response(decoded)
         raw = json.dumps(public_response, separators=(",", ":")).encode()
         status = "completed"
-    except httpx.TimeoutException as error:
-        timed_out = True
+    except _ProviderCallError as error:
+        upstream_attempts = error.attempts
+        timed_out = error.timed_out
         route_observable = True
+        detail = (
+            "inference provider timed out"
+            if timed_out
+            else "inference provider unavailable"
+        )
         raise HTTPException(
-            status_code=504, detail="inference provider timed out"
-        ) from error
-    except httpx.HTTPError as error:
-        route_observable = True
-        raise HTTPException(
-            status_code=502, detail="inference provider unavailable"
+            status_code=504 if timed_out else 502, detail=detail
         ) from error
     except HTTPException:
         raise
@@ -833,6 +896,7 @@ async def proxy_chat_completions(
                 upstream_provider=upstream_provider,
                 timed_out=timed_out,
                 latency_ms=max(0, round((time.monotonic() - started) * 1000)),
+                upstream_attempts=upstream_attempts,
             )
             from ditto.db.models import InferenceGrant
 
@@ -966,33 +1030,20 @@ async def proxy_embeddings(
     prompt_tokens = 0
     raw: bytes | None = None
     timed_out = False
+    upstream_attempts = 0
     started = time.monotonic()
     try:
-        upstream: httpx.Response | None = None
-        for attempt in range(3):
-            try:
-                candidate = await request.app.state.inference_client.post(
-                    config.embedding_upstream_url,
-                    json=upstream_payload,
-                    headers={
-                        "Authorization": f"Bearer {config.openrouter_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                )
-            except (httpx.TimeoutException, httpx.TransportError):
-                if attempt == 2:
-                    raise
-                await asyncio.sleep(0.25 * (2**attempt))
-                continue
-            if candidate.status_code in {408, 429, 500, 502, 503, 504} and attempt < 2:
-                await asyncio.sleep(0.25 * (2**attempt))
-                continue
-            upstream = candidate
-            break
-        if upstream is None:
-            raise HTTPException(
-                status_code=502, detail="embedding provider unavailable"
-            )
+        provider_result = await _post_provider_with_retry(
+            request.app.state.inference_client,
+            config.embedding_upstream_url,
+            payload=upstream_payload,
+            headers={
+                "Authorization": f"Bearer {config.openrouter_api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        upstream = provider_result.response
+        upstream_attempts = provider_result.attempts
         if len(upstream.content) > config.embedding_response_body_bytes:
             raise HTTPException(
                 status_code=502, detail="embedding response is too large"
@@ -1015,14 +1066,16 @@ async def proxy_embeddings(
         )
         raw = json.dumps(public_response, separators=(",", ":")).encode()
         status = "completed"
-    except httpx.TimeoutException as error:
-        timed_out = True
+    except _ProviderCallError as error:
+        upstream_attempts = error.attempts
+        timed_out = error.timed_out
+        detail = (
+            "embedding provider timed out"
+            if timed_out
+            else "embedding provider unavailable"
+        )
         raise HTTPException(
-            status_code=504, detail="embedding provider timed out"
-        ) from error
-    except httpx.HTTPError as error:
-        raise HTTPException(
-            status_code=502, detail="embedding provider unavailable"
+            status_code=504 if timed_out else 502, detail=detail
         ) from error
     finally:
         finished_at = datetime.now(UTC)
@@ -1043,6 +1096,7 @@ async def proxy_embeddings(
                 upstream_provider=config.embedding_provider,
                 timed_out=timed_out,
                 latency_ms=max(0, round((time.monotonic() - started) * 1000)),
+                upstream_attempts=upstream_attempts,
             )
     if not deliverable or raw is None:
         raise HTTPException(status_code=409, detail="embedding grant is no longer live")

@@ -198,7 +198,7 @@ async def test_v7_grant_requires_and_binds_one_calibrated_dynamic_route(
         assert activated is not None
         bearer = activated[1]
         nonce = uuid4()
-        assert await begin_inference_request(
+        started = await begin_inference_request(
             session,
             grant_id=grant.grant_id,
             nonce=nonce,
@@ -209,6 +209,8 @@ async def test_v7_grant_requires_and_binds_one_calibrated_dynamic_route(
             config=config,
             request_kind="embedding",
         )
+        assert started
+        request = started[1]
         assert await finish_inference_request(
             session,
             grant_id=grant.grant_id,
@@ -221,12 +223,14 @@ async def test_v7_grant_requires_and_binds_one_calibrated_dynamic_route(
             usage_available=True,
             now=now,
             upstream_provider=config.embedding_provider,
+            upstream_attempts=3,
         )
         assert grant.embedding_request_count == 1
         assert grant.embedding_tokens == 250_000
         assert grant.embedding_cost_microusd == 1_000
         assert grant.request_count == 0
         assert grant.prompt_tokens == 0
+        assert request.upstream_attempts == 3
 
 
 @pytest.mark.asyncio
