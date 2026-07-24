@@ -1789,6 +1789,36 @@ async def _top5_confirmation_seed_plan(
     return missing if member_depth >= target_depth - 1 else missing[:2]
 
 
+async def _canonical_tail_is_draining(
+    session: AsyncSession,
+    *,
+    requesting_validator: str,
+    canonical_version: int,
+    now: datetime,
+) -> bool:
+    """Whether another validator is finishing current-version quorum work.
+
+    Honest validators ask for canonical work before entering the continual
+    top-five lane.  While the last canonical leases are still running, a
+    validator that received no job would otherwise sit idle until the next
+    scheduled confirmation tempo.  Treat that bounded tail-drain window as
+    spare capacity without opening the continual lane permanently between
+    tempos.
+    """
+    active_agent_id = await session.scalar(
+        select(ValidatorTicket.agent_id)
+        .where(
+            ValidatorTicket.bench_version == canonical_version,
+            ValidatorTicket.validator_hotkey != requesting_validator,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.purpose == TicketPurpose.CANONICAL_QUORUM,
+            ValidatorTicket.deadline > now,
+        )
+        .limit(1)
+    )
+    return active_agent_id is not None
+
+
 @router.post(
     "/top5-confirmation-job",
     response_model=JobResponse,
@@ -1906,13 +1936,23 @@ async def request_top5_confirmation_job(
         champion = await get_agent_by_id(session, agent_id=payload.champion_agent_id)
         assert champion is not None
         crown_block = champion.dataset_seed_block or block.number
-        if not top5_round_is_due(
+        scheduled_round = top5_round_is_due(
             block.number,
             crown_block,
             base=config.top5_backoff_base,
             doubling_k=config.top5_backoff_doubling_tempos,
             cap=config.top5_backoff_cap,
-        ):
+        )
+        spare_capacity_round = (
+            not scheduled_round
+            and await _canonical_tail_is_draining(
+                session,
+                requesting_validator=payload.validator_hotkey,
+                canonical_version=canonical_version,
+                now=now,
+            )
+        )
+        if not scheduled_round and not spare_capacity_round:
             raise HTTPException(
                 status_code=409,
                 detail="top-5 shared-seed rescore round is not due at this block",
