@@ -5219,8 +5219,10 @@ async def _seed_top5_emission_set(
     maker: async_sessionmaker[AsyncSession],
     *,
     bench_version: int = 2,
+    composites: list[float] | None = None,
+    composite_stderr: float = 0.03,
 ) -> list[UUID]:
-    composites = [0.90, 0.88, 0.86, 0.84, 0.82, 0.80]
+    composites = composites or [0.90, 0.88, 0.86, 0.84, 0.82, 0.80]
     agent_ids = [
         await _seed_agent(
             maker,
@@ -5248,7 +5250,10 @@ async def _seed_top5_emission_set(
                         memory_mean=composite,
                         median_ms=100,
                         n=114,
-                        details={"bench_version": 2, "composite_stderr": 0.03},
+                        details={
+                            "bench_version": bench_version,
+                            "composite_stderr": composite_stderr,
+                        },
                         generated_at=datetime.now(UTC),
                     )
                 )
@@ -5309,6 +5314,55 @@ def _top5_score_payload(
 
 
 class TestTop5ConfirmationLane:
+    async def test_claim_uses_version_aware_koth_band_decay(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # At v6 the 0.006 lead clears the decayed band around the older 0.900
+        # incumbent, but it does not clear the legacy flat 0.007 band. The
+        # validator ledger fold and public projection both carry bench_version;
+        # the claim verifier must do the same or it rejects the real champion.
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            bench_version=6,
+            composites=[0.900, 0.906, 0.86, 0.84, 0.82, 0.80],
+            composite_stderr=0.0,
+        )
+        champion = agent_ids[1]
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=6,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now,
+                    activated_at=now,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+        generator = MagicMock(run_size="full")
+        generator.generate = AsyncMock(
+            side_effect=lambda seed, *, bench_version: hashlib.sha256(
+                f"{bench_version}:{seed}".encode()
+            ).hexdigest()
+        )
+        app.dependency_overrides[get_dataset_generator] = lambda: generator
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, champion),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(champion)
+
     async def test_rejects_out_of_cadence_claim_without_canonical_tail(
         self,
         app: FastAPI,

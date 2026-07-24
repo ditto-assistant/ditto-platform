@@ -1713,6 +1713,7 @@ async def _current_koth_entries(
                 composite=row.composite,
                 first_seen=row.first_seen,
                 raw_rank=rank,
+                bench_version=row.bench_version,
                 composite_stderr=_ledger_stderr(details, quorum.get(row.agent_id, [])),
                 confirmation_composites=(
                     tuple(value for _seed, value in confirmations)
