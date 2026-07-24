@@ -48,6 +48,7 @@ from ditto.db.queries.confirmation_scores import (
     completed_confirmation_wave_seeds,
     confirmation_history_by_agent,
 )
+from ditto.db.queries.heartbeats import live_validator_fleet_supports_protocol
 from ditto.db.queries.scores import (
     list_eligible_ledger,
     quorum_composites,
@@ -70,6 +71,7 @@ router = APIRouter(prefix="/scoring", tags=["scoring"])
 # snapshot could hide a genuine change, so we stop vouching for it.
 _MAX_STALE_SECONDS = 300
 _LEDGER_REQUEST_MAX_AGE = timedelta(minutes=2)
+_CONTINUAL_MEAN_PROTOCOL = 14
 
 
 def _ledger_signing_message(
@@ -302,6 +304,11 @@ async def scores(
             [r.agent_id for r in rows],
             bench_versions={r.agent_id: r.bench_version for r in rows},
         )
+        continual_mean_active = await live_validator_fleet_supports_protocol(
+            session,
+            minimum_protocol=_CONTINUAL_MEAN_PROTOCOL,
+            now=auth_now,
+        )
     except SQLAlchemyError as e:
         return _serve_last_known(request, x_validator_hotkey, e)
 
@@ -348,8 +355,12 @@ async def scores(
             signature=r.signature,
             score_proofs=[_score_proof(s) for s in proof_rows.get(r.agent_id, [])],
             composite_stderr=_ledger_stderr(r.details, quorum.get(r.agent_id, [])),
-            confirmation_composites=_confirmation_composites(r.details),
-            confirmation_seeds=_confirmation_seeds(r.details),
+            confirmation_composites=(
+                _confirmation_composites(r.details) if continual_mean_active else None
+            ),
+            confirmation_seeds=(
+                _confirmation_seeds(r.details) if continual_mean_active else None
+            ),
             confirmation_history=(
                 [
                     ConfirmationScoreRecord(
@@ -362,8 +373,11 @@ async def scores(
                     for row in history[r.agent_id]
                     if row.seed in completed_wave_seeds
                 ]
-                if r.agent_id in history
+                if continual_mean_active and r.agent_id in history
                 else None
+            ),
+            continual_aggregate_method=(
+                "mean_after_quorum" if continual_mean_active else None
             ),
             status=r.status,
         )
@@ -423,9 +437,23 @@ def _serve_last_known(
         len(snapshot.entries),
         error,
     )
+    # Capability truth lives in the same database that just failed.  Strip the
+    # additive marker rather than replaying an active snapshot into a fleet that
+    # may have regressed to a legacy protocol while the database was unavailable.
+    entries = [
+        entry.model_copy(
+            update={
+                "continual_aggregate_method": None,
+                "confirmation_composites": None,
+                "confirmation_seeds": None,
+                "confirmation_history": None,
+            }
+        )
+        for entry in snapshot.entries
+    ]
     return LedgerResponse(
-        entries=snapshot.entries,
-        count=len(snapshot.entries),
+        entries=entries,
+        count=len(entries),
         generated_at=snapshot.generated_at,
         stale=True,
         age_seconds=max(0, age),

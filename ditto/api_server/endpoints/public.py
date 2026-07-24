@@ -159,6 +159,7 @@ from ditto.api_server.koth import (
     KOTH_RANK_SHARES,
     KOTH_TAIL_SIZE,
     KothEntry,
+    effective_composite,
     project_koth,
 )
 from ditto.api_server.storage import ObjectDownloadFailedError
@@ -204,6 +205,7 @@ from ditto.db.queries.heartbeats import (
     list_active_validator_work,
     list_screener_heartbeats,
     list_validator_heartbeats,
+    live_validator_fleet_supports_protocol,
 )
 from ditto.db.queries.retry_state import (
     AgentRetryState,
@@ -285,6 +287,7 @@ _DATAGEN_VERSION_BY_BENCH_VERSION = {
 _DATAGEN_RUN_SIZES = frozenset({"small", "medium", "full"})
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 _VALIDATOR_STALE_WINDOW = timedelta(minutes=15)
+_CONTINUAL_MEAN_PROTOCOL = 14
 # Grace after a lease is issued before the validator is expected to report (in a
 # heartbeat) that it has picked the agent up. Within this window an assigned-but-
 # not-yet-reported validator reads as "assigning" rather than a mismatch, so the
@@ -981,6 +984,11 @@ def _public_entry(
     rollout_composite: float | None = None,
     rollout_score_count: int | None = None,
     artifact_release: PublicArtifactRelease | None = None,
+    official_composite: float | None = None,
+    completed_wave_count: int = 0,
+    initial_quorum_composites: tuple[float, ...] = (),
+    completed_wave_composites: tuple[float, ...] = (),
+    continual_aggregate_active: bool = False,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -1013,6 +1021,22 @@ def _public_entry(
             finalized and r.eligible and registered if registered is not None else None
         ),
         composite=r.composite,
+        official_composite=(
+            official_composite if official_composite is not None else r.composite
+        ),
+        aggregate_method=(
+            "continual_mean"
+            if continual_aggregate_active and completed_wave_count > 0
+            else "canonical_median"
+        ),
+        aggregate_sample_count=(
+            SCORING_QUORUM + completed_wave_count
+            if continual_aggregate_active
+            else SCORING_QUORUM
+        ),
+        completed_wave_count=completed_wave_count,
+        initial_quorum_composites=list(initial_quorum_composites),
+        completed_wave_composites=list(completed_wave_composites),
         raw_composite=(
             float(details["raw_composite"])
             if isinstance(details.get("raw_composite"), (int, float))
@@ -1053,14 +1077,14 @@ def _public_entry(
     )
 
 
-def _public_koth_emissions(
+def _completed_wave_data(
     rows: list[LedgerRow],
     *,
     stderrs: dict[UUID, float | None],
     confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
     confirmation_depth: dict[UUID, int] | None = None,
-) -> PublicKothEmissions | None:
-    """Project the finalized score pool through the validator's pure fold."""
+) -> tuple[list[LedgerRow], dict[UUID, dict[int, float]], dict[UUID, int]]:
+    """Return canonical candidates plus only fully completed cohort-wave data."""
     by_seed = confirmation_by_seed or {}
     depths = confirmation_depth or {}
     candidates: list[LedgerRow] = []
@@ -1106,13 +1130,37 @@ def _public_koth_emissions(
     depths.update(
         {member.agent_id: len(completed_wave_seeds) for member in raw_members}
     )
+    return candidates, by_seed, depths
+
+
+def _public_koth_emissions(
+    rows: list[LedgerRow],
+    *,
+    stderrs: dict[UUID, float | None],
+    quorum_by_agent: dict[UUID, list[float]] | None = None,
+    confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
+    confirmation_depth: dict[UUID, int] | None = None,
+    include_continual_scores: bool = True,
+) -> PublicKothEmissions | None:
+    """Project the finalized score pool through the validator's pure fold."""
+    quorum_values = quorum_by_agent or {}
+    candidates, by_seed, depths = _completed_wave_data(
+        rows,
+        stderrs=stderrs,
+        confirmation_by_seed=confirmation_by_seed,
+        confirmation_depth=confirmation_depth,
+    )
 
     fold_entries = []
     for raw_rank, row in enumerate(candidates, start=1):
         details = row.details if isinstance(row.details, dict) else {}
         merged_confirmations: dict[int, float] = {}
-        legacy_seeds = _confirmation_seeds(details)
-        legacy_composites = _confirmation_composites(details)
+        legacy_seeds = (
+            _confirmation_seeds(details) if include_continual_scores else None
+        )
+        legacy_composites = (
+            _confirmation_composites(details) if include_continual_scores else None
+        )
         if legacy_seeds is not None and legacy_composites is not None:
             merged_confirmations.update(
                 zip(legacy_seeds, legacy_composites, strict=False)
@@ -1132,6 +1180,11 @@ def _public_koth_emissions(
                 raw_rank=raw_rank,
                 bench_version=row.bench_version,
                 composite_stderr=stderrs.get(row.agent_id),
+                quorum_composites=tuple(quorum_values.get(row.agent_id, ())),
+                completed_wave_composites=tuple(
+                    value
+                    for _seed, value in sorted(by_seed.get(row.agent_id, {}).items())
+                ),
                 confirmation_composites=(
                     tuple(composite for _seed, composite in confirmations)
                     if confirmations is not None
@@ -1353,6 +1406,15 @@ async def leaderboard(
         if score_counts.get(row.agent_id, 0) >= SCORING_QUORUM
     ]
     finalized_ids = [row.agent_id for row in finalized_rows]
+    continual_mean_active = (
+        bench_version is None
+        and await live_validator_fleet_supports_protocol(
+            session,
+            minimum_protocol=_CONTINUAL_MEAN_PROTOCOL,
+            now=now,
+            freshness=_VALIDATOR_STALE_WINDOW,
+        )
+    )
     if bench_version is None:
         confirmation_by_seed = await confirmation_composites_by_seed(
             session,
@@ -1367,6 +1429,41 @@ async def leaderboard(
     else:
         confirmation_by_seed = {}
         confirmation_depth = {}
+    _, completed_by_seed, completed_depth = _completed_wave_data(
+        finalized_rows,
+        stderrs=fold_stderrs,
+        confirmation_by_seed=confirmation_by_seed,
+        confirmation_depth=confirmation_depth,
+    )
+    official_composites = {
+        row.agent_id: effective_composite(
+            KothEntry(
+                miner_hotkey=row.miner_hotkey,
+                agent_id=row.agent_id,
+                composite=row.composite,
+                first_seen=row.first_seen,
+                raw_rank=0,
+                bench_version=row.bench_version,
+                quorum_composites=tuple(quorum.get(row.agent_id, ())),
+                completed_wave_composites=tuple(
+                    value
+                    for _seed, value in sorted(
+                        completed_by_seed.get(row.agent_id, {}).items()
+                    )
+                ),
+            )
+        )
+        for row in finalized_rows
+    }
+    if not continual_mean_active:
+        official_composites = {row.agent_id: row.composite for row in finalized_rows}
+    finalized_rows.sort(
+        key=lambda row: (
+            -official_composites.get(row.agent_id, row.composite),
+            row.first_seen,
+            row.agent_id,
+        )
+    )
     finalized_miners = {row.miner_hotkey for row in finalized_rows}
     provisional_candidates = [
         (row, score_counts.get(row.agent_id, 0))
@@ -1468,6 +1565,16 @@ async def leaderboard(
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
                 artifact_release=artifact_releases[row.agent_id],
+                official_composite=official_composites.get(row.agent_id, row.composite),
+                completed_wave_count=completed_depth.get(row.agent_id, 0),
+                initial_quorum_composites=tuple(quorum.get(row.agent_id, ())),
+                completed_wave_composites=tuple(
+                    value
+                    for _seed, value in sorted(
+                        completed_by_seed.get(row.agent_id, {}).items()
+                    )
+                ),
+                continual_aggregate_active=continual_mean_active,
             )
         )
     for row, count in provisional_rows:
@@ -1507,6 +1614,8 @@ async def leaderboard(
         desired_bench_version=desired_version,
         available_bench_versions=await list_scored_bench_versions(session),
         selection_mode="historical" if bench_version is not None else "authoritative",
+        continual_aggregate_active=continual_mean_active,
+        continual_aggregate_required_protocol=_CONTINUAL_MEAN_PROTOCOL,
         entries=entries,
         emissions=(
             None
@@ -1514,8 +1623,14 @@ async def leaderboard(
             else _public_koth_emissions(
                 finalized_rows,
                 stderrs=fold_stderrs,
-                confirmation_by_seed=confirmation_by_seed,
-                confirmation_depth=confirmation_depth,
+                quorum_by_agent=quorum,
+                confirmation_by_seed=(
+                    confirmation_by_seed if continual_mean_active else {}
+                ),
+                confirmation_depth=(
+                    confirmation_depth if continual_mean_active else {}
+                ),
+                include_continual_scores=continual_mean_active,
             )
         ),
     )

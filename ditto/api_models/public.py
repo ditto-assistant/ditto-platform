@@ -396,9 +396,34 @@ class PublicLeaderboardEntry(BaseModel):
         Field(
             ge=0.0,
             le=1.0,
-            description="Best composite in [0,1].",
+            description=(
+                "Canonical three-validator median in [0,1]. Preserved for score "
+                "provenance; use official_composite for current ranking."
+            ),
         ),
     ]
+    official_composite: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Composite used for the current leaderboard and weight fold. It "
+                "starts as the canonical three-validator median, then becomes "
+                "the arithmetic mean of those three scores plus every completed "
+                "continual cohort-wave score. Partial waves never enter it."
+            ),
+        ),
+    ]
+    aggregate_method: Literal["canonical_median", "continual_mean"] = "canonical_median"
+    aggregate_sample_count: Annotated[int, Field(ge=3)] = 3
+    completed_wave_count: Annotated[int, Field(ge=0)] = 0
+    initial_quorum_composites: list[Annotated[float, Field(ge=0.0, le=1.0)]] = Field(
+        default_factory=list
+    )
+    completed_wave_composites: list[Annotated[float, Field(ge=0.0, le=1.0)]] = Field(
+        default_factory=list
+    )
     raw_composite: Annotated[
         float | None,
         Field(
@@ -801,6 +826,17 @@ class PublicLeaderboardResponse(BaseModel):
             )
         ),
     ]
+    continual_aggregate_active: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether completed continual waves currently update rankings and "
+                "validator weights. Activation is global and fail-closed until every "
+                "recently-live validator supports the required protocol."
+            )
+        ),
+    ] = False
+    continual_aggregate_required_protocol: Annotated[int, Field(ge=1)] = 14
     entries: Annotated[
         list[PublicLeaderboardEntry],
         Field(default_factory=list, description="Ranked miners, best composite first."),

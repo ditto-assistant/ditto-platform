@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -333,6 +333,31 @@ async def list_validator_heartbeats(
         )
     )
     return list(result)
+
+
+async def live_validator_fleet_supports_protocol(
+    session: AsyncSession,
+    *,
+    minimum_protocol: int,
+    now: datetime,
+    freshness: timedelta = timedelta(minutes=15),
+) -> bool:
+    """Whether every recently-live validator supports one additive contract.
+
+    This is deliberately a *global* fleet predicate, not request negotiation:
+    every validator must receive byte-equivalent ledger semantics during an
+    asynchronous client rollout.  An empty fleet fails closed.  A legacy
+    validator that returns within the operational stale window disables the new
+    contract globally again, so mixed fleets never split their weight fold.
+    """
+    protocols = list(
+        await session.scalars(
+            select(ValidatorHeartbeat.protocol_version).where(
+                ValidatorHeartbeat.seen_at >= now - freshness
+            )
+        )
+    )
+    return bool(protocols) and min(protocols) >= minimum_protocol
 
 
 async def list_active_validator_work(
