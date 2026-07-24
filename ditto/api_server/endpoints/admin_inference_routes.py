@@ -127,7 +127,10 @@ async def list_inference_routes(
                     func.sum(InferenceRequest.cost_microusd).label("cost_microusd"),
                     func.avg(InferenceRequest.latency_ms).label("average_latency_ms"),
                 )
-                .where(InferenceRequest.upstream_provider.is_not(None))
+                .where(
+                    InferenceRequest.upstream_provider.is_not(None),
+                    InferenceRequest.request_kind == "chat",
+                )
                 .group_by(InferenceRequest.upstream_provider)
                 .order_by(InferenceRequest.upstream_provider)
             )

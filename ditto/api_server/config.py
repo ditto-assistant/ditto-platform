@@ -69,6 +69,21 @@ class InferenceProxyConfig:
     routing_mode: str
     request_budget: int
     token_budget: int
+    embedding_upstream_url: str
+    embedding_model: str
+    embedding_profile: str
+    embedding_provider: str
+    embedding_dimensions: int
+    embedding_request_budget: int
+    embedding_token_budget: int
+    embedding_per_ticket_concurrency: int
+    embedding_per_validator_concurrency: int
+    embedding_global_concurrency: int
+    embedding_per_ticket_requests_per_minute: int
+    embedding_per_validator_requests_per_minute: int
+    embedding_global_requests_per_minute: int
+    embedding_request_body_bytes: int
+    embedding_response_body_bytes: int
     per_ticket_concurrency: int
     per_validator_concurrency: int
     global_concurrency: int
@@ -172,6 +187,21 @@ class ApiServerConfig:
             routing_mode="aggregate_throughput",
             request_budget=1024,
             token_budget=4_000_000,
+            embedding_upstream_url="https://openrouter.ai/api/v1/embeddings",
+            embedding_model="perplexity/pplx-embed-v1-0.6b",
+            embedding_profile="dittobench-v7-openrouter-pplx-embed-v1-0.6b-768-v1",
+            embedding_provider="Perplexity",
+            embedding_dimensions=768,
+            embedding_request_budget=100_000,
+            embedding_token_budget=1_000_000_000,
+            embedding_per_ticket_concurrency=1,
+            embedding_per_validator_concurrency=8,
+            embedding_global_concurrency=32,
+            embedding_per_ticket_requests_per_minute=10_000,
+            embedding_per_validator_requests_per_minute=40_000,
+            embedding_global_requests_per_minute=100_000,
+            embedding_request_body_bytes=1 << 20,
+            embedding_response_body_bytes=16 << 20,
             per_ticket_concurrency=8,
             per_validator_concurrency=24,
             global_concurrency=72,
@@ -322,6 +352,53 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
                 os.environ.get("DITTO_INFERENCE_REQUEST_BUDGET", "1024")
             ),
             token_budget=int(os.environ.get("DITTO_INFERENCE_TOKEN_BUDGET", "4000000")),
+            embedding_upstream_url=os.environ.get(
+                "DITTO_EMBEDDING_UPSTREAM_URL",
+                "https://openrouter.ai/api/v1/embeddings",
+            ),
+            embedding_model=os.environ.get(
+                "DITTO_EMBEDDING_MODEL", "perplexity/pplx-embed-v1-0.6b"
+            ).strip(),
+            embedding_profile=os.environ.get(
+                "DITTO_EMBEDDING_PROFILE",
+                "dittobench-v7-openrouter-pplx-embed-v1-0.6b-768-v1",
+            ).strip(),
+            embedding_provider=os.environ.get(
+                "DITTO_EMBEDDING_PROVIDER", "Perplexity"
+            ).strip(),
+            embedding_dimensions=int(
+                os.environ.get("DITTO_EMBEDDING_DIMENSIONS", "768")
+            ),
+            embedding_request_budget=int(
+                os.environ.get("DITTO_EMBEDDING_REQUEST_BUDGET", "100000")
+            ),
+            embedding_token_budget=int(
+                os.environ.get("DITTO_EMBEDDING_TOKEN_BUDGET", "1000000000")
+            ),
+            embedding_per_ticket_concurrency=int(
+                os.environ.get("DITTO_EMBEDDING_TICKET_CONCURRENCY", "1")
+            ),
+            embedding_per_validator_concurrency=int(
+                os.environ.get("DITTO_EMBEDDING_VALIDATOR_CONCURRENCY", "8")
+            ),
+            embedding_global_concurrency=int(
+                os.environ.get("DITTO_EMBEDDING_GLOBAL_CONCURRENCY", "32")
+            ),
+            embedding_per_ticket_requests_per_minute=int(
+                os.environ.get("DITTO_EMBEDDING_TICKET_RPM", "10000")
+            ),
+            embedding_per_validator_requests_per_minute=int(
+                os.environ.get("DITTO_EMBEDDING_VALIDATOR_RPM", "40000")
+            ),
+            embedding_global_requests_per_minute=int(
+                os.environ.get("DITTO_EMBEDDING_GLOBAL_RPM", "100000")
+            ),
+            embedding_request_body_bytes=int(
+                os.environ.get("DITTO_EMBEDDING_REQUEST_BODY_BYTES", str(1 << 20))
+            ),
+            embedding_response_body_bytes=int(
+                os.environ.get("DITTO_EMBEDDING_RESPONSE_BODY_BYTES", str(16 << 20))
+            ),
             per_ticket_concurrency=int(
                 os.environ.get("DITTO_INFERENCE_TICKET_CONCURRENCY", "8")
             ),
@@ -552,6 +629,21 @@ def check_config(config: ApiServerConfig) -> None:
         raise ApiServerConfigError(
             "inference upstream must be OpenRouter chat completions"
         )
+    embedding_upstream = urlparse(inference.embedding_upstream_url)
+    if (
+        embedding_upstream.scheme != "https"
+        or embedding_upstream.hostname != "openrouter.ai"
+        or embedding_upstream.path != "/api/v1/embeddings"
+    ):
+        raise ApiServerConfigError("embedding upstream must be OpenRouter embeddings")
+    if (
+        inference.embedding_model != "perplexity/pplx-embed-v1-0.6b"
+        or inference.embedding_profile
+        != "dittobench-v7-openrouter-pplx-embed-v1-0.6b-768-v1"
+        or inference.embedding_provider != "Perplexity"
+        or inference.embedding_dimensions != 768
+    ):
+        raise ApiServerConfigError("v7 embedding identity is not the reviewed contract")
     public_base = urlparse(inference.public_base_url)
     if public_base.scheme not in {"http", "https"} or not public_base.netloc:
         raise ApiServerConfigError("inference public base URL must be absolute")
@@ -567,6 +659,16 @@ def check_config(config: ApiServerConfig) -> None:
         inference.request_body_bytes,
         inference.response_body_bytes,
         inference.max_output_tokens,
+        inference.embedding_request_budget,
+        inference.embedding_token_budget,
+        inference.embedding_per_ticket_concurrency,
+        inference.embedding_per_validator_concurrency,
+        inference.embedding_global_concurrency,
+        inference.embedding_per_ticket_requests_per_minute,
+        inference.embedding_per_validator_requests_per_minute,
+        inference.embedding_global_requests_per_minute,
+        inference.embedding_request_body_bytes,
+        inference.embedding_response_body_bytes,
     )
     if any(value < 1 for value in limits):
         raise ApiServerConfigError("inference proxy limits must be positive")
@@ -626,6 +728,15 @@ def check_config(config: ApiServerConfig) -> None:
             "inference concurrency must be ordered ticket <= validator <= global <= 128"
         )
     if not (
+        inference.embedding_per_ticket_concurrency
+        <= inference.embedding_per_validator_concurrency
+        <= inference.embedding_global_concurrency
+        <= 128
+    ):
+        raise ApiServerConfigError(
+            "embedding concurrency must be ordered ticket <= validator <= global <= 128"
+        )
+    if not (
         inference.per_ticket_requests_per_minute
         <= inference.per_validator_requests_per_minute
         <= inference.global_requests_per_minute
@@ -633,6 +744,15 @@ def check_config(config: ApiServerConfig) -> None:
     ):
         raise ApiServerConfigError(
             "inference request rates must be ordered ticket <= validator <= global"
+        )
+    if not (
+        inference.embedding_per_ticket_requests_per_minute
+        <= inference.embedding_per_validator_requests_per_minute
+        <= inference.embedding_global_requests_per_minute
+        <= 100_000
+    ):
+        raise ApiServerConfigError(
+            "embedding request rates must be ordered ticket <= validator <= global"
         )
     if (
         inference.request_budget > 4096
@@ -642,6 +762,13 @@ def check_config(config: ApiServerConfig) -> None:
         or inference.max_output_tokens > 32_768
     ):
         raise ApiServerConfigError("inference proxy limit exceeds its safety bound")
+    if (
+        inference.embedding_request_budget > 100_000
+        or inference.embedding_token_budget > 1_000_000_000
+        or inference.embedding_request_body_bytes > 1 << 20
+        or inference.embedding_response_body_bytes > 16 << 20
+    ):
+        raise ApiServerConfigError("embedding proxy limit exceeds its safety bound")
     if not 1 <= inference.timeout_seconds <= 120:
         raise ApiServerConfigError(
             "inference timeout must be between 1 and 120 seconds"
