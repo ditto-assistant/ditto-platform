@@ -89,6 +89,10 @@ from ditto.db.models import (
     ValidatorHeartbeat,
     ValidatorTicket,
 )
+from ditto.db.queries.confirmation_scores import (
+    ConfirmationSeedScore,
+    append_confirmation_scores,
+)
 from ditto.db.queries.tickets import MAX_INFRA_RETRY_GRANTS
 
 # Real dev keypairs: sign for real so _verify_signature runs end to end. The k=3
@@ -2592,7 +2596,13 @@ class TestRequestJob:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         now = datetime.now(UTC)
-        cohort = (await _seed_top5_emission_set(session_maker, bench_version=7))[:5]
+        cohort = (
+            await _seed_top5_emission_set(
+                session_maker,
+                bench_version=7,
+                seed_heartbeats=False,
+            )
+        )[:5]
         source_agent = await _seed_agent(
             session_maker,
             status=AgentStatus.EVALUATING,
@@ -5190,7 +5200,12 @@ def test_infra_retry_backoff_doubles_and_caps() -> None:
         prev = current
 
 
-def _install_chain_with_block(app: FastAPI, *, block_number: int) -> None:
+def _install_chain_with_block(
+    app: FastAPI,
+    *,
+    block_number: int,
+    extra_keypairs: tuple[bittensor.Keypair, ...] = (),
+) -> None:
     from ditto.chain.models import BlockInfo
 
     neurons = [
@@ -5201,7 +5216,7 @@ def _install_chain_with_block(app: FastAPI, *, block_number: int) -> None:
             stake=1000.0,
             validator_permit=True,
         )
-        for uid, keypair in enumerate(_KEYPAIRS, start=1)
+        for uid, keypair in enumerate((*_KEYPAIRS, *extra_keypairs), start=1)
     ]
 
     async def _chain() -> MagicMock:
@@ -5221,6 +5236,7 @@ async def _seed_top5_emission_set(
     bench_version: int = 2,
     composites: list[float] | None = None,
     composite_stderr: float = 0.03,
+    seed_heartbeats: bool = True,
 ) -> list[UUID]:
     composites = composites or [0.90, 0.88, 0.86, 0.84, 0.82, 0.80]
     agent_ids = [
@@ -5257,25 +5273,42 @@ async def _seed_top5_emission_set(
                         generated_at=datetime.now(UTC),
                     )
                 )
+    if seed_heartbeats:
+        for keypair in _KEYPAIRS:
+            await _seed_validator_heartbeat(
+                maker,
+                keypair=keypair,
+                protocol_version=13,
+            )
     return agent_ids
 
 
-def _top5_job_payload(champion: UUID, member: UUID) -> dict[str, str]:
+def _top5_job_payload(
+    champion: UUID,
+    member: UUID,
+    *,
+    keypair: bittensor.Keypair = _KEYPAIR,
+) -> dict[str, str]:
     nonce = uuid4()
     requested_at = datetime.now(UTC)
     requested = requested_at.isoformat(timespec="microseconds")
+    validator_hotkey = keypair.ss58_address
     message = (
         "validator-top5-confirmation-job:v1:"
-        f"{_VALIDATOR_HOTKEY}:{champion}:{member}:{nonce}:{requested}"
+        f"{validator_hotkey}:{champion}:{member}:{nonce}:{requested}"
     ).encode()
     return {
-        "validator_hotkey": _VALIDATOR_HOTKEY,
+        "validator_hotkey": validator_hotkey,
         "champion_agent_id": str(champion),
         "member_agent_id": str(member),
         "nonce": str(nonce),
         "requested_at": requested_at.isoformat(),
-        "signature": _KEYPAIR.sign(message).hex(),
+        "signature": keypair.sign(message).hex(),
     }
+
+
+def _top5_auth_header(keypair: bittensor.Keypair) -> dict[str, str]:
+    return {"X-Validator-Hotkey": keypair.ss58_address}
 
 
 def _top5_score_payload(
@@ -5314,6 +5347,179 @@ def _top5_score_payload(
 
 
 class TestTop5ConfirmationLane:
+    async def test_requires_single_seed_capable_validator_protocol(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member, *_ = await _seed_top5_emission_set(
+            session_maker,
+            seed_heartbeats=False,
+        )
+        await _seed_validator_heartbeat(session_maker, protocol_version=12)
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 428
+        assert "protocol 13" in response.json()["message"]
+
+    async def test_requires_fresh_validator_heartbeat(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member, *_ = await _seed_top5_emission_set(
+            session_maker,
+            seed_heartbeats=False,
+        )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 428
+        assert "fresh heartbeat" in response.json()["message"]
+
+    async def test_distributes_concurrent_claims_across_least_covered_members(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, second, third = agent_ids[:3]
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        first = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[0]),
+            json=_top5_job_payload(champion, champion, keypair=_KEYPAIRS[0]),
+        )
+        assert first.status_code == 200, first.text
+
+        repeated_champion = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[1]),
+            json=_top5_job_payload(champion, champion, keypair=_KEYPAIRS[1]),
+        )
+        assert repeated_champion.status_code == 409
+        assert "less confirmation coverage" in repeated_champion.json()["message"]
+
+        second_claim = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[1]),
+            json=_top5_job_payload(champion, second, keypair=_KEYPAIRS[1]),
+        )
+        assert second_claim.status_code == 200, second_claim.text
+
+        repeated_second = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[2]),
+            json=_top5_job_payload(champion, second, keypair=_KEYPAIRS[2]),
+        )
+        assert repeated_second.status_code == 409
+        assert "less confirmation coverage" in repeated_second.json()["message"]
+
+        third_claim = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[2]),
+            json=_top5_job_payload(champion, third, keypair=_KEYPAIRS[2]),
+        )
+        assert third_claim.status_code == 200, third_claim.text
+
+    async def test_protocol_13_validator_without_canonical_score_can_claim(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Fleet additions may append evidence without changing canonical k=3."""
+        champion, *_ = await _seed_top5_emission_set(session_maker)
+        await _seed_validator_heartbeat(
+            session_maker,
+            keypair=_DAVE,
+            protocol_version=13,
+        )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1, extra_keypairs=(_DAVE,))
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_DAVE),
+            json=_top5_job_payload(champion, champion, keypair=_DAVE),
+        )
+
+        assert response.status_code == 200, response.text
+        async with session_maker() as session:
+            canonical = await session.get(Score, (champion, 2, _DAVE.ss58_address))
+            ticket = await session.get(
+                ValidatorTicket,
+                (champion, 2, _DAVE.ss58_address),
+            )
+        assert canonical is None
+        assert ticket is not None
+        assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
+
+    async def test_confirmation_retry_cooldown_defers_then_releases_member(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, *_ = await _seed_top5_emission_set(session_maker)
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=champion,
+                    bench_version=2,
+                    validator_hotkey=_VALIDATOR_HOTKEY,
+                    status=TicketStatus.EXPIRED,
+                    purpose=TicketPurpose.CONTINUAL_RETEST,
+                    purpose_revision=1,
+                    issued_at=now - timedelta(hours=1),
+                    deadline=now - timedelta(minutes=30),
+                    retry_after=now + timedelta(minutes=30),
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        deferred = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, champion),
+        )
+        assert deferred.status_code == 409
+
+        async with session_maker() as session, session.begin():
+            ticket = await session.get(
+                ValidatorTicket,
+                (champion, 2, _VALIDATOR_HOTKEY),
+            )
+            assert ticket is not None
+            ticket.retry_after = datetime.now(UTC) - timedelta(seconds=1)
+
+        released = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, champion),
+        )
+        assert released.status_code == 200, released.text
+
     async def test_claim_uses_version_aware_koth_band_decay(
         self,
         app: FastAPI,
@@ -5362,6 +5568,63 @@ class TestTop5ConfirmationLane:
 
         assert response.status_code == 200, response.text
         assert response.json()["agent_id"] == str(champion)
+
+    async def test_completed_wave_champion_can_claim_the_next_wave(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The claim fold must match the completed-wave scoring ledger fold.
+
+        A complete shared-seed wave can legitimately dethrone the canonical-score
+        incumbent.  Rechecking the claim against a fold with confirmation history
+        disabled would reject every subsequent claim with a stale champion and
+        permanently stop the retest lane.
+        """
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            composites=[0.90, 0.906, 0.86, 0.84, 0.82, 0.80],
+            composite_stderr=0.0,
+        )
+        old_champion, new_champion = agent_ids[:2]
+        cohort = agent_ids[:5]
+        completed_seeds = champion_anchored_seeds(
+            old_champion,
+            version=2,
+            max_seeds=16,
+        )[:2]
+        async with session_maker() as session, session.begin():
+            await append_confirmation_scores(
+                session,
+                rows=[
+                    ConfirmationSeedScore(
+                        agent_id,
+                        _VALIDATOR_HOTKEY,
+                        seed,
+                        0.95 if agent_id == new_champion else 0.80,
+                        f"completed-wave-{agent_id}-{seed}",
+                        None,
+                    )
+                    for agent_id in cohort
+                    for seed in completed_seeds
+                ],
+                bench_version=2,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(new_champion, new_champion),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(new_champion)
 
     async def test_rejects_out_of_cadence_claim_without_canonical_tail(
         self,
@@ -5519,7 +5782,10 @@ class TestTop5ConfirmationLane:
         from ditto.api_server.crn import champion_anchored_seeds
 
         agent_ids = await _seed_top5_emission_set(session_maker)
-        champion, member = agent_ids[0], agent_ids[1]
+        # This lease was valid when issued, but the member has since fallen out
+        # of the current five. Deployment must not strand already-running old
+        # multi-seed work; its live signed ticket remains the authorization.
+        champion, member = agent_ids[0], agent_ids[5]
         deadline = datetime.now(UTC) + timedelta(minutes=30)
         await _seed_ticket(
             session_maker,
@@ -5558,7 +5824,11 @@ class TestTop5ConfirmationLane:
         session_maker: async_sessionmaker[AsyncSession],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        agent_ids = await _seed_top5_emission_set(session_maker, bench_version=7)
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            bench_version=7,
+            seed_heartbeats=False,
+        )
         champion, member = agent_ids[0], agent_ids[1]
         now = datetime.now(UTC)
         profile = "openrouter-route-a471cd87ae7df5b9-v1"
@@ -5585,7 +5855,7 @@ class TestTop5ConfirmationLane:
         }
         await _seed_validator_heartbeat(
             session_maker,
-            protocol_version=11,
+            protocol_version=13,
             capabilities=capabilities,
             stack=_V7_STACK,
         )
@@ -5660,7 +5930,7 @@ class TestTop5ConfirmationLane:
         from ditto.api_server.crn import champion_anchored_seeds
 
         expected_seeds = list(
-            champion_anchored_seeds(champion, version=7, max_seeds=16)[:2]
+            champion_anchored_seeds(champion, version=7, max_seeds=16)[:1]
         )
         assert [pin["seed"] for pin in body["confirmation_datasets"]] == expected_seeds
         assert all(pin["run_size"] == "full" for pin in body["confirmation_datasets"])

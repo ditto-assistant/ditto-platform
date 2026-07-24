@@ -41,9 +41,13 @@ from ditto.api_server.endpoints.validator import (
     _assert_validator_permitted,
     _verify_signature,
 )
+from ditto.api_server.koth import KothEntry, emission_set, project_koth
 from ditto.db.models import Score
 from ditto.db.queries.benchmark_rollout import active_bench_version
-from ditto.db.queries.confirmation_scores import confirmation_history_by_agent
+from ditto.db.queries.confirmation_scores import (
+    completed_confirmation_wave_seeds,
+    confirmation_history_by_agent,
+)
 from ditto.db.queries.scores import (
     list_eligible_ledger,
     quorum_composites,
@@ -301,6 +305,32 @@ async def scores(
     except SQLAlchemyError as e:
         return _serve_last_known(request, x_validator_hotkey, e)
 
+    raw_candidates = [row for row in rows if row.eligible and row.composite > 0.0]
+    raw_candidates.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
+    raw_projection = project_koth(
+        [
+            KothEntry(
+                miner_hotkey=row.miner_hotkey,
+                agent_id=row.agent_id,
+                composite=row.composite,
+                first_seen=row.first_seen,
+                raw_rank=rank,
+                bench_version=row.bench_version,
+                composite_stderr=_ledger_stderr(
+                    row.details, quorum.get(row.agent_id, [])
+                ),
+            )
+            for rank, row in enumerate(raw_candidates, start=1)
+        ]
+    )
+    raw_member_ids = [member.agent_id for member in emission_set(raw_projection)]
+    completed_wave_seeds = completed_confirmation_wave_seeds(
+        member_ids=raw_member_ids or history.keys(),
+        seeds_by_agent={
+            agent_id: tuple(row.seed for row in agent_history)
+            for agent_id, agent_history in history.items()
+        },
+    )
     generated_at = datetime.now(UTC)
     entries = [
         LedgerEntry(
@@ -330,6 +360,7 @@ async def scores(
                         signature=row.signature,
                     )
                     for row in history[r.agent_id]
+                    if row.seed in completed_wave_seeds
                 ]
                 if r.agent_id in history
                 else None

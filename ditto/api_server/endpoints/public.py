@@ -184,6 +184,7 @@ from ditto.db.queries.benchmark_rollout import (
     rollout_state,
 )
 from ditto.db.queries.confirmation_scores import (
+    completed_confirmation_wave_seeds,
     confirmation_composites_by_seed,
     confirmation_depths,
 )
@@ -983,6 +984,44 @@ def _public_koth_emissions(
         if row.eligible and row.composite > 0.0:
             candidates.append(row)
     candidates.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
+
+    raw_projection = project_koth(
+        [
+            KothEntry(
+                miner_hotkey=row.miner_hotkey,
+                agent_id=row.agent_id,
+                composite=row.composite,
+                first_seen=row.first_seen,
+                raw_rank=raw_rank,
+                bench_version=row.bench_version,
+                composite_stderr=stderrs.get(row.agent_id),
+            )
+            for raw_rank, row in enumerate(candidates, start=1)
+        ]
+    )
+    raw_members = (
+        (raw_projection.champion, *raw_projection.tail)
+        if raw_projection is not None
+        else ()
+    )
+    completed_wave_seeds = completed_confirmation_wave_seeds(
+        member_ids=[member.agent_id for member in raw_members],
+        seeds_by_agent={
+            agent_id: values.keys() for agent_id, values in by_seed.items()
+        },
+    )
+    by_seed = {
+        agent_id: {
+            seed: value
+            for seed, value in values.items()
+            if seed in completed_wave_seeds
+        }
+        for agent_id, values in by_seed.items()
+    }
+    depths = dict.fromkeys(depths, 0)
+    depths.update(
+        {member.agent_id: len(completed_wave_seeds) for member in raw_members}
+    )
 
     fold_entries = []
     for raw_rank, row in enumerate(candidates, start=1):

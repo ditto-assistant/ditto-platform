@@ -16,7 +16,7 @@ surfaced on the leaderboard.
 from __future__ import annotations
 
 import statistics
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -59,6 +59,31 @@ class ConfirmationHistoryRow:
     validator_hotkey: str
     bench_version: int
     signature: str | None
+
+
+def completed_confirmation_wave_seeds(
+    *,
+    member_ids: Iterable[UUID],
+    seeds_by_agent: Mapping[UUID, Iterable[int]],
+) -> frozenset[int]:
+    """Seeds with accepted confirmation evidence for every cohort member.
+
+    Continual retests are cohort waves, not independent per-agent samples.  A
+    partially completed wave stays append-only and visible for audit, but must
+    not enter the KOTH fold until every current top-five member has one result
+    for the same seed.  Otherwise the first report can change the champion and
+    invalidate the still-running leases for the rest of the wave.
+    """
+    members = tuple(dict.fromkeys(member_ids))
+    if not members:
+        return frozenset()
+    common: set[int] | None = None
+    for member_id in members:
+        member_seeds = set(seeds_by_agent.get(member_id, ()))
+        common = member_seeds if common is None else common & member_seeds
+        if not common:
+            return frozenset()
+    return frozenset(common or ())
 
 
 async def append_confirmation_scores(
