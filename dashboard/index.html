@@ -2268,19 +2268,34 @@
     }
     @media (min-width: 1181px) and (max-width: 1919px) {
       .overview-split .hide-sm { display: none; }
-      /* The Tool/Memory columns are hidden at these widths; keep the subscores
-         visible as a compact line in the composite cell so a miner tuning one
-         of them never loses sight of it on a laptop. */
-      .overview-split .tm-mini { display: inline-block; }
+      /* Every column except Model stays visible in the split (nth-child
+         selectors: Model at 4 is display:none but still counts). */
       /* The remaining four columns must actually fit the half-width pane.
          table-layout: fixed makes the table exactly container width — columns
          obey the widths below and content ellipsizes/wraps inside its cell
          instead of forcing a horizontal scroll. Cell min-widths that assume
          the full-page table (identity 190px, metric 150px) are relaxed. */
       .overview-split #board { table-layout: fixed; }
-      .overview-split #board th[data-sort="rank"] { width: 54px !important; }
-      .overview-split #board thead th:nth-child(3) { width: 118px !important; }
-      .overview-split #board th[data-sort="composite"] { width: 172px !important; }
+      /* Tool and Memory stay visible at every split width. Percentage columns
+         that sum to 100: with table-layout fixed this is fully deterministic
+         at every pane width — no auto column to pool slack, no pixel sums to
+         overflow. Bars degrade to slivers before data ever disappears. */
+      .overview-split #board th[data-sort="tool"],
+      .overview-split #board th[data-sort="memory"],
+      .overview-split #board th[data-sort="latency"],
+      .overview-split #board th[data-sort="first_seen"],
+      .overview-split #board td.hide-sm:nth-child(6),
+      .overview-split #board td.hide-sm:nth-child(7),
+      .overview-split #board td.hide-sm:nth-child(8),
+      .overview-split #board td.hide-sm:nth-child(9) { display: table-cell; }
+      .overview-split #board th[data-sort="rank"] { width: 7% !important; }
+      .overview-split #board th[data-sort="name"] { width: 22% !important; }
+      .overview-split #board thead th:nth-child(3) { width: 14% !important; }
+      .overview-split #board th[data-sort="composite"] { width: 20% !important; }
+      .overview-split #board th[data-sort="tool"],
+      .overview-split #board th[data-sort="memory"] { width: 10.5% !important; }
+      .overview-split #board th[data-sort="latency"],
+      .overview-split #board th[data-sort="first_seen"] { width: 8% !important; }
       .overview-split #board th, .overview-split #board td { padding-inline: 9px; }
       .overview-split #board td { overflow: hidden; }
       .overview-split #board .winner-identity { min-width: 0; }
@@ -2292,7 +2307,6 @@
       .overview-split .leaderboard-version-switch { align-items: flex-start; flex-direction: column; gap: 8px; }
       .overview-split .leaderboard-version-switch .activity-filter-list { justify-content: flex-start; }
     }
-    .tm-mini { display: none; margin-top: 2px; color: var(--text-dim); font: 700 11px/1.4 var(--mono); letter-spacing: .04em; font-variant-numeric: tabular-nums; }
 
     /* ── Overview: champion box + snapshot ledger ────────────
        The reigning-KOTH box heads the leaderboard column; the snapshot ledger
@@ -4785,11 +4799,7 @@
       var tokenChip = tokenPenaltyChip(e);
       var line2 = (spark || chip || gateChip || tokenChip)
         ? '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-height:16px">' + spark + chip + gateChip + tokenChip + '</div>' : "";
-      // Shown by CSS only at split widths where the Tool/Memory columns hide.
-      var tm = (e.tool_mean != null || e.memory_mean != null)
-        ? '<span class="tm-mini">tool ' + (e.tool_mean != null ? fx(e.tool_mean) : "–") +
-          ' · mem ' + (e.memory_mean != null ? fx(e.memory_mean) : "–") + '</span>' : "";
-      return '<td><div class="cwrap">' + row + line2 + tm + '</div></td>';
+      return '<td><div class="cwrap">' + row + line2 + '</div></td>';
     }
     // Why the composite is not simply the tool/memory average: the base IS that
     // average (½·tool + ½·memory), and the benchmark quality gates (chiefly the
