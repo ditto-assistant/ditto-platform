@@ -243,6 +243,10 @@ class TestLeaderboardBonusExposure:
         # 3 members at 100k/200k/400k: nearest-rank P25 = 100k, median = 200k.
         assert status["reference_p25_tokens"] == 100_000.0
         assert status["reference_median_tokens"] == 200_000.0
+        # Two-tier policy frozen with its knobs and derived deep frontier.
+        assert status["curve_version"] == 2
+        assert status["deep_bonus_cap"] == 0.10
+        assert status["deep_frontier_tokens"] == 50_000.0
 
         lean = _entry(payload, agents["lean"])
         assert lean["efficiency_bonus"] == 0.05
@@ -291,8 +295,51 @@ class TestLeaderboardBonusExposure:
                 _entry(second, agents[name])["efficiency_bonus"]
                 == _entry(first, agents[name])["efficiency_bonus"]
             )
-        # 50k <= frozen P25 (100k) -> full bonus against the frozen frontier.
-        assert _entry(second, newcomer)["efficiency_bonus"] == 0.05
+        # 50k == the frozen deep frontier (0.5 x P25 = 50k) -> the newcomer
+        # saturates at the frozen deep cap, judged against the frozen policy.
+        assert _entry(second, newcomer)["efficiency_bonus"] == 0.10
+        assert _entry(second, newcomer)["effective_composite"] == pytest.approx(
+            0.75 * 1.10
+        )
+
+    async def test_cohort_member_below_deep_frontier_saturates_at_deep_cap(
+        self, session_maker: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Full two-tier epoch: five cohort members whose totals put one below
+        the deep frontier (flat deep cap), one exactly on P25 (base cap), and
+        the rest at or past the median (zero)."""
+        await _activate_bench_version(session_maker, 7)
+        totals = [10_000, 100_000, 110_000, 200_000, 400_000]
+        agents = [
+            await _seed_finalized(
+                session_maker,
+                miner=miner,
+                composite=0.9 - i * 0.05,
+                total_tokens=total,
+            )
+            for i, (miner, total) in enumerate(zip(_MINERS, totals, strict=True))
+        ]
+        app = _make_app(session_maker, efficiency=_ENABLED)
+        async with _client(app) as client:
+            payload = (await client.get("/api/v1/public/leaderboard")).json()
+
+        status = payload["efficiency"]
+        # n=5: nearest-rank P25 = 2nd smallest = 100k; median = 110k;
+        # deep frontier = 0.5 x 100k = 50k.
+        assert status["active"] is True
+        assert status["reference_p25_tokens"] == 100_000.0
+        assert status["reference_median_tokens"] == 110_000.0
+        assert status["deep_frontier_tokens"] == 50_000.0
+
+        deep, at_p25, at_median, heavy, heaviest = (
+            _entry(payload, agent_id) for agent_id in agents
+        )
+        assert deep["efficiency_bonus"] == 0.10  # 10k < 50k: saturated
+        assert deep["effective_composite"] == pytest.approx(0.9 * 1.10)
+        assert at_p25["efficiency_bonus"] == 0.05  # exactly P25: base cap
+        assert at_median["efficiency_bonus"] == 0.0  # at the median: zero
+        assert heavy["efficiency_bonus"] == 0.0
+        assert heaviest["efficiency_bonus"] == 0.0
 
     async def test_below_n_min_is_inactive_and_awards_nothing(
         self, session_maker: async_sessionmaker[AsyncSession]

@@ -62,16 +62,34 @@ windows counted from the Unix epoch). Once per epoch, per
    * `P25` = nearest-rank 25th percentile of cohort token totals — the
      efficient-quartile full-bonus frontier;
    * `median` = cohort median — the zero-bonus point.
-8. **Bonus curve.** For a qualified submission with audited cost `C`:
+8. **Bonus curve** (two tiers, `curve_version = 2`). Let
+   `deep_frontier = deep_frontier_ratio x P25` (default `0.5 x P25`). For a
+   qualified submission with audited cost `C`:
 
    ```
-   bonus = cap                                  if C <= P25
-   bonus = cap * (median - C) / (median - P25)  if P25 < C < median
-   bonus = 0                                    if C >= median
+   bonus = deep_cap                                                 if C <= deep_frontier   (tier 2: SATURATED)
+   bonus = cap + (deep_cap - cap) * (P25 - C) / (P25 - deep_frontier)  if deep_frontier < C <= P25   (tier 2: ramp)
+   bonus = cap * (median - C) / (median - P25)                      if P25 < C < median     (tier 1: unchanged)
+   bonus = 0                                                        if C >= median
    ```
 
-   `cap` = `B_max`, default 5%, hard ceiling 10% (boot check + DB CHECK).
-   Degenerate cohorts (`median == P25`) collapse to a step at the frontier.
+   `cap` = tier-1 `B_max`, default 5%; `deep_cap` default 10%; both inside
+   the agreed 5–10% envelope: boot checks enforce `0 < cap <= deep_cap <=
+   0.10` and `0 < deep_frontier_ratio < 1`, and the DB CHECKs mirror them
+   (the `efficiency_bonuses.bonus <= 0.1` CHECK already admits the 10% deep
+   cap). The curve is **continuous at P25** (both tiers evaluate to `cap`
+   there) and **monotone non-increasing** in usage. Every anchor is a pure
+   cohort statistic — P25, median, and a fixed fraction of P25 — never the
+   single cheapest submission. Degenerate cohorts (`median == P25`) collapse
+   to a step at the frontier; a degenerate `P25 == 0` collapses tier 2 to a
+   step at zero.
+
+   **Saturation rationale:** below the deep frontier the bonus is flat at
+   `deep_cap` on purpose. An asymptotically increasing reward for ever-fewer
+   tokens would incentivize gutting real work (skipping retrieval passes,
+   truncating memory writes) in ways the quality gate cannot fully observe
+   on a finite case sample. Flat saturation means once a harness is already
+   twice as lean as the efficient quartile, further starvation buys nothing.
 
    *Reconciliation note:* the validator-side spec draft tapered to zero at
    `4 x P25`. The operator decision (implemented here) anchors the zero point
@@ -79,7 +97,13 @@ windows counted from the Unix epoch). Once per epoch, per
    taper to the cohort's actual dispersion, so a uniformly lean cohort does
    not hand near-full bonuses to its own laggards, and an outlier-heavy tail
    cannot stretch the paying range. Full-bonus frontier (P25) and the 5–10%
-   cap are identical to the spec.
+   cap envelope are identical to the spec.
+
+   **Curve/policy versioning:** every snapshot freezes its `curve_version`
+   (`1` = original single-tier, `2` = two-tier) plus the tier-2 knobs.
+   `reference_from_snapshot` replays a snapshot under **its stored policy**,
+   so a pre-tier snapshot reproduces its single-tier bonuses exactly forever,
+   regardless of the running build's defaults.
 9. **Strictly upside.** `bonus >= 0` always. Unqualified, unaudited, or
    expensive runs keep their unmodified composite. There is no path where
    fewer tokens raise a score that quality did not already earn.
@@ -118,6 +142,7 @@ windows counted from the Unix epoch). Once per epoch, per
 | `bench_version`, `run_size`, `epoch_index` | unique cohort key |
 | `active` | whether `n_min` was met after dedupe |
 | `cohort_limit`, `n_min`, `bonus_cap`, `quality_floor`, `memory_floor` | frozen policy |
+| `curve_version`, `deep_bonus_cap`, `deep_frontier_ratio` | frozen bonus-curve policy (1 = single-tier legacy, 2 = two-tier; tier-2 knobs null under v1) |
 | `reference_p25_tokens`, `reference_median_tokens` | frozen robust reference (null while inactive) |
 | `members` (JSON) | `[{agent_id, miner_hotkey, lineage_key, composite, memory_mean, token_total, collapsed_agent_ids}]` |
 | `computed_at` | freeze time (UTC) |
@@ -170,7 +195,9 @@ must be synced when that repo picks up the fields.)
 |---|---|---|
 | `DITTO_EFFICIENCY_BONUS_ENABLED` | `false` | master switch: snapshots, bonus assignment, public exposure |
 | `DITTO_EFFICIENCY_BONUS_FOLD_ENABLED` | `false` | expose effective_composite on the validator ledger (requires enabled) |
-| `DITTO_EFFICIENCY_BONUS_CAP` | `0.05` | `B_max`; boot-validated to `(0, 0.10]` |
+| `DITTO_EFFICIENCY_BONUS_CAP` | `0.05` | tier-1 `B_max` (the curve's value at P25); boot-validated to `(0, 0.10]` |
+| `DITTO_EFFICIENCY_BONUS_DEEP_CAP` | `0.10` | tier-2 saturation cap; boot-validated to `cap <= deep_cap <= 0.10` |
+| `DITTO_EFFICIENCY_BONUS_DEEP_FRONTIER_RATIO` | `0.5` | deep frontier as a fraction of P25; boot-validated to `(0, 1)`; the bonus saturates flat below `ratio x P25` |
 | `DITTO_EFFICIENCY_BONUS_COHORT_SIZE` | `25` | top-N cohort membership cap |
 | `DITTO_EFFICIENCY_BONUS_MIN_COHORT` | `8` | `N_min` activation gate (after dedupe) |
 | `DITTO_EFFICIENCY_BONUS_EPOCH_HOURS` | `24` | efficiency epoch length (fixed UTC windows) |
@@ -206,9 +233,13 @@ exposure without the master switch.
    `active_bench_version >= 7`) and that scores carry
    `token_efficiency.formula_version == "v7-quality-only-v1"` with complete
    `token_usage` blocks.
-3. Pick the epoch's policy: leave defaults (`cap 5%`, `N=25`, `N_min 8`,
-   24 h epochs) or set the env knobs. Set static floors if the first epoch
-   should already gate quality (e.g. `QUALITY_FLOOR=0.3`).
+3. Pick the epoch's policy: leave defaults (`cap 5%`, `deep cap 10%`, `deep
+   frontier 0.5 x P25`, `N=25`, `N_min 8`, 24 h epochs) or set the env knobs.
+   Set static floors if the first epoch should already gate quality (e.g.
+   `QUALITY_FLOOR=0.3`). To run tier 1 only, set `DEEP_CAP` equal to `CAP`
+   (the ramp collapses to flat `cap` below P25 — bonuses never drop from
+   disabling tier 2 mid-flight because old snapshots keep their frozen
+   policy).
 4. Set `DITTO_EFFICIENCY_BONUS_ENABLED=true` and restart. The next
    leaderboard read freezes the first snapshot.
 5. Verify: `/public/leaderboard` → `efficiency.active`; when true, spot-check
@@ -236,8 +267,13 @@ Blocked by construction:
   else artifact sha256), so cloning a lean harness across hotkeys does not
   widen its influence on the frontier; the coldkey-deduped ledger already
   limits one entry per paying owner.
-* **Blast radius:** the cap (5%, hard max 10%) keeps the bonus a tiebreaker
-  among comparable-quality agents; quality dominates by construction.
+* **Blast radius:** the cap envelope (tier-1 5%, tier-2 saturation 10%, hard
+  max 10% everywhere) keeps the bonus a tiebreaker among comparable-quality
+  agents; quality dominates by construction.
+* **Token-starvation racing:** tier 2 SATURATES flat below the deep frontier
+  — there is no marginal reward for pushing usage toward zero, so the curve
+  never incentivizes gutting real work (skipped retrieval, truncated memory
+  writes) that the quality gate cannot fully observe on a finite sample.
 * **Retroactive drift:** epoch-frozen snapshots + insert-once bonus rows —
   published scores never move when new submissions arrive.
 * **Cheap-model substitution / miner-reported usage:** only relay-metered
@@ -275,7 +311,11 @@ Residual risks (honest list):
 * `ditto/tests/api_server/test_efficiency.py` — audited-total parsing,
   lineage keys/dedupe, nearest-rank + median reference, interpolation
   boundaries (at/below P25, at/above median, midpoint, degenerate), quality
-  gate, N_min inactivity, strictly-upside, floor ratchet, epoch arithmetic.
+  gate, N_min inactivity, strictly-upside, floor ratchet, epoch arithmetic;
+  two-tier curve: continuity at P25, monotonicity across the whole curve,
+  saturation at/below the deep frontier, tier-1 half unchanged, legacy
+  single-tier when the knobs are absent, envelope bound, and
+  curve_version-1 references reproducing single-tier bonuses.
 * `ditto/tests/db/queries/test_efficiency.py` — snapshot roundtrip
   (members JSON), unique epoch key, old-snapshot immutability under new
   epochs, bonus insert-once.

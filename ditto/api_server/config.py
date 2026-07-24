@@ -134,8 +134,21 @@ class EfficiencyBonusConfig:
     before consuming the field; until then the ledger stays byte-identical."""
 
     cap: float = 0.05
-    """Maximum bonus fraction ``B_max`` (``DITTO_EFFICIENCY_BONUS_CAP``).
-    Default 5%; hard ceiling 10% enforced at boot and by DB check."""
+    """Tier-1 maximum bonus fraction ``B_max`` (``DITTO_EFFICIENCY_BONUS_CAP``)
+    — the curve's value at the P25 frontier. Default 5%; hard ceiling 10%
+    enforced at boot and by DB check."""
+
+    deep_cap: float = 0.10
+    """Tier-2 saturation cap (``DITTO_EFFICIENCY_BONUS_DEEP_CAP``): the flat
+    bonus at or below the deep frontier. Bounded ``cap <= deep_cap <= 0.10``
+    at boot and by DB check, so the whole curve stays inside the agreed 5-10%
+    envelope."""
+
+    deep_frontier_ratio: float = 0.5
+    """Deep frontier as a fraction of P25
+    (``DITTO_EFFICIENCY_BONUS_DEEP_FRONTIER_RATIO``), in (0, 1). Below
+    ``ratio x P25`` the bonus saturates flat at ``deep_cap`` — deliberately
+    no extra reward for racing toward zero tokens."""
 
     cohort_size: int = 25
     """Top-N quality-qualified agents forming a cohort
@@ -545,6 +558,10 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
                 in _TRUTHY
             ),
             cap=float(os.environ.get("DITTO_EFFICIENCY_BONUS_CAP", "0.05")),
+            deep_cap=float(os.environ.get("DITTO_EFFICIENCY_BONUS_DEEP_CAP", "0.10")),
+            deep_frontier_ratio=float(
+                os.environ.get("DITTO_EFFICIENCY_BONUS_DEEP_FRONTIER_RATIO", "0.5")
+            ),
             cohort_size=int(os.environ.get("DITTO_EFFICIENCY_BONUS_COHORT_SIZE", "25")),
             min_cohort=int(os.environ.get("DITTO_EFFICIENCY_BONUS_MIN_COHORT", "8")),
             epoch_hours=int(os.environ.get("DITTO_EFFICIENCY_BONUS_EPOCH_HOURS", "24")),
@@ -862,6 +879,14 @@ def check_config(config: ApiServerConfig) -> None:
         )
     if not 0.0 < efficiency.cap <= 0.10:
         raise ApiServerConfigError("DITTO_EFFICIENCY_BONUS_CAP must be in (0, 0.10]")
+    if not efficiency.cap <= efficiency.deep_cap <= 0.10:
+        raise ApiServerConfigError(
+            "DITTO_EFFICIENCY_BONUS_DEEP_CAP must satisfy cap <= deep_cap <= 0.10"
+        )
+    if not 0.0 < efficiency.deep_frontier_ratio < 1.0:
+        raise ApiServerConfigError(
+            "DITTO_EFFICIENCY_BONUS_DEEP_FRONTIER_RATIO must be in (0, 1)"
+        )
     if efficiency.min_cohort < 2:
         raise ApiServerConfigError(
             "DITTO_EFFICIENCY_BONUS_MIN_COHORT must be at least 2"

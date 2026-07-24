@@ -30,6 +30,14 @@ def upgrade() -> None:
         sa.Column("cohort_limit", sa.Integer(), nullable=False),
         sa.Column("n_min", sa.Integer(), nullable=False),
         sa.Column("bonus_cap", sa.Float(), nullable=False),
+        sa.Column(
+            "curve_version",
+            sa.Integer(),
+            server_default=sa.text("1"),
+            nullable=False,
+        ),
+        sa.Column("deep_bonus_cap", sa.Float(), nullable=True),
+        sa.Column("deep_frontier_ratio", sa.Float(), nullable=True),
         sa.Column("quality_floor", sa.Float(), nullable=False),
         sa.Column("memory_floor", sa.Float(), nullable=False),
         sa.Column("reference_p25_tokens", sa.Float(), nullable=True),
@@ -55,6 +63,20 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "bonus_cap > 0 AND bonus_cap <= 0.1",
             name="efficiency_cohort_snapshots_cap_check",
+        ),
+        sa.CheckConstraint(
+            "deep_bonus_cap IS NULL OR "
+            "(deep_bonus_cap >= bonus_cap AND deep_bonus_cap <= 0.1)",
+            name="efficiency_cohort_snapshots_deep_cap_check",
+        ),
+        sa.CheckConstraint(
+            "deep_frontier_ratio IS NULL OR "
+            "(deep_frontier_ratio > 0 AND deep_frontier_ratio < 1)",
+            name="efficiency_cohort_snapshots_deep_frontier_check",
+        ),
+        sa.CheckConstraint(
+            "curve_version >= 1",
+            name="efficiency_cohort_snapshots_curve_version_check",
         ),
         sa.CheckConstraint(
             "n_min >= 2", name="efficiency_cohort_snapshots_n_min_check"

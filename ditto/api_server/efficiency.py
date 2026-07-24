@@ -15,9 +15,13 @@ validator-side spec (ditto-subnet ``docs/relative-efficiency-bonus-spec.md``):
   the cohort's audited chat token totals is the full-bonus frontier and the
   cohort median is the zero-bonus point — never the mean, never the single
   minimum.
-* The **bonus** is strictly additive and capped (default 5%, hard max 10%):
-  ``effective_composite = composite * (1 + bonus)``. The validator composite
-  is never touched; the bonus is a separate platform-side field.
+* The **bonus** is strictly additive and capped inside the 5-10% envelope:
+  tier 1 pays up to the base cap (default 5%) at the P25 frontier; tier 2
+  keeps climbing to the deep cap (default 10%) down to the deep frontier
+  (``deep_frontier_ratio x P25``) and then SATURATES flat — no reward for
+  racing toward zero tokens. ``effective_composite = composite * (1 +
+  bonus)``. The validator composite is never touched; the bonus is a
+  separate platform-side field.
 * **Frozen cohorts**: the snapshot (membership, floors, reference values) is
   computed once per epoch and persisted; a submission's bonus is assigned
   once, against the frozen reference of the epoch it finalized in, and never
@@ -67,6 +71,18 @@ MEMORY_FLOOR_FRACTION = 0.8
 # Fraction of the cohort used for the full-bonus frontier (efficient quartile).
 FRONTIER_QUANTILE = 0.25
 
+# Frozen bonus-curve policy versions. A snapshot records the version it was
+# frozen under so ``reference_from_snapshot`` reproduces its bonuses exactly,
+# forever, regardless of later curve changes.
+CURVE_VERSION_SINGLE_TIER = 1
+"""Original curve: full ``bonus_cap`` at or below P25, zero at or above the
+median, linear in between."""
+CURVE_VERSION_TWO_TIER = 2
+"""Two-tier curve: tier 1 as above; tier 2 ramps ``bonus_cap`` up to
+``deep_bonus_cap`` between P25 and ``deep_frontier_ratio x P25``, then
+SATURATES flat below that deep frontier (racing toward zero tokens earns
+nothing extra)."""
+
 
 @dataclass(frozen=True)
 class EfficiencyCandidate:
@@ -115,6 +131,14 @@ class CohortReference:
     reference_p25_tokens: float | None
     reference_median_tokens: float | None
     members: tuple[CohortMember, ...]
+    curve_version: int = CURVE_VERSION_SINGLE_TIER
+    """Bonus-curve policy this snapshot was frozen under. Defaults to the
+    single-tier legacy curve so rehydrated pre-tier snapshots (or hand-built
+    references that omit the tier-2 knobs) reproduce their original bonuses."""
+    deep_bonus_cap: float | None = None
+    """Tier-2 saturation cap (two-tier curve only); ``>= bonus_cap``, <= 0.10."""
+    deep_frontier_ratio: float | None = None
+    """Deep frontier as a fraction of P25 (two-tier curve only), in (0, 1)."""
 
 
 def lineage_key(normalized_source_hash: str | None, sha256: str) -> str:
@@ -240,10 +264,14 @@ def build_cohort_snapshot(
     bonus_cap: float,
     quality_floor: float,
     memory_floor: float,
+    deep_bonus_cap: float | None = None,
+    deep_frontier_ratio: float | None = None,
 ) -> CohortReference:
     """Freeze one epoch's cohort: qualify, dedupe, cap at top-N, derive the
     robust reference. Pure and deterministic — the same candidates always
-    produce the same snapshot."""
+    produce the same snapshot. With both tier-2 knobs supplied the snapshot
+    is frozen under the two-tier curve (:data:`CURVE_VERSION_TWO_TIER`);
+    otherwise under the single-tier legacy curve."""
     qualified = [
         candidate
         for candidate in candidates
@@ -276,6 +304,13 @@ def build_cohort_snapshot(
         reference_p25_tokens=p25,
         reference_median_tokens=med,
         members=tuple(members),
+        curve_version=(
+            CURVE_VERSION_TWO_TIER
+            if deep_bonus_cap is not None and deep_frontier_ratio is not None
+            else CURVE_VERSION_SINGLE_TIER
+        ),
+        deep_bonus_cap=deep_bonus_cap,
+        deep_frontier_ratio=deep_frontier_ratio,
     )
 
 
@@ -285,19 +320,41 @@ def bonus_fraction(
     reference_p25: float,
     reference_median: float,
     cap: float,
+    deep_cap: float | None = None,
+    deep_frontier_ratio: float | None = None,
 ) -> float:
-    """The bonus curve: full ``cap`` at or below the efficient quartile, zero
-    at or above the cohort median, linear in between.
+    """The bonus curve — continuous and monotone non-increasing in usage.
 
-    The zero point deliberately sits at the *median* (the operator's
-    cohort-relative rule) rather than the spec draft's absolute ``4 x P25``
-    multiple: both are robust, but the median anchors the taper to the
-    cohort's actual dispersion, so a cohort of uniformly lean harnesses does
-    not hand near-full bonuses to its own laggards. Degenerate cohorts
-    (median == P25) collapse to a step at the frontier.
+    Tier 1 (always): zero at or above the cohort median, linear up to ``cap``
+    at the efficient quartile P25. The zero point deliberately sits at the
+    *median* (the operator's cohort-relative rule) rather than the spec
+    draft's absolute ``4 x P25`` multiple: both are robust, but the median
+    anchors the taper to the cohort's actual dispersion, so a cohort of
+    uniformly lean harnesses does not hand near-full bonuses to its own
+    laggards. Degenerate cohorts (median == P25) collapse to a step at the
+    frontier.
+
+    Tier 2 (only when both ``deep_cap`` and ``deep_frontier_ratio`` are
+    given — the two-tier policy): between P25 and the deep frontier
+    ``deep_frontier_ratio x P25`` the bonus keeps climbing linearly from
+    ``cap`` to ``deep_cap``; both tiers equal ``cap`` exactly at P25, so the
+    curve is continuous there. Below the deep frontier the bonus SATURATES
+    flat at ``deep_cap``: deliberately no extra reward for racing toward
+    zero tokens, which would otherwise incentivize gutting real work the
+    quality gate cannot fully observe. All anchors remain pure cohort
+    statistics (P25, median, a fraction of P25) — never the single cheapest
+    submission.
     """
     if token_total <= reference_p25:
-        return cap
+        if deep_cap is None or deep_frontier_ratio is None:
+            return cap  # single-tier legacy policy
+        deep_frontier = deep_frontier_ratio * reference_p25
+        if token_total <= deep_frontier:
+            return deep_cap
+        span = reference_p25 - deep_frontier
+        if span <= 0.0:
+            return deep_cap  # degenerate (P25 == 0): step at the frontier
+        return cap + (deep_cap - cap) * (reference_p25 - token_total) / span
     if token_total >= reference_median:
         return 0.0
     span = reference_median - reference_p25
@@ -334,11 +391,14 @@ def bonus_for_submission(
         memory_floor=reference.memory_floor,
     ):
         return 0.0
+    two_tier = reference.curve_version >= CURVE_VERSION_TWO_TIER
     return bonus_fraction(
         token_total,
         reference_p25=reference.reference_p25_tokens,
         reference_median=reference.reference_median_tokens,
         cap=reference.bonus_cap,
+        deep_cap=reference.deep_bonus_cap if two_tier else None,
+        deep_frontier_ratio=reference.deep_frontier_ratio if two_tier else None,
     )
 
 
@@ -552,6 +612,8 @@ async def _materialize_epoch(
             bonus_cap=config.cap,
             quality_floor=quality_floor,
             memory_floor=memory_floor,
+            deep_bonus_cap=config.deep_cap,
+            deep_frontier_ratio=config.deep_frontier_ratio,
         )
         snapshot = await insert_snapshot(session, reference)
         logger.info(
@@ -618,6 +680,12 @@ def reference_from_snapshot(snapshot: EfficiencyCohortSnapshot) -> CohortReferen
         reference_p25_tokens=snapshot.reference_p25_tokens,
         reference_median_tokens=snapshot.reference_median_tokens,
         members=tuple(members),
+        # The frozen policy version travels with the snapshot: a pre-tier
+        # (curve_version 1) snapshot reproduces its single-tier bonuses
+        # exactly, even under a build whose config defaults to two tiers.
+        curve_version=snapshot.curve_version,
+        deep_bonus_cap=snapshot.deep_bonus_cap,
+        deep_frontier_ratio=snapshot.deep_frontier_ratio,
     )
 
 

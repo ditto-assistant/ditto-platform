@@ -1706,6 +1706,12 @@ def _efficiency_status(
     if view is None or view.snapshot is None:
         return None
     snapshot = view.snapshot
+    deep_frontier_tokens = (
+        snapshot.deep_frontier_ratio * snapshot.reference_p25_tokens
+        if snapshot.deep_frontier_ratio is not None
+        and snapshot.reference_p25_tokens is not None
+        else None
+    )
     return PublicEfficiencyStatus(
         active=snapshot.active,
         bench_version=snapshot.bench_version,
@@ -1715,6 +1721,9 @@ def _efficiency_status(
         cohort_size=len(snapshot.members or []),
         n_min=snapshot.n_min,
         bonus_cap=snapshot.bonus_cap,
+        curve_version=snapshot.curve_version,
+        deep_bonus_cap=snapshot.deep_bonus_cap,
+        deep_frontier_tokens=deep_frontier_tokens,
         reference_p25_tokens=snapshot.reference_p25_tokens,
         reference_median_tokens=snapshot.reference_median_tokens,
     )
@@ -1770,6 +1779,9 @@ async def efficiency_snapshot(
         cohort_limit=snapshot.cohort_limit,
         n_min=snapshot.n_min,
         bonus_cap=snapshot.bonus_cap,
+        curve_version=snapshot.curve_version,
+        deep_bonus_cap=snapshot.deep_bonus_cap,
+        deep_frontier_ratio=snapshot.deep_frontier_ratio,
         quality_floor=snapshot.quality_floor,
         memory_floor=snapshot.memory_floor,
         reference_p25_tokens=snapshot.reference_p25_tokens,

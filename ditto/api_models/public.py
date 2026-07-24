@@ -855,8 +855,50 @@ class PublicEfficiencyStatus(BaseModel):
     ]
     bonus_cap: Annotated[
         float,
-        Field(gt=0.0, le=0.1, description="Frozen maximum bonus fraction B_max."),
+        Field(
+            gt=0.0,
+            le=0.1,
+            description="Frozen tier-1 bonus fraction B_max (the value at P25).",
+        ),
     ]
+    curve_version: Annotated[
+        int,
+        Field(
+            default=1,
+            ge=1,
+            description=(
+                "Frozen bonus-curve policy: 1 = single-tier (cap at/below "
+                "P25), 2 = two-tier (cap ramps to deep_bonus_cap between P25 "
+                "and the deep frontier, then saturates flat)."
+            ),
+        ),
+    ] = 1
+    deep_bonus_cap: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0.0,
+            le=0.1,
+            description=(
+                "Frozen tier-2 saturation cap (two-tier curve only): the flat "
+                "bonus at or below the deep frontier. Null under the "
+                "single-tier policy."
+            ),
+        ),
+    ] = None
+    deep_frontier_tokens: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            description=(
+                "The deep frontier in tokens (deep_frontier_ratio x P25): "
+                "usage at or below it earns the flat deep_bonus_cap — no "
+                "extra reward for racing further toward zero. Null while "
+                "inactive or under the single-tier policy."
+            ),
+        ),
+    ] = None
     reference_p25_tokens: Annotated[
         float | None,
         Field(
@@ -864,8 +906,8 @@ class PublicEfficiencyStatus(BaseModel):
             ge=0.0,
             description=(
                 "Efficient-quartile frontier (nearest-rank P25 of the cohort's "
-                "audited chat token totals): usage at or below it earns the "
-                "full bonus. Null while inactive."
+                "audited chat token totals): the tier-1 full-bonus point. "
+                "Null while inactive."
             ),
         ),
     ] = None
@@ -928,6 +970,11 @@ class PublicEfficiencySnapshotResponse(BaseModel):
     cohort_limit: Annotated[int, Field(ge=2)]
     n_min: Annotated[int, Field(ge=2)]
     bonus_cap: Annotated[float, Field(gt=0.0, le=0.1)]
+    curve_version: Annotated[int, Field(default=1, ge=1)] = 1
+    deep_bonus_cap: Annotated[float | None, Field(default=None, gt=0.0, le=0.1)] = None
+    deep_frontier_ratio: Annotated[
+        float | None, Field(default=None, gt=0.0, lt=1.0)
+    ] = None
     quality_floor: Annotated[float, Field(ge=0.0, le=1.0)]
     memory_floor: Annotated[float, Field(ge=0.0, le=1.0)]
     reference_p25_tokens: Annotated[float | None, Field(default=None, ge=0.0)] = None

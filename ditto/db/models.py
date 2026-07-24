@@ -1052,7 +1052,25 @@ class EfficiencyCohortSnapshot(Base):
     """Minimum deduped cohort size required for activation."""
 
     bonus_cap: Mapped[float] = mapped_column(Float, nullable=False)
-    """Maximum bonus fraction (``B_max``) frozen for this epoch."""
+    """Tier-1 maximum bonus fraction (``B_max``) frozen for this epoch: the
+    value the curve reaches at the P25 frontier."""
+
+    curve_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+    """Bonus-curve policy this snapshot was frozen under
+    (:data:`ditto.api_server.efficiency.CURVE_VERSION_SINGLE_TIER` /
+    ``CURVE_VERSION_TWO_TIER``). Stored so a historical snapshot reproduces
+    its bonuses under ITS policy forever, regardless of later curve changes."""
+
+    deep_bonus_cap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """Tier-2 saturation cap frozen for this epoch (two-tier curve only):
+    the flat bonus at or below the deep frontier. ``>= bonus_cap``, <= 0.10.
+    Null under the single-tier policy."""
+
+    deep_frontier_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """Deep frontier as a fraction of the P25 reference (two-tier curve
+    only), in (0, 1). Null under the single-tier policy."""
 
     quality_floor: Mapped[float] = mapped_column(Float, nullable=False)
     """Composite floor (``Q_min``) applied at freeze time."""
@@ -1097,6 +1115,20 @@ class EfficiencyCohortSnapshot(Base):
         CheckConstraint(
             "bonus_cap > 0 AND bonus_cap <= 0.1",
             name="efficiency_cohort_snapshots_cap_check",
+        ),
+        CheckConstraint(
+            "deep_bonus_cap IS NULL OR "
+            "(deep_bonus_cap >= bonus_cap AND deep_bonus_cap <= 0.1)",
+            name="efficiency_cohort_snapshots_deep_cap_check",
+        ),
+        CheckConstraint(
+            "deep_frontier_ratio IS NULL OR "
+            "(deep_frontier_ratio > 0 AND deep_frontier_ratio < 1)",
+            name="efficiency_cohort_snapshots_deep_frontier_check",
+        ),
+        CheckConstraint(
+            "curve_version >= 1",
+            name="efficiency_cohort_snapshots_curve_version_check",
         ),
         CheckConstraint("n_min >= 2", name="efficiency_cohort_snapshots_n_min_check"),
         Index(

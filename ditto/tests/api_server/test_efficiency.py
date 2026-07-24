@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+import pytest
+
 from ditto.api_server.efficiency import (
     BONUS_RUN_SIZE,
     MIN_BONUS_BENCH_VERSION,
@@ -212,6 +214,22 @@ class TestBuildCohortSnapshot:
         # Membership is still frozen for observability; it awards nothing.
         assert len(snapshot.members) == 3
 
+    def test_two_tier_knobs_freeze_curve_version_two(self) -> None:
+        candidates = [_candidate(n, token_total=100.0) for n in range(1, 5)]
+        snapshot = self._snapshot(
+            candidates, deep_bonus_cap=0.10, deep_frontier_ratio=0.5
+        )
+        assert snapshot.curve_version == 2
+        assert snapshot.deep_bonus_cap == 0.10
+        assert snapshot.deep_frontier_ratio == 0.5
+
+    def test_without_deep_knobs_freezes_single_tier(self) -> None:
+        candidates = [_candidate(n, token_total=100.0) for n in range(1, 5)]
+        snapshot = self._snapshot(candidates)
+        assert snapshot.curve_version == 1
+        assert snapshot.deep_bonus_cap is None
+        assert snapshot.deep_frontier_ratio is None
+
     def test_dedupe_applies_before_n_min(self) -> None:
         # Four submissions but only three lineages: the gate must see 3.
         candidates = [
@@ -269,8 +287,102 @@ class TestBonusFraction:
             )
 
 
+class TestTwoTierBonusFraction:
+    """Tier 2: cap ramps to deep cap between P25 and ratio x P25, then
+    saturates flat — continuous at P25 and monotone across the whole curve."""
+
+    _KW = {
+        "reference_p25": 100.0,
+        "reference_median": 200.0,
+        "cap": 0.05,
+        "deep_cap": 0.10,
+        "deep_frontier_ratio": 0.5,
+    }
+
+    def test_continuous_at_p25(self) -> None:
+        # Both tiers meet at exactly the base cap on the P25 boundary.
+        assert bonus_fraction(100.0, **self._KW) == 0.05
+        just_above = bonus_fraction(100.0 + 1e-9, **self._KW)
+        just_below = bonus_fraction(100.0 - 1e-9, **self._KW)
+        assert abs(just_above - 0.05) < 1e-9
+        assert abs(just_below - 0.05) < 1e-9
+
+    def test_saturates_flat_at_and_below_deep_frontier(self) -> None:
+        # deep_frontier = 0.5 x 100 = 50: racing further toward zero tokens
+        # earns nothing extra.
+        assert bonus_fraction(50.0, **self._KW) == 0.10
+        assert bonus_fraction(25.0, **self._KW) == 0.10
+        assert bonus_fraction(0.0, **self._KW) == 0.10
+
+    def test_linear_ramp_between_deep_frontier_and_p25(self) -> None:
+        # Midpoint of [50, 100] -> midway between deep cap and base cap.
+        assert bonus_fraction(75.0, **self._KW) == pytest.approx(0.075)
+        assert bonus_fraction(60.0, **self._KW) == pytest.approx(
+            0.05 + 0.05 * (100.0 - 60.0) / 50.0
+        )
+
+    def test_monotone_non_increasing_across_the_whole_curve(self) -> None:
+        samples = [
+            bonus_fraction(float(tokens), **self._KW) for tokens in range(0, 260, 5)
+        ]
+        assert all(a >= b for a, b in zip(samples[:-1], samples[1:], strict=True))
+        assert samples[0] == 0.10
+        assert samples[-1] == 0.0
+
+    def test_tier_one_half_is_unchanged(self) -> None:
+        # At and above P25 the two-tier curve is identical to single-tier.
+        for tokens in (100.0, 150.0, 175.0, 200.0, 1e9):
+            assert bonus_fraction(tokens, **self._KW) == bonus_fraction(
+                tokens,
+                reference_p25=100.0,
+                reference_median=200.0,
+                cap=0.05,
+            )
+
+    def test_legacy_single_tier_when_deep_knobs_absent(self) -> None:
+        # Missing either knob -> the original flat-cap-below-P25 curve.
+        assert (
+            bonus_fraction(10.0, reference_p25=100.0, reference_median=200.0, cap=0.05)
+            == 0.05
+        )
+        assert (
+            bonus_fraction(
+                10.0,
+                reference_p25=100.0,
+                reference_median=200.0,
+                cap=0.05,
+                deep_cap=0.10,
+            )
+            == 0.05
+        )
+
+    def test_degenerate_zero_p25_steps_to_deep_cap(self) -> None:
+        assert (
+            bonus_fraction(
+                0.0,
+                reference_p25=0.0,
+                reference_median=200.0,
+                cap=0.05,
+                deep_cap=0.10,
+                deep_frontier_ratio=0.5,
+            )
+            == 0.10
+        )
+
+    def test_never_exceeds_deep_cap_envelope(self) -> None:
+        for tokens in range(0, 260, 5):
+            assert 0.0 <= bonus_fraction(float(tokens), **self._KW) <= 0.10
+
+
 class TestBonusForSubmission:
-    def _reference(self, *, active: bool = True) -> CohortReference:
+    def _reference(
+        self,
+        *,
+        active: bool = True,
+        curve_version: int = 1,
+        deep_bonus_cap: float | None = None,
+        deep_frontier_ratio: float | None = None,
+    ) -> CohortReference:
         return CohortReference(
             bench_version=7,
             run_size=BONUS_RUN_SIZE,
@@ -284,6 +396,9 @@ class TestBonusForSubmission:
             reference_p25_tokens=100.0 if active else None,
             reference_median_tokens=200.0 if active else None,
             members=(),
+            curve_version=curve_version,
+            deep_bonus_cap=deep_bonus_cap,
+            deep_frontier_ratio=deep_frontier_ratio,
         )
 
     def test_inactive_snapshot_awards_nothing(self) -> None:
@@ -299,6 +414,26 @@ class TestBonusForSubmission:
         reference = self._reference()
         assert bonus_for_submission(0.9, 0.9, 50.0, reference) == 0.05
         assert bonus_for_submission(0.9, 0.9, 150.0, reference) == 0.025
+
+    def test_two_tier_reference_uses_the_deep_curve(self) -> None:
+        reference = self._reference(
+            curve_version=2, deep_bonus_cap=0.10, deep_frontier_ratio=0.5
+        )
+        assert bonus_for_submission(0.9, 0.9, 40.0, reference) == 0.10  # saturated
+        assert bonus_for_submission(0.9, 0.9, 75.0, reference) == pytest.approx(0.075)
+        assert bonus_for_submission(0.9, 0.9, 100.0, reference) == 0.05
+        assert bonus_for_submission(0.9, 0.9, 150.0, reference) == 0.025
+
+    def test_pre_tier_snapshot_policy_reproduces_single_tier_bonuses(self) -> None:
+        # A curve_version-1 snapshot must reproduce its original bonuses even
+        # if it (hypothetically) carried tier-2 knobs: the frozen policy
+        # version, not the current config, decides the curve.
+        legacy = self._reference(
+            curve_version=1, deep_bonus_cap=0.10, deep_frontier_ratio=0.5
+        )
+        assert bonus_for_submission(0.9, 0.9, 40.0, legacy) == 0.05
+        assert bonus_for_submission(0.9, 0.9, 75.0, legacy) == 0.05
+        assert bonus_for_submission(0.9, 0.9, 100.0, legacy) == 0.05
 
 
 class TestEffectiveComposite:

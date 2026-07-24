@@ -97,7 +97,56 @@ class TestSnapshots:
         assert read.members is not None and len(read.members) == 2
         assert read.members[0]["agent_id"] == str(UUID(int=1))
         assert read.members[0]["collapsed_agent_ids"] == [str(UUID(int=9))]
+        # Default reference = the single-tier legacy policy.
+        assert read.curve_version == 1
+        assert read.deep_bonus_cap is None
+        assert read.deep_frontier_ratio is None
         assert await get_snapshot_by_id(session, inserted.snapshot_id) is not None
+
+    async def test_two_tier_policy_roundtrip(self, session: AsyncSession):
+        from dataclasses import replace
+
+        reference = replace(
+            _reference(),
+            curve_version=2,
+            deep_bonus_cap=0.10,
+            deep_frontier_ratio=0.5,
+        )
+        async with session.begin():
+            await insert_snapshot(session, reference)
+        read = await get_snapshot(
+            session, bench_version=7, run_size="full", epoch_index=1000
+        )
+        assert read is not None
+        assert read.curve_version == 2
+        assert read.deep_bonus_cap == 0.10
+        assert read.deep_frontier_ratio == 0.5
+
+    async def test_pre_tier_snapshot_reproduces_single_tier_bonuses(
+        self, session: AsyncSession
+    ):
+        """A stored curve_version-1 snapshot must reproduce its original
+        single-tier bonuses via ``reference_from_snapshot`` forever, even on a
+        build whose config defaults to the two-tier curve."""
+        from ditto.api_server.efficiency import (
+            bonus_for_submission,
+            reference_from_snapshot,
+        )
+
+        async with session.begin():
+            await insert_snapshot(session, _reference())  # curve_version 1
+        stored = await get_snapshot(
+            session, bench_version=7, run_size="full", epoch_index=1000
+        )
+        assert stored is not None
+        rehydrated = reference_from_snapshot(stored)
+        assert rehydrated.curve_version == 1
+        # P25=100, median=200: deep in what tier 2 would call saturation
+        # territory, the frozen single-tier policy still pays exactly the
+        # base cap — never the (never-frozen) deep cap.
+        assert bonus_for_submission(0.9, 0.9, 10.0, rehydrated) == 0.05
+        assert bonus_for_submission(0.9, 0.9, 75.0, rehydrated) == 0.05
+        assert bonus_for_submission(0.9, 0.9, 150.0, rehydrated) == 0.025
 
     async def test_epoch_key_is_unique(self, session: AsyncSession):
         async with session.begin():

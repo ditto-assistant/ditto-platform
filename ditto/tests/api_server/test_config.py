@@ -331,6 +331,8 @@ class TestEfficiencyBonusConfig:
         assert efficiency.enabled is False
         assert efficiency.fold_enabled is False
         assert efficiency.cap == 0.05
+        assert efficiency.deep_cap == 0.10
+        assert efficiency.deep_frontier_ratio == 0.5
         assert efficiency.cohort_size == 25
         assert efficiency.min_cohort == 8
         assert efficiency.epoch_hours == 24
@@ -339,16 +341,20 @@ class TestEfficiencyBonusConfig:
     def test_env_overrides_picked_up(self, monkeypatch: pytest.MonkeyPatch):
         _set_minimum_env(monkeypatch)
         monkeypatch.setenv("DITTO_EFFICIENCY_BONUS_ENABLED", "true")
-        monkeypatch.setenv("DITTO_EFFICIENCY_BONUS_CAP", "0.1")
+        monkeypatch.setenv("DITTO_EFFICIENCY_BONUS_CAP", "0.06")
         monkeypatch.setenv("DITTO_EFFICIENCY_BONUS_COHORT_SIZE", "30")
         monkeypatch.setenv("DITTO_EFFICIENCY_BONUS_MIN_COHORT", "10")
+        monkeypatch.setenv("DITTO_EFFICIENCY_BONUS_DEEP_CAP", "0.08")
+        monkeypatch.setenv("DITTO_EFFICIENCY_BONUS_DEEP_FRONTIER_RATIO", "0.25")
         monkeypatch.setenv("DITTO_EFFICIENCY_BONUS_EPOCH_HOURS", "12")
         monkeypatch.setenv("DITTO_EFFICIENCY_BONUS_QUALITY_FLOOR", "0.4")
         monkeypatch.setenv("DITTO_EFFICIENCY_BONUS_MEMORY_FLOOR", "0.3")
         config = parse_api_server_config_from_env(commit_hash="abc")
         efficiency = config.efficiency_bonus
         assert efficiency.enabled is True
-        assert efficiency.cap == 0.1
+        assert efficiency.cap == 0.06
+        assert efficiency.deep_cap == 0.08
+        assert efficiency.deep_frontier_ratio == 0.25
         assert efficiency.cohort_size == 30
         assert efficiency.min_cohort == 10
         assert efficiency.epoch_hours == 12
@@ -368,6 +374,11 @@ class TestEfficiencyBonusConfig:
             ({"fold_enabled": True}, "enabled before"),
             ({"enabled": True, "cap": 0.11}, "0.10"),
             ({"enabled": True, "cap": 0.0}, "0.10"),
+            ({"enabled": True, "deep_cap": 0.04}, "cap <= deep_cap"),
+            ({"enabled": True, "deep_cap": 0.11}, "cap <= deep_cap"),
+            ({"enabled": True, "deep_frontier_ratio": 0.0}, "in \\(0, 1\\)"),
+            ({"enabled": True, "deep_frontier_ratio": 1.0}, "in \\(0, 1\\)"),
+            ({"enabled": True, "deep_frontier_ratio": -0.5}, "in \\(0, 1\\)"),
             ({"enabled": True, "min_cohort": 1}, "at least 2"),
             (
                 {"enabled": True, "cohort_size": 5, "min_cohort": 8},
