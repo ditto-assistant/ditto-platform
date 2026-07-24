@@ -231,7 +231,7 @@
     .chain-observation.show { display: flex; }
     .chain-badge {
       flex: 0 0 auto; margin-top: 1px; padding: 2px 6px; border: 1px solid color-mix(in oklab, var(--accent) 38%, var(--border));
-      border-radius: 999px; color: var(--accent); font: 700 9px/1.35 var(--mono); letter-spacing: .05em; text-transform: uppercase;
+      border-radius: 999px; color: var(--accent); font: 700 11px/1.35 var(--mono); letter-spacing: .05em; text-transform: uppercase;
     }
     .chain-weight-note { display: block; margin-top: 4px; color: var(--text-faint); font: 9.5px/1.35 var(--mono); white-space: nowrap; }
 
@@ -1014,8 +1014,14 @@
     /* Shared CSS tooltip bubble: keyboard- and touch-accessible (reveals on
        :focus-visible), used by the circular .retry-info marker and the
        dotted-underline .tip terms on stat cards and table headers. */
+    /* Chips (gate/token/rollout/quorum/prov/rankmove) share the bubble via
+       .tip-chip: hover bubble for pointer users, aria-describedby text for
+       screen readers (wired by wireTips). They stay out of the tab order —
+       the row itself opens the full breakdown for keyboard users. */
+    .tip-chip { position: relative; cursor: help; }
     .retry-info::after,
-    .tip::after {
+    .tip::after,
+    .tip-chip::after {
       content: attr(data-tooltip);
       /* display:none until revealed (not just opacity:0): a hidden absolutely
          positioned box still contributes to its scroll container's scrollable
@@ -1039,11 +1045,12 @@
     /* The marker's bubble sits above it; the .tip bubble drops below the term so
        it is never clipped by the table's horizontal-scroll container. */
     .retry-info::after { left: -88px; bottom: calc(100% + 8px); }
-    .tip::after { left: 0; top: calc(100% + 8px); }
+    .tip::after, .tip-chip::after { left: 0; top: calc(100% + 8px); }
     .retry-info:hover::after,
     .retry-info:focus-visible::after,
     .tip:hover::after,
-    .tip:focus-visible::after {
+    .tip:focus-visible::after,
+    .tip-chip:hover::after {
       display: block;
     }
     .retry-info:focus-visible,
@@ -1076,7 +1083,8 @@
       .run-telemetry-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .screening-dispute-wallets { grid-template-columns: 1fr; }
       .retry-info::after,
-      .tip::after { width: min(240px, calc(100vw - 72px)); }
+      .tip::after,
+      .tip-chip::after { width: min(240px, calc(100vw - 72px)); }
       /* In the 2-col mobile stat grid the hidden "Subnet snapshot" h2 is child 1
          and the primary card (child 2) owns its full row, so right-column cards
          are the even children >= 4. Left-anchored bubbles on those cards run off
@@ -1687,7 +1695,7 @@
     }
     .board:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
     table { min-width: 850px; }
-    thead th { padding: 11px 14px; border-color: var(--border); background: var(--bg-elev-2); color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em; }
+    thead th { padding: 11px 14px; border-color: var(--border); background: var(--bg-elev-2); color: var(--text-dim); font-family: var(--mono); font-size: 11px; letter-spacing: .06em; }
     tbody td { padding: 11px 14px; border-color: color-mix(in oklch, var(--border) 72%, transparent); font-size: 13px; }
     tbody tr:hover,
     tbody tr:focus-visible { background: color-mix(in oklch, var(--accent) 6%, var(--bg-elev)); }
@@ -4284,8 +4292,8 @@
         ? "ranked by settled v" + activeBench + " composite during the v" + data.desired_bench_version +
           " rollout · v" + data.desired_bench_version + " progress shown per row"
         : finalizedEntries.length
-        ? "authoritative per-agent score"
-        : "early accepted scores · ranked provisionally by composite";
+        ? "authoritative per-agent score · open a row for tool & memory detail"
+        : "early accepted scores · ranked provisionally by composite · open a row for detail";
       document.getElementById("leaderboard-version-context").textContent = historicalView
         ? "Historical Bench v" + data.current_bench_version + " standings. Current emissions remain on the rollout view."
         : rolloutSettledView
@@ -4321,6 +4329,16 @@
       });
       applyChainWeights(entries, lastChainWeights, emissions);
       var emissionsStrip = document.getElementById("emissions-strip");
+      // Signature-gate the strip: it is a polite live region, and re-assigning
+      // identical innerHTML every 30s tick makes screen readers re-announce a
+      // paragraph of KOTH math. Rebuild only when the fold actually changed.
+      // (The champion box below has the same gate via lastChampionHtml.)
+      var chainShown = document.getElementById("chain-observation").classList.contains("show");
+      var champForSig = emissions ? entries.find(function (entry) { return String(entry.agent_id) === String(emissions.champion_agent_id); }) : null;
+      var emissionsSig = JSON.stringify(emissions) + "|" + chainShown + "|" + leaderboardVersionView +
+        (champForSig ? "|" + displayComposite(champForSig) + "|" + (champForSig.rank || "") + "|" + agentName(champForSig.agent_name) : "");
+      if (emissionsSig !== lastEmissionsSig) {
+      lastEmissionsSig = emissionsSig;
       if (emissions) {
         var championEntry = entries.find(function (entry) { return String(entry.agent_id) === String(emissions.champion_agent_id); });
         var rawLeaderEntry = entries.find(function (entry) { return String(entry.agent_id) === String(emissions.raw_leader_agent_id); });
@@ -4389,6 +4407,7 @@
         document.getElementById("emissions-reason").textContent = "";
         document.getElementById("emissions-recipients").textContent = "";
         renderDethroneFloor(null, null);
+      }
       }
       applyEmissionsCopy(emissions);
       // The dethrone-math explainer collapses behind a disclosure so the table
@@ -4485,14 +4504,14 @@
         var rankCls = (finalizedEntry && elig && activelyEligible && e.rank <= 3) ? " r" + e.rank : "";
         var kind = unrankedKind(e);
         var prov = kind === "zero"
-          ? '<span class="prov" title="This full run scored a composite of 0.000, so it is shown for transparency but is not ranked and not emission-eligible.">no score</span>'
+          ? '<span class="prov tip-chip" data-tooltip="This full run scored a composite of 0.000, so it is shown for transparency but is not ranked and not emission-eligible.">no score</span>'
           : kind === "provisional"
-          ? '<span class="prov" title="Provisional. It ran a smaller profile that did not administer the full benchmark, so it is shown for transparency but is not ranked and not emission-eligible.">provisional</span>'
+          ? '<span class="prov tip-chip" data-tooltip="Provisional. It ran a smaller profile that did not administer the full benchmark, so it is shown for transparency but is not ranked and not emission-eligible.">provisional</span>'
           : "";
         var rankCell = elig
           ? '<span class="rank' + rankCls + '">' + (finalizedEntry ? e.rank : "P" + e.rank) + '</span>' +
             (finalizedEntry ? rankMove(e.miner_hotkey, e.rank) : "")
-          : '<span class="rank prov-rank" title="Not ranked (' + (kind === "zero" ? "scored 0.000" : "provisional run") + ').">–</span>';
+          : '<span class="rank prov-rank tip-chip" data-tooltip="Not ranked (' + (kind === "zero" ? "scored 0.000" : "provisional run") + ').">–</span>';
         var displayAgentName = agentName(e.agent_name);
         var accessibleAgentName = agentLabel(e.agent_name, e.agent_version);
         var rowLabel = (elig ? (finalizedEntry ? "Rank " : "Provisional rank ") + e.rank : (kind === "zero" ? "Unranked, scored zero" : "Provisional, unranked")) +
@@ -4500,7 +4519,7 @@
           ", hotkey " + shortKey(e.miner_hotkey) + ", composite " + fx(displayComposite(e)) +
           (emission ? ", KOTH " + emission.role + " receiving " + pct(emission.share_of_miner_pool) + " of the miner pool" : "") +
           (chainWeight ? ", " + chainWeightLabel(chainWeight) : "") + ". Activate for run detail.";
-        var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge" title="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
+        var quorumBadge = finalizedEntry ? "" : '<span class="quorum-badge tip-chip" data-tooltip="Accepted score feedback; final at ' + esc(e.score_quorum || 3) + ' independent validators.">' +
           esc(e.score_count || 0) + ' of ' + esc(e.score_quorum || 3) + ' · provisional</span>';
         var registrationBadge = registered
           ? ""
@@ -4519,7 +4538,7 @@
               '<button type="button" class="copy" data-key="' + esc(e.miner_hotkey) + '" aria-label="Copy full hotkey" title="Copy hotkey"><span aria-hidden="true">⧉</span></button></span></span></td>' +
             '<td>' + (emission ? '<span class="emission-badge ' + esc(emission.role) + '"><span aria-hidden="true">●</span> ' +
               (emission.role === "champion" ? "Champion" : "Tail") + ' · ' + pct(emission.share_of_miner_pool) + '</span>' : '<span class="muted">–</span>') +
-              (chainWeight ? '<span class="chain-weight-note" title="How many validators most recently revealed this miner as their top choice, or assigned it any weight. Block ' + esc(lastChainWeights.block) + '; this can lag active commitments and is not final Yuma emissions.">' + esc(chainWeightLabel(chainWeight)) + '</span>' : '') + '</td>' +
+              (chainWeight ? '<span class="chain-weight-note tip-chip" data-tooltip="How many validators most recently revealed this miner as their top choice, or assigned it any weight. Block ' + esc(lastChainWeights.block) + '; this can lag active commitments and is not final Yuma emissions.">' + esc(chainWeightLabel(chainWeight)) + '</span>' : '') + '</td>' +
             modelCell(e) +
             compositeCell(e) +
             '<td class="hide-sm">' + bar("tool", e.tool_mean) + '</td>' +
@@ -4528,7 +4547,36 @@
             '<td class="num hide-sm muted">' + relTime(e.first_seen) + '</td>' +
           '</tr>';
       }).join("");
+      wireTips();
     }
+
+    // Screen-reader access for the CSS tooltip layer: every [data-tooltip]
+    // element (dotted .tip terms and .tip-chip score chips) gets a hidden
+    // description node wired via aria-describedby, so the bubble text is
+    // announced rather than only drawn. Rebuilt wholesale because board rows
+    // regenerate on every data change.
+    var tipDescSeq = 0;
+    function wireTips() {
+      var host = document.getElementById("tip-descs");
+      if (!host) {
+        host = document.createElement("div");
+        host.id = "tip-descs";
+        host.hidden = true;
+        document.body.appendChild(host);
+      }
+      host.textContent = "";
+      document.querySelectorAll("[data-tooltip]").forEach(function (el) {
+        var text = el.getAttribute("data-tooltip");
+        if (!text) return;
+        var id = "tipdesc-" + (++tipDescSeq);
+        var span = document.createElement("span");
+        span.id = id;
+        span.textContent = text;
+        host.appendChild(span);
+        el.setAttribute("aria-describedby", id);
+      });
+    }
+    wireTips();
 
     // Tab / sort / page controls. Each only re-renders the visible slice.
     document.querySelectorAll("[data-board-tab]").forEach(function (btn) {
@@ -4557,6 +4605,16 @@
         boardView.page = 1;
         writeBoardPage(false);
         renderBoardRows();
+      });
+      // The focusable tooltip term inside the header doubles as the keyboard
+      // sort control: it is the header's one tab stop, so Enter/Space there
+      // must do what a pointer click on the header does.
+      var sortTip = th.querySelector(".tip");
+      if (sortTip) sortTip.setAttribute("role", "button");
+      th.addEventListener("keydown", function (ev) {
+        if (ev.key !== "Enter" && ev.key !== " ") return;
+        ev.preventDefault();
+        th.click();
       });
     });
     (function () {
@@ -4670,7 +4728,11 @@
       var tokenChip = tokenPenaltyChip(e);
       var line2 = (spark || chip || gateChip || tokenChip)
         ? '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-height:16px">' + spark + chip + gateChip + tokenChip + '</div>' : "";
-      return '<td><div class="cwrap">' + row + line2 + '</div></td>';
+      // Shown by CSS only at split widths where the Tool/Memory columns hide.
+      var tm = (e.tool_mean != null || e.memory_mean != null)
+        ? '<span class="tm-mini">tool ' + (e.tool_mean != null ? fx(e.tool_mean) : "–") +
+          ' · mem ' + (e.memory_mean != null ? fx(e.memory_mean) : "–") + '</span>' : "";
+      return '<td><div class="cwrap">' + row + line2 + tm + '</div></td>';
     }
     // Why the composite is not simply the tool/memory average: the base IS that
     // average (½·tool + ½·memory), and the benchmark quality gates (chiefly the
@@ -4689,7 +4751,7 @@
         "below the average. The largest gate is conversational sanity: leaking on a " +
         "greeting or missing a plain declarative floors it at 0.5. Consistency, canary " +
         "integrity, and wasteful tool use also count. Open the row for the full breakdown.";
-      return '<span class="gate-chip" title="' + esc(tip) + '">gates −' + (reduction * 100).toFixed(0) + '%</span>';
+      return '<span class="gate-chip tip-chip" data-tooltip="' + esc(tip) + '">gates −' + (reduction * 100).toFixed(0) + '%</span>';
     }
     function tokenPenaltyChip(e) {
       var b = e && e.composite_breakdown;
@@ -4700,7 +4762,7 @@
       var tip = penalized
         ? "Token efficiency reduced the pre-token composite by " + (penalty * 100).toFixed(1) + "%. The maximum is 10%."
         : "Token use stayed within the v5 budget, so token efficiency did not reduce this score. The maximum possible penalty is 10%.";
-      return '<span class="token-chip' + (penalized ? ' penalized' : '') + '" title="' + esc(tip) + '">' + esc(label) + '</span>';
+      return '<span class="token-chip tip-chip' + (penalized ? ' penalized' : '') + '" data-tooltip="' + esc(tip) + '">' + esc(label) + '</span>';
     }
     // Mid-rollout settlement state for the row: the agent's median on the
     // incoming benchmark version so far and how many of the 3 independent
@@ -4711,7 +4773,7 @@
       var count = Number(e.rollout_score_count) || 0;
       var vlabel = "v" + (desiredBench || benchmarkDisplayVersion());
       if (!count || e.rollout_composite == null) {
-        return '<span class="rollout-chip pending" title="No accepted ' + esc(vlabel) +
+        return '<span class="rollout-chip pending tip-chip" data-tooltip="No accepted ' + esc(vlabel) +
           ' score yet. This agent still ranks and earns on its settled score.">' +
           esc(vlabel) + ' pending · 0/' + quorum + '</span>';
       }
@@ -4720,7 +4782,7 @@
         ? esc(vlabel) + " reached quorum: this median is locked in and takes over when the " + esc(vlabel) + " rollout fully activates."
         : "Preliminary " + esc(vlabel) + " median from " + count + " of " + quorum +
           " scores. It can change until quorum and does not affect rank or weights yet.";
-      return '<span class="rollout-chip' + (settled ? " settled" : " partial") + '" title="' + tip + '">' +
+      return '<span class="rollout-chip tip-chip' + (settled ? " settled" : " partial") + '" data-tooltip="' + tip + '">' +
         esc(vlabel) + ' ' + fx(e.rollout_composite) + ' · ' + count + '/' + quorum +
         (settled ? ' settled' : '') + '</span>';
     }
@@ -4783,11 +4845,11 @@
     function rankMove(hotkey, currRank) {
       if (!(hotkey in prevRanks)) {
         return prevRanksHasData
-          ? '<span class="rankmove new" title="New since your last visit">NEW</span>' : "";
+          ? '<span class="rankmove new tip-chip" data-tooltip="New since your last visit">NEW</span>' : "";
       }
       var d = prevRanks[hotkey] - currRank;
-      if (d > 0) return '<span class="rankmove up" title="Up ' + d + ' since your last visit">▲' + d + '</span>';
-      if (d < 0) return '<span class="rankmove down" title="Down ' + (-d) + ' since your last visit">▼' + (-d) + '</span>';
+      if (d > 0) return '<span class="rankmove up tip-chip" data-tooltip="Up ' + d + ' since your last visit">▲' + d + '</span>';
+      if (d < 0) return '<span class="rankmove down tip-chip" data-tooltip="Down ' + (-d) + ' since your last visit">▼' + (-d) + '</span>';
       return "";
     }
 
