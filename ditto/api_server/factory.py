@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -23,11 +24,16 @@ from ditto.api_server.config import (
     parse_api_server_config_from_env,
 )
 from ditto.api_server.datapipeline import create_generator
+from ditto.api_server.efficiency_settings import (
+    DEFAULT_SETTINGS_TTL_SECONDS,
+    EfficiencyBonusSettingsResolver,
+)
 from ditto.api_server.embedding import create_embedder
 from ditto.api_server.endpoints import (
     admin_artifact_release_settings_router,
     admin_benchmark_rollout_router,
     admin_copy_review_router,
+    admin_efficiency_bonus_settings_router,
     admin_inference_routes_router,
     admin_miner_fees_router,
     admin_quarantine_router,
@@ -70,6 +76,23 @@ _DASHBOARD_IMAGE = (
     Path(__file__).resolve().parents[2] / "dashboard" / "assets" / "paperditto-512.png"
 )
 _WANDB_META_RE = re.compile(r'(<meta name="ditto:wandb-url" content=")[^"]*(")')
+
+
+def _efficiency_settings_ttl_seconds() -> float:
+    """TTL for the hot-swappable efficiency-bonus policy read cache.
+
+    ``DITTO_EFFICIENCY_BONUS_SETTINGS_TTL_SECONDS`` overrides the default; a
+    malformed or negative value falls back to the default rather than failing
+    boot (the setting only bounds propagation latency, never correctness).
+    """
+    raw = os.environ.get("DITTO_EFFICIENCY_BONUS_SETTINGS_TTL_SECONDS")
+    if raw is None:
+        return DEFAULT_SETTINGS_TTL_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_SETTINGS_TTL_SECONDS
+    return value if value >= 0 else DEFAULT_SETTINGS_TTL_SECONDS
 
 
 def _render_dashboard(wandb_url: str) -> str | None:
@@ -185,6 +208,15 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     )
     app.state.config = config
     app.state.commit_hash = config.commit_hash
+    # Hot-swappable efficiency-bonus policy: the compute path resolves the
+    # latest append-only revision through this resolver (short TTL), falling
+    # back to the env seed (config.efficiency_bonus) when none exists. The DB
+    # read uses app.state.session_maker (set in lifespan), so before lifespan —
+    # or in unit tests without it — resolve() just returns the seed.
+    app.state.efficiency_settings = EfficiencyBonusSettingsResolver(
+        config.efficiency_bonus,
+        ttl_seconds=_efficiency_settings_ttl_seconds(),
+    )
     # The object exists even when lifespan is skipped in unit tests. Its
     # snapshot path is synchronous and disabled by default; production lifespan
     # starts the optional background refresher without blocking API startup.
@@ -223,6 +255,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(public_router, prefix="/api/v1")
     app.include_router(admin_artifact_release_settings_router, prefix="/api/v1")
     app.include_router(admin_benchmark_rollout_router, prefix="/api/v1")
+    app.include_router(admin_efficiency_bonus_settings_router, prefix="/api/v1")
     app.include_router(admin_inference_routes_router, prefix="/api/v1")
     app.include_router(admin_quarantine_router, prefix="/api/v1")
     app.include_router(admin_validation_retry_router, prefix="/api/v1")
