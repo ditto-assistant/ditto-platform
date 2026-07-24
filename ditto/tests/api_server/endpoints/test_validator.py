@@ -5372,6 +5372,51 @@ class TestTop5ConfirmationLane:
         body = response.json()
         assert body["agent_id"] == str(member)
 
+    async def test_allows_out_of_cadence_claim_just_after_canonical_tail_finishes(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        finished_agent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCORED,
+            name="canonical-tail-finished",
+            miner_hotkey="5CanonicalTailFinishedMiner",
+        )
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            champion_row = await session.get(Agent, champion)
+            assert champion_row is not None
+            champion_row.dataset_seed_block = 1
+            session.add(
+                ValidatorTicket(
+                    agent_id=finished_agent,
+                    bench_version=2,
+                    validator_hotkey=_KEYPAIRS[1].ss58_address,
+                    status=TicketStatus.SCORED,
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
+                    purpose_revision=1,
+                    issued_at=now - timedelta(minutes=30),
+                    deadline=now + timedelta(minutes=60),
+                    updated_at=now - timedelta(minutes=1),
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=361)
+        app.state.config = replace(app.state.config, top5_backoff_base=2)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
     @pytest.mark.parametrize(
         "purpose",
         [TicketPurpose.CANONICAL_QUORUM, TicketPurpose.LEGACY_UNCLASSIFIED],
