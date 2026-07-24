@@ -68,7 +68,7 @@ from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.models import AgentStatus
 from ditto.db.queries.agents import (
-    enforce_submission_cooldown,
+    SubmissionCooldownError,
     get_submission_retry_at,
     insert_agent,
 )
@@ -80,6 +80,11 @@ from ditto.db.queries.payments import (
     get_same_hotkey_agent_by_sha,
     get_same_owner_agent_by_sha,
     insert_evaluation_payment,
+)
+from ditto.db.queries.submission_settings import (
+    consume_or_enforce_upload_admission,
+    effective_submission_settings,
+    reserve_upload_admission,
 )
 
 if TYPE_CHECKING:
@@ -100,7 +105,6 @@ ERROR_CODE_IDENTICAL_SUBMISSION = 1104
 ERROR_CODE_SUBMISSION_COOLDOWN = 1105
 
 DEFAULT_MAX_TARBALL_SIZE_BYTES = 20 * 1024 * 1024
-SUBMISSION_COOLDOWN = timedelta(hours=1)
 
 
 def _tarball_size_cap_from_env() -> int:
@@ -237,13 +241,36 @@ async def check(
             )
 
     retry_at = None
+    settings = await effective_submission_settings(session)
     if duplicate is None and owner_coldkey is not None:
         retry_at = await get_submission_retry_at(
             session,
             miner_coldkey=owner_coldkey,
-            cooldown=SUBMISSION_COOLDOWN,
+            cooldown=timedelta(seconds=settings.cooldown_seconds),
         )
         if retry_at is not None:
+            codes.append(ERROR_CODE_SUBMISSION_COOLDOWN)
+            messages.append(f"owner coldkey may submit again at {retry_at.isoformat()}")
+
+    admission = None
+    if not codes and body.reserve_submission_slot:
+        assert owner_coldkey is not None
+        if session.in_transaction():
+            rollback_result = session.rollback()
+            if inspect.isawaitable(rollback_result):
+                await rollback_result
+        try:
+            async with session.begin():
+                settings = await effective_submission_settings(session)
+                admission = await reserve_upload_admission(
+                    session,
+                    miner_coldkey=owner_coldkey,
+                    miner_hotkey=body.hotkey,
+                    sha256=body.sha256,
+                    settings=settings,
+                )
+        except SubmissionCooldownError as exc:
+            retry_at = exc.retry_at
             codes.append(ERROR_CODE_SUBMISSION_COOLDOWN)
             messages.append(f"owner coldkey may submit again at {retry_at.isoformat()}")
 
@@ -255,6 +282,9 @@ async def check(
         identical_agent_id=duplicate.agent_id if duplicate else None,
         identical_agent_status=duplicate.status if duplicate else None,
         retry_at=retry_at,
+        admission_token=admission.token if admission else None,
+        admission_expires_at=admission.expires_at if admission else None,
+        cooldown_seconds=settings.cooldown_seconds,
     )
 
 
@@ -283,6 +313,7 @@ async def upload_agent(
     embedder: EmbedderDep,
     session: SessionDep,
     allow_identical_rescore: Annotated[bool, Form()] = False,
+    admission_token: Annotated[uuid.UUID | None, Form()] = None,
 ) -> UploadAgentResponse:
     """Full upload submission with proof of payment.
 
@@ -532,10 +563,14 @@ async def upload_agent(
     # (3207) and the envelope handler maps it to HTTP 402.
     try:
         async with session.begin():
-            await enforce_submission_cooldown(
+            settings = await effective_submission_settings(session)
+            await consume_or_enforce_upload_admission(
                 session,
                 miner_coldkey=owner_coldkey,
-                cooldown=SUBMISSION_COOLDOWN,
+                miner_hotkey=hotkey,
+                sha256=sha256,
+                admission_token=admission_token,
+                settings=settings,
             )
             version = await insert_agent(
                 session,

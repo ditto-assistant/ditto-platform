@@ -1562,6 +1562,77 @@ class ArtifactReleaseSettingsRevision(Base):
     )
 
 
+class SubmissionSettingsRevision(Base):
+    """Append-only, operator-audited miner submission cooldown revision."""
+
+    __tablename__ = "submission_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    cooldown_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "cooldown_seconds BETWEEN 60 AND 86400",
+            name="submission_settings_cooldown_seconds_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="submission_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="submission_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="submission_settings_actor_check",
+        ),
+        UniqueConstraint(
+            "parent_revision",
+            name="submission_settings_parent_revision_key",
+        ),
+    )
+
+
+class UploadAdmissionReservation(Base):
+    """Short-lived pre-payment reservation for one payment coldkey."""
+
+    __tablename__ = "upload_admission_reservations"
+
+    miner_coldkey: Mapped[str] = mapped_column(Text, primary_key=True)
+    token: Mapped[UUID] = mapped_column(
+        SaUUID(as_uuid=True), unique=True, nullable=False
+    )
+    miner_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    settings_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    cooldown_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "cooldown_seconds BETWEEN 60 AND 86400",
+            name="upload_admission_cooldown_seconds_check",
+        ),
+        CheckConstraint(
+            "length(sha256) = 64",
+            name="upload_admission_sha256_length_check",
+        ),
+        Index("upload_admission_expires_at_idx", "expires_at"),
+    )
+
+
 class AgentKingship(Base):
     """King-reign ledger gating public source release, in two write-once stages.
 

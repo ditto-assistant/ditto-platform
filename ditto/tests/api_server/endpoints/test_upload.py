@@ -81,7 +81,11 @@ def _stub_ban_check(monkeypatch: pytest.MonkeyPatch) -> None:
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
-        "ditto.api_server.endpoints.upload.enforce_submission_cooldown",
+        "ditto.api_server.endpoints.upload.effective_submission_settings",
+        AsyncMock(return_value=SimpleNamespace(revision=0, cooldown_seconds=3600)),
+    )
+    monkeypatch.setattr(
+        "ditto.api_server.endpoints.upload.consume_or_enforce_upload_admission",
         AsyncMock(return_value=None),
     )
 
@@ -178,6 +182,38 @@ class TestUploadCheck:
         assert result["error_codes"] == []
         assert result["messages"] == []
         assert result["payment_required"] is True
+
+    async def test_reserves_slot_before_payment_when_requested(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        override_get_chain_client(app)
+        token = uuid4()
+        expires_at = datetime(2026, 7, 24, 20, 30, tzinfo=UTC)
+        reserve = AsyncMock(
+            return_value=SimpleNamespace(
+                token=token,
+                expires_at=expires_at,
+                cooldown_seconds=3600,
+            )
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.reserve_upload_admission", reserve
+        )
+        response = await client.post(
+            "/api/v1/upload/check",
+            json={**_signed_request_body(), "reserve_submission_slot": True},
+        )
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["ok"] is True
+        assert result["admission_token"] == str(token)
+        assert result["admission_expires_at"] == "2026-07-24T20:30:00Z"
+        assert result["cooldown_seconds"] == 3600
+        reserve.assert_awaited_once()
 
     async def test_identical_artifact_stops_payment_unless_rescore_is_explicit(
         self,
@@ -687,7 +723,7 @@ class TestUploadAgentValidationFailures:
         )
         retry_at = datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=30)
         monkeypatch.setattr(
-            "ditto.api_server.endpoints.upload.enforce_submission_cooldown",
+            "ditto.api_server.endpoints.upload.consume_or_enforce_upload_admission",
             AsyncMock(side_effect=SubmissionCooldownError(retry_at)),
         )
         data, files = _upload_agent_form(keypair=kp)
