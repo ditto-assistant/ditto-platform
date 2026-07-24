@@ -212,7 +212,7 @@ class TestDashboard:
         assert 'cache: "no-store"' in body
         assert "Download submitted source" in body
         assert "The 3/3 score quorum" in body
-        assert "Number(release.embargo_hours) || 6" in body
+        assert "Number(release.embargo_hours) || 24" in body
         assert "privacy window" in body
         assert "the original 3/3 timestamp still applies" in body
         assert "function relTimeUntil(iso)" in body
