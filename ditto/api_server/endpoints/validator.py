@@ -51,7 +51,7 @@ from uuid import UUID, uuid4
 import bittensor
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
@@ -1796,23 +1796,35 @@ async def _canonical_tail_is_draining(
     canonical_version: int,
     now: datetime,
 ) -> bool:
-    """Whether another validator is finishing current-version quorum work.
+    """Whether current-version quorum work is finishing or just finished.
 
     Honest validators ask for canonical work before entering the continual
     top-five lane.  While the last canonical leases are still running, a
     validator that received no job would otherwise sit idle until the next
     scheduled confirmation tempo.  Treat that bounded tail-drain window as
     spare capacity without opening the continual lane permanently between
-    tempos.
+    tempos.  Keep the window open for one canonical lease TTL after the last
+    score lands: otherwise the final score closes the live-ticket predicate
+    before the idle validators' next poll, recreating the idle gap this guard
+    exists to fill.
     """
+    recently_settled_after = now - _TICKET_TTL
     active_agent_id = await session.scalar(
         select(ValidatorTicket.agent_id)
         .where(
             ValidatorTicket.bench_version == canonical_version,
             ValidatorTicket.validator_hotkey != requesting_validator,
-            ValidatorTicket.status == TicketStatus.ISSUED,
             ValidatorTicket.purpose == TicketPurpose.CANONICAL_QUORUM,
-            ValidatorTicket.deadline > now,
+            or_(
+                (
+                    (ValidatorTicket.status == TicketStatus.ISSUED)
+                    & (ValidatorTicket.deadline > now)
+                ),
+                (
+                    (ValidatorTicket.status == TicketStatus.SCORED)
+                    & (ValidatorTicket.updated_at >= recently_settled_after)
+                ),
+            ),
         )
         .limit(1)
     )
