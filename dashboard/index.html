@@ -5670,7 +5670,10 @@
           type: "submission",
           entry: entry,
           title: agentLabel(entry.name, entry.version),
-          detail: String(entry.agent_id || "").slice(0, 8) + " · " + stage[0] + " · " + relTime(entry.submitted_at),
+          detail: String(entry.agent_id || "").slice(0, 8) + " · " + stage[0] +
+            (entry.preserved_composite != null ? " · composite " + fx(Number(entry.preserved_composite))
+              : entry.provisional_composite != null ? " · provisional " + fx(Number(entry.provisional_composite)) : "") +
+            " · " + relTime(entry.submitted_at),
           text: [entry.name, agentVersionLabel(entry.version), entry.agent_id, entry.miner_hotkey, entry.status, stage[0], entry.review_reason, entry.screening_reason, entry.duplicate_of, entry.duplicate_name, agentVersionLabel(entry.duplicate_version)].map(searchText).join(" ")
         });
       });
