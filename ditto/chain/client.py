@@ -173,6 +173,16 @@ class ChainClient:
         neurons = await self.get_recent_neurons(netuid)
         return any(n.hotkey == hotkey for n in neurons)
 
+    async def get_registered_coldkey(self, hotkey: str, netuid: int) -> str | None:
+        """Return the current coldkey owner when ``hotkey`` is registered.
+
+        This uses the same recent-neurons snapshot as :meth:`is_registered`, so
+        pre-payment policy checks can bind to ownership without a second chain
+        backend or trusting a miner-supplied coldkey.
+        """
+        neurons = await self.get_recent_neurons(netuid)
+        return next((n.coldkey for n in neurons if n.hotkey == hotkey), None)
+
     # --- Block + extrinsic reads ---
 
     async def get_latest_block(self) -> BlockInfo:

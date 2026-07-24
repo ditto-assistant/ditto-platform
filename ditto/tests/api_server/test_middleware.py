@@ -49,7 +49,11 @@ def _attach_error_routes(app: FastAPI) -> None:
 
     @app.get("/_test/http")
     async def _raise_http() -> dict[str, Any]:
-        raise HTTPException(status_code=418, detail="i am a teapot")
+        raise HTTPException(
+            status_code=418,
+            detail="i am a teapot",
+            headers={"Retry-After": "60"},
+        )
 
     @app.get("/_test/validation")
     async def _raise_validation() -> dict[str, Any]:
@@ -193,6 +197,7 @@ class TestErrorEnvelope:
         assert body["error_code"] == ERROR_CODE_HTTP_EXCEPTION
         assert body["message"] == "i am a teapot"
         assert "request_id" in body
+        assert response.headers["Retry-After"] == "60"
 
     async def test_validation_error_returns_envelope(
         self, app: FastAPI, client: httpx.AsyncClient

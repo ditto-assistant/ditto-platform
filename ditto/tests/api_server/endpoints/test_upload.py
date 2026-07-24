@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import tarfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +22,7 @@ from ditto.api_server.endpoints.upload import (
     ERROR_CODE_BAD_SIGNATURE,
     ERROR_CODE_HOTKEY_NOT_REGISTERED,
     ERROR_CODE_IDENTICAL_SUBMISSION,
+    ERROR_CODE_SUBMISSION_COOLDOWN,
     ERROR_CODE_TARBALL_TOO_LARGE,
     MAX_TARBALL_SIZE_BYTES,
 )
@@ -53,6 +54,7 @@ from ditto.api_server.pricing import (
 )
 from ditto.api_server.storage import ObjectUploadFailedError
 from ditto.chain.errors import ChainConnectionError
+from ditto.db.queries.agents import SubmissionCooldownError
 from ditto.tests.api_server.conftest import (
     override_get_chain_client,
     override_get_embedder,
@@ -73,6 +75,14 @@ def _stub_ban_check(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "ditto.api_server.endpoints.upload.is_hotkey_banned",
         AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        "ditto.api_server.endpoints.upload.get_submission_retry_at",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "ditto.api_server.endpoints.upload.enforce_submission_cooldown",
+        AsyncMock(return_value=None),
     )
 
 
@@ -223,6 +233,29 @@ class TestUploadCheck:
         assert result["ok"] is False
         assert ERROR_CODE_HOTKEY_BANNED in result["error_codes"]
 
+    async def test_cooldown_returns_retry_timestamp_before_payment(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        override_get_chain_client(app)
+        retry_at = datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_submission_retry_at",
+            AsyncMock(return_value=retry_at),
+        )
+
+        response = await client.post(
+            "/api/v1/upload/check", json=_signed_request_body()
+        )
+
+        result = response.json()
+        assert result["ok"] is False
+        assert result["payment_required"] is False
+        assert ERROR_CODE_SUBMISSION_COOLDOWN in result["error_codes"]
+        assert result["retry_at"] == "2026-07-24T12:30:00Z"
+
     async def test_bad_signature_returns_1100(
         self, app: FastAPI, client: httpx.AsyncClient
     ):
@@ -246,6 +279,7 @@ class TestUploadCheck:
         async def _fake_chain() -> MagicMock:
             chain = MagicMock()
             chain.is_registered = AsyncMock(return_value=False)
+            chain.get_registered_coldkey = AsyncMock(return_value=None)
             return chain
 
         app.dependency_overrides[get_chain_client] = _fake_chain
@@ -277,6 +311,7 @@ class TestUploadCheck:
         async def _fake_chain() -> MagicMock:
             chain = MagicMock()
             chain.is_registered = AsyncMock(return_value=False)
+            chain.get_registered_coldkey = AsyncMock(return_value=None)
             return chain
 
         app.dependency_overrides[get_chain_client] = _fake_chain
@@ -320,11 +355,15 @@ class TestUploadCheck:
         async def _fake_chain() -> MagicMock:
             chain = MagicMock()
 
-            async def _is_registered(_hotkey: str, *, netuid: int) -> bool:
+            async def _get_registered_coldkey(
+                _hotkey: str, *, netuid: int
+            ) -> str | None:
                 recorded["netuid"] = netuid
-                return False
+                return None
 
-            chain.is_registered = AsyncMock(side_effect=_is_registered)
+            chain.get_registered_coldkey = AsyncMock(
+                side_effect=_get_registered_coldkey
+            )
             return chain
 
         custom_app.dependency_overrides[get_chain_client] = _fake_chain
@@ -635,6 +674,30 @@ class TestUploadAgentHappyPath:
 
 
 class TestUploadAgentValidationFailures:
+    async def test_cooldown_race_returns_429_with_retry_after(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _wire_full_stack(app)
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        _override_payment_verifier(
+            app, verified=_make_verified_payment(miner_hotkey=kp.ss58_address)
+        )
+        retry_at = datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=30)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.enforce_submission_cooldown",
+            AsyncMock(side_effect=SubmissionCooldownError(retry_at)),
+        )
+        data, files = _upload_agent_form(keypair=kp)
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 429
+        assert int(response.headers["Retry-After"]) in range(1798, 1801)
+        assert retry_at.isoformat() in response.json()["message"]
+
     async def test_bad_signature_returns_400(
         self, app: FastAPI, client: httpx.AsyncClient
     ):
