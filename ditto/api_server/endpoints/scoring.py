@@ -34,6 +34,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from ditto.api_models import ConfirmationScoreRecord, LedgerEntry, LedgerResponse
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_models.validator import LedgerScoreProof
+from ditto.api_server.efficiency import effective_composite
 from ditto.api_server.endpoints.validator import (
     ChainDep,
     SessionDep,
@@ -48,6 +49,7 @@ from ditto.db.queries.confirmation_scores import (
     completed_confirmation_wave_seeds,
     confirmation_history_by_agent,
 )
+from ditto.db.queries.efficiency import get_bonus_rows
 from ditto.db.queries.heartbeats import live_validator_fleet_supports_protocol
 from ditto.db.queries.scores import (
     list_eligible_ledger,
@@ -309,6 +311,20 @@ async def scores(
             minimum_protocol=_CONTINUAL_MEAN_PROTOCOL,
             now=auth_now,
         )
+        # Frozen relative token-efficiency bonuses (bench_version >= 7) are
+        # surfaced to validators only behind the fold flag; with it off the
+        # ledger is byte-identical to the pre-bonus wire shape, and the
+        # subnet's weight fold must ship its own consensus change before any
+        # validator may consume these advisory fields.
+        efficiency_config = request.app.state.config.efficiency_bonus
+        if efficiency_config.enabled and efficiency_config.fold_enabled:
+            bonus_rows = await get_bonus_rows(
+                session,
+                [r.agent_id for r in rows],
+                bench_versions={r.agent_id: r.bench_version for r in rows},
+            )
+        else:
+            bonus_rows = {}
     except SQLAlchemyError as e:
         return _serve_last_known(request, x_validator_hotkey, e)
 
@@ -378,6 +394,14 @@ async def scores(
             ),
             continual_aggregate_method=(
                 "mean_after_quorum" if continual_mean_active else None
+            ),
+            efficiency_bonus=(
+                bonus_rows[r.agent_id].bonus if r.agent_id in bonus_rows else None
+            ),
+            effective_composite=(
+                effective_composite(r.composite, bonus_rows[r.agent_id].bonus)
+                if r.agent_id in bonus_rows
+                else None
             ),
             status=r.status,
         )

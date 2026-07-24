@@ -47,7 +47,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import ValidationError
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
@@ -82,6 +82,9 @@ from ditto.api_models import (
     PublicConfirmationScore,
     PublicDatasetReveal,
     PublicDethroneDecision,
+    PublicEfficiencyCohortMember,
+    PublicEfficiencySnapshotResponse,
+    PublicEfficiencyStatus,
     PublicEmissionRecipient,
     PublicHealthResponse,
     PublicKothEmissions,
@@ -141,6 +144,14 @@ from ditto.api_models.validator_capabilities import (
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.benchmark_rollout import rolling_qualification_blockers
 from ditto.api_server.datapipeline import DataPipelineError
+from ditto.api_server.efficiency import (
+    EfficiencyBoardView,
+    ensure_efficiency_state,
+    read_efficiency_board,
+)
+from ditto.api_server.efficiency import (
+    effective_composite as bonus_effective_composite,
+)
 from ditto.api_server.endpoints.scoring import (
     _confirmation_composites,
     _confirmation_seeds,
@@ -989,6 +1000,8 @@ def _public_entry(
     initial_quorum_composites: tuple[float, ...] = (),
     completed_wave_composites: tuple[float, ...] = (),
     continual_aggregate_active: bool = False,
+    efficiency_bonus: float | None = None,
+    efficiency_snapshot_id: UUID | None = None,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -1043,6 +1056,13 @@ def _public_entry(
             and not isinstance(details.get("raw_composite"), bool)
             else None
         ),
+        efficiency_bonus=efficiency_bonus,
+        effective_composite=(
+            bonus_effective_composite(r.composite, efficiency_bonus)
+            if efficiency_bonus is not None
+            else None
+        ),
+        efficiency_snapshot_id=efficiency_snapshot_id,
         # Use the exact uncertainty value sent to validators: a stashed re-score
         # SE when present, otherwise the k=3 quorum SEM. This keeps the displayed
         # band and the KOTH projection aligned with the real fold.
@@ -1357,6 +1377,22 @@ async def leaderboard(
     now = datetime.now(UTC)
     from ditto.db.queries.benchmark_rollout import open_rollout
 
+    efficiency_config = request.app.state.config.efficiency_bonus
+    if efficiency_config.enabled and bench_version is None:
+        # Materialize the current efficiency epoch (frozen cohort snapshot +
+        # insert-once bonus rows) before any other read opens a transaction on
+        # this session. A no-op below bench_version 7 and after the first call
+        # of an epoch; failure degrades to serving the board without bonuses.
+        try:
+            await ensure_efficiency_state(
+                session, efficiency_config, now=datetime.now(UTC)
+            )
+        except SQLAlchemyError:
+            logger.warning(
+                "efficiency bonus materialization failed; serving board without it",
+                exc_info=True,
+            )
+
     active_version = await active_bench_version(session)
     rollout = await open_rollout(session)
     desired_version = rollout.desired_version if rollout is not None else active_version
@@ -1415,6 +1451,23 @@ async def leaderboard(
             freshness=_VALIDATOR_STALE_WINDOW,
         )
     )
+    efficiency_view: EfficiencyBoardView | None = None
+    if efficiency_config.enabled and finalized_rows:
+        board_version = max(row.bench_version for row in finalized_rows)
+        try:
+            efficiency_view = await read_efficiency_board(
+                session,
+                efficiency_config,
+                bench_version=board_version,
+                agent_ids=finalized_ids,
+                bench_versions=selected_versions,
+                now=datetime.now(UTC),
+            )
+        except SQLAlchemyError:
+            logger.warning(
+                "efficiency bonus read failed; serving board without it",
+                exc_info=True,
+            )
     if bench_version is None:
         confirmation_by_seed = await confirmation_composites_by_seed(
             session,
@@ -1542,6 +1595,11 @@ async def leaderboard(
         settled, rolling, rolling_count = rollout_states.get(
             row.agent_id, (None, None, None)
         )
+        bonus_row = (
+            efficiency_view.bonuses.get(row.agent_id)
+            if efficiency_view is not None
+            else None
+        )
         entries.append(
             _public_entry(
                 i,
@@ -1553,6 +1611,10 @@ async def leaderboard(
                 settled_composite=settled,
                 rollout_composite=rolling,
                 rollout_score_count=rolling_count,
+                efficiency_bonus=bonus_row.bonus if bonus_row is not None else None,
+                efficiency_snapshot_id=(
+                    bonus_row.snapshot_id if bonus_row is not None else None
+                ),
                 registered=(
                     row.miner_hotkey in registered_uids
                     if registered_uids is not None
@@ -1633,6 +1695,87 @@ async def leaderboard(
                 include_continual_scores=continual_mean_active,
             )
         ),
+        efficiency=_efficiency_status(efficiency_view),
+    )
+
+
+def _efficiency_status(
+    view: EfficiencyBoardView | None,
+) -> PublicEfficiencyStatus | None:
+    """The board-level bonus status from the governing frozen snapshot."""
+    if view is None or view.snapshot is None:
+        return None
+    snapshot = view.snapshot
+    return PublicEfficiencyStatus(
+        active=snapshot.active,
+        bench_version=snapshot.bench_version,
+        run_size=snapshot.run_size,
+        epoch_index=snapshot.epoch_index,
+        snapshot_id=snapshot.snapshot_id,
+        cohort_size=len(snapshot.members or []),
+        n_min=snapshot.n_min,
+        bonus_cap=snapshot.bonus_cap,
+        reference_p25_tokens=snapshot.reference_p25_tokens,
+        reference_median_tokens=snapshot.reference_median_tokens,
+    )
+
+
+@router.get(
+    "/efficiency/snapshots/{snapshot_id}",
+    response_model=PublicEfficiencySnapshotResponse,
+    responses={404: {"description": "Unknown snapshot id."}},
+)
+async def efficiency_snapshot(
+    snapshot_id: UUID,
+    session: SessionDep,
+    response: Response,
+) -> PublicEfficiencySnapshotResponse:
+    """One immutable frozen efficiency-cohort snapshot, for bonus provenance.
+
+    Everything a third party needs to reproduce a published bonus from stored
+    data: the frozen membership (lineage-deduped, exposed as opaque lineage
+    group ordinals — never the raw digests), the quality floors in force, and
+    the robust reference statistics (P25 frontier / median zero point).
+    Snapshots never change once written, so this response is immutable.
+    """
+    from ditto.db.queries.efficiency import get_snapshot_by_id
+
+    snapshot = await get_snapshot_by_id(session, snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="efficiency snapshot not found")
+    response.headers["Cache-Control"] = _SETTLED_BENCH_CACHE_CONTROL
+    members: list[PublicEfficiencyCohortMember] = []
+    for ordinal, raw in enumerate(snapshot.members or [], start=1):
+        if not isinstance(raw, dict):
+            continue
+        members.append(
+            PublicEfficiencyCohortMember(
+                agent_id=UUID(str(raw["agent_id"])),
+                miner_hotkey=str(raw["miner_hotkey"]),
+                composite=float(raw["composite"]),
+                memory_mean=float(raw["memory_mean"]),
+                token_total=float(raw["token_total"]),
+                lineage_group=ordinal,
+                collapsed_agent_ids=[
+                    UUID(str(value)) for value in raw.get("collapsed_agent_ids", [])
+                ],
+            )
+        )
+    return PublicEfficiencySnapshotResponse(
+        snapshot_id=snapshot.snapshot_id,
+        bench_version=snapshot.bench_version,
+        run_size=snapshot.run_size,
+        epoch_index=snapshot.epoch_index,
+        active=snapshot.active,
+        cohort_limit=snapshot.cohort_limit,
+        n_min=snapshot.n_min,
+        bonus_cap=snapshot.bonus_cap,
+        quality_floor=snapshot.quality_floor,
+        memory_floor=snapshot.memory_floor,
+        reference_p25_tokens=snapshot.reference_p25_tokens,
+        reference_median_tokens=snapshot.reference_median_tokens,
+        computed_at=snapshot.computed_at,
+        members=members,
     )
 
 
