@@ -5311,6 +5311,69 @@ def _top5_score_payload(
 
 
 class TestTop5ConfirmationLane:
+    async def test_rejects_out_of_cadence_claim_without_canonical_tail(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        async with session_maker() as session, session.begin():
+            champion_row = await session.get(Agent, champion)
+            assert champion_row is not None
+            champion_row.dataset_seed_block = 1
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=361)
+        app.state.config = replace(app.state.config, top5_backoff_base=2)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 409
+        assert "not due" in response.json()["message"]
+
+    async def test_allows_out_of_cadence_claim_while_canonical_tail_drains(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        draining_agent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="canonical-tail",
+            miner_hotkey="5CanonicalTailMiner",
+        )
+        async with session_maker() as session, session.begin():
+            champion_row = await session.get(Agent, champion)
+            assert champion_row is not None
+            champion_row.dataset_seed_block = 1
+        await _seed_ticket(
+            session_maker,
+            draining_agent,
+            keypair=_KEYPAIRS[1],
+            deadline=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=361)
+        app.state.config = replace(app.state.config, top5_backoff_base=2)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["agent_id"] == str(member)
+
     @pytest.mark.parametrize(
         "purpose",
         [TicketPurpose.CANONICAL_QUORUM, TicketPurpose.LEGACY_UNCLASSIFIED],
