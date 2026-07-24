@@ -4088,7 +4088,7 @@
       var narrow = width < 560, tight = width < 400;
       var height = narrow
         ? Math.max(300, Math.round(width * 0.86))
-        : Math.max(340, Math.min(470, Math.round(width * 0.42)));
+        : Math.max(272, Math.min(376, Math.round(width * 0.34)));
       var left = tight ? 32 : narrow ? 40 : 58;
       var right = narrow ? 14 : 26;
       var top = narrow ? 22 : 30;
@@ -4347,7 +4347,7 @@
         // are the ones this chart deliberately leaves out.
         (fieldCount ? '<span><strong>' + fieldCount + '</strong> finalized runs</span>' : "") +
         '<span><strong>' + minerPoints.length + '</strong> records</span>' +
-        (latestMiner ? '<span>Latest record <strong>' + fx(latestMiner.score) + '</strong> on v' + latestMiner.version + '</span>' : '<span>Miner history is not yet available</span>') +
+        (latestMiner ? '<span>Latest record <strong>' + fx(latestMiner.score) + '</strong> on <strong>v' + latestMiner.version + '</strong></span>' : '<span>Miner history is not yet available</span>') +
         (pendingTotal ? '<span><strong>' + pendingTotal + '</strong> awaiting quorum</span>' : "") +
         '<span><strong>' + latestReferences.length + '</strong> native reference series' +
         (referenceThrough != null && unmeasuredEras.length ? ' through v' + referenceThrough : "") + '</span></p>' +
