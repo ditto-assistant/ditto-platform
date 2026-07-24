@@ -2637,6 +2637,7 @@ async def _validator_artifact_routing(
     responses={
         401: {"description": "Missing/invalid validator auth."},
         404: {"description": "No agent with the given id."},
+        409: {"description": "No open scoring ticket for this validator/agent."},
         422: {"description": "Malformed UUID path parameter."},
         503: {"description": "Chain unavailable for the permit check."},
     },
@@ -2653,7 +2654,12 @@ async def agent_artifact(
     x_validator_artifact_requested_at: Annotated[datetime | None, Header()] = None,
     x_validator_artifact_signature: Annotated[str | None, Header()] = None,
 ) -> ArtifactResponse:
-    """Return an artifact URL after fresh proof of validator-key possession."""
+    """Return an artifact URL after fresh proof of validator-key possession.
+
+    Download is bound to an unexpired ``ISSUED`` scoring ticket for this
+    validator and agent. Possession alone is not enough to bulk-fetch competitor
+    source or screened images.
+    """
     response.headers["Cache-Control"] = "no-store"
     if (
         x_validator_hotkey is None
@@ -2714,6 +2720,14 @@ async def agent_artifact(
                 ValidatorTicket.deadline > now,
             )
         )
+        if ticket is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "no open scoring ticket for this validator and agent "
+                    "(never issued, expired, or already scored)"
+                ),
+            )
     url = await storage.presigned_get_url(
         key=_artifact_key(agent_id),
         expires_in=int(_ARTIFACT_URL_TTL.total_seconds()),
@@ -2728,9 +2742,10 @@ async def agent_artifact(
             expires_in=int(_ARTIFACT_URL_TTL.total_seconds()),
         )
     logger.info(
-        "validator=%s fetched artifact url for agent_id=%s",
+        "validator=%s fetched artifact url for agent_id=%s bench_version=%s",
         x_validator_hotkey,
         agent_id,
+        ticket.bench_version,
     )
     return ArtifactResponse(
         agent_id=agent_id,
@@ -2742,7 +2757,7 @@ async def agent_artifact(
         screened_image_size_bytes=agent.screened_image_size_bytes,
         screened_image_id=agent.screened_image_id,
         screened_image_ref=agent.screened_image_ref,
-        bench_version=ticket.bench_version if ticket is not None else None,
+        bench_version=ticket.bench_version,
         screening_policy_version=agent.screening_policy_version,
     )
 

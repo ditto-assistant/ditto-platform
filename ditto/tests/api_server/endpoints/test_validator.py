@@ -2409,6 +2409,7 @@ class TestArtifact:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, bench_version=3)
         _install_db(app, session_maker)
         _install_chain(app)
         storage = _install_storage(app)
@@ -2424,6 +2425,7 @@ class TestArtifact:
         assert body["download_url"].startswith("https://")
         assert body["screened_image_url"] is None
         assert body["screened_image_sha256"] is None
+        assert body["bench_version"] == 3
         storage.presigned_get_url.assert_awaited_once()
         assert (
             storage.presigned_get_url.await_args.kwargs["key"]
@@ -2437,6 +2439,7 @@ class TestArtifact:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, bench_version=3)
         upload_id = uuid4()
         async with session_maker() as session, session.begin():
             agent = await session.get(Agent, agent_id)
@@ -2463,9 +2466,72 @@ class TestArtifact:
         assert body["screened_image_size_bytes"] == 123
         assert body["screened_image_id"] == "sha256:" + "34" * 32
         assert body["screened_image_ref"] == f"ditto-screen/{agent_id}:latest"
+        assert body["bench_version"] == 3
         assert storage.presigned_get_url.await_args_list[1].kwargs["key"] == (
             f"{agent_id}/screened-images/{upload_id}.tar"
         )
+
+    async def test_without_open_ticket_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
+        )
+        assert response.status_code == 409
+        assert "no open scoring ticket" in response.json()["message"]
+        storage.presigned_get_url.assert_not_awaited()
+
+    async def test_expired_ticket_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(
+            session_maker,
+            agent_id,
+            deadline=datetime.now(UTC) - timedelta(seconds=1),
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
+        )
+        assert response.status_code == 409
+        storage.presigned_get_url.assert_not_awaited()
+
+    async def test_ticket_for_other_validator_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        other = bittensor.Keypair.create_from_uri("//Dave")
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, keypair=other)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
+        )
+        assert response.status_code == 409
+        storage.presigned_get_url.assert_not_awaited()
 
     async def test_unknown_agent_returns_404(
         self,
@@ -2493,6 +2559,7 @@ class TestArtifact:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
         _install_db(app, session_maker)
         _install_chain(app)
         _install_storage(app)
@@ -2510,6 +2577,7 @@ class TestArtifact:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
         _install_db(app, session_maker)
         _install_chain(app)
         _install_storage(app)

@@ -682,7 +682,8 @@ async def claim(
     responses={
         401: {"description": "Missing/invalid screener auth."},
         404: {"description": "No agent with the given id."},
-        422: {"description": "Malformed UUID path parameter."},
+        409: {"description": "No active screening attempt for this screener/agent."},
+        422: {"description": "Malformed UUID path or query parameter."},
     },
 )
 async def agent_artifact(
@@ -691,18 +692,57 @@ async def agent_artifact(
     screener_hotkey: ScreenerDep,
     session: SessionDep,
     storage: StorageDep,
+    attempt_id: Annotated[UUID | None, Query()] = None,
 ) -> ArtifactResponse:
-    """Return a short-lived pre-signed download URL for the agent's tarball."""
+    """Return a short-lived pre-signed download URL for the agent's tarball.
+
+    Download is bound to an active screening lease for this screener. Callers
+    should pass the claim ``attempt_id``; without it the platform still requires
+    a unique running attempt for ``(screener_hotkey, agent_id)``.
+    """
     response.headers["Cache-Control"] = "no-store"
-    agent = await get_agent_by_id(session, agent_id=agent_id)
-    if agent is None:
-        raise AgentNotFoundError(f"no agent with id={agent_id}")
+    now = datetime.now(UTC)
+    async with session.begin():
+        agent = await get_agent_by_id(session, agent_id=agent_id)
+        if agent is None:
+            raise AgentNotFoundError(f"no agent with id={agent_id}")
+        if attempt_id is not None:
+            attempt = await get_screening_attempt(
+                session, attempt_id=attempt_id, for_update=True
+            )
+        else:
+            attempt = await session.scalar(
+                select(ScreeningAttempt)
+                .where(
+                    ScreeningAttempt.agent_id == agent_id,
+                    ScreeningAttempt.screener_hotkey == screener_hotkey,
+                    ScreeningAttempt.status == "running",
+                )
+                .with_for_update()
+            )
+        if (
+            attempt is None
+            or attempt.agent_id != agent_id
+            or attempt.screener_hotkey != screener_hotkey
+            or attempt.status != "running"
+        ):
+            raise AgentNotScreenableError(
+                "artifact download does not match an active screening attempt"
+            )
+        deadline = attempt.deadline
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        if now > deadline:
+            raise AgentNotScreenableError("screening attempt lease has expired")
     url = await storage.presigned_get_url(
         key=_artifact_key(agent_id),
         expires_in=int(_ARTIFACT_URL_TTL.total_seconds()),
     )
     logger.info(
-        "screener=%s fetched artifact url for agent_id=%s", screener_hotkey, agent_id
+        "screener=%s fetched artifact url for agent_id=%s attempt_id=%s",
+        screener_hotkey,
+        agent_id,
+        attempt.attempt_id,
     )
     return ArtifactResponse(
         agent_id=agent_id,
