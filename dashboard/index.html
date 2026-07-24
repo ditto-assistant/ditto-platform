@@ -2227,12 +2227,29 @@
        so the page stacks exactly as it did before the split. */
     @media (min-width: 1181px) {
       .overview-split { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 26px; align-items: start; }
+      /* The wrap's 72px bottom padding serves scrolling pages; the overview is
+         a fixed two-pane shell, so reclaim it for the columns. (If :has is
+         unsupported the columns just sit taller and sticky catches the rest.) */
+      .wrap:has(.page.active[data-page="overview"]) { padding-bottom: 20px; }
       .overview-rail {
-        position: sticky; top: 18px; max-height: calc(100vh - 36px);
+        /* Budget the page's full vertical chrome (~108px resting offset above:
+           wrap padding + page header; 72px wrap padding below) so both columns
+           fit the viewport at rest and the page itself has nothing to scroll —
+           each column scrolls internally instead. Sticky remains only as a
+           fallback for states that grow the page (banner, wrapped header). */
+        position: sticky; top: 18px; max-height: calc(100vh - 136px);
         overflow-y: auto; overscroll-behavior: contain;
         scrollbar-width: thin; padding-right: 2px;
       }
       .overview-rail .harness-comparison { margin-top: 0; }
+      /* The board column scrolls the same way as the rail: two independent
+         viewport-height columns. Bare scroll container — no surface or frame
+         of its own; the champion box, strips, and board carry their own. */
+      .overview-main {
+        position: sticky; top: 18px; max-height: calc(100vh - 136px);
+        overflow-y: auto; overscroll-behavior: contain;
+        scrollbar-width: thin; padding-right: 2px;
+      }
       .overview-main > :first-child { margin-top: 0; }
       /* The board lives at roughly half the window in the split, so window-
          width column hiding never fires on desktop. Mirror the responsive
@@ -2395,7 +2412,7 @@
     </section>
     </aside>
 
-    <div class="overview-main">
+    <div class="overview-main" tabindex="0" role="region" aria-label="Champion and leaderboard column, scrolls separately from the timeline rail">
     <section class="champion-box" aria-labelledby="champion-box-kicker">
       <div class="champion-kicker" id="champion-box-kicker">KOTH · reigning champion</div>
       <div class="champion-body" id="champion-body" role="status" aria-live="polite">
