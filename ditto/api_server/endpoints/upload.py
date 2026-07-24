@@ -20,6 +20,7 @@ import inspect
 import logging
 import os
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Annotated
 
@@ -66,7 +67,11 @@ from ditto.api_server.pricing import (
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
 from ditto.db.models import AgentStatus
-from ditto.db.queries.agents import insert_agent
+from ditto.db.queries.agents import (
+    enforce_submission_cooldown,
+    get_submission_retry_at,
+    insert_agent,
+)
 from ditto.db.queries.bans import is_hotkey_banned
 from ditto.db.queries.payments import (
     consume_evaluation_credit,
@@ -92,8 +97,10 @@ ERROR_CODE_HOTKEY_NOT_REGISTERED = 1101
 ERROR_CODE_TARBALL_TOO_LARGE = 1102
 ERROR_CODE_HOTKEY_BANNED = 1103
 ERROR_CODE_IDENTICAL_SUBMISSION = 1104
+ERROR_CODE_SUBMISSION_COOLDOWN = 1105
 
 DEFAULT_MAX_TARBALL_SIZE_BYTES = 20 * 1024 * 1024
+SUBMISSION_COOLDOWN = timedelta(hours=1)
 
 
 def _tarball_size_cap_from_env() -> int:
@@ -187,12 +194,13 @@ async def check(
     # 2. Hotkey registered. On a chain outage we return 503 instead of
     #    a silent false-pass that would lie to miners.
     try:
-        registered = await chain.is_registered(body.hotkey, netuid=netuid)
+        owner_coldkey = await chain.get_registered_coldkey(body.hotkey, netuid=netuid)
     except ChainError as e:
         logger.warning(f"chain unreachable during /upload/check: {e}")
         raise HTTPException(
             status_code=503, detail="chain unavailable; retry shortly"
         ) from e
+    registered = owner_coldkey is not None
     if not registered:
         codes.append(ERROR_CODE_HOTKEY_NOT_REGISTERED)
         messages.append(f"hotkey is not registered on netuid {netuid}")
@@ -228,6 +236,17 @@ async def check(
                 "Set allow_identical_rescore=true only to purchase another seed."
             )
 
+    retry_at = None
+    if duplicate is None and owner_coldkey is not None:
+        retry_at = await get_submission_retry_at(
+            session,
+            miner_coldkey=owner_coldkey,
+            cooldown=SUBMISSION_COOLDOWN,
+        )
+        if retry_at is not None:
+            codes.append(ERROR_CODE_SUBMISSION_COOLDOWN)
+            messages.append(f"owner coldkey may submit again at {retry_at.isoformat()}")
+
     return UploadCheckResponse(
         ok=not codes,
         error_codes=codes,
@@ -235,6 +254,7 @@ async def check(
         payment_required=not codes,
         identical_agent_id=duplicate.agent_id if duplicate else None,
         identical_agent_status=duplicate.status if duplicate else None,
+        retry_at=retry_at,
     )
 
 
@@ -512,6 +532,11 @@ async def upload_agent(
     # (3207) and the envelope handler maps it to HTTP 402.
     try:
         async with session.begin():
+            await enforce_submission_cooldown(
+                session,
+                miner_coldkey=owner_coldkey,
+                cooldown=SUBMISSION_COOLDOWN,
+            )
             version = await insert_agent(
                 session,
                 agent_id=agent_id,

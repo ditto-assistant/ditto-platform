@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select, text
@@ -18,12 +18,73 @@ from sqlalchemy.orm import undefer_group
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
-from ditto.db.models import Agent, Score, ScreeningAttempt
+from ditto.db.models import Agent, EvaluationPayment, Score, ScreeningAttempt
 
 if TYPE_CHECKING:
     from uuid import UUID
 
     from sqlalchemy.ext.asyncio import AsyncSession
+
+
+class SubmissionCooldownError(Exception):
+    """A miner coldkey submitted again before its cooldown expired."""
+
+    def __init__(self, retry_at: datetime) -> None:
+        self.retry_at = retry_at
+        super().__init__(f"submission cooldown active until {retry_at.isoformat()}")
+
+
+async def get_submission_retry_at(
+    session: AsyncSession,
+    *,
+    miner_coldkey: str,
+    cooldown: timedelta,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Return the next allowed submission time, or ``None`` when eligible."""
+    latest = await session.scalar(
+        select(func.max(Agent.created_at))
+        .join(EvaluationPayment, EvaluationPayment.agent_id == Agent.agent_id)
+        .where(EvaluationPayment.miner_coldkey == miner_coldkey)
+    )
+    if latest is None:
+        return None
+
+    # SQLite drops timezone metadata while Postgres preserves it. Normalize both
+    # before comparing so this query has one contract in tests and production.
+    if latest.tzinfo is None:
+        latest = latest.replace(tzinfo=UTC)
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    retry_at = latest + cooldown
+    return retry_at if retry_at > current else None
+
+
+async def enforce_submission_cooldown(
+    session: AsyncSession,
+    *,
+    miner_coldkey: str,
+    cooldown: timedelta,
+) -> None:
+    """Atomically reserve a coldkey's next submission slot on PostgreSQL.
+
+    The caller must insert the new agent in the same transaction. The
+    transaction-scoped advisory lock serializes even the no-existing-row case,
+    where a row lock cannot protect two concurrent first submissions.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:coldkey, 0))"),
+            {"coldkey": miner_coldkey},
+        )
+    retry_at = await get_submission_retry_at(
+        session,
+        miner_coldkey=miner_coldkey,
+        cooldown=cooldown,
+    )
+    if retry_at is not None:
+        raise SubmissionCooldownError(retry_at)
 
 
 async def insert_agent(

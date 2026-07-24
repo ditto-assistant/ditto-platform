@@ -191,9 +191,11 @@ def override_get_chain_client(app: FastAPI, *, raises: Exception | None = None) 
         if raises is not None:
             chain.get_latest_block = AsyncMock(side_effect=raises)
             chain.is_registered = AsyncMock(side_effect=raises)
+            chain.get_registered_coldkey = AsyncMock(side_effect=raises)
         else:
             chain.get_latest_block = AsyncMock(return_value=MagicMock(number=42))
             chain.is_registered = AsyncMock(return_value=True)
+            chain.get_registered_coldkey = AsyncMock(return_value="5Coldkey")
         return chain
 
     app.dependency_overrides[get_chain_client] = _fake_chain

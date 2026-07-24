@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -80,6 +81,9 @@ class UploadCheckResponse(BaseModel):
 
     identical_agent_status: AgentStatus | None = None
     """Current lifecycle state of :attr:`identical_agent_id`."""
+
+    retry_at: datetime | None = None
+    """UTC timestamp when an owner coldkey blocked by cooldown may retry."""
 
 
 class UploadAgentResponse(BaseModel):
