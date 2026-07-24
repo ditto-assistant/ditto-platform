@@ -370,9 +370,19 @@ def _validate_request_schema(payload: dict[str, Any]) -> None:
         }.get(role)
         if allowed is None or set(message) - allowed:
             raise HTTPException(status_code=400, detail="invalid message")
-        if message.get("content") is not None and not isinstance(
-            message.get("content"), str
-        ):
+        content = message.get("content")
+        text_parts = (
+            isinstance(content, list)
+            and bool(content)
+            and all(
+                isinstance(part, dict)
+                and set(part) == {"type", "text"}
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+                for part in content
+            )
+        )
+        if content is not None and not isinstance(content, str) and not text_parts:
             raise HTTPException(status_code=400, detail="text content only")
         tool_calls = message.get("tool_calls", [])
         if not isinstance(tool_calls, list):

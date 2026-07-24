@@ -215,6 +215,40 @@ def test_proxy_schema_allows_only_local_function_tools() -> None:
     )
 
 
+def test_proxy_schema_accepts_exact_openai_text_content_parts() -> None:
+    _validate_request_schema(
+        {
+            "model": "openai/gpt-oss-20b",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "follow the tools"}],
+                },
+                {"role": "user", "content": "hello"},
+            ],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [],
+        [{"type": "image_url", "image_url": {"url": "https://example.test"}}],
+        [{"type": "text", "text": "hello", "url": "https://example.test"}],
+        [{"type": "text", "text": 1}],
+    ],
+)
+def test_proxy_schema_rejects_non_text_content_parts(content: object) -> None:
+    with pytest.raises(HTTPException, match="text content only"):
+        _validate_request_schema(
+            {
+                "model": "openai/gpt-oss-20b",
+                "messages": [{"role": "user", "content": content}],
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "parameter",
     [
