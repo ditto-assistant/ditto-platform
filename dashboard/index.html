@@ -6225,22 +6225,6 @@
       return summary;
     }
 
-    function confirmationCohorts(pipeline) {
-      var cohorts = {};
-      (pipeline.confirmation_scores || []).forEach(function (score) {
-        var key = benchmarkVersionKey(score.bench_version);
-        if (!cohorts[key]) cohorts[key] = [];
-        cohorts[key].push(score);
-      });
-      return Object.keys(cohorts).sort(function (a, b) {
-        if (a === "unknown") return 1;
-        if (b === "unknown") return -1;
-        return Number(b) - Number(a);
-      }).map(function (key) {
-        return { key: key, scores: cohorts[key] };
-      });
-    }
-
     function cohortMedian(scores) {
       var values = scores.map(function (score) { return Number(score.composite); }).sort(function (a, b) { return a - b; });
       var middle = Math.floor(values.length / 2);
@@ -6426,47 +6410,39 @@
     }
 
     function renderConfirmationScores(pipeline) {
-      var cohorts = confirmationCohorts(pipeline);
       var boardEntry = (lastEntries || []).find(function (entry) {
         return entry.agent_id === pipeline.agent_id;
       });
+      var completedWaves = boardEntry && Array.isArray(boardEntry.completed_wave_composites)
+        ? boardEntry.completed_wave_composites.map(Number).filter(Number.isFinite)
+        : [];
       var activeVersion = Number(pipeline.active_bench_version);
       var currentAttempts = (pipeline.validation_attempts || []).filter(function (attempt) {
         return Number(attempt.bench_version) === activeVersion;
       });
       var counts = retestAttemptCounts(currentAttempts);
-      if (!cohorts.length && !counts.running && !counts.assigned && !counts.expired) return "";
+      if (!completedWaves.length && !counts.running && !counts.assigned && !counts.expired) return "";
       var state = [];
       if (counts.running) state.push(counts.running + " running");
       if (counts.assigned) state.push(counts.assigned + " assigned");
       if (counts.expired) state.push(counts.expired + " expired");
-      var rows = cohorts.map(function (cohort) {
-        var seedScores = cohort.scores.slice().sort(function (a, b) {
-          var left = String(a.seed);
-          var right = String(b.seed);
-          return left.length - right.length || left.localeCompare(right);
-        }).map(function (score) {
-          return '<div class="accepted-score">' +
-            '<div><span class="accepted-score-value">' + fx(score.composite) + '</span>' +
-              '<span class="accepted-score-label"><span class="bench-version-badge">' +
-                esc(benchmarkVersionLabel(benchmarkVersionKey(score.bench_version))) +
-              '</span>Accepted shared seed <code>' + esc(score.seed) + '</code> · ' +
-                entityAnchor("validator", score.validator_hotkey, "Validator " + shortKey(score.validator_hotkey)) +
-                (score.accepted_at ? " · " + relTime(score.accepted_at) : "") + '</span></div>' +
-          '</div>';
-        }).join("");
-        return '<div class="benchmark-cohort">' +
-          '<div class="benchmark-cohort-heading"><h5>' + esc(benchmarkVersionLabel(cohort.key)) + '</h5>' +
-            '<span class="benchmark-cohort-summary">' + esc(cohort.scores.length) +
-              ' accepted seed ' + (cohort.scores.length === 1 ? "result" : "results") + '</span></div>' +
-          '<p class="accepted-score-note">Append-only shared-seed evidence. A seed changes the current leaderboard score only after every member of the same top-five cohort wave finishes it; partial waves remain visible evidence but do not count.</p>' +
-          '<div class="accepted-score-list">' + seedScores + '</div></div>';
+      var rows = completedWaves.map(function (score, index) {
+        return '<div class="accepted-score">' +
+          '<div><span class="accepted-score-value">' + fx(score) + '</span>' +
+            '<span class="accepted-score-label"><span class="bench-version-badge">' +
+              esc(benchmarkVersionLabel(benchmarkVersionKey(activeVersion))) +
+            '</span>Completed cohort wave ' + esc(index + 1) + ' · consensus aggregate</span></div>' +
+        '</div>';
       }).join("");
       var aggregate = boardEntry && boardEntry.aggregate_method === "continual_mean"
         ? '<p class="accepted-score-final">Current leaderboard score: ' + fx(boardEntry.official_composite) +
           ' · arithmetic mean of the initial three scores plus ' + esc(boardEntry.completed_wave_count) +
           ' completed cohort ' + (boardEntry.completed_wave_count === 1 ? "wave" : "waves") +
           ' (' + esc(boardEntry.aggregate_sample_count) + ' samples total).</p>'
+        : completedWaves.length
+        ? '<p class="accepted-score-note">' + esc(completedWaves.length) + ' full cohort ' +
+          (completedWaves.length === 1 ? 'wave is' : 'waves are') +
+          ' recorded. The initial three-score median remains authoritative until the compatible continual-mean rollout activates.</p>'
         : '<p class="accepted-score-note">No full cohort wave has completed for this agent yet, so the initial three-score median still drives its leaderboard position.</p>';
       return '<section class="pipeline-section" aria-labelledby="pipeline-confirmation-scores">' +
         '<div class="pipeline-section-heading"><h4 id="pipeline-confirmation-scores">Continual top-five retests</h4>' +
@@ -6474,7 +6450,8 @@
         '</div>' +
         aggregate +
         '<p class="accepted-score-note">The initial quorum remains immutable provenance. The current leaderboard score continually adjusts up or down as full cohort waves complete.</p>' +
-        (rows || '<p class="pipeline-detail-state">No continual retest seed result has landed yet.</p>') +
+        '<p class="accepted-score-note">Only completed cohort-wave aggregates are shown here. Partial, legacy, and superseded raw retest rows remain in the audit ledger but are omitted from the score list.</p>' +
+        (rows ? '<div class="accepted-score-list">' + rows + '</div>' : '<p class="pipeline-detail-state">No completed continual retest wave yet.</p>') +
       '</section>';
     }
 
@@ -6760,11 +6737,12 @@
       var retests = retestAttemptCounts(((pipeline && pipeline.validation_attempts) || []).filter(function (attempt) {
         return !currentCohort || benchmarkVersionKey(attempt.bench_version) === currentCohort.key;
       }));
-      var acceptedRetests = ((pipeline && pipeline.confirmation_scores) || []).filter(function (score) {
-        return !currentCohort || benchmarkVersionKey(score.bench_version) === currentCohort.key;
-      }).length;
+      var boardEntry = (lastEntries || []).find(function (entry) {
+        return pipeline && entry.agent_id === pipeline.agent_id;
+      });
+      var acceptedRetests = Math.max(0, Number(boardEntry && boardEntry.completed_wave_count) || 0);
       var retestFact = [];
-      if (acceptedRetests) retestFact.push(acceptedRetests + " accepted seed " + (acceptedRetests === 1 ? "result" : "results"));
+      if (acceptedRetests) retestFact.push(acceptedRetests + " completed " + (acceptedRetests === 1 ? "wave" : "waves"));
       if (retests.running) retestFact.push(retests.running + " running");
       if (retests.assigned) retestFact.push(retests.assigned + " assigned");
       if (retests.expired) retestFact.push(retests.expired + " expired");

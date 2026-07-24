@@ -314,9 +314,13 @@ class TestDashboard:
         assert '"Legacy lease unclassified · "' in body
         assert 'retestState(retests.running, "running")' in body
         assert 'retestState(retests.assigned, "assigned")' in body
-        assert "function confirmationCohorts(pipeline)" in body
         assert "function renderConfirmationScores(pipeline)" in body
         assert "Continual top-five retests" in body
+        assert "Completed cohort wave" in body
+        assert "Only completed cohort-wave aggregates are shown here" in body
+        assert "Partial, legacy, and superseded raw retest rows" in body
+        assert "Accepted shared seed" not in body
+        assert "function confirmationCohorts(pipeline)" not in body
         assert "Accepted validator scores" in body
         assert "Canonical quorum" in body
         assert "canonical median of" in body
