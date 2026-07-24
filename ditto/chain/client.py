@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from ditto.chain.errors import (
     ChainAuthError,
@@ -379,14 +380,12 @@ class ChainClient:
         from async_substrate_interface import AsyncSubstrateInterface
 
         try:
-            async with AsyncSubstrateInterface(
-                url=self._historical_substrate_url()
-            ) as substrate:
-                events = await substrate.query(
-                    module=_SYSTEM_MODULE,
-                    storage_function="Events",
-                    block_hash=block_hash,
-                )
+            events = await self._query_historical_storage(
+                AsyncSubstrateInterface,
+                module=_SYSTEM_MODULE,
+                storage_function="Events",
+                block_hash=block_hash,
+            )
         except TimeoutError as e:
             raise ChainTimeoutError(
                 f"check_extrinsic_success({block_hash}, {extrinsic_index}) timed out"
@@ -444,15 +443,13 @@ class ChainClient:
         from async_substrate_interface import AsyncSubstrateInterface
 
         try:
-            async with AsyncSubstrateInterface(
-                url=self._historical_substrate_url()
-            ) as substrate:
-                result = await substrate.query(
-                    module=_SUBTENSOR_MODULE,
-                    storage_function=_OWNER_STORAGE,
-                    params=[hotkey],
-                    block_hash=block_hash,
-                )
+            result = await self._query_historical_storage(
+                AsyncSubstrateInterface,
+                module=_SUBTENSOR_MODULE,
+                storage_function=_OWNER_STORAGE,
+                params=[hotkey],
+                block_hash=block_hash,
+            )
         except TimeoutError as e:
             raise ChainTimeoutError(
                 f"get_coldkey_for_hotkey({hotkey}, {block_hash}) timed out"
@@ -494,14 +491,12 @@ class ChainClient:
         from async_substrate_interface import AsyncSubstrateInterface
 
         try:
-            async with AsyncSubstrateInterface(
-                url=self._historical_substrate_url()
-            ) as substrate:
-                result = await substrate.query(
-                    module=_TIMESTAMP_MODULE,
-                    storage_function=_TIMESTAMP_NOW_STORAGE,
-                    block_hash=block_hash,
-                )
+            result = await self._query_historical_storage(
+                AsyncSubstrateInterface,
+                module=_TIMESTAMP_MODULE,
+                storage_function=_TIMESTAMP_NOW_STORAGE,
+                block_hash=block_hash,
+            )
         except TimeoutError as e:
             raise ChainTimeoutError(
                 f"get_block_timestamp({block_hash}) timed out"
@@ -531,16 +526,70 @@ class ChainClient:
             return _LOCAL_WS_URL
         return network
 
-    def _historical_substrate_url(self) -> str:
-        """Return the archive RPC URL without ever logging its credential."""
+    def _configured_archive_url(self) -> str | None:
+        """Return the configured provider URL with its credential attached."""
         url = self._config.archive_rpc_url
         if not url:
-            return self._substrate_url()
+            return None
         api_key = self._config.archive_rpc_api_key
-        if not api_key:
+        auth_mode = self._config.archive_rpc_auth_mode
+        if not api_key or auth_mode == "none":
             return url
+        if auth_mode == "path":
+            return f"{url.rstrip('/')}/{quote(api_key, safe='')}"
         separator = "&" if "?" in url else "?"
         return f"{url}{separator}authorization={quote(api_key, safe='')}"
+
+    def _historical_substrate_urls(self) -> tuple[str, ...]:
+        """Return the free-first archive try list, then configured paid RPC."""
+        urls = list(self._config.public_archive_rpc_urls)
+        configured_url = self._configured_archive_url()
+        if configured_url:
+            urls.append(configured_url)
+        if not urls:
+            urls.append(self._substrate_url())
+        # Preserve order while preventing duplicate calls when an operator
+        # configures one of the built-in public endpoints explicitly.
+        return tuple(dict.fromkeys(urls))
+
+    async def _query_historical_storage(
+        self,
+        substrate_factory: Any,
+        *,
+        module: str,
+        storage_function: str,
+        block_hash: str,
+        params: list[Any] | None = None,
+    ) -> Any:
+        """Query archive providers in order and return the first successful read."""
+        failures: list[tuple[str, Exception]] = []
+        for url in self._historical_substrate_urls():
+            provider = urlsplit(url).hostname or "configured archive"
+            try:
+                async with asyncio.timeout(self._config.archive_rpc_timeout_seconds):
+                    async with substrate_factory(url=url) as substrate:
+                        query_kwargs: dict[str, Any] = {
+                            "module": module,
+                            "storage_function": storage_function,
+                            "block_hash": block_hash,
+                        }
+                        if params is not None:
+                            query_kwargs["params"] = params
+                        return await substrate.query(**query_kwargs)
+            except Exception as error:
+                failures.append((provider, error))
+                logger.warning(
+                    "historical archive read failed provider=%s error=%s",
+                    provider,
+                    self._safe_rpc_error(error),
+                )
+
+        summary = "; ".join(
+            f"{provider}: {self._safe_rpc_error(error)}" for provider, error in failures
+        )
+        if failures and all(isinstance(error, TimeoutError) for _, error in failures):
+            raise TimeoutError(summary)
+        raise RuntimeError(summary or "no historical archive endpoint configured")
 
     def _safe_rpc_error(self, error: Exception) -> str:
         """Render an RPC exception with configured credentials redacted."""
