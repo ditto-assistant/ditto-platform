@@ -258,9 +258,12 @@
     /* The board's filter row reuses the submissions pills (.activity-filter)
        and its band treatment, centered so it brackets the table with the pager. */
     .board-tabs { justify-content: center; padding: 12px 14px; border-bottom: 1px solid var(--border); background: color-mix(in oklab, var(--bg-elev-2) 38%, var(--bg-elev)); }
-    .leaderboard-version-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
+    .leaderboard-version-switch { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
     .leaderboard-version-switch .context { color: var(--text-dim); font-size: 12px; }
-    .leaderboard-version-switch .activity-filter-list { flex: 0 0 auto; }
+    /* One pill per shipped bench version: the list must be allowed to shrink
+       and wrap, or it pushes the row past the column and the page gains a
+       horizontal scrollbar. */
+    .leaderboard-version-switch .activity-filter-list { flex: 0 1 auto; min-width: 0; justify-content: flex-end; }
     @media (max-width: 640px) {
       .leaderboard-version-switch { align-items: flex-start; flex-direction: column; }
     }
