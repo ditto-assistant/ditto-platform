@@ -2282,6 +2282,10 @@
       .overview-split #board .metric { min-width: 0; }
       .overview-split #board .chain-weight-note { white-space: normal; }
       .overview-split #board .emission-badge { white-space: normal; }
+      /* The half-width pane can't fit context text + one pill per bench
+         version side by side; stack them like the mobile layout does. */
+      .overview-split .leaderboard-version-switch { align-items: flex-start; flex-direction: column; gap: 8px; }
+      .overview-split .leaderboard-version-switch .activity-filter-list { justify-content: flex-start; }
     }
     .tm-mini { display: none; margin-top: 2px; color: var(--text-dim); font: 700 11px/1.4 var(--mono); letter-spacing: .04em; font-variant-numeric: tabular-nums; }
 
