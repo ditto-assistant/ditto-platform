@@ -53,6 +53,24 @@ def upgrade() -> None:
             name="artifact_release_settings_parent_revision_key",
         ),
     )
+    artifact_release_settings = sa.table(
+        "artifact_release_settings_revisions",
+        sa.column("parent_revision", sa.Integer()),
+        sa.column("embargo_hours", sa.Integer()),
+        sa.column("reason", sa.Text()),
+        sa.column("actor", sa.Text()),
+    )
+    op.bulk_insert(
+        artifact_release_settings,
+        [
+            {
+                "parent_revision": 0,
+                "embargo_hours": 24,
+                "reason": "Initialize privacy-first 24-hour source embargo",
+                "actor": "migration",
+            }
+        ],
+    )
 
 
 def downgrade() -> None:
