@@ -1333,6 +1333,44 @@ class ScreenerReviewSettingsRevision(Base):
     )
 
 
+class ArtifactReleaseSettingsRevision(Base):
+    """Append-only, operator-audited public source embargo revision."""
+
+    __tablename__ = "artifact_release_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    embargo_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "embargo_hours BETWEEN 6 AND 24",
+            name="artifact_release_settings_embargo_hours_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="artifact_release_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="artifact_release_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="artifact_release_settings_actor_check",
+        ),
+        UniqueConstraint(
+            "parent_revision",
+            name="artifact_release_settings_parent_revision_key",
+        ),
+    )
+
+
 class ScreenerShadowReview(Base):
     """Non-authoritative L2/L3 telemetry bound to one live attempt."""
 

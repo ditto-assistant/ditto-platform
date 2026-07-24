@@ -270,6 +270,31 @@ class PublicCompositeBreakdown(BaseModel):
     final_composite: Annotated[float, Field(ge=0.0, le=1.0)]
 
 
+class PublicArtifactRelease(BaseModel):
+    """Public-source eligibility derived from a submission's score quorum."""
+
+    status: Literal[
+        "awaiting_quorum", "under_review", "embargoed", "available", "unavailable"
+    ]
+    bench_version: Annotated[int | None, Field(default=None, ge=1)] = None
+    score_quorum: Annotated[int, Field(default=3, ge=1)] = 3
+    embargo_hours: Annotated[int, Field(default=6, ge=1)] = 6
+    finalized_at: datetime | None = None
+    available_at: datetime | None = None
+    download_available: bool = False
+
+
+class PublicArtifactDownload(BaseModel):
+    """Short-lived download credential for an embargo-cleared source tarball."""
+
+    agent_id: UUID
+    bench_version: Annotated[int, Field(ge=1)]
+    sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    finalized_at: datetime
+    download_url: Annotated[str, Field(min_length=1)]
+    expires_at: datetime
+
+
 class PublicLeaderboardEntry(BaseModel):
     """One miner's best score, aggregate-only, for public display.
 
@@ -327,6 +352,7 @@ class PublicLeaderboardEntry(BaseModel):
             description="Winning submission's version; null for legacy uploads.",
         ),
     ] = None
+    artifact_release: PublicArtifactRelease | None = None
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Miner's SS58 hotkey.")
     ]
@@ -987,6 +1013,7 @@ class PublicSubmissionScores(BaseModel):
         str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
     ]
     status: Annotated[str, Field(description='Public status ("scored" or "live").')]
+    artifact_release: PublicArtifactRelease
     quorum: Annotated[
         int, Field(ge=1, description="Validators required to finalize (k=3).")
     ]
@@ -1050,6 +1077,7 @@ class PublicSubmissionSummary(BaseModel):
         str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
     ]
     status: Annotated[str, Field(description='Public status ("scored" or "live").')]
+    artifact_release: PublicArtifactRelease
     score_count: Annotated[
         int, Field(ge=0, description="Score rows recorded for this agent.")
     ]
@@ -1148,6 +1176,7 @@ class PublicActivityEntry(BaseModel):
             )
         ),
     ]
+    artifact_release: PublicArtifactRelease
     submitted_at: Annotated[
         datetime, Field(description="When the platform accepted the upload (UTC).")
     ]

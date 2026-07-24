@@ -60,6 +60,7 @@ from ditto.chain.models import (
 )
 from ditto.db.models import (
     Agent,
+    ArtifactReleaseSettingsRevision,
     AthReview,
     Base,
     BenchmarkDataset,
@@ -1558,6 +1559,7 @@ class TestPublicActivity:
             "name",
             "version",
             "status",
+            "artifact_release",
             "submitted_at",
             "last_scored_at",
             "screening_reason",
@@ -1583,7 +1585,7 @@ class TestPublicActivity:
         serialized = resp.text
         for private_field in (
             "sha256",
-            "artifact",
+            "download_url",
             "payment",
             "SECRET_FROM_BUILD",
         ):
@@ -3610,6 +3612,283 @@ class TestPublicSubmissionScores:
         body = resp.json()
         assert body["count"] == 0
         assert body["submissions"] == []
+
+
+async def _set_score_created_times(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    agent_id: str,
+    created_at: list[datetime],
+) -> None:
+    async with maker() as session, session.begin():
+        scores = list(
+            (
+                await session.execute(
+                    select(Score)
+                    .where(Score.agent_id == UUID(agent_id))
+                    .order_by(Score.bench_version, Score.validator_hotkey)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(scores) == len(created_at)
+        for score, recorded_at in zip(scores, created_at, strict=True):
+            score.created_at = recorded_at
+
+
+class TestPublicArtifactRelease:
+    async def test_default_retroactively_releases_cleared_submissions_after_24h(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        first_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        second_id = await _seed_k3(
+            session_maker, miner=_MINER_B, composites=[0.7, 0.8, 0.9]
+        )
+        for agent_id in (first_id, second_id):
+            await _set_score_created_times(
+                session_maker,
+                agent_id=agent_id,
+                created_at=[
+                    now - timedelta(hours=26),
+                    now - timedelta(hours=25),
+                    now - timedelta(hours=24, minutes=1),
+                ],
+            )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+        storage.presigned_get_url.side_effect = lambda **kwargs: (
+            f"https://objects.example/{kwargs['key']}"
+        )
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        submissions = (await client.get("/api/v1/public/submissions")).json()
+        releases = {
+            entry["agent_id"]: entry["artifact_release"]
+            for entry in submissions["submissions"]
+        }
+        assert set(releases) == {first_id, second_id}
+        assert all(release["status"] == "available" for release in releases.values())
+        assert all(release["embargo_hours"] == 24 for release in releases.values())
+        assert all(
+            release["download_available"] is True for release in releases.values()
+        )
+
+        for agent_id in (first_id, second_id):
+            response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+            assert response.status_code == 200
+            assert response.headers["Cache-Control"] == "private, no-store"
+            body = response.json()
+            assert body["agent_id"] == agent_id
+            assert body["bench_version"] == 2
+            assert body["sha256"] == "ab" * 32
+            assert body["download_url"].endswith(f"{agent_id}/agent.tar.gz")
+
+        assert {
+            call.kwargs["key"] for call in storage.presigned_get_url.await_args_list
+        } == {
+            f"{first_id}/agent.tar.gz",
+            f"{second_id}/agent.tar.gz",
+        }
+        assert all(
+            call.kwargs["expires_in"] == 300
+            for call in storage.presigned_get_url.await_args_list
+        )
+        assert {
+            call.kwargs["attachment_filename"]
+            for call in storage.presigned_get_url.await_args_list
+        } == {
+            f"ditto-agent-{first_id}.tar.gz",
+            f"ditto-agent-{second_id}.tar.gz",
+        }
+
+    async def test_fourth_score_does_not_restart_the_quorum_embargo(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6, 0.7],
+        )
+        await _set_score_created_times(
+            session_maker,
+            agent_id=agent_id,
+            created_at=[
+                now - timedelta(hours=27),
+                now - timedelta(hours=26),
+                now - timedelta(hours=25),
+                now - timedelta(minutes=5),
+            ],
+        )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+        storage.presigned_get_url.return_value = "https://objects.example/source"
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+        assert response.status_code == 200
+
+    async def test_shortened_setting_releases_existing_quorums_retroactively(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        await _set_score_created_times(
+            session_maker,
+            agent_id=agent_id,
+            created_at=[
+                now - timedelta(hours=8),
+                now - timedelta(hours=7),
+                now - timedelta(hours=6, minutes=1),
+            ],
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                ArtifactReleaseSettingsRevision(
+                    parent_revision=0,
+                    embargo_hours=6,
+                    reason="Complete the staged privacy rollout",
+                    actor="operator@example.com",
+                )
+            )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+        storage.presigned_get_url.return_value = "https://objects.example/source"
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+        assert response.status_code == 200
+        submission = (await client.get("/api/v1/public/submissions")).json()[
+            "submissions"
+        ][0]
+        assert submission["artifact_release"]["embargo_hours"] == 6
+        assert submission["artifact_release"]["status"] == "available"
+
+    async def test_embargo_and_review_hold_fail_closed(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        embargoed_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        held_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.9, 0.9, 0.9],
+            status=AgentStatus.ATH_PENDING_REVIEW,
+        )
+        await _set_score_created_times(
+            session_maker,
+            agent_id=embargoed_id,
+            created_at=[
+                now - timedelta(hours=3),
+                now - timedelta(hours=2),
+                now - timedelta(hours=1),
+            ],
+        )
+        await _set_score_created_times(
+            session_maker,
+            agent_id=held_id,
+            created_at=[
+                now - timedelta(hours=10),
+                now - timedelta(hours=9),
+                now - timedelta(hours=8),
+            ],
+        )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        embargoed = await client.get(f"/api/v1/public/agent/{embargoed_id}/artifact")
+        assert embargoed.status_code == 425
+        assert "embargoed until" in embargoed.json()["message"]
+        held = await client.get(f"/api/v1/public/agent/{held_id}/artifact")
+        assert held.status_code == 404
+        storage.presigned_get_url.assert_not_awaited()
+
+        entries = (await client.get("/api/v1/public/activity")).json()["entries"]
+        held_entry = next(entry for entry in entries if entry["agent_id"] == held_id)
+        assert held_entry["artifact_release"]["status"] == "under_review"
+        assert held_entry["artifact_release"]["download_available"] is False
+
+    async def test_scores_from_different_versions_do_not_form_a_quorum(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5],
+            status=AgentStatus.SCORED,
+            details={"bench_version": 2},
+        )
+        async with session_maker() as session, session.begin():
+            await upsert_score(
+                session,
+                agent_id=UUID(agent_id),
+                validator_hotkey=_VALIDATOR_C,
+                bench_version=3,
+                run_id="run-v3",
+                seed=1,
+                composite=0.6,
+                tool_mean=0.6,
+                memory_mean=0.6,
+                median_ms=500,
+                n=110,
+                generated_at=datetime.now(UTC) - timedelta(hours=10),
+                details={"bench_version": 3},
+            )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        submissions = (await client.get("/api/v1/public/submissions")).json()
+        assert submissions["submissions"][0]["artifact_release"]["status"] == (
+            "awaiting_quorum"
+        )
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+        assert response.status_code == 425
+        storage.presigned_get_url.assert_not_awaited()
 
 
 async def _seed_audit(maker: async_sessionmaker[AsyncSession], *, n: int) -> None:
