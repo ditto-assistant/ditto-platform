@@ -127,6 +127,7 @@ from ditto.db.models import (
     AthReview,
     BenchmarkDataset,
     BenchmarkRollout,
+    ConfirmationScore,
     InferenceGrant,
     Score,
     ValidatorHeartbeat,
@@ -154,6 +155,7 @@ from ditto.db.queries.benchmark_rollout import (
 from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
+    completed_confirmation_wave_seeds,
     confirmation_composites_by_seed,
 )
 from ditto.db.queries.heartbeats import (
@@ -1668,8 +1670,14 @@ async def _current_koth_entries(
     session: AsyncSession,
     *,
     canonical_version: int,
+    completed_waves_only: bool = True,
 ) -> list[KothEntry]:
-    """Build the active-version KOTH fold, including append-only confirmations."""
+    """Build the active-version KOTH fold from canonical or completed evidence.
+
+    Confirmation evidence is admitted only as a complete cohort wave. Partial
+    results remain append-only and public for audit, but cannot move the crown
+    while sibling leases for the same seed are still running.
+    """
     from ditto.api_server.endpoints.scoring import (
         _confirmation_composites,
         _confirmation_seeds,
@@ -1696,6 +1704,28 @@ async def _current_koth_entries(
         agent_ids=[row.agent_id for row in rows],
         bench_version=canonical_version,
     )
+    raw_entries = [
+        KothEntry(
+            miner_hotkey=row.miner_hotkey,
+            agent_id=row.agent_id,
+            composite=row.composite,
+            first_seen=row.first_seen,
+            raw_rank=rank,
+            bench_version=row.bench_version,
+            composite_stderr=_ledger_stderr(
+                row.details if isinstance(row.details, dict) else {},
+                quorum.get(row.agent_id, []),
+            ),
+        )
+        for rank, row in enumerate(rows, start=1)
+    ]
+    raw_members = emission_set(project_koth(raw_entries))
+    completed_seeds = completed_confirmation_wave_seeds(
+        member_ids=[member.agent_id for member in raw_members],
+        seeds_by_agent={
+            agent_id: values.keys() for agent_id, values in history.items()
+        },
+    )
     entries: list[KothEntry] = []
     for rank, row in enumerate(rows, start=1):
         details = row.details if isinstance(row.details, dict) else {}
@@ -1704,7 +1734,18 @@ async def _current_koth_entries(
         legacy_composites = _confirmation_composites(details)
         if legacy_seeds is not None and legacy_composites is not None:
             merged.update(zip(legacy_seeds, legacy_composites, strict=False))
-        merged.update(history.get(row.agent_id, {}))
+        if completed_waves_only:
+            merged.update(
+                {
+                    seed: value
+                    for seed, value in history.get(row.agent_id, {}).items()
+                    if seed in completed_seeds
+                }
+            )
+        else:
+            # Compatibility view for leases issued before cohort-wave gating.
+            # New KOTH/ledger projections must never use this mode.
+            merged.update(history.get(row.agent_id, {}))
         confirmations = tuple(sorted(merged.items())) if len(merged) >= 2 else None
         entries.append(
             KothEntry(
@@ -1734,8 +1775,13 @@ async def _current_emission_set(
     session: AsyncSession,
     *,
     canonical_version: int,
+    completed_waves_only: bool = True,
 ) -> tuple[KothEntry, ...]:
-    entries = await _current_koth_entries(session, canonical_version=canonical_version)
+    entries = await _current_koth_entries(
+        session,
+        canonical_version=canonical_version,
+        completed_waves_only=completed_waves_only,
+    )
     return emission_set(project_koth(entries))
 
 
@@ -1743,8 +1789,13 @@ async def _champion_anchored_seed_set(
     session: AsyncSession,
     *,
     canonical_version: int,
+    completed_waves_only: bool = True,
 ) -> frozenset[int]:
-    members = await _current_emission_set(session, canonical_version=canonical_version)
+    members = await _current_emission_set(
+        session,
+        canonical_version=canonical_version,
+        completed_waves_only=completed_waves_only,
+    )
     if not members:
         return frozenset()
     return frozenset(
@@ -1761,9 +1812,10 @@ async def _top5_confirmation_seed_plan(
     *,
     champion_agent_id: UUID,
     member_agent_id: UUID,
+    cohort_member_ids: tuple[UUID, ...],
     canonical_version: int,
 ) -> tuple[int, ...]:
-    """Mirror the validator's bounded next-seed plan from durable history."""
+    """Return at most one seed: the cohort's current incomplete wave."""
     full = champion_anchored_seeds(
         champion_agent_id,
         version=canonical_version,
@@ -1771,23 +1823,96 @@ async def _top5_confirmation_seed_plan(
     )
     history = await confirmation_composites_by_seed(
         session,
-        agent_ids=[champion_agent_id, member_agent_id],
+        agent_ids=cohort_member_ids,
         bench_version=canonical_version,
     )
-    champion_seeds = history.get(champion_agent_id, {})
-    covered = 0
-    for seed in full:
-        if seed not in champion_seeds:
-            break
-        covered += 1
-    target_depth = min(len(full), max(covered + 1, 3))
-    anchor = full[:target_depth]
-    member_seeds = history.get(member_agent_id, {})
-    missing = tuple(seed for seed in anchor if seed not in member_seeds)
-    if member_agent_id == champion_agent_id:
-        return missing
-    member_depth = sum(seed in member_seeds for seed in anchor)
-    return missing if member_depth >= target_depth - 1 else missing[:2]
+    completed = completed_confirmation_wave_seeds(
+        member_ids=cohort_member_ids,
+        seeds_by_agent={
+            agent_id: values.keys() for agent_id, values in history.items()
+        },
+    )
+    next_seed = next((seed for seed in full if seed not in completed), None)
+    if next_seed is None or next_seed in history.get(member_agent_id, {}):
+        return ()
+    return (next_seed,)
+
+
+async def _top5_member_is_least_covered(
+    session: AsyncSession,
+    *,
+    members: tuple[KothEntry, ...],
+    requested_member_id: UUID,
+    wave_seed: int,
+    validator_hotkey: str,
+    canonical_version: int,
+    now: datetime,
+) -> bool:
+    """Admit one unclaimed member in the current one-seed cohort wave."""
+    member_ids = [member.agent_id for member in members]
+    if requested_member_id not in member_ids:
+        return False
+
+    existing_live = await session.scalar(
+        select(ValidatorTicket)
+        .where(
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
+        )
+        .limit(1)
+    )
+    if existing_live is not None:
+        return (
+            existing_live.agent_id == requested_member_id
+            and existing_live.bench_version == canonical_version
+            and existing_live.purpose == TicketPurpose.CONTINUAL_RETEST
+            and existing_live.seed == wave_seed
+        )
+
+    history = await confirmation_composites_by_seed(
+        session,
+        agent_ids=member_ids,
+        bench_version=canonical_version,
+    )
+    eligible: list[UUID] = []
+    for member_id in member_ids:
+        latest_retest = await get_latest_score_retest_event(
+            session,
+            agent_id=member_id,
+            validator_hotkey=validator_hotkey,
+        )
+        if (
+            latest_retest is not None
+            and latest_retest.event == EVENT_SCORE_RETEST_REQUESTED
+        ):
+            continue
+        existing_ticket = await session.get(
+            ValidatorTicket,
+            (member_id, canonical_version, validator_hotkey),
+        )
+        if existing_ticket is not None and existing_ticket.retry_after is not None:
+            retry_after = existing_ticket.retry_after
+            if retry_after.tzinfo is None:
+                retry_after = retry_after.replace(tzinfo=UTC)
+            if retry_after > now:
+                continue
+        if wave_seed not in history.get(member_id, {}):
+            eligible.append(member_id)
+    if requested_member_id not in eligible:
+        return False
+
+    active_rows = await session.execute(
+        select(ValidatorTicket.agent_id).where(
+            ValidatorTicket.agent_id.in_(eligible),
+            ValidatorTicket.bench_version == canonical_version,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
+            ValidatorTicket.purpose == TicketPurpose.CONTINUAL_RETEST,
+            or_(ValidatorTicket.seed == wave_seed, ValidatorTicket.seed.is_(None)),
+        )
+    )
+    return requested_member_id not in set(active_rows.scalars())
 
 
 async def _canonical_tail_is_draining(
@@ -1908,6 +2033,14 @@ async def request_top5_confirmation_job(
             ) from exc
         canonical_version = await active_bench_version(session)
         heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
+        if heartbeat is None or heartbeat.protocol_version < 13:
+            raise HTTPException(
+                status_code=428,
+                detail=(
+                    "a fresh heartbeat with protocol 13 is required for "
+                    "single-seed top-five retests"
+                ),
+            )
         v7_calibration = None
         if canonical_version >= 7:
             try:
@@ -1934,7 +2067,8 @@ async def request_top5_confirmation_job(
                     detail="fresh benchmark v7 inference capability is required",
                 )
         members = await _current_emission_set(
-            session, canonical_version=canonical_version
+            session,
+            canonical_version=canonical_version,
         )
         if not members or members[0].agent_id != payload.champion_agent_id:
             raise HTTPException(
@@ -1970,6 +2104,27 @@ async def request_top5_confirmation_job(
                 status_code=409,
                 detail="top-5 shared-seed rescore round is not due at this block",
             )
+        if session.get_bind().dialect.name == "postgresql":
+            await session.execute(
+                select(
+                    func.pg_advisory_xact_lock(
+                        func.hashtextextended("top5-confirmation-fairness", 0)
+                    )
+                )
+            )
+        seeds = await _top5_confirmation_seed_plan(
+            session,
+            champion_agent_id=payload.champion_agent_id,
+            member_agent_id=payload.member_agent_id,
+            cohort_member_ids=tuple(member.agent_id for member in members),
+            canonical_version=canonical_version,
+        )
+        if not seeds:
+            raise HTTPException(
+                status_code=409,
+                detail="the requested member has no pending confirmation seeds",
+            )
+        wave_seed = seeds[0]
         confirmation_datasets: list[ConfirmationDatasetPin] = []
         if canonical_version >= 3:
             if generator.run_size is None:
@@ -1977,27 +2132,28 @@ async def request_top5_confirmation_job(
                     status_code=503,
                     detail="top-5 confirmation dataset generation is unavailable",
                 )
-            seeds = await _top5_confirmation_seed_plan(
-                session,
-                champion_agent_id=payload.champion_agent_id,
-                member_agent_id=payload.member_agent_id,
-                canonical_version=canonical_version,
-            )
-            if not seeds:
-                raise HTTPException(
-                    status_code=409,
-                    detail="the requested member has no pending confirmation seeds",
-                )
             confirmation_datasets = [
                 ConfirmationDatasetPin(
-                    seed=seed,
+                    seed=wave_seed,
                     dataset_sha256=await generator.generate(
-                        seed, bench_version=canonical_version
+                        wave_seed, bench_version=canonical_version
                     ),
                     run_size=generator.run_size,
                 )
-                for seed in seeds
             ]
+        if not await _top5_member_is_least_covered(
+            session,
+            members=members,
+            requested_member_id=payload.member_agent_id,
+            wave_seed=wave_seed,
+            validator_hotkey=payload.validator_hotkey,
+            canonical_version=canonical_version,
+            now=now,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="another top-five member has less confirmation coverage",
+            )
         ticket = await issue_confirmation_ticket(
             session,
             agent_id=payload.member_agent_id,
@@ -2005,11 +2161,19 @@ async def request_top5_confirmation_job(
             now=now,
             ttl=_TICKET_TTL,
             bench_version=canonical_version,
+            seed=(wave_seed if confirmation_datasets else None),
+            dataset_sha256=(
+                confirmation_datasets[0].dataset_sha256
+                if confirmation_datasets
+                else None
+            ),
         )
         if ticket is None:
             raise HTTPException(
                 status_code=409,
-                detail="validator has another live assignment or no prior quorum slot",
+                detail=(
+                    "validator has another live assignment or this retest is deferred"
+                ),
             )
         agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
         assert agent is not None
@@ -2178,22 +2342,46 @@ async def submit_top5_confirmation_score(
             ticket.purpose = TicketPurpose.CONTINUAL_RETEST
             ticket.purpose_revision = 1
             ticket.legacy_completion_allowed = False
-        members = await _current_emission_set(
-            session, canonical_version=canonical_version
-        )
-        if agent_id not in {member.agent_id for member in members}:
-            raise HTTPException(
-                status_code=409,
-                detail="agent left the current emission set before submission",
+        if ticket.seed is not None:
+            if seeds != [ticket.seed]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="confirmation report does not match the leased wave seed",
+                )
+        else:
+            # Bounded compatibility for already-issued bundle leases. New
+            # protocol-13 tickets are pinned to exactly one seed above and do
+            # not become invalid merely because rollout filtering changed the
+            # projected champion while this old run was in flight. The live
+            # ticket is the membership authorization; seeds remain bounded to
+            # either the completed-wave or legacy partial-wave champion, plus
+            # a seed already accepted from a sibling in that same old wave.
+            allowed = set(
+                await _champion_anchored_seed_set(
+                    session, canonical_version=canonical_version
+                )
             )
-        allowed = await _champion_anchored_seed_set(
-            session, canonical_version=canonical_version
-        )
-        if any(seed not in allowed for seed in seeds):
-            raise HTTPException(
-                status_code=409,
-                detail="confirmation report contains a non-canonical seed",
+            allowed.update(
+                await _champion_anchored_seed_set(
+                    session,
+                    canonical_version=canonical_version,
+                    completed_waves_only=False,
+                )
             )
+            allowed.update(
+                (
+                    await session.scalars(
+                        select(ConfirmationScore.seed).where(
+                            ConfirmationScore.bench_version == canonical_version
+                        )
+                    )
+                ).all()
+            )
+            if any(seed not in allowed for seed in seeds):
+                raise HTTPException(
+                    status_code=409,
+                    detail="confirmation report contains a non-canonical seed",
+                )
         await append_confirmation_scores(
             session,
             rows=[

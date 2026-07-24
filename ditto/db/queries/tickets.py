@@ -922,6 +922,8 @@ async def issue_confirmation_ticket(
     now: datetime,
     ttl: timedelta,
     bench_version: int,
+    seed: int | None = None,
+    dataset_sha256: str | None = None,
 ) -> ValidatorTicket | None:
     """Reissue this validator's existing quorum slot for top-five maintenance.
 
@@ -955,6 +957,10 @@ async def issue_confirmation_ticket(
             and existing_live.bench_version == bench_version
             and existing_live.purpose == TicketPurpose.CONTINUAL_RETEST
             and existing_live.purpose_revision > 0
+            and (seed is None or existing_live.seed == seed)
+            and (
+                dataset_sha256 is None or existing_live.dataset_sha256 == dataset_sha256
+            )
             else None
         )
 
@@ -963,17 +969,10 @@ async def issue_confirmation_ticket(
     )
     if agent is None or agent.status not in {AgentStatus.SCORED, AgentStatus.LIVE}:
         return None
-    # Confirmation replaces one member of the existing k=3 quorum; it must not
-    # create a fourth scorer and change consensus cardinality.
-    prior_score = await session.scalar(
-        select(Score).where(
-            Score.agent_id == agent_id,
-            Score.bench_version == bench_version,
-            Score.validator_hotkey == validator_hotkey,
-        )
-    )
-    if prior_score is None:
-        return None
+    # Confirmation evidence is append-only and never changes the canonical k=3
+    # Score rows, so any permitted validator may contribute the shared wave.
+    # Restricting this to the original three scorers strands healthy validators
+    # and can make a five-member wave impossible to finish during fleet churn.
     latest_retest = await get_latest_score_retest_event(
         session,
         agent_id=agent_id,
@@ -991,6 +990,12 @@ async def issue_confirmation_ticket(
     ticket = await session.get(
         ValidatorTicket, (agent_id, bench_version, validator_hotkey)
     )
+    if ticket is not None and ticket.retry_after is not None:
+        retry_after = ticket.retry_after
+        if retry_after.tzinfo is None:
+            retry_after = retry_after.replace(tzinfo=UTC)
+        if retry_after > now:
+            return None
     if ticket is None:
         ticket = ValidatorTicket(
             agent_id=agent_id,
@@ -1001,6 +1006,8 @@ async def issue_confirmation_ticket(
             issued_at=now,
             deadline=now + ttl,
             bench_version=bench_version,
+            seed=seed,
+            dataset_sha256=dataset_sha256,
             attempt_count=1,
             manual_retry_grants=0,
             retry_after=None,
@@ -1015,6 +1022,10 @@ async def issue_confirmation_ticket(
         ticket.issued_at = now
         ticket.deadline = now + ttl
         ticket.bench_version = bench_version
+        ticket.seed = seed
+        ticket.dataset_sha256 = dataset_sha256
+        ticket.seed_block = None
+        ticket.seed_block_hash = None
         ticket.attempt_count = ticket.attempt_count + 1 if same_version else 1
         ticket.manual_retry_grants = ticket.manual_retry_grants if same_version else 0
         ticket.retry_after = None

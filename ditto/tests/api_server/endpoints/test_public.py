@@ -663,21 +663,27 @@ class TestPublicLeaderboard:
             details={"bench_version": DEFAULT_BENCH_VERSION},
             created_at=datetime(2026, 6, 1, tzinfo=UTC),
         )
-        await _seed_k3(
+        tail_id = await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.80, 0.80, 0.80],
             details={"bench_version": DEFAULT_BENCH_VERSION},
             created_at=datetime(2026, 6, 2, tzinfo=UTC),
         )
-        # The champion accumulated three champion-anchored shared-seed rescores.
+        # A wave counts only after every emission-set member has the seed.
         async with session_maker() as s, s.begin():
             await append_confirmation_scores(
                 s,
                 rows=[
                     ConfirmationSeedScore(
-                        UUID(champion_id), "5V1", seed, 0.90, f"r{seed}", None
+                        UUID(agent_id),
+                        "5V1",
+                        seed,
+                        0.90,
+                        f"r{agent_id}-{seed}",
+                        None,
                     )
+                    for agent_id in (champion_id, tail_id)
                     for seed in (100, 200, 300)
                 ],
                 bench_version=DEFAULT_BENCH_VERSION,
