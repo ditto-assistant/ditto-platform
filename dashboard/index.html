@@ -3788,7 +3788,7 @@
       var narrow = width < 560, tight = width < 400;
       var height = narrow
         ? Math.max(300, Math.round(width * 0.86))
-        : Math.max(340, Math.min(470, Math.round(width * 0.42)));
+        : Math.max(272, Math.min(376, Math.round(width * 0.34)));
       var left = tight ? 32 : narrow ? 40 : 58;
       var right = narrow ? 14 : 26;
       var top = narrow ? 22 : 30;
@@ -3959,7 +3959,7 @@
       target.innerHTML = '<p class="harness-comparison-summary">' +
         (fieldCount ? '<span><strong>' + fieldCount + '</strong> scored runs</span>' : "") +
         '<span><strong>' + minerPoints.length + '</strong> records</span>' +
-        (latestMiner ? '<span>Latest record <strong>' + fx(latestMiner.score) + '</strong> on v' + latestMiner.version + '</span>' : '<span>Miner history is not yet available</span>') +
+        (latestMiner ? '<span>Latest record <strong>' + fx(latestMiner.score) + '</strong> on <strong>v' + latestMiner.version + '</strong></span>' : '<span>Miner history is not yet available</span>') +
         '<span><strong>' + latestReferences.length + '</strong> native reference series</span></p>' +
         '<div class="memory-timeline-legend" aria-label="Timeline legend"><span class="legend-group">Best finalized miner' + eraLegend + '</span><span class="hermes"><i></i>Hermes Agent</span><span class="openclaw"><i></i>OpenClaw</span></div>' +
         '<div class="memory-timeline-frame" tabindex="0" role="region" aria-label="Memory-score timeline, horizontally scrollable on small screens"><svg class="memory-timeline-svg" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-labelledby="memory-timeline-title memory-timeline-desc"><title id="memory-timeline-title">Best miner memory score with Hermes and OpenClaw across DittoBench v' + eras[0].version + ' through v' + eras[eras.length - 1].version + '</title><desc id="memory-timeline-desc">Memory score from zero to one. Each benchmark contract occupies an equal band across the horizontal axis, coloured light to dark as the generations advance, with its records ordered left to right inside the band. A muted dashed connector crosses each contract boundary because every contract rescores from scratch. Third-party points are retrospective measurements placed in each contract band.</desc>' + svg.join("") + '</svg><div class="memory-timeline-tooltip" role="tooltip" hidden></div></div>' +
