@@ -179,6 +179,9 @@ from ditto.db.queries.artifact_release import (
     ArtifactScoreQuorum,
     list_first_score_quorums,
 )
+from ditto.db.queries.artifact_release_settings import (
+    artifact_release_embargo_hours,
+)
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.benchmark_admission import (
     admitted_agent_ids,
@@ -251,7 +254,6 @@ _TIMELINE_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=3600"
 # so this is a long freshness window rather than `immutable`: a reload reuses it
 # with no request at all, and any correction lands within the hour.
 _SETTLED_BENCH_CACHE_CONTROL = "public, max-age=3600, stale-while-revalidate=86400"
-_ARTIFACT_RELEASE_EMBARGO = timedelta(hours=6)
 _ARTIFACT_DOWNLOAD_TTL_SECONDS = 5 * 60
 _REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 1.0
 _REGISTRATION_CACHE_TTL_SECONDS = 15.0
@@ -458,6 +460,7 @@ def _public_artifact_release(
     *,
     status: AgentStatus,
     score_quorum: ArtifactScoreQuorum | None,
+    embargo_hours: int,
     now: datetime,
 ) -> PublicArtifactRelease:
     """Project source visibility without mutating a public GET request."""
@@ -466,7 +469,9 @@ def _public_artifact_release(
 
     finalized_at = score_quorum.finalized_at if score_quorum is not None else None
     available_at = (
-        finalized_at + _ARTIFACT_RELEASE_EMBARGO if finalized_at is not None else None
+        finalized_at + timedelta(hours=embargo_hours)
+        if finalized_at is not None
+        else None
     )
     release_status: Literal[
         "awaiting_quorum", "under_review", "embargoed", "available", "unavailable"
@@ -487,7 +492,7 @@ def _public_artifact_release(
             score_quorum.bench_version if score_quorum is not None else None
         ),
         score_quorum=SCORING_QUORUM,
-        embargo_hours=int(_ARTIFACT_RELEASE_EMBARGO.total_seconds() // 3600),
+        embargo_hours=embargo_hours,
         finalized_at=finalized_at,
         available_at=available_at,
         download_available=release_status == "available",
@@ -511,10 +516,12 @@ async def _artifact_release_snapshot(
         agent_ids=list(statuses),
         quorum=SCORING_QUORUM,
     )
+    embargo_hours = await artifact_release_embargo_hours(session)
     return {
         agent_id: _public_artifact_release(
             status=status,
             score_quorum=score_quorums.get(agent_id),
+            embargo_hours=embargo_hours,
             now=now,
         )
         for agent_id, status in statuses.items()
@@ -2940,7 +2947,7 @@ async def agent_artifact(
     storage: StorageDep,
     agent_id: UUID,
 ) -> PublicArtifactDownload:
-    """Return a short-lived source URL six hours after a cleared 3/3 score."""
+    """Return a short-lived source URL after the configured cleared-score embargo."""
     response.headers["Cache-Control"] = "private, no-store"
     agent = await session.get(Agent, agent_id)
     if agent is None or agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
@@ -2955,6 +2962,7 @@ async def agent_artifact(
     release = _public_artifact_release(
         status=agent.status,
         score_quorum=score_quorum,
+        embargo_hours=await artifact_release_embargo_hours(session),
         now=now,
     )
     if release.status != "available" or score_quorum is None:

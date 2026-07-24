@@ -60,6 +60,7 @@ from ditto.chain.models import (
 )
 from ditto.db.models import (
     Agent,
+    ArtifactReleaseSettingsRevision,
     AthReview,
     Base,
     BenchmarkDataset,
@@ -3637,7 +3638,7 @@ async def _set_score_created_times(
 
 
 class TestPublicArtifactRelease:
-    async def test_retroactively_releases_every_cleared_submission_after_six_hours(
+    async def test_default_retroactively_releases_cleared_submissions_after_24h(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -3655,9 +3656,9 @@ class TestPublicArtifactRelease:
                 session_maker,
                 agent_id=agent_id,
                 created_at=[
-                    now - timedelta(hours=8),
-                    now - timedelta(hours=7),
-                    now - timedelta(hours=6, minutes=1),
+                    now - timedelta(hours=26),
+                    now - timedelta(hours=25),
+                    now - timedelta(hours=24, minutes=1),
                 ],
             )
         _install_db(app, session_maker)
@@ -3678,7 +3679,7 @@ class TestPublicArtifactRelease:
         }
         assert set(releases) == {first_id, second_id}
         assert all(release["status"] == "available" for release in releases.values())
-        assert all(release["embargo_hours"] == 6 for release in releases.values())
+        assert all(release["embargo_hours"] == 24 for release in releases.values())
         assert all(
             release["download_available"] is True for release in releases.values()
         )
@@ -3727,9 +3728,9 @@ class TestPublicArtifactRelease:
             session_maker,
             agent_id=agent_id,
             created_at=[
-                now - timedelta(hours=9),
-                now - timedelta(hours=8),
-                now - timedelta(hours=7),
+                now - timedelta(hours=27),
+                now - timedelta(hours=26),
+                now - timedelta(hours=25),
                 now - timedelta(minutes=5),
             ],
         )
@@ -3744,6 +3745,51 @@ class TestPublicArtifactRelease:
 
         response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
         assert response.status_code == 200
+
+    async def test_shortened_setting_releases_existing_quorums_retroactively(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        await _set_score_created_times(
+            session_maker,
+            agent_id=agent_id,
+            created_at=[
+                now - timedelta(hours=8),
+                now - timedelta(hours=7),
+                now - timedelta(hours=6, minutes=1),
+            ],
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                ArtifactReleaseSettingsRevision(
+                    parent_revision=0,
+                    embargo_hours=6,
+                    reason="Complete the staged privacy rollout",
+                    actor="operator@example.com",
+                )
+            )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+        storage.presigned_get_url.return_value = "https://objects.example/source"
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+        assert response.status_code == 200
+        submission = (await client.get("/api/v1/public/submissions")).json()[
+            "submissions"
+        ][0]
+        assert submission["artifact_release"]["embargo_hours"] == 6
+        assert submission["artifact_release"]["status"] == "available"
 
     async def test_embargo_and_review_hold_fail_closed(
         self,

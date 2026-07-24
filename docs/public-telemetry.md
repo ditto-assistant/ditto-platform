@@ -16,7 +16,8 @@ SN118 publishes publicly and how. Implementation tracked per section below.
 3. **Public read API = yes.** Add a rate-limited, no-auth read endpoint so the
    dashboard (and anyone) can read the leaderboard without a validator hotkey.
 4. **Submitted source becomes public after finalization.** Every cleared
-   submission becomes downloadable six hours after its third accepted validator
+   submission becomes downloadable after the configured embargo (24 hours by
+   default, operator-shortenable to 6 hours) from its third accepted validator
    score. The clock is derived from immutable score insertion timestamps, so the
    policy applies retroactively without a backfill. Scores from different
    benchmark versions never combine into a quorum. Quarantined, held, and
@@ -193,7 +194,7 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
 - `GET /api/v1/public/agent/{agent_id}/artifact` → `{ agent_id, bench_version,
   sha256, finalized_at, download_url, expires_at }`.
   Returns a five-minute private-bucket URL only when one benchmark version has
-  three independently inserted score rows, six hours have elapsed since the
+  three independently inserted score rows, the configured embargo has elapsed since the
   third row, and the agent is currently in a cleared finalized state (`scored`
   or legacy `live`). Before the deadline it fails with 425; unknown,
   held-for-review, quarantined, and rejected agents fail closed with 404. The
@@ -367,7 +368,7 @@ for the deep dive. Sections:
 - **Submission pipeline** — recent agent uploads, miner hotkey, public lifecycle
   stage, screening/review evidence, submission time, and accepted provisional
   composites with reproducibility commands, visible before scoring completes.
-  Each submission shows its six-hour source-release state and exposes a download
+  Each submission shows its current source-release embargo and exposes a download
   control once available.
 - **Leaderboard** — rank, miner, composite, category radar sparkline, weight %,
   trend arrow; champion highlighted.

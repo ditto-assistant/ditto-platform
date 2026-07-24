@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from ditto.api_server.endpoints.admin_artifact_release_settings import (
+    router as admin_artifact_release_settings_router,
+)
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     router as admin_benchmark_rollout_router,
 )
@@ -39,6 +42,7 @@ from ditto.api_server.endpoints.validator import router as validator_router
 __all__ = [
     "health_router",
     "inference_router",
+    "admin_artifact_release_settings_router",
     "admin_benchmark_rollout_router",
     "admin_inference_routes_router",
     "admin_copy_review_router",
