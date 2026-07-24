@@ -218,6 +218,7 @@ from ditto.db.queries.heartbeats import (
     list_validator_heartbeats,
     live_validator_fleet_supports_protocol,
 )
+from ditto.db.queries.king_reign import get_first_crowned
 from ditto.db.queries.retry_state import (
     AgentRetryState,
     classify_agent_retry_states,
@@ -475,16 +476,24 @@ def _public_artifact_release(
     status: AgentStatus,
     score_quorum: ArtifactScoreQuorum | None,
     embargo_hours: int,
+    first_crowned_at: datetime | None,
     now: datetime,
 ) -> PublicArtifactRelease:
-    """Project source visibility without mutating a public GET request."""
+    """Project source visibility without mutating a public GET request.
+
+    Source release is **king-only**: an agent's source is revealed only if it
+    has held the KOTH crown, and the embargo window is measured from
+    ``first_crowned_at`` (the moment it first took the throne), not from its
+    score quorum. A submission that never reigned stays private forever, even
+    after it finalizes a quorum.
+    """
     if status in (AgentStatus.REJECTED, AgentStatus.BANNED):
         return PublicArtifactRelease(status="unavailable")
 
     finalized_at = score_quorum.finalized_at if score_quorum is not None else None
     available_at = (
-        finalized_at + timedelta(hours=embargo_hours)
-        if finalized_at is not None
+        first_crowned_at + timedelta(hours=embargo_hours)
+        if first_crowned_at is not None
         else None
     )
     release_status: Literal[
@@ -495,8 +504,11 @@ def _public_artifact_release(
     elif score_quorum is None:
         release_status = "awaiting_quorum"
     elif status in (AgentStatus.SCORED, AgentStatus.LIVE):
-        assert available_at is not None
-        release_status = "available" if now >= available_at else "embargoed"
+        if available_at is None:
+            # Never held the crown: the source stays private (king-only release).
+            release_status = "unavailable"
+        else:
+            release_status = "available" if now >= available_at else "embargoed"
     else:
         release_status = "unavailable"
 
@@ -508,7 +520,10 @@ def _public_artifact_release(
         score_quorum=SCORING_QUORUM,
         embargo_hours=embargo_hours,
         finalized_at=finalized_at,
-        available_at=available_at,
+        crowned_at=first_crowned_at,
+        available_at=(
+            available_at if release_status in ("embargoed", "available") else None
+        ),
         download_available=release_status == "available",
     )
 
@@ -530,12 +545,14 @@ async def _artifact_release_snapshot(
         agent_ids=list(statuses),
         quorum=SCORING_QUORUM,
     )
+    first_crowned = await get_first_crowned(session, agent_ids=list(statuses))
     embargo_hours = await artifact_release_embargo_hours(session)
     return {
         agent_id: _public_artifact_release(
             status=status,
             score_quorum=score_quorums.get(agent_id),
             embargo_hours=embargo_hours,
+            first_crowned_at=first_crowned.get(agent_id),
             now=now,
         )
         for agent_id, status in statuses.items()
@@ -3229,10 +3246,22 @@ async def agent_artifact(
             session, agent_ids=[agent_id], quorum=SCORING_QUORUM
         )
     ).get(agent_id)
+    first_crowned_at = (await get_first_crowned(session, agent_ids=[agent_id])).get(
+        agent_id
+    )
+    # King-only: an agent that has never held the crown is never revealed.
+    if first_crowned_at is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "source is not publicly available; only the king's source is released"
+            ),
+        )
     release = _public_artifact_release(
         status=agent.status,
         score_quorum=score_quorum,
         embargo_hours=await artifact_release_embargo_hours(session),
+        first_crowned_at=first_crowned_at,
         now=now,
     )
     if release.status != "available" or score_quorum is None:

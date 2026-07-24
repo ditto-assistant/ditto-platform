@@ -5,8 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.db.models import ArtifactReleaseSettingsRevision
 
-DEFAULT_ARTIFACT_RELEASE_EMBARGO_HOURS = 24
+DEFAULT_ARTIFACT_RELEASE_EMBARGO_HOURS = 48
 MIN_ARTIFACT_RELEASE_EMBARGO_HOURS = 6
+MAX_ARTIFACT_RELEASE_EMBARGO_HOURS = 48
 
 
 async def latest_artifact_release_settings(
