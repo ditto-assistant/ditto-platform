@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
-"""Validate that Alembic migrations remain a safe, linear history."""
+"""Validate that Alembic migrations remain a safe, linear history.
+
+Two modes:
+
+``check_migration_order.py [base_ref]``
+    The CI mode. Validates the PR's migrations against ``base_ref``
+    (default ``origin/main``): nothing removed, nothing edited, dated
+    forward, and resolving to exactly one head.
+
+``check_migration_order.py --head``
+    The deploy mode. Resolves the *working tree's* migrations to a single
+    head and prints it, using only the standard library -- no venv, no
+    alembic import, no database. ``scripts/update.sh`` runs this before it
+    touches the host, because the CI mode cannot catch the case that
+    matters at deploy time: two PRs that each extended the single head of
+    ``main`` independently, passed their own checks, and produced two
+    heads only once both had merged. ``alembic upgrade head`` then refuses
+    to run with ``Multiple head revisions are present``.
+"""
 
 from __future__ import annotations
 
@@ -216,7 +234,42 @@ def check(base_ref: str) -> tuple[int, str, str]:
     return len(new_paths), ", ".join(sorted(base_heads)), head_revision
 
 
+def resolve_working_tree_head() -> str:
+    """Return the sole head of the checked-out migrations.
+
+    Raises :class:`MigrationError` naming every head, plus the exact
+    ``alembic merge`` that reconciles them, when there is more than one.
+    """
+    migrations = _head_migrations()
+    heads = sorted(_history_heads(migrations, "working tree"))
+    if len(heads) == 1:
+        return heads[0]
+    joined = " ".join(heads)
+    raise MigrationError(
+        f"{len(heads)} head revisions are present: {', '.join(heads)}.\n"
+        "`alembic upgrade head` cannot choose between them and will refuse to "
+        "run. Two migrations were merged that each extended the same parent, "
+        "so a human has to say how they combine. Reconcile on a branch with:\n"
+        f'    uv run alembic merge -m "merge heads" {joined}\n'
+        "Review the merged branches for conflicting changes to the same table "
+        "before assuming an empty merge revision is correct."
+    )
+
+
+def head_mode() -> int:
+    """``--head``: print the single working-tree head, or explain the divergence."""
+    try:
+        head = resolve_working_tree_head()
+    except MigrationError as exc:
+        print(f"migration-head: {exc}", file=sys.stderr)
+        return 1
+    print(head)
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--head":
+        return head_mode()
     base_ref = sys.argv[1] if len(sys.argv) > 1 else "origin/main"
     try:
         count, base_head, head = check(base_ref)

@@ -49,7 +49,7 @@ dependency-light `ditto-screening-protocol` package, pinned to an exact commit.
 
 | Method & path | Purpose |
 | --- | --- |
-| `GET /health` | Liveness + DB/chain readiness + build commit |
+| `GET /health` | Liveness + DB/chain readiness + running vs checked-out commit |
 | `GET /metrics` | Prometheus metrics |
 | `GET /api/v1/upload/eval-pricing` | Quote the upload fee in rao (CoinGecko TAO/USD oracle) |
 | `POST /api/v1/upload/check` | Pre-payment validation (signature, registration, size, accidental identical-upload detection) |
@@ -195,6 +195,32 @@ pm2 status                   # process state
   `DITTO_HEALTH_TIMEOUT` (default 120s). The one-shot image-cleanup job is
   cron-driven with `autorestart: false`, so `stopped` is its correct state and
   is not treated as a failure.
+- **A deploy only passes when the process reports the commit that was checked
+  out.** Being checked out and being in effect are different facts. `/health`
+  carries the commit resolved at the *process's* boot, and the deploy gate
+  compares it against `git rev-parse HEAD`; a 200 from a build older than the
+  checkout fails the deploy. `/health` also reports `checked_out_commit` and
+  `commit_drift` so the question "is this host running what it has checked
+  out?" can be answered at any time, not just during a deploy. Drift is
+  reported, never enforced — it does not change the HTTP status, because
+  pulling a serving host out of rotation over stale code turns a deploy problem
+  into an outage.
+- **Divergent Alembic heads stop the deploy in preflight, not mid-sequence.**
+  Two migrations that each extend the same parent and merge independently make
+  `alembic upgrade head` refuse to run. `update.sh` now asserts a single head
+  *before* `uv sync` or the database is touched, using
+  `scripts/check_migration_order.py --head` (stdlib only, no venv), and prints
+  every head plus the exact `alembic merge` that reconciles them. `heads`
+  (plural) was deliberately **not** adopted: applying two unreconciled branches
+  in an order nobody reviewed can produce a schema neither branch intended.
+- **A deploy that fails before pm2 restarts rolls the checkout back.** The old
+  process is still serving in that window, so the checkout is reset to the
+  revision `/health` reports and dependencies are re-synced — the host stops
+  claiming a deploy that never took effect. After pm2 has been restarted the
+  checkout is left alone; going back from there is a deploy of the previous
+  revision, not a `git reset`. Every attempt is recorded in
+  `logs/last-deploy.json` (result, stage, target, rollback), which is also the
+  fallback rollback target when the API cannot answer for itself.
 
 ---
 

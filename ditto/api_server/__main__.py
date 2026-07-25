@@ -12,12 +12,12 @@ import argparse
 import logging
 import logging.config
 import os
-import subprocess
 import sys
 from dataclasses import replace
 
 import uvicorn
 
+from ditto.api_server import revision
 from ditto.api_server.config import (
     ApiServerConfig,
     check_config,
@@ -71,25 +71,14 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _resolve_commit_hash() -> str:
-    """Return the git revision the process was built from.
+    """Return the git revision the process is being built from.
 
-    Falls back to ``"unknown"`` on any failure (subprocess error, non-zero
-    exit, missing git binary, no ``.git`` directory). The fallback lets
-    deploy images without git history boot cleanly.
+    Resolved exactly once, here at startup, and then carried for the life of
+    the process: it is the record of what this process is actually running,
+    which is why ``/health`` can compare it against the checkout that a later
+    deploy may have moved underneath it. See :mod:`ditto.api_server.revision`.
     """
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return "unknown"
-    if result.returncode != 0:
-        return "unknown"
-    return result.stdout.strip() or "unknown"
+    return revision.resolve_commit_hash()
 
 
 def _config_from_args(ns: argparse.Namespace) -> ApiServerConfig:
