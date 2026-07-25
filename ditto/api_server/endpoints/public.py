@@ -143,6 +143,7 @@ from ditto.api_models.validator_capabilities import (
 )
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.benchmark_rollout import rolling_qualification_blockers
+from ditto.api_server.continual_retest_settings import aggregate_is_active
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.efficiency import (
     EfficiencyBoardView,
@@ -1487,14 +1488,17 @@ async def leaderboard(
         if score_counts.get(row.agent_id, 0) >= SCORING_QUORUM
     ]
     finalized_ids = [row.agent_id for row in finalized_rows]
-    continual_mean_active = (
-        bench_version is None
-        and await live_validator_fleet_supports_protocol(
-            session,
-            minimum_protocol=_CONTINUAL_MEAN_PROTOCOL,
-            now=now,
-            freshness=_VALIDATOR_STALE_WINDOW,
-        )
+    fleet_protocol_ready = await live_validator_fleet_supports_protocol(
+        session,
+        minimum_protocol=_CONTINUAL_MEAN_PROTOCOL,
+        now=now,
+        freshness=_VALIDATOR_STALE_WINDOW,
+    )
+    continual_settings = await request.app.state.continual_retest_settings.resolve(
+        getattr(request.app.state, "session_maker", None)
+    )
+    continual_mean_active = bench_version is None and aggregate_is_active(
+        continual_settings, fleet_protocol_ready=fleet_protocol_ready
     )
     efficiency_view: EfficiencyBoardView | None = None
     if efficiency_config.enabled and finalized_rows:

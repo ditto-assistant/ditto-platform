@@ -8,6 +8,9 @@ from ditto.api_server.endpoints.admin_artifact_release_settings import (
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     router as admin_benchmark_rollout_router,
 )
+from ditto.api_server.endpoints.admin_continual_retest_settings import (
+    router as admin_continual_retest_settings_router,
+)
 from ditto.api_server.endpoints.admin_copy_review import (
     router as admin_copy_review_router,
 )
@@ -53,6 +56,7 @@ __all__ = [
     "admin_efficiency_bonus_settings_router",
     "admin_inference_routes_router",
     "admin_copy_review_router",
+    "admin_continual_retest_settings_router",
     "admin_miner_fees_router",
     "admin_quarantine_router",
     "admin_scoring_readiness_router",
