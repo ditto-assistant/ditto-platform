@@ -84,6 +84,7 @@ from ditto.db.models import (
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
+    ConfirmationScore,
     ContinualRetestSettingsRevision,
     Score,
     ScreenerHeartbeat,
@@ -5445,6 +5446,46 @@ def _top5_score_payload(
 
 
 class TestTop5ConfirmationLane:
+    async def test_emission_set_uses_completed_wave_mean_for_champion(
+        self,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Retest claims and the validator ledger must agree on the incumbent.
+
+        A completed continual wave can preserve an older incumbent even when a
+        newer agent leads the raw three-score median.  Omitting the quorum and
+        completed-wave samples here made every healthy validator claim the raw
+        leader and receive a 409 from the authoritative job endpoint.
+        """
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            bench_version=6,
+            composites=[0.90, 0.92, 0.86, 0.84, 0.82, 0.80],
+        )
+        seed = 123456
+        async with session_maker() as session, session.begin():
+            for index, agent_id in enumerate(agent_ids[:5]):
+                session.add(
+                    ConfirmationScore(
+                        agent_id=agent_id,
+                        validator_hotkey=_VALIDATOR_HOTKEY,
+                        bench_version=6,
+                        seed=seed,
+                        composite=1.0 if index == 0 else 0.0,
+                        run_id=f"completed-wave-{index}",
+                        signature=None,
+                    )
+                )
+
+        from ditto.api_server.endpoints.validator import _current_emission_set
+
+        async with session_maker() as session:
+            members = await _current_emission_set(session, canonical_version=6)
+
+        assert members[0].agent_id == agent_ids[0]
+        assert members[0].quorum_composites == (0.90, 0.90, 0.90)
+        assert members[0].completed_wave_composites == (1.0,)
+
     async def test_requires_single_seed_capable_validator_protocol(
         self,
         app: FastAPI,

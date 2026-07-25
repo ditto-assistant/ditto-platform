@@ -265,6 +265,11 @@ class TestDashboard:
         assert "Waiting for scores" in body
         assert "function validatorQueueCompare(a, b)" in body
         assert "indexed.sort(validatorQueueCompare)" in body
+        assert "var pipelineShowStuck = false" in body
+        assert "data-pipeline-stuck-filter" in body
+        assert 'aria-pressed="' in body
+        assert 'item.entry.retry_state !== "exhausted"' in body
+        assert 'item.entry.retry_state === "exhausted"' in body
         assert "function queueRelevantBenchmark(progress)" in body
         assert "Number(activeBench) || Number(currentBench)" in body
         assert "version >= activeVersion" in body
