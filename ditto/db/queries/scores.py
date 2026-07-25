@@ -21,6 +21,7 @@ from uuid import UUID
 
 from sqlalchemy import ColumnElement, and_, case, func, literal, null, or_, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
+from sqlalchemy.orm.util import AliasedClass
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
@@ -269,20 +270,38 @@ async def list_memory_leader_timeline(
     return timeline
 
 
-def _emission_owner_key() -> ColumnElement[str]:
-    """Stable owner key for one-emission-position selection.
+def emission_owner_key(
+    *,
+    agent: type[Agent] | AliasedClass[Agent] = Agent,
+    payment: type[EvaluationPayment] | AliasedClass[EvaluationPayment] = (
+        EvaluationPayment
+    ),
+) -> ColumnElement[str]:
+    """Stable owner key for one-slot-per-owner selection.
 
     New uploads always carry an immutable payment-time coldkey. The hotkey
     fallback preserves legacy/test rows without accidentally collapsing every
     missing-payment row into one owner.
+
+    The single authority for this expression. It is public and takes optional
+    aliases because previous-generation carryover dedupes on the same notion of
+    "who a miner is" and needs to compare two aliased agents inside one
+    statement; a hand-rolled fourth copy of the case expression is exactly how
+    the queue-rank preview came to disagree with the allocator about owners.
+    Callers must join/outerjoin ``payment`` to ``agent`` themselves.
     """
     return case(
         (
-            EvaluationPayment.miner_coldkey.is_not(None),
-            literal("coldkey:") + EvaluationPayment.miner_coldkey,
+            payment.miner_coldkey.is_not(None),
+            literal("coldkey:") + payment.miner_coldkey,
         ),
-        else_=literal("hotkey:") + Agent.miner_hotkey,
+        else_=literal("hotkey:") + agent.miner_hotkey,
     )
+
+
+# Module-private alias kept so the two existing emission call sites below read
+# unchanged.
+_emission_owner_key = emission_owner_key
 
 
 @dataclass(frozen=True)
