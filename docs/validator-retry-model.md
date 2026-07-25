@@ -106,3 +106,85 @@ commit together.
 
 Recoveries are bounded (`MAX_OPERATOR_RECOVERIES_PER_AGENT = 3`) and audited in
 `ValidatorRetryRecovery`.
+
+## Retirement: when the benchmark generation closed instead
+
+Everything above assumes the submission's benchmark version is still being
+scored. A rollout is forward-only, so once a newer version activates, the older
+one is never scored again. A submission still below quorum in the closed era is
+not stuck and not slow: it is finished, and no retry can change that. Its
+remaining attempts are denominated in a version for which no ticket will ever be
+issued.
+
+`SubmissionRetirement` is the terminal state for exactly those rows. It is a
+sibling of `ValidatorQueueWithdrawal`, not a reuse of it, because the two answer
+different questions:
+
+| | withdrawal | retirement |
+|---|---|---|
+| what happened | the submission burned its slots and cannot reach quorum | the benchmark generation closed underneath it |
+| scope | `(agent, bench_version)` | `(agent, bench_version)`, plus `superseded_by_version` |
+| gate | requires enough exhausted tickets that quorum is unreachable | requires the era to be older than the active one and unadmitted to it |
+| public status | `not_queued` | `retired` |
+
+Retirement does **not** change scoring semantics. The `agents` row is not
+touched at all, no score is created or removed, and `AgentStatus` gains no
+member. The agent stays `evaluating`; the retirement row is what the queue
+predicates and the public projection read.
+
+### Eligibility
+
+A submission may be retired only when all of these hold:
+
+1. it is still `evaluating`;
+2. its own benchmark era is strictly older than the active one;
+3. it is **not** admitted to the active era by any disjunct of
+   `benchmark_admission_predicate` (frozen rollout cohort, adopted carryover
+   row, or audited contract refresh);
+4. it is below quorum in its own era;
+5. it is not already withdrawn from that era, and not already retired.
+
+Note what is absent: retry budget. A submission with attempts left is still
+retirable, because those attempts cannot be spent.
+
+### Interaction with previous-generation carryover
+
+Carryover (`ditto/db/queries/benchmark_carryover.py`) adopts stranded
+previous-generation submissions *into* the new era. Retirement closes them out.
+They are opposite remedies for the same rows, so exactly one may apply:
+
+- **carryover first** writes a `BenchmarkRolloutCarryover` row, which is an
+  admission disjunct, so clause 3 fails and the submission is no longer
+  retirable;
+- **retirement first** is respected by `stranded_prev_gen_candidates`, so an
+  adoption pass skips retired rows. Enabling the carryover policy later can
+  never silently resurrect work an operator has already closed out.
+
+Retirement takes precedence, deliberately: it carries a named actor and a
+reason, so undoing one should be an explicit operator act rather than a side
+effect of flipping a policy flag. There is no un-retire route today; bringing a
+retired submission back means deleting its retirement row on purpose.
+
+### Applying it
+
+1. `GET /api/v1/admin/retirements` previews the eligible set. Read
+   `population_counts` and `finalized_prev_gen_count` before acting: "previous
+   generation" is three groups, and only `partially_scored` and `never_scored`
+   are ever eligible. `finalized_prev_gen_count` is the already-scored
+   population, which this action never touches.
+2. `POST /api/v1/admin/retirements/{agent_id}` retires one, with a `snapshot`,
+   an idempotency `request_id`, a `reason`, and the confirmation phrase
+   `RETIRE PREVIOUS GENERATION`.
+3. `POST /api/v1/admin/retirements/batch` retires several, with one
+   `{agent_id, request_id, expected_snapshot}` item each. An item whose state
+   moved is **skipped** with a reason rather than force-applied, and all
+   retirements commit together.
+
+### What a miner sees
+
+The row leaves "Waiting for scores", loses its `validator_queue_rank`, stops
+being counted in the waiting total, and carries no retry chip. It stays on the
+submissions page, findable by search and by direct URL, labelled
+`Retired · earlier benchmark`, with copy explaining that the subnet moved to a
+newer benchmark, that nothing was rejected, and that the scores it did receive
+are still on file.

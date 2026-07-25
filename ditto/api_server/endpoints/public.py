@@ -229,6 +229,7 @@ from ditto.db.queries.queue_order import (
     QueuePreviewEntry,
     preview_queue_order,
 )
+from ditto.db.queries.retirement import retired_agent_ids
 from ditto.db.queries.retry_state import (
     AgentRetryState,
     classify_agent_retry_states,
@@ -390,6 +391,7 @@ _PUBLIC_ACTIVITY_STATUSES = frozenset(
         "evaluating",
         "below_score_floor",
         "not_queued",
+        "retired",
         "under_review",
         "rejected",
         "scored",
@@ -2905,6 +2907,7 @@ def _public_activity_status(
     highest_composite: float | None = None,
     score_continuation_floor: float | None = None,
     benchmark_admitted: bool = True,
+    retired: bool = False,
 ) -> str:
     """Collapse internal moderation detail into stable public lifecycle labels."""
     needs_rescreen = (
@@ -2920,6 +2923,14 @@ def _public_activity_status(
     if status in (AgentStatus.UPLOADED, AgentStatus.SCREENING_FAILED) or needs_rescreen:
         return "waiting_screening"
     if status in (AgentStatus.SCREENING_PASSED, AgentStatus.EVALUATING):
+        # Checked before ``not_queued`` because it is the more specific and more
+        # useful answer. Both mean "not in the active queue", but ``not_queued``
+        # reads as a state the submission could still leave, while a retirement
+        # names the reason it never will: the benchmark generation it was
+        # submitted against has closed. A retired row keeps this status even
+        # while an already-issued ticket drains, so the label cannot flicker.
+        if retired:
+            return "retired"
         if (
             not benchmark_admitted
             and not has_active_validation
@@ -3019,6 +3030,7 @@ def _public_activity_statuses(
     score_continuation_floor: float | None,
     active_bench_version: int | None = None,
     benchmark_admitted_agent_ids: set[UUID] | None = None,
+    retired_agent_ids: set[UUID] | None = None,
 ) -> dict[UUID, str]:
     """Public lifecycle label per submission, keyed by agent id.
 
@@ -3032,6 +3044,7 @@ def _public_activity_statuses(
         or work.ticket.bench_version == active_bench_version
     }
     admitted = benchmark_admitted_agent_ids
+    retired = retired_agent_ids or set()
     return {
         row.agent.agent_id: _public_activity_status(
             row.agent.status,
@@ -3043,6 +3056,7 @@ def _public_activity_statuses(
             highest_composite=row.highest_composite,
             score_continuation_floor=score_continuation_floor,
             benchmark_admitted=(admitted is None or row.agent.agent_id in admitted),
+            retired=row.agent.agent_id in retired,
         )
         for row in rows
     }
@@ -3067,6 +3081,7 @@ def _public_activity_response(
     duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
     ath_review_opened_at: dict[UUID, datetime] | None = None,
     ath_review_composite: dict[UUID, float] | None = None,
+    retired_agent_ids: set[UUID] | None = None,
     ath_only: bool = False,
     terminal_history_limit: int | None = None,
 ) -> PublicActivityResponse:
@@ -3084,6 +3099,7 @@ def _public_activity_response(
         score_continuation_floor=score_continuation_floor,
         active_bench_version=active_bench_version,
         benchmark_admitted_agent_ids=benchmark_admitted_agent_ids,
+        retired_agent_ids=retired_agent_ids,
     )
     projected = [(row, statuses[row.agent.agent_id]) for row in rows]
     if ath_only:
@@ -3346,6 +3362,11 @@ async def activity(
         for assignment in assignments
         if assignment.ticket.bench_version == active_version
     }
+    # Read once and feed both the preview population and the projected labels.
+    # If the preview did not know about retirement it would rank a row this
+    # response calls "retired", which is the preview/allocator divergence the
+    # shared ordering exists to make impossible.
+    retired = await retired_agent_ids(session)
     queue_preview = await queue_preview_for_rows(
         session,
         rows=rows,
@@ -3356,6 +3377,7 @@ async def activity(
             score_continuation_floor=score_continuation_floor,
             active_bench_version=active_version,
             benchmark_admitted_agent_ids=admitted,
+            retired_agent_ids=retired,
         ),
         bench_version=active_version,
         now=now,
@@ -3382,6 +3404,7 @@ async def activity(
         duplicate_metadata=await _duplicate_submission_metadata(session, rows),
         ath_review_opened_at=ath_opened_at,
         ath_review_composite=ath_composite,
+        retired_agent_ids=retired,
         ath_only=review == "ath",
     )
 
@@ -3423,6 +3446,9 @@ async def operations(
         for assignment in assignments
         if assignment.ticket.bench_version == active_version
     }
+    # One read, shared by the preview population and the projected labels --
+    # same reason as ``/activity`` above.
+    retired = await retired_agent_ids(session)
     activity_snapshot = _public_activity_response(
         rows=activity_rows,
         active_work=active_work,
@@ -3448,6 +3474,7 @@ async def operations(
                 score_continuation_floor=score_continuation_floor,
                 active_bench_version=active_version,
                 benchmark_admitted_agent_ids=admitted,
+                retired_agent_ids=retired,
             ),
             bench_version=active_version,
             now=now,
@@ -3460,6 +3487,7 @@ async def operations(
             session, agents=[row.agent for row in activity_rows], now=now
         ),
         duplicate_metadata=await _duplicate_submission_metadata(session, activity_rows),
+        retired_agent_ids=retired,
         terminal_history_limit=50,
     )
     validator_snapshot = _validator_heartbeats_response(
@@ -3687,6 +3715,10 @@ async def agent_pipeline(
     benchmark_admitted = await agent_is_admitted(
         session, bench_version=canonical_version, agent_id=agent_id
     )
+    # Retirement is per (agent, closed era), so ask without pinning a version:
+    # the detail page must report the state no matter which era it names, and a
+    # retired submission stays reachable by direct URL by design.
+    agent_retired = agent_id in await retired_agent_ids(session)
     dispute = await session.scalar(
         select(ScreeningDispute).where(ScreeningDispute.agent_id == agent_id)
     )
@@ -3714,6 +3746,7 @@ async def agent_pipeline(
             ),
             score_continuation_floor=score_continuation_floor,
             benchmark_admitted=benchmark_admitted,
+            retired=agent_retired,
         ),
         active_bench_version=canonical_version,
         score_count=len(canonical_scores),

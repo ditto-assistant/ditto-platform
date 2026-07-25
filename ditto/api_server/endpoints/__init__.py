@@ -32,6 +32,9 @@ from ditto.api_server.endpoints.admin_quarantine import (
 from ditto.api_server.endpoints.admin_queue_policy_settings import (
     router as admin_queue_policy_settings_router,
 )
+from ditto.api_server.endpoints.admin_retirement import (
+    router as admin_retirement_router,
+)
 from ditto.api_server.endpoints.admin_scoring_readiness import (
     router as admin_scoring_readiness_router,
 )
@@ -70,6 +73,7 @@ __all__ = [
     "admin_continual_retest_settings_router",
     "admin_miner_fees_router",
     "admin_quarantine_router",
+    "admin_retirement_router",
     "admin_scoring_readiness_router",
     "admin_screener_review_settings_router",
     "admin_submission_settings_router",

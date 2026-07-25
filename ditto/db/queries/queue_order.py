@@ -83,6 +83,7 @@ from ditto.db.queries.benchmark_admission import (
     benchmark_admission_predicate,
     validator_queue_admission_predicate,
 )
+from ditto.db.queries.retirement import retirement_admission_predicate
 from ditto.db.queries.scores import SCORING_QUORUM, emission_owner_key
 
 if TYPE_CHECKING:
@@ -198,6 +199,13 @@ def queue_candidate_predicate(
         agent.status == AgentStatus.EVALUATING,
         agent.screening_policy_version >= SCREENING_POLICY_VERSION,
         validator_queue_admission_predicate(bench_version=bench_version, agent=agent),
+        # A retirement can only be written against an era older than the active
+        # one, so this is a no-op for current-era work. It is here so that
+        # "retired" is a real queue exclusion rather than a label the allocator
+        # could disagree with, exactly like a withdrawal -- and because it is
+        # fleet-wide, the preview must gate on it too or it would rank a retired
+        # row as though it were next.
+        retirement_admission_predicate(bench_version=bench_version, agent=agent),
     ]
     if bench_version != 2:
         predicates.append(
@@ -842,6 +850,14 @@ async def selected_owner_agent_id(
                 else literal(True)
             ),
             validator_queue_admission_predicate(
+                bench_version=bench_version,
+                agent=sibling_agent,
+            ),
+            # A retired generation must not hold the owner's one slot. It can
+            # never be leased again, so pinning it would strand every healthy
+            # sibling behind a submission that can no longer finish -- the same
+            # failure ``owner_quorum_reachable`` above exists to prevent.
+            retirement_admission_predicate(
                 bench_version=bench_version,
                 agent=sibling_agent,
             ),

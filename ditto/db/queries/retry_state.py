@@ -22,6 +22,7 @@ from ditto.api_models.ticket_status import TicketStatus
 from ditto.db.models import (
     Agent,
     Score,
+    SubmissionRetirement,
     ValidatorQueueWithdrawal,
     ValidatorRetryRecovery,
     ValidatorTicket,
@@ -299,6 +300,21 @@ async def classify_agent_retry_states(
             )
         ).all()
     )
+    # A retired submission's benchmark generation has closed, so a retry state
+    # would be describing attempts denominated in a version no validator will
+    # ever be issued a ticket for. Treated exactly like a withdrawal here: no
+    # retry classification, which also keeps the row out of the operator
+    # "stuck" triage feed and out of the public retry chips.
+    retirements = set(
+        (
+            await session.execute(
+                select(
+                    SubmissionRetirement.agent_id,
+                    SubmissionRetirement.bench_version,
+                ).where(SubmissionRetirement.agent_id.in_(id_subq))
+            )
+        ).all()
+    )
     canonical_version = await active_bench_version(session)
 
     result: dict[UUID, AgentRetryState] = {}
@@ -314,6 +330,8 @@ async def classify_agent_retry_states(
             canonical_version=canonical_version,
         )
         if (agent_id, bench_version) in withdrawals:
+            continue
+        if (agent_id, bench_version) in retirements:
             continue
         v_scores = [s for s in all_scores if s.bench_version == bench_version]
         v_tickets = [t for t in all_tickets if t.bench_version == bench_version]
