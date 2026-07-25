@@ -38,7 +38,10 @@ from ditto.api_models.benchmark_progress import (
     BenchmarkProgress,
     benchmark_progress_signing_token,
 )
-from ditto.api_models.queue_policy_settings import QueuePolicySettings
+from ditto.api_models.queue_policy_settings import (
+    PrevGenCarryoverSettings,
+    QueuePolicySettings,
+)
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.stack_health import (
     ValidatorStackHealth,
@@ -2894,6 +2897,110 @@ class TestArtifact:
 
 
 class TestRequestJob:
+    async def test_source_backfill_declines_while_the_new_era_has_work(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Retired-era work is strictly last, fleet-wide -- not per validator.
+
+        Reaching this helper only means the polling validator's own new-era
+        lanes came back empty, which happens constantly while the queue is deep.
+        Leasing a v6 artifact on that evidence takes a slot away from a v7 queue
+        the validator simply could not see.
+        """
+        now = datetime.now(UTC)
+        rollout = MagicMock(
+            rollout_id=uuid4(), from_version=6, desired_version=7, cohort_size=10
+        )
+        session = AsyncMock()
+        session.get_bind = MagicMock(
+            return_value=MagicMock(dialect=MagicMock(name="sqlite"))
+        )
+        # No live lease on this slot, so the helper reaches new admission.
+        session.scalar = AsyncMock(return_value=None)
+        issue = AsyncMock(return_value=MagicMock())
+        outstanding = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.heartbeat_supports_version",
+            MagicMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.rollout_cohort_complete",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr("ditto.api_server.endpoints.validator.issue_ticket", issue)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.desired_era_work_outstanding",
+            outstanding,
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator._desired_era_capable_hotkeys",
+            AsyncMock(return_value={"validator-a"}),
+        )
+
+        blocked = await _issue_source_backfill_ticket(
+            session,
+            rollout=rollout,
+            heartbeat=MagicMock(),
+            validator_hotkey="validator-a",
+            now=now,
+            artifact_mode="screened_only",
+            validator_running_benchmark=False,
+            slot_id="slot-1",
+            carryover_settings=PrevGenCarryoverSettings(enabled=True),
+        )
+
+        assert blocked is None
+        issue.assert_not_awaited()
+        outstanding.assert_awaited()
+
+    async def test_source_backfill_resumes_a_live_lease_despite_the_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate guards new admission, never a benchmark already running.
+
+        Declining to resume would strand the lease until it expired and burn a
+        retry attempt for a submission that did nothing wrong.
+        """
+        now = datetime.now(UTC)
+        rollout = MagicMock(
+            rollout_id=uuid4(), from_version=6, desired_version=7, cohort_size=10
+        )
+        session = AsyncMock()
+        session.get_bind = MagicMock(
+            return_value=MagicMock(dialect=MagicMock(name="sqlite"))
+        )
+        issued = MagicMock()
+        issue = AsyncMock(return_value=issued)
+        outstanding = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.heartbeat_supports_version",
+            MagicMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.rollout_cohort_complete",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr("ditto.api_server.endpoints.validator.issue_ticket", issue)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.desired_era_work_outstanding",
+            outstanding,
+        )
+
+        ticket = await _issue_source_backfill_ticket(
+            session,
+            rollout=rollout,
+            heartbeat=MagicMock(),
+            validator_hotkey="validator-a",
+            now=now,
+            artifact_mode="screened_only",
+            validator_running_benchmark=True,
+            slot_id="slot-1",
+            carryover_settings=PrevGenCarryoverSettings(enabled=True),
+        )
+
+        assert ticket is issued
+        outstanding.assert_not_awaited()
+
     async def test_source_backfill_waits_for_top_ten_then_reuses_v6_allocator(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

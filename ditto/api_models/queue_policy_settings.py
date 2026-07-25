@@ -193,6 +193,37 @@ class PrevGenCarryoverSettings(BaseModel):
     are strictly wider than the default.
     """
 
+    require_desired_era_drained: bool = True
+    """Whether previous-generation work waits for the desired-era queue to empty.
+
+    ``True`` (the default) makes the previous generation STRICTLY the lowest
+    priority thing the fleet does: a retired-era artifact is leased only when no
+    admitted desired-era submission has an unfilled quorum slot that any capable
+    validator could take. Not a ratio, not a weighted share -- carryover and
+    source backfill issue only into a genuinely empty desired-era queue.
+
+    Lane position alone did not deliver that. Both previous-generation lanes
+    already sit at the tail of ``request_job``, but reaching them only means
+    *this validator's* desired-era lanes came back empty, and they routinely do
+    while the queue is deep: one ticket per (agent, version, validator), one
+    generation per owner, plus per-validator cooldowns. A validator would take a
+    retired-era lease and disappear for its full length while the desired-era
+    queue it could not see was still waiting on exactly that slot.
+
+    The gate is fleet-wide but not absolute, and deliberately so. Submissions
+    every capable validator is already blocked on -- scored, cooling down,
+    retry-exhausted -- do not hold it shut, so a permanently unactionable
+    backlog cannot starve the previous generation forever. Setting this
+    ``False`` restores the old lane-position-only behaviour, which drains the
+    retired era faster at the cost of the desired era's fresh submissions.
+
+    Unlike :attr:`require_cohort_complete`, this applies to BOTH previous-
+    generation lanes: the adopted carryover below and the retired-era source
+    backfill. They differ in which era's dataset the artifact runs under, not in
+    priority -- a miner waiting behind either one is waiting behind the previous
+    generation.
+    """
+
     require_cohort_complete: bool = True
     """Whether carryover waits for the inherited rescore cohort to settle.
 

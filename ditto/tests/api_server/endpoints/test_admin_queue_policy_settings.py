@@ -62,6 +62,7 @@ def _settings(**overrides: object) -> dict[str, object]:
             "include_exhausted": False,
             "dedupe_scope": "coldkey",
             "require_cohort_complete": True,
+            "require_desired_era_drained": True,
         },
     }
     settings.update(overrides)
@@ -140,6 +141,7 @@ class TestDefaultAndRoundTrip:
             "include_exhausted": False,
             "dedupe_scope": "coldkey",
             "require_cohort_complete": True,
+            "require_desired_era_drained": True,
         }
 
     async def test_apply_then_get_reflects_the_revision(
@@ -364,6 +366,7 @@ class TestWholePolicyWrites:
             "include_exhausted": False,
             "dedupe_scope": "coldkey",
             "require_cohort_complete": True,
+            "require_desired_era_drained": True,
         }
         created = await client.post(
             _URL, headers=_HEADERS, json=_payload(prev_gen_carryover=carryover)
@@ -539,6 +542,7 @@ class TestLaneModulusIsLockedDuringARollout:
                     "include_exhausted": False,
                     "dedupe_scope": "coldkey",
                     "require_cohort_complete": True,
+                    "require_desired_era_drained": True,
                 },
             ),
         )

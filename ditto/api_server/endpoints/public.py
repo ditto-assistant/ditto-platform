@@ -212,6 +212,7 @@ from ditto.db.queries.confirmation_scores import (
     confirmation_composites_by_seed,
     confirmation_depths,
 )
+from ditto.db.queries.desired_era_backlog import prev_generation_agent_ids
 from ditto.db.queries.heartbeats import (
     ActiveValidatorAssignment,
     ActiveValidatorWork,
@@ -2941,6 +2942,7 @@ def _public_activity_response(
     duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
     ath_review_opened_at: dict[UUID, datetime] | None = None,
     ath_review_composite: dict[UUID, float] | None = None,
+    prev_generation_agent_ids: set[UUID] | None = None,
     ath_only: bool = False,
     terminal_history_limit: int | None = None,
 ) -> PublicActivityResponse:
@@ -3027,9 +3029,19 @@ def _public_activity_response(
             :PROVISIONAL_CONTENDER_LANE_SIZE
         ]
     }
+    # Previous-generation submissions sort behind every current-era row, ahead
+    # of nothing but the score floor. They are served by the carryover and
+    # source-backfill lanes, which issue only into an empty current-era queue,
+    # so ranking them by arrival date alone put a stranded backlog at the head
+    # of a queue it is in fact strictly last in. Miners read this list as the
+    # order the fleet will work in, and it was telling them the opposite of the
+    # truth: the oldest stranded rows held ranks 2 through 13 while every fresh
+    # submission sat below them.
+    prev_generation = prev_generation_agent_ids or set()
     waiting_rows = sorted(
         waiting_candidates,
         key=lambda candidate: (
+            1 if candidate[0].agent.agent_id in prev_generation else 0,
             1 if candidate[1] == "below_score_floor" else 0,
             0 if candidate[0].agent.agent_id in provisional_contender_ids else 1,
             -(
@@ -3304,6 +3316,11 @@ async def activity(
         duplicate_metadata=await _duplicate_submission_metadata(session, rows),
         ath_review_opened_at=ath_opened_at,
         ath_review_composite=ath_composite,
+        prev_generation_agent_ids=await prev_generation_agent_ids(
+            session,
+            bench_version=active_version,
+            agent_ids=[row.agent.agent_id for row in rows],
+        ),
         ath_only=review == "ath",
     )
 

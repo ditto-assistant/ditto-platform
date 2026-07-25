@@ -2493,6 +2493,59 @@ class TestPublicActivity:
         ):
             assert private_value not in serialized
 
+    async def test_previous_generation_rows_rank_behind_the_current_era(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A stranded backlog must not appear to hold the head of the queue.
+
+        Pre-rollout submissions are served only by the carryover and
+        source-backfill lanes, which issue into an empty current-era queue and
+        nothing else. Ranking them by arrival alone told miners the opposite of
+        the order the fleet actually works in -- the exact report this fixes.
+        """
+        rollout_started = datetime(2026, 7, 18, 14, 30, tzinfo=UTC)
+        stranded_id = await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.EVALUATING,
+            name="stranded-prev-gen",
+            created_at=rollout_started - timedelta(days=3),
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        fresh_id = await _seed_agent(
+            session_maker,
+            miner=_MINER_B,
+            status=AgentStatus.EVALUATING,
+            name="fresh-current-era",
+            created_at=rollout_started + timedelta(days=1),
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                # Live production shape: authority taken, qualification still
+                # settling, so the rollout row is "collecting" not "activated".
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=1,
+                    desired_version=2,
+                    status="collecting",
+                    cohort_size=5,
+                    created_at=rollout_started,
+                )
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/activity")
+        by_id = {entry["agent_id"]: entry for entry in response.json()["entries"]}
+
+        # Older by arrival, last by priority.
+        assert by_id[fresh_id]["validator_queue_rank"] == 1
+        assert by_id[stranded_id]["validator_queue_rank"] == 2
+        assert by_id[stranded_id]["status"] == "waiting_validator"
+
     async def test_exposes_queue_priority_with_provisional_composites(
         self,
         app: FastAPI,
