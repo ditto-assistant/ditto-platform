@@ -19,6 +19,7 @@ import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -4904,3 +4905,67 @@ class TestQuarantineSourceInspection:
             headers=_ADMIN_HEADERS,
         )
         assert tampered.status_code == 502
+
+
+def test_shadow_review_accepts_a_full_length_provider_trajectory() -> None:
+    """A real L2/L3 escalation reports one provider stage per model call.
+
+    Analyst turns, the critic, and each adjudicator all append a stage, and
+    model failover retries add more. Production trajectories were observed
+    spanning 9 to 25 stages while this bound was 8, which rejected every
+    shadow observation with HTTP 422 and silently discarded the telemetry.
+    """
+    from ditto.api_models.screener import (
+        MAX_SHADOW_PROVIDER_STAGES,
+        ShadowReviewObservationRequest,
+        ShadowReviewUsage,
+    )
+
+    usage = ShadowReviewUsage(
+        input_tokens=849180,
+        output_tokens=11502,
+        cached_input_tokens=665728,
+        reasoning_tokens=6253,
+        estimated_cost_usd=1.59,
+        reported_cost_usd=1.18,
+    )
+    stages = 25
+    assert stages <= MAX_SHADOW_PROVIDER_STAGES
+
+    observation = ShadowReviewObservationRequest(
+        attempt_id=uuid4(),
+        artifact_sha256="ab" * 32,
+        settings_revision=1,
+        settings_scope="*",
+        settings_checksum="cd" * 32,
+        disposition="violation",
+        risk_level="high",
+        categories=("benchmark_emulation",),
+        finding_digest="ef" * 32,
+        resolution_basis="benchmark_answer_replacement",
+        clearance_path="l3_adjudicated_violation_cause",
+        critic_disposition="not_required",
+        adjudicator_disposition=None,
+        response_models=tuple(["moonshotai/kimi-k3"] * stages),
+        response_providers=tuple(["Moonshot AI"] * stages),
+        usage=usage,
+    )
+
+    assert len(observation.response_models) == stages
+    assert len(observation.response_providers) == stages
+
+    with pytest.raises(ValidationError):
+        ShadowReviewObservationRequest(
+            attempt_id=uuid4(),
+            artifact_sha256="ab" * 32,
+            settings_revision=1,
+            settings_scope="*",
+            settings_checksum="cd" * 32,
+            disposition="violation",
+            risk_level="high",
+            response_models=tuple(
+                ["moonshotai/kimi-k3"] * (MAX_SHADOW_PROVIDER_STAGES + 1)
+            ),
+            response_providers=("Moonshot AI",),
+            usage=usage,
+        )

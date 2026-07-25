@@ -156,6 +156,16 @@ class ShadowReviewUsage(BaseModel):
     reported_cost_usd: Annotated[float, Field(ge=0, le=25)] | None = None
 
 
+# One shadow observation records every provider stage the L2/L3 trajectory
+# used: each analyst turn, the critic, and every adjudicator, including model
+# failover retries. A bounded escalation therefore reports far more than a
+# handful of stages -- observed production runs span 9 to 25. The screener
+# caps this at 50 (_MAX_SHADOW_PROVIDER_STAGES in ditto_screener), and this
+# bound must not be tighter, or the platform silently rejects the telemetry it
+# asked the screener to collect.
+MAX_SHADOW_PROVIDER_STAGES = 50
+
+
 class ShadowReviewObservationRequest(BaseModel):
     """Bounded, non-authoritative observation for an active attempt."""
 
@@ -182,7 +192,10 @@ class ShadowReviewObservationRequest(BaseModel):
     def validate_bounds(self) -> ShadowReviewObservationRequest:
         if len(self.categories) > 8:
             raise ValueError("shadow review has too many categories")
-        if len(self.response_models) > 8 or len(self.response_providers) > 8:
+        if (
+            len(self.response_models) > MAX_SHADOW_PROVIDER_STAGES
+            or len(self.response_providers) > MAX_SHADOW_PROVIDER_STAGES
+        ):
             raise ValueError("shadow review has too many provider stages")
         if self.disposition in {"safe", "violation"} and self.risk_level is None:
             raise ValueError("decisive shadow review requires a risk level")
