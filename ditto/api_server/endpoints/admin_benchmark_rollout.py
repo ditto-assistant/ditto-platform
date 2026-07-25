@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
+from time import monotonic
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -40,6 +42,7 @@ from ditto.db.queries.benchmark_rollout import (
     RolloutConflictError,
     active_bench_version,
     authority_selection_state,
+    capable_validator_counts,
     create_rollout_snapshot,
     heartbeat_supports_version,
     historical_rescore_cohort,
@@ -54,6 +57,11 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 GeneratorDep = Annotated[DatasetGenerator, Depends(get_dataset_generator)]
 AdminDep = Annotated[None, Depends(require_admin)]
 MINIMUM_ROLLOUT_START_VALIDATORS = 1
+# Wall-clock budget for one read of the rollout status. Deliberately shorter
+# than the operator console's own request timeout so a slow read comes back as
+# a named 503 (or a flagged partial) from this service, rather than as a client
+# abort that names no dependency and reads like an auth failure.
+ROLLOUT_STATUS_BUDGET_SECONDS = 12.0
 
 _Reason = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=3, max_length=500)
@@ -84,6 +92,11 @@ class AdminActiveContractRequest(BaseModel):
     actor: _Actor = "admin_api"
     confirmation: str
     expected_active_version: int
+
+
+def _remaining(deadline: float) -> float:
+    """Seconds left before ``deadline``, never negative enough to skip the await."""
+    return max(deadline - monotonic(), 0.0)
 
 
 def _parse_desired_version(desired_version: str) -> int:
@@ -251,18 +264,51 @@ async def get_rollout_control(
     _: AdminDep,
     session: SessionDep,
 ) -> dict[str, object]:
-    """Advertise shipped targets and durable state without changing either."""
-    state = await rollout_state(session)
-    active = int(state["active_version"])
+    """Advertise shipped targets and durable state without changing either.
+
+    Strictly read-only and deadline-bounded. Nothing here renders a dataset,
+    calls the generate-service, or writes a row: the operator console loads this
+    on every page view, and a rollout only ever moves on a deliberate POST.
+
+    The per-contract validator count comes from one heartbeat read rather than a
+    full :func:`rollout_state` per shipped contract. The qualification lookups
+    that remain are the genuinely heavy part, so they run under the request's
+    remaining budget and degrade to an empty, explicitly-flagged list instead of
+    holding the whole page hostage. Empty is the fail-closed answer: the console
+    offers no activation it cannot prove is qualified.
+    """
+    deadline = monotonic() + ROLLOUT_STATUS_BUDGET_SECONDS
     contracts = benchmark_contracts()
-    capability_counts = {
-        contract.version: int(
-            (await rollout_state(session, capability_version=contract.version))[
-                "canary_capable_validator_count"
-            ]
-        )
-        for contract in contracts
-    }
+    try:
+        async with asyncio.timeout(_remaining(deadline)):
+            state = await rollout_state(session)
+            capability_counts = await capable_validator_counts(
+                session, versions=[contract.version for contract in contracts]
+            )
+    except TimeoutError as exc:
+        await session.invalidate()
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "benchmark rollout status exceeded its "
+                f"{ROLLOUT_STATUS_BUDGET_SECONDS:.0f}s read budget. The platform "
+                "database, not the operator token, is the dependency to check."
+            ),
+        ) from exc
+    active = int(state["active_version"])
+    targets = [contract.version for contract in contracts if contract.version > active]
+    degraded: list[str] = []
+    candidates: list[dict[str, object]] = []
+    try:
+        async with asyncio.timeout(_remaining(deadline)):
+            for version in targets:
+                candidates.append(
+                    await authority_selection_state(session, bench_version=version)
+                )
+    except TimeoutError:
+        await session.invalidate()
+        candidates = []
+        degraded = ["active_contract_candidates"]
     return {
         **state,
         "contracts": [
@@ -276,14 +322,9 @@ async def get_rollout_control(
             }
             for contract in contracts
         ],
-        "available_target_versions": [
-            contract.version for contract in contracts if contract.version > active
-        ],
-        "active_contract_candidates": [
-            await authority_selection_state(session, bench_version=contract.version)
-            for contract in contracts
-            if contract.version > active
-        ],
+        "available_target_versions": targets,
+        "active_contract_candidates": candidates,
+        "degraded_sections": degraded,
     }
 
 
