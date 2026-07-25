@@ -5971,8 +5971,17 @@
       if (!progress || !progress.stage) return "Benchmark progress not reported";
       if (progress.stage === "failed_retrying") return "Failed · a new attempt will start shortly";
       if (progress.stalled) {
-        return benchmarkStageLabel(progress.stage) + " · stalled" +
-          (progress.started_at ? ", no progress for " + elapsedDuration(progress.started_at) : "");
+        // Say what the run has actually done, not just how long it has been
+        // going: "3 of 281 checks after 45m" is diagnosable, "no progress for
+        // 45m" reads as a reporting gap and sends the operator to the wrong
+        // place. The validator is still heartbeating here — a validator that has
+        // gone quiet shows up separately as offline or stale.
+        var stalledFor = progress.started_at ? " after " + elapsedDuration(progress.started_at) : "";
+        if (progress.completed_checks != null && progress.total_checks != null) {
+          return benchmarkStageLabel(progress.stage) + " · stalled · " +
+            progress.completed_checks + " of " + progress.total_checks + " checks" + stalledFor;
+        }
+        return benchmarkStageLabel(progress.stage) + " · stalled" + stalledFor;
       }
       if (progress.percent == null) return benchmarkStageLabel(progress.stage) + " · working…";
       var text = "Benchmark " + progress.percent + "%";
@@ -6014,7 +6023,10 @@
       var ariaText = (versionLabel ? versionLabel + ". " : "") + label + ". " + text;
       var bar;
       if (determinate) {
-        var value = Math.max(0, Math.min(95, Number(progress.percent) || 0));
+        // The server already holds percent below 100 until the run reaches a
+        // terminal stage, so clamp only to the bar's own domain. Clamping to 95
+        // here would re-flatten the exact percentage the API now publishes.
+        var value = Math.max(0, Math.min(100, Number(progress.percent) || 0));
         bar = '<progress max="100" value="' + value + '" aria-label="' + esc(ariaText) + '"></progress>';
       } else {
         bar = '<span class="bench-bar" role="img" aria-label="' + esc(ariaText) + '"><i></i></span>';

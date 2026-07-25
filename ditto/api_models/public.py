@@ -1446,7 +1446,15 @@ class PublicSubmissionsResponse(BaseModel):
 
 
 class PublicBenchmarkProgress(BaseModel):
-    """Ticket-validated and coarsened public benchmark progress allowlist."""
+    """Ticket-validated public benchmark progress allowlist.
+
+    The allowlist itself is unchanged and remains closed: stage plus aggregate
+    counts, never per-case identity, question text, verdicts, seeds or timings.
+    ``percent`` is no longer quantized to 5% buckets — it is derived from the
+    exact ``completed_checks``/``total_checks`` already on this model, which an
+    observer can divide anyway, so the quantizer degraded the progress bar
+    without withholding anything.
+    """
 
     agent_id: UUID
     slot_id: str = "slot-0"
@@ -1460,17 +1468,31 @@ class PublicBenchmarkProgress(BaseModel):
     stage: BenchmarkProgressStage | None = None
     completed_checks: Annotated[int | None, Field(default=None, ge=0)] = None
     total_checks: Annotated[int | None, Field(default=None, ge=1)] = None
-    percent: Annotated[int | None, Field(default=None, ge=0, le=95, multiple_of=5)] = (
-        None
-    )
+    percent: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            le=100,
+            description=(
+                "Exact completion percentage from the reported check counts. "
+                "Held below 100 until the run reaches finalizing/submitting, so "
+                "a full bar always means the work is actually finished."
+            ),
+        ),
+    ] = None
     stalled: Annotated[
         bool,
         Field(
             default=False,
             description=(
-                "The run has sat in an early stage (preparing/building/starting "
-                "the harness) far longer than that stage should take, so it is "
-                "very likely stuck rather than progressing."
+                "The run has taken far longer than its own reported progress "
+                "allows — either sitting in an early stage (preparing/building/"
+                "generating/starting the harness) past the point that stage "
+                "should ever take, or running with a check count too frozen to "
+                "explain the elapsed time. Distinct from validator liveness: a "
+                "stalled run still heartbeats, while a validator that has "
+                "stopped reporting is surfaced as offline/heartbeat_stale."
             ),
         ),
     ] = False

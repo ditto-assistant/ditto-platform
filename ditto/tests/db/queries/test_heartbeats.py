@@ -10,15 +10,20 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import get_args
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.benchmark_progress import BenchmarkProgress
+from ditto.api_models.benchmark_progress import (
+    BenchmarkProgress,
+    BenchmarkProgressStage,
+)
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.db.models import Agent, ValidatorHeartbeat
 from ditto.db.queries.heartbeats import (
+    _STAGE_ORDER,
     live_validator_fleet_supports_protocol,
     upsert_validator_heartbeat,
 )
@@ -339,3 +344,74 @@ async def test_newer_capacity_cannot_regress_secondary_slot_progress(
     assert row.benchmark_capacity is not None
     assert row.benchmark_capacity["active"][0]["progress"]["completed"] == 9
     assert row.seen_at == base + timedelta(seconds=1)
+
+
+def test_stage_order_covers_every_wire_stage() -> None:
+    """``_STAGE_ORDER`` must be exhaustive over ``BenchmarkProgressStage``.
+
+    ``_validate_same_lease_progress`` subscripts ``_STAGE_ORDER`` directly, so a
+    stage missing from it raises ``KeyError`` rather than the
+    ``HeartbeatProgressRegressionError`` every call site catches — surfacing as a
+    500 from ``/validator/heartbeat``. mypy cannot catch the gap because a
+    ``dict[Literal, int]`` literal need not be exhaustive, so this test is the
+    only guard. It is written against ``get_args`` rather than a hardcoded list
+    so that adding a stage to the wire enum fails here until it is ordered.
+    """
+    assert set(get_args(BenchmarkProgressStage)) == set(_STAGE_ORDER)
+
+
+async def test_generating_dataset_does_not_regress_or_error(
+    session: AsyncSession,
+) -> None:
+    """A ``generating_dataset`` heartbeat is accepted after ``preparing``.
+
+    Regression test for the stage being absent from ``_STAGE_ORDER``: the second
+    upsert below raised ``KeyError`` (a 500 at the endpoint), which froze
+    ``seen_at`` and made an actively scoring validator read as heartbeat_stale.
+    """
+    agent_id = await _seed_agent(session)
+    base = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+    _, accepted = await _upsert(
+        session, agent_id, _progress("preparing", run_token="a" * 16), reported_at=base
+    )
+    assert accepted
+
+    row, accepted = await _upsert(
+        session,
+        agent_id,
+        _progress("generating_dataset", run_token="a" * 16),
+        reported_at=base + timedelta(seconds=10),
+    )
+    assert accepted
+    assert _stored(row).stage == "generating_dataset"
+    assert row.seen_at == base + timedelta(seconds=10)
+
+
+async def test_generating_dataset_is_ordered_before_running(
+    session: AsyncSession,
+) -> None:
+    """The new stage takes its place in the lifecycle, not merely a slot.
+
+    ``generating_dataset`` sits after the image is in hand and before the harness
+    starts, so a late poll reporting it must not drag a run that already reached
+    ``running_benchmark`` backwards.
+    """
+    agent_id = await _seed_agent(session)
+    base = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+    await _upsert(
+        session,
+        agent_id,
+        _progress("running_benchmark", completed=7, total=281, run_token="a" * 16),
+        reported_at=base,
+    )
+    row, accepted = await _upsert(
+        session,
+        agent_id,
+        _progress("generating_dataset", run_token="a" * 16),
+        reported_at=base + timedelta(seconds=10),
+    )
+    # Fail-open: accepted for liveness, but the stage floor holds.
+    assert accepted
+    assert _stored(row).stage == "running_benchmark"
+    assert _stored(row).completed == 7
+    assert row.seen_at == base + timedelta(seconds=10)

@@ -36,14 +36,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Every member of ``BenchmarkProgressStage`` must appear here. ``_STAGE_ORDER`` is
+# subscripted directly by :func:`_validate_same_lease_progress`, so a missing
+# stage raises ``KeyError`` — not ``HeartbeatProgressRegressionError`` — which no
+# call site catches. That escapes as a 500 from the heartbeat ingest, freezing
+# ``seen_at`` and making an actively scoring validator read as heartbeat_stale:
+# exactly the "stuck stream looks like a stuck run" confusion this module is
+# supposed to resolve. ``generating_dataset`` was added to the wire enum without
+# being added here. mypy cannot catch it (a ``dict[Literal, int]`` literal need
+# not be exhaustive), so ``test_stage_order_covers_every_wire_stage`` does.
 _STAGE_ORDER: dict[BenchmarkProgressStage, int] = {
     "preparing": 0,
     "building_harness": 1,
-    "starting_harness": 2,
-    "running_benchmark": 3,
-    "finalizing": 4,
-    "submitting_result": 5,
-    "failed_retrying": 6,
+    "generating_dataset": 2,
+    "starting_harness": 3,
+    "running_benchmark": 4,
+    "finalizing": 5,
+    "submitting_result": 6,
+    "failed_retrying": 7,
 }
 
 
