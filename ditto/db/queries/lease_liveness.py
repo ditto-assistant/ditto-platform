@@ -58,7 +58,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from prometheus_client import Counter
 from pydantic import ValidationError
@@ -98,6 +98,8 @@ REASON_HEARTBEAT_STALE = "heartbeat_stale"
 REASON_EVIDENCE_PREDATES_LEASE = "evidence_predates_lease"
 REASON_CAPACITY_UNREADABLE = "capacity_unreadable"
 REASON_SLOT_ACTIVE = "slot_active"
+REASON_SLOT_CLAIMED = "slot_claimed_but_unconfirmed"
+REASON_AGENT_CLAIMED_ELSEWHERE = "agent_claimed_on_another_slot"
 REASON_AGENT_ACTIVE_ELSEWHERE = "agent_active_on_another_slot"
 REASON_IDLE_CAPACITY = "idle_capacity_reports_slot_free"
 REASON_IDLE_STATE = "idle_state_not_running_benchmark"
@@ -132,6 +134,32 @@ class LeaseLiveness:
 
 def _assume_running(reason: str, **evidence: Any) -> LeaseLiveness:
     return LeaseLiveness(idle=False, reason=reason, evidence=evidence)
+
+
+def _claim_covers(
+    claimed_slots: Any, *, slot_id: str, agent_id: UUID
+) -> tuple[bool, str | None]:
+    """Read the signed occupancy claim: ``(claims this slot, agent's other slot)``.
+
+    Deliberately total and defensive — a malformed or absent claim yields "no
+    evidence", never an exception and never a licence to revoke. The claim can
+    only ever REFUSE a revocation, so a garbage value costs nothing but the
+    protection it would have granted.
+    """
+    if not isinstance(claimed_slots, list):
+        return False, None
+    elsewhere: str | None = None
+    for entry in claimed_slots:
+        if not isinstance(entry, dict):
+            continue
+        entry_slot = entry.get("slot_id")
+        if entry_slot == slot_id:
+            return True, None
+        if entry.get("agent_id") == str(agent_id) and isinstance(entry_slot, str):
+            # The validator moved this agent's run to a different slot. Releasing
+            # this lease kills that run just the same.
+            elsewhere = entry_slot
+    return False, elsewhere
 
 
 async def lease_liveness(
@@ -202,6 +230,27 @@ async def lease_liveness(
                     heartbeat_age_seconds=age_seconds,
                     active_slot_id=slot.slot_id,
                 )
+        # Absence from ``capacity.active`` is NOT by itself evidence of an idle
+        # slot. The stored capacity holds only the slots the ingest could confirm
+        # against a live ticket, and confirmation is an exact match on the
+        # deadline the validator cached — a re-issued lease moves that deadline
+        # and silently evicts a slot whose run is very much alive. Fall back to
+        # the signed, unfiltered occupancy claim before concluding anything.
+        claimed_slot, claimed_agent = _claim_covers(
+            heartbeat.claimed_slots, slot_id=slot_id, agent_id=ticket.agent_id
+        )
+        if claimed_slot:
+            return _assume_running(
+                REASON_SLOT_CLAIMED,
+                heartbeat_age_seconds=age_seconds,
+                active_slot_ids=[slot.slot_id for slot in capacity.active],
+            )
+        if claimed_agent is not None:
+            return _assume_running(
+                REASON_AGENT_CLAIMED_ELSEWHERE,
+                heartbeat_age_seconds=age_seconds,
+                claimed_slot_id=claimed_agent,
+            )
         return LeaseLiveness(
             idle=True,
             reason=REASON_IDLE_CAPACITY,

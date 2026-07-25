@@ -87,6 +87,7 @@ async def _seed_heartbeat(
     protocol_version: int = 11,
     state: str = "polling",
     benchmark_capacity: dict | None = None,
+    claimed_slots: list[dict] | None = None,
 ) -> None:
     async with session.begin():
         session.add(
@@ -101,6 +102,7 @@ async def _seed_heartbeat(
                 seen_at=seen_at,
                 signature="cd" * 64,
                 benchmark_capacity=benchmark_capacity,
+                claimed_slots=claimed_slots,
             )
         )
 
@@ -393,3 +395,88 @@ class TestScoreRetestLane:
         assert len(audit) == 1
         assert audit[0].action == "closed_unserviceable"
         assert audit[0].context == "score_retest"
+
+
+class TestUnconfirmedSlotIsNotIdle:
+    """A slot the ingest could not confirm must never read as proof of idleness.
+
+    ``benchmark_capacity`` holds only the slots the platform managed to confirm
+    against a live ticket. A healthy run whose lease was re-issued in place
+    signs progress with the deadline it cached, so it can be evicted from that
+    blob while still scoring. Before ``claimed_slots`` existed, that eviction was
+    indistinguishable from "the slot is free" and the run was force-expired --
+    the exact class of failure #437 was written to stop, re-entering through the
+    per-slot filter.
+    """
+
+    async def test_claimed_slot_absent_from_capacity_is_not_idle(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            benchmark_capacity=_capacity(),
+            claimed_slots=[{"slot_id": _SLOT, "agent_id": str(_AGENT)}],
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - LEASE_REPORTING_GRACE - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is False
+        assert verdict.reason == "slot_claimed_but_unconfirmed"
+
+    async def test_claimed_agent_on_another_slot_is_not_idle(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            benchmark_capacity=_capacity(),
+            claimed_slots=[{"slot_id": "slot-3", "agent_id": str(_AGENT)}],
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - LEASE_REPORTING_GRACE - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is False
+        assert verdict.reason == "agent_claimed_on_another_slot"
+
+    @pytest.mark.parametrize(
+        "claimed",
+        [
+            None,
+            [],
+            [{"slot_id": "slot-2", "agent_id": str(uuid4())}],
+            "not-a-list",
+            [None, 7, {"slot_id": None}],
+        ],
+    )
+    async def test_no_claim_covering_the_slot_still_reads_idle(
+        self, session: AsyncSession, claimed: object
+    ) -> None:
+        """The claim only ever *refuses* a revocation; it must not block a real one.
+
+        A genuinely free slot is still reclaimable, and a malformed claim is
+        treated as no evidence rather than raising.
+        """
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            benchmark_capacity=_capacity(),
+            claimed_slots=claimed,  # type: ignore[arg-type]
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - LEASE_REPORTING_GRACE - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is True
+        assert verdict.reason == "idle_capacity_reports_slot_free"

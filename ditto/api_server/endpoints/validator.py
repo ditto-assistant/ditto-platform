@@ -45,7 +45,7 @@ import re
 import statistics
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -207,6 +207,7 @@ from ditto.db.queries.scores import (
 from ditto.db.queries.tickets import (
     MAX_INFRA_RETRY_GRANTS,
     RETRY_COOLDOWN,
+    get_live_slot_ticket,
     get_open_ticket,
     infra_retry_backoff,
     issue_confirmation_ticket,
@@ -1151,13 +1152,30 @@ class _HeartbeatWork:
     active_agent_id: UUID | None
     benchmark_progress: dict | None
     benchmark_capacity: BenchmarkCapacity | None
+    # The signed occupancy claim, kept whole even when confirmation narrows
+    # ``benchmark_capacity``. Never used to grant work or accept a score --
+    # only to refuse a revocation. See ``ValidatorHeartbeat.claimed_slots``.
+    claimed_slots: list[dict] | None = None
 
 
 # What a heartbeat stores when its work payload cannot be validated: alive, but
 # making no claim about what it is running.
 _LIVENESS_ONLY_WORK = _HeartbeatWork(
-    active_agent_id=None, benchmark_progress=None, benchmark_capacity=None
+    active_agent_id=None,
+    benchmark_progress=None,
+    benchmark_capacity=None,
+    claimed_slots=None,
 )
+
+
+def _claimed_slots(capacity: BenchmarkCapacity | None) -> list[dict] | None:
+    """Project the signed capacity onto its bare (slot, agent) occupancy claim."""
+    if capacity is None:
+        return None
+    return [
+        {"slot_id": slot.slot_id, "agent_id": str(slot.agent_id)}
+        for slot in capacity.active
+    ]
 
 
 async def _validated_heartbeat_work(
@@ -1182,6 +1200,11 @@ async def _validated_heartbeat_work(
         else None
     )
     stored_benchmark_capacity = request_body.benchmark_capacity
+    # Captured BEFORE the confirmation filter below. A slot that fails to confirm
+    # is dropped from the stored capacity, and the lease liveness gate reads that
+    # absence as positive evidence the slot is idle -- so without this the filter
+    # can hand the revoker a false idle verdict for a run that is very much alive.
+    claimed = _claimed_slots(stored_benchmark_capacity)
     if stored_benchmark_capacity is not None:
         previous_heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
         previous_slots = {}
@@ -1200,14 +1223,16 @@ async def _validated_heartbeat_work(
             agent = await get_agent_by_id(
                 session, agent_id=slot.agent_id, for_update=True
             )
-            ticket = await get_open_ticket(
+            # Identity, not deadline stamp. A re-issued lease moves the deadline
+            # the validator cached, and matching on it evicted a live slot from
+            # the stored capacity: its progress vanished from the fleet view and
+            # the revoker then read the absence as proof the slot was idle.
+            ticket = await get_live_slot_ticket(
                 session,
                 agent_id=slot.agent_id,
                 validator_hotkey=validator_hotkey,
-                now=now,
-                deadline=slot.progress.ticket_deadline,
-                bench_version=slot.bench_version,
                 slot_id=slot.slot_id,
+                now=now,
                 for_update=True,
             )
             if (
@@ -1277,6 +1302,7 @@ async def _validated_heartbeat_work(
         active_agent_id=stored_active_agent_id,
         benchmark_progress=stored_benchmark_progress,
         benchmark_capacity=stored_benchmark_capacity,
+        claimed_slots=claimed,
     )
 
 
@@ -1386,7 +1412,13 @@ async def heartbeat(
             # revocation destroy healthy v7 runs (#437). With capacity NULL the
             # next `/job` claim fails closed with 428 (fresh valid benchmark
             # capacity is required) instead of revoking live work.
-            work = _LIVENESS_ONLY_WORK
+            # The occupancy claim comes straight off the verified signature and
+            # needs no ledger read, so it survives a failed work validation. It
+            # only ever refuses a revocation, so keeping it is the safe side.
+            work = replace(
+                _LIVENESS_ONLY_WORK,
+                claimed_slots=_claimed_slots(request_body.benchmark_capacity),
+            )
             VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED.labels(
                 stage="work_validation", reason=type(error).__name__
             ).inc()
@@ -1435,6 +1467,7 @@ async def heartbeat(
                 if work.benchmark_capacity is not None
                 else None
             ),
+            claimed_slots=work.claimed_slots,
             reported_at=reported_at,
             seen_at=now,
             signature=request_body.signature,

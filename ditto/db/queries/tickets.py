@@ -1104,6 +1104,44 @@ async def get_open_ticket(
     return ticket
 
 
+async def get_live_slot_ticket(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    validator_hotkey: str,
+    slot_id: str,
+    now: datetime,
+    for_update: bool = False,
+) -> ValidatorTicket | None:
+    """Return the live lease occupying one validator slot, by identity alone.
+
+    Deliberately *not* deadline-stamped, unlike :func:`get_open_ticket`. This is
+    for confirming a heartbeat's per-slot occupancy claim, where an exact
+    deadline match is the wrong test: the platform re-issues a lease in place
+    (``deadline = now + ttl``), and the validator keeps signing progress with the
+    deadline it was handed at claim time. That drift is normal and says nothing
+    about whether a run is alive, but matching on it evicts a healthy slot from
+    the stored capacity — which blanks its progress in the fleet view and, worse,
+    hands the revoker a false idle verdict.
+
+    ``(validator_hotkey, slot_id)`` is unique among issued tickets, so pinning
+    the agent as well makes this unambiguous without the deadline. Scoring still
+    goes through the exact-deadline path; nothing here accepts a score.
+    """
+    statement = select(ValidatorTicket).where(
+        ValidatorTicket.agent_id == agent_id,
+        ValidatorTicket.validator_hotkey == validator_hotkey,
+        ValidatorTicket.slot_id == slot_id,
+        ValidatorTicket.status == TicketStatus.ISSUED,
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    ticket = await session.scalar(statement)
+    if ticket is None or _as_utc(ticket.deadline) <= now:
+        return None
+    return ticket
+
+
 async def mark_ticket_scored(
     session: AsyncSession,
     *,

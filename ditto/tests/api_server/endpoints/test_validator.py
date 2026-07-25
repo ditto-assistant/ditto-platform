@@ -6839,3 +6839,152 @@ class TestTop5RolloutStanddown:
         )
 
         assert reported.status_code == 200, reported.text
+
+
+class TestReissuedLeaseKeepsSlotProgress:
+    """A lease re-issued in place must not blank its slot in the fleet view.
+
+    The platform refreshes ``deadline`` on an existing ticket row, but the
+    validator keeps signing progress with the deadline it was handed at claim
+    time. Confirming the slot on that stamp evicted a healthy run from the
+    stored capacity, so slot-1 rendered as "Benchmark progress not reported"
+    while slot-0 reported normally -- and the revoker then read the same absence
+    as evidence the slot was idle.
+    """
+
+    async def test_deadline_drift_still_publishes_every_active_slot(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        first = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, name="slot-a"
+        )
+        second = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="slot-b",
+            miner_hotkey="5SecondMiner" + "x" * 35,
+        )
+        await _seed_ticket(session_maker, first, slot_id="slot-0", bench_version=7)
+        await _seed_ticket(session_maker, second, slot_id="slot-1", bench_version=7)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        first_progress = _progress("running_benchmark", completed=3, total=283)
+        # Signed against the deadline this slot cached before its lease was
+        # re-issued. One microsecond of drift used to be enough to erase it.
+        drifted = _progress(
+            "running_benchmark",
+            completed=61,
+            total=283,
+            ticket_deadline=_TICKET_DEADLINE + timedelta(microseconds=1),
+        )
+        capacity = {
+            "configured_slots": 4,
+            "healthy_slots": ["slot-0", "slot-1", "slot-2", "slot-3"],
+            "admission": "accepting",
+            "active": [
+                {
+                    "slot_id": "slot-0",
+                    "agent_id": str(first),
+                    "bench_version": 7,
+                    "progress": first_progress,
+                },
+                {
+                    "slot_id": "slot-1",
+                    "agent_id": str(second),
+                    "bench_version": 7,
+                    "progress": drifted,
+                },
+            ],
+        }
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=10,
+                state="running_benchmark",
+                active_agent_id=first,
+                benchmark_progress=first_progress,
+                capabilities=_V9_CAPABILITIES,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert response.status_code == 200, response.text
+
+        public = (await client.get("/api/v1/public/validators")).json()["validators"][0]
+        assert [item["slot_id"] for item in public["active_benchmarks"]] == [
+            "slot-0",
+            "slot-1",
+        ]
+        by_slot = {item["slot_id"]: item for item in public["active_benchmarks"]}
+        assert by_slot["slot-1"]["stage"] == "running_benchmark"
+        assert by_slot["slot-1"]["completed_checks"] == 61
+        # Every assigned slot resolves to real progress, so nothing renders as
+        # "Benchmark progress not reported".
+        assert all(item["stage"] is not None for item in public["assigned_benchmarks"])
+
+    async def test_unconfirmed_slot_is_recorded_as_a_claim(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The signed occupancy claim is stored whole, before confirmation."""
+        agent = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, name="slot-a"
+        )
+        stray = uuid4()
+        await _seed_ticket(session_maker, agent, slot_id="slot-0", bench_version=7)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        confirmed = _progress("running_benchmark", completed=3, total=283)
+        capacity = {
+            "configured_slots": 2,
+            "healthy_slots": ["slot-0", "slot-1"],
+            "admission": "accepting",
+            "active": [
+                {
+                    "slot_id": "slot-0",
+                    "agent_id": str(agent),
+                    "bench_version": 7,
+                    "progress": confirmed,
+                },
+                {
+                    # No ticket for this one: it drops out of the confirmed
+                    # capacity but must survive as a claim.
+                    "slot_id": "slot-1",
+                    "agent_id": str(stray),
+                    "bench_version": 7,
+                    "progress": _progress("running_benchmark", completed=9, total=283),
+                },
+            ],
+        }
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=10,
+                state="running_benchmark",
+                active_agent_id=agent,
+                benchmark_progress=confirmed,
+                capabilities=_V9_CAPABILITIES,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert response.status_code == 200, response.text
+        async with session_maker() as s:
+            row = await s.get(ValidatorHeartbeat, _KEYPAIR.ss58_address)
+            assert row is not None
+            stored = row.benchmark_capacity
+            assert stored is not None
+            assert [slot["slot_id"] for slot in stored["active"]] == ["slot-0"]
+            assert row.claimed_slots == [
+                {"slot_id": "slot-0", "agent_id": str(agent)},
+                {"slot_id": "slot-1", "agent_id": str(stray)},
+            ]
