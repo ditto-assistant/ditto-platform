@@ -283,6 +283,13 @@ class TestDashboard:
         assert '"Provisional " + fx(Number(entry.provisional_composite))' in body
         assert "Highest current priority; validator eligibility can vary" in body
         assert ">Up next</span>" in body
+        # Rank 1 alone must never earn the badge: a gated row can hold the head
+        # of the list while no validator is able to lease it.
+        assert "&& !queueGate;" in body
+        assert "function queueGateLabel(entry)" in body
+        assert 'class="pipeline-gate-badge"' in body
+        for gate in ("previous_generation", "owner_serialized", "not_leasable"):
+            assert gate + ": {" in body
         assert "Evaluating" in body
         assert 'id="pipeline-scored"' in body
         assert 'data-pipeline-stage="scored"' in body

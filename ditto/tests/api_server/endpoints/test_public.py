@@ -413,10 +413,18 @@ async def _seed_k3(
     details: dict | None = None,
     base_time: datetime = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
     created_at: datetime | None = None,
+    accepted_tickets: bool = True,
 ) -> str:
     """Seed one agent scored by ``len(composites)`` distinct validators.
 
     Returns the agent_id (hex str) so a test can hit the detail endpoint.
+
+    ``accepted_tickets`` records the SCORED ticket each score came from, which
+    is the only shape production ever has: a validator cannot post a score
+    without holding a ticket for the submission. It matters because the
+    allocator's contender lane counts *accepted tickets*, not recorded scores,
+    so a fixture with scores and no tickets silently disables the lane it is
+    trying to exercise.
     """
     validators = [
         "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
@@ -460,6 +468,22 @@ async def _seed_k3(
                 details=details,
                 bench_version=bench_version,
             )
+            if accepted_tickets:
+                s.add(
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        bench_version=bench_version,
+                        validator_hotkey=validators[i],
+                        slot_id="slot-0",
+                        status=TicketStatus.SCORED,
+                        purpose=TicketPurpose.CANONICAL_QUORUM,
+                        purpose_revision=1,
+                        issued_at=base_time + timedelta(minutes=i),
+                        deadline=base_time + timedelta(minutes=i + 90),
+                        attempt_count=1,
+                        manual_retry_grants=0,
+                    )
+                )
     return str(agent_id)
 
 
@@ -2444,6 +2468,7 @@ class TestPublicActivity:
             "score_count",
             "provisional_composite",
             "validator_queue_rank",
+            "validator_queue_gate",
             "previous_generation",
             "quorum",
             "retry_state",
@@ -2602,6 +2627,24 @@ class TestPublicActivity:
         # integer rank; only this distinguishes a stranded row from a queued one.
         assert by_id[stranded_id]["previous_generation"] is True
         assert by_id[fresh_id]["previous_generation"] is False
+        # ``previous_generation`` is the era-specific case of the general gate,
+        # read off the same shared preview so the two cannot disagree.
+        assert by_id[stranded_id]["validator_queue_gate"] == "previous_generation"
+        assert by_id[fresh_id]["validator_queue_gate"] is None
+
+        # The operations board renders the pipeline the miners actually look
+        # at, and it never received #448's ranking fix: it called the
+        # projection without the previous-generation set at all, so a stranded
+        # backlog kept holding rank 1 there -- badged "Up next" -- after
+        # /activity was corrected. Both endpoints now go through one preview.
+        operations = (await client.get("/api/v1/public/operations")).json()
+        ops_by_id = {
+            entry["agent_id"]: entry for entry in operations["activity"]["entries"]
+        }
+        assert ops_by_id[fresh_id]["validator_queue_rank"] == 1
+        assert ops_by_id[stranded_id]["validator_queue_rank"] == 2
+        assert ops_by_id[stranded_id]["validator_queue_gate"] == "previous_generation"
+        assert ops_by_id[stranded_id]["previous_generation"] is True
 
     async def test_flags_a_previous_generation_row_that_holds_rank_one(
         self,
@@ -2646,6 +2689,9 @@ class TestPublicActivity:
 
         assert by_id[stranded_id]["validator_queue_rank"] == 1
         assert by_id[stranded_id]["previous_generation"] is True
+        # The gate is what the badge must key on: rank 1 in a stalled lane is
+        # exactly the arrangement that made "Up next" a lie.
+        assert by_id[stranded_id]["validator_queue_gate"] == "previous_generation"
 
     async def test_exposes_queue_priority_with_provisional_composites(
         self,
@@ -2698,9 +2744,17 @@ class TestPublicActivity:
         assert by_id[one_high_id]["validator_queue_rank"] == 1
         assert by_id[high_id]["validator_queue_rank"] == 2
         assert by_id[zero_id]["validator_queue_rank"] == 3
-        assert by_id[one_id]["validator_queue_rank"] == 4
-        assert by_id[low_id]["validator_queue_rank"] == 5
+        assert by_id[low_id]["validator_queue_rank"] == 4
+        # ``one`` and ``high`` are the same miner's submissions, and ``high``
+        # has already started progressing, so the allocator pins that owner's
+        # single slot to it. ``one`` cannot be leased until ``high`` settles --
+        # previously the preview ranked it fourth as though nothing were in its
+        # way, which is the "why isn't mine moving" case with no explanation.
+        assert by_id[one_id]["validator_queue_rank"] == 5
+        assert by_id[one_id]["validator_queue_gate"] == "owner_serialized"
         assert by_id[low_id]["status"] == "below_score_floor"
+        # A below-floor row is still leasable, just last.
+        assert by_id[low_id]["validator_queue_gate"] is None
         assert by_id[zero_id]["provisional_composite"] is None
         assert by_id[one_id]["provisional_composite"] == pytest.approx(0.5)
         assert by_id[one_high_id]["provisional_composite"] == pytest.approx(0.95)
@@ -4344,6 +4398,10 @@ class TestPublicActivity:
                 composites=[0.91, 0.92, 0.93],
                 status=AgentStatus.SCORED,
                 details={"bench_version": 2},
+                # This test writes its own continual-retest tickets on the same
+                # composite key, so the helper must not also seed the canonical
+                # quorum tickets.
+                accepted_tickets=False,
             )
         )
         now = datetime.now(UTC)

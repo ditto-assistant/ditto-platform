@@ -20,19 +20,13 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
-from sqlalchemy import and_, case, func, literal, or_, select
-from sqlalchemy.orm import aliased
+from sqlalchemy import func, select
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_contract import benchmark_contract
-from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.db.models import (
     Agent,
-    BenchmarkDataset,
-    BenchmarkRollout,
-    EvaluationPayment,
-    Score,
     ValidatorTicket,
 )
 from ditto.db.queries.audit import (
@@ -42,12 +36,21 @@ from ditto.db.queries.audit import (
 from ditto.db.queries.benchmark_admission import (
     activated_rollout_for_version,
     benchmark_admission_predicate,
-    validator_queue_admission_predicate,
 )
 from ditto.db.queries.lease_liveness import maybe_force_expire_lease
+from ditto.db.queries.queue_order import (
+    EMISSION_CONTENDER_COUNT,
+    PROVISIONAL_CONTENDER_LANE_SIZE,
+    eligible_screened_image_predicate,
+    owner_live_lease_agent_ids,
+    queue_candidate_predicate,
+    queue_order_terms,
+    resolve_fifo_start_at,
+    resolve_owner_linkage,
+    selected_owner_agent_id,
+)
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
-    emission_owner_key,
     list_eligible_ledger,
 )
 
@@ -119,20 +122,10 @@ def ticket_attempt_cap(ticket: ValidatorTicket) -> int:
     )
 
 
-# The KOTH champion plus four participation-tail miners receive emissions.
-# Ticket continuation uses the current fifth finalized score as a dynamic floor,
-# but only after two scores: with median-of-three, the highest final score still
-# reachable from two observations is their maximum. A single low first score is
-# never sufficient to eliminate a submission because two later high scores can
-# make that first score irrelevant to the median.
-EMISSION_CONTENDER_COUNT = 5
-
-# Advance a bounded set of likely leaderboard contenders before the ordinary
-# coverage rounds. Keeping one best submission per miner in this small lane
-# lets a strong 1-of-3 result reach 2-of-3 quickly and still finishes strong
-# 2-of-3 submissions, without allowing the whole scored backlog to starve new
-# miners.
-PROVISIONAL_CONTENDER_LANE_SIZE = 10
+# ``EMISSION_CONTENDER_COUNT`` and ``PROVISIONAL_CONTENDER_LANE_SIZE`` now live
+# beside the ordering they parameterize, in
+# :mod:`ditto.db.queries.queue_order`, and are re-exported here for the callers
+# that already import them from this module.
 
 
 async def get_score_priority_floors(
@@ -294,15 +287,8 @@ async def issue_ticket(
         session, bench_version=bench_version
     )
     if fifo_start_at is None:
-        fifo_start_at = (
-            activated_rollout.created_at
-            if activated_rollout is not None
-            else await session.scalar(
-                select(BenchmarkRollout.created_at)
-                .where(BenchmarkRollout.desired_version == bench_version)
-                .order_by(BenchmarkRollout.created_at.desc())
-                .limit(1)
-            )
+        fifo_start_at = await resolve_fifo_start_at(
+            session, bench_version=bench_version, rollout=activated_rollout
         )
     contract = benchmark_contract(bench_version)
     requires_screened = (
@@ -312,16 +298,8 @@ async def issue_ticket(
     # A validator slot executes one benchmark at a time. Polling the same slot
     # again (including after a process restart) must resume that still-live
     # lease instead of allocating unrelated work and leaving it stranded.
-    complete_screened_image = (
-        Agent.screened_image_sha256.is_not(None)
-        & Agent.screened_image_size_bytes.is_not(None)
-        & Agent.screened_image_id.is_not(None)
-        & Agent.screened_image_ref.is_not(None)
-        & Agent.screened_image_upload_id.is_not(None)
-        & Agent.screened_image_verified_at.is_not(None)
-    )
-    eligible_screened_image = complete_screened_image & (
-        Agent.screening_policy_version >= contract.minimum_screening_policy_version
+    eligible_screened_image = eligible_screened_image_predicate(
+        bench_version=bench_version
     )
     rollout_admitted = None
     if activated_rollout is not None:
@@ -425,176 +403,19 @@ async def issue_ticket(
             )
         ),
     )
-    had_prior_ticket = (
-        select(ValidatorTicket.agent_id)
-        .where(
-            ValidatorTicket.agent_id == Agent.agent_id,
-            ValidatorTicket.validator_hotkey == validator_hotkey,
-        )
-        .correlate(Agent)
-        .exists()
-    )
-    live_assignment_count = (
-        select(func.count())
-        .where(
-            ValidatorTicket.agent_id == Agent.agent_id,
-            ValidatorTicket.bench_version == bench_version,
-            ValidatorTicket.status == TicketStatus.ISSUED,
-            ValidatorTicket.deadline > now,
-        )
-        .correlate(Agent)
-        .scalar_subquery()
-    )
-    provisional_composite = func.coalesce(
-        (
-            select(func.avg(Score.composite))
-            .where(
-                Score.agent_id == Agent.agent_id,
-                Score.bench_version == bench_version,
-            )
-            .correlate(Agent)
-            .scalar_subquery()
-        ),
-        0.0,
-    )
-    recorded_score_count = (
-        select(func.count(Score.validator_hotkey))
-        .where(
-            Score.agent_id == Agent.agent_id,
-            Score.bench_version == bench_version,
-        )
-        .correlate(Agent)
-        .scalar_subquery()
-    )
-    highest_recorded_score = func.coalesce(
-        (
-            select(func.max(Score.composite))
-            .where(
-                Score.agent_id == Agent.agent_id,
-                Score.bench_version == bench_version,
-            )
-            .correlate(Agent)
-            .scalar_subquery()
-        ),
-        0.0,
-    )
-    # A median-of-three cannot be bounded safely after one score. Once two
-    # scores exist, their maximum is the best final median the third score can
-    # produce, so a submission whose strict upper bound sits below this era's
-    # finalized fifth place cannot reach the emission set. That earns it last
-    # place in the queue, not removal: the third score still finalizes the
-    # submission for the public record, and deferring rather than dropping it
-    # means a later floor move (or a new benchmark era, where the old floor
-    # never applied) cannot strand it at 2-of-3 forever. When the era has no
-    # floor yet, every candidate shares lane 0 and ordering is unchanged.
-    below_floor_lane = (
-        case(
-            (
-                (recorded_score_count == SCORING_QUORUM - 1)
-                & (highest_recorded_score < score_continuation_floor),
-                1,
-            ),
-            else_=0,
-        )
-        if score_continuation_floor is not None
-        else literal(0)
-    )
-    contender = aliased(Agent)
-    contender_accepted_score_count = (
-        select(func.count())
-        .where(
-            ValidatorTicket.agent_id == contender.agent_id,
-            ValidatorTicket.bench_version == bench_version,
-            ValidatorTicket.status == TicketStatus.SCORED,
-        )
-        .correlate(contender)
-        .scalar_subquery()
-    )
-    contender_recorded_score_count = (
-        select(func.count(Score.validator_hotkey))
-        .where(
-            Score.agent_id == contender.agent_id,
-            Score.bench_version == bench_version,
-        )
-        .correlate(contender)
-        .scalar_subquery()
-    )
-    contender_first_score = (
-        select(Score.composite)
-        .where(
-            Score.agent_id == contender.agent_id,
-            Score.bench_version == bench_version,
-        )
-        .order_by(Score.created_at.asc(), Score.validator_hotkey.asc())
-        .limit(1)
-        .correlate(contender)
-        .scalar_subquery()
-    )
-    contender_provisional_composite = (
-        select(func.avg(Score.composite))
-        .where(
-            Score.agent_id == contender.agent_id,
-            Score.bench_version == bench_version,
-        )
-        .correlate(contender)
-        .scalar_subquery()
-    )
-    contender_payment = aliased(EvaluationPayment)
-    contender_owner = emission_owner_key(agent=contender, payment=contender_payment)
-    contender_per_miner = (
-        select(
-            contender.agent_id.label("agent_id"),
-            contender.created_at.label("created_at"),
-            contender_provisional_composite.label("provisional_composite"),
-            func.row_number()
-            .over(
-                partition_by=contender_owner,
-                order_by=(
-                    contender_provisional_composite.desc(),
-                    contender.created_at.asc(),
-                    contender.agent_id.asc(),
-                ),
-            )
-            .label("miner_rank"),
-        )
-        .outerjoin(
-            contender_payment,
-            contender_payment.agent_id == contender.agent_id,
-        )
-        .where(
-            contender.status == AgentStatus.EVALUATING,
-            contender.screening_policy_version >= SCREENING_POLICY_VERSION,
-            contender_accepted_score_count.between(1, SCORING_QUORUM - 1),
-            contender_recorded_score_count >= contender_accepted_score_count,
-            (
-                contender_first_score >= provisional_contender_floor
-                if provisional_contender_floor is not None
-                else literal(True)
-            ),
-        )
-        .subquery()
-    )
-    top_provisional_contenders = (
-        select(contender_per_miner.c.agent_id)
-        .where(contender_per_miner.c.miner_rank == 1)
-        .order_by(
-            contender_per_miner.c.provisional_composite.desc(),
-            contender_per_miner.c.created_at.asc(),
-            contender_per_miner.c.agent_id.asc(),
-        )
-        .limit(PROVISIONAL_CONTENDER_LANE_SIZE)
-    )
-    contender_lane = case(
-        (Agent.agent_id.in_(top_provisional_contenders), 0),
-        else_=1,
-    )
-    contender_lane_score = case(
-        (Agent.agent_id.in_(top_provisional_contenders), provisional_composite),
-        else_=0.0,
-    )
-    overflow_two_score_lane = case(
-        (recorded_score_count >= SCORING_QUORUM - 1, 1),
-        else_=0,
+    # Every lane, tiebreak, and floor comparison below is built by
+    # :func:`ditto.db.queries.queue_order.queue_order_terms`, which the public
+    # queue preview composes from the same call. Restating the order here is
+    # what produced three miner-visible divergences in one evening.
+    queue_order = queue_order_terms(
+        bench_version=bench_version,
+        now=now,
+        artifact_mode=artifact_mode,
+        fifo_start_at=fifo_start_at,
+        score_continuation_floor=score_continuation_floor,
+        provisional_contender_floor=provisional_contender_floor,
+        completion_first=completion_first,
+        validator_hotkey=validator_hotkey,
     )
     # Lock one candidate Agent row before counting its tickets. The recount is a
     # separate statement after the lock is acquired, so under Postgres READ
@@ -602,68 +423,26 @@ async def issue_ticket(
     # SKIP LOCKED lets unrelated agents continue allocating concurrently.
     skipped: list[UUID] = []
     while True:
+        # The validator-independent half of the filter is shared with the queue
+        # preview, so "would the allocator even look at this row" has one
+        # answer. The per-validator half (``already_mine``) and this loop's
+        # ``skipped`` set stay here: neither has a fleet-wide truth value.
         candidate = select(Agent.agent_id).where(
-            Agent.status == AgentStatus.EVALUATING,
-            Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
-            validator_queue_admission_predicate(bench_version=bench_version),
+            *queue_candidate_predicate(
+                bench_version=bench_version,
+                artifact_mode=artifact_mode,
+                rollout=activated_rollout,
+                submitted_at_or_after=(
+                    None if only_agent_ids is not None else submitted_at_or_after
+                ),
+            )
         )
         if not completion_first:
             candidate = candidate.where(Agent.agent_id.not_in(already_mine))
-        if bench_version != 2:
-            versioned_dataset = (
-                select(BenchmarkDataset.agent_id)
-                .where(
-                    BenchmarkDataset.agent_id == Agent.agent_id,
-                    BenchmarkDataset.bench_version == bench_version,
-                )
-                .exists()
-            )
-            candidate = candidate.where(versioned_dataset)
-        if requires_screened:
-            candidate = candidate.where(eligible_screened_image)
-        if rollout_admitted is not None:
-            candidate = candidate.where(rollout_admitted)
         if only_agent_ids is not None:
             candidate = candidate.where(Agent.agent_id.in_(set(only_agent_ids)))
-        elif submitted_at_or_after is not None:
-            candidate = candidate.where(Agent.created_at >= submitted_at_or_after)
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
-        fifo_age = (
-            case(
-                (Agent.created_at < fifo_start_at, fifo_start_at),
-                else_=Agent.created_at,
-            )
-            if fifo_start_at is not None
-            else Agent.created_at
-        )
-        queue_order = (
-            (
-                # Keep the fresh-submission lane independent of the ordinary
-                # queue's contender, coverage, artifact, and continuation-floor
-                # priorities. Age is the contract; UUID is only a stable tie.
-                fifo_age.asc(),
-                Agent.agent_id.asc(),
-            )
-            if completion_first
-            else (
-                below_floor_lane.asc(),
-                case(
-                    (complete_screened_image, 0),
-                    else_=(0 if artifact_mode == "legacy" else 1),
-                ).asc(),
-                contender_lane.asc(),
-                contender_lane_score.desc(),
-                # Keep the existing bounded-contender guarantee: a two-score
-                # row outside the top contender set must not turn the whole
-                # backlog into an unbounded completion lane.
-                overflow_two_score_lane.asc(),
-                live_assignment_count.asc(),
-                had_prior_ticket.asc(),
-                fifo_age.asc(),
-                Agent.agent_id.asc(),
-            )
-        )
         candidate = (
             # The ordinary queue first advances the bounded set of strongest
             # scored provisional contenders, one best submission per miner. A
@@ -688,56 +467,14 @@ async def issue_ticket(
         # generation selected until it settles. The post-lock checks close the
         # race where two platform replicas select different agents for the same
         # owner before either ticket exists.
-        owner_row = (
-            await session.execute(
-                select(Agent.miner_hotkey, EvaluationPayment.miner_coldkey)
-                .outerjoin(
-                    EvaluationPayment,
-                    EvaluationPayment.agent_id == Agent.agent_id,
-                )
-                .where(Agent.agent_id == agent_id)
-            )
-        ).one()
-        owner_hotkey, owner_coldkey = owner_row
-        linked_coldkeys = {
-            coldkey
-            for coldkey in (
-                await session.scalars(
-                    select(EvaluationPayment.miner_coldkey)
-                    .where(
-                        EvaluationPayment.miner_hotkey == owner_hotkey,
-                        EvaluationPayment.miner_coldkey.is_not(None),
-                    )
-                    .distinct()
-                )
-            ).all()
-            if coldkey is not None
-        }
-        if owner_coldkey is not None:
-            linked_coldkeys.add(owner_coldkey)
-        linked_hotkeys = {owner_hotkey}
-        if linked_coldkeys:
-            linked_hotkeys.update(
-                (
-                    await session.scalars(
-                        select(EvaluationPayment.miner_hotkey)
-                        .where(EvaluationPayment.miner_coldkey.in_(linked_coldkeys))
-                        .distinct()
-                    )
-                ).all()
-            )
+        linkage = await resolve_owner_linkage(session, agent_id=agent_id)
         if session.get_bind().dialect.name == "postgresql":
             # A legacy row inherits every payment-time coldkey previously
             # observed for its hotkey. Lock those identities in sorted order,
             # so it also serializes with a paid generation submitted after a
             # hotkey rotation. A truly unlinked legacy row falls back to its
             # hotkey. The canonical ordering prevents multi-key deadlocks.
-            owner_lock_keys = (
-                [f"coldkey:{coldkey}" for coldkey in sorted(linked_coldkeys)]
-                if linked_coldkeys
-                else [f"hotkey:{owner_hotkey}"]
-            )
-            for owner_lock_key in owner_lock_keys:
+            for owner_lock_key in linkage.advisory_lock_keys:
                 await session.execute(
                     select(
                         func.pg_advisory_xact_lock(
@@ -745,38 +482,9 @@ async def issue_ticket(
                         )
                     )
                 )
-        sibling_agent = aliased(Agent)
-        sibling_payment = aliased(EvaluationPayment)
-        same_owner = (
-            or_(
-                sibling_payment.miner_coldkey.in_(linked_coldkeys),
-                and_(
-                    sibling_payment.miner_coldkey.is_(None),
-                    sibling_agent.miner_hotkey.in_(linked_hotkeys),
-                ),
-            )
-            if linked_coldkeys
-            else and_(
-                sibling_payment.miner_coldkey.is_(None),
-                sibling_agent.miner_hotkey == owner_hotkey,
-            )
-        )
-        live_sibling_count = await session.scalar(
-            select(func.count())
-            .select_from(ValidatorTicket)
-            .join(sibling_agent, sibling_agent.agent_id == ValidatorTicket.agent_id)
-            .outerjoin(
-                sibling_payment,
-                sibling_payment.agent_id == sibling_agent.agent_id,
-            )
-            .where(
-                sibling_agent.agent_id != agent_id,
-                ValidatorTicket.status == TicketStatus.ISSUED,
-                ValidatorTicket.deadline > now,
-                same_owner,
-            )
-        )
-        if (live_sibling_count or 0) > 0:
+        if await owner_live_lease_agent_ids(session, linkage=linkage, now=now) - {
+            agent_id
+        }:
             skipped.append(agent_id)
             continue
 
@@ -787,70 +495,15 @@ async def issue_ticket(
         # generation. Historical overlaps converge deterministically on the
         # generation whose accepted/live progress began first. Expired-only
         # attempts do not pin an owner, so failed work can still drain.
-        owner_progress_started_at = (
-            select(func.min(ValidatorTicket.issued_at))
-            .where(
-                ValidatorTicket.agent_id == sibling_agent.agent_id,
-                ValidatorTicket.bench_version == bench_version,
-                (
-                    (ValidatorTicket.status == TicketStatus.SCORED)
-                    | (
-                        (ValidatorTicket.status == TicketStatus.ISSUED)
-                        & (ValidatorTicket.deadline > now)
-                    )
-                ),
-            )
-            .correlate(sibling_agent)
-            .scalar_subquery()
+        owner_selected_agent_id = await selected_owner_agent_id(
+            session,
+            linkage=linkage,
+            bench_version=bench_version,
+            now=now,
+            provisional_contender_floor=provisional_contender_floor,
+            rollout=activated_rollout,
         )
-        owner_first_score = (
-            select(Score.composite)
-            .where(
-                Score.agent_id == sibling_agent.agent_id,
-                Score.bench_version == bench_version,
-            )
-            .order_by(Score.created_at.asc(), Score.validator_hotkey.asc())
-            .limit(1)
-            .correlate(sibling_agent)
-            .scalar_subquery()
-        )
-        selected_owner_agent_id = await session.scalar(
-            select(sibling_agent.agent_id)
-            .outerjoin(
-                sibling_payment,
-                sibling_payment.agent_id == sibling_agent.agent_id,
-            )
-            .where(
-                sibling_agent.status == AgentStatus.EVALUATING,
-                same_owner,
-                owner_progress_started_at.is_not(None),
-                (
-                    owner_first_score >= provisional_contender_floor
-                    if provisional_contender_floor is not None
-                    else literal(True)
-                ),
-                (
-                    benchmark_admission_predicate(
-                        rollout=activated_rollout,
-                        bench_version=bench_version,
-                        agent=sibling_agent,
-                    )
-                    if activated_rollout is not None
-                    else literal(True)
-                ),
-                validator_queue_admission_predicate(
-                    bench_version=bench_version,
-                    agent=sibling_agent,
-                ),
-            )
-            .order_by(
-                owner_progress_started_at.asc(),
-                sibling_agent.created_at.asc(),
-                sibling_agent.agent_id.asc(),
-            )
-            .limit(1)
-        )
-        if selected_owner_agent_id is not None and selected_owner_agent_id != agent_id:
+        if owner_selected_agent_id is not None and owner_selected_agent_id != agent_id:
             skipped.append(agent_id)
             continue
         occupied = await session.scalar(

@@ -136,6 +136,34 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   `rejected`. `artifact_release` exposes only the derived quorum/embargo state;
   signed download URLs, source hashes, payments, and raw screener/build logs are
   never included in this listing.
+  Each waiting entry also carries `validator_queue_rank` and
+  `validator_queue_gate` — the queue preview, described next.
+- **Queue preview (`validator_queue_rank` + `validator_queue_gate`).** Both the
+  preview and the allocator that issues tickets read one ordering,
+  `ditto.db.queries.queue_order.queue_order_terms`: the allocator composes it
+  with `LIMIT 1` and a row lock, the preview composes the identical SQL with no
+  limit. There is no second implementation to keep in sync, which is the whole
+  reason the module exists — the preview used to restate the order in Python
+  and drifted from the fleet three separate times.
+  It is an **ordering, not a prediction of the next assignment**, and the
+  difference is structural rather than a shortcoming to be fixed later. Three
+  of the allocator's rules have no fleet-wide truth value:
+  - **one score per validator** — a validator that already scored a submission
+    is excluded from it, so every validator sees a different queue;
+  - **per-validator retry cooldowns and attempt budgets** — a row a validator
+    failed on is invisible to *that* validator until its cooldown lapses;
+  - **coverage tiebreak and artifact mode** — whether a validator has held a
+    submission before, and whether it prefers screened images, are properties
+    of the validator, not of the queue.
+  A global list cannot carry any of them, so rank 1 means "first in the shared
+  order", not "scored next". `validator_queue_gate` is the honest half the
+  preview *can* answer: `previous_generation` (retired-era work the fleet
+  serves only once the current era drains), `owner_serialized` (another
+  submission from the same paid owner holds that owner's single validator slot
+  — rotating hotkeys does not buy a second one), or `not_leasable` (excluded by
+  the allocator's candidate filter). A non-null gate means no validator can
+  take the row on its next poll regardless of rank, and consumers must not
+  present it as imminent.
 - `GET /api/v1/public/agent/{agent_id}/pipeline` → versioned screening history,
   validator assignment progress, and `provisional_scores` as soon as the
   platform accepts them. Each score exposes only `composite`, the post-commit
