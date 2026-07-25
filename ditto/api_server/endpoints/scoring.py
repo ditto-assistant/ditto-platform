@@ -34,6 +34,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from ditto.api_models import ConfirmationScoreRecord, LedgerEntry, LedgerResponse
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_models.validator import LedgerScoreProof
+from ditto.api_server.continual_retest_settings import aggregate_is_active
 from ditto.api_server.efficiency import effective_composite
 from ditto.api_server.endpoints.validator import (
     ChainDep,
@@ -306,10 +307,16 @@ async def scores(
             [r.agent_id for r in rows],
             bench_versions={r.agent_id: r.bench_version for r in rows},
         )
-        continual_mean_active = await live_validator_fleet_supports_protocol(
+        fleet_protocol_ready = await live_validator_fleet_supports_protocol(
             session,
             minimum_protocol=_CONTINUAL_MEAN_PROTOCOL,
             now=auth_now,
+        )
+        continual_settings = await request.app.state.continual_retest_settings.resolve(
+            getattr(request.app.state, "session_maker", None)
+        )
+        continual_mean_active = aggregate_is_active(
+            continual_settings, fleet_protocol_ready=fleet_protocol_ready
         )
         # Frozen relative token-efficiency bonuses (bench_version >= 7) are
         # surfaced to validators only behind the fold flag; with it off the

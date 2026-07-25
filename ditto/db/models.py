@@ -2524,3 +2524,51 @@ class EfficiencyBonusSettingsRevision(Base):
             name="efficiency_bonus_settings_scope_parent_key",
         ),
     )
+
+
+class ContinualRetestSettingsRevision(Base):
+    """Append-only operator policy for continual aggregation and idle waves."""
+
+    __tablename__ = "continual_retest_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("scope = '*'", name="continual_retest_settings_scope_check"),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="continual_retest_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="continual_retest_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="continual_retest_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="continual_retest_settings_actor_check",
+        ),
+        Index(
+            "continual_retest_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="continual_retest_settings_scope_parent_key",
+        ),
+    )

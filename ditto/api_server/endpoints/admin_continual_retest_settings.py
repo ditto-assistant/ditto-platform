@@ -1,0 +1,156 @@
+"""Audited hot-swappable controls for continual top-five retesting."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import UTC, datetime, timedelta
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ditto.api_models.continual_retest_settings import (
+    AdminContinualRetestSettingsRequest,
+    AdminContinualRetestSettingsResponse,
+    ContinualRetestSettings,
+    ContinualRetestSettingsRevision,
+    EffectiveContinualRetestSettings,
+)
+from ditto.api_server.continual_retest_settings import (
+    DEFAULT_SETTINGS,
+    ContinualRetestSettingsResolver,
+    aggregate_is_active,
+    settings_from_row,
+)
+from ditto.api_server.dependencies import get_session
+from ditto.api_server.endpoints.admin_quarantine import require_admin
+from ditto.db.models import ContinualRetestSettingsRevision as RevisionRow
+from ditto.db.queries.continual_retest_settings import (
+    GLOBAL_SCOPE,
+    insert_continual_retest_settings_revision,
+    latest_continual_retest_settings_revision,
+    list_continual_retest_settings_revisions,
+)
+from ditto.db.queries.heartbeats import live_validator_fleet_supports_protocol
+
+router = APIRouter(prefix="/admin/continual-retest-settings", tags=["admin"])
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+AdminDep = Annotated[None, Depends(require_admin)]
+_REQUIRED_PROTOCOL = 14
+_FRESHNESS = timedelta(minutes=15)
+
+
+def _checksum(settings: ContinualRetestSettings) -> str:
+    encoded = json.dumps(
+        settings.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _revision(row: RevisionRow) -> ContinualRetestSettingsRevision:
+    return ContinualRetestSettingsRevision(
+        revision=row.revision,
+        parent_revision=row.parent_revision,
+        scope=row.scope,
+        settings=ContinualRetestSettings.model_validate(row.settings),
+        reason=row.reason,
+        actor=row.actor,
+        created_at=row.created_at,
+        checksum=row.checksum,
+    )
+
+
+def _resolver(request: Request) -> ContinualRetestSettingsResolver:
+    resolver = getattr(request.app.state, "continual_retest_settings", None)
+    if resolver is None:  # pragma: no cover
+        raise HTTPException(
+            status_code=503,
+            detail="continual retest settings unavailable",
+        )
+    return resolver
+
+
+async def _fleet_ready(session: AsyncSession) -> bool:
+    return await live_validator_fleet_supports_protocol(
+        session,
+        minimum_protocol=_REQUIRED_PROTOCOL,
+        now=datetime.now(UTC),
+        freshness=_FRESHNESS,
+    )
+
+
+@router.get("", response_model=AdminContinualRetestSettingsResponse)
+async def get_settings(
+    request: Request, _admin: AdminDep, session: SessionDep
+) -> AdminContinualRetestSettingsResponse:
+    resolver = _resolver(request)
+    latest = await latest_continual_retest_settings_revision(session)
+    history = await list_continual_retest_settings_revisions(session)
+    settings = settings_from_row(latest)
+    fleet_ready = await _fleet_ready(session)
+    return AdminContinualRetestSettingsResponse(
+        current=[_revision(latest)] if latest is not None else [],
+        history=[_revision(row) for row in history],
+        default=DEFAULT_SETTINGS,
+        effective=EffectiveContinualRetestSettings(
+            revision=latest.revision if latest is not None else 0,
+            scope=latest.scope if latest is not None else GLOBAL_SCOPE,
+            settings=settings,
+            checksum=latest.checksum if latest is not None else "",
+            source="revision" if latest is not None else "default",
+            fleet_protocol_ready=fleet_ready,
+            aggregate_active=aggregate_is_active(
+                settings, fleet_protocol_ready=fleet_ready
+            ),
+            max_age_seconds=resolver.ttl_seconds,
+        ),
+    )
+
+
+@router.post("", response_model=ContinualRetestSettingsRevision)
+async def create_settings_revision(
+    request: Request,
+    payload: AdminContinualRetestSettingsRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+) -> ContinualRetestSettingsRevision:
+    if payload.scope != GLOBAL_SCOPE:
+        raise HTTPException(status_code=422, detail="scope must be '*'")
+    expected_confirmation = "APPLY CONTINUAL RETEST SETTINGS"
+    if payload.confirmation != expected_confirmation:
+        raise HTTPException(
+            status_code=409,
+            detail=f"confirmation must be exactly {expected_confirmation}",
+        )
+    latest = await latest_continual_retest_settings_revision(session)
+    actual_revision = latest.revision if latest is not None else 0
+    if payload.expected_revision != actual_revision:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "continual retest settings changed; refresh before applying "
+                f"(expected {payload.expected_revision}, current {actual_revision})"
+            ),
+        )
+    try:
+        row = await insert_continual_retest_settings_revision(
+            session,
+            parent_revision=actual_revision,
+            scope=payload.scope,
+            settings=payload.settings.model_dump(mode="json"),
+            checksum=_checksum(payload.settings),
+            reason=payload.reason.strip(),
+            actor=payload.actor.strip(),
+        )
+        await session.commit()
+    except IntegrityError as error:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="continual retest settings changed concurrently; refresh and retry",
+        ) from error
+    await session.refresh(row)
+    _resolver(request).invalidate()
+    return _revision(row)

@@ -23,6 +23,7 @@ from ditto.api_server.config import (
     ApiServerConfig,
     parse_api_server_config_from_env,
 )
+from ditto.api_server.continual_retest_settings import ContinualRetestSettingsResolver
 from ditto.api_server.datapipeline import create_generator
 from ditto.api_server.efficiency_settings import (
     DEFAULT_SETTINGS_TTL_SECONDS,
@@ -32,6 +33,7 @@ from ditto.api_server.embedding import create_embedder
 from ditto.api_server.endpoints import (
     admin_artifact_release_settings_router,
     admin_benchmark_rollout_router,
+    admin_continual_retest_settings_router,
     admin_copy_review_router,
     admin_efficiency_bonus_settings_router,
     admin_inference_routes_router,
@@ -218,6 +220,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
         config.efficiency_bonus,
         ttl_seconds=_efficiency_settings_ttl_seconds(),
     )
+    app.state.continual_retest_settings = ContinualRetestSettingsResolver()
     # The object exists even when lifespan is skipped in unit tests. Its
     # snapshot path is synchronous and disabled by default; production lifespan
     # starts the optional background refresher without blocking API startup.
@@ -264,6 +267,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(admin_screener_review_settings_router, prefix="/api/v1")
     app.include_router(admin_submission_settings_router, prefix="/api/v1")
     app.include_router(admin_copy_review_router, prefix="/api/v1")
+    app.include_router(admin_continual_retest_settings_router, prefix="/api/v1")
     app.include_router(admin_miner_fees_router, prefix="/api/v1")
 
     # Serve the public dashboard SPA same-origin at ``/`` so the platform is the

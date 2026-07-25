@@ -84,6 +84,7 @@ from ditto.db.models import (
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
+    ContinualRetestSettingsRevision,
     Score,
     ScreenerHeartbeat,
     ValidatorHeartbeat,
@@ -5718,6 +5719,46 @@ class TestTop5ConfirmationLane:
 
         assert response.status_code == 409
         assert "not due" in response.json()["message"]
+
+    async def test_idle_retest_switch_uses_spare_validator_capacity(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        async with session_maker() as session, session.begin():
+            champion_row = await session.get(Agent, champion)
+            assert champion_row is not None
+            champion_row.dataset_seed_block = 1
+            session.add(
+                ContinualRetestSettingsRevision(
+                    parent_revision=0,
+                    scope="*",
+                    settings={
+                        "aggregate_mode": "fleet_ready",
+                        "idle_retests_enabled": True,
+                    },
+                    checksum="a" * 64,
+                    reason="use spare capacity for bounded continual retests",
+                    actor="operator@example.com",
+                )
+            )
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+        _install_chain_with_block(app, block_number=361)
+        app.state.config = replace(app.state.config, top5_backoff_base=2)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
 
     async def test_allows_out_of_cadence_claim_while_canonical_tail_drains(
         self,

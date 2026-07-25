@@ -101,6 +101,7 @@ from ditto.api_server.benchmark_rollout import (
     refresh_rolling_qualification,
 )
 from ditto.api_server.config import ValidatorCompatibilityConfig
+from ditto.api_server.continual_retest_settings import ContinualRetestSettingsResolver
 from ditto.api_server.crn import champion_anchored_seeds
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
@@ -2062,6 +2063,12 @@ async def request_top5_confirmation_job(
         network=config.chain.subtensor_network,
     )
     block = await chain.get_latest_block()
+    continual_resolver: ContinualRetestSettingsResolver = (
+        request.app.state.continual_retest_settings
+    )
+    continual_settings = await continual_resolver.resolve(
+        getattr(request.app.state, "session_maker", None)
+    )
 
     async with session.begin():
         await _assert_validator_compatible(
@@ -2151,7 +2158,11 @@ async def request_top5_confirmation_job(
                 now=now,
             )
         )
-        if not scheduled_round and not spare_capacity_round:
+        if (
+            not scheduled_round
+            and not spare_capacity_round
+            and not continual_settings.idle_retests_enabled
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="top-5 shared-seed rescore round is not due at this block",
