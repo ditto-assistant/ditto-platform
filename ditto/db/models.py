@@ -2385,6 +2385,59 @@ class InferenceRequest(Base):
     )
 
 
+class ValidatorLeaseAudit(Base):
+    """Append-only record of every lease the platform revoked before its deadline.
+
+    Force-expiring a live lease destroys an in-flight benchmark run and spends
+    one of the agent's bounded same-version retries, and until this table existed
+    it left no trace at all: no log line, no row, no metric, just a ticket whose
+    ``deadline`` had been silently rewritten to the moment of the revocation. A
+    day of investigation went into reconstructing three such events from ticket
+    timestamps alone. Every revocation now records the evidence it acted on, so
+    the next one is a query rather than an archaeology project.
+
+    Not part of the score audit chain: no score, verdict, or miner-visible
+    outcome is created or replaced here, only a lease lifecycle event.
+    """
+
+    __tablename__ = "validator_lease_audit"
+
+    audit_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    slot_id: Mapped[str] = mapped_column(Text, nullable=False)
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    """What happened to the lease; ``force_expired`` today."""
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    """The liveness reason code that admitted the revocation."""
+    context: Mapped[str] = mapped_column(Text, nullable=False)
+    """Which issuance path revoked it (``issue_ticket``, ``issue_rollout_ticket``,
+    ``score_retest``)."""
+    evidence: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    """The heartbeat freshness, capacity snapshot, and lease age acted on."""
+    recorded_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "bench_version > 0",
+            name="validator_lease_audit_bench_version_positive",
+        ),
+        Index(
+            "validator_lease_audit_agent_idx",
+            "agent_id",
+            "recorded_at",
+        ),
+        Index(
+            "validator_lease_audit_validator_idx",
+            "validator_hotkey",
+            "recorded_at",
+        ),
+    )
+
+
 class ValidatorRetryRecovery(Base):
     """One immutable operator action that restores bounded validation eligibility.
 

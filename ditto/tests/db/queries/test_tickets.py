@@ -7,6 +7,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
@@ -19,11 +20,17 @@ from ditto.db.models import (
     BenchmarkRolloutMember,
     EvaluationPayment,
     Score,
+    ValidatorHeartbeat,
+    ValidatorLeaseAudit,
     ValidatorTicket,
 )
 from ditto.db.queries.audit import (
     EVENT_SCORE_RETEST_REQUESTED,
     append_audit_entry,
+)
+from ditto.db.queries.lease_liveness import (
+    IDLE_EVIDENCE_MAX_AGE,
+    LEASE_REPORTING_GRACE,
 )
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import (
@@ -41,6 +48,63 @@ _NOW = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
 _TTL = timedelta(minutes=30)
 _LATER = _NOW + timedelta(hours=1)
 _AFTER_COOLDOWN = _NOW + timedelta(hours=7)
+# Long enough after issuance that a heartbeat reporting an empty slot is real
+# evidence of idleness rather than a run that has not announced itself yet.
+_AFTER_REPORTING_GRACE = _NOW + LEASE_REPORTING_GRACE + timedelta(minutes=1)
+
+
+async def _seed_heartbeat(
+    session: AsyncSession,
+    *,
+    validator_hotkey: str,
+    seen_at: datetime,
+    active: tuple[dict, ...] = (),
+    protocol_version: int = 10,
+    state: str = "polling",
+) -> None:
+    """Store the signed snapshot that is the platform's only evidence of what a
+    validator's slots are doing. Must be called inside a transaction."""
+    session.add(
+        ValidatorHeartbeat(
+            validator_hotkey=validator_hotkey,
+            software_version="1.0.0",
+            protocol_version=protocol_version,
+            code_digest="d" * 64,
+            state=state,
+            first_seen_at=seen_at,
+            reported_at=seen_at,
+            seen_at=seen_at,
+            signature="ab" * 64,
+            benchmark_capacity={
+                "configured_slots": 1,
+                "healthy_slots": ["slot-0"],
+                "admission": "accepting",
+                "active": list(active),
+            },
+        )
+    )
+    await session.flush()
+
+
+def _active_slot(
+    agent_id: UUID,
+    *,
+    ticket_deadline: datetime,
+    bench_version: int = 2,
+    slot_id: str = "slot-0",
+) -> dict:
+    """One in-flight benchmark as a validator advertises it."""
+    return {
+        "slot_id": slot_id,
+        "agent_id": str(agent_id),
+        "bench_version": bench_version,
+        "progress": {
+            "stage": "running_benchmark",
+            "completed": 143,
+            "total": 281,
+            "ticket_deadline": ticket_deadline.isoformat(),
+        },
+    }
 
 
 async def _seed_evaluating(
@@ -864,15 +928,22 @@ class TestIssueTicket:
                     slot_id="slot-0",
                     status=TicketStatus.ISSUED,
                     issued_at=_NOW - timedelta(minutes=1),
-                    deadline=_NOW + _TTL,
+                    deadline=_AFTER_REPORTING_GRACE + _TTL,
                 )
+            )
+            # The validator is heartbeating right now and advertising no work on
+            # the slot: real, fresh, post-issuance evidence that it is idle.
+            await _seed_heartbeat(
+                session,
+                validator_hotkey="5EraAdmission",
+                seen_at=_AFTER_REPORTING_GRACE - timedelta(seconds=30),
             )
 
         async with session.begin():
             ticket = await issue_ticket(
                 session,
                 validator_hotkey="5EraAdmission",
-                now=_NOW,
+                now=_AFTER_REPORTING_GRACE,
                 ttl=_TTL,
                 bench_version=3,
                 validator_running_benchmark=False,
@@ -882,7 +953,7 @@ class TestIssueTicket:
         expired = await session.get(ValidatorTicket, (old, 3, "5EraAdmission"))
         assert expired is not None
         assert expired.status == TicketStatus.EXPIRED
-        assert expired.deadline.replace(tzinfo=UTC) == _NOW
+        assert expired.deadline.replace(tzinfo=UTC) == _AFTER_REPORTING_GRACE
 
     async def test_screened_only_skips_source_only_agent(
         self, session: AsyncSession
@@ -942,7 +1013,15 @@ class TestIssueTicket:
         source_id = await _seed_evaluating(session)
         async with session.begin():
             issued = await issue_ticket(
-                session, validator_hotkey="5Transition", now=_NOW, ttl=_TTL
+                session,
+                validator_hotkey="5Transition",
+                now=_NOW,
+                ttl=timedelta(hours=2),
+            )
+            await _seed_heartbeat(
+                session,
+                validator_hotkey="5Transition",
+                seen_at=_AFTER_REPORTING_GRACE - timedelta(seconds=30),
             )
         assert issued is not None
 
@@ -950,7 +1029,7 @@ class TestIssueTicket:
             replacement = await issue_ticket(
                 session,
                 validator_hotkey="5Transition",
-                now=_NOW + timedelta(seconds=1),
+                now=_AFTER_REPORTING_GRACE,
                 ttl=_TTL,
                 artifact_mode="screened_only",
                 validator_running_benchmark=False,
@@ -981,6 +1060,219 @@ class TestIssueTicket:
             preserved = await session.get(ValidatorTicket, (source_id, 2, "5Running"))
             assert preserved is not None
             assert preserved.status == TicketStatus.ISSUED
+
+    async def test_stale_heartbeat_never_revokes_a_live_lease(
+        self, session: AsyncSession
+    ) -> None:
+        """The v7 run-loss bug: heartbeat ingest breaks, the stored capacity blob
+        freezes with the slot absent, and the next job claim destroys a healthy
+        19-minute benchmark. Staleness is not evidence of idleness."""
+        source_id = await _seed_evaluating(session)
+        async with session.begin():
+            issued = await issue_ticket(
+                session,
+                validator_hotkey="5Frozen",
+                now=_NOW,
+                ttl=timedelta(hours=2),
+            )
+            assert issued is not None
+            # Ingest died 19 minutes ago; the blob it left behind predates the
+            # run and shows no active slot. Exactly the frozen row that read as
+            # "slot free" while the validator logged `scoring continues`.
+            await _seed_heartbeat(
+                session,
+                validator_hotkey="5Frozen",
+                seen_at=_NOW - timedelta(seconds=30),
+            )
+
+        claimed_at = _NOW + timedelta(minutes=19)
+        async with session.begin():
+            replacement = await issue_ticket(
+                session,
+                validator_hotkey="5Frozen",
+                now=claimed_at,
+                ttl=_TTL,
+                artifact_mode="screened_only",
+                validator_running_benchmark=False,
+            )
+
+        assert replacement is None
+        async with session.begin():
+            live = await session.get(ValidatorTicket, (source_id, 2, "5Frozen"))
+            assert live is not None
+            assert live.status == TicketStatus.ISSUED
+            assert live.deadline.replace(tzinfo=UTC) == _NOW + timedelta(hours=2)
+            assert (
+                await session.scalar(
+                    select(func.count()).select_from(ValidatorLeaseAudit)
+                )
+                == 0
+            )
+
+    async def test_fresh_heartbeat_reporting_the_slot_active_keeps_the_lease(
+        self, session: AsyncSession
+    ) -> None:
+        """Ingest is healthy and the blob names the slot: unambiguously alive."""
+        source_id = await _seed_evaluating(session)
+        async with session.begin():
+            issued = await issue_ticket(
+                session,
+                validator_hotkey="5Busy",
+                now=_NOW,
+                ttl=timedelta(hours=2),
+            )
+            assert issued is not None
+            await _seed_heartbeat(
+                session,
+                validator_hotkey="5Busy",
+                seen_at=_AFTER_REPORTING_GRACE - timedelta(seconds=10),
+                state="running_benchmark",
+                active=(
+                    _active_slot(source_id, ticket_deadline=_NOW + timedelta(hours=2)),
+                ),
+            )
+
+        async with session.begin():
+            replacement = await issue_ticket(
+                session,
+                validator_hotkey="5Busy",
+                now=_AFTER_REPORTING_GRACE,
+                ttl=_TTL,
+                artifact_mode="screened_only",
+                validator_running_benchmark=False,
+            )
+
+        assert replacement is None
+        async with session.begin():
+            live = await session.get(ValidatorTicket, (source_id, 2, "5Busy"))
+            assert live is not None
+            assert live.status == TicketStatus.ISSUED
+
+    async def test_idle_blob_predating_the_lease_cannot_revoke_it(
+        self, session: AsyncSession
+    ) -> None:
+        """A validator that just claimed work has not had time to advertise the
+        slot, so "not active" describes the moment before the run, not the run."""
+        source_id = await _seed_evaluating(session)
+        async with session.begin():
+            issued = await issue_ticket(
+                session,
+                validator_hotkey="5Starting",
+                now=_NOW,
+                ttl=timedelta(hours=2),
+            )
+            assert issued is not None
+            await _seed_heartbeat(
+                session,
+                validator_hotkey="5Starting",
+                seen_at=_NOW + timedelta(minutes=1),
+            )
+
+        async with session.begin():
+            replacement = await issue_ticket(
+                session,
+                validator_hotkey="5Starting",
+                now=_NOW + timedelta(minutes=1, seconds=30),
+                ttl=_TTL,
+                artifact_mode="screened_only",
+                validator_running_benchmark=False,
+            )
+
+        assert replacement is None
+        async with session.begin():
+            live = await session.get(ValidatorTicket, (source_id, 2, "5Starting"))
+            assert live is not None
+            assert live.status == TicketStatus.ISSUED
+
+    async def test_abandoned_lease_is_still_reclaimed_and_audited(
+        self, session: AsyncSession
+    ) -> None:
+        """The reclaim path must not regress into leaking slots forever: a
+        validator that restarted keeps heartbeating, so it proves its own slot
+        idle and gets it back on the next claim, with an audit row explaining
+        why."""
+        source_id = await _seed_evaluating(session)
+        async with session.begin():
+            issued = await issue_ticket(
+                session,
+                validator_hotkey="5Restarted",
+                now=_NOW,
+                ttl=timedelta(hours=2),
+            )
+            assert issued is not None
+            await _seed_heartbeat(
+                session,
+                validator_hotkey="5Restarted",
+                seen_at=_AFTER_REPORTING_GRACE - timedelta(seconds=30),
+            )
+
+        async with session.begin():
+            replacement = await issue_ticket(
+                session,
+                validator_hotkey="5Restarted",
+                now=_AFTER_REPORTING_GRACE,
+                ttl=_TTL,
+                artifact_mode="screened_only",
+                validator_running_benchmark=False,
+            )
+
+        assert replacement is None
+        async with session.begin():
+            reclaimed = await session.get(ValidatorTicket, (source_id, 2, "5Restarted"))
+            assert reclaimed is not None
+            assert reclaimed.status == TicketStatus.EXPIRED
+            assert reclaimed.deadline.replace(tzinfo=UTC) == _AFTER_REPORTING_GRACE
+            audit = (await session.scalars(select(ValidatorLeaseAudit))).all()
+        assert len(audit) == 1
+        entry = audit[0]
+        assert entry.agent_id == source_id
+        assert entry.validator_hotkey == "5Restarted"
+        assert entry.action == "force_expired"
+        assert entry.reason == "idle_capacity_reports_slot_free"
+        assert entry.context == "issue_ticket"
+        assert entry.evidence["heartbeat_age_seconds"] == 30.0
+        assert (
+            entry.evidence["lease_age_seconds"]
+            == LEASE_REPORTING_GRACE.total_seconds() + 60
+        )
+        assert entry.evidence["active_slot_ids"] == []
+
+    async def test_heartbeat_just_past_the_freshness_window_is_not_evidence(
+        self, session: AsyncSession
+    ) -> None:
+        """The boundary that decides whether a run lives: one second past the
+        window and the blob stops counting as proof."""
+        source_id = await _seed_evaluating(session)
+        claimed_at = _AFTER_REPORTING_GRACE
+        async with session.begin():
+            issued = await issue_ticket(
+                session,
+                validator_hotkey="5Boundary",
+                now=_NOW,
+                ttl=timedelta(hours=2),
+            )
+            assert issued is not None
+            await _seed_heartbeat(
+                session,
+                validator_hotkey="5Boundary",
+                seen_at=claimed_at - IDLE_EVIDENCE_MAX_AGE - timedelta(seconds=1),
+            )
+
+        async with session.begin():
+            replacement = await issue_ticket(
+                session,
+                validator_hotkey="5Boundary",
+                now=claimed_at,
+                ttl=_TTL,
+                artifact_mode="screened_only",
+                validator_running_benchmark=False,
+            )
+
+        assert replacement is None
+        async with session.begin():
+            live = await session.get(ValidatorTicket, (source_id, 2, "5Boundary"))
+            assert live is not None
+            assert live.status == TicketStatus.ISSUED
 
     @pytest.mark.parametrize(
         "status",
@@ -1344,17 +1636,22 @@ class TestIssueTicket:
                 session,
                 validator_hotkey="5V1",
                 now=_NOW,
-                ttl=_TTL,
+                ttl=timedelta(hours=2),
                 bench_version=2,
             )
             assert legacy is not None
             assert legacy.agent_id == legacy_agent
+            await _seed_heartbeat(
+                session,
+                validator_hotkey="5V1",
+                seen_at=_AFTER_REPORTING_GRACE - timedelta(seconds=30),
+            )
 
         async with session.begin():
             current = await issue_ticket(
                 session,
                 validator_hotkey="5V1",
-                now=_NOW + timedelta(minutes=1),
+                now=_AFTER_REPORTING_GRACE,
                 ttl=_TTL,
                 bench_version=3,
                 artifact_mode="screened_only",

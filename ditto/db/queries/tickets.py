@@ -44,6 +44,7 @@ from ditto.db.queries.benchmark_admission import (
     benchmark_admission_predicate,
     validator_queue_admission_predicate,
 )
+from ditto.db.queries.lease_liveness import maybe_force_expire_lease
 from ditto.db.queries.scores import SCORING_QUORUM, list_eligible_ledger
 
 if TYPE_CHECKING:
@@ -366,16 +367,26 @@ async def issue_ticket(
             # their deadline. A canonical claim must neither serve nor cancel
             # work from another authorization lane.
             return None
-        if validator_running_benchmark:
-            # Never revoke work a fresh signed heartbeat says is active.
-            return None
         # A validator may only resume a lease from the requested benchmark era
-        # and artifact contract. Release an idle incompatible assignment so a
-        # retired benchmark cannot leak into the active queue after activation.
-        incompatible_existing.status = TicketStatus.EXPIRED
-        incompatible_existing.deadline = now
-        incompatible_existing.retry_after = now
-        await session.flush()
+        # and artifact contract. Release an *idle* incompatible assignment so a
+        # retired benchmark cannot leak into the active queue after activation --
+        # but only on positive, fresh evidence of idleness. ``not
+        # validator_running_benchmark`` alone is absence of evidence: it is
+        # derived from a stored capacity blob that silently freezes whenever
+        # heartbeat ingest fails, and acting on it destroyed three healthy v7
+        # runs mid-benchmark. When the lease is not proven idle the slot simply
+        # keeps it until its deadline.
+        if not await maybe_force_expire_lease(
+            session,
+            ticket=incompatible_existing,
+            validator_hotkey=validator_hotkey,
+            slot_id=slot_id,
+            now=now,
+            context="issue_ticket",
+            running_benchmark_reported=validator_running_benchmark,
+            requested_bench_version=bench_version,
+        ):
+            return None
 
     # Scoped to the era this ticket is for: a v2 fifth place says nothing about
     # whether a v4 two-score maximum is still in contention.

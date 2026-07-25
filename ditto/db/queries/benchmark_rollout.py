@@ -1295,9 +1295,18 @@ async def issue_rollout_ticket(
     # Retained as a keyword-compatible parameter for mixed platform callers;
     # the version contract, not an operator-wide routing flag, governs this.
     _ = artifact_mode
+    from ditto.db.queries.tickets import expire_overdue_tickets
+
     rollout = await open_rollout(session, for_update=True)
     if rollout is None:
         return None
+    # Mirrors the canonical issuance path. This lane could previously be entered
+    # without any sweep, so the only thing clearing an overdue lease off the slot
+    # was the revocation below -- which is why that query had to match overdue
+    # rows and could not carry a ``deadline > now`` filter. Sweeping first lets
+    # the revocation narrow to genuinely live leases without stranding the slot
+    # behind the one-issued-per-validator-slot unique index.
+    await expire_overdue_tickets(session, now=now)
     heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
     if heartbeat is None or not heartbeat_supports_version(
         heartbeat, now=now, version=rollout.desired_version
@@ -1428,6 +1437,11 @@ async def issue_rollout_ticket(
             ValidatorTicket.validator_hotkey == validator_hotkey,
             ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.status == TicketStatus.ISSUED,
+            # Overdue leases are the deadline sweep's business, not a
+            # revocation's: the sweep above has already flipped them and set the
+            # cooldown from the deadline rather than from now. Without this the
+            # sweep and this branch disagreed about the same row.
+            ValidatorTicket.deadline > now,
         )
         .limit(1)
         .with_for_update()
@@ -1438,12 +1452,24 @@ async def issue_rollout_ticket(
             or competing_ticket.purpose_revision <= 0
         ):
             return None
-        if validator_running_benchmark:
+        # Same fail-safe rule as the canonical issuance path, through the same
+        # gate: revoke only on fresh, post-issuance, positive evidence that the
+        # slot is idle. This copy was the looser of the two (it matched overdue
+        # leases as well), so routing both through one helper is what keeps them
+        # from drifting apart again.
+        from ditto.db.queries.lease_liveness import maybe_force_expire_lease
+
+        if not await maybe_force_expire_lease(
+            session,
+            ticket=competing_ticket,
+            validator_hotkey=validator_hotkey,
+            slot_id=slot_id,
+            now=now,
+            context="issue_rollout_ticket",
+            running_benchmark_reported=validator_running_benchmark,
+            requested_bench_version=rollout.desired_version,
+        ):
             return None
-        competing_ticket.status = TicketStatus.EXPIRED
-        competing_ticket.deadline = now
-        competing_ticket.retry_after = now
-        await session.flush()
     ticket = await session.get(
         ValidatorTicket,
         (member.agent_id, rollout.desired_version, validator_hotkey),
