@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import get_args
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
@@ -344,6 +345,48 @@ async def test_newer_capacity_cannot_regress_secondary_slot_progress(
     assert row.benchmark_capacity is not None
     assert row.benchmark_capacity["active"][0]["progress"]["completed"] == 9
     assert row.seen_at == base + timedelta(seconds=1)
+
+
+async def test_monotonicity_failure_still_advances_liveness(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The liveness write survives an unexpected failure in payload reasoning.
+
+    The endpoint guards its own capacity loop with a savepoint, but the
+    monotonicity check runs *inside* this function, on the far side of that
+    guard. An exception here would abort the same transaction that carries
+    ``seen_at`` — the failure mode ``test_stage_order_covers_every_wire_stage``
+    can only prevent for one known cause.
+    """
+    agent_id = await _seed_agent(session)
+    base = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+    _, accepted = await _upsert(
+        session,
+        agent_id,
+        _progress("running_benchmark", completed=3, total=10, run_token="a" * 16),
+        reported_at=base,
+    )
+    assert accepted
+
+    def _boom(*_args: object) -> None:
+        raise KeyError("some_unordered_stage")
+
+    monkeypatch.setattr(
+        "ditto.db.queries.heartbeats._validate_same_lease_progress", _boom
+    )
+    row, accepted = await _upsert(
+        session,
+        agent_id,
+        _progress("running_benchmark", completed=6, total=10, run_token="a" * 16),
+        reported_at=base + timedelta(seconds=10),
+    )
+    assert accepted
+    assert row.seen_at == base + timedelta(seconds=10)
+    assert row.reported_at == base + timedelta(seconds=10)
+    # Fail open on the payload: the unchecked report is stored rather than the
+    # write being lost. The check is a display floor, not an authorization gate.
+    assert _stored(row).completed == 6
 
 
 def test_stage_order_covers_every_wire_stage() -> None:

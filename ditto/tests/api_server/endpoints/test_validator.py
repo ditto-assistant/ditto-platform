@@ -611,6 +611,11 @@ def _progress(
     }
 
 
+def _as_utc(value: datetime) -> datetime:
+    """The SQLite unit-test fallback hands back naive datetimes; compare in UTC."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 async def _score_to_quorum(
     client: httpx.AsyncClient,
     agent_id: UUID,
@@ -1176,6 +1181,111 @@ class TestHeartbeat:
             "slot-1",
         ]
         assert public["active_benchmark"] == public["active_benchmarks"][0]
+
+    async def test_capacity_validation_failure_still_advances_liveness(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A broken capacity payload must not make a live validator look dead.
+
+        Liveness (``seen_at`` / ``reported_at``) is proven by the signature alone.
+        When payload validation blows up — here a ``KeyError`` from a stage
+        missing from ``_STAGE_ORDER``, the exact shape of #430, which no
+        ``except HeartbeatProgressRegressionError`` catches — the ingest must
+        keep the liveness write and drop only the work payload. Rolling both back
+        is what froze the capacity blob that a lease revocation then acted on,
+        destroying three healthy v7 runs (#437).
+        """
+        agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent, slot_id="slot-0")
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        def _capacity(progress: dict[str, object]) -> dict[str, object]:
+            return {
+                "configured_slots": 1,
+                "healthy_slots": ["slot-0"],
+                "admission": "accepting",
+                "active": [
+                    {
+                        "slot_id": "slot-0",
+                        "agent_id": str(agent),
+                        "bench_version": 2,
+                        "progress": progress,
+                    }
+                ],
+            }
+
+        base_ts = int(datetime.now(UTC).timestamp()) - 10
+        first_progress = _progress("running_benchmark", completed=3, total=10)
+        first = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                timestamp=base_ts,
+                protocol_version=10,
+                state="running_benchmark",
+                active_agent_id=agent,
+                benchmark_progress=first_progress,
+                capabilities=_V9_CAPABILITIES,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=_capacity(first_progress),
+            ),
+        )
+        assert first.status_code == 200, first.text
+        async with session_maker() as s:
+            stored = await s.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert stored is not None
+            assert stored.benchmark_capacity is not None
+            before_seen_at = _as_utc(stored.seen_at)
+            before_reported_at = _as_utc(stored.reported_at)
+
+        # The next heartbeat carries a slot the loop compares against the stored
+        # one, so the patched validator is reached while the row locks are held.
+        def _boom(*_args: object) -> None:
+            raise KeyError("generating_dataset")
+
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator._validate_same_lease_progress", _boom
+        )
+
+        second_progress = _progress("running_benchmark", completed=6, total=10)
+        second = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                timestamp=base_ts + 5,
+                protocol_version=10,
+                state="running_benchmark",
+                active_agent_id=agent,
+                benchmark_progress=second_progress,
+                capabilities=_V9_CAPABILITIES,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=_capacity(second_progress),
+            ),
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["accepted"] is True
+
+        async with session_maker() as s:
+            stored = await s.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert stored is not None
+            # Liveness advanced: this validator does not read as heartbeat_stale.
+            assert _as_utc(stored.seen_at) > before_seen_at
+            assert _as_utc(stored.reported_at) > before_reported_at
+            assert _as_utc(stored.reported_at) == datetime.fromtimestamp(
+                base_ts + 5, tz=UTC
+            )
+            # The payload — and only the payload — was dropped. A NULL capacity
+            # makes the next `/job` claim fail closed (428) instead of letting a
+            # revocation act on a frozen blob.
+            assert stored.benchmark_capacity is None
+            assert stored.active_agent_id is None
 
     async def test_v10_accepts_v7_scorer_advertisement_without_v11_calibration(
         self,

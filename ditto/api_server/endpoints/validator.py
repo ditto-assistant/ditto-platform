@@ -45,6 +45,7 @@ import re
 import statistics
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -208,6 +209,7 @@ from ditto.db.queries.validator_auth import (
     ValidatorRequestReplayError,
     consume_validator_nonce,
 )
+from ditto.metrics import VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED
 
 if TYPE_CHECKING:
     from ditto.api_server.config import InferenceProxyConfig
@@ -1066,6 +1068,147 @@ def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class _HeartbeatWork:
+    """The ticket-validated work a heartbeat claims, ready to persist.
+
+    Separate from the *liveness* half of a heartbeat (``seen_at`` /
+    ``reported_at`` / identity / health), which is proven by the signature alone
+    and must be storable even when nothing here can be derived.
+    """
+
+    active_agent_id: UUID | None
+    benchmark_progress: dict | None
+    benchmark_capacity: BenchmarkCapacity | None
+
+
+# What a heartbeat stores when its work payload cannot be validated: alive, but
+# making no claim about what it is running.
+_LIVENESS_ONLY_WORK = _HeartbeatWork(
+    active_agent_id=None, benchmark_progress=None, benchmark_capacity=None
+)
+
+
+async def _validated_heartbeat_work(
+    session: AsyncSession,
+    *,
+    validator_hotkey: str,
+    request_body: ValidatorHeartbeatRequest,
+    now: datetime,
+) -> _HeartbeatWork:
+    """Project the signed work claim onto what the ledger actually agrees with.
+
+    Every slot is confirmed against a live ticket and a scoreable agent under
+    ``FOR UPDATE``, so the stored capacity cannot describe work whose lease is
+    being revoked concurrently. Callers must run this where a failure is
+    containable (a savepoint): it row-locks, and it is the half of the ingest
+    that can fail on a payload the validator is legitimately allowed to send.
+    """
+    stored_active_agent_id = request_body.active_agent_id
+    stored_benchmark_progress = (
+        request_body.benchmark_progress.model_dump(mode="json")
+        if request_body.benchmark_progress is not None
+        else None
+    )
+    stored_benchmark_capacity = request_body.benchmark_capacity
+    if stored_benchmark_capacity is not None:
+        previous_heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
+        previous_slots = {}
+        if previous_heartbeat is not None and isinstance(
+            previous_heartbeat.benchmark_capacity, dict
+        ):
+            with contextlib.suppress(ValidationError):
+                previous_capacity = BenchmarkCapacity.model_validate(
+                    previous_heartbeat.benchmark_capacity
+                )
+                previous_slots = {
+                    slot.slot_id: slot for slot in previous_capacity.active
+                }
+        valid_active = []
+        for slot in stored_benchmark_capacity.active:
+            agent = await get_agent_by_id(
+                session, agent_id=slot.agent_id, for_update=True
+            )
+            ticket = await get_open_ticket(
+                session,
+                agent_id=slot.agent_id,
+                validator_hotkey=validator_hotkey,
+                now=now,
+                deadline=slot.progress.ticket_deadline,
+                bench_version=slot.bench_version,
+                slot_id=slot.slot_id,
+                for_update=True,
+            )
+            if (
+                ticket is not None
+                and agent is not None
+                and agent.status in _SCOREABLE_STATUSES
+            ):
+                previous_slot = previous_slots.get(slot.slot_id)
+                if previous_slot is not None:
+                    try:
+                        _validate_same_lease_progress(
+                            previous_slot.progress, slot.progress
+                        )
+                    except HeartbeatProgressRegressionError:
+                        slot = previous_slot
+                valid_active.append(slot)
+            else:
+                logger.info(
+                    "validator heartbeat dropped stale slot progress "
+                    "validator=%s slot=%s",
+                    validator_hotkey,
+                    slot.slot_id,
+                )
+        valid_active.sort(key=lambda slot: slot.slot_id)
+        stored_benchmark_capacity = stored_benchmark_capacity.model_copy(
+            update={"active": valid_active}
+        )
+        primary = (
+            sorted(valid_active, key=lambda slot: slot.slot_id)[0]
+            if valid_active
+            else None
+        )
+        stored_active_agent_id = primary.agent_id if primary is not None else None
+        stored_benchmark_progress = (
+            primary.progress.model_dump(mode="json") if primary is not None else None
+        )
+    if (
+        stored_benchmark_capacity is None
+        and request_body.benchmark_progress is not None
+    ):
+        assert request_body.active_agent_id is not None
+        agent = await get_agent_by_id(
+            session, agent_id=request_body.active_agent_id, for_update=True
+        )
+        ticket = await get_open_ticket(
+            session,
+            agent_id=request_body.active_agent_id,
+            validator_hotkey=validator_hotkey,
+            now=now,
+            deadline=request_body.benchmark_progress.ticket_deadline,
+            bench_version=None,
+            for_update=True,
+        )
+        if ticket is None or agent is None or agent.status not in _SCOREABLE_STATUSES:
+            # Ticket-bound progress is optional decoration. A benchmark can
+            # outlive or lose its lease, but that must not discard an
+            # otherwise valid signed liveness/health report. Persist the
+            # authenticated fail-open projection without stale work context;
+            # tickets, submissions, benchmarks, and scores are untouched.
+            stored_active_agent_id = None
+            stored_benchmark_progress = None
+            logger.info(
+                "validator heartbeat dropped stale ticket-bound progress validator=%s",
+                validator_hotkey,
+            )
+    return _HeartbeatWork(
+        active_agent_id=stored_active_agent_id,
+        benchmark_progress=stored_benchmark_progress,
+        benchmark_capacity=stored_benchmark_capacity,
+    )
+
+
 @router.post(
     "/heartbeat",
     response_model=ValidatorHeartbeatResponse,
@@ -1148,111 +1291,41 @@ async def heartbeat(
 
     reported_at = datetime.fromtimestamp(request_body.timestamp, tz=UTC)
     async with session.begin():
-        stored_active_agent_id = request_body.active_agent_id
-        stored_benchmark_progress = (
-            request_body.benchmark_progress.model_dump(mode="json")
-            if request_body.benchmark_progress is not None
-            else None
-        )
-        stored_benchmark_capacity = request_body.benchmark_capacity
-        if stored_benchmark_capacity is not None:
-            previous_heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
-            previous_slots = {}
-            if previous_heartbeat is not None and isinstance(
-                previous_heartbeat.benchmark_capacity, dict
-            ):
-                with contextlib.suppress(ValidationError):
-                    previous_capacity = BenchmarkCapacity.model_validate(
-                        previous_heartbeat.benchmark_capacity
-                    )
-                    previous_slots = {
-                        slot.slot_id: slot for slot in previous_capacity.active
-                    }
-            valid_active = []
-            for slot in stored_benchmark_capacity.active:
-                agent = await get_agent_by_id(
-                    session, agent_id=slot.agent_id, for_update=True
-                )
-                ticket = await get_open_ticket(
+        try:
+            # SAVEPOINT, not a bare try: deriving the work payload row-locks
+            # tickets and agents, so a database-level failure inside it (lock
+            # timeout, deadlock) would otherwise poison the surrounding
+            # transaction and take the liveness write down with it anyway.
+            # Rolling back to the savepoint releases those reads and locks and
+            # leaves the transaction usable for the upsert below.
+            async with session.begin_nested():
+                work = await _validated_heartbeat_work(
                     session,
-                    agent_id=slot.agent_id,
                     validator_hotkey=validator_hotkey,
+                    request_body=request_body,
                     now=now,
-                    deadline=slot.progress.ticket_deadline,
-                    bench_version=slot.bench_version,
-                    slot_id=slot.slot_id,
-                    for_update=True,
                 )
-                if (
-                    ticket is not None
-                    and agent is not None
-                    and agent.status in _SCOREABLE_STATUSES
-                ):
-                    previous_slot = previous_slots.get(slot.slot_id)
-                    if previous_slot is not None:
-                        try:
-                            _validate_same_lease_progress(
-                                previous_slot.progress, slot.progress
-                            )
-                        except HeartbeatProgressRegressionError:
-                            slot = previous_slot
-                    valid_active.append(slot)
-                else:
-                    logger.info(
-                        "validator heartbeat dropped stale slot progress "
-                        "validator=%s slot=%s",
-                        validator_hotkey,
-                        slot.slot_id,
-                    )
-            valid_active.sort(key=lambda slot: slot.slot_id)
-            stored_benchmark_capacity = stored_benchmark_capacity.model_copy(
-                update={"active": valid_active}
+        except Exception as error:  # noqa: BLE001 - liveness must not depend on payload
+            # Fail OPEN on liveness. The signature already proved this validator
+            # is alive and on schedule; whatever went wrong concerns only what it
+            # *claims to be doing*. Storing the liveness-only projection keeps
+            # `seen_at` moving so the fleet does not read the validator as
+            # heartbeat_stale, and drops the work payload rather than freezing
+            # the previous one — a frozen capacity blob is what let a lease
+            # revocation destroy healthy v7 runs (#437). With capacity NULL the
+            # next `/job` claim fails closed with 428 (fresh valid benchmark
+            # capacity is required) instead of revoking live work.
+            work = _LIVENESS_ONLY_WORK
+            VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED.labels(
+                stage="work_validation", reason=type(error).__name__
+            ).inc()
+            logger.exception(
+                "validator heartbeat stored liveness-only after work payload "
+                "validation failed validator=%s protocol=%s state=%s",
+                validator_hotkey,
+                request_body.protocol_version,
+                request_body.state,
             )
-            primary = (
-                sorted(valid_active, key=lambda slot: slot.slot_id)[0]
-                if valid_active
-                else None
-            )
-            stored_active_agent_id = primary.agent_id if primary is not None else None
-            stored_benchmark_progress = (
-                primary.progress.model_dump(mode="json")
-                if primary is not None
-                else None
-            )
-        if (
-            stored_benchmark_capacity is None
-            and request_body.benchmark_progress is not None
-        ):
-            assert request_body.active_agent_id is not None
-            agent = await get_agent_by_id(
-                session, agent_id=request_body.active_agent_id, for_update=True
-            )
-            ticket = await get_open_ticket(
-                session,
-                agent_id=request_body.active_agent_id,
-                validator_hotkey=validator_hotkey,
-                now=now,
-                deadline=request_body.benchmark_progress.ticket_deadline,
-                bench_version=None,
-                for_update=True,
-            )
-            if (
-                ticket is None
-                or agent is None
-                or agent.status not in _SCOREABLE_STATUSES
-            ):
-                # Ticket-bound progress is optional decoration. A benchmark can
-                # outlive or lose its lease, but that must not discard an
-                # otherwise valid signed liveness/health report. Persist the
-                # authenticated fail-open projection without stale work context;
-                # tickets, submissions, benchmarks, and scores are untouched.
-                stored_active_agent_id = None
-                stored_benchmark_progress = None
-                logger.info(
-                    "validator heartbeat dropped stale ticket-bound progress "
-                    "validator=%s",
-                    validator_hotkey,
-                )
         # Progress monotonicity is enforced fail-open inside the query: a
         # genuine same-run regression keeps the previously stored progress
         # (never moving the public display backward) but never rejects an
@@ -1264,13 +1337,13 @@ async def heartbeat(
             protocol_version=request_body.protocol_version,
             code_digest=request_body.code_digest,
             state=request_body.state,
-            active_agent_id=stored_active_agent_id,
+            active_agent_id=work.active_agent_id,
             system_metrics=(
                 request_body.system_metrics.model_dump(mode="json")
                 if request_body.system_metrics is not None
                 else None
             ),
-            benchmark_progress=stored_benchmark_progress,
+            benchmark_progress=work.benchmark_progress,
             capabilities=(
                 request_body.capabilities.model_dump(mode="json", exclude_none=True)
                 if request_body.capabilities is not None
@@ -1287,8 +1360,8 @@ async def heartbeat(
                 else None
             ),
             benchmark_capacity=(
-                stored_benchmark_capacity.model_dump(mode="json")
-                if stored_benchmark_capacity is not None
+                work.benchmark_capacity.model_dump(mode="json")
+                if work.benchmark_capacity is not None
                 else None
             ),
             reported_at=reported_at,

@@ -28,6 +28,7 @@ from ditto.db.models import (
     ValidatorHeartbeat,
     ValidatorTicket,
 )
+from ditto.metrics import VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -175,6 +176,49 @@ def _reconcile_capacity_progress(
     )
 
 
+def _regresses_within_run(
+    row: ValidatorHeartbeat,
+    *,
+    benchmark_progress: dict | None,
+    active_agent_id: UUID | None,
+    validator_hotkey: str,
+) -> bool:
+    """Whether the incoming progress walks the stored progress backwards.
+
+    True means "keep what is stored as the public display floor". This is a pure
+    read over already-loaded values so callers can guard it without a savepoint.
+    """
+    if row.benchmark_progress is None or benchmark_progress is None:
+        return False
+    try:
+        previous_progress = _parse_progress(row.benchmark_progress)
+        current_progress = _parse_progress(benchmark_progress)
+    except ValidationError:
+        # A malformed stored or incoming blob is not a reason to reject an
+        # authenticated liveness report. Fail open: skip monotonicity and
+        # accept the incoming progress.
+        return False
+    if row.benchmark_progress_agent_id != active_agent_id or not _is_same_run(
+        previous_progress, current_progress
+    ):
+        # A changed lease or run_token rebaselines: the fresh run restarts its
+        # counts legitimately, so monotonicity does not apply across the boundary.
+        return False
+    # Same lease, same run: enforce monotonicity, but fail open on a regression.
+    try:
+        _validate_same_lease_progress(previous_progress, current_progress)
+    except HeartbeatProgressRegressionError:
+        logger.info(
+            "validator heartbeat kept prior progress after regression "
+            "validator=%s stored_stage=%s incoming_stage=%s",
+            validator_hotkey,
+            previous_progress.stage,
+            current_progress.stage,
+        )
+        return True
+    return False
+
+
 async def upsert_validator_heartbeat(
     session: AsyncSession,
     *,
@@ -269,38 +313,26 @@ async def upsert_validator_heartbeat(
             existing_reported_at = existing_reported_at.replace(tzinfo=UTC)
         if reported_at <= existing_reported_at:
             return row, False
-        if row.benchmark_progress is not None and benchmark_progress is not None:
-            previous_progress: BenchmarkProgress | None
-            current_progress: BenchmarkProgress | None
-            try:
-                previous_progress = _parse_progress(row.benchmark_progress)
-                current_progress = _parse_progress(benchmark_progress)
-            except ValidationError:
-                # A malformed stored or incoming blob is not a reason to reject an
-                # authenticated liveness report. Fail open: skip monotonicity and
-                # accept the incoming progress.
-                previous_progress = None
-                current_progress = None
-            if (
-                previous_progress is not None
-                and current_progress is not None
-                and row.benchmark_progress_agent_id == active_agent_id
-                and _is_same_run(previous_progress, current_progress)
-            ):
-                # Same lease, same run: enforce monotonicity, but fail open on a
-                # regression. A changed run_token skips this block entirely and
-                # rebaselines (the fresh run restarts its counts legitimately).
-                try:
-                    _validate_same_lease_progress(previous_progress, current_progress)
-                except HeartbeatProgressRegressionError:
-                    keep_stored_progress = True
-                    logger.info(
-                        "validator heartbeat kept prior progress after regression "
-                        "validator=%s stored_stage=%s incoming_stage=%s",
-                        validator_hotkey,
-                        previous_progress.stage,
-                        current_progress.stage,
-                    )
+        # Payload reasoning, not liveness. It runs on data already in memory, so
+        # a failure here cannot poison the transaction — but it must not escape
+        # either, because everything below it is the liveness write.
+        try:
+            keep_stored_progress = _regresses_within_run(
+                row,
+                benchmark_progress=benchmark_progress,
+                active_agent_id=active_agent_id,
+                validator_hotkey=validator_hotkey,
+            )
+        except Exception as error:  # noqa: BLE001 - liveness must not depend on payload
+            keep_stored_progress = False
+            VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED.labels(
+                stage="progress_monotonicity", reason=type(error).__name__
+            ).inc()
+            logger.exception(
+                "validator heartbeat skipped progress monotonicity after an "
+                "unexpected failure validator=%s",
+                validator_hotkey,
+            )
     row.software_version = software_version
     row.protocol_version = protocol_version
     row.code_digest = code_digest
@@ -310,9 +342,23 @@ async def upsert_validator_heartbeat(
     row.capabilities = capabilities
     row.stack = stack
     row.stack_health = stack_health
-    row.benchmark_capacity = _reconcile_capacity_progress(
-        row.benchmark_capacity if not is_new else None, benchmark_capacity
-    )
+    try:
+        row.benchmark_capacity = _reconcile_capacity_progress(
+            row.benchmark_capacity if not is_new else None, benchmark_capacity
+        )
+    except Exception as error:  # noqa: BLE001 - liveness must not depend on payload
+        # Reconciliation only smooths per-slot display; the incoming capacity was
+        # already ticket-validated by the caller. Store it unreconciled rather
+        # than losing the liveness write this assignment sits inside.
+        row.benchmark_capacity = benchmark_capacity
+        VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED.labels(
+            stage="capacity_reconcile", reason=type(error).__name__
+        ).inc()
+        logger.exception(
+            "validator heartbeat stored unreconciled capacity after an "
+            "unexpected failure validator=%s",
+            validator_hotkey,
+        )
     if benchmark_progress is not None and not keep_stored_progress:
         row.benchmark_progress = benchmark_progress
         row.benchmark_progress_reported = True
