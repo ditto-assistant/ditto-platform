@@ -41,6 +41,7 @@ from ditto.db.queries.audit import (
 from ditto.db.queries.benchmark_admission import (
     activated_rollout_for_version,
     benchmark_admission_predicate,
+    validator_queue_admission_predicate,
 )
 from ditto.db.queries.scores import SCORING_QUORUM, list_eligible_ledger
 
@@ -580,6 +581,7 @@ async def issue_ticket(
         candidate = select(Agent.agent_id).where(
             Agent.status == AgentStatus.EVALUATING,
             Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
+            validator_queue_admission_predicate(bench_version=bench_version),
         )
         if not completion_first:
             candidate = candidate.where(Agent.agent_id.not_in(already_mine))
@@ -809,6 +811,10 @@ async def issue_ticket(
                     )
                     if activated_rollout is not None
                     else literal(True)
+                ),
+                validator_queue_admission_predicate(
+                    bench_version=bench_version,
+                    agent=sibling_agent,
                 ),
             )
             .order_by(

@@ -36,6 +36,17 @@ class AdminValidationRecovery(BaseModel):
     created_at: datetime
 
 
+class AdminValidationQueueWithdrawal(BaseModel):
+    withdrawal_id: UUID
+    agent_id: UUID
+    bench_version: int
+    actor: str
+    reason: str
+    expected_snapshot: str
+    score_count: int
+    created_at: datetime
+
+
 class AdminValidationRetryDetail(BaseModel):
     agent_id: UUID
     miner_hotkey: str
@@ -48,6 +59,9 @@ class AdminValidationRetryDetail(BaseModel):
     automatic_retry_available: bool
     recovery_allowed: bool
     blocking_reason: str | None
+    withdrawal_allowed: bool
+    withdrawal_blocking_reason: str | None
+    withdrawal: AdminValidationQueueWithdrawal | None
     tickets: list[AdminValidationTicket]
     recoveries: list[AdminValidationRecovery]
 
@@ -107,6 +121,23 @@ class AdminValidationRetryRequest(BaseModel):
 
 class AdminValidationRetryResponse(BaseModel):
     recovery: AdminValidationRecovery
+    idempotent: bool
+
+
+class AdminValidationQueueWithdrawalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: UUID
+    expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    reason: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+    ]
+    confirmation: Literal["REMOVE FROM VALIDATOR QUEUE"]
+
+
+class AdminValidationQueueWithdrawalResponse(BaseModel):
+    withdrawal: AdminValidationQueueWithdrawal
     idempotent: bool
 
 
