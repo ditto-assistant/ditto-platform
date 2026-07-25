@@ -19,7 +19,15 @@ from ditto.db.queries.tickets import issue_ticket
 pytestmark = pytest.mark.integration
 
 
-async def test_same_validator_slots_do_not_advance_past_fifo_head() -> None:
+async def test_same_validator_slots_take_the_two_oldest_agents_in_fifo_order() -> None:
+    """Concurrent sibling slots advance in FIFO order without double-claiming.
+
+    Before #449 the second slot returned no job while this validator held a
+    live lease on the head, and this test asserted that idle. #449 made the
+    sibling skip to the next FIFO candidate instead, so both slots now do
+    useful work; what must still hold under concurrency is that they take
+    distinct agents, strictly oldest-first, and never two leases on one agent.
+    """
     engine = create_db_engine()
     maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC).replace(microsecond=0)
@@ -63,15 +71,27 @@ async def test_same_validator_slots_do_not_advance_past_fifo_head() -> None:
             return ticket.agent_id if ticket is not None else None
 
     outcomes = await asyncio.gather(claim("slot-0"), claim("slot-1"))
+    # Since #449 a sibling slot no longer parks behind a head this validator
+    # already holds a live lease on: one ticket per (agent, version, validator)
+    # is the composite primary key, so the head's remaining quorum slots belong
+    # to other validators regardless, and idling bought the head nothing. Under
+    # concurrency the two slots therefore take the two oldest agents in FIFO
+    # order -- whichever slot wins the row lock -- rather than one of them
+    # returning no job at all.
     assert outcomes.count(oldest) == 1
-    assert outcomes.count(None) == 1
-    assert newer not in outcomes
+    assert outcomes.count(newer) == 1
+    assert None not in outcomes
 
     async with maker() as session:
+        oldest_tickets = await session.scalar(
+            select(func.count()).where(ValidatorTicket.agent_id == oldest)
+        )
         newer_tickets = await session.scalar(
             select(func.count()).where(ValidatorTicket.agent_id == newer)
         )
-    assert newer_tickets == 0
+    # Advancing past the head must not become a second lease on it.
+    assert oldest_tickets == 1
+    assert newer_tickets == 1
     await engine.dispose()
 
 
