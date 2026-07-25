@@ -167,7 +167,7 @@ npm install -g pm2           # one-time, if not present
 ./scripts/start.sh           # infra up + migrate + start API under pm2
 pm2 logs ditto-api           # tail logs
 pm2 status                   # process state
-./scripts/update.sh          # git pull + uv sync + migrate + pm2 reload
+./scripts/update.sh          # git pull + uv sync + migrate + pm2 reload + health gate
 ./scripts/stop.sh            # stop the API process
 ```
 
@@ -179,6 +179,22 @@ pm2 status                   # process state
   degrades to a stop/start: expect ~6s of refused connections per deploy
   (measured). Cluster mode would close that gap and is an open operator
   decision, not something the reload command papers over today.
+- **`pm2 reload` does not reconcile how a process is launched.** `script`,
+  `interpreter`, `interpreter_args`, `exec_mode`, and `cwd` are kept from pm2's
+  saved dump even when `ecosystem.config.js` changes them; `args` and env *are*
+  reconciled. Changing `script` and reloading therefore runs the OLD program
+  with the NEW args, which is how a deploy once left the API in `waiting
+  restart` with pid 0 while the site served 502. `scripts/update.sh` now diffs
+  the running launch identity against the config
+  ([`scripts/pm2_deploy_plan.js`](scripts/pm2_deploy_plan.js)) and does
+  `pm2 delete` + `pm2 start` for that app when they differ, so this is handled;
+  if you ever bypass `update.sh`, recreate the app rather than reloading it.
+- **`update.sh` fails the deploy if the app does not come back.** After
+  starting or reloading it polls `/health` on the local port and exits non-zero
+  with the tail of `logs/ditto-api.err.log` if the API is not serving within
+  `DITTO_HEALTH_TIMEOUT` (default 120s). The one-shot image-cleanup job is
+  cron-driven with `autorestart: false`, so `stopped` is its correct state and
+  is not treated as a failure.
 
 ---
 

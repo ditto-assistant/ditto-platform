@@ -104,10 +104,13 @@ jobs:
             --command "sudo -iu deploy bash -lc 'cd /opt/ditto-platform && git fetch --prune origin && git checkout -fB ${{ steps.target.outputs.branch }} origin/${{ steps.target.outputs.branch }} && git reset --hard origin/${{ steps.target.outputs.branch }} && DITTO_DEPLOY_BRANCH=${{ steps.target.outputs.branch }} DITTO_UPLOAD_PAYMENT_ADDRESS=${{ secrets.DITTO_UPLOAD_PAYMENT_ADDRESS }} DITTO_DASHBOARD_WANDB_URL=${{ vars.DITTO_DASHBOARD_WANDB_URL }} ./scripts/update.sh'"
 
       - name: Health check
-        # Hits the public Caddy endpoint, so it depends on public DNS + the VM's
-        # cert being issued. Window is generous (≈3 min) for a first/cold deploy
+        # Second gate, from outside the VM. update.sh already verified the app is
+        # serving /health on the host's own port and fails the deploy step if it
+        # is not, so this one covers the path the host cannot see: public DNS and
+        # the VM's cert. Window is generous (≈3 min) for a first/cold deploy
         # (uv build + app import + Caddy ACME). A red here after a green deploy
-        # step usually means DNS/cert, not the app.
+        # step points at DNS/cert/Caddy rather than the app -- but confirm that
+        # against the deploy step's own health output before assuming it.
         run: |
           host="${{ steps.target.outputs.host }}"
           for i in $(seq 1 20); do
