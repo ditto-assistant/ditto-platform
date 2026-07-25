@@ -247,32 +247,6 @@ async def test_route_admission_requires_exact_confirmation_and_quality_floor(
     assert audited.json()["audits"][0]["action"] == "route_eligible"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "OPEN PRODUCTION BUG, deliberately left red-as-xfail rather than "
-        "papered over. GET /api/v1/admin/inference-routes serializes four "
-        "aggregate columns as JSON *strings* against real Postgres, and as "
-        "numbers against SQLite -- which is why this was green for as long "
-        "as the suite ran on SQLite. Two ingredients: (1) "
-        "admin_inference_routes.py:123-128 -- func.sum() over BigInteger "
-        "yields `numeric` in Postgres (not bigint) and func.avg() yields "
-        "`numeric`, both of which asyncpg hands back as Decimal; (2) "
-        "admin_inference_routes.py:82 -- the handler is annotated "
-        "`-> dict[str, object]`, so FastAPI serializes through Pydantic v2, "
-        "which renders Decimal as a string. The tell is that request_count / "
-        "completed_count / timeout_count (func.count and sum over an int "
-        "CASE, both `bigint`) stay integers; only the four `numeric` "
-        "aggregates flip. This is the live wire shape production serves "
-        "today, not a test artifact. Fix is ~4 lines of int()/float() "
-        "coercion at admin_inference_routes.py:220-223, or better a typed "
-        "response_model -- admin_miner_fees.py:28 declares one and its "
-        "equally-Decimal sums serialize correctly. Held back because a v7 "
-        "rollout is open and this PR changes no production code. `strict` "
-        "so that fixing the endpoint turns CI red until this marker is "
-        "removed."
-    ),
-)
 async def test_aggregate_mode_blocks_adaptive_controls_but_allows_logical_route(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -380,3 +354,92 @@ async def test_aggregate_mode_blocks_adaptive_controls_but_allows_logical_route(
         json=provider_payload,
     )
     assert admitted.status_code == 200, admitted.text
+
+
+async def test_provider_telemetry_aggregates_are_json_numbers_not_strings(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Every aggregate leaves this endpoint as a JSON number.
+
+    Regression test for the production bug #446 found. ``func.sum()`` over a
+    ``BigInteger`` is ``numeric`` in Postgres -- not ``bigint`` -- and
+    ``func.avg()`` is ``numeric`` too, so asyncpg returns both as ``Decimal``;
+    the handler's old ``-> dict[str, object]`` annotation then had Pydantic v2
+    render each ``Decimal`` as a *string*. Backroom parses this array with
+    ``z.number()`` (``admin.schemas.ts``), so the string form failed its parse
+    outright.
+
+    Type assertions rather than value equality, because ``250 == 250.0`` in
+    Python: a plain ``==`` comparison against the expected dict cannot tell an
+    int from a float, and would not notice the aggregates drifting back.
+    """
+    await _install(app, session_maker)
+    now = datetime.now(UTC)
+    async with session_maker() as session, session.begin():
+        grant_id = await _seed_grant(session)
+        for index, (provider, latency) in enumerate(
+            (("Groq", 200), ("Groq", 300), ("WandB", None))
+        ):
+            session.add(
+                InferenceRequest(
+                    grant_id=grant_id,
+                    nonce=uuid4(),
+                    generation=1,
+                    status="completed",
+                    model=_MODEL,
+                    reserved_tokens=100,
+                    prompt_tokens=80,
+                    completion_tokens=20,
+                    cost_microusd=123,
+                    upstream_provider=provider,
+                    timed_out=index == 2,
+                    latency_ms=latency,
+                    started_at=now,
+                    completed_at=now,
+                )
+            )
+
+    listing = await client.get("/api/v1/admin/inference-routes", headers=_HEADERS)
+    assert listing.status_code == 200, listing.text
+    telemetry = listing.json()["provider_telemetry"]
+    assert telemetry == [
+        {
+            "provider": "Groq",
+            "request_count": 2,
+            "completed_count": 2,
+            "timeout_count": 0,
+            "prompt_tokens": 160,
+            "completion_tokens": 40,
+            "cost_microusd": 246,
+            "average_latency_ms": 250.0,
+        },
+        {
+            "provider": "WandB",
+            "request_count": 1,
+            "completed_count": 1,
+            "timeout_count": 1,
+            "prompt_tokens": 80,
+            "completion_tokens": 20,
+            "cost_microusd": 123,
+            # `latency_ms` is nullable, so avg() over an all-null group is
+            # NULL. Null, not 0: "not measured" is not "instant".
+            "average_latency_ms": None,
+        },
+    ]
+    groq, wandb = telemetry
+    for field in (
+        "request_count",
+        "completed_count",
+        "timeout_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "cost_microusd",
+    ):
+        assert isinstance(groq[field], int), (field, groq[field])
+    assert isinstance(groq["average_latency_ms"], float)
+    assert wandb["average_latency_ms"] is None
+    # Nothing numeric arrives quoted, whatever the column type behind it.
+    assert '"160"' not in listing.text
+    assert "250.0000000000000000" not in listing.text

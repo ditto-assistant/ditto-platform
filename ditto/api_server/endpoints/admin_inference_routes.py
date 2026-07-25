@@ -11,6 +11,14 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ditto.api_models.admin_inference_routes import (
+    AdminInferenceRoutes,
+    AggregateRouteView,
+    InferenceRouteView,
+    InferenceRoutingAuditView,
+    InferenceRoutingPolicyView,
+    ProviderTelemetryView,
+)
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
 from ditto.api_server.inference_routing import (
@@ -76,10 +84,18 @@ class RoutingPolicyRequest(BaseModel):
     confirmation: str
 
 
-@router.get("")
+@router.get("", response_model=AdminInferenceRoutes)
 async def list_inference_routes(
     _: AdminDep, session: SessionDep, request: Request, response: Response
-) -> dict[str, object]:
+) -> AdminInferenceRoutes:
+    """The operator console's whole inference-routing inventory.
+
+    Typed rather than ``dict[str, object]`` because the aggregates below come
+    back from asyncpg as ``Decimal`` (``sum``/``avg`` are ``numeric`` in
+    Postgres), and an untyped ``object`` slot makes Pydantic v2 serialize a
+    ``Decimal`` as a JSON *string*. The declared ``int``/``float`` fields are
+    what keep this endpoint serving numbers.
+    """
     response.headers["Cache-Control"] = "no-store"
     rows = list(
         (
@@ -139,92 +155,92 @@ async def list_inference_routes(
     inference_config = request.app.state.config.inference_proxy
     routing_mode = inference_config.routing_mode
     aggregate_model = benchmark_model(7)
-    return {
-        "routing_mode": routing_mode,
-        "aggregate_route": (
-            {
-                "model": aggregate_model,
-                "provider": AGGREGATE_PROVIDER,
-                "profile_revision": aggregate_profile_revision(aggregate_model),
-                "provider_sort": "throughput",
-                "allow_fallbacks": True,
-            }
+    return AdminInferenceRoutes(
+        routing_mode=routing_mode,
+        aggregate_route=(
+            AggregateRouteView(
+                model=aggregate_model,
+                provider=AGGREGATE_PROVIDER,
+                profile_revision=aggregate_profile_revision(aggregate_model),
+                provider_sort="throughput",
+                allow_fallbacks=True,
+            )
             if routing_mode == "aggregate_throughput"
             else None
         ),
-        "policies": [
-            {
-                "model": policy.model,
-                "revision": policy.revision,
-                "enabled": policy.enabled,
-                "speed_weight": policy.speed_weight,
-                "cost_weight": policy.cost_weight,
-                "exploration_weight": policy.exploration_weight,
-                "exploration_ticket_budget": policy.exploration_ticket_budget,
-                "min_tool_accuracy": policy.min_tool_accuracy,
-                "min_composite": policy.min_composite,
-                "min_calibration_samples": policy.min_calibration_samples,
-                "max_error_rate": policy.max_error_rate,
-                "max_timeout_rate": policy.max_timeout_rate,
-                "cooldown_seconds": policy.cooldown_seconds,
-                "ewma_alpha": policy.ewma_alpha,
-                "updated_at": policy.updated_at,
-            }
+        policies=[
+            InferenceRoutingPolicyView(
+                model=policy.model,
+                revision=policy.revision,
+                enabled=policy.enabled,
+                speed_weight=policy.speed_weight,
+                cost_weight=policy.cost_weight,
+                exploration_weight=policy.exploration_weight,
+                exploration_ticket_budget=policy.exploration_ticket_budget,
+                min_tool_accuracy=policy.min_tool_accuracy,
+                min_composite=policy.min_composite,
+                min_calibration_samples=policy.min_calibration_samples,
+                max_error_rate=policy.max_error_rate,
+                max_timeout_rate=policy.max_timeout_rate,
+                cooldown_seconds=policy.cooldown_seconds,
+                ewma_alpha=policy.ewma_alpha,
+                updated_at=policy.updated_at,
+            )
             for policy in policies
         ],
-        "routes": [
-            {
-                "model": row.model,
-                "provider": row.provider,
-                "profile_revision": row.profile_revision,
-                "quantization": row.quantization,
-                "status": row.status,
-                "calibration_status": row.calibration_status,
-                "calibration_revision": row.calibration_revision,
-                "calibration_manifest_sha256": row.calibration_manifest_sha256,
-                "calibration_sample_count": row.calibration_sample_count,
-                "calibration_tool_accuracy": row.calibration_tool_accuracy,
-                "calibration_composite": row.calibration_composite,
-                "sample_count": row.sample_count,
-                "selected_ticket_count": row.selected_ticket_count,
-                "exploration_ticket_count": row.exploration_ticket_count,
-                "last_selected_at": row.last_selected_at,
-                "ewma_tokens_per_second": row.ewma_tokens_per_second,
-                "ewma_latency_ms": row.ewma_latency_ms,
-                "ewma_error_rate": row.ewma_error_rate,
-                "ewma_timeout_rate": row.ewma_timeout_rate,
-                "prompt_price_per_token": row.prompt_price_per_token,
-                "completion_price_per_token": row.completion_price_per_token,
-                "updated_at": row.updated_at,
-            }
+        routes=[
+            InferenceRouteView(
+                model=row.model,
+                provider=row.provider,
+                profile_revision=row.profile_revision,
+                quantization=row.quantization,
+                status=row.status,
+                calibration_status=row.calibration_status,
+                calibration_revision=row.calibration_revision,
+                calibration_manifest_sha256=row.calibration_manifest_sha256,
+                calibration_sample_count=row.calibration_sample_count,
+                calibration_tool_accuracy=row.calibration_tool_accuracy,
+                calibration_composite=row.calibration_composite,
+                sample_count=row.sample_count,
+                selected_ticket_count=row.selected_ticket_count,
+                exploration_ticket_count=row.exploration_ticket_count,
+                last_selected_at=row.last_selected_at,
+                ewma_tokens_per_second=row.ewma_tokens_per_second,
+                ewma_latency_ms=row.ewma_latency_ms,
+                ewma_error_rate=row.ewma_error_rate,
+                ewma_timeout_rate=row.ewma_timeout_rate,
+                prompt_price_per_token=row.prompt_price_per_token,
+                completion_price_per_token=row.completion_price_per_token,
+                updated_at=row.updated_at,
+            )
             for row in rows
         ],
-        "audits": [
-            {
-                "audit_id": str(audit.audit_id),
-                "actor": audit.actor,
-                "action": audit.action,
-                "model": audit.model,
-                "profile_revision": audit.profile_revision,
-                "payload": audit.payload,
-                "recorded_at": audit.recorded_at,
-            }
+        audits=[
+            InferenceRoutingAuditView(
+                audit_id=str(audit.audit_id),
+                actor=audit.actor,
+                action=audit.action,
+                model=audit.model,
+                profile_revision=audit.profile_revision,
+                payload=audit.payload,
+                recorded_at=audit.recorded_at,
+            )
             for audit in audits
         ],
-        "provider_telemetry": [
-            {
-                "provider": row.upstream_provider,
-                "request_count": row.request_count,
-                "completed_count": row.completed_count,
-                "timeout_count": row.timeout_count,
-                "prompt_tokens": row.prompt_tokens,
-                "completion_tokens": row.completion_tokens,
-                "cost_microusd": row.cost_microusd,
-                "average_latency_ms": row.average_latency_ms,
-            }
+        provider_telemetry=[
+            ProviderTelemetryView(
+                provider=row.upstream_provider,
+                request_count=row.request_count,
+                completed_count=row.completed_count,
+                timeout_count=row.timeout_count,
+                prompt_tokens=row.prompt_tokens,
+                completion_tokens=row.completion_tokens,
+                cost_microusd=row.cost_microusd,
+                average_latency_ms=row.average_latency_ms,
+            )
             for row in provider_telemetry
         ],
-    }
+    )
 
 
 @router.put("/policy/{model:path}")
