@@ -120,6 +120,56 @@ def emission_set(projection: KothProjection | None) -> tuple[KothEntry, ...]:
     return tuple(members)
 
 
+def retest_cohort(
+    entries: Sequence[KothEntry],
+    projection: KothProjection | None,
+    *,
+    size: int,
+) -> tuple[KothEntry, ...]:
+    """Return the continual-retest cohort: the top ``size`` ranked agents.
+
+    ``size == EMISSION_SET_SIZE`` reproduces :func:`emission_set` exactly --- same
+    champion anchor, same ``-effective_composite`` distinct-miner ordering, same
+    membership --- because this reuses ``project_koth``'s tail rule and only
+    raises the cap it applies. That equality is the point: the operator dial
+    starts from the historical lane and extends it, so nothing about the top five
+    changes when it moves.
+
+    Above five, the next ranked entrants join the cohort. They are rescored on
+    the same champion-anchored wave seeds, which is what makes a challenger's
+    arrival in the emission set cheap: it brings confirmation depth with it
+    instead of needing a fresh sweep before it can settle a paired comparison.
+
+    ``entries`` must be the same pool ``projection`` was built from; the
+    champion comes from the projection's dethrone chain, never from rank order.
+    """
+    if projection is None:
+        return ()
+    champion = projection.champion
+    ranked = sorted(
+        (
+            entry
+            for entry in entries
+            if entry.composite > 0.0 and entry.miner_hotkey != champion.miner_hotkey
+        ),
+        key=lambda entry: (
+            -effective_composite(entry),
+            entry.first_seen,
+            entry.agent_id,
+        ),
+    )
+    seen = {champion.agent_id}
+    members = [champion]
+    for entry in ranked:
+        if len(members) >= max(1, size):
+            break
+        if entry.agent_id in seen:
+            continue
+        seen.add(entry.agent_id)
+        members.append(entry)
+    return tuple(members)
+
+
 def tempo_index(block_number: int) -> int:
     """The tempo ordinal a chain block falls in (``block // BLOCKS_PER_TEMPO``)."""
     return block_number // BLOCKS_PER_TEMPO

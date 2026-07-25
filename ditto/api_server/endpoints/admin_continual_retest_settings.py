@@ -36,6 +36,7 @@ from ditto.db.queries.continual_retest_settings import (
     list_continual_retest_settings_revisions,
 )
 from ditto.db.queries.heartbeats import live_validator_fleet_supports_protocol
+from ditto.db.queries.scores import list_eligible_ledger
 
 router = APIRouter(prefix="/admin/continual-retest-settings", tags=["admin"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
@@ -85,6 +86,21 @@ async def _fleet_ready(session: AsyncSession) -> bool:
     )
 
 
+async def _eligible_agent_count(session: AsyncSession) -> int:
+    """Ranked agents the cohort could draw from on the active generation.
+
+    The operator can ask for 25 in a field of nine; without this the page would
+    show a cohort size that silently means "everyone" and give no way to tell.
+    """
+    rows = await list_eligible_ledger(
+        session,
+        include_fingerprints=False,
+        include_details=False,
+        bench_version=await active_bench_version(session),
+    )
+    return sum(1 for row in rows if row.eligible and row.composite > 0.0)
+
+
 @router.get("", response_model=AdminContinualRetestSettingsResponse)
 async def get_settings(
     request: Request, _admin: AdminDep, session: SessionDep
@@ -123,6 +139,7 @@ async def get_settings(
             max_age_seconds=resolver.ttl_seconds,
             open_rollout_desired_version=desired_version,
             rollout_standdown_active=standdown_active,
+            eligible_agent_count=await _eligible_agent_count(session),
         ),
     )
 

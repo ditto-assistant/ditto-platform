@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import statistics
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -5916,6 +5916,65 @@ async def _seed_top5_emission_set(
     return agent_ids
 
 
+async def _seed_ranked_pool(
+    maker: async_sessionmaker[AsyncSession], *, size: int
+) -> list[UUID]:
+    """Seed ``size`` ranked agents so the cohort can extend past the top five."""
+    return await _seed_top5_emission_set(
+        maker,
+        composites=[round(0.90 - rank / 100, 2) for rank in range(size)],
+    )
+
+
+async def _seed_confirmation_wave(
+    maker: async_sessionmaker[AsyncSession],
+    agent_ids: Sequence[UUID],
+    *,
+    seed: int,
+    bench_version: int = 2,
+    composite: float = 0.90,
+) -> None:
+    """Record one already-scored wave seed for ``agent_ids``.
+
+    ``composite`` defaults to the champion's own score on purpose: a completed
+    wave feeds ``effective_composite``, so a low value here would re-rank the
+    pool and quietly change which agents the test is even talking about.
+    """
+    async with maker() as session, session.begin():
+        for index, agent_id in enumerate(agent_ids):
+            session.add(
+                ConfirmationScore(
+                    agent_id=agent_id,
+                    validator_hotkey=_VALIDATOR_HOTKEY,
+                    bench_version=bench_version,
+                    seed=seed,
+                    composite=composite,
+                    run_id=f"wave-{seed}-{index}",
+                    signature=None,
+                )
+            )
+
+
+async def _set_retest_cohort_size(
+    maker: async_sessionmaker[AsyncSession], size: int
+) -> None:
+    async with maker() as session, session.begin():
+        session.add(
+            ContinualRetestSettingsRevision(
+                parent_revision=0,
+                scope="*",
+                settings={
+                    "aggregate_mode": "fleet_ready",
+                    "idle_retests_enabled": False,
+                    "retest_cohort_size": size,
+                },
+                checksum="b" * 64,
+                reason="retest deeper than the emission set",
+                actor="operator@example.com",
+            )
+        )
+
+
 def _top5_job_payload(
     champion: UUID,
     member: UUID,
@@ -6698,7 +6757,7 @@ class TestTop5ConfirmationLane:
         assert ticket is not None and ticket.status == TicketStatus.SCORED
         assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
 
-    async def test_rejects_member_outside_emission_set(
+    async def test_rejects_member_outside_the_retest_cohort(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -6714,7 +6773,109 @@ class TestTop5ConfirmationLane:
             json=_top5_job_payload(champion, sixth),
         )
         assert response.status_code == 409
-        assert "emission set" in response.json()["message"]
+        # Default cohort is the emission set, so rank six is still refused.
+        assert "retest cohort (top 5)" in response.json()["message"]
+
+    async def test_widened_cohort_admits_ranked_agents_below_the_emission_set(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Top-10 is one operator revision, not a redeploy."""
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        agent_ids = await _seed_ranked_pool(session_maker, size=10)
+        champion, sixth = agent_ids[0], agent_ids[5]
+        wave_seed = champion_anchored_seeds(champion, version=2, max_seeds=16)[0]
+        # Every emission-set member but the champion already holds this seed;
+        # the champion is leased below. Nothing in the top five is left waiting,
+        # so the extended cohort is what the spare slot is for.
+        await _seed_confirmation_wave(session_maker, agent_ids[1:5], seed=wave_seed)
+        await _set_retest_cohort_size(session_maker, 10)
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+        _install_chain_with_block(app, block_number=1)
+
+        champion_claim = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[0]),
+            json=_top5_job_payload(champion, champion, keypair=_KEYPAIRS[0]),
+        )
+        assert champion_claim.status_code == 200, champion_claim.text
+
+        extended = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[1]),
+            json=_top5_job_payload(champion, sixth, keypair=_KEYPAIRS[1]),
+        )
+
+        assert extended.status_code == 200, extended.text
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket, (sixth, 2, _KEYPAIRS[1].ss58_address)
+            )
+        assert ticket is not None
+        assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
+
+    async def test_emission_set_is_served_before_the_extended_cohort(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A wave completes on the top five, so they get the slots first."""
+        agent_ids = await _seed_ranked_pool(session_maker, size=10)
+        champion, sixth = agent_ids[0], agent_ids[5]
+        await _set_retest_cohort_size(session_maker, 10)
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+        _install_chain_with_block(app, block_number=1)
+
+        too_early = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, sixth),
+        )
+
+        assert too_early.status_code == 409
+        assert "less confirmation coverage" in too_early.json()["message"]
+
+    async def test_extended_member_cannot_hold_a_wave_open(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Wave completion stays keyed to the emission set at any cohort width.
+
+        With all five emission members scored on the current seed the wave is
+        complete and the lane opens the next one, so the champion can be leased
+        again. Were completion keyed to the whole cohort, rank six's missing
+        result would hold the wave open and this claim would 409 --- and the
+        crown would sit behind whichever extended member was slowest.
+        """
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        agent_ids = await _seed_ranked_pool(session_maker, size=10)
+        champion = agent_ids[0]
+        seeds = champion_anchored_seeds(champion, version=2, max_seeds=16)
+        await _seed_confirmation_wave(session_maker, agent_ids[:5], seed=seeds[0])
+        await _set_retest_cohort_size(session_maker, 10)
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+        _install_chain_with_block(app, block_number=1)
+
+        advanced = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, champion),
+        )
+
+        assert advanced.status_code == 200, advanced.text
 
 
 def _v3_capable_capabilities(*, now: datetime) -> dict[str, object]:
