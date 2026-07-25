@@ -44,7 +44,7 @@ import os
 import re
 import statistics
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, Literal
@@ -101,7 +101,10 @@ from ditto.api_models.validator_capabilities import (
     validator_artifact_mode,
     validator_identity_signing_token,
 )
-from ditto.api_models.validator_slot_settings import ValidatorSlotSettings
+from ditto.api_models.validator_slot_settings import (
+    HARD_SLOT_CEILING,
+    ValidatorSlotSettings,
+)
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
 from ditto.api_server.benchmark_rollout import (
     refresh_rolling_qualification,
@@ -401,14 +404,73 @@ _UNRANKED_SLOT = 1 << 16
 def _slot_ordinal(slot_id: str) -> int:
     """Return the ordinal N of a ``slot-N`` id, or a value above every cap.
 
-    The validator numbers its slots densely from zero, so the ordinal is what
-    the operator cap compares against. Anything that does not parse fails
-    closed.
+    Used only to reject ids outside the wire contract's ``^slot-[0-7]$``.
+    Anything that does not parse fails closed. The ordinal is deliberately NOT
+    what the operator cap compares against -- see :func:`_slot_cap_declines`.
     """
     prefix, _, suffix = slot_id.partition("-")
     if prefix != "slot" or not suffix.isdigit():
         return _UNRANKED_SLOT
     return int(suffix)
+
+
+async def _held_lease_slots(
+    session: AsyncSession, *, validator_hotkey: str, now: datetime
+) -> set[str]:
+    """Slot ids on which this validator currently holds a live lease.
+
+    ``deadline > now`` rather than status alone, because the overdue sweep runs
+    downstream of the cap gate: an expired-but-unswept lease is not occupied
+    capacity and must not be charged against the cap.
+    """
+    return set(
+        (
+            await session.scalars(
+                select(ValidatorTicket.slot_id)
+                .where(
+                    ValidatorTicket.validator_hotkey == validator_hotkey,
+                    ValidatorTicket.status == TicketStatus.ISSUED,
+                    ValidatorTicket.deadline > now,
+                )
+                .distinct()
+            )
+        ).all()
+    )
+
+
+def _slot_cap_declines(
+    *,
+    slot_id: str,
+    slot_running_benchmark: bool,
+    allowed_slots: int,
+    held_slots: Collection[str],
+) -> bool:
+    """Whether the operator slot cap refuses a NEW lease on ``slot_id``.
+
+    The cap counts concurrent leases, not slot ordinals. #433 gated on the
+    ordinal instead, on the stated assumption that "the validator numbers its
+    slots densely from zero". Production disproves it: ``healthy_slots`` is a
+    sparse subset of ``configured_slots`` whenever a slot is draining or
+    unhealthy, so a validator advertising four slots with slot-0 unhealthy has
+    only ordinals 1-3 to offer and an ordinal ceiling of three silently costs
+    it the third lease the operator granted. Counting what the validator
+    actually holds is also what :func:`allowed_slot_count` already documents
+    its result is for.
+
+    ``slot_id`` is excluded from the count: a slot polling for its own live
+    lease is served by the resume path downstream, and charging that lease
+    against the cap would make a validator at exactly the cap unable to pick
+    its own work back up after a restart.
+
+    Live work is still exempt (a slot the heartbeat reports as running), so
+    lowering the cap continues to cost the fleet new work only, never leases
+    already in flight.
+    """
+    if slot_running_benchmark:
+        return False
+    if _slot_ordinal(slot_id) >= HARD_SLOT_CEILING:
+        return True
+    return len({held for held in held_slots if held != slot_id}) >= allowed_slots
 
 
 def _heartbeat_disk_percent(heartbeat: ValidatorHeartbeat | None) -> int | None:
@@ -1718,16 +1780,18 @@ async def request_job(
             # Operator slot cap. Validators advertise the capacity their host
             # can offer; how much of it the fleet actually uses is an operator
             # decision that must be changeable from backroom without a release.
-            # Slots are numbered densely from zero, so declining every ordinal
-            # at or above the cap is a hard ceiling on new leases per validator
-            # regardless of what the heartbeat advertises.
+            # The ceiling is on how many leases one validator holds at once, so
+            # it is enforced by counting the live ones -- not by refusing every
+            # slot ordinal at or above the cap, which silently under-fills any
+            # validator whose healthy slots are sparse (see
+            # ``_slot_cap_declines``).
             #
             # A slot already running a benchmark is exempt, and every path that
             # resumes a live lease is downstream of this gate: without the
-            # exemption, lowering the cap would strand the in-flight leases on
-            # the ordinals it removed until they expired, burning a retry
-            # attempt each. Lowering the cap must cost the fleet nothing but new
-            # work. The exemption cannot be forged -- heartbeat ingest drops any
+            # exemption, lowering the cap would strand the in-flight leases it
+            # no longer covers until they expired, burning a retry attempt
+            # each. Lowering the cap must cost the fleet nothing but new work.
+            # The exemption cannot be forged -- heartbeat ingest drops any
             # active slot with no matching open ticket -- so ``capacity.active``
             # only ever names slots the platform itself leased.
             allowed_slots = allowed_slot_count(
@@ -1735,7 +1799,16 @@ async def request_job(
                 advertised_slots=capacity.configured_slots,
                 disk_percent=_heartbeat_disk_percent(heartbeat),
             )
-            if not slot_running_benchmark and _slot_ordinal(slot_id) >= allowed_slots:
+            if _slot_cap_declines(
+                slot_id=slot_id,
+                slot_running_benchmark=slot_running_benchmark,
+                allowed_slots=allowed_slots,
+                held_slots=await _held_lease_slots(
+                    session,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                ),
+            ):
                 return Response(status_code=204)
         if rollout is not None:
             fresh_lane_due = (
