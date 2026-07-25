@@ -1768,6 +1768,13 @@ async def _current_koth_entries(
                 raw_rank=rank,
                 bench_version=row.bench_version,
                 composite_stderr=_ledger_stderr(details, quorum.get(row.agent_id, [])),
+                quorum_composites=tuple(quorum.get(row.agent_id, [])) or None,
+                completed_wave_composites=tuple(
+                    value
+                    for seed, value in sorted(history.get(row.agent_id, {}).items())
+                    if seed in completed_seeds
+                )
+                or None,
                 confirmation_composites=(
                     tuple(value for _seed, value in confirmations)
                     if confirmations is not None
