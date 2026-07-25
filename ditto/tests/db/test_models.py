@@ -9,7 +9,8 @@ tests in a future PR.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import warnings
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -330,3 +331,89 @@ class TestAgentIdType:
         )
         assert result is not None
         assert isinstance(result.agent_id, UUID)
+
+
+class TestSqliteDatetimeAdapter:
+    """Pins how aware datetimes reach SQLite in the test/dev backend.
+
+    ``ditto/tests/conftest.py`` registers explicit ``sqlite3`` adapters
+    in place of the ones CPython deprecated in 3.12. These tests lock in
+    that the replacement stores byte-identical text to the old default,
+    so timezone information is preserved exactly rather than quietly
+    dropped.
+    """
+
+    async def _stored_text(self, session: AsyncSession) -> str:
+        """Read ``created_at`` as raw SQLite TEXT, bypassing type coercion.
+
+        Each test gets its own in-memory engine holding a single agent
+        row, so an unqualified SELECT is unambiguous.
+        """
+        stored = await session.scalar(
+            text("SELECT CAST(created_at AS TEXT) FROM agents")
+        )
+        assert isinstance(stored, str)
+        return stored
+
+    async def _insert_raw(self, session: AsyncSession, ts: datetime) -> None:
+        """INSERT via a raw ``text()`` bind, the path that hits the adapter."""
+        agent_id = uuid4()
+        await session.execute(
+            text(
+                "INSERT INTO agents "
+                "(agent_id, miner_hotkey, name, sha256, status, created_at) "
+                "VALUES (:agent_id, :hotkey, :name, :sha, :status, :ts)"
+            ),
+            {
+                "agent_id": str(agent_id),
+                "hotkey": "5HK1",
+                "name": "alpha",
+                "sha": "abc",
+                "status": AgentStatus.UPLOADED.value,
+                "ts": ts,
+            },
+        )
+
+    async def test_raw_bind_preserves_utc_offset(self, session: AsyncSession):
+        """A raw datetime bind keeps its ``+00:00`` suffix in stored text."""
+        await self._insert_raw(session, datetime(2026, 5, 19, 12, 30, tzinfo=UTC))
+
+        assert await self._stored_text(session) == "2026-05-19 12:30:00+00:00"
+
+    async def test_raw_bind_preserves_non_utc_offset(self, session: AsyncSession):
+        """A non-UTC offset survives verbatim; it is not normalised to UTC."""
+        kolkata = timezone(timedelta(hours=5, minutes=30))
+        await self._insert_raw(session, datetime(2026, 5, 19, 12, 30, tzinfo=kolkata))
+
+        assert await self._stored_text(session) == "2026-05-19 12:30:00+05:30"
+
+    async def test_raw_bind_emits_no_deprecation_warning(self, session: AsyncSession):
+        """The implicit adapter, removed in a future Python, is not relied on."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await self._insert_raw(session, datetime(2026, 5, 19, 12, 30, tzinfo=UTC))
+
+        assert [w for w in caught if "adapter is deprecated" in str(w.message)] == []
+
+    async def test_mapped_column_round_trip_is_unaffected(self, session: AsyncSession):
+        """The ORM path is untouched by the adapter and keeps its wall clock.
+
+        Mapped ``TIMESTAMP(timezone=True)`` columns never reach the
+        ``sqlite3`` adapter: SQLAlchemy's SQLite dialect stringifies them
+        itself. That dialect's storage format carries no offset, so the
+        value comes back naive on SQLite while Postgres returns it aware.
+        That divergence predates -- and is untouched by -- the adapter
+        registration; this test pins it so a future change to either side
+        is visible rather than silent.
+        """
+        original = make_agent(created_at=datetime(2026, 5, 19, 12, 30, tzinfo=UTC))
+        session.add(original)
+        await session.commit()
+        session.expunge_all()
+
+        loaded = await session.scalar(
+            select(Agent).where(Agent.agent_id == original.agent_id)
+        )
+        assert loaded is not None
+        assert loaded.created_at.replace(tzinfo=UTC) == original.created_at
+        assert await self._stored_text(session) == "2026-05-19 12:30:00.000000"
