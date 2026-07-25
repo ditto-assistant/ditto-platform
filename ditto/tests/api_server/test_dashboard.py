@@ -1148,12 +1148,31 @@ class TestDashboardScoringTransparency:
         """
         body = await self._body()
         assert "var REFERENCE_BASELINES = {" in body
-        # The published runs, both from dittobench-api docs/BASELINES.md.
+        # The calibration runs published in dittobench-api docs/BASELINES.md.
         assert "2: { composite: 0.492" in body
         assert "3: { composite: 0.445" in body
         assert "4: { composite: 0.429" in body
+        # The released-contract runs published in the kit's own BASELINES.md.
+        assert "5: { composite: 0.263" in body
+        assert "6: { composite: 0.242" in body
         # Unmeasured versions must be stated, not rendered as a bare dash.
         assert "not yet measured" in body
         assert "No reference baseline has been measured on bench_version" in body
         # And the card must not claim a baseline is the winning score.
         assert "it is not the score that wins" in body
+
+    async def test_reference_baseline_cites_the_document_it_came_from(self) -> None:
+        """The source is per row, because no one document holds every run.
+
+        The kit's own BASELINES.md publishes the released contracts a miner
+        targets; the validator's docs/BASELINES.md additionally carries the
+        calibration runs that shipped with scorer work. A single hardcoded
+        citation sent a reader to a document that did not contain the number
+        they were looking at, which is worse than no citation at all.
+        """
+        body = await self._body()
+        assert 'Source: " + baseline.source + ".' in body
+        assert "Source: dittobench-api docs/BASELINES.md. This is the score" not in body
+        # Every row carries its own citation, and both documents are named.
+        assert body.count('source: "dittobench-api docs/BASELINES.md"') == 3
+        assert body.count('source: "dittobench-starter-kit BASELINES.md"') == 2
