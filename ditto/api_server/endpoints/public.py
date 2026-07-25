@@ -230,6 +230,7 @@ from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
     SubmissionRow,
+    emission_owner,
     get_public_health,
     get_score_counts,
     get_submission_scores,
@@ -2015,7 +2016,15 @@ async def leaderboard(
             row.agent_id,
         )
     )
-    finalized_miners = {row.miner_hotkey for row in finalized_rows}
+    # The finalized board is already one row per owner (``list_eligible_ledger``
+    # partitions on ``emission_owner``), so the provisional overlay has to
+    # suppress and dedupe on that same owner. Keyed on the hotkey it showed an
+    # owner's second hotkey as an extra provisional row beside the finalized one
+    # it is not separately ranked against.
+    finalized_owners = {
+        emission_owner(miner_hotkey=row.miner_hotkey, miner_coldkey=row.miner_coldkey)
+        for row in finalized_rows
+    }
     provisional_candidates = [
         (row, score_counts.get(row.agent_id, 0))
         for row in ledger_rows
@@ -2029,11 +2038,15 @@ async def leaderboard(
             str(candidate[0].agent_id),
         )
     )
-    provisional_by_miner: dict[str, tuple[LedgerRow, int]] = {}
+    provisional_by_owner: dict[str, tuple[LedgerRow, int]] = {}
     for candidate in provisional_candidates:
-        if candidate[0].miner_hotkey not in finalized_miners:
-            provisional_by_miner.setdefault(candidate[0].miner_hotkey, candidate)
-    provisional_rows = list(provisional_by_miner.values())
+        owner = emission_owner(
+            miner_hotkey=candidate[0].miner_hotkey,
+            miner_coldkey=candidate[0].miner_coldkey,
+        )
+        if owner not in finalized_owners:
+            provisional_by_owner.setdefault(owner, candidate)
+    provisional_rows = list(provisional_by_owner.values())
     rows = finalized_rows + [row for row, _count in provisional_rows]
     # During an open rollout the board is a mixed-version pool (v3 at quorum,
     # otherwise v2), which makes composite ordering jump between incomparable
@@ -2989,12 +3002,23 @@ def _public_activity_response(
             str(row.agent.agent_id),
         ),
     )
-    best_provisional_by_miner: dict[str, Any] = {}
+    # Group by the payment-time owner, not the hotkey: the allocator partitions
+    # its contender lane on ``emission_owner_key`` (ditto/db/queries/tickets.py),
+    # so one coldkey funding several hotkeys holds ONE contender slot. Keying on
+    # the hotkey here handed that owner a slot per hotkey, pushing every miner
+    # below it a rank too deep and evicting a genuine contender from the lane.
+    best_provisional_by_owner: dict[str, Any] = {}
     for row in provisional_candidates:
-        best_provisional_by_miner.setdefault(row.agent.miner_hotkey, row)
+        best_provisional_by_owner.setdefault(
+            emission_owner(
+                miner_hotkey=row.agent.miner_hotkey,
+                miner_coldkey=row.miner_coldkey,
+            ),
+            row,
+        )
     provisional_contender_ids = {
         row.agent.agent_id
-        for row in list(best_provisional_by_miner.values())[
+        for row in list(best_provisional_by_owner.values())[
             :PROVISIONAL_CONTENDER_LANE_SIZE
         ]
     }

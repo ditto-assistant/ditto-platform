@@ -14,6 +14,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
@@ -67,6 +68,7 @@ from ditto.db.models import (
     Base,
     BenchmarkDataset,
     BenchmarkRollout,
+    EvaluationPayment,
     Score,
     ScreeningAttempt,
     ScreeningQuarantine,
@@ -549,6 +551,35 @@ async def _seed_agent(
             )
         )
     return str(agent_id)
+
+
+async def _seed_payment(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    agent_id: str,
+    miner_hotkey: str,
+    miner_coldkey: str,
+    index: int,
+) -> None:
+    """Attach a payment-time coldkey to a seeded submission.
+
+    The owner identity the validator ticket allocator and the emission ledger
+    both partition on lives here, not on the agent row.
+    """
+    async with maker() as s, s.begin():
+        s.add(
+            EvaluationPayment(
+                block_hash=f"0xpayment-{index}",
+                extrinsic_index=index,
+                agent_id=UUID(agent_id),
+                miner_hotkey=miner_hotkey,
+                miner_coldkey=miner_coldkey,
+                amount_rao=1,
+                tao_usd_rate=Decimal("1"),
+                dest_address="5Destination",
+                timestamp=datetime.now(UTC),
+            )
+        )
 
 
 async def _drain_weight_refreshes(app: FastAPI) -> None:
@@ -1299,6 +1330,70 @@ class TestPublicLeaderboard:
         assert entry["score_count"] == 2
         assert entry["score_quorum"] == 3
         assert entry["bench_version"] == DEFAULT_BENCH_VERSION
+
+    async def test_provisional_overlay_gives_one_row_per_coldkey_not_per_hotkey(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The overlay must group the way the emission ledger does.
+
+        ``list_eligible_ledger`` ranks one row per payment-time coldkey, so a
+        coldkey funding several hotkeys holds one board position. Keyed on the
+        hotkey, the provisional overlay showed an owner a second row — and even
+        showed a provisional row beside its own finalized one.
+        """
+        shared_coldkey = "5SharedProvisionalColdkey"
+        settled_coldkey = "5SettledColdkey"
+        best_provisional = await _seed_k3(
+            session_maker,
+            miner="5" + "P" * 47,
+            composites=[0.80, 0.80],
+            status=AgentStatus.EVALUATING,
+        )
+        sibling_provisional = await _seed_k3(
+            session_maker,
+            miner="5" + "Q" * 47,
+            composites=[0.75],
+            status=AgentStatus.EVALUATING,
+        )
+        finalized = await _seed_k3(
+            session_maker,
+            miner="5" + "R" * 47,
+            composites=[0.70, 0.70, 0.70],
+        )
+        # Same owner as ``finalized``, and scoring higher: without owner
+        # grouping this outranks its own settled row on the public board.
+        shadow_provisional = await _seed_k3(
+            session_maker,
+            miner="5" + "S" * 47,
+            composites=[0.85],
+            status=AgentStatus.EVALUATING,
+        )
+        for index, (agent_id, hotkey, coldkey) in enumerate(
+            (
+                (best_provisional, "5" + "P" * 47, shared_coldkey),
+                (sibling_provisional, "5" + "Q" * 47, shared_coldkey),
+                (finalized, "5" + "R" * 47, settled_coldkey),
+                (shadow_provisional, "5" + "S" * 47, settled_coldkey),
+            ),
+            start=1,
+        ):
+            await _seed_payment(
+                session_maker,
+                agent_id=agent_id,
+                miner_hotkey=hotkey,
+                miner_coldkey=coldkey,
+                index=index,
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        listed = [entry["agent_id"] for entry in body["entries"]]
+        assert listed == [finalized, best_provisional]
+        assert body["count"] == 2
 
     async def test_open_rollout_exposes_settled_and_rollout_state_per_entry(
         self,
@@ -2485,6 +2580,77 @@ class TestPublicActivity:
         assert by_id[one_high_id]["provisional_composite"] == pytest.approx(0.95)
         assert by_id[high_id]["provisional_composite"] == pytest.approx(0.85)
         assert by_id[low_id]["provisional_composite"] == pytest.approx(0.25)
+
+    async def test_contender_lane_gives_one_slot_per_coldkey_not_per_hotkey(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The preview must group contenders the way the allocator does.
+
+        ``issue_ticket``'s contender lane partitions on the payment-time coldkey
+        (``emission_owner_key``), so one coldkey funding two hotkeys occupies a
+        single contender slot. Grouping the preview by hotkey handed that owner
+        two slots and pushed every miner below it one rank too deep.
+        """
+        shared_coldkey = "5SharedColdkeyFundingTwoHotkeys"
+        best_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.90],
+            status=AgentStatus.EVALUATING,
+        )
+        sibling_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.89],
+            status=AgentStatus.EVALUATING,
+        )
+        unscored_id = await _seed_agent(
+            session_maker,
+            miner=_VALIDATOR_C,
+            status=AgentStatus.EVALUATING,
+            name="unscored",
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=best_id,
+            miner_hotkey=_MINER_A,
+            miner_coldkey=shared_coldkey,
+            index=1,
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=sibling_id,
+            miner_hotkey=_MINER_B,
+            miner_coldkey=shared_coldkey,
+            index=2,
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=unscored_id,
+            miner_hotkey=_VALIDATOR_C,
+            miner_coldkey="5IndependentColdkey",
+            index=3,
+        )
+        async with session_maker() as session, session.begin():
+            for agent_id in (best_id, sibling_id):
+                agent = await session.get(Agent, UUID(agent_id))
+                assert agent is not None
+                agent.screening_policy_version = SCREENING_POLICY_VERSION
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/activity")
+        by_id = {entry["agent_id"]: entry for entry in response.json()["entries"]}
+
+        # Only the owner's best submission takes a contender slot. Its sibling
+        # drops to the ordinary queue, where the untouched submission's coverage
+        # priority (zero scores) puts it ahead.
+        assert by_id[best_id]["validator_queue_rank"] == 1
+        assert by_id[unscored_id]["validator_queue_rank"] == 2
+        assert by_id[sibling_id]["validator_queue_rank"] == 3
 
     async def test_filters_complete_dataset_before_paginating_with_counts(
         self,

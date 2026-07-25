@@ -301,6 +301,13 @@ class PublicActivityRow:
     highest_composite: float | None
     last_scored_at: datetime | None
     screening_attempt: ScreeningAttempt | None
+    miner_coldkey: str | None = None
+    """Payment-time owner identity, ``None`` for rows that predate payments.
+
+    Carried so the public queue-rank preview can group contenders by the same
+    owner the validator ticket allocator partitions on
+    (:func:`ditto.db.queries.scores.emission_owner_key`) instead of by hotkey.
+    Moderation-only, never exposed on the wire."""
 
 
 async def list_public_activity(
@@ -352,12 +359,19 @@ async def list_public_activity(
             score_counts.c.highest_composite,
             score_counts.c.last_scored_at,
             ScreeningAttempt,
+            EvaluationPayment.miner_coldkey,
         )
         .outerjoin(score_counts, score_counts.c.agent_id == Agent.agent_id)
         .outerjoin(
             ScreeningAttempt,
             (ScreeningAttempt.agent_id == Agent.agent_id)
             & (ScreeningAttempt.status == "running"),
+        )
+        # ``evaluation_payments`` is UNIQUE on ``agent_id``, so this cannot fan
+        # a submission out into several activity rows.
+        .outerjoin(
+            EvaluationPayment,
+            EvaluationPayment.agent_id == Agent.agent_id,
         )
         .order_by(Agent.created_at.desc(), Agent.agent_id.desc())
     )
@@ -386,6 +400,7 @@ async def list_public_activity(
                 ),
                 last_scored_at=last_scored_at,
                 screening_attempt=screening_attempt,
+                miner_coldkey=miner_coldkey,
             )
             for (
                 agent,
@@ -395,6 +410,7 @@ async def list_public_activity(
                 highest_composite,
                 last_scored_at,
                 screening_attempt,
+                miner_coldkey,
             ) in result.all()
         ],
         total,
