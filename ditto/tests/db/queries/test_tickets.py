@@ -2122,9 +2122,16 @@ class TestIssueTicket:
         assert ticket.agent_id == oldest
         assert ticket.agent_id != newer
 
-    async def test_completion_first_second_slot_waits_for_global_oldest(
+    async def test_completion_first_second_slot_advances_past_own_live_head(
         self, session: AsyncSession
     ) -> None:
+        """A live lease on the head must not idle the same validator's siblings.
+
+        One ticket per (agent, version, validator) is the composite primary key,
+        so the head's remaining quorum slots belong to other validators no
+        matter what this slot does. Parking the sibling behind the head bought
+        the head nothing and cost the fleet a slot for the whole lease.
+        """
         oldest = await _seed_evaluating(session, created_at=_NOW, name="oldest")
         newer = await _seed_evaluating(
             session,
@@ -2152,8 +2159,38 @@ class TestIssueTicket:
 
         assert slot0 is not None
         assert slot0.agent_id == oldest
+        assert slot1 is not None
+        # Strictly the next FIFO candidate, never a second lease on the head.
+        assert slot1.agent_id == newer
+        assert slot1.slot_id == "slot-1"
+
+    async def test_completion_first_second_slot_stops_when_fifo_is_exhausted(
+        self, session: AsyncSession
+    ) -> None:
+        """Advancing past the head is not permission to invent work."""
+        oldest = await _seed_evaluating(session, created_at=_NOW, name="oldest")
+
+        async with session.begin():
+            slot0 = await issue_ticket(
+                session,
+                validator_hotkey="5OnlyOneAgent",
+                slot_id="slot-0",
+                now=_NOW,
+                ttl=_TTL,
+                completion_first=True,
+            )
+            slot1 = await issue_ticket(
+                session,
+                validator_hotkey="5OnlyOneAgent",
+                slot_id="slot-1",
+                now=_NOW,
+                ttl=_TTL,
+                completion_first=True,
+            )
+
+        assert slot0 is not None
+        assert slot0.agent_id == oldest
         assert slot1 is None
-        assert await session.get(ValidatorTicket, (newer, 2, "5ParallelFinish")) is None
 
     async def test_completion_first_advances_past_head_validator_already_scored(
         self, session: AsyncSession
