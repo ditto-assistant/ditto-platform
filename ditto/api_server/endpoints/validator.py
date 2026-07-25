@@ -183,6 +183,7 @@ from ditto.db.queries.confirmation_scores import (
     completed_confirmation_wave_seeds,
     confirmation_composites_by_seed,
 )
+from ditto.db.queries.desired_era_backlog import desired_era_work_outstanding
 from ditto.db.queries.heartbeats import (
     HeartbeatProgressRegressionError,
     _validate_same_lease_progress,
@@ -441,6 +442,65 @@ async def _validator_slot_settings(request: Request) -> ValidatorSlotSettings:
     return await resolver.resolve(getattr(request.app.state, "session_maker", None))
 
 
+PREV_GEN_CARRYOVER_DEFAULTS = QUEUE_POLICY_DEFAULTS.prev_gen_carryover
+"""Previous-generation policy in force when a caller supplies none.
+
+The shipped defaults, so an omitted policy makes retired-era work stricter --
+never looser -- than an operator's stored revision would.
+"""
+
+
+async def _desired_era_capable_hotkeys(
+    session: AsyncSession, *, rollout: BenchmarkRollout, now: datetime
+) -> set[str]:
+    """Validators whose fresh signed heartbeat advertises the desired version.
+
+    The fleet that could actually take desired-era work. A stale or
+    source-version-only heartbeat is not part of it, so a validator that cannot
+    serve the new era never makes the previous generation look like it is
+    crowding anything.
+    """
+    heartbeats = (await session.scalars(select(ValidatorHeartbeat))).all()
+    return {
+        candidate.validator_hotkey
+        for candidate in heartbeats
+        if heartbeat_supports_version(
+            candidate, now=now, version=rollout.desired_version
+        )
+    }
+
+
+async def _prev_gen_lane_open(
+    session: AsyncSession,
+    *,
+    rollout: BenchmarkRollout,
+    now: datetime,
+    settings: PrevGenCarryoverSettings,
+) -> bool:
+    """Whether previous-generation work may issue at all on this poll.
+
+    Strict priority, shared by both previous-generation lanes: reaching the tail
+    of ``request_job`` only proves that *this* validator found no desired-era
+    work, and that happens constantly while the queue is deep (one ticket per
+    agent/version/validator, one generation per owner, per-validator cooldowns).
+    Leasing retired-era work on that evidence takes a slot away from a queue the
+    validator simply could not see.
+
+    See :mod:`ditto.db.queries.desired_era_backlog` for why the fleet-wide
+    answer errs toward "still outstanding" and why it nonetheless terminates.
+    """
+    if not settings.require_desired_era_drained:
+        return True
+    return not await desired_era_work_outstanding(
+        session,
+        rollout=rollout,
+        now=now,
+        capable_validator_hotkeys=await _desired_era_capable_hotkeys(
+            session, rollout=rollout, now=now
+        ),
+    )
+
+
 async def _issue_source_backfill_ticket(
     session: AsyncSession,
     *,
@@ -454,9 +514,18 @@ async def _issue_source_backfill_ticket(
     # Defaults to the conservative policy so an omitted cap narrows the
     # backfill budget rather than widening it.
     slot_settings: ValidatorSlotSettings = SLOT_SETTINGS_DEFAULT,
+    carryover_settings: PrevGenCarryoverSettings = PREV_GEN_CARRYOVER_DEFAULTS,
     resume_only: bool = False,
 ) -> ValidatorTicket | None:
-    """Use otherwise-idle capacity after the inherited cohort settles."""
+    """Use otherwise-idle capacity after the desired era has nothing to give.
+
+    Retired-era work is previous-generation work, exactly like the adopted
+    carryover below, so both answer to the same operator policy
+    (``queue_policy.prev_gen_carryover``): it issues only into a genuinely empty
+    desired-era queue. A lease already in flight is never revoked -- the gate
+    guards new admission, not resumption, because expiring a running benchmark
+    would burn a retry attempt for a submission that did nothing wrong.
+    """
     if heartbeat is None or not heartbeat_supports_version(
         heartbeat, now=now, version=rollout.from_version
     ):
@@ -500,6 +569,12 @@ async def _issue_source_backfill_ticket(
             slot_id=slot_id,
         )
     if resume_only:
+        return None
+    # New retired-era admission only. Checked before the fleet lock so a poll
+    # that is going to decline anyway does not serialize behind one that is not.
+    if not await _prev_gen_lane_open(
+        session, rollout=rollout, now=now, settings=carryover_settings
+    ):
         return None
     if is_postgresql:
         acquired_fleet_lock = await session.scalar(
@@ -614,6 +689,9 @@ async def _issue_prev_gen_carryover_ticket(
     precedent as :func:`_issue_source_backfill_ticket` ("use otherwise-idle
     capacity after the inherited cohort settles"): carryover rides on a
     transition and must never be able to delay the one it is riding on.
+
+    Lane position is necessary but not sufficient, so it additionally waits for
+    the desired-era queue to be fleet-wide empty -- see :func:`_prev_gen_lane_open`.
     """
     if not settings.enabled or not target_inference_ready:
         return None
@@ -623,6 +701,10 @@ async def _issue_prev_gen_carryover_ticket(
         return None
     if settings.require_cohort_complete and not await rollout_cohort_complete(
         session, rollout=rollout, cohort_size=rollout.cohort_size
+    ):
+        return None
+    if not await _prev_gen_lane_open(
+        session, rollout=rollout, now=now, settings=settings
     ):
         return None
     adopted = await carryover_agent_ids(session, rollout=rollout)
@@ -1863,6 +1945,7 @@ async def request_job(
                     validator_running_benchmark=slot_running_benchmark,
                     slot_id=slot_id,
                     slot_settings=slot_settings,
+                    carryover_settings=queue_policy.prev_gen_carryover,
                 )
             if ticket is None and rollout is not None:
                 return Response(status_code=204)

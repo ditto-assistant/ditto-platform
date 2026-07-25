@@ -42,10 +42,12 @@ def _patch(
     supports: bool = True,
     cohort_complete: bool = True,
     adopted: list | None = None,
-) -> tuple[AsyncMock, AsyncMock, MagicMock]:
+    desired_era_outstanding: bool = False,
+) -> tuple[AsyncMock, AsyncMock, MagicMock, AsyncMock]:
     issue = AsyncMock(return_value=MagicMock(name="ticket"))
     complete = AsyncMock(return_value=cohort_complete)
     ids = AsyncMock(return_value=_ADOPTED if adopted is None else adopted)
+    outstanding = AsyncMock(return_value=desired_era_outstanding)
     supports_version = MagicMock(return_value=supports)
     monkeypatch.setattr(
         "ditto.api_server.endpoints.validator.heartbeat_supports_version",
@@ -56,14 +58,21 @@ def _patch(
     )
     monkeypatch.setattr("ditto.api_server.endpoints.validator.carryover_agent_ids", ids)
     monkeypatch.setattr("ditto.api_server.endpoints.validator.issue_ticket", issue)
-    return issue, complete, ids
+    monkeypatch.setattr(
+        "ditto.api_server.endpoints.validator.desired_era_work_outstanding", outstanding
+    )
+    monkeypatch.setattr(
+        "ditto.api_server.endpoints.validator._desired_era_capable_hotkeys",
+        AsyncMock(return_value={"5Validator"}),
+    )
+    return issue, complete, ids, outstanding
 
 
 async def test_disabled_policy_issues_nothing_and_queries_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The shipped default must not even look at the carryover table."""
-    issue, complete, ids = _patch(monkeypatch)
+    issue, complete, ids, _outstanding = _patch(monkeypatch)
     ticket = await _issue_prev_gen_carryover_ticket(
         AsyncMock(),
         rollout=_rollout(),
@@ -92,7 +101,7 @@ async def test_capability_gates_refuse_before_touching_the_queue(
     supports: bool,
 ) -> None:
     """A validator that cannot run the new era is never handed new-era work."""
-    issue, _complete, ids = _patch(monkeypatch, supports=supports)
+    issue, _complete, ids, _outstanding = _patch(monkeypatch, supports=supports)
     ticket = await _issue_prev_gen_carryover_ticket(
         AsyncMock(),
         rollout=_rollout(),
@@ -114,7 +123,7 @@ async def test_waits_for_the_inherited_cohort_then_issues(
 ) -> None:
     """Default policy: spare capacity only, on the source-backfill precedent."""
     rollout = _rollout()
-    issue, complete, _ids = _patch(monkeypatch, cohort_complete=False)
+    issue, complete, _ids, _outstanding = _patch(monkeypatch, cohort_complete=False)
 
     blocked = await _issue_prev_gen_carryover_ticket(
         AsyncMock(),
@@ -156,7 +165,7 @@ async def test_waits_for_the_inherited_cohort_then_issues(
 async def test_interleaving_policy_does_not_wait_for_the_cohort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    issue, complete, _ids = _patch(monkeypatch, cohort_complete=False)
+    issue, complete, _ids, _outstanding = _patch(monkeypatch, cohort_complete=False)
     ticket = await _issue_prev_gen_carryover_ticket(
         AsyncMock(),
         rollout=_rollout(),
@@ -176,7 +185,7 @@ async def test_no_adopted_agents_issues_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An enabled policy with an empty carryover table is still a no-op."""
-    issue, _complete, _ids = _patch(monkeypatch, adopted=[])
+    issue, _complete, _ids, _outstanding = _patch(monkeypatch, adopted=[])
     ticket = await _issue_prev_gen_carryover_ticket(
         AsyncMock(),
         rollout=_rollout(),
@@ -190,3 +199,57 @@ async def test_no_adopted_agents_issues_nothing(
     )
     assert ticket is None
     issue.assert_not_awaited()
+
+
+async def test_strict_priority_blocks_while_the_new_era_still_has_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lane is last, not proportional: any leasable new-era row wins.
+
+    Reaching this helper only proves that THIS validator's desired-era lanes
+    came back empty, which they do constantly while the queue is deep. The
+    fleet-wide question is the one that decides.
+    """
+    issue, _complete, ids, outstanding = _patch(
+        monkeypatch, desired_era_outstanding=True
+    )
+    ticket = await _issue_prev_gen_carryover_ticket(
+        AsyncMock(),
+        rollout=_rollout(),
+        heartbeat=MagicMock(),
+        validator_hotkey="5Validator",
+        now=_NOW,
+        settings=_ENABLED,
+        target_inference_ready=True,
+        validator_running_benchmark=False,
+        slot_id="slot-0",
+    )
+    assert ticket is None
+    issue.assert_not_awaited()
+    ids.assert_not_awaited()
+    outstanding.assert_awaited()
+
+
+async def test_operator_can_relax_strict_priority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The knob lives on the #429 board, so the gate is not hardcoded."""
+    issue, _complete, _ids, outstanding = _patch(
+        monkeypatch, desired_era_outstanding=True
+    )
+    ticket = await _issue_prev_gen_carryover_ticket(
+        AsyncMock(),
+        rollout=_rollout(),
+        heartbeat=MagicMock(),
+        validator_hotkey="5Validator",
+        now=_NOW,
+        settings=PrevGenCarryoverSettings(
+            enabled=True, require_desired_era_drained=False
+        ),
+        target_inference_ready=True,
+        validator_running_benchmark=False,
+        slot_id="slot-0",
+    )
+    assert ticket is not None
+    issue.assert_awaited()
+    outstanding.assert_not_awaited()
