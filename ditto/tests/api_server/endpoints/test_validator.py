@@ -88,6 +88,7 @@ from ditto.db.models import (
     BenchmarkRolloutMember,
     ConfirmationScore,
     ContinualRetestSettingsRevision,
+    InferenceGrant,
     Score,
     ScreenerHeartbeat,
     ValidatorHeartbeat,
@@ -726,6 +727,45 @@ async def _seed_agent(
             )
         )
     return aid
+
+
+async def _seed_revoked_grant(
+    maker: async_sessionmaker[AsyncSession],
+    agent_id: UUID,
+    *,
+    bench_version: int = 2,
+    deadline: datetime = _TICKET_DEADLINE,
+    status: str = "revoked",
+) -> None:
+    """Record the platform having terminated a lease's inference grant.
+
+    Mirrors what begin_inference_request writes when it finds the owning ticket
+    no longer ISSUED or its deadline rewritten: the grant flips to ``revoked``
+    and every later request on it is declined 429.
+    """
+    async with maker() as s, s.begin():
+        s.add(
+            InferenceGrant(
+                grant_id=uuid4(),
+                agent_id=agent_id,
+                bench_version=bench_version,
+                validator_hotkey=_VALIDATOR_HOTKEY,
+                slot_id="slot-0",
+                ticket_deadline=deadline,
+                expires_at=deadline,
+                status=status,
+                generation=0,
+                allowed_models=["qwen/qwen3-32b"],
+                request_budget=1000,
+                token_budget=1_000_000,
+                embedding_model="test-embed",
+                embedding_profile="test-embed-v1",
+                embedding_provider="test",
+                embedding_dimensions=768,
+                embedding_request_budget=1000,
+                embedding_token_budget=1_000_000,
+            )
+        )
 
 
 async def _seed_ticket(
@@ -4173,6 +4213,65 @@ class TestFailJob:
         # A scoring_error is the agent's own failure — no compensating grant.
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(agent_id, reason="scoring_error"),
+        )
+        assert failed.status_code == 200, failed.text
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.infra_retry_grants == 0
+
+    async def test_platform_revoked_lease_is_not_billed_to_the_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The regression this exists for: the platform revoked the run's
+        # inference grant mid-lease, the run died, and the validator -- which
+        # could only see "the scorer failed" -- reported scoring_error. That
+        # spent one of the agent's finite attempts for an outage it did not
+        # cause. The platform holds the evidence that it revoked the lease, so
+        # it compensates regardless of the label the validator put on it.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        await _seed_revoked_grant(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(agent_id, reason="scoring_error"),
+        )
+        assert failed.status_code == 200, failed.text
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.infra_retry_grants == 1
+            # The diagnosis is preserved verbatim; only the billing changed.
+            assert ticket.failure_reason == "scoring_error"
+
+    async def test_scoring_error_without_a_revoked_lease_still_bills_the_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The other half of the guarantee. A genuinely broken harness -- one
+        # that crashed the scorer with its lease perfectly healthy -- must keep
+        # consuming its own attempts, or one bad agent burns fleet capacity
+        # forever. An `exhausted` grant is the agent spending the budget it was
+        # given, so it is deliberately not treated as a platform fault.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        await _seed_revoked_grant(session_maker, agent_id, status="exhausted")
         _install_db(app, session_maker)
         _install_chain(app)
 

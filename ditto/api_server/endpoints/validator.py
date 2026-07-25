@@ -192,7 +192,11 @@ from ditto.db.queries.heartbeats import (
     _validate_same_lease_progress,
     upsert_validator_heartbeat,
 )
-from ditto.db.queries.inference import ensure_inference_grant, revoke_ticket_inference
+from ditto.db.queries.inference import (
+    ensure_inference_grant,
+    revoke_ticket_inference,
+    ticket_inference_revoked_mid_lease,
+)
 from ditto.db.queries.king_reign import (
     list_unconfirmed_kings,
     record_first_crowned,
@@ -3069,23 +3073,54 @@ async def fail_job(
             for_update=True,
         )
         if ticket is not None:
+            # Ask the platform's own records whether it killed this lease's
+            # inference before believing the reported reason. A validator can
+            # only classify from what its scorer told it, and that report has
+            # been demonstrably wrong: a run the platform revoked mid-lease
+            # reached fail_job as "scoring_error" and spent a real attempt.
+            # Checked BEFORE revoke_ticket_inference below, which would
+            # otherwise manufacture the very evidence being read, and scoped to
+            # this lease's own deadline (captured before the rewrite two lines
+            # down) so a prior attempt's cleanup cannot be mistaken for it.
+            platform_revoked = await ticket_inference_revoked_mid_lease(
+                session,
+                agent_id=ticket.agent_id,
+                bench_version=ticket.bench_version,
+                validator_hotkey=payload.validator_hotkey,
+                ticket_deadline=payload.ticket_deadline,
+            )
             # Close for reissue without the 6h agent-failure cooldown so the
             # next request_job mints a fresh lease instead of resuming this one.
             ticket.status = TicketStatus.EXPIRED
             ticket.deadline = now
             ticket.failure_reason = payload.reason
             ticket.failed_at = now
-            if payload.reason == "infrastructure":
+            if payload.reason == "infrastructure" or platform_revoked:
                 # Not the agent's fault: bump the (bounded) infra grant that
                 # offsets the coming attempt_count++, so an outage never spends
                 # the agent's genuine per-version budget. Then apply an
                 # escalating cooldown so a *sustained* outage isn't hammered by
                 # immediate back-to-back re-leases of the same agent.
+                #
+                # The same compensation covers a platform-revoked lease however
+                # the validator labelled it. MAX_INFRA_RETRY_GRANTS still caps
+                # it, so a persistently broken lease cannot mint attempts
+                # forever, and failure_reason still records what was actually
+                # reported -- this corrects the billing, not the diagnosis.
                 if ticket.infra_retry_grants < MAX_INFRA_RETRY_GRANTS:
                     ticket.infra_retry_grants += 1
                 ticket.retry_after = now + infra_retry_backoff(
                     ticket.infra_retry_grants
                 )
+                if platform_revoked and payload.reason != "infrastructure":
+                    logger.warning(
+                        "platform-revoked lease reported as %s; compensating "
+                        "agent=%s validator=%s deadline=%s",
+                        payload.reason,
+                        payload.agent_id,
+                        payload.validator_hotkey,
+                        payload.ticket_deadline.isoformat(),
+                    )
             elif payload.reason == "sandbox_oom":
                 # The sandbox, rather than validator-owned infrastructure,
                 # exhausted its memory allowance. Preserve the failed attempt
