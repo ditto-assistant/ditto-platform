@@ -1137,42 +1137,38 @@ class TestDashboardScoringTransparency:
         assert '<span class="tag" id="bs-version">v–</span>' in body
         assert 'class="bv-desired"' in body
 
-    async def test_reference_baseline_is_keyed_by_benchmark_version(self) -> None:
-        """Every measured version keeps its baseline; unmeasured ones say so.
+    async def test_no_reference_baseline_stat(self) -> None:
+        """The stock-harness reference baseline is deliberately not published.
 
-        A baseline is a real run of the stock harness on the locked model, so it
-        cannot be carried across versions -- composites only compare within one.
-        Holding a single constant meant the card went blank the moment the board
-        moved to a version it was not measured on, which reads as a broken widget
-        rather than as the honest "we have not run this yet" it actually is.
+        A single composite cannot represent that measurement honestly. The stock
+        kit's v7 calibration runs are sharply bimodal: 15 of 20 seeds score
+        conversational_sanity exactly 0.000 and land at composite 0.185-0.221,
+        while the 5 that clear the gate land at 0.344-0.450. The distribution has
+        no mass at its own mean (0.248, sd 0.087), so any one number on the card
+        would describe a run that does not exist and would misinform a reader
+        deciding whether a submission is worth making.
+
+        If a baseline is ever published again it needs to carry the shape of the
+        distribution, not a point estimate, so this guards against the stat
+        reappearing as a bare composite.
         """
         body = await self._body()
-        assert "var REFERENCE_BASELINES = {" in body
-        # The calibration runs published in dittobench-api docs/BASELINES.md.
-        assert "2: { composite: 0.492" in body
-        assert "3: { composite: 0.445" in body
-        assert "4: { composite: 0.429" in body
-        # The released-contract runs published in the kit's own BASELINES.md.
-        assert "5: { composite: 0.263" in body
-        assert "6: { composite: 0.242" in body
-        # Unmeasured versions must be stated, not rendered as a bare dash.
-        assert "not yet measured" in body
-        assert "No reference baseline has been measured on bench_version" in body
-        # And the card must not claim a baseline is the winning score.
-        assert "it is not the score that wins" in body
+        assert "REFERENCE_BASELINES" not in body
+        assert "Reference Baseline" not in body
+        assert 'id="c-baseline"' not in body
+        assert 'id="c-baseline-tip"' not in body
+        assert "reference baseline" not in body.lower()
+        assert "must beat" not in body
 
-    async def test_reference_baseline_cites_the_document_it_came_from(self) -> None:
-        """The source is per row, because no one document holds every run.
+    async def test_neighbouring_comparison_features_survive(self) -> None:
+        """Removing the baseline must not touch the features that sat near it.
 
-        The kit's own BASELINES.md publishes the released contracts a miner
-        targets; the validator's docs/BASELINES.md additionally carries the
-        calibration runs that shipped with scorer work. A single hardcoded
-        citation sent a reader to a document that did not contain the number
-        they were looking at, which is worse than no citation at all.
+        The off-network harness comparison and the token-efficiency budget are
+        separate measurements that merely live beside the removed card in the
+        same file; both stay.
         """
         body = await self._body()
-        assert 'Source: " + baseline.source + ".' in body
-        assert "Source: dittobench-api docs/BASELINES.md. This is the score" not in body
-        # Every row carries its own citation, and both documents are named.
-        assert body.count('source: "dittobench-api docs/BASELINES.md"') == 3
-        assert body.count('source: "dittobench-starter-kit BASELINES.md"') == 2
+        assert "var THIRD_PARTY_HARNESSES = [" in body
+        assert "Hermes Agent" in body
+        assert "OpenClaw" in body
+        assert "baseline_total_tokens" in body
