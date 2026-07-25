@@ -303,6 +303,21 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   validator signature proves who reported them, not independent host or image
   attestation. Signatures and arbitrary host/container fields remain private.
 
+  Heartbeat protocol v15 adds `capabilities.scorer_benchmarks.probe`: the
+  observation behind the scorer status rather than the conclusion drawn from it.
+  It carries `outcome` (`served`, `served_degraded`, `http_error`, `unreadable`,
+  `timeout`, `connect_error`, `not_probed`), the `observed_at` of the probe, the
+  `http_status` when the scorer answered, a `reason` when a readable reply was
+  partly rejected, `last_served_at`, and `consecutive_failures`. Without it a
+  scorer that never answered and a scorer that answered with something unusable
+  are identical on the wire: both report null identity fields. The field is
+  additive and optional, so a pre-v15 reporter signs exactly the bytes it always
+  did and reads `scorer_liveness: unreported`, never a claim that its scorer is
+  fine. A validator whose probe reports no usable answer is published as
+  `health: critical`, which is why `critical` joins the fleet health values.
+  Reporting is deliberately not a precondition for acceptance: telemetry that
+  can silence a validator is worse than telemetry that is missing.
+
   Heartbeat protocol v4 optionally signs a ticket-bound benchmark stage and
   aggregate `completed`/`total` check counts. The platform revalidates the live
   ticket, evaluating agent, freshness, stage allowlist, bounds, and monotonic

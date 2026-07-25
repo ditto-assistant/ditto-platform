@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, call
 from uuid import UUID, uuid4
 
@@ -932,6 +933,13 @@ _V9_STACK_HEALTH: dict[str, object] = {
 }
 
 
+def _quorum_capabilities() -> dict[str, object]:
+    """A fresh, mutable v12+ capability set (signed score quorum is required)."""
+    capabilities = json.loads(json.dumps(_V9_CAPABILITIES))
+    capabilities["signed_score_quorum"] = True
+    return dict(capabilities)
+
+
 def _screener_heartbeat_payload(
     *, timestamp: int, system_metrics: dict[str, object]
 ) -> dict[str, object]:
@@ -1236,6 +1244,166 @@ class TestHeartbeat:
             ),
         )
         assert accepted_v11.status_code == 200, accepted_v11.text
+
+    async def test_v15_publishes_the_evidence_behind_the_scorer_status(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The TAO.com sidecar, end to end.
+
+        Its ``/v1/capabilities`` route 404d, so the validator reported
+        ``legacy_v2`` with every identity field null -- byte-identical to a real
+        pre-capabilities scorer. The fleet view read ``warning`` beside
+        ``accepting`` while the validator took leases it could never finish.
+        With the probe the same heartbeat is publicly ``critical`` and says why.
+        """
+        _install_db(app, session_maker)
+        _install_chain(app)
+        capabilities = _quorum_capabilities()
+        capabilities["scorer_benchmarks"] = {
+            "status": "legacy_v2",
+            "supported_bench_versions": [2],
+            "probe": {
+                "outcome": "http_error",
+                "observed_at": 1_784_020_800,
+                "http_status": 404,
+                "consecutive_failures": 97,
+            },
+        }
+        capacity = {
+            "configured_slots": 1,
+            "healthy_slots": ["slot-0"],
+            "admission": "accepting",
+            "active": [],
+        }
+
+        accepted = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=15,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert accepted.status_code == 200, accepted.text
+
+        public = (await client.get("/api/v1/public/validators")).json()["validators"][0]
+        assert public["scorer_liveness"] == "not_serving"
+        assert public["health"] == "critical"
+        assert "scorer not serving: http 404 (97 in a row)" in public["health_reasons"]
+        probe = public["capabilities"]["scorer_benchmarks"]["probe"]
+        assert probe["outcome"] == "http_error"
+        assert probe["http_status"] == 404
+        assert probe.get("last_served_at") is None
+        # Admission semantics are deliberately untouched by this change: the
+        # validator is now visibly broken, and whether it should stop accepting
+        # work is a separate fleet-wide policy decision.
+        assert public["admission"] == "accepting"
+
+    async def test_probe_evidence_requires_protocol_v15(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A validator cannot claim an old protocol and send a new field.
+
+        The signed envelope and the declared protocol have to agree, or the
+        platform cannot reason about what a given protocol number guarantees.
+        """
+        _install_db(app, session_maker)
+        _install_chain(app)
+        capabilities = _quorum_capabilities()
+        scorer = cast(dict[str, object], capabilities["scorer_benchmarks"])
+        scorer["probe"] = {
+            "outcome": "served",
+            "observed_at": 1_784_020_800,
+            "http_status": 200,
+            "last_served_at": 1_784_020_800,
+        }
+        capacity = {
+            "configured_slots": 1,
+            "healthy_slots": ["slot-0"],
+            "admission": "accepting",
+            "active": [],
+        }
+
+        rejected = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=14,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert rejected.status_code == 422, rejected.text
+
+        accepted = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=15,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert accepted.status_code == 200, accepted.text
+
+    async def test_a_v14_validator_keeps_working_against_a_v15_platform(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Old validators must be unaffected while the fleet rolls forward.
+
+        Nothing about their signing bytes changed, so the only observable
+        difference is that they read ``unreported`` rather than claiming a
+        liveness they never measured.
+        """
+        _install_db(app, session_maker)
+        _install_chain(app)
+        capacity = {
+            "configured_slots": 1,
+            "healthy_slots": ["slot-0"],
+            "admission": "accepting",
+            "active": [],
+        }
+
+        accepted = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=14,
+                capabilities=_quorum_capabilities(),
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert accepted.status_code == 200, accepted.text
+
+        public = (await client.get("/api/v1/public/validators")).json()["validators"][0]
+        assert public["scorer_liveness"] == "unreported"
+        assert public["health"] != "critical"
+        assert public["capabilities"]["scorer_benchmarks"]["probe"] is None
+        # No scorer-liveness reason is invented for software that cannot report
+        # one; the reasons it does carry are the pre-existing stack findings.
+        assert not [
+            reason
+            for reason in public["health_reasons"]
+            if reason.startswith("scorer ")
+        ]
 
     async def test_malformed_stored_stack_health_is_omitted_publicly(
         self,

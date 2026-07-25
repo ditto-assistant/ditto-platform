@@ -2061,6 +2061,7 @@
     .fleet-ledger-row strong { font-family: var(--display); font-size: 23px; font-weight: 400; line-height: 1; font-variant-numeric: tabular-nums; }
     .fleet-ledger-row > span:last-child { color: var(--text-dim); font: 650 10px/1.2 var(--mono); text-transform: uppercase; }
     .fleet-ledger-row.healthy .fleet-ledger-dot { background: var(--good); }
+    .fleet-ledger-row.critical .fleet-ledger-dot { background: var(--danger); }
     .fleet-ledger-row.warning .fleet-ledger-dot { background: var(--warn); }
     .fleet-ledger-row.stale .fleet-ledger-dot { background: var(--warn); }
     .fleet-ledger-row.offline .fleet-ledger-dot { background: var(--danger); }
@@ -2460,6 +2461,7 @@
 
         <aside class="fleet-ledger" aria-label="Fleet status summary">
           <div class="fleet-ledger-row healthy"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-healthy">–</strong><span>Healthy</span></div>
+          <div class="fleet-ledger-row critical"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-critical">–</strong><span>Critical</span></div>
           <div class="fleet-ledger-row warning"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-warning">–</strong><span>Warning</span></div>
           <div class="fleet-ledger-row stale"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-stale">–</strong><span>Stale</span></div>
           <div class="fleet-ledger-row offline"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-offline">–</strong><span>Offline</span></div>
@@ -7189,6 +7191,10 @@
     }
 
     function fleetStatus(entry) {
+      // A scorer that is not serving comes first: the validator cannot finish a
+      // single lease, so nothing below this is the headline.
+      if (entry.scorer_liveness === "not_serving") return ["Scorer down", "bad"];
+      if (entry.health === "critical") return ["Critical", "bad"];
       // A live-but-off-assignment validator (bad) is distinct from a quiet one
       // (warn); "assigning" is a normal hand-off and stays green via health below.
       if (entry.assignment_state === "assignment_mismatch") return ["Mismatch", "bad"];
@@ -7375,10 +7381,38 @@
       };
       var chip = statusChips[scorer.status] || [scorer.status, "unknown"];
       var out = vstat("Scorer status", '<span class="stage ' + chip[1] + '">' + esc(chip[0]) + '</span>');
+      out += renderScorerProbe(scorer.probe);
       out += vstat("Supported benchmarks", esc((scorer.supported_bench_versions || []).map(function (v) { return "v" + v; }).join(", ") || "–"));
       if (scorer.observed_at != null) out += vstat("Capability observed", unixTimeHtml(scorer.observed_at));
       if (scorer.software_version) out += vstat("Scorer version", esc(scorer.software_version));
       if (scorer.source_revision) out += vstat("Scorer revision", monoValue(scorer.source_revision, "scorer source revision"), true);
+      return out;
+    }
+
+    // The status above is what the validator concluded. This is what its probe
+    // saw, which is the part that separates a scorer that never answered from
+    // one that answered with something unusable.
+    function renderScorerProbe(probe) {
+      if (!probe) return vstat("Scorer probe", '<span class="muted">Not reported (requires heartbeat protocol 15)</span>');
+      var outcomeChips = {
+        served: ["Serving", "good"],
+        served_degraded: ["Serving, reply partly rejected", "warn"],
+        http_error: ["No usable answer", "bad"],
+        unreadable: ["Answered, reply unusable", "bad"],
+        timeout: ["Probe timed out", "bad"],
+        connect_error: ["Connection failed", "bad"],
+        not_probed: ["Not probed", "unknown"]
+      };
+      var chip = outcomeChips[probe.outcome] || [probe.outcome, "unknown"];
+      var detail = "";
+      if (probe.http_status != null) detail += " · HTTP " + probe.http_status;
+      if (probe.reason) detail += " · " + probe.reason;
+      if (probe.consecutive_failures) detail += " · " + probe.consecutive_failures + " in a row";
+      var out = vstat("Scorer probe", '<span class="stage ' + chip[1] + '">' + esc(chip[0]) + '</span>' + esc(detail));
+      out += vstat("Probe observed", unixTimeHtml(probe.observed_at));
+      out += vstat("Last served", probe.last_served_at != null
+        ? unixTimeHtml(probe.last_served_at)
+        : '<span class="muted">Not since this validator started</span>');
       return out;
     }
 
@@ -7491,9 +7525,13 @@
     }
 
     function updateFleetLedger(entries) {
-      var counts = { healthy: 0, warning: 0, stale: 0, offline: 0, paused: 0, unknown: 0 };
+      var counts = { healthy: 0, critical: 0, warning: 0, stale: 0, offline: 0, paused: 0, unknown: 0 };
       entries.forEach(function (entry) {
-        if (entry.assignment_state === "assignment_mismatch") counts.warning++;
+        // Critical is counted before availability: a validator whose scorer is
+        // not serving is broken whether or not it is also quiet, and burying it
+        // under "stale" is how it stayed invisible.
+        if (entry.health === "critical") counts.critical++;
+        else if (entry.assignment_state === "assignment_mismatch") counts.warning++;
         else if (entry.availability === "stale") counts.stale++;
         else if (entry.availability === "offline") counts.offline++;
         else if (entry.availability === "paused") counts.paused++;
@@ -7507,7 +7545,7 @@
     }
 
     function resetFleetLedger() {
-      ["healthy", "warning", "stale", "offline", "paused", "unknown"].forEach(function (key) {
+      ["healthy", "critical", "warning", "stale", "offline", "paused", "unknown"].forEach(function (key) {
         document.getElementById("fleet-count-" + key).textContent = "–";
       });
     }

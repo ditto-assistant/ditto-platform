@@ -124,6 +124,7 @@ from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.public import (
     FleetAvailability,
     FleetHealth,
+    ScorerLiveness,
     ValidatorAssignmentState,
 )
 from ditto.api_models.screener import (
@@ -934,12 +935,62 @@ def _stack_component_issues(stack_health: ValidatorStackHealth | None) -> list[s
     ]
 
 
+# Heartbeat protocol that first carries scorer probe evidence. Below it,
+# "unreported" is expected and says nothing about the scorer; at or above it,
+# "unreported" means a validator that could have reported evidence and did not.
+_SCORER_PROBE_PROTOCOL = 15
+
+_SCORER_PROBE_LIVENESS: dict[str, ScorerLiveness] = {
+    "served": "serving",
+    "served_degraded": "degraded",
+    "http_error": "not_serving",
+    "unreadable": "not_serving",
+    "timeout": "not_serving",
+    "connect_error": "not_serving",
+    "not_probed": "unreported",
+}
+
+
+def _scorer_liveness(
+    capabilities: ValidatorCapabilities | None, protocol_version: int
+) -> tuple[ScorerLiveness, list[str]]:
+    """Return whether the scorer is serving, and the labels explaining it.
+
+    A running container is not a serving scorer. The heartbeat already reported
+    what the validator concluded about its scorer; this reads what the probe
+    observed, so a sidecar that 404s its capability route stops looking like an
+    old-but-fine v2 scorer, and a scorer whose reply was only partly readable
+    stops looking fully healthy.
+    """
+    scorer = capabilities.scorer_benchmarks if capabilities is not None else None
+    probe = scorer.probe if scorer is not None else None
+    if probe is None:
+        if protocol_version >= _SCORER_PROBE_PROTOCOL:
+            return "unreported", ["scorer liveness not reported"]
+        return "unreported", []
+    liveness = _SCORER_PROBE_LIVENESS.get(probe.outcome, "unreported")
+    if liveness == "serving":
+        return liveness, []
+    detail = (
+        f"http {probe.http_status}"
+        if probe.outcome == "http_error"
+        else (probe.reason or probe.outcome)
+    )
+    if liveness == "unreported":
+        return liveness, ["scorer was not probed"]
+    label = "scorer not serving" if liveness == "not_serving" else "scorer degraded"
+    if probe.consecutive_failures > 1:
+        return liveness, [f"{label}: {detail} ({probe.consecutive_failures} in a row)"]
+    return liveness, [f"{label}: {detail}"]
+
+
 def _health_reasons(
     *,
     state: str,
     metrics: PublicSystemMetrics | None,
     active_benchmark: PublicBenchmarkProgress | None,
     stack_health: ValidatorStackHealth | None,
+    scorer_reasons: list[str],
 ) -> list[str]:
     """Human-readable labels explaining a non-healthy fleet badge.
 
@@ -965,6 +1016,7 @@ def _health_reasons(
     if active_benchmark is not None and active_benchmark.stalled:
         reasons.append("benchmark stalled")
     reasons.extend(_stack_component_issues(stack_health))
+    reasons.extend(scorer_reasons)
     return reasons
 
 
@@ -2256,6 +2308,9 @@ def _validator_heartbeats_response(
             for item in validator_assignments
         ]
         assigned_benchmarks.sort(key=lambda progress: progress.slot_id)
+        scorer_liveness, scorer_reasons = _scorer_liveness(
+            capabilities, row.protocol_version
+        )
         entries.append(
             PublicValidatorHeartbeat(
                 validator_hotkey=row.validator_hotkey,
@@ -2286,17 +2341,26 @@ def _validator_heartbeats_response(
                 seen_at=seen_at,
                 online=online,
                 availability=availability,
-                # A wedged benchmark or a required stack component that is
+                # A scorer that is not serving outranks everything else here: the
+                # validator cannot complete a single lease, which is worse than
+                # any host-metric warning and must not read like one. Below it, a
+                # wedged benchmark or a required stack component that is
                 # degraded/unreachable/identity-mismatched is a real operational
                 # problem regardless of how the host metrics look (or whether they
                 # were reported), so surface it as a warning in the fleet health
                 # roll-up rather than only in the nested per-component map.
                 health=(
-                    "warning"
-                    if (active_benchmark is not None and active_benchmark.stalled)
-                    or _stack_component_issues(stack_health)
-                    else health
+                    "critical"
+                    if scorer_liveness == "not_serving"
+                    else (
+                        "warning"
+                        if scorer_reasons
+                        or (active_benchmark is not None and active_benchmark.stalled)
+                        or _stack_component_issues(stack_health)
+                        else health
+                    )
                 ),
+                scorer_liveness=scorer_liveness,
                 # The detailed "why" behind the badge, kept as structured labels
                 # (for a tooltip) so the summary stays compact without hiding info.
                 health_reasons=_health_reasons(
@@ -2304,6 +2368,7 @@ def _validator_heartbeats_response(
                     metrics=metrics,
                     active_benchmark=active_benchmark,
                     stack_health=stack_health,
+                    scorer_reasons=scorer_reasons,
                 ),
                 system_metrics=metrics,
                 capabilities=capabilities,
