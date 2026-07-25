@@ -2112,6 +2112,11 @@
     .fleet-meter-track i { display: block; width: calc(var(--value) * 1%); height: 100%; background: var(--good); }
     .fleet-meter.warn .fleet-meter-track i { background: var(--warn); }
     .fleet-meter-value { color: var(--text); font: 10px/1 var(--mono); font-variant-numeric: tabular-nums; }
+    /* One row per concurrent benchmark slot, stacked inside the work cell so
+       the fleet table keeps its column count as slot counts grow. */
+    .fleet-slot { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+    .fleet-slot + .fleet-slot { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border); }
+    .fleet-slot > .fleet-protocol { flex: none; font-variant-numeric: tabular-nums; }
     .fleet-container-health { color: var(--text); font: 10px/1.35 var(--mono); white-space: nowrap; }
     .fleet-container-health.bad { color: var(--danger); }
     .fleet-unreported { color: var(--text-faint); font-size: 11px; }
@@ -7270,6 +7275,42 @@
       return "";
     }
 
+    // Every slot a validator could show work on, ordered by ordinal. The union
+    // matters: a validator running on a slot outside its reported
+    // configured_slots range would otherwise have that job silently dropped
+    // from the fleet view, which is exactly when an operator needs to see it.
+    function validatorSlotIds(entry) {
+      var seen = {};
+      var configured = Math.max(1, Number(entry.configured_slots) || 1);
+      for (var index = 0; index < configured; index += 1) seen["slot-" + index] = true;
+      (entry.healthy_slots || []).forEach(function (slotId) {
+        if (slotId) seen[slotId] = true;
+      });
+      [entry.active_benchmarks || [], entry.assigned_benchmarks || []].forEach(function (list) {
+        list.forEach(function (benchmark) {
+          if (benchmark && benchmark.slot_id) seen[benchmark.slot_id] = true;
+        });
+      });
+      return Object.keys(seen).sort(function (a, b) {
+        return slotOrdinal(a) - slotOrdinal(b);
+      });
+    }
+
+    function slotOrdinal(slotId) {
+      var parsed = parseInt(String(slotId).replace(/^slot-/, ""), 10);
+      return isNaN(parsed) ? Number.MAX_SAFE_INTEGER : parsed;
+    }
+
+    // True when any slot is reporting a stage, not just the lowest one. Keying
+    // this off a single slot hid live progress whenever slot zero was idle.
+    function anyBenchmarkStage(entry) {
+      var benchmarks = entry.active_benchmarks || [];
+      for (var index = 0; index < benchmarks.length; index += 1) {
+        if (benchmarks[index] && benchmarks[index].stage) return true;
+      }
+      return !!(entry.active_benchmark && entry.active_benchmark.stage);
+    }
+
 
     // ── Validator detail (signed heartbeat, capabilities, per-component stack health) ──
     var STACK_COMPONENT_LABELS = {
@@ -7440,7 +7481,21 @@
       report += vstat("Platform received", isoTimeHtml(entry.seen_at));
       var assignment = renderValidatorAssignment(entry);
       if (assignment) report += vstat("Assignment", assignment);
-      else if (entry.active_benchmark) report += vstat("Active benchmark", renderBenchmarkProgress(entry.active_benchmark, true));
+      report += vstat("Slots", esc(
+        String((entry.healthy_slots || []).length) + " healthy of " +
+        String(entry.configured_slots || 1) + " · " + String(entry.admission || "accepting")));
+      var activeSlots = entry.active_benchmarks || [];
+      if (activeSlots.length) {
+        // One row per running job. The modal used to show only the lowest slot,
+        // so a second concurrent benchmark was invisible here.
+        activeSlots.slice().sort(function (a, b) {
+          return slotOrdinal(a.slot_id) - slotOrdinal(b.slot_id);
+        }).forEach(function (benchmark) {
+          report += vstat(benchmark.slot_id || "slot-0", renderBenchmarkProgress(benchmark, true));
+        });
+      } else if (!assignment && entry.active_benchmark) {
+        report += vstat("Active benchmark", renderBenchmarkProgress(entry.active_benchmark, true));
+      }
 
       var caps = "";
       var c = entry.capabilities;
@@ -7659,10 +7714,7 @@
             assignedBySlot[benchmark.slot_id || "slot-0"] = benchmark;
           });
           var healthySlots = entry.healthy_slots || [];
-          var slotCount = Math.max(1, Number(entry.configured_slots) || 1);
-          var slotRows = [];
-          for (var slotIndex = 0; slotIndex < slotCount; slotIndex += 1) {
-            var slotId = "slot-" + slotIndex;
+          var slotRows = validatorSlotIds(entry).map(function (slotId) {
             var benchmark = activeBySlot[slotId] || assignedBySlot[slotId];
             var slotState = benchmark
               ? renderBenchmarkProgress(benchmark, true)
@@ -7671,8 +7723,8 @@
                 : (healthySlots.indexOf(slotId) >= 0
                   ? '<span class="stage success">Idle</span>'
                   : '<span class="stage warn">Unavailable</span>'));
-            slotRows.push('<div title="' + esc(slotId) + '"><span class="fleet-protocol">' + esc(slotId) + '</span> ' + slotState + '</div>');
-          }
+            return '<div class="fleet-slot" title="' + esc(slotId) + '"><span class="fleet-protocol">' + esc(slotId) + '</span> ' + slotState + '</div>';
+          });
           slotWork = slotRows.join("");
         }
         var currentWork = slotWork || assignmentState || (singular === "validator" && entry.active_benchmark
@@ -7680,7 +7732,7 @@
           : (singular === "screener" && entry.screening_progress ? renderScreenerProgress(entry) : active));
         var hasGranularProgress =
           assignmentState ||
-          (singular === "validator" && entry.active_benchmark && entry.active_benchmark.stage) ||
+          (singular === "validator" && anyBenchmarkStage(entry)) ||
           (singular === "screener" && entry.screening_progress);
         var workStatus = hasGranularProgress
           ? ""

@@ -100,6 +100,7 @@ from ditto.api_models.validator_capabilities import (
     validator_artifact_mode,
     validator_identity_signing_token,
 )
+from ditto.api_models.validator_slot_settings import ValidatorSlotSettings
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
 from ditto.api_server.benchmark_rollout import (
     refresh_rolling_qualification,
@@ -136,6 +137,13 @@ from ditto.api_server.queue_policy_settings import (
 )
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
+from ditto.api_server.validator_slot_settings import (
+    DEFAULT_SETTINGS as SLOT_SETTINGS_DEFAULT,
+)
+from ditto.api_server.validator_slot_settings import (
+    ValidatorSlotSettingsResolver,
+    allowed_slot_count,
+)
 from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
@@ -381,6 +389,55 @@ async def _fresh_submission_lane_due(
     return settings.fresh_submission_lane_due(int(completed_since_rollout or 0))
 
 
+# Unparseable slot ids sort above every cap, so an unrecognised id is declined
+# rather than silently treated as slot zero.
+_UNRANKED_SLOT = 1 << 16
+
+
+def _slot_ordinal(slot_id: str) -> int:
+    """Return the ordinal N of a ``slot-N`` id, or a value above every cap.
+
+    The validator numbers its slots densely from zero, so the ordinal is what
+    the operator cap compares against. Anything that does not parse fails
+    closed.
+    """
+    prefix, _, suffix = slot_id.partition("-")
+    if prefix != "slot" or not suffix.isdigit():
+        return _UNRANKED_SLOT
+    return int(suffix)
+
+
+def _heartbeat_disk_percent(heartbeat: ValidatorHeartbeat | None) -> int | None:
+    """Read the last reported host disk usage, or None when it is unknown.
+
+    Unknown is deliberately not treated as a tripped breaker: a validator that
+    reports no metrics must not lose the slots it already had.
+    """
+    if heartbeat is None:
+        return None
+    metrics = heartbeat.system_metrics
+    if not isinstance(metrics, dict):
+        return None
+    value = metrics.get("disk_percent")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+async def _validator_slot_settings(request: Request) -> ValidatorSlotSettings:
+    """Resolve the operator slot cap, falling back to the conservative default.
+
+    A missing resolver (an app built without lifespan) must not uncap the
+    fleet, so the default policy is returned instead of an unbounded one.
+    """
+    resolver: ValidatorSlotSettingsResolver | None = getattr(
+        request.app.state, "validator_slot_settings", None
+    )
+    if resolver is None:
+        return SLOT_SETTINGS_DEFAULT
+    return await resolver.resolve(getattr(request.app.state, "session_maker", None))
+
+
 async def _issue_source_backfill_ticket(
     session: AsyncSession,
     *,
@@ -391,6 +448,9 @@ async def _issue_source_backfill_ticket(
     artifact_mode: Literal["legacy", "prefer_screened", "screened_only"],
     validator_running_benchmark: bool,
     slot_id: str,
+    # Defaults to the conservative policy so an omitted cap narrows the
+    # backfill budget rather than widening it.
+    slot_settings: ValidatorSlotSettings = SLOT_SETTINGS_DEFAULT,
     resume_only: bool = False,
 ) -> ValidatorTicket | None:
     """Use otherwise-idle capacity after the inherited cohort settles."""
@@ -473,8 +533,19 @@ async def _issue_source_backfill_ticket(
                 )
             except ValidationError:
                 continue
+            # Count the slots the platform will actually fill, not the ones the
+            # host merely advertises. Validators advertise headroom so the cap
+            # can be raised without a release; counting that headroom here would
+            # widen the source-backfill budget to capacity that never receives a
+            # ticket, and drown the desired version this reservation protects.
             slot_count = (
-                len(capacity.healthy_slots) if capacity.admission == "accepting" else 0
+                allowed_slot_count(
+                    slot_settings,
+                    advertised_slots=len(capacity.healthy_slots),
+                    disk_percent=_heartbeat_disk_percent(candidate),
+                )
+                if capacity.admission == "accepting"
+                else 0
             )
         else:
             slot_count = 1
@@ -1360,6 +1431,10 @@ async def request_job(
     # session to refill a cold cache, and doing that inside this transaction
     # would nest sessions on the hot path.
     queue_policy = await _resolve_queue_policy(request)
+    # Resolve the operator slot cap on the resolver's own session, before the
+    # request transaction opens: reading it on `session` here would autobegin and
+    # break the `session.begin()` below.
+    slot_settings = await _validator_slot_settings(request)
 
     job: JobResponse | None = None
     async with session.begin():
@@ -1451,6 +1526,28 @@ async def request_job(
                 capacity.admission != "accepting"
                 or slot_id not in capacity.healthy_slots
             ):
+                return Response(status_code=204)
+            # Operator slot cap. Validators advertise the capacity their host
+            # can offer; how much of it the fleet actually uses is an operator
+            # decision that must be changeable from backroom without a release.
+            # Slots are numbered densely from zero, so declining every ordinal
+            # at or above the cap is a hard ceiling on new leases per validator
+            # regardless of what the heartbeat advertises.
+            #
+            # A slot already running a benchmark is exempt, and every path that
+            # resumes a live lease is downstream of this gate: without the
+            # exemption, lowering the cap would strand the in-flight leases on
+            # the ordinals it removed until they expired, burning a retry
+            # attempt each. Lowering the cap must cost the fleet nothing but new
+            # work. The exemption cannot be forged -- heartbeat ingest drops any
+            # active slot with no matching open ticket -- so ``capacity.active``
+            # only ever names slots the platform itself leased.
+            allowed_slots = allowed_slot_count(
+                slot_settings,
+                advertised_slots=capacity.configured_slots,
+                disk_percent=_heartbeat_disk_percent(heartbeat),
+            )
+            if not slot_running_benchmark and _slot_ordinal(slot_id) >= allowed_slots:
                 return Response(status_code=204)
         if rollout is not None:
             fresh_lane_due = (
@@ -1582,6 +1679,7 @@ async def request_job(
                     artifact_mode=artifact_mode,
                     validator_running_benchmark=slot_running_benchmark,
                     slot_id=slot_id,
+                    slot_settings=slot_settings,
                     resume_only=True,
                 )
             if ticket is None and rollout is None:
@@ -1658,6 +1756,7 @@ async def request_job(
                     artifact_mode=artifact_mode,
                     validator_running_benchmark=slot_running_benchmark,
                     slot_id=slot_id,
+                    slot_settings=slot_settings,
                 )
             if ticket is None and rollout is not None:
                 return Response(status_code=204)

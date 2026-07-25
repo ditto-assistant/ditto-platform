@@ -2902,3 +2902,73 @@ class InferenceConcurrencySettingsRevision(Base):
             name="inference_concurrency_settings_scope_parent_key",
         ),
     )
+
+
+class ValidatorSlotSettingsRevision(Base):
+    """Append-only, operator-audited concurrent-benchmark-slot policy revision.
+
+    A validator advertises its own slot capacity in the heartbeat (bounded to
+    eight by the protocol) and the platform used to honor it unconditionally.
+    Each row here freezes a full policy as JSON -- the per-validator cap plus the
+    disk-utilization circuit breaker -- and ticket dispatch reads the latest one
+    at run time (short TTL) so an operator can cap or ramp fleet parallelism from
+    backroom with no redeploy. Rows are **append-only**: nothing UPDATEs or
+    deletes one, so the audit trail of every cap change is complete.
+
+    When no row exists the module default in
+    ``ditto.api_server.validator_slot_settings`` governs (cap 2), which is also
+    the fallback for every failure path -- an unreadable policy holds the fleet
+    conservative rather than uncapping it.
+
+    Scope is subnet-global (only ``*``); the column mirrors the other revision
+    tables' shape and leaves room for future per-validator scoping.
+    """
+
+    __tablename__ = "validator_slot_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope = '*' OR length(scope) BETWEEN 1 AND 63",
+            name="validator_slot_settings_scope_check",
+        ),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="validator_slot_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="validator_slot_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="validator_slot_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="validator_slot_settings_actor_check",
+        ),
+        Index(
+            "validator_slot_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        # The optimistic-concurrency key: two writers that both read revision N
+        # as current cannot both append a child of N.
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="validator_slot_settings_scope_parent_key",
+        ),
+    )
