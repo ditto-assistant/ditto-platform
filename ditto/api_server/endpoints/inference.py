@@ -18,7 +18,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from uuid import UUID
 
 import httpx
@@ -37,11 +37,15 @@ from ditto.api_server.endpoints.validator import (
     _assert_validator_permitted,
     _verify_signature,
 )
+from ditto.api_server.inference_concurrency_settings import (
+    InferenceConcurrencySettingsResolver,
+)
 from ditto.api_server.inference_routing import (
     benchmark_reasoning,
     record_route_observation,
 )
 from ditto.db.queries.inference import (
+    InferenceDecline,
     activate_inference_grant,
     begin_inference_request,
     finish_inference_request,
@@ -50,6 +54,9 @@ from ditto.db.queries.validator_auth import (
     ValidatorRequestReplayError,
     consume_validator_nonce,
 )
+
+if TYPE_CHECKING:
+    from ditto.api_server.config import InferenceProxyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -557,6 +564,27 @@ def _locked_upstream_payload(
     return upstream
 
 
+async def _resolve_admission_config(
+    request: Request, config: InferenceProxyConfig
+) -> InferenceProxyConfig:
+    """``config`` with the operator's live hosted-embedding limits overlaid.
+
+    With no resolver bound (unit tests, or a deployment predating the board) the
+    boot-time config is returned untouched, so ``DITTO_INFERENCE_*`` env
+    overrides keep their meaning as the seed. The board's shipped defaults are
+    the same numbers ``config.py`` seeds, so an empty settings table and an
+    absent resolver produce identical admission behaviour.
+    """
+    resolver: InferenceConcurrencySettingsResolver | None = getattr(
+        request.app.state, "inference_concurrency_settings", None
+    )
+    if resolver is None:
+        return config
+    return await resolver.resolve_config(
+        config, getattr(request.app.state, "session_maker", None)
+    )
+
+
 def _provider_rejection_is_route_observable(status_code: int) -> bool:
     """Exclude caller-shape failures from shared provider-route health."""
     return status_code >= 400 and status_code not in {400, 422}
@@ -828,6 +856,11 @@ async def proxy_chat_completions(
         )
         if reserved is None:
             raise HTTPException(status_code=429, detail="inference grant unavailable")
+        # The chat lane never returns a capacity decline: its limits are
+        # boot-time constants that cannot move under a live ticket, so there is
+        # nothing new for it to distinguish. Asserted rather than handled so the
+        # day someone makes chat tunable, this line is the thing that fails.
+        assert not isinstance(reserved, InferenceDecline)
 
     upstream_payload = _locked_upstream_payload(
         payload, model=model, max_tokens=max_tokens
@@ -1023,6 +1056,12 @@ async def proxy_embeddings(
     )
 
     session_maker = request.app.state.session_maker
+    # Resolve the operator's concurrency board BEFORE opening the admission
+    # transaction. That transaction holds a global advisory lock and two
+    # FOR UPDATE row locks, so a settings SELECT inside it would lengthen the
+    # most contended critical section in the service. The resolver is TTL-cached
+    # and reads on its own session, so the common case costs nothing.
+    admission_config = await _resolve_admission_config(request, config)
     now = datetime.now(UTC)
     async with session_maker() as session, session.begin():
         from ditto.db.models import InferenceGrant
@@ -1065,11 +1104,25 @@ async def proxy_embeddings(
             model=config.embedding_model,
             token_reservation=max(1, len(body)),
             now=now,
-            config=config,
+            config=admission_config,
             request_kind="embedding",
         )
+        if reserved is InferenceDecline.AT_CAPACITY:
+            # The lease is fine; the lane is momentarily full. Answering 429
+            # here would be read as a revoked lease by the broker and discard a
+            # healthy run (dittobench-api #103), which is precisely what would
+            # happen the first time an operator lowered the concurrency board.
+            # 503 is also already in the broker's retryable-transient class, so
+            # a fleet that has not yet learned about capacity backpressure still
+            # backs off and survives instead of failing closed.
+            raise HTTPException(
+                status_code=503,
+                detail="embedding lane is at capacity",
+                headers={"Retry-After": "1"},
+            )
         if reserved is None:
             raise HTTPException(status_code=429, detail="embedding grant unavailable")
+        assert not isinstance(reserved, InferenceDecline)
 
     upstream_payload = {
         "model": config.embedding_model,

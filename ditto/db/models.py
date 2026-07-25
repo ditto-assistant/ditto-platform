@@ -2788,3 +2788,64 @@ class QueuePolicySettingsRevision(Base):
             name="queue_policy_settings_scope_parent_key",
         ),
     )
+
+
+class InferenceConcurrencySettingsRevision(Base):
+    """Append-only operator policy for the hosted v7 embedding lane.
+
+    Governs how many hosted embedding requests may be in flight per ticket, per
+    validator, and fleet-wide. Scoped tightly on purpose: the chat lane keeps its
+    boot-time configuration, and the local-Ollama lane used by bench_version 2-6
+    is not reachable from this table at all.
+
+    Each revision stores the WHOLE policy rather than a diff, so any historical
+    revision is reconstructable on its own and a read never merges partials. See
+    ``ditto.api_models.inference_concurrency_settings`` for the bounds and why
+    the shipped defaults sit above what the validator will ever ask for.
+    """
+
+    __tablename__ = "inference_concurrency_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope = '*'", name="inference_concurrency_settings_scope_check"
+        ),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="inference_concurrency_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="inference_concurrency_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="inference_concurrency_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="inference_concurrency_settings_actor_check",
+        ),
+        Index(
+            "inference_concurrency_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="inference_concurrency_settings_scope_parent_key",
+        ),
+    )

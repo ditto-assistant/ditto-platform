@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
@@ -242,6 +243,39 @@ async def revoke_ticket_inference(
         grant.updated_at = now
 
 
+class InferenceDecline(StrEnum):
+    """Why an admission was refused, when the reason is *not* fail-closed.
+
+    Historically :func:`begin_inference_request` returned ``None`` for every
+    refusal and the endpoint mapped all of them to ``429``. That conflates two
+    opposite situations, and dittobench-api #103 documents the damage: on the
+    ticket path a ``429`` means the validator's lease is gone, so the broker
+    correctly discards the whole run.
+
+    A refusal caused by a *concurrency or rate limit* is the opposite — the
+    lease is perfectly healthy and the caller should simply come back. That
+    distinction only started to matter when the hosted embedding limits became
+    operator-tunable: a backroom revision can now lower a limit underneath a
+    live run, and without this signal that emergency brake would destroy every
+    run it touched instead of slowing them down.
+
+    Scoped to the embedding lane on purpose. The chat limits are still boot-time
+    constants that cannot move under a running ticket, so a chat capacity
+    refusal is not a new hazard and its behaviour is left exactly as it was.
+    """
+
+    AT_CAPACITY = "at_capacity"
+
+
+def _capacity_decline(request_kind: str) -> InferenceDecline | None:
+    """The refusal a full-but-healthy lane returns.
+
+    ``None`` for chat, preserving its existing ``429``, because chat limits
+    cannot be changed without a restart and so cannot surprise a live run.
+    """
+    return InferenceDecline.AT_CAPACITY if request_kind == "embedding" else None
+
+
 async def begin_inference_request(
     session: AsyncSession,
     *,
@@ -253,8 +287,16 @@ async def begin_inference_request(
     now: datetime,
     config: InferenceProxyConfig,
     request_kind: str = "chat",
-) -> tuple[InferenceGrant, InferenceRequest] | None:
-    """Atomically consume one nonce and reserve bounded proxy capacity."""
+) -> tuple[InferenceGrant, InferenceRequest] | InferenceDecline | None:
+    """Atomically consume one nonce and reserve bounded proxy capacity.
+
+    Returns the reservation on success. ``None`` is the fail-closed class -- a
+    revoked or expired lease, a spent budget, a replayed nonce, a bad proof --
+    and the caller answers it with ``429`` exactly as before.
+    :class:`InferenceDecline` is returned only when the embedding lane refused
+    on a concurrency or rate limit and the lease is still healthy, so the caller
+    can answer with retryable backpressure instead.
+    """
     if request_kind not in {"chat", "embedding"}:
         return None
     if session.get_bind().dialect.name == "postgresql":
@@ -368,7 +410,10 @@ async def begin_inference_request(
         else config.embedding_per_ticket_concurrency
     )
     if active_requests >= per_ticket_concurrency:
-        return None
+        # Healthy lease, lane momentarily full. This is the limit an operator
+        # tunes from backroom, so it is also the one most likely to move under a
+        # live run -- it must degrade to backpressure, never to a lost run.
+        return _capacity_decline(request_kind)
 
     # Fast replay path avoids an ORM identity collision in the common case;
     # the composite primary key and nested transaction remain authoritative
@@ -448,7 +493,7 @@ async def begin_inference_request(
         or int(validator_recent or 0) >= per_validator_rpm
         or int(global_recent or 0) >= global_rpm
     ):
-        return None
+        return _capacity_decline(request_kind)
 
     request = InferenceRequest(
         grant_id=grant.grant_id,
@@ -587,6 +632,7 @@ async def finish_inference_request(
 __all__ = [
     "activate_inference_grant",
     "bearer_digest",
+    "InferenceDecline",
     "begin_inference_request",
     "ensure_inference_grant",
     "finish_inference_request",
