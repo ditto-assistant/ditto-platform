@@ -9,6 +9,18 @@
 //   pm2 logs ditto-api
 //   pm2 reload scripts/ecosystem.config.js --update-env   # see "Restarts" below
 //
+// !! CHANGING `script`, `interpreter`, `interpreter_args`, `exec_mode`, OR `cwd`
+// !! REQUIRES RECREATING THE APP, NOT RELOADING IT.
+// `pm2 reload` reconciles `args` and env but keeps those five fields from pm2's
+// saved dump, so a reload after editing them relaunches the OLD program with the
+// NEW args. That is exactly how moving `script` from `uv` to `.venv/bin/python`
+// took prod down: pm2 ran `/usr/local/bin/uv -m ditto.api_server`, uv exited on
+// `unexpected argument '-m' found`, and the API sat in `waiting restart` with
+// pid 0 behind a 502.
+// scripts/update.sh detects this automatically (scripts/pm2_deploy_plan.js diffs
+// the running launch identity and recreates the app when it drifted), so a normal
+// deploy is safe. Doing it by hand: `pm2 delete <app>` then `pm2 start`.
+//
 // Launcher: the venv interpreter is invoked DIRECTLY, not via `uv run`.
 // `uv run` does not exec into the interpreter -- it forks it as a child process
 // and proxies signals -- so pm2 ends up owning a ~59 MB launcher shim while the
