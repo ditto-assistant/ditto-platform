@@ -21,6 +21,7 @@ from uuid import UUID
 
 from sqlalchemy import ColumnElement, and_, case, func, literal, null, or_, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
+from sqlalchemy.orm.util import AliasedClass
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.errors import IntegrityError as DbIntegrityError
@@ -269,20 +270,51 @@ async def list_memory_leader_timeline(
     return timeline
 
 
-def _emission_owner_key() -> ColumnElement[str]:
-    """Stable owner key for one-emission-position selection.
+def emission_owner_key(
+    *,
+    agent: type[Agent] | AliasedClass[Agent] = Agent,
+    payment: type[EvaluationPayment] | AliasedClass[EvaluationPayment] = (
+        EvaluationPayment
+    ),
+) -> ColumnElement[str]:
+    """Stable owner key for one-slot-per-owner selection.
 
     New uploads always carry an immutable payment-time coldkey. The hotkey
     fallback preserves legacy/test rows without accidentally collapsing every
     missing-payment row into one owner.
+
+    The single authority for this expression. It is public and takes optional
+    aliases because previous-generation carryover dedupes on the same notion of
+    "who a miner is" and needs to compare two aliased agents inside one
+    statement; a hand-rolled fourth copy of the case expression is exactly how
+    the queue-rank preview came to disagree with the allocator about owners.
+    Callers must join/outerjoin ``payment`` to ``agent`` themselves.
     """
     return case(
         (
-            EvaluationPayment.miner_coldkey.is_not(None),
-            literal("coldkey:") + EvaluationPayment.miner_coldkey,
+            payment.miner_coldkey.is_not(None),
+            literal("coldkey:") + payment.miner_coldkey,
         ),
-        else_=literal("hotkey:") + Agent.miner_hotkey,
+        else_=literal("hotkey:") + agent.miner_hotkey,
     )
+
+
+# Module-private alias kept so the two existing emission call sites below read
+# unchanged.
+_emission_owner_key = emission_owner_key
+
+
+def emission_owner(*, miner_hotkey: str, miner_coldkey: str | None) -> str:
+    """In-Python counterpart of :func:`emission_owner_key`.
+
+    Preview and overlay code that groups already-loaded rows must produce the
+    same owner key the allocator's SQL does, or it reports a queue the
+    validators will not honour. ``is None`` (not falsiness) mirrors the SQL
+    ``IS NOT NULL`` exactly.
+    """
+    if miner_coldkey is not None:
+        return f"coldkey:{miner_coldkey}"
+    return f"hotkey:{miner_hotkey}"
 
 
 @dataclass(frozen=True)
@@ -752,6 +784,7 @@ async def list_eligible_ledger(
     session: AsyncSession,
     *,
     include_fingerprints: bool = True,
+    include_details: bool = True,
     bench_version: int | None = None,
 ) -> list[LedgerRow]:
     """Return the best eligible score per payment-time coldkey.
@@ -762,6 +795,11 @@ async def list_eligible_ledger(
     only reader that compares them. The public leaderboard, validator ledger
     read, and ticket-eligibility paths were paying that serialization cost on
     every poll for data they never used.
+
+    ``include_details=False`` likewise replaces the large score telemetry JSON
+    with NULL. Queue-floor, cleanup, and efficiency-cohort consumers need only
+    scalar ranking fields; avoiding the per-case blob keeps those frequently
+    polled reads from detoasting and transferring audit payloads they discard.
 
     The persistent ledger the validator folds into KOTH+ATH weights (via
     ``GET /scoring/scores``). "Eligible" = agents in ``scored`` — this excludes
@@ -822,6 +860,9 @@ async def list_eligible_ledger(
         if bench_version is not None
         else tuple({canonical_version, desired_version} - {None})
     )
+    details_column = (
+        Score.details.label("details") if include_details else null().label("details")
+    )
     agent_best = (
         select(
             Score.agent_id.label("agent_id"),
@@ -834,7 +875,7 @@ async def list_eligible_ledger(
             Score.median_ms.label("median_ms"),
             Score.n.label("n"),
             _is_ranked().label("eligible"),
-            Score.details.label("details"),
+            details_column,
             Score.validator_hotkey.label("validator_hotkey"),
             Score.signature.label("signature"),
             # Row count in the agent's pool, so the median position is (cnt+1)/2.
@@ -1121,7 +1162,7 @@ async def list_provisional_ledger(
     *,
     bench_version: int | None = None,
 ) -> list[tuple[LedgerRow, int]]:
-    """Return each unfinalized miner's best partially scored submission.
+    """Return each unfinalized owner's best partially scored submission.
 
     This is a public-feedback read only. It deliberately considers only agents
     still in ``evaluating`` with at least one accepted score; validator weights
@@ -1129,14 +1170,22 @@ async def list_provisional_ledger(
     the finalized ``scored`` status. Numeric fields are medians of the accepted
     reports available so far. Opaque run details are omitted because, before
     quorum, no single validator row is the canonical result.
+
+    One row per *owner*, matching how :func:`list_eligible_ledger` partitions
+    the finalized board: a coldkey funding several hotkeys holds one emission
+    position, so its provisional overlay must not preview several either.
     """
     from ditto.db.queries.benchmark_rollout import active_bench_version
 
     canonical_version = bench_version or await active_bench_version(session)
     rows = (
         await session.execute(
-            select(Agent, Score)
+            select(Agent, Score, EvaluationPayment.miner_coldkey)
             .join(Score, Score.agent_id == Agent.agent_id)
+            .outerjoin(
+                EvaluationPayment,
+                EvaluationPayment.agent_id == Agent.agent_id,
+            )
             .where(
                 Agent.status == AgentStatus.EVALUATING,
                 Score.bench_version == canonical_version,
@@ -1150,14 +1199,14 @@ async def list_provisional_ledger(
         )
     ).all()
 
-    by_agent: dict[UUID, tuple[Agent, list[Score]]] = {}
-    for agent, score in rows:
+    by_agent: dict[UUID, tuple[Agent, str | None, list[Score]]] = {}
+    for agent, score, miner_coldkey in rows:
         if agent.agent_id not in by_agent:
-            by_agent[agent.agent_id] = (agent, [])
-        by_agent[agent.agent_id][1].append(score)
+            by_agent[agent.agent_id] = (agent, miner_coldkey, [])
+        by_agent[agent.agent_id][2].append(score)
 
     candidates: list[tuple[LedgerRow, int]] = []
-    for agent, scores in by_agent.values():
+    for agent, miner_coldkey, scores in by_agent.values():
         if not scores:
             continue
         representative = sorted(
@@ -1184,6 +1233,7 @@ async def list_provisional_ledger(
                     validator_hotkey=representative.validator_hotkey,
                     signature=representative.signature,
                     status=AgentStatus.EVALUATING,
+                    miner_coldkey=miner_coldkey,
                     bench_version=representative.bench_version,
                     median_ms=median_ms,
                     n=n,
@@ -1202,10 +1252,16 @@ async def list_provisional_ledger(
             str(candidate[0].agent_id),
         ),
     )
-    best_by_miner: dict[str, tuple[LedgerRow, int]] = {}
+    best_by_owner: dict[str, tuple[LedgerRow, int]] = {}
     for candidate in candidates:
-        best_by_miner.setdefault(candidate[0].miner_hotkey, candidate)
-    return list(best_by_miner.values())
+        best_by_owner.setdefault(
+            emission_owner(
+                miner_hotkey=candidate[0].miner_hotkey,
+                miner_coldkey=candidate[0].miner_coldkey,
+            ),
+            candidate,
+        )
+    return list(best_by_owner.values())
 
 
 async def list_scored_bench_versions(session: AsyncSession) -> list[int]:

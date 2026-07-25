@@ -15,6 +15,7 @@ lock guarantees one validator cannot hold two live assignments across agents.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
@@ -41,8 +42,14 @@ from ditto.db.queries.audit import (
 from ditto.db.queries.benchmark_admission import (
     activated_rollout_for_version,
     benchmark_admission_predicate,
+    validator_queue_admission_predicate,
 )
-from ditto.db.queries.scores import SCORING_QUORUM, list_eligible_ledger
+from ditto.db.queries.lease_liveness import maybe_force_expire_lease
+from ditto.db.queries.scores import (
+    SCORING_QUORUM,
+    emission_owner_key,
+    list_eligible_ledger,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -128,6 +135,33 @@ EMISSION_CONTENDER_COUNT = 5
 PROVISIONAL_CONTENDER_LANE_SIZE = 10
 
 
+async def get_score_priority_floors(
+    session: AsyncSession, *, bench_version: int | None = None
+) -> tuple[float | None, float | None]:
+    """Return finalized fifth-place and tenth-place floors for one benchmark era."""
+    eligible = [
+        row
+        for row in await list_eligible_ledger(
+            session,
+            include_fingerprints=False,
+            include_details=False,
+            bench_version=bench_version,
+        )
+        if row.eligible
+    ]
+    continuation = (
+        eligible[EMISSION_CONTENDER_COUNT - 1].composite
+        if len(eligible) >= EMISSION_CONTENDER_COUNT
+        else None
+    )
+    provisional = (
+        eligible[PROVISIONAL_CONTENDER_LANE_SIZE - 1].composite
+        if len(eligible) >= PROVISIONAL_CONTENDER_LANE_SIZE
+        else None
+    )
+    return continuation, provisional
+
+
 async def get_score_continuation_floor(
     session: AsyncSession, *, bench_version: int | None = None
 ) -> float | None:
@@ -146,16 +180,31 @@ async def get_score_continuation_floor(
     Returns ``None`` when the era does not yet have five eligible agents, which
     correctly disables the floor for a benchmark version still filling up.
     """
-    eligible = [
-        row
-        for row in await list_eligible_ledger(
-            session, include_fingerprints=False, bench_version=bench_version
-        )
-        if row.eligible
-    ]
-    if len(eligible) < EMISSION_CONTENDER_COUNT:
-        return None
-    return eligible[EMISSION_CONTENDER_COUNT - 1].composite
+    continuation, _ = await get_score_priority_floors(
+        session, bench_version=bench_version
+    )
+    return continuation
+
+
+async def get_provisional_contender_floor(
+    session: AsyncSession, *, bench_version: int | None = None
+) -> float | None:
+    """Return the finalized tenth-place score for provisional fast-lane admission.
+
+    A provisional submission is only a likely top-ten contender when its first
+    accepted score reaches the current finalized top ten.  Ranking the ten best
+    provisional rows against one another is not sufficient: when the whole
+    provisional pool is weak, that interpretation starves untouched submissions
+    without advancing a plausible leaderboard contender.
+
+    ``None`` means fewer than ten finalized owners exist in this benchmark era,
+    so there is not yet a meaningful top-ten boundary and the bounded lane keeps
+    its bootstrap behavior.
+    """
+    _, provisional = await get_score_priority_floors(
+        session, bench_version=bench_version
+    )
+    return provisional
 
 
 async def expire_overdue_tickets(session: AsyncSession, *, now: datetime) -> int:
@@ -198,23 +247,34 @@ async def issue_ticket(
     fifo_start_at: datetime | None = None,
     completion_first: bool = False,
     slot_id: str = "slot-0",
+    only_agent_ids: Collection[UUID] | None = None,
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
     Sweeps overdue tickets first, then picks an ``evaluating`` agent that (a)
     has fewer than :data:`SCORING_QUORUM` live tickets and (b) this validator
     does not already hold a live or scored ticket for. Candidates in the
-    strongest bounded set of scored provisional contenders come first. The
-    remaining candidates advance 1-of-3 submissions before uncovered work,
-    with live assignments spread within each lane. ``completion_first`` instead
-    makes benchmark-era FIFO primary so the oldest submission reaches quorum
-    before the next submission is opened. A
+    bounded set whose first score can reach the finalized top ten comes first.
+    Other provisional rows do not outrank untouched submissions merely because
+    they already have a score. ``completion_first`` instead makes benchmark-era
+    FIFO primary so the oldest submission reaches quorum before the next
+    submission is opened. A
     2-of-3 submission that can no longer reach this era's emission set sorts
     behind every other candidate rather than being withheld, so it still
     finalizes once the queue drains. A prior expired row is reissued only after
     its cooldown and only once for the same benchmark version. Returns the
     ticket, or ``None`` when there is no work for this validator ("no job for
     you"). Runs inside the caller's transaction.
+
+    ``only_agent_ids`` narrows the candidate set to an explicit id list and, when
+    set, suppresses ``submitted_at_or_after``. The two cannot both apply: the
+    caller that names ids has already decided membership, and the arrival-time
+    filter exists to express "this era's submissions only" -- which is precisely
+    what a previous-generation carryover list is not. Every other eligibility
+    rule (screening policy, versioned dataset, rollout admission, per-owner
+    serialization, attempt caps) still applies unchanged, so a named agent that
+    is not genuinely leasable still yields ``None``. Default ``None`` leaves
+    every existing caller's behaviour untouched.
     """
     # No row exists to lock before a validator's first claim. Serialize that
     # gap explicitly on Postgres; the unique partial index remains the durable
@@ -311,23 +371,33 @@ async def issue_ticket(
             # their deadline. A canonical claim must neither serve nor cancel
             # work from another authorization lane.
             return None
-        if validator_running_benchmark:
-            # Never revoke work a fresh signed heartbeat says is active.
-            return None
         # A validator may only resume a lease from the requested benchmark era
-        # and artifact contract. Release an idle incompatible assignment so a
-        # retired benchmark cannot leak into the active queue after activation.
-        incompatible_existing.status = TicketStatus.EXPIRED
-        incompatible_existing.deadline = now
-        incompatible_existing.retry_after = now
-        await session.flush()
+        # and artifact contract. Release an *idle* incompatible assignment so a
+        # retired benchmark cannot leak into the active queue after activation --
+        # but only on positive, fresh evidence of idleness. ``not
+        # validator_running_benchmark`` alone is absence of evidence: it is
+        # derived from a stored capacity blob that silently freezes whenever
+        # heartbeat ingest fails, and acting on it destroyed three healthy v7
+        # runs mid-benchmark. When the lease is not proven idle the slot simply
+        # keeps it until its deadline.
+        if not await maybe_force_expire_lease(
+            session,
+            ticket=incompatible_existing,
+            validator_hotkey=validator_hotkey,
+            slot_id=slot_id,
+            now=now,
+            context="issue_ticket",
+            running_benchmark_reported=validator_running_benchmark,
+            requested_bench_version=bench_version,
+        ):
+            return None
 
     # Scoped to the era this ticket is for: a v2 fifth place says nothing about
     # whether a v4 two-score maximum is still in contention.
-    score_continuation_floor = (
-        None
+    score_continuation_floor, provisional_contender_floor = (
+        (None, None)
         if completion_first
-        else await get_score_continuation_floor(session, bench_version=bench_version)
+        else await get_score_priority_floors(session, bench_version=bench_version)
     )
 
     # Agents this validator must not receive right now: live/scored tickets,
@@ -363,16 +433,6 @@ async def issue_ticket(
         )
         .correlate(Agent)
         .exists()
-    )
-    accepted_score_count = (
-        select(func.count())
-        .where(
-            ValidatorTicket.agent_id == Agent.agent_id,
-            ValidatorTicket.bench_version == bench_version,
-            ValidatorTicket.status == TicketStatus.SCORED,
-        )
-        .correlate(Agent)
-        .scalar_subquery()
     )
     live_assignment_count = (
         select(func.count())
@@ -418,13 +478,6 @@ async def issue_ticket(
         ),
         0.0,
     )
-    covered_lane_score = case(
-        (
-            accepted_score_count >= 1,
-            provisional_composite,
-        ),
-        else_=0.0,
-    )
     # A median-of-three cannot be bounded safely after one score. Once two
     # scores exist, their maximum is the best final median the third score can
     # produce, so a submission whose strict upper bound sits below this era's
@@ -466,6 +519,17 @@ async def issue_ticket(
         .correlate(contender)
         .scalar_subquery()
     )
+    contender_first_score = (
+        select(Score.composite)
+        .where(
+            Score.agent_id == contender.agent_id,
+            Score.bench_version == bench_version,
+        )
+        .order_by(Score.created_at.asc(), Score.validator_hotkey.asc())
+        .limit(1)
+        .correlate(contender)
+        .scalar_subquery()
+    )
     contender_provisional_composite = (
         select(func.avg(Score.composite))
         .where(
@@ -476,13 +540,7 @@ async def issue_ticket(
         .scalar_subquery()
     )
     contender_payment = aliased(EvaluationPayment)
-    contender_owner = case(
-        (
-            contender_payment.miner_coldkey.is_not(None),
-            literal("coldkey:") + contender_payment.miner_coldkey,
-        ),
-        else_=literal("hotkey:") + contender.miner_hotkey,
-    )
+    contender_owner = emission_owner_key(agent=contender, payment=contender_payment)
     contender_per_miner = (
         select(
             contender.agent_id.label("agent_id"),
@@ -508,6 +566,11 @@ async def issue_ticket(
             contender.screening_policy_version >= SCREENING_POLICY_VERSION,
             contender_accepted_score_count.between(1, SCORING_QUORUM - 1),
             contender_recorded_score_count >= contender_accepted_score_count,
+            (
+                contender_first_score >= provisional_contender_floor
+                if provisional_contender_floor is not None
+                else literal(True)
+            ),
         )
         .subquery()
     )
@@ -529,10 +592,6 @@ async def issue_ticket(
         (Agent.agent_id.in_(top_provisional_contenders), provisional_composite),
         else_=0.0,
     )
-    one_score_completion_lane = case(
-        (accepted_score_count == 1, 0),
-        else_=1,
-    )
     overflow_two_score_lane = case(
         (recorded_score_count >= SCORING_QUORUM - 1, 1),
         else_=0,
@@ -546,6 +605,7 @@ async def issue_ticket(
         candidate = select(Agent.agent_id).where(
             Agent.status == AgentStatus.EVALUATING,
             Agent.screening_policy_version >= SCREENING_POLICY_VERSION,
+            validator_queue_admission_predicate(bench_version=bench_version),
         )
         if not completion_first:
             candidate = candidate.where(Agent.agent_id.not_in(already_mine))
@@ -563,7 +623,9 @@ async def issue_ticket(
             candidate = candidate.where(eligible_screened_image)
         if rollout_admitted is not None:
             candidate = candidate.where(rollout_admitted)
-        if submitted_at_or_after is not None:
+        if only_agent_ids is not None:
+            candidate = candidate.where(Agent.agent_id.in_(set(only_agent_ids)))
+        elif submitted_at_or_after is not None:
             candidate = candidate.where(Agent.created_at >= submitted_at_or_after)
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))
@@ -592,18 +654,12 @@ async def issue_ticket(
                 ).asc(),
                 contender_lane.asc(),
                 contender_lane_score.desc(),
-                # One accepted result is real progress toward the public 3-of-3
-                # settlement contract. Advance those rows before opening a
-                # wider one-score backlog. The separately bounded contender
-                # lane above owns strong 2-of-3 work.
-                one_score_completion_lane.asc(),
                 # Keep the existing bounded-contender guarantee: a two-score
                 # row outside the top contender set must not turn the whole
                 # backlog into an unbounded completion lane.
                 overflow_two_score_lane.asc(),
                 live_assignment_count.asc(),
                 had_prior_ticket.asc(),
-                covered_lane_score.desc(),
                 fifo_age.asc(),
                 Agent.agent_id.asc(),
             )
@@ -613,8 +669,9 @@ async def issue_ticket(
             # scored provisional contenders, one best submission per miner. A
             # stronger 1-of-3 candidate can therefore receive its second score
             # before a weaker 2-of-3 candidate receives its third. The remaining
-            # queue advances 1-of-3 rows before uncovered work. The fresh lane
-            # uses queue_order's FIFO-first alternative.
+            # queue gives untouched work a coverage opportunity before weak
+            # provisional rows. The fresh lane uses queue_order's FIFO-first
+            # alternative.
             candidate.order_by(*queue_order)
             .limit(1)
             .with_for_update(of=Agent, skip_locked=not completion_first)
@@ -746,6 +803,17 @@ async def issue_ticket(
             .correlate(sibling_agent)
             .scalar_subquery()
         )
+        owner_first_score = (
+            select(Score.composite)
+            .where(
+                Score.agent_id == sibling_agent.agent_id,
+                Score.bench_version == bench_version,
+            )
+            .order_by(Score.created_at.asc(), Score.validator_hotkey.asc())
+            .limit(1)
+            .correlate(sibling_agent)
+            .scalar_subquery()
+        )
         selected_owner_agent_id = await session.scalar(
             select(sibling_agent.agent_id)
             .outerjoin(
@@ -757,6 +825,11 @@ async def issue_ticket(
                 same_owner,
                 owner_progress_started_at.is_not(None),
                 (
+                    owner_first_score >= provisional_contender_floor
+                    if provisional_contender_floor is not None
+                    else literal(True)
+                ),
+                (
                     benchmark_admission_predicate(
                         rollout=activated_rollout,
                         bench_version=bench_version,
@@ -764,6 +837,10 @@ async def issue_ticket(
                     )
                     if activated_rollout is not None
                     else literal(True)
+                ),
+                validator_queue_admission_predicate(
+                    bench_version=bench_version,
+                    agent=sibling_agent,
                 ),
             )
             .order_by(
@@ -790,9 +867,9 @@ async def issue_ticket(
             # Completion-first admission is global, not per validator slot.
             # Every slot waits on the same FIFO head. Once the row lock is
             # acquired, re-check this validator against fresh committed state.
-            # A sibling slot waits while this validator owns the head; a
-            # validator that can no longer score the head advances to the next
-            # FIFO candidate instead of idling behind impossible work.
+            # A validator that cannot claim the head -- for any reason, live
+            # lease included -- advances to the next FIFO candidate instead of
+            # idling behind work it can never take.
             same_validator_blocking_status = await session.scalar(
                 select(ValidatorTicket.status)
                 .where(
@@ -819,17 +896,28 @@ async def issue_ticket(
                 )
                 .limit(1)
             )
-            if same_validator_blocking_status == TicketStatus.ISSUED:
-                # A sibling slot must not advance while this validator already
-                # owns the FIFO head. Let another validator fill the remaining
-                # quorum slots first.
-                return None
             if same_validator_blocking_status is not None:
                 # This validator cannot contribute another score to the FIFO
-                # head (it already scored it, is cooling down, or exhausted its
-                # retry budget). Keeping it parked here can idle the entire
-                # fleet when every remaining scorer is similarly ineligible.
-                # Preserve FIFO among work this validator can actually claim.
+                # head: it already holds a live lease on it, already scored it,
+                # is cooling down, or exhausted its retry budget. One ticket per
+                # (agent, version, validator) is the composite primary key, so
+                # none of those states can be advanced by trying again here --
+                # the head's remaining quorum slots belong to OTHER validators
+                # either way.
+                #
+                # The live-lease case used to return no job at all, which was
+                # correct while a validator ran one benchmark at a time: there
+                # was no sibling slot to serve. Since #433 a validator holds up
+                # to ``max_concurrent_slots`` leases, and returning None parked
+                # every sibling slot for the full ninety-minute lease of the
+                # head. That is fleet capacity idling in front of a queue it is
+                # allowed to serve, and it does not bring the head one score
+                # closer.
+                #
+                # Skipping preserves FIFO among the work this validator can
+                # actually claim, and the ordinary owner-serialization and
+                # quorum-occupancy checks above still bound how much of the
+                # queue one validator (or one miner) can hold at once.
                 skipped.append(agent_id)
                 continue
         break
@@ -877,6 +965,8 @@ async def issue_confirmation_ticket(
     now: datetime,
     ttl: timedelta,
     bench_version: int,
+    seed: int | None = None,
+    dataset_sha256: str | None = None,
 ) -> ValidatorTicket | None:
     """Reissue this validator's existing quorum slot for top-five maintenance.
 
@@ -910,6 +1000,10 @@ async def issue_confirmation_ticket(
             and existing_live.bench_version == bench_version
             and existing_live.purpose == TicketPurpose.CONTINUAL_RETEST
             and existing_live.purpose_revision > 0
+            and (seed is None or existing_live.seed == seed)
+            and (
+                dataset_sha256 is None or existing_live.dataset_sha256 == dataset_sha256
+            )
             else None
         )
 
@@ -918,17 +1012,10 @@ async def issue_confirmation_ticket(
     )
     if agent is None or agent.status not in {AgentStatus.SCORED, AgentStatus.LIVE}:
         return None
-    # Confirmation replaces one member of the existing k=3 quorum; it must not
-    # create a fourth scorer and change consensus cardinality.
-    prior_score = await session.scalar(
-        select(Score).where(
-            Score.agent_id == agent_id,
-            Score.bench_version == bench_version,
-            Score.validator_hotkey == validator_hotkey,
-        )
-    )
-    if prior_score is None:
-        return None
+    # Confirmation evidence is append-only and never changes the canonical k=3
+    # Score rows, so any permitted validator may contribute the shared wave.
+    # Restricting this to the original three scorers strands healthy validators
+    # and can make a five-member wave impossible to finish during fleet churn.
     latest_retest = await get_latest_score_retest_event(
         session,
         agent_id=agent_id,
@@ -946,6 +1033,12 @@ async def issue_confirmation_ticket(
     ticket = await session.get(
         ValidatorTicket, (agent_id, bench_version, validator_hotkey)
     )
+    if ticket is not None and ticket.retry_after is not None:
+        retry_after = ticket.retry_after
+        if retry_after.tzinfo is None:
+            retry_after = retry_after.replace(tzinfo=UTC)
+        if retry_after > now:
+            return None
     if ticket is None:
         ticket = ValidatorTicket(
             agent_id=agent_id,
@@ -956,6 +1049,8 @@ async def issue_confirmation_ticket(
             issued_at=now,
             deadline=now + ttl,
             bench_version=bench_version,
+            seed=seed,
+            dataset_sha256=dataset_sha256,
             attempt_count=1,
             manual_retry_grants=0,
             retry_after=None,
@@ -970,6 +1065,10 @@ async def issue_confirmation_ticket(
         ticket.issued_at = now
         ticket.deadline = now + ttl
         ticket.bench_version = bench_version
+        ticket.seed = seed
+        ticket.dataset_sha256 = dataset_sha256
+        ticket.seed_block = None
+        ticket.seed_block_hash = None
         ticket.attempt_count = ticket.attempt_count + 1 if same_version else 1
         ticket.manual_retry_grants = ticket.manual_retry_grants if same_version else 0
         ticket.retry_after = None
@@ -1012,6 +1111,44 @@ async def get_open_ticket(
         or _as_utc(ticket.deadline) <= now
         or _as_utc(ticket.deadline) != _as_utc(deadline)
     ):
+        return None
+    return ticket
+
+
+async def get_live_slot_ticket(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    validator_hotkey: str,
+    slot_id: str,
+    now: datetime,
+    for_update: bool = False,
+) -> ValidatorTicket | None:
+    """Return the live lease occupying one validator slot, by identity alone.
+
+    Deliberately *not* deadline-stamped, unlike :func:`get_open_ticket`. This is
+    for confirming a heartbeat's per-slot occupancy claim, where an exact
+    deadline match is the wrong test: the platform re-issues a lease in place
+    (``deadline = now + ttl``), and the validator keeps signing progress with the
+    deadline it was handed at claim time. That drift is normal and says nothing
+    about whether a run is alive, but matching on it evicts a healthy slot from
+    the stored capacity — which blanks its progress in the fleet view and, worse,
+    hands the revoker a false idle verdict.
+
+    ``(validator_hotkey, slot_id)`` is unique among issued tickets, so pinning
+    the agent as well makes this unambiguous without the deadline. Scoring still
+    goes through the exact-deadline path; nothing here accepts a score.
+    """
+    statement = select(ValidatorTicket).where(
+        ValidatorTicket.agent_id == agent_id,
+        ValidatorTicket.validator_hotkey == validator_hotkey,
+        ValidatorTicket.slot_id == slot_id,
+        ValidatorTicket.status == TicketStatus.ISSUED,
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    ticket = await session.scalar(statement)
+    if ticket is None or _as_utc(ticket.deadline) <= now:
         return None
     return ticket
 

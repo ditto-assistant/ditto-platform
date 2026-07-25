@@ -13,18 +13,16 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_server.dependencies import get_session, get_storage_client
 from ditto.api_server.fingerprint import reference_corpus_provenance
 from ditto.api_server.storage import ObjectDownloadFailedError
-from ditto.db.models import Agent, AgentStatus, AthReview, AthReviewAction, Base, Score
+from ditto.db.models import Agent, AgentStatus, AthReview, AthReviewAction, Score
 from ditto.db.queries.scores import list_eligible_ledger
 
 _TOKEN = "test-admin-token-at-least-32-characters"
@@ -34,24 +32,11 @@ _CORPUS_ID = reference_corpus_provenance()["corpus_id"]
 
 
 @pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    await eng.dispose()
-
-
-@pytest.fixture
-def maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
+def maker(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> async_sessionmaker[AsyncSession]:
+    """Local alias for the root Postgres ``session_maker``."""
+    return session_maker
 
 
 def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
@@ -637,7 +622,8 @@ async def test_incompatible_current_comparison_is_never_bulk_eligible(
     )
 
     assert response.status_code == 200
-    assert response.json()["current_decision"] == "inconclusive_review"
+    assert response.json()["current_decision"] == "clear"
+    assert response.json()["triggered"] is False
     assert response.json()["bulk_eligible"] is False
 
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from ditto.api_server.config import (
     ApiServerConfig,
+    EfficiencyBonusConfig,
     ScreenerAuthConfig,
     ValidatorCompatibilityConfig,
     parse_api_server_config_from_env,
@@ -38,6 +39,7 @@ __all__ = [
     "create_api_server",
     # Configuration
     "ApiServerConfig",
+    "EfficiencyBonusConfig",
     "ScreenerAuthConfig",
     "ValidatorCompatibilityConfig",
     "ValidatorNamesConfig",

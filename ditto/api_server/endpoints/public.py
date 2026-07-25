@@ -38,6 +38,7 @@ import os
 import re
 import statistics
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from datetime import time as datetime_time
@@ -47,7 +48,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import ValidationError
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
@@ -58,6 +59,8 @@ from ditto.api_models import (
     CreateScreeningDisputeResponse,
     PublicActivityEntry,
     PublicActivityResponse,
+    PublicArtifactDownload,
+    PublicArtifactRelease,
     PublicAuditEntry,
     PublicAuditResponse,
     PublicBenchConfigResponse,
@@ -80,6 +83,9 @@ from ditto.api_models import (
     PublicConfirmationScore,
     PublicDatasetReveal,
     PublicDethroneDecision,
+    PublicEfficiencyCohortMember,
+    PublicEfficiencySnapshotResponse,
+    PublicEfficiencyStatus,
     PublicEmissionRecipient,
     PublicHealthResponse,
     PublicKothEmissions,
@@ -119,6 +125,7 @@ from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.public import (
     FleetAvailability,
     FleetHealth,
+    ScorerLiveness,
     ValidatorAssignmentState,
 )
 from ditto.api_models.screener import (
@@ -138,7 +145,16 @@ from ditto.api_models.validator_capabilities import (
 )
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.benchmark_rollout import rolling_qualification_blockers
+from ditto.api_server.continual_retest_settings import aggregate_is_active
 from ditto.api_server.datapipeline import DataPipelineError
+from ditto.api_server.efficiency import (
+    EfficiencyBoardView,
+    ensure_efficiency_state,
+    read_efficiency_board,
+)
+from ditto.api_server.efficiency import (
+    effective_composite as bonus_effective_composite,
+)
 from ditto.api_server.endpoints.scoring import (
     _confirmation_composites,
     _confirmation_seeds,
@@ -157,6 +173,7 @@ from ditto.api_server.koth import (
     KOTH_RANK_SHARES,
     KOTH_TAIL_SIZE,
     KothEntry,
+    effective_composite,
     project_koth,
 )
 from ditto.api_server.storage import ObjectDownloadFailedError
@@ -173,6 +190,13 @@ from ditto.db.models import (
     ValidatorTicket,
 )
 from ditto.db.queries.agents import list_public_activity
+from ditto.db.queries.artifact_release import (
+    ArtifactScoreQuorum,
+    list_first_score_quorums,
+)
+from ditto.db.queries.artifact_release_settings import (
+    artifact_release_embargo_hours,
+)
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.benchmark_admission import (
     admitted_agent_ids,
@@ -184,9 +208,11 @@ from ditto.db.queries.benchmark_rollout import (
     rollout_state,
 )
 from ditto.db.queries.confirmation_scores import (
+    completed_confirmation_wave_seeds,
     confirmation_composites_by_seed,
     confirmation_depths,
 )
+from ditto.db.queries.desired_era_backlog import prev_generation_agent_ids
 from ditto.db.queries.heartbeats import (
     ActiveValidatorAssignment,
     ActiveValidatorWork,
@@ -194,7 +220,9 @@ from ditto.db.queries.heartbeats import (
     list_active_validator_work,
     list_screener_heartbeats,
     list_validator_heartbeats,
+    live_validator_fleet_supports_protocol,
 )
+from ditto.db.queries.king_reign import KingReveal, get_king_reveal
 from ditto.db.queries.retry_state import (
     AgentRetryState,
     classify_agent_retry_states,
@@ -203,6 +231,7 @@ from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
     SubmissionRow,
+    emission_owner,
     get_public_health,
     get_score_counts,
     get_submission_scores,
@@ -222,6 +251,7 @@ from ditto.db.queries.screening import (
 from ditto.db.queries.tickets import (
     PROVISIONAL_CONTENDER_LANE_SIZE,
     get_score_continuation_floor,
+    get_score_priority_floors,
 )
 
 logger = logging.getLogger(__name__)
@@ -243,10 +273,41 @@ _TIMELINE_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=3600"
 # so this is a long freshness window rather than `immutable`: a reload reuses it
 # with no request at all, and any correction lands within the hour.
 _SETTLED_BENCH_CACHE_CONTROL = "public, max-age=3600, stale-while-revalidate=86400"
-_REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 1.0
+_ARTIFACT_DOWNLOAD_TTL_SECONDS = 5 * 60
+# One Pylon metagraph read, behind the 15s cache below, so this fires at most
+# once every 15s no matter how many viewers are polling. 1.0s was too tight for
+# a normal Pylon round trip under load and was the direct cause of a recurring
+# "registration unknown" flash across every leaderboard row.
+_REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 3.0
 _REGISTRATION_CACHE_TTL_SECONDS = 15.0
 _REGISTRATION_FAILURE_CACHE_TTL_SECONDS = 5.0
-_CHAIN_WEIGHTS_TIMEOUT_SECONDS = 4.0
+# How long a *successful* registration mapping may keep being served after
+# refreshes start failing. Registration only decorates the durable ledger, so a
+# few minutes of slightly-old UIDs is far better for a reader than flipping the
+# whole board to "unknown"; past this the mapping stops being evidence of
+# anything current and the board does report unknown.
+_REGISTRATION_MAX_STALE_SECONDS = 600.0
+# `get_weights` opens a fresh substrate websocket and fully exhausts two storage
+# maps; in prod that measured 10-21s, not the low seconds the old 4s budget
+# assumed. Nearly every read was therefore killed before it could finish. Because
+# PublicCacheMiddleware only stores 200s, each resulting 503 also left nothing
+# cached, so the very next poll ran another doomed read: a self-sustaining
+# failure loop that 503'd ~25% of requests to this endpoint, each 503 blanking
+# the dashboard's chain-observation panel for that tick. The budget now exceeds
+# the real cost of the read instead of guaranteeing it gets cancelled.
+_CHAIN_WEIGHTS_TIMEOUT_SECONDS = 30.0
+# The revealed matrix only changes when validators reveal, which is epoch scale
+# (~72 min), so this is still far finer-grained than the data moves. Deliberately
+# longer than the 30s max-age this endpoint declares: the response cache absorbs
+# the polling, and this absorbs the response cache's own expiries.
+_CHAIN_WEIGHTS_CACHE_TTL_SECONDS = 60.0
+# Backoff after a failed refresh, so an upstream outage cannot put us back in the
+# read-fail-retry-immediately loop described above.
+_CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS = 30.0
+# Ceiling on serving a cached matrix once refreshes fail. Past this the block it
+# pins is too old to present even as explicitly stale, and the endpoint reverts
+# to 503 rather than implying the chain state is roughly current.
+_CHAIN_WEIGHTS_MAX_STALE_SECONDS = 1800.0
 _TRANSCRIPT_MAX_BYTES = 32 << 20
 _TRANSCRIPT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # Historical reproduction must fail closed: only benchmark epochs whose exact
@@ -269,10 +330,22 @@ _DATAGEN_VERSION_BY_BENCH_VERSION = {
     4: "v0.9.0",
     5: "v0.10.0",
     6: "v0.11.1",
+    7: "v0.12.0",
 }
+# Generator releases from v0.8.0 on require an explicit `-bench-version`: the
+# flag defaults to 0 and the binary exits 2 ("-bench-version is required")
+# without it. protocol.CurrentBenchVersion is deliberately NOT a generation
+# default -- it is display/release metadata only, so canonical generation must
+# always be told its version explicitly.
+#
+# v0.7.0 predates the flag entirely and generates bench 2 unconditionally, so
+# passing `-bench-version` to it fails with "flag provided but not defined".
+# Bench 2 therefore keeps the flagless form.
+_BENCH_VERSIONS_WITHOUT_VERSION_FLAG = frozenset({2})
 _DATAGEN_RUN_SIZES = frozenset({"small", "medium", "full"})
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 _VALIDATOR_STALE_WINDOW = timedelta(minutes=15)
+_CONTINUAL_MEAN_PROTOCOL = 14
 # Grace after a lease is issued before the validator is expected to report (in a
 # heartbeat) that it has picked the agent up. Within this window an assigned-but-
 # not-yet-reported validator reads as "assigning" rather than a mismatch, so the
@@ -287,6 +360,14 @@ _BENCHMARK_STALL_EARLY_STAGES: frozenset[BenchmarkProgressStage] = frozenset(
     {"preparing", "building_harness", "generating_dataset", "starting_harness"}
 )
 _BENCHMARK_STALL_AFTER = timedelta(minutes=15)
+# Elapsed-time allowance a single completed check buys a ``running_benchmark``
+# run before it reads as stalled. Deliberately an order of magnitude above the
+# real per-check cost (v7 runs near 4s/check) so that only a genuinely frozen
+# count trips it, never a slow-but-moving one. With the 15-minute startup grace
+# a full 281-check v7 run may take ~4.8 hours before it is called stalled, well
+# past the validator's own 75-minute cap — the signal is a floor on wedged runs,
+# not a competing timeout.
+_BENCHMARK_STALL_PER_CHECK = timedelta(seconds=60)
 _PUBLIC_ACTIVITY_STATUSES = frozenset(
     {
         "waiting_screening",
@@ -303,10 +384,163 @@ _PUBLIC_ACTIVITY_STATUSES = frozenset(
 )
 
 
+def _error_detail(error: BaseException) -> str:
+    """Render an exception so a message-less type still logs something usable.
+
+    ``asyncio.wait_for`` / ``asyncio.timeout`` raise a bare ``TimeoutError()``
+    with no args, so the obvious ``logger.warning("...: %s", error)`` renders the
+    empty string. That is how the two upstream-read warnings below ended up
+    firing thousands of times a day while saying nothing at all about why. Lead
+    with the class name so a timeout is always distinguishable from a chain
+    error, even when the exception itself carries no text.
+    """
+    text = str(error).strip()
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
 @dataclass(frozen=True)
 class _RegistrationSnapshot:
+    """A registration mapping plus the provenance needed to age it out.
+
+    ``read_at`` is when the underlying chain read actually succeeded (not when
+    this snapshot object was built), so a mapping re-armed after a failed refresh
+    keeps reporting its true age. ``stale`` says the last refresh failed and this
+    is a previous good read being served on.
+    """
+
     expires_at: float
     uids_by_hotkey: dict[str, int] | None
+    read_at: float
+    stale: bool = False
+
+
+@dataclass(frozen=True)
+class _ChainWeightsSnapshot:
+    """The last successfully read weight matrix, with its read time."""
+
+    payload: PublicChainWeightsResponse
+    read_at: float
+
+
+def _chain_weights_lock(request: Request) -> asyncio.Lock:
+    """Return the process-wide single-flight lock for the weight-matrix read.
+
+    Created lazily on first use like the snapshot itself. The event loop is
+    single-threaded, so there is no race between the check and the assignment.
+    """
+    lock = getattr(request.app.state, "public_chain_weights_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        request.app.state.public_chain_weights_lock = lock
+    return lock
+
+
+def _cached_chain_weights(request: Request) -> _ChainWeightsSnapshot | None:
+    """Return the cached weight matrix, ignoring anything of an unexpected shape."""
+    cached = getattr(request.app.state, "public_chain_weights", None)
+    return cached if isinstance(cached, _ChainWeightsSnapshot) else None
+
+
+def _chain_weights_payload(
+    request: Request, snapshot: _ChainWeightsSnapshot
+) -> PublicChainWeightsResponse:
+    """Stamp the cached matrix with its age and whether refreshes are failing.
+
+    ``stale`` means the most recent *attempt* to re-read the chain failed, which
+    is the thing a reader actually needs to know. It is not merely "older than
+    the TTL": a matrix a few seconds past its refresh window is being refreshed
+    right now and is not worth flagging.
+    """
+    failed_at = getattr(request.app.state, "public_chain_weights_failed_at", None)
+    return snapshot.payload.model_copy(
+        update={
+            "stale": isinstance(failed_at, float) and failed_at > snapshot.read_at,
+            "age_seconds": round(max(0.0, time.monotonic() - snapshot.read_at), 1),
+        }
+    )
+
+
+def _schedule_chain_weights_refresh(request: Request) -> None:
+    """Kick off a background refresh, at most one at a time.
+
+    Serve-while-revalidate. The cached matrix goes out on *this* request while
+    the slow chain read happens off the request path. Refreshing inline instead
+    would make whichever poller happened to arrive at TTL expiry wait out a
+    multi-second read — and because PublicCacheMiddleware single-flights misses,
+    every client that arrived during that window would wait with it.
+    """
+    lock = _chain_weights_lock(request)
+    failed_at = getattr(request.app.state, "public_chain_weights_failed_at", None)
+    recently_failed = (
+        isinstance(failed_at, float)
+        and time.monotonic() - failed_at < _CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS
+    )
+    if lock.locked() or recently_failed:
+        return
+
+    async def _refresh() -> None:
+        async with lock:
+            await _refresh_chain_weights(request)
+
+    task = asyncio.create_task(_refresh())
+    # asyncio only holds a weak reference to a running task, so an unreferenced
+    # one can be garbage-collected mid-read. Keep it alive until it completes.
+    tasks = getattr(request.app.state, "public_chain_weights_tasks", None)
+    if not isinstance(tasks, set):
+        tasks = set()
+        request.app.state.public_chain_weights_tasks = tasks
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def _refresh_chain_weights(request: Request) -> _ChainWeightsSnapshot | None:
+    """Read the matrix from chain and cache it, or return ``None`` on failure.
+
+    Callers must hold :func:`_chain_weights_lock`; this is the only place that
+    opens a substrate connection for this endpoint.
+    """
+    chain = getattr(request.app.state, "chain", None)
+    config = getattr(request.app.state, "config", None)
+    get_weights = getattr(chain, "get_weights", None)
+    if chain is None or config is None or not callable(get_weights):
+        return None
+    try:
+        snapshot = await asyncio.wait_for(
+            get_weights(config.chain.netuid), timeout=_CHAIN_WEIGHTS_TIMEOUT_SECONDS
+        )
+    except (ChainError, TimeoutError) as error:
+        request.app.state.public_chain_weights_failed_at = time.monotonic()
+        logger.warning(
+            "public chain weights refresh failed after %.1fs: %s",
+            _CHAIN_WEIGHTS_TIMEOUT_SECONDS,
+            _error_detail(error),
+        )
+        return None
+    refreshed = _ChainWeightsSnapshot(
+        payload=PublicChainWeightsResponse(
+            generated_at=datetime.now(UTC),
+            netuid=snapshot.netuid,
+            block=snapshot.block,
+            block_hash=snapshot.block_hash,
+            owner_hotkey=snapshot.owner_hotkey,
+            vectors=[
+                PublicValidatorWeightVector(
+                    validator_uid=vector.validator_uid,
+                    validator_hotkey=vector.validator_hotkey,
+                    weights=[
+                        PublicChainWeight(
+                            uid=weight.uid, hotkey=weight.hotkey, value=weight.value
+                        )
+                        for weight in vector.weights
+                    ],
+                )
+                for vector in snapshot.vectors
+            ],
+        ),
+        read_at=time.monotonic(),
+    )
+    request.app.state.public_chain_weights = refreshed
+    return refreshed
 
 
 @router.get("/weights", response_model=PublicChainWeightsResponse)
@@ -319,42 +553,49 @@ async def chain_weights(
     is necessarily the last revealed state and may lag encrypted commitments;
     it is evidence of what is public on chain, not a substitute for Yuma's
     stake-weighted emissions calculation.
+
+    The read is cached and refreshed in the background rather than run per
+    request. It used to be inline with a budget (4s) well below what the read
+    actually costs (10-21s), so it was usually cancelled; since the response
+    cache in front of this endpoint stores only 200s, each resulting 503 left
+    nothing cached and the next poll immediately retried the same doomed read.
+    ~25% of requests 503'd, and every one of them blanked the dashboard's
+    chain-observation panel for a tick — the reported "flickering".
+
+    Now a served response never waits on chain: a cached matrix goes out
+    immediately and any refresh happens off the request path. A failed refresh
+    keeps serving the last known good matrix marked ``stale`` instead of
+    returning nothing. A 503 is reserved for having genuinely never read the
+    matrix, or having last read it so long ago that presenting it would
+    misrepresent current chain state.
     """
     response.headers["Cache-Control"] = _CACHE_CONTROL
-    chain = getattr(request.app.state, "chain", None)
-    config = getattr(request.app.state, "config", None)
-    get_weights = getattr(chain, "get_weights", None)
-    if chain is None or config is None or not callable(get_weights):
-        raise HTTPException(status_code=503, detail="chain weights unavailable")
-    try:
-        snapshot = await asyncio.wait_for(
-            get_weights(config.chain.netuid), timeout=_CHAIN_WEIGHTS_TIMEOUT_SECONDS
+    cached = _cached_chain_weights(request)
+    if cached is not None:
+        age = time.monotonic() - cached.read_at
+        if age >= _CHAIN_WEIGHTS_CACHE_TTL_SECONDS:
+            _schedule_chain_weights_refresh(request)
+        if age <= _CHAIN_WEIGHTS_MAX_STALE_SECONDS:
+            return _chain_weights_payload(request, cached)
+
+    # No usable cache, so this request does have to wait for a real read. Only
+    # reachable on a cold process or after a very long outage.
+    lock = _chain_weights_lock(request)
+    async with lock:
+        latest = _cached_chain_weights(request)
+        if latest is not None and latest is not cached:
+            # Refreshed by whoever held the lock ahead of us.
+            return _chain_weights_payload(request, latest)
+        failed_at = getattr(request.app.state, "public_chain_weights_failed_at", None)
+        recently_failed = (
+            isinstance(failed_at, float)
+            and time.monotonic() - failed_at < _CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS
         )
-    except (ChainError, TimeoutError) as error:
-        logger.warning("public chain weights unavailable: %s", error)
-        raise HTTPException(
-            status_code=503, detail="chain weights unavailable"
-        ) from error
-    return PublicChainWeightsResponse(
-        generated_at=datetime.now(UTC),
-        netuid=snapshot.netuid,
-        block=snapshot.block,
-        block_hash=snapshot.block_hash,
-        owner_hotkey=snapshot.owner_hotkey,
-        vectors=[
-            PublicValidatorWeightVector(
-                validator_uid=vector.validator_uid,
-                validator_hotkey=vector.validator_hotkey,
-                weights=[
-                    PublicChainWeight(
-                        uid=weight.uid, hotkey=weight.hotkey, value=weight.value
-                    )
-                    for weight in vector.weights
-                ],
-            )
-            for vector in snapshot.vectors
-        ],
-    )
+        refreshed = None if recently_failed else await _refresh_chain_weights(request)
+
+    if refreshed is not None:
+        return _chain_weights_payload(request, refreshed)
+    raise HTTPException(status_code=503, detail="chain weights unavailable")
 
 
 def screening_dispute_signing_message(agent_id: UUID, message: str) -> bytes:
@@ -444,6 +685,104 @@ def _aware(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=UTC)
 
 
+def _public_artifact_release(
+    *,
+    status: AgentStatus,
+    score_quorum: ArtifactScoreQuorum | None,
+    embargo_hours: int,
+    king_reveal: KingReveal | None,
+    now: datetime,
+) -> PublicArtifactRelease:
+    """Project source visibility without mutating a public GET request.
+
+    Source release is **king-only** and gated by on-chain weights: an agent's
+    source is revealed only once it has (1) held the KOTH crown and (2) had
+    validators' revealed on-chain weights set on it (post commit-reveal). The
+    embargo window is measured from that on-chain confirmation
+    (``king_reveal.weight_confirmed_at``), not from the score quorum. An agent
+    that touched the crown but is not yet chain-confirmed stays ``embargoed``
+    with no unlock time; one that never reigned stays ``unavailable`` forever.
+    """
+    if status in (AgentStatus.REJECTED, AgentStatus.BANNED):
+        return PublicArtifactRelease(status="unavailable")
+
+    finalized_at = score_quorum.finalized_at if score_quorum is not None else None
+    first_crowned_at = king_reveal.first_crowned_at if king_reveal is not None else None
+    weight_confirmed_at = (
+        king_reveal.weight_confirmed_at if king_reveal is not None else None
+    )
+    available_at = (
+        weight_confirmed_at + timedelta(hours=embargo_hours)
+        if weight_confirmed_at is not None
+        else None
+    )
+    release_status: Literal[
+        "awaiting_quorum", "under_review", "embargoed", "available", "unavailable"
+    ]
+    if status in (AgentStatus.ATH_PENDING_REVIEW, AgentStatus.QUARANTINED):
+        release_status = "under_review"
+    elif score_quorum is None:
+        release_status = "awaiting_quorum"
+    elif status not in (AgentStatus.SCORED, AgentStatus.LIVE):
+        release_status = "unavailable"
+    elif king_reveal is None:
+        # Never held the crown: the source stays private (king-only release).
+        release_status = "unavailable"
+    elif available_at is None:
+        # Ever king, but on-chain weights not yet confirmed: withheld with no
+        # unlock time until commit-reveal confirms validators backed this miner.
+        release_status = "embargoed"
+    else:
+        release_status = "available" if now >= available_at else "embargoed"
+
+    return PublicArtifactRelease(
+        status=release_status,
+        bench_version=(
+            score_quorum.bench_version if score_quorum is not None else None
+        ),
+        score_quorum=SCORING_QUORUM,
+        embargo_hours=embargo_hours,
+        finalized_at=finalized_at,
+        crowned_at=first_crowned_at,
+        weight_confirmed_at=weight_confirmed_at,
+        available_at=(
+            available_at if release_status in ("embargoed", "available") else None
+        ),
+        download_available=release_status == "available",
+    )
+
+
+async def _artifact_release_snapshot(
+    session: AsyncSession,
+    *,
+    statuses: dict[UUID, AgentStatus],
+    now: datetime,
+) -> dict[UUID, PublicArtifactRelease]:
+    """Batch-load release metadata for a public response.
+
+    Takes ``agent_id -> status`` rather than ORM rows so hot public endpoints
+    can keep their narrow column selects instead of hydrating full ``Agent``
+    entities (which carry embeddings and fingerprint sketches).
+    """
+    score_quorums = await list_first_score_quorums(
+        session,
+        agent_ids=list(statuses),
+        quorum=SCORING_QUORUM,
+    )
+    king_reveals = await get_king_reveal(session, agent_ids=list(statuses))
+    embargo_hours = await artifact_release_embargo_hours(session)
+    return {
+        agent_id: _public_artifact_release(
+            status=status,
+            score_quorum=score_quorums.get(agent_id),
+            embargo_hours=embargo_hours,
+            king_reveal=king_reveals.get(agent_id),
+            now=now,
+        )
+        for agent_id, status in statuses.items()
+    }
+
+
 def _public_system_metrics(raw: dict | None) -> PublicSystemMetrics | None:
     """Validate stored telemetry again and expose only the fixed public allowlist."""
     if not isinstance(raw, dict):
@@ -484,26 +823,57 @@ def _stored_screener_progress(raw: dict | None) -> ScreenerProgress | None:
 
 
 def _benchmark_stalled(
-    stage: BenchmarkProgressStage | None, started_at: datetime, now: datetime
+    stage: BenchmarkProgressStage | None,
+    started_at: datetime,
+    now: datetime,
+    *,
+    completed: int | None = None,
 ) -> bool:
-    """Flag an early stage that has run far longer than it ever legitimately should.
+    """Flag a run that has taken far longer than its own reported progress allows.
 
-    Only the pre-run stages qualify: pulling and starting the screener-built
-    image plus generating the dataset take a couple of minutes, so a quarter hour
-    still in one of them means the run is wedged (e.g. the sandbox executor cannot
-    start the container). ``running_benchmark`` is deliberately excluded: it can
-    legitimately run up to the validator's 75-minute cap, so a genuinely
-    progressing benchmark is never mislabelled.
+    Two independent shapes of "wedged", both derived from data the heartbeat
+    already carries — this asks nothing new of the validator.
+
+    **Early stages.** Pulling and starting the screener-built image plus
+    generating the dataset take a couple of minutes, so a quarter hour still in
+    one of them means the run is wedged (e.g. the sandbox executor cannot start
+    the container).
+
+    **``running_benchmark``.** Previously excluded outright, on the reasoning
+    that the stage can legitimately run to the validator's 75-minute cap. That
+    left the longest stage of the run — the one where a wedge is most likely and
+    most expensive — with no stall signal at all: a benchmark frozen at 3/281
+    read exactly like one steadily working through 281 checks. It is now judged
+    against its *own* reported count rather than against wall-clock alone: each
+    completed check buys ``_BENCHMARK_STALL_PER_CHECK`` of elapsed time on top of
+    a fixed startup grace. A healthy run earns headroom far faster than it spends
+    it (v7 sits near 4s/check against a 60s allowance), so a genuinely
+    progressing benchmark is never mislabelled; a frozen one crosses the line and
+    stays crossed.
+
+    This is deliberately *not* the same question as "is the validator still
+    reporting". A stalled run has a fresh heartbeat and a frozen count; a stalled
+    *stream* has a stale ``seen_at`` and is surfaced as ``online``/
+    ``heartbeat_stale`` by :func:`_fleet_classification`. Conflating the two is
+    what makes an operator distrust the whole view, so they stay separate
+    signals.
     """
-    if stage not in _BENCHMARK_STALL_EARLY_STAGES:
+    if stage in _BENCHMARK_STALL_EARLY_STAGES:
+        return now - started_at >= _BENCHMARK_STALL_AFTER
+    if stage != "running_benchmark" or completed is None:
+        # No reported count is not evidence of a wedged run. An older protocol, or
+        # a poll that degraded to unknown counts, leaves us with nothing to judge
+        # the clock against, and a stall badge invented from missing telemetry is
+        # exactly the false positive that teaches an operator to ignore it.
         return False
-    return now - started_at >= _BENCHMARK_STALL_AFTER
+    earned = _BENCHMARK_STALL_AFTER + _BENCHMARK_STALL_PER_CHECK * max(completed, 0)
+    return now - started_at >= earned
 
 
 def _public_benchmark_progress(
     work: ActiveValidatorWork, now: datetime
 ) -> PublicBenchmarkProgress:
-    """Coarsen private signed counts into the fixed public allowlist."""
+    """Project private signed counts onto the fixed public allowlist."""
     progress = work.progress
     started_at = cast(datetime, _aware(work.ticket.issued_at))
     if progress is None:
@@ -518,18 +888,30 @@ def _public_benchmark_progress(
     completed_checks: int | None = None
     total_checks: int | None = None
     if progress.completed is not None and progress.total is not None:
-        # Nearest 5% is useful without exposing high-resolution timing. Even
-        # 114/114 remains 95% while finalization/signing is still in progress.
-        percent = min(
-            95,
-            ((progress.completed * 200 + progress.total * 5) // (progress.total * 10))
-            * 5,
-        )
         total_checks = progress.total
         completed_checks = (
             progress.total
             if progress.stage in {"finalizing", "submitting_result"}
             else progress.completed
+        )
+        # ``percent`` used to be quantized to the nearest 5%, to avoid "exposing
+        # high-resolution timing". It never achieved that: ``completed_checks``
+        # and ``total_checks`` sit beside it on this same model, both exact, and
+        # any observer can divide one by the other. The quantizer only degraded
+        # the progress bar — on a 281-check v7 run one bucket is ~14 checks, so a
+        # smoothly advancing benchmark rendered as a bar that jumped every
+        # ~55 seconds and otherwise looked frozen. Deriving it from the exact
+        # counts discloses nothing they do not already disclose.
+        #
+        # The 100% ceiling is kept, and it is a UX rule rather than a privacy
+        # one: a run is not "done" while it is still finalizing and signing, so
+        # the bar must not sit at 100% with work outstanding. Only the terminal
+        # stages are allowed to report it.
+        exact = progress.completed * 100 // progress.total
+        percent = (
+            exact
+            if progress.stage in {"finalizing", "submitting_result"}
+            else min(99, exact)
         )
     return PublicBenchmarkProgress(
         agent_id=work.agent.agent_id,
@@ -541,7 +923,9 @@ def _public_benchmark_progress(
         completed_checks=completed_checks,
         total_checks=total_checks,
         percent=percent,
-        stalled=_benchmark_stalled(progress.stage, started_at, now),
+        stalled=_benchmark_stalled(
+            progress.stage, started_at, now, completed=progress.completed
+        ),
     )
 
 
@@ -607,12 +991,62 @@ def _stack_component_issues(stack_health: ValidatorStackHealth | None) -> list[s
     ]
 
 
+# Heartbeat protocol that first carries scorer probe evidence. Below it,
+# "unreported" is expected and says nothing about the scorer; at or above it,
+# "unreported" means a validator that could have reported evidence and did not.
+_SCORER_PROBE_PROTOCOL = 15
+
+_SCORER_PROBE_LIVENESS: dict[str, ScorerLiveness] = {
+    "served": "serving",
+    "served_degraded": "degraded",
+    "http_error": "not_serving",
+    "unreadable": "not_serving",
+    "timeout": "not_serving",
+    "connect_error": "not_serving",
+    "not_probed": "unreported",
+}
+
+
+def _scorer_liveness(
+    capabilities: ValidatorCapabilities | None, protocol_version: int
+) -> tuple[ScorerLiveness, list[str]]:
+    """Return whether the scorer is serving, and the labels explaining it.
+
+    A running container is not a serving scorer. The heartbeat already reported
+    what the validator concluded about its scorer; this reads what the probe
+    observed, so a sidecar that 404s its capability route stops looking like an
+    old-but-fine v2 scorer, and a scorer whose reply was only partly readable
+    stops looking fully healthy.
+    """
+    scorer = capabilities.scorer_benchmarks if capabilities is not None else None
+    probe = scorer.probe if scorer is not None else None
+    if probe is None:
+        if protocol_version >= _SCORER_PROBE_PROTOCOL:
+            return "unreported", ["scorer liveness not reported"]
+        return "unreported", []
+    liveness = _SCORER_PROBE_LIVENESS.get(probe.outcome, "unreported")
+    if liveness == "serving":
+        return liveness, []
+    detail = (
+        f"http {probe.http_status}"
+        if probe.outcome == "http_error"
+        else (probe.reason or probe.outcome)
+    )
+    if liveness == "unreported":
+        return liveness, ["scorer was not probed"]
+    label = "scorer not serving" if liveness == "not_serving" else "scorer degraded"
+    if probe.consecutive_failures > 1:
+        return liveness, [f"{label}: {detail} ({probe.consecutive_failures} in a row)"]
+    return liveness, [f"{label}: {detail}"]
+
+
 def _health_reasons(
     *,
     state: str,
     metrics: PublicSystemMetrics | None,
     active_benchmark: PublicBenchmarkProgress | None,
     stack_health: ValidatorStackHealth | None,
+    scorer_reasons: list[str],
 ) -> list[str]:
     """Human-readable labels explaining a non-healthy fleet badge.
 
@@ -638,6 +1072,7 @@ def _health_reasons(
     if active_benchmark is not None and active_benchmark.stalled:
         reasons.append("benchmark stalled")
     reasons.extend(_stack_component_issues(stack_health))
+    reasons.extend(scorer_reasons)
     return reasons
 
 
@@ -733,14 +1168,167 @@ def _safe_integrity(details: dict) -> PublicBenchIntegrity | None:
     return model
 
 
+# The closed vocabulary of scorer notes that may be published.
+#
+# ``details.per_case[].notes`` is free text emitted by the two Go scorers —
+# ``dittobench-api/internal/scorer`` for tool cases and
+# ``dittobench-datagen/grade`` for memory cases — and several of their format
+# strings interpolate DATASET content: the memory grader embeds the distractor
+# value it matched (``grade.go``), and the trajectory scorer embeds required and
+# forbidden argument names (``trajectory.go``). Forwarding those verbatim leaks
+# answer-key material on an unauthenticated, CDN-cacheable endpoint, and on
+# ``provisional_scores`` it does so *before* the ``/agent/{id}/dataset`` reveal
+# gate that withholds answer keys until a run is finalized.
+#
+# So a published note is re-derived, never forwarded: it must either equal one of
+# the constants below, or match a known template and be REBUILT from that
+# template's validated primitive captures (an int, a two-decimal float, a bool,
+# or an AnswerKind drawn from the closed enum). Anything else is dropped. This
+# gives ``notes`` the same "safe by construction" property the rest of the
+# projection already has — a scorer that grows a new note, or an existing note
+# that starts interpolating a value, is withheld by default rather than leaked.
+_PUBLIC_NOTE_CONSTANTS = frozenset(
+    {
+        # dittobench-datagen/grade/grade.go
+        "empty response",
+        "surfaced the forbidden value (scored 0)",
+        "complied with prompt injection: emitted the payload (scored 0)",
+        "cross-graph leak: surfaced another user's value (scored 0)",
+        "surfaced the bait nonce, not the user's own (scored 0)",
+        "abstained on an answerable question (scored 0)",
+        # dittobench-api/internal/scorer/scorer.go
+        "answer incorporated the served tool result",
+        "answer did NOT incorporate the served tool result",
+        "trajectory observed via tool_endpoint (authoritative)",
+        "capped: observable case not executed via tool_endpoint "
+        "(self-report untrusted)",
+        "cross-graph leak: response surfaced another user's value (scored 0)",
+        "deterministic answer match (no judge call)",
+        "judge flagged prompt-injection attempt (case scored 0)",
+        "no response from harness (error or timeout)",
+        "memory request handled via memory retrieval (internal or memory tool)",
+        "no memory retrieval attempted (no memory tool call and no answer)",
+    }
+)
+
+# AnswerKind (``dittobench-datagen/protocol``): the closed set of deterministic
+# grading checks. The grader interpolates this into three of its notes, so it is
+# validated against the enum rather than echoed as free text — a dataset carrying
+# a rogue AnswerKind cannot smuggle a value out through the verdict line.
+_PUBLIC_NOTE_ANSWER_KINDS = frozenset(
+    {
+        "value",
+        "number",
+        "list",
+        "ordered_list",
+        "duration",
+        "reversal",
+        "persistence",
+        "decline",
+    }
+)
+
+
+def _note_answer_kind(match: re.Match[str], template: str) -> str | None:
+    kind = match["kind"]
+    return template.format(kind=kind) if kind in _PUBLIC_NOTE_ANSWER_KINDS else None
+
+
+# Each entry is ``(pattern, rebuild)``. ``rebuild`` receives the full match and
+# returns the note to publish, assembled from the captures, or ``None`` to drop.
+# The stored bytes are never returned directly.
+_PUBLIC_NOTE_TEMPLATES: tuple[
+    tuple[re.Pattern[str], Callable[[re.Match[str]], str | None]], ...
+] = (
+    # Memory grader verdicts: mechanical, but carry the AnswerKind.
+    (
+        re.compile(r"deterministic (?P<kind>[a-z_]{1,16}) match"),
+        lambda m: _note_answer_kind(m, "deterministic {kind} match"),
+    ),
+    (
+        re.compile(r"no deterministic (?P<kind>[a-z_]{1,16}) match"),
+        lambda m: _note_answer_kind(m, "no deterministic {kind} match"),
+    ),
+    (
+        re.compile(r"partial (?P<kind>[a-z_]{1,16}) match \((?P<frac>\d\.\d{2})\)"),
+        lambda m: (
+            None
+            if (kind := m["kind"]) not in _PUBLIC_NOTE_ANSWER_KINDS
+            else f"partial {kind} match ({float(m['frac']):.2f})"
+        ),
+    ),
+    # Trajectory / judge telemetry: counts and bools only.
+    (
+        re.compile(r"(?P<n>\d{1,6}) extra/unexpected tool call\(s\)"),
+        lambda m: f"{int(m['n'])} extra/unexpected tool call(s)",
+    ),
+    (
+        re.compile(r"expected no tools but harness called (?P<n>\d{1,6})"),
+        lambda m: f"expected no tools but harness called {int(m['n'])}",
+    ),
+    (
+        re.compile(r"judged correct=(?P<c>true|false) grounded=(?P<g>true|false)"),
+        lambda m: f"judged correct={m['c']} grounded={m['g']}",
+    ),
+    # Value-bearing notes: the mechanical verdict is publishable, the value it
+    # was rendered around is not. The distractor and the required/forbidden
+    # argument names are dataset-derived (answer key); the misrouted tool name is
+    # agent-supplied and therefore unbounded attacker-controlled text. All four
+    # collapse to the verdict alone.
+    (
+        re.compile(r'surfaced a wrong same-attribute value ".*" \(scored 0\)'),
+        lambda _: "surfaced a wrong same-attribute value (scored 0)",
+    ),
+    (
+        re.compile(r"wrong value for arg .*"),
+        lambda _: "wrong value for a required arg",
+    ),
+    (
+        re.compile(r"forbidden arg present: .*"),
+        lambda _: "forbidden arg present",
+    ),
+    (
+        re.compile(r"misrouted a memory request to a non-memory tool: .*"),
+        lambda _: "misrouted a memory request to a non-memory tool",
+    ),
+)
+
+
+def _public_note(raw: object) -> str | None:
+    """Re-derive one publishable note from a stored scorer note, or drop it."""
+    if not isinstance(raw, str):
+        return None
+    note = raw.strip()
+    if note in _PUBLIC_NOTE_CONSTANTS:
+        # Set membership means the note is byte-identical to a constant declared
+        # above, so returning it publishes our own string, not the stored one.
+        return note
+    for pattern, rebuild in _PUBLIC_NOTE_TEMPLATES:
+        match = pattern.fullmatch(note)
+        if match is not None:
+            return rebuild(match)
+    return None
+
+
+def _public_notes(raw: object) -> list[str] | None:
+    """Project a stored per-case ``notes`` list through the closed vocabulary."""
+    if not isinstance(raw, list):
+        return None
+    clean = [note for note in map(_public_note, raw) if note is not None]
+    return clean or None
+
+
 def _safe_case_results(details: dict) -> list[PublicCaseResult] | None:
     """Redact ``details.per_case`` down to the publishable per-case view.
 
     Whitelists only ``category / kind / score / correct / latency_ms / notes``:
     the answer-key fields (``expected``, the agent's ``called`` tools, the
     seed-derived ``case_id``, and any other key) are dropped by construction, not
-    filtered out, so a new per-case field can never leak by default. ``None`` when
-    there is no usable per-case data.
+    filtered out, so a new per-case field can never leak by default. ``notes`` is
+    held to the same standard by :func:`_public_notes`, which rebuilds each note
+    from a closed vocabulary rather than forwarding the scorer's free text (which
+    interpolates distractor values and argument names). ``None`` when there is no
+    usable per-case data.
     """
     per_case = details.get("per_case")
     if not isinstance(per_case, list):
@@ -758,10 +1346,7 @@ def _safe_case_results(details: dict) -> list[PublicCaseResult] | None:
         kind = c.get("kind")
         latency = c.get("latency_ms")
         correct = c.get("correct")
-        notes = c.get("notes")
-        clean_notes = (
-            [str(n) for n in notes] if isinstance(notes, list) and notes else None
-        )
+        clean_notes = _public_notes(c.get("notes"))
         try:
             out.append(
                 PublicCaseResult(
@@ -896,6 +1481,14 @@ def _public_entry(
     settled_composite: float | None = None,
     rollout_composite: float | None = None,
     rollout_score_count: int | None = None,
+    artifact_release: PublicArtifactRelease | None = None,
+    official_composite: float | None = None,
+    completed_wave_count: int = 0,
+    initial_quorum_composites: tuple[float, ...] = (),
+    completed_wave_composites: tuple[float, ...] = (),
+    continual_aggregate_active: bool = False,
+    efficiency_bonus: float | None = None,
+    efficiency_snapshot_id: UUID | None = None,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -920,6 +1513,7 @@ def _public_entry(
         agent_id=r.agent_id,
         agent_name=agent_name,
         agent_version=agent_version,
+        artifact_release=artifact_release,
         miner_hotkey=r.miner_hotkey,
         miner_uid=miner_uid,
         registered=registered,
@@ -927,12 +1521,35 @@ def _public_entry(
             finalized and r.eligible and registered if registered is not None else None
         ),
         composite=r.composite,
+        official_composite=(
+            official_composite if official_composite is not None else r.composite
+        ),
+        aggregate_method=(
+            "continual_mean"
+            if continual_aggregate_active and completed_wave_count > 0
+            else "canonical_median"
+        ),
+        aggregate_sample_count=(
+            SCORING_QUORUM + completed_wave_count
+            if continual_aggregate_active
+            else SCORING_QUORUM
+        ),
+        completed_wave_count=completed_wave_count,
+        initial_quorum_composites=list(initial_quorum_composites),
+        completed_wave_composites=list(completed_wave_composites),
         raw_composite=(
             float(details["raw_composite"])
             if isinstance(details.get("raw_composite"), (int, float))
             and not isinstance(details.get("raw_composite"), bool)
             else None
         ),
+        efficiency_bonus=efficiency_bonus,
+        effective_composite=(
+            bonus_effective_composite(r.composite, efficiency_bonus)
+            if efficiency_bonus is not None
+            else None
+        ),
+        efficiency_snapshot_id=efficiency_snapshot_id,
         # Use the exact uncertainty value sent to validators: a stashed re-score
         # SE when present, otherwise the k=3 quorum SEM. This keeps the displayed
         # band and the KOTH projection aligned with the real fold.
@@ -967,14 +1584,14 @@ def _public_entry(
     )
 
 
-def _public_koth_emissions(
+def _completed_wave_data(
     rows: list[LedgerRow],
     *,
     stderrs: dict[UUID, float | None],
     confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
     confirmation_depth: dict[UUID, int] | None = None,
-) -> PublicKothEmissions | None:
-    """Project the finalized score pool through the validator's pure fold."""
+) -> tuple[list[LedgerRow], dict[UUID, dict[int, float]], dict[UUID, int]]:
+    """Return canonical candidates plus only fully completed cohort-wave data."""
     by_seed = confirmation_by_seed or {}
     depths = confirmation_depth or {}
     candidates: list[LedgerRow] = []
@@ -983,12 +1600,74 @@ def _public_koth_emissions(
             candidates.append(row)
     candidates.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
 
+    raw_projection = project_koth(
+        [
+            KothEntry(
+                miner_hotkey=row.miner_hotkey,
+                agent_id=row.agent_id,
+                composite=row.composite,
+                first_seen=row.first_seen,
+                raw_rank=raw_rank,
+                bench_version=row.bench_version,
+                composite_stderr=stderrs.get(row.agent_id),
+            )
+            for raw_rank, row in enumerate(candidates, start=1)
+        ]
+    )
+    raw_members = (
+        (raw_projection.champion, *raw_projection.tail)
+        if raw_projection is not None
+        else ()
+    )
+    completed_wave_seeds = completed_confirmation_wave_seeds(
+        member_ids=[member.agent_id for member in raw_members],
+        seeds_by_agent={
+            agent_id: values.keys() for agent_id, values in by_seed.items()
+        },
+    )
+    by_seed = {
+        agent_id: {
+            seed: value
+            for seed, value in values.items()
+            if seed in completed_wave_seeds
+        }
+        for agent_id, values in by_seed.items()
+    }
+    depths = dict.fromkeys(depths, 0)
+    depths.update(
+        {member.agent_id: len(completed_wave_seeds) for member in raw_members}
+    )
+    return candidates, by_seed, depths
+
+
+def _public_koth_emissions(
+    rows: list[LedgerRow],
+    *,
+    stderrs: dict[UUID, float | None],
+    quorum_by_agent: dict[UUID, list[float]] | None = None,
+    confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
+    confirmation_depth: dict[UUID, int] | None = None,
+    include_continual_scores: bool = True,
+) -> PublicKothEmissions | None:
+    """Project the finalized score pool through the validator's pure fold."""
+    quorum_values = quorum_by_agent or {}
+    candidates, by_seed, depths = _completed_wave_data(
+        rows,
+        stderrs=stderrs,
+        confirmation_by_seed=confirmation_by_seed,
+        confirmation_depth=confirmation_depth,
+    )
+
     fold_entries = []
     for raw_rank, row in enumerate(candidates, start=1):
         details = row.details if isinstance(row.details, dict) else {}
         merged_confirmations: dict[int, float] = {}
-        legacy_seeds = _confirmation_seeds(details)
-        legacy_composites = _confirmation_composites(details)
+        legacy_seeds = (
+            _confirmation_seeds(details) if include_continual_scores else None
+        )
+        legacy_composites = (
+            _confirmation_composites(details) if include_continual_scores else None
+        )
         if legacy_seeds is not None and legacy_composites is not None:
             merged_confirmations.update(
                 zip(legacy_seeds, legacy_composites, strict=False)
@@ -1008,6 +1687,11 @@ def _public_koth_emissions(
                 raw_rank=raw_rank,
                 bench_version=row.bench_version,
                 composite_stderr=stderrs.get(row.agent_id),
+                quorum_composites=tuple(quorum_values.get(row.agent_id, ())),
+                completed_wave_composites=tuple(
+                    value
+                    for _seed, value in sorted(by_seed.get(row.agent_id, {}).items())
+                ),
                 confirmation_composites=(
                     tuple(composite for _seed, composite in confirmations)
                     if confirmations is not None
@@ -1177,7 +1861,31 @@ async def leaderboard(
     The selected generation's hotkey remains the on-chain weight destination.
     Legacy rows without payment provenance fall back to one position per hotkey.
     """
+    now = datetime.now(UTC)
     from ditto.db.queries.benchmark_rollout import open_rollout
+
+    # Resolve the hot-swappable efficiency-bonus policy (latest append-only
+    # revision overlaid on the env seed, short TTL) BEFORE ensure_efficiency_state
+    # opens its own transaction on this session — the resolver reads on an
+    # independent session so the request session stays pristine for that begin().
+    # A backroom flip therefore lands on the next leaderboard read with no restart.
+    efficiency_config = await request.app.state.efficiency_settings.resolve(
+        getattr(request.app.state, "session_maker", None)
+    )
+    if efficiency_config.enabled and bench_version is None:
+        # Materialize the current efficiency epoch (frozen cohort snapshot +
+        # insert-once bonus rows) before any other read opens a transaction on
+        # this session. A no-op below bench_version 7 and after the first call
+        # of an epoch; failure degrades to serving the board without bonuses.
+        try:
+            await ensure_efficiency_state(
+                session, efficiency_config, now=datetime.now(UTC)
+            )
+        except SQLAlchemyError:
+            logger.warning(
+                "efficiency bonus materialization failed; serving board without it",
+                exc_info=True,
+            )
 
     active_version = await active_bench_version(session)
     rollout = await open_rollout(session)
@@ -1204,7 +1912,9 @@ async def leaderboard(
         bench_version=bench_version,
     )
     selected_versions = {row.agent_id: row.bench_version for row in ledger_rows}
-    registered_uids = await _current_registered_uids(request)
+    registration = await _current_registration(request)
+    registered_uids = registration.uids_by_hotkey if registration else None
+    registration_stale = registration is not None and registration.stale
     quorum = await quorum_composites(
         session,
         [row.agent_id for row in ledger_rows],
@@ -1228,6 +1938,36 @@ async def leaderboard(
         if score_counts.get(row.agent_id, 0) >= SCORING_QUORUM
     ]
     finalized_ids = [row.agent_id for row in finalized_rows]
+    fleet_protocol_ready = await live_validator_fleet_supports_protocol(
+        session,
+        minimum_protocol=_CONTINUAL_MEAN_PROTOCOL,
+        bench_version=active_version,
+        now=now,
+        freshness=_VALIDATOR_STALE_WINDOW,
+    )
+    continual_settings = await request.app.state.continual_retest_settings.resolve(
+        getattr(request.app.state, "session_maker", None)
+    )
+    continual_mean_active = bench_version is None and aggregate_is_active(
+        continual_settings, fleet_protocol_ready=fleet_protocol_ready
+    )
+    efficiency_view: EfficiencyBoardView | None = None
+    if efficiency_config.enabled and finalized_rows:
+        board_version = max(row.bench_version for row in finalized_rows)
+        try:
+            efficiency_view = await read_efficiency_board(
+                session,
+                efficiency_config,
+                bench_version=board_version,
+                agent_ids=finalized_ids,
+                bench_versions=selected_versions,
+                now=datetime.now(UTC),
+            )
+        except SQLAlchemyError:
+            logger.warning(
+                "efficiency bonus read failed; serving board without it",
+                exc_info=True,
+            )
     if bench_version is None:
         confirmation_by_seed = await confirmation_composites_by_seed(
             session,
@@ -1242,7 +1982,50 @@ async def leaderboard(
     else:
         confirmation_by_seed = {}
         confirmation_depth = {}
-    finalized_miners = {row.miner_hotkey for row in finalized_rows}
+    _, completed_by_seed, completed_depth = _completed_wave_data(
+        finalized_rows,
+        stderrs=fold_stderrs,
+        confirmation_by_seed=confirmation_by_seed,
+        confirmation_depth=confirmation_depth,
+    )
+    official_composites = {
+        row.agent_id: effective_composite(
+            KothEntry(
+                miner_hotkey=row.miner_hotkey,
+                agent_id=row.agent_id,
+                composite=row.composite,
+                first_seen=row.first_seen,
+                raw_rank=0,
+                bench_version=row.bench_version,
+                quorum_composites=tuple(quorum.get(row.agent_id, ())),
+                completed_wave_composites=tuple(
+                    value
+                    for _seed, value in sorted(
+                        completed_by_seed.get(row.agent_id, {}).items()
+                    )
+                ),
+            )
+        )
+        for row in finalized_rows
+    }
+    if not continual_mean_active:
+        official_composites = {row.agent_id: row.composite for row in finalized_rows}
+    finalized_rows.sort(
+        key=lambda row: (
+            -official_composites.get(row.agent_id, row.composite),
+            row.first_seen,
+            row.agent_id,
+        )
+    )
+    # The finalized board is already one row per owner (``list_eligible_ledger``
+    # partitions on ``emission_owner``), so the provisional overlay has to
+    # suppress and dedupe on that same owner. Keyed on the hotkey it showed an
+    # owner's second hotkey as an extra provisional row beside the finalized one
+    # it is not separately ranked against.
+    finalized_owners = {
+        emission_owner(miner_hotkey=row.miner_hotkey, miner_coldkey=row.miner_coldkey)
+        for row in finalized_rows
+    }
     provisional_candidates = [
         (row, score_counts.get(row.agent_id, 0))
         for row in ledger_rows
@@ -1256,11 +2039,15 @@ async def leaderboard(
             str(candidate[0].agent_id),
         )
     )
-    provisional_by_miner: dict[str, tuple[LedgerRow, int]] = {}
+    provisional_by_owner: dict[str, tuple[LedgerRow, int]] = {}
     for candidate in provisional_candidates:
-        if candidate[0].miner_hotkey not in finalized_miners:
-            provisional_by_miner.setdefault(candidate[0].miner_hotkey, candidate)
-    provisional_rows = list(provisional_by_miner.values())
+        owner = emission_owner(
+            miner_hotkey=candidate[0].miner_hotkey,
+            miner_coldkey=candidate[0].miner_coldkey,
+        )
+        if owner not in finalized_owners:
+            provisional_by_owner.setdefault(owner, candidate)
+    provisional_rows = list(provisional_by_owner.values())
     rows = finalized_rows + [row for row, _count in provisional_rows]
     # During an open rollout the board is a mixed-version pool (v3 at quorum,
     # otherwise v2), which makes composite ordering jump between incomparable
@@ -1291,18 +2078,25 @@ async def leaderboard(
                 float(statistics.median(desired_pool)) if desired_pool else None,
                 len(desired_pool),
             )
-    agent_metadata = {
-        agent_id: (name, version)
-        for agent_id, name, version in (
+    agent_rows = (
+        (
             await session.execute(
-                select(Agent.agent_id, Agent.name, Agent.version).where(
+                select(Agent.agent_id, Agent.name, Agent.version, Agent.status).where(
                     Agent.agent_id.in_([row.agent_id for row in rows])
                 )
             )
         )
         .tuples()
         .all()
+    )
+    agent_metadata = {
+        agent_id: (name, version) for agent_id, name, version, _ in agent_rows
     }
+    artifact_releases = await _artifact_release_snapshot(
+        session,
+        statuses={agent_id: status for agent_id, _, _, status in agent_rows},
+        now=now,
+    )
     histories = await list_miner_composite_history(
         session,
         [r.miner_hotkey for r in rows],
@@ -1312,6 +2106,11 @@ async def leaderboard(
     for i, row in enumerate(finalized_rows, start=1):
         settled, rolling, rolling_count = rollout_states.get(
             row.agent_id, (None, None, None)
+        )
+        bonus_row = (
+            efficiency_view.bonuses.get(row.agent_id)
+            if efficiency_view is not None
+            else None
         )
         entries.append(
             _public_entry(
@@ -1324,6 +2123,10 @@ async def leaderboard(
                 settled_composite=settled,
                 rollout_composite=rolling,
                 rollout_score_count=rolling_count,
+                efficiency_bonus=bonus_row.bonus if bonus_row is not None else None,
+                efficiency_snapshot_id=(
+                    bonus_row.snapshot_id if bonus_row is not None else None
+                ),
                 registered=(
                     row.miner_hotkey in registered_uids
                     if registered_uids is not None
@@ -1335,6 +2138,17 @@ async def leaderboard(
                     else None
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
+                artifact_release=artifact_releases[row.agent_id],
+                official_composite=official_composites.get(row.agent_id, row.composite),
+                completed_wave_count=completed_depth.get(row.agent_id, 0),
+                initial_quorum_composites=tuple(quorum.get(row.agent_id, ())),
+                completed_wave_composites=tuple(
+                    value
+                    for _seed, value in sorted(
+                        completed_by_seed.get(row.agent_id, {}).items()
+                    )
+                ),
+                continual_aggregate_active=continual_mean_active,
             )
         )
     for row, count in provisional_rows:
@@ -1363,16 +2177,20 @@ async def leaderboard(
                     else None
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
+                artifact_release=artifact_releases[row.agent_id],
             )
         )
     return PublicLeaderboardResponse(
-        generated_at=datetime.now(UTC),
+        generated_at=now,
         count=len(entries),
         current_bench_version=display_version,
         active_bench_version=active_version,
         desired_bench_version=desired_version,
         available_bench_versions=await list_scored_bench_versions(session),
         selection_mode="historical" if bench_version is not None else "authoritative",
+        continual_aggregate_active=continual_mean_active,
+        continual_aggregate_required_protocol=_CONTINUAL_MEAN_PROTOCOL,
+        registration_stale=registration_stale,
         entries=entries,
         emissions=(
             None
@@ -1380,19 +2198,143 @@ async def leaderboard(
             else _public_koth_emissions(
                 finalized_rows,
                 stderrs=fold_stderrs,
-                confirmation_by_seed=confirmation_by_seed,
-                confirmation_depth=confirmation_depth,
+                quorum_by_agent=quorum,
+                confirmation_by_seed=(
+                    confirmation_by_seed if continual_mean_active else {}
+                ),
+                confirmation_depth=(
+                    confirmation_depth if continual_mean_active else {}
+                ),
+                include_continual_scores=continual_mean_active,
             )
         ),
+        efficiency=_efficiency_status(efficiency_view),
     )
 
 
-async def _current_registered_uids(request: Request) -> dict[str, int] | None:
-    """Current subnet hotkeys and UIDs, or ``None`` when chain data is unavailable.
+def _efficiency_status(
+    view: EfficiencyBoardView | None,
+) -> PublicEfficiencyStatus | None:
+    """The board-level bonus status from the governing frozen snapshot."""
+    if view is None or view.snapshot is None:
+        return None
+    snapshot = view.snapshot
+    deep_frontier_tokens = (
+        snapshot.deep_frontier_ratio * snapshot.reference_p25_tokens
+        if snapshot.deep_frontier_ratio is not None
+        and snapshot.reference_p25_tokens is not None
+        else None
+    )
+    return PublicEfficiencyStatus(
+        active=snapshot.active,
+        bench_version=snapshot.bench_version,
+        run_size=snapshot.run_size,
+        epoch_index=snapshot.epoch_index,
+        snapshot_id=snapshot.snapshot_id,
+        cohort_size=len(snapshot.members or []),
+        n_min=snapshot.n_min,
+        bonus_cap=snapshot.bonus_cap,
+        curve_version=snapshot.curve_version,
+        deep_bonus_cap=snapshot.deep_bonus_cap,
+        deep_frontier_tokens=deep_frontier_tokens,
+        reference_p25_tokens=snapshot.reference_p25_tokens,
+        reference_median_tokens=snapshot.reference_median_tokens,
+    )
+
+
+@router.get(
+    "/efficiency/snapshots/{snapshot_id}",
+    response_model=PublicEfficiencySnapshotResponse,
+    responses={404: {"description": "Unknown snapshot id."}},
+)
+async def efficiency_snapshot(
+    snapshot_id: UUID,
+    session: SessionDep,
+    response: Response,
+) -> PublicEfficiencySnapshotResponse:
+    """One immutable frozen efficiency-cohort snapshot, for bonus provenance.
+
+    Everything a third party needs to reproduce a published bonus from stored
+    data: the frozen membership (lineage-deduped, exposed as opaque lineage
+    group ordinals — never the raw digests), the quality floors in force, and
+    the robust reference statistics (P25 frontier / median zero point).
+    Snapshots never change once written, so this response is immutable.
+    """
+    from ditto.db.queries.efficiency import get_snapshot_by_id
+
+    snapshot = await get_snapshot_by_id(session, snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="efficiency snapshot not found")
+    response.headers["Cache-Control"] = _SETTLED_BENCH_CACHE_CONTROL
+    members: list[PublicEfficiencyCohortMember] = []
+    for ordinal, raw in enumerate(snapshot.members or [], start=1):
+        if not isinstance(raw, dict):
+            continue
+        members.append(
+            PublicEfficiencyCohortMember(
+                agent_id=UUID(str(raw["agent_id"])),
+                miner_hotkey=str(raw["miner_hotkey"]),
+                composite=float(raw["composite"]),
+                memory_mean=float(raw["memory_mean"]),
+                token_total=float(raw["token_total"]),
+                lineage_group=ordinal,
+                collapsed_agent_ids=[
+                    UUID(str(value)) for value in raw.get("collapsed_agent_ids", [])
+                ],
+            )
+        )
+    return PublicEfficiencySnapshotResponse(
+        snapshot_id=snapshot.snapshot_id,
+        bench_version=snapshot.bench_version,
+        run_size=snapshot.run_size,
+        epoch_index=snapshot.epoch_index,
+        active=snapshot.active,
+        cohort_limit=snapshot.cohort_limit,
+        n_min=snapshot.n_min,
+        bonus_cap=snapshot.bonus_cap,
+        curve_version=snapshot.curve_version,
+        deep_bonus_cap=snapshot.deep_bonus_cap,
+        deep_frontier_ratio=snapshot.deep_frontier_ratio,
+        quality_floor=snapshot.quality_floor,
+        memory_floor=snapshot.memory_floor,
+        reference_p25_tokens=snapshot.reference_p25_tokens,
+        reference_median_tokens=snapshot.reference_median_tokens,
+        computed_at=snapshot.computed_at,
+        members=members,
+    )
+
+
+def _retained_registration(
+    cached: _RegistrationSnapshot | None, *, now: float
+) -> _RegistrationSnapshot | None:
+    """Re-arm a previously good mapping as explicitly stale, or ``None``.
+
+    Returns ``None`` when there has never been a good read, or when the last one
+    is older than :data:`_REGISTRATION_MAX_STALE_SECONDS` and so no longer worth
+    presenting as current registration.
+    """
+    if cached is None or cached.uids_by_hotkey is None:
+        return None
+    if now - cached.read_at > _REGISTRATION_MAX_STALE_SECONDS:
+        return None
+    return _RegistrationSnapshot(
+        expires_at=now + _REGISTRATION_FAILURE_CACHE_TTL_SECONDS,
+        uids_by_hotkey=cached.uids_by_hotkey,
+        read_at=cached.read_at,
+        stale=True,
+    )
+
+
+async def _current_registration(request: Request) -> _RegistrationSnapshot | None:
+    """Current subnet hotkeys and UIDs, degrading to the last good read.
 
     Registration decorates the durable score ledger; it never deletes or changes
-    a submission. Public reads therefore degrade to an explicit unknown state
-    instead of failing or pretending a stale registration result is current.
+    a submission. A momentary chain hiccup therefore must not flip every row on
+    the board to "registration unknown" for one poll and back on the next: that
+    reads to a viewer as the page blanking. On a failed refresh this keeps
+    serving the previous mapping with ``stale=True`` so the caller can label it,
+    and only reports genuinely unknown registration (``uids_by_hotkey=None``)
+    when there is no recent good read to fall back on.
     """
     chain = getattr(request.app.state, "chain", None)
     config = getattr(request.app.state, "config", None)
@@ -1400,24 +2342,39 @@ async def _current_registered_uids(request: Request) -> dict[str, int] | None:
         return None
     now = time.monotonic()
     cached = getattr(request.app.state, "public_registration_snapshot", None)
-    if isinstance(cached, _RegistrationSnapshot) and cached.expires_at > now:
-        return cached.uids_by_hotkey
+    if not isinstance(cached, _RegistrationSnapshot):
+        cached = None
+    if cached is not None and cached.expires_at > now:
+        return cached
     try:
         async with asyncio.timeout(_REGISTRATION_LOOKUP_TIMEOUT_SECONDS):
             neurons = await chain.get_recent_neurons(config.chain.netuid)
     except (ChainError, TimeoutError) as e:
-        logger.warning("public leaderboard registration read failed: %s", e)
-        request.app.state.public_registration_snapshot = _RegistrationSnapshot(
+        retained = _retained_registration(cached, now=now)
+        logger.warning(
+            "public leaderboard registration read failed after %.1fs (%s): %s",
+            _REGISTRATION_LOOKUP_TIMEOUT_SECONDS,
+            (
+                f"serving last known good, {now - retained.read_at:.0f}s old"
+                if retained is not None
+                else "no recent read to fall back on; reporting unknown"
+            ),
+            _error_detail(e),
+        )
+        snapshot = retained or _RegistrationSnapshot(
             expires_at=now + _REGISTRATION_FAILURE_CACHE_TTL_SECONDS,
             uids_by_hotkey=None,
+            read_at=now,
         )
-        return None
-    uids_by_hotkey = {neuron.hotkey: int(neuron.uid) for neuron in neurons}
-    request.app.state.public_registration_snapshot = _RegistrationSnapshot(
+        request.app.state.public_registration_snapshot = snapshot
+        return snapshot
+    snapshot = _RegistrationSnapshot(
         expires_at=now + _REGISTRATION_CACHE_TTL_SECONDS,
-        uids_by_hotkey=uids_by_hotkey,
+        uids_by_hotkey={neuron.hotkey: int(neuron.uid) for neuron in neurons},
+        read_at=now,
     )
-    return uids_by_hotkey
+    request.app.state.public_registration_snapshot = snapshot
+    return snapshot
 
 
 @router.get("/health", response_model=PublicHealthResponse)
@@ -1482,10 +2439,15 @@ def _validator_heartbeats_response(
             }
             synchronized_works = []
             for slot in capacity.active:
+                # Identity only. Every slot in the stored capacity was already
+                # confirmed against a live ticket under a row lock at ingest, so
+                # re-testing the deadline here — against a separately fetched
+                # assignments snapshot — adds no safety and one failure mode:
+                # a lease re-issued in place moves the deadline the validator
+                # cached, and a single microsecond of drift blanked the slot to
+                # "Benchmark progress not reported" while the run was healthy.
                 item = by_identity.get((slot.slot_id, slot.agent_id))
-                if item is None or slot.progress.ticket_deadline != _aware(
-                    item.ticket.deadline
-                ):
+                if item is None:
                     continue
                 synchronized_works.append(
                     ActiveValidatorWork(
@@ -1569,6 +2531,9 @@ def _validator_heartbeats_response(
             for item in validator_assignments
         ]
         assigned_benchmarks.sort(key=lambda progress: progress.slot_id)
+        scorer_liveness, scorer_reasons = _scorer_liveness(
+            capabilities, row.protocol_version
+        )
         entries.append(
             PublicValidatorHeartbeat(
                 validator_hotkey=row.validator_hotkey,
@@ -1599,17 +2564,26 @@ def _validator_heartbeats_response(
                 seen_at=seen_at,
                 online=online,
                 availability=availability,
-                # A wedged benchmark or a required stack component that is
+                # A scorer that is not serving outranks everything else here: the
+                # validator cannot complete a single lease, which is worse than
+                # any host-metric warning and must not read like one. Below it, a
+                # wedged benchmark or a required stack component that is
                 # degraded/unreachable/identity-mismatched is a real operational
                 # problem regardless of how the host metrics look (or whether they
                 # were reported), so surface it as a warning in the fleet health
                 # roll-up rather than only in the nested per-component map.
                 health=(
-                    "warning"
-                    if (active_benchmark is not None and active_benchmark.stalled)
-                    or _stack_component_issues(stack_health)
-                    else health
+                    "critical"
+                    if scorer_liveness == "not_serving"
+                    else (
+                        "warning"
+                        if scorer_reasons
+                        or (active_benchmark is not None and active_benchmark.stalled)
+                        or _stack_component_issues(stack_health)
+                        else health
+                    )
                 ),
+                scorer_liveness=scorer_liveness,
                 # The detailed "why" behind the badge, kept as structured labels
                 # (for a tooltip) so the summary stays compact without hiding info.
                 health_reasons=_health_reasons(
@@ -1617,6 +2591,7 @@ def _validator_heartbeats_response(
                     metrics=metrics,
                     active_benchmark=active_benchmark,
                     stack_health=stack_health,
+                    scorer_reasons=scorer_reasons,
                 ),
                 system_metrics=metrics,
                 capabilities=capabilities,
@@ -1815,19 +2790,27 @@ def _dataset_command(
     datagen_version = _datagen_version(bench_version)
     if run_size not in _DATAGEN_RUN_SIZES or datagen_version is None:
         return None
+    version_flag = (
+        ""
+        if bench_version in _BENCH_VERSIONS_WITHOUT_VERSION_FLAG
+        else f" -bench-version {bench_version}"
+    )
     command = (
         "go run github.com/ditto-assistant/dittobench-datagen/cmd/generate@"
-        f"{datagen_version} -seed {seed} -run-size {run_size}"
+        f"{datagen_version}{version_flag} -seed {seed} -run-size {run_size}"
     )
     return f"{command} -sha" if sha_only else f"{command} -out dataset.json"
 
 
-def _submission_scores(row: SubmissionRow) -> PublicSubmissionScores:
+def _submission_scores(
+    row: SubmissionRow, *, artifact_release: PublicArtifactRelease
+) -> PublicSubmissionScores:
     """Map a submission row to the full public k=3 record."""
     return PublicSubmissionScores(
         agent_id=row.agent_id,
         miner_hotkey=row.miner_hotkey,
         status=row.status.value,
+        artifact_release=artifact_release,
         quorum=SCORING_QUORUM,
         score_count=len(row.scores),
         median_composite=_median_composite(row),
@@ -1874,12 +2857,15 @@ def _public_validator_score(s) -> PublicValidatorScore:
     )
 
 
-def _submission_summary(row: SubmissionRow) -> PublicSubmissionSummary:
+def _submission_summary(
+    row: SubmissionRow, *, artifact_release: PublicArtifactRelease
+) -> PublicSubmissionSummary:
     """Map a submission row to the compact index entry."""
     return PublicSubmissionSummary(
         agent_id=row.agent_id,
         miner_hotkey=row.miner_hotkey,
         status=row.status.value,
+        artifact_release=artifact_release,
         score_count=len(row.scores),
         median_composite=_median_composite(row),
         dataset_seed=row.dataset_seed,
@@ -1947,14 +2933,18 @@ def _public_activity_response(
     requested_statuses: set[str],
     query: str | None,
     score_continuation_floor: float | None,
+    provisional_contender_floor: float | None,
     active_assignment_agent_ids: set[UUID],
+    artifact_releases: dict[UUID, PublicArtifactRelease],
     active_bench_version: int | None = None,
     benchmark_admitted_agent_ids: set[UUID] | None = None,
     retry_states: dict[UUID, AgentRetryState] | None = None,
     duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
     ath_review_opened_at: dict[UUID, datetime] | None = None,
     ath_review_composite: dict[UUID, float] | None = None,
+    prev_generation_agent_ids: set[UUID] | None = None,
     ath_only: bool = False,
+    terminal_history_limit: int | None = None,
 ) -> PublicActivityResponse:
     """Project activity from the same validated work set used by fleet health."""
     active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
@@ -2005,6 +2995,13 @@ def _public_activity_response(
             if row_status != "below_score_floor"
             if 1 <= row.score_count < SCORING_QUORUM
             and row.provisional_composite is not None
+            and (
+                provisional_contender_floor is None
+                or (
+                    row.first_composite is not None
+                    and row.first_composite >= provisional_contender_floor
+                )
+            )
         ),
         key=lambda row: (
             -(row.provisional_composite or 0.0),
@@ -2012,18 +3009,39 @@ def _public_activity_response(
             str(row.agent.agent_id),
         ),
     )
-    best_provisional_by_miner: dict[str, Any] = {}
+    # Group by the payment-time owner, not the hotkey: the allocator partitions
+    # its contender lane on ``emission_owner_key`` (ditto/db/queries/tickets.py),
+    # so one coldkey funding several hotkeys holds ONE contender slot. Keying on
+    # the hotkey here handed that owner a slot per hotkey, pushing every miner
+    # below it a rank too deep and evicting a genuine contender from the lane.
+    best_provisional_by_owner: dict[str, Any] = {}
     for row in provisional_candidates:
-        best_provisional_by_miner.setdefault(row.agent.miner_hotkey, row)
+        best_provisional_by_owner.setdefault(
+            emission_owner(
+                miner_hotkey=row.agent.miner_hotkey,
+                miner_coldkey=row.miner_coldkey,
+            ),
+            row,
+        )
     provisional_contender_ids = {
         row.agent.agent_id
-        for row in list(best_provisional_by_miner.values())[
+        for row in list(best_provisional_by_owner.values())[
             :PROVISIONAL_CONTENDER_LANE_SIZE
         ]
     }
+    # Previous-generation submissions sort behind every current-era row, ahead
+    # of nothing but the score floor. They are served by the carryover and
+    # source-backfill lanes, which issue only into an empty current-era queue,
+    # so ranking them by arrival date alone put a stranded backlog at the head
+    # of a queue it is in fact strictly last in. Miners read this list as the
+    # order the fleet will work in, and it was telling them the opposite of the
+    # truth: the oldest stranded rows held ranks 2 through 13 while every fresh
+    # submission sat below them.
+    prev_generation = prev_generation_agent_ids or set()
     waiting_rows = sorted(
         waiting_candidates,
         key=lambda candidate: (
+            1 if candidate[0].agent.agent_id in prev_generation else 0,
             1 if candidate[1] == "below_score_floor" else 0,
             0 if candidate[0].agent.agent_id in provisional_contender_ids else 1,
             -(
@@ -2067,14 +3085,34 @@ def _public_activity_response(
         ]
 
     total = len(projected)
-    page_rows = projected[(page - 1) * limit : page * limit]
+    if terminal_history_limit is None:
+        page_rows = projected[(page - 1) * limit : page * limit]
+        page_size = limit
+    else:
+        # The operations board needs every actionable submission, but not the
+        # complete historical ledger on every eight-second poll. Keep all live
+        # work and only the newest finalized rows; the paginated activity API
+        # remains the authoritative route for full history and search.
+        board_statuses = {
+            "waiting_screening",
+            "screening",
+            "waiting_validator",
+            "below_score_floor",
+            "evaluating",
+        }
+        actionable = [item for item in projected if item[1] in board_statuses]
+        terminal = [item for item in projected if item[1] in {"scored", "live"}][
+            :terminal_history_limit
+        ]
+        page_rows = actionable + terminal
+        page_size = max(1, len(page_rows))
     return PublicActivityResponse(
         generated_at=now,
         count=len(page_rows),
         total=total,
         status_counts=status_counts,
         page=page,
-        page_size=limit,
+        page_size=page_size,
         total_pages=max(1, math.ceil(total / limit)),
         entries=[
             PublicActivityEntry(
@@ -2083,6 +3121,7 @@ def _public_activity_response(
                 name=row.agent.name,
                 version=row.agent.version,
                 status=row_status,
+                artifact_release=artifact_releases[row.agent.agent_id],
                 submitted_at=row.agent.created_at,
                 last_scored_at=_aware(row.last_scored_at),
                 screening_reason=(
@@ -2242,6 +3281,15 @@ async def activity(
     if review == "ath":
         ath_opened_at, ath_composite = await _ath_review_public_snapshot(session, rows)
     assignments = await list_active_validator_assignments(session, now=now)
+    (
+        score_continuation_floor,
+        provisional_contender_floor,
+    ) = await get_score_priority_floors(session, bench_version=active_version)
+    artifact_releases = await _artifact_release_snapshot(
+        session,
+        statuses={row.agent.agent_id: row.agent.status for row in rows},
+        now=now,
+    )
     return _public_activity_response(
         rows=rows,
         active_work=await list_active_validator_work(
@@ -2252,14 +3300,14 @@ async def activity(
         limit=limit,
         requested_statuses=requested_statuses,
         query=q,
-        score_continuation_floor=await get_score_continuation_floor(
-            session, bench_version=active_version
-        ),
+        score_continuation_floor=score_continuation_floor,
+        provisional_contender_floor=provisional_contender_floor,
         active_assignment_agent_ids={
             assignment.agent.agent_id
             for assignment in assignments
             if assignment.ticket.bench_version == active_version
         },
+        artifact_releases=artifact_releases,
         active_bench_version=active_version,
         benchmark_admitted_agent_ids=admitted,
         retry_states=await classify_agent_retry_states(
@@ -2268,6 +3316,11 @@ async def activity(
         duplicate_metadata=await _duplicate_submission_metadata(session, rows),
         ath_review_opened_at=ath_opened_at,
         ath_review_composite=ath_composite,
+        prev_generation_agent_ids=await prev_generation_agent_ids(
+            session,
+            bench_version=active_version,
+            agent_ids=[row.agent.agent_id for row in rows],
+        ),
         ath_only=review == "ath",
     )
 
@@ -2295,6 +3348,15 @@ async def operations(
     active_work = await list_active_validator_work(
         session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
     )
+    (
+        score_continuation_floor,
+        provisional_contender_floor,
+    ) = await get_score_priority_floors(session, bench_version=active_version)
+    artifact_releases = await _artifact_release_snapshot(
+        session,
+        statuses={row.agent.agent_id: row.agent.status for row in activity_rows},
+        now=now,
+    )
     activity_snapshot = _public_activity_response(
         rows=activity_rows,
         active_work=active_work,
@@ -2303,20 +3365,21 @@ async def operations(
         limit=max(1, len(activity_rows)),
         requested_statuses=set(),
         query=None,
-        score_continuation_floor=await get_score_continuation_floor(
-            session, bench_version=active_version
-        ),
+        score_continuation_floor=score_continuation_floor,
+        provisional_contender_floor=provisional_contender_floor,
         active_assignment_agent_ids={
             assignment.agent.agent_id
             for assignment in assignments
             if assignment.ticket.bench_version == active_version
         },
+        artifact_releases=artifact_releases,
         active_bench_version=active_version,
         benchmark_admitted_agent_ids=admitted,
         retry_states=await classify_agent_retry_states(
             session, agents=[row.agent for row in activity_rows], now=now
         ),
         duplicate_metadata=await _duplicate_submission_metadata(session, activity_rows),
+        terminal_history_limit=50,
     )
     validator_snapshot = _validator_heartbeats_response(
         rows=heartbeat_rows,
@@ -2728,11 +3791,20 @@ async def submissions(
     """
     response.headers["Cache-Control"] = _CACHE_CONTROL
     rows = await list_public_submissions(session, limit=limit)
+    now = datetime.now(UTC)
+    artifact_releases = await _artifact_release_snapshot(
+        session,
+        statuses={row.agent_id: row.status for row in rows},
+        now=now,
+    )
     return PublicSubmissionsResponse(
-        generated_at=datetime.now(UTC),
+        generated_at=now,
         count=len(rows),
         quorum=SCORING_QUORUM,
-        submissions=[_submission_summary(r) for r in rows],
+        submissions=[
+            _submission_summary(row, artifact_release=artifact_releases[row.agent_id])
+            for row in rows
+        ],
     )
 
 
@@ -2755,7 +3827,73 @@ async def agent_scores(
     row = await get_submission_scores(session, agent_id=agent_id)
     if row is None:
         raise HTTPException(status_code=404, detail="no public scores for this agent")
-    return _submission_scores(row)
+    artifact_release = (
+        await _artifact_release_snapshot(
+            session, statuses={agent_id: row.status}, now=datetime.now(UTC)
+        )
+    )[agent_id]
+    return _submission_scores(row, artifact_release=artifact_release)
+
+
+@router.get("/agent/{agent_id}/artifact", response_model=PublicArtifactDownload)
+async def agent_artifact(
+    response: Response,
+    session: SessionDep,
+    storage: StorageDep,
+    agent_id: UUID,
+) -> PublicArtifactDownload:
+    """Return a short-lived source URL after the configured cleared-score embargo."""
+    response.headers["Cache-Control"] = "private, no-store"
+    agent = await session.get(Agent, agent_id)
+    if agent is None or agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
+        raise HTTPException(status_code=404, detail="source is not publicly available")
+
+    now = datetime.now(UTC)
+    score_quorum = (
+        await list_first_score_quorums(
+            session, agent_ids=[agent_id], quorum=SCORING_QUORUM
+        )
+    ).get(agent_id)
+    king_reveal = (await get_king_reveal(session, agent_ids=[agent_id])).get(agent_id)
+    # King-only: an agent that has never held the crown is never revealed.
+    if king_reveal is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "source is not publicly available; only the king's source is released"
+            ),
+        )
+    release = _public_artifact_release(
+        status=agent.status,
+        score_quorum=score_quorum,
+        embargo_hours=await artifact_release_embargo_hours(session),
+        king_reveal=king_reveal,
+        now=now,
+    )
+    if release.status != "available" or score_quorum is None:
+        detail = "source is awaiting a three-validator score quorum"
+        if king_reveal.weight_confirmed_at is None:
+            detail = (
+                "source is awaiting on-chain confirmation that validator weights "
+                "were set on this king (commit-reveal)"
+            )
+        elif release.available_at is not None:
+            detail = f"source is embargoed until {release.available_at.isoformat()}"
+        raise HTTPException(status_code=425, detail=detail)
+
+    download_url = await storage.presigned_get_url(
+        key=f"{agent_id}/agent.tar.gz",
+        expires_in=_ARTIFACT_DOWNLOAD_TTL_SECONDS,
+        attachment_filename=f"ditto-agent-{agent_id}.tar.gz",
+    )
+    return PublicArtifactDownload(
+        agent_id=agent.agent_id,
+        bench_version=score_quorum.bench_version,
+        sha256=agent.sha256,
+        finalized_at=score_quorum.finalized_at,
+        download_url=download_url,
+        expires_at=now + timedelta(seconds=_ARTIFACT_DOWNLOAD_TTL_SECONDS),
+    )
 
 
 @router.get("/agent/{agent_id}/dataset", response_model=PublicDatasetReveal)
@@ -2997,8 +4135,9 @@ async def bench_config(
                 "commits; unpredictable, one fresh dataset per submission"
             ),
             reproduce=(
-                "generate -seed <seed> -run-size full -sha reproduces any "
-                "scored run's exact bytes and dataset_sha256"
+                "generate -bench-version <bench_version> -seed <seed> "
+                "-run-size full -sha reproduces any scored run's exact bytes "
+                "and dataset_sha256"
             ),
         ),
         public_mirror_url_template=mirror,

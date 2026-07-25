@@ -100,7 +100,7 @@ from ditto.db.models import (
     ScreeningQuarantine,
 )
 from ditto.db.queries.agents import get_agent_by_id
-from ditto.db.queries.benchmark_rollout import active_bench_version, open_rollout
+from ditto.db.queries.benchmark_rollout import arrival_bench_version
 from ditto.db.queries.heartbeats import (
     prune_stale_screener_heartbeats,
     upsert_screener_heartbeat,
@@ -682,7 +682,8 @@ async def claim(
     responses={
         401: {"description": "Missing/invalid screener auth."},
         404: {"description": "No agent with the given id."},
-        422: {"description": "Malformed UUID path parameter."},
+        409: {"description": "No active screening attempt for this screener/agent."},
+        422: {"description": "Malformed UUID path or query parameter."},
     },
 )
 async def agent_artifact(
@@ -691,18 +692,57 @@ async def agent_artifact(
     screener_hotkey: ScreenerDep,
     session: SessionDep,
     storage: StorageDep,
+    attempt_id: Annotated[UUID | None, Query()] = None,
 ) -> ArtifactResponse:
-    """Return a short-lived pre-signed download URL for the agent's tarball."""
+    """Return a short-lived pre-signed download URL for the agent's tarball.
+
+    Download is bound to an active screening lease for this screener. Callers
+    should pass the claim ``attempt_id``; without it the platform still requires
+    a unique running attempt for ``(screener_hotkey, agent_id)``.
+    """
     response.headers["Cache-Control"] = "no-store"
-    agent = await get_agent_by_id(session, agent_id=agent_id)
-    if agent is None:
-        raise AgentNotFoundError(f"no agent with id={agent_id}")
+    now = datetime.now(UTC)
+    async with session.begin():
+        agent = await get_agent_by_id(session, agent_id=agent_id)
+        if agent is None:
+            raise AgentNotFoundError(f"no agent with id={agent_id}")
+        if attempt_id is not None:
+            attempt = await get_screening_attempt(
+                session, attempt_id=attempt_id, for_update=True
+            )
+        else:
+            attempt = await session.scalar(
+                select(ScreeningAttempt)
+                .where(
+                    ScreeningAttempt.agent_id == agent_id,
+                    ScreeningAttempt.screener_hotkey == screener_hotkey,
+                    ScreeningAttempt.status == "running",
+                )
+                .with_for_update()
+            )
+        if (
+            attempt is None
+            or attempt.agent_id != agent_id
+            or attempt.screener_hotkey != screener_hotkey
+            or attempt.status != "running"
+        ):
+            raise AgentNotScreenableError(
+                "artifact download does not match an active screening attempt"
+            )
+        deadline = attempt.deadline
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        if now > deadline:
+            raise AgentNotScreenableError("screening attempt lease has expired")
     url = await storage.presigned_get_url(
         key=_artifact_key(agent_id),
         expires_in=int(_ARTIFACT_URL_TTL.total_seconds()),
     )
     logger.info(
-        "screener=%s fetched artifact url for agent_id=%s", screener_hotkey, agent_id
+        "screener=%s fetched artifact url for agent_id=%s attempt_id=%s",
+        screener_hotkey,
+        agent_id,
+        attempt.attempt_id,
     )
     return ArtifactResponse(
         agent_id=agent_id,
@@ -1342,14 +1382,15 @@ async def submit_result(
 
     public_reason: str | None
     if payload.outcome == ScreenResultOutcome.INCONCLUSIVE:
-        # Inconclusive is explicitly a NON-verdict: the worker keeps it
-        # private (journal + lease expiry) and never posts it. Accepting one
-        # here would fall through to the legacy detail-based mapping and turn
-        # "we could not tell" into a rejection.
-        raise AgentNotScreenableError(
-            "inconclusive outcomes are not submittable verdicts"
-        )
-    if payload.outcome == ScreenResultOutcome.QUARANTINE:
+        # Inconclusive remains a NON-verdict: it neither passes nor rejects the
+        # submission. Persist the completed attempt as an early-expired lease
+        # so operators do not see work that finished minutes ago as still
+        # running. Claim selection keeps the agent in backoff until the
+        # original deadline, and the existing expiry cap still bounds repeated
+        # ambiguous results before operator review.
+        target = AgentStatus.SCREENING_FAILED
+        public_reason = "Screening was inconclusive; retry scheduled"
+    elif payload.outcome == ScreenResultOutcome.QUARANTINE:
         # A build-only attempt rebuilds an already-adjudicated submission's
         # prerequisites and runs no source review, so it must not be able to
         # re-quarantine — that would let a screener silently override the
@@ -1402,10 +1443,7 @@ async def submit_result(
             existing = await get_agent_by_id(session, agent_id=agent_id)
             if existing is None:
                 raise AgentNotFoundError(f"no agent with id={agent_id}")
-            bench_version = await active_bench_version(session)
-            rollout = await open_rollout(session)
-            if rollout is not None and existing.created_at >= rollout.created_at:
-                bench_version = rollout.desired_version
+            bench_version = await arrival_bench_version(session, agent=existing)
             versioned_dataset = await session.get(
                 BenchmarkDataset, (agent_id, bench_version)
             )
@@ -1440,7 +1478,9 @@ async def submit_result(
             raise AgentNotFoundError(f"no agent with id={agent_id}")
         attempt: ScreeningAttempt | None = None
         attempt_status = (
-            "quarantined"
+            "expired"
+            if payload.outcome == ScreenResultOutcome.INCONCLUSIVE
+            else "quarantined"
             if target == AgentStatus.QUARANTINED
             else "passed"
             if payload.passed

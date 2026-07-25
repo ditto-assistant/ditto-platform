@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
@@ -37,11 +38,28 @@ async def ensure_inference_grant(
     supported_profiles: tuple[str, ...] | None = None,
     calibration_manifest_sha256: str | None = None,
 ) -> InferenceGrant | None:
-    """Create or return the one grant bound to this exact live lease."""
+    """Create or return the one grant bound to this exact live lease.
+
+    Creation is race-free at the database level, not by convention. ``SELECT
+    ... FOR UPDATE`` locks rows that exist; when the grant has not been created
+    yet there is nothing to lock, so two callers racing on the same lease -- two
+    concurrent offer/heartbeat calls for one ticket -- can both miss and both
+    insert. The ``inference_grants_ticket_lease`` unique constraint has always
+    made the dangerous outcome impossible: a single ticket could never actually
+    obtain two grants and therefore never double its request or token budget.
+    What was missing was handling the losing side, which surfaced the conflict
+    as an unhandled IntegrityError and a 500 on an otherwise valid offer. The
+    loser now adopts the winner's row, which is the answer it wanted anyway.
+
+    The savepoint spans route selection as well as the insert, so a loser also
+    rolls back the ``selected_ticket_count`` increment ``select_route`` applies:
+    it never held a ticket, so it must not be counted as having been offered
+    one.
+    """
     if not config.enabled or ticket.status != TicketStatus.ISSUED:
         return None
     deadline = _aware(ticket.deadline)
-    grant = await session.scalar(
+    lease = (
         select(InferenceGrant)
         .where(
             InferenceGrant.agent_id == ticket.agent_id,
@@ -50,7 +68,9 @@ async def ensure_inference_grant(
             InferenceGrant.ticket_deadline == deadline,
         )
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
+    grant = await session.scalar(lease)
     if grant is None:
         model = benchmark_model(ticket.bench_version)
         if model not in config.allowed_models:
@@ -60,60 +80,66 @@ async def ensure_inference_grant(
         route_quantization: str | None = None
         route_prompt_price_per_token: float | None = None
         route_completion_price_per_token: float | None = None
-        if ticket.bench_version >= 7:
-            route = await select_route(
-                session,
-                model=model,
-                now=datetime.now(UTC),
-                supported_profiles=supported_profiles,
-                calibration_manifest_sha256=calibration_manifest_sha256,
-                routing_mode=config.routing_mode,
-            )
-            if route is None:
-                return None
-            route_provider = route.provider
-            route_profile = route.profile_revision
-            route_quantization = route.quantization
-            route_prompt_price_per_token = route.prompt_price_per_token
-            route_completion_price_per_token = route.completion_price_per_token
-        grant = InferenceGrant(
-            grant_id=uuid4(),
-            agent_id=ticket.agent_id,
-            bench_version=ticket.bench_version,
-            validator_hotkey=ticket.validator_hotkey,
-            slot_id=ticket.slot_id,
-            ticket_deadline=deadline,
-            status="pending",
-            bearer_digest=None,
-            broker_public_key=None,
-            generation=0,
-            allowed_models=[model],
-            route_provider=route_provider,
-            route_profile=route_profile,
-            route_quantization=route_quantization,
-            route_prompt_price_per_token=route_prompt_price_per_token,
-            route_completion_price_per_token=route_completion_price_per_token,
-            request_budget=config.request_budget,
-            token_budget=config.token_budget,
-            embedding_model=config.embedding_model,
-            embedding_profile=config.embedding_profile,
-            embedding_provider=config.embedding_provider,
-            embedding_dimensions=config.embedding_dimensions,
-            embedding_request_budget=config.embedding_request_budget,
-            embedding_token_budget=config.embedding_token_budget,
-            embedding_request_count=0,
-            embedding_tokens=0,
-            embedding_cost_microusd=0,
-            embedding_active_requests=0,
-            request_count=0,
-            prompt_tokens=0,
-            completion_tokens=0,
-            cost_microusd=0,
-            active_requests=0,
-            expires_at=deadline,
-        )
-        session.add(grant)
-        await session.flush()
+        try:
+            async with session.begin_nested():
+                if ticket.bench_version >= 7:
+                    route = await select_route(
+                        session,
+                        model=model,
+                        now=datetime.now(UTC),
+                        supported_profiles=supported_profiles,
+                        calibration_manifest_sha256=calibration_manifest_sha256,
+                        routing_mode=config.routing_mode,
+                    )
+                    if route is None:
+                        return None
+                    route_provider = route.provider
+                    route_profile = route.profile_revision
+                    route_quantization = route.quantization
+                    route_prompt_price_per_token = route.prompt_price_per_token
+                    route_completion_price_per_token = route.completion_price_per_token
+                grant = InferenceGrant(
+                    grant_id=uuid4(),
+                    agent_id=ticket.agent_id,
+                    bench_version=ticket.bench_version,
+                    validator_hotkey=ticket.validator_hotkey,
+                    slot_id=ticket.slot_id,
+                    ticket_deadline=deadline,
+                    status="pending",
+                    bearer_digest=None,
+                    broker_public_key=None,
+                    generation=0,
+                    allowed_models=[model],
+                    route_provider=route_provider,
+                    route_profile=route_profile,
+                    route_quantization=route_quantization,
+                    route_prompt_price_per_token=route_prompt_price_per_token,
+                    route_completion_price_per_token=route_completion_price_per_token,
+                    request_budget=config.request_budget,
+                    token_budget=config.token_budget,
+                    embedding_model=config.embedding_model,
+                    embedding_profile=config.embedding_profile,
+                    embedding_provider=config.embedding_provider,
+                    embedding_dimensions=config.embedding_dimensions,
+                    embedding_request_budget=config.embedding_request_budget,
+                    embedding_token_budget=config.embedding_token_budget,
+                    embedding_request_count=0,
+                    embedding_tokens=0,
+                    embedding_cost_microusd=0,
+                    embedding_active_requests=0,
+                    request_count=0,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    cost_microusd=0,
+                    active_requests=0,
+                    expires_at=deadline,
+                )
+                session.add(grant)
+                await session.flush()
+        except IntegrityError:
+            # Another caller created this lease's grant first. Its row is the
+            # one grant for this ticket; adopt it instead of inserting a second.
+            return await session.scalar(lease)
     return grant
 
 
@@ -143,6 +169,7 @@ async def activate_inference_grant(
         select(InferenceGrant)
         .where(InferenceGrant.grant_id == grant_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if grant is None:
         return None
@@ -212,6 +239,7 @@ async def revoke_ticket_inference(
                     InferenceGrant.status.in_(("pending", "active")),
                 )
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).all()
     )
@@ -242,6 +270,39 @@ async def revoke_ticket_inference(
         grant.updated_at = now
 
 
+class InferenceDecline(StrEnum):
+    """Why an admission was refused, when the reason is *not* fail-closed.
+
+    Historically :func:`begin_inference_request` returned ``None`` for every
+    refusal and the endpoint mapped all of them to ``429``. That conflates two
+    opposite situations, and dittobench-api #103 documents the damage: on the
+    ticket path a ``429`` means the validator's lease is gone, so the broker
+    correctly discards the whole run.
+
+    A refusal caused by a *concurrency or rate limit* is the opposite — the
+    lease is perfectly healthy and the caller should simply come back. That
+    distinction only started to matter when the hosted embedding limits became
+    operator-tunable: a backroom revision can now lower a limit underneath a
+    live run, and without this signal that emergency brake would destroy every
+    run it touched instead of slowing them down.
+
+    Scoped to the embedding lane on purpose. The chat limits are still boot-time
+    constants that cannot move under a running ticket, so a chat capacity
+    refusal is not a new hazard and its behaviour is left exactly as it was.
+    """
+
+    AT_CAPACITY = "at_capacity"
+
+
+def _capacity_decline(request_kind: str) -> InferenceDecline | None:
+    """The refusal a full-but-healthy lane returns.
+
+    ``None`` for chat, preserving its existing ``429``, because chat limits
+    cannot be changed without a restart and so cannot surprise a live run.
+    """
+    return InferenceDecline.AT_CAPACITY if request_kind == "embedding" else None
+
+
 async def begin_inference_request(
     session: AsyncSession,
     *,
@@ -253,14 +314,61 @@ async def begin_inference_request(
     now: datetime,
     config: InferenceProxyConfig,
     request_kind: str = "chat",
-) -> tuple[InferenceGrant, InferenceRequest] | None:
-    """Atomically consume one nonce and reserve bounded proxy capacity."""
+) -> tuple[InferenceGrant, InferenceRequest] | InferenceDecline | None:
+    """Atomically consume one nonce and reserve bounded proxy capacity.
+
+    Returns the reservation on success. ``None`` is the fail-closed class -- a
+    revoked or expired lease, a spent budget, a replayed nonce, a bad proof --
+    and the caller answers it with ``429`` exactly as before.
+    :class:`InferenceDecline` is returned only when the embedding lane refused
+    on a concurrency or rate limit and the lease is still healthy, so the caller
+    can answer with retryable backpressure instead.
+
+    Locking model: the grant row taken ``FOR UPDATE`` below is the only
+    serialization point, and every invariant that spends a budget is scoped to
+    that one grant -- reserved tokens, request count, per-ticket concurrency,
+    per-ticket rate, stale reclamation, and the nonce replay guard all filter on
+    ``grant_id``. Postgres serializes writers of one row by construction, so
+    two reservations against the same grant cannot both pass a budget check,
+    while reservations against different grants proceed fully in parallel.
+
+    ``populate_existing`` on that locking read is load-bearing, not decoration.
+    The unlocked ``session.get`` above puts the row in the identity map, and by
+    default SQLAlchemy will hand a later query the object it already has
+    without overwriting its attributes from the new result. The FOR UPDATE
+    select would then block correctly, wait its turn correctly, and still
+    evaluate every budget check against the values it read *before* acquiring
+    the lock -- so concurrent reservations would each see a stale
+    ``request_count`` and collectively overspend the grant. The old global
+    advisory lock hid this: it was taken before the unlocked read, so nothing
+    could commit between them and the stale value was always current anyway.
+    Removing the lock without this is silent accounting corruption, and
+    ``test_reservations_on_one_grant_serialize_and_respect_the_budget`` fails
+    against real Postgres if it is dropped.
+
+    This previously also took ``pg_advisory_xact_lock(hashtextextended(
+    'inference', 0))`` -- one lock, with a constant key, for every reservation
+    on the platform. It was held for the whole transaction (roughly eight
+    statements), so it serialized the entire fleet's reservation path and put a
+    hard ceiling on horizontal scaling. It was never what protected the
+    money-critical invariants; the grant row lock already did, and no other
+    caller in this module ever took the advisory lock, so it also provided no
+    mutual exclusion with grant creation, activation, revocation, or finish.
+
+    What it did cover is the cross-grant admission rails below (per-validator
+    and global in-flight counts and per-minute rates). Those aggregate across
+    every grant, so no row lock can make them exact, and making them exact
+    would require reintroducing exactly the global barrier being removed. They
+    are therefore best-effort: a burst of simultaneous reservations can
+    overshoot a rail by at most the number of racers, which is acceptable for
+    operational load-shedding backstops with headroom. The per-ticket rails
+    directly above them stay exact, and those are the ones a miner can target.
+    Best-effort does not change what a refusal *means*: a cross-grant rail that
+    does trip still answers through :func:`_capacity_decline`, so the embedding
+    lane reports a healthy-but-full lane rather than a dead lease.
+    """
     if request_kind not in {"chat", "embedding"}:
         return None
-    if session.get_bind().dialect.name == "postgresql":
-        await session.execute(
-            select(func.pg_advisory_xact_lock(func.hashtextextended("inference", 0)))
-        )
     snapshot = await session.get(InferenceGrant, grant_id)
     if snapshot is None:
         return None
@@ -273,6 +381,7 @@ async def begin_inference_request(
         select(InferenceGrant)
         .where(InferenceGrant.grant_id == grant_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if (
         grant is None
@@ -368,7 +477,10 @@ async def begin_inference_request(
         else config.embedding_per_ticket_concurrency
     )
     if active_requests >= per_ticket_concurrency:
-        return None
+        # Healthy lease, lane momentarily full. This is the limit an operator
+        # tunes from backroom, so it is also the one most likely to move under a
+        # live run -- it must degrade to backpressure, never to a lost run.
+        return _capacity_decline(request_kind)
 
     # Fast replay path avoids an ORM identity collision in the common case;
     # the composite primary key and nested transaction remain authoritative
@@ -448,7 +560,7 @@ async def begin_inference_request(
         or int(validator_recent or 0) >= per_validator_rpm
         or int(global_recent or 0) >= global_rpm
     ):
-        return None
+        return _capacity_decline(request_kind)
 
     request = InferenceRequest(
         grant_id=grant.grant_id,
@@ -493,6 +605,7 @@ async def finish_inference_request(
     upstream_provider: str | None = None,
     timed_out: bool = False,
     latency_ms: int | None = None,
+    upstream_attempts: int = 0,
 ) -> bool:
     snapshot = await session.get(InferenceGrant, grant_id)
     if snapshot is None:
@@ -506,6 +619,7 @@ async def finish_inference_request(
         select(InferenceGrant)
         .where(InferenceGrant.grant_id == grant_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     request = await session.get(
         InferenceRequest, (grant_id, nonce), with_for_update=True
@@ -557,6 +671,7 @@ async def finish_inference_request(
     request.completion_tokens = completion_tokens
     request.cost_microusd = cost_microusd
     request.upstream_provider = upstream_provider
+    request.upstream_attempts = max(0, upstream_attempts)
     request.timed_out = timed_out
     request.latency_ms = latency_ms
     request.completed_at = now
@@ -585,6 +700,7 @@ async def finish_inference_request(
 __all__ = [
     "activate_inference_grant",
     "bearer_digest",
+    "InferenceDecline",
     "begin_inference_request",
     "ensure_inference_grant",
     "finish_inference_request",

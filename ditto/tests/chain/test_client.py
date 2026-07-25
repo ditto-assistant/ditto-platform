@@ -266,6 +266,28 @@ class TestIsRegistered:
                 await client.is_registered("5HK1", 118)
 
 
+class TestGetRegisteredColdkey:
+    async def test_returns_owner_for_registered_hotkey(
+        self, install_pylon_module: AsyncMock
+    ) -> None:
+        install_pylon_module.v1.open_access.get_recent_neurons.return_value = (
+            make_neurons_response({"5HK1": make_pylon_neuron(coldkey="5Coldkey")})
+        )
+        async with ChainClient(make_chain_config()) as client:
+            result = await client.get_registered_coldkey("5HK1", 118)
+        assert result == "5Coldkey"
+
+    async def test_returns_none_for_unregistered_hotkey(
+        self, install_pylon_module: AsyncMock
+    ) -> None:
+        install_pylon_module.v1.open_access.get_recent_neurons.return_value = (
+            make_neurons_response({"5HK1": make_pylon_neuron()})
+        )
+        async with ChainClient(make_chain_config()) as client:
+            result = await client.get_registered_coldkey("5OTHER", 118)
+        assert result is None
+
+
 class TestGetLatestBlock:
     """Tests for ChainClient.get_latest_block."""
 

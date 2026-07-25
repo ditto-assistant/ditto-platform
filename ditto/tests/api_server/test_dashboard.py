@@ -204,6 +204,26 @@ class TestDashboard:
         assert ">Score rank</span>" in body
         assert ">Emissions</span>" in body
         assert 'id="emissions-strip" role="status" aria-live="polite"' in body
+        assert "function artifactReleaseCopy(release)" in body
+        assert "function artifactReleaseNote(release)" in body
+        assert "function renderArtifactRelease(release, agentId)" in body
+        assert "function downloadArtifact(agentId, button)" in body
+        assert '"/public/agent/" + encodeURIComponent(agentId) + "/artifact"' in body
+        assert 'cache: "no-store"' in body
+        assert "Download submitted source" in body
+        assert "This king's source" in body
+        assert "Number(release.embargo_hours) || 48" in body
+        assert "on-chain weights were set on this king" in body
+        assert "Awaiting that on-chain confirmation." in body
+        assert "its king reveal timing still applies" in body
+        assert "function relTimeUntil(iso)" in body
+        assert "relTimeUntil(release.available_at)" in body
+        assert "relTime(release.available_at)" not in body
+        assert "window.location.assign(data.download_url)" in body
+        assert "Download started" in body
+        assert "Download opened" not in body
+        assert "public/king/artifact" not in body
+        assert "continuous 24-hour reign" not in body
         assert 'id="chain-observation"' in body
         assert 'getJSON("/public/weights")' in body
         assert "Commit-reveal can make this lag active commitments" in body
@@ -245,6 +265,11 @@ class TestDashboard:
         assert "Waiting for scores" in body
         assert "function validatorQueueCompare(a, b)" in body
         assert "indexed.sort(validatorQueueCompare)" in body
+        assert "var pipelineShowStuck = false" in body
+        assert "data-pipeline-stuck-filter" in body
+        assert 'aria-pressed="' in body
+        assert 'item.entry.retry_state !== "exhausted"' in body
+        assert 'item.entry.retry_state === "exhausted"' in body
         assert "function queueRelevantBenchmark(progress)" in body
         assert "Number(activeBench) || Number(currentBench)" in body
         assert "version >= activeVersion" in body
@@ -295,12 +320,23 @@ class TestDashboard:
         assert '"Legacy lease unclassified · "' in body
         assert 'retestState(retests.running, "running")' in body
         assert 'retestState(retests.assigned, "assigned")' in body
-        assert "function confirmationCohorts(pipeline)" in body
         assert "function renderConfirmationScores(pipeline)" in body
         assert "Continual top-five retests" in body
+        assert "Completed cohort wave" in body
+        assert "Only completed cohort-wave aggregates are shown here" in body
+        assert "Partial, legacy, and superseded raw retest rows" in body
+        assert "Accepted shared seed" not in body
+        assert "function confirmationCohorts(pipeline)" not in body
         assert "Accepted validator scores" in body
         assert "Canonical quorum" in body
         assert "canonical median of" in body
+        assert "Current leaderboard score" in body
+        assert "initial quorum aggregate" in body
+        assert "mean of the initial three scores" in body
+        assert "full cohort wave" in body
+        assert "continually adjusts up or down" in body
+        assert "function continualVarianceSvg(e)" in body
+        assert "Score observations: initial quorum" in body
         assert "benchmarkVersionKey(pipeline.active_bench_version)" in body
         assert "cohortMedian(cohort.scores)" in body
         assert "pipeline.score_count) + ' of ' + esc(pipeline.quorum)" not in body
@@ -312,9 +348,7 @@ class TestDashboard:
         assert "Provisional scores may change" in body
         assert "final median is authoritative" in body
         assert "No validator score has been accepted yet." in body
-        assert (
-            "esc(benchmarkVersionLabel(cohort.key)) + ' official aggregate: '" in body
-        )
+        assert "initial quorum aggregate: ' + fx(median)" in body
         assert "median of " in body
         assert "score.reproduction_command" in body
         assert "score.verification_command" in body
@@ -1108,23 +1142,38 @@ class TestDashboardScoringTransparency:
         assert '<span class="tag" id="bs-version">v–</span>' in body
         assert 'class="bv-desired"' in body
 
-    async def test_reference_baseline_is_keyed_by_benchmark_version(self) -> None:
-        """Every measured version keeps its baseline; unmeasured ones say so.
+    async def test_no_reference_baseline_stat(self) -> None:
+        """The stock-harness reference baseline is deliberately not published.
 
-        A baseline is a real run of the stock harness on the locked model, so it
-        cannot be carried across versions -- composites only compare within one.
-        Holding a single constant meant the card went blank the moment the board
-        moved to a version it was not measured on, which reads as a broken widget
-        rather than as the honest "we have not run this yet" it actually is.
+        A single composite cannot represent that measurement honestly. The stock
+        kit's v7 calibration runs are sharply bimodal: 15 of 20 seeds score
+        conversational_sanity exactly 0.000 and land at composite 0.185-0.221,
+        while the 5 that clear the gate land at 0.344-0.450. The distribution has
+        no mass at its own mean (0.248, sd 0.087), so any one number on the card
+        would describe a run that does not exist and would misinform a reader
+        deciding whether a submission is worth making.
+
+        If a baseline is ever published again it needs to carry the shape of the
+        distribution, not a point estimate, so this guards against the stat
+        reappearing as a bare composite.
         """
         body = await self._body()
-        assert "var REFERENCE_BASELINES = {" in body
-        # The published runs, both from dittobench-api docs/BASELINES.md.
-        assert "2: { composite: 0.492" in body
-        assert "3: { composite: 0.445" in body
-        assert "4: { composite: 0.429" in body
-        # Unmeasured versions must be stated, not rendered as a bare dash.
-        assert "not yet measured" in body
-        assert "No reference baseline has been measured on bench_version" in body
-        # And the card must not claim a baseline is the winning score.
-        assert "it is not the score that wins" in body
+        assert "REFERENCE_BASELINES" not in body
+        assert "Reference Baseline" not in body
+        assert 'id="c-baseline"' not in body
+        assert 'id="c-baseline-tip"' not in body
+        assert "reference baseline" not in body.lower()
+        assert "must beat" not in body
+
+    async def test_neighbouring_comparison_features_survive(self) -> None:
+        """Removing the baseline must not touch the features that sat near it.
+
+        The off-network harness comparison and the token-efficiency budget are
+        separate measurements that merely live beside the removed card in the
+        same file; both stay.
+        """
+        body = await self._body()
+        assert "var THIRD_PARTY_HARNESSES = [" in body
+        assert "Hermes Agent" in body
+        assert "OpenClaw" in body
+        assert "baseline_total_tokens" in body

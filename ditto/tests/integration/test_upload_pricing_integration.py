@@ -57,6 +57,7 @@ class TestUploadPricingIntegration:
         assert body["amount_rao"] > 0
         assert body["send_address"].startswith("5")
 
+    @pytest.mark.needs_chain
     async def test_check_happy_path_against_real_chain(self):
         """Uses a //Alice keypair, which is NOT registered on real netuid 118,
         so we expect ok=false with the not-registered code; signature should

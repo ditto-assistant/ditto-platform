@@ -9,7 +9,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ditto.api_models.admin_quarantine import AdminBenchmarkQualificationRequest
 from ditto.api_models.agent_status import AgentStatus
@@ -34,7 +34,6 @@ from ditto.api_server.endpoints.admin_quarantine import (
 )
 from ditto.db.models import (
     Agent,
-    Base,
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutAudit,
@@ -44,12 +43,13 @@ from ditto.db.models import (
     InferenceRoutingPolicy,
     Score,
     ValidatorHeartbeat,
+    ValidatorLeaseAudit,
     ValidatorTicket,
 )
 from ditto.db.queries.benchmark_rollout import (
     CANARY_BENCH_VERSION,
+    DEFAULT_RESCORE_COHORT_SIZE,
     MIN_DESIRED_AUTHORITY_AGENTS,
-    RESCORE_COHORT_SIZE,
     DatasetPin,
     InferenceActivationRequirements,
     RolloutConflictError,
@@ -57,6 +57,7 @@ from ditto.db.queries.benchmark_rollout import (
     active_bench_version,
     append_rollout_member,
     bind_inference_activation_requirements,
+    capable_validator_counts,
     create_rollout_snapshot,
     heartbeat_supports_version,
     historical_rescore_cohort,
@@ -71,18 +72,19 @@ from ditto.db.queries.benchmark_rollout import (
     select_active_bench_version,
     supersede_open_rollout,
 )
+from ditto.db.queries.queue_policy_settings import (
+    insert_queue_policy_settings_revision,
+)
 from ditto.db.queries.scores import count_ranked_quorum_agents, list_eligible_ledger
 from ditto.db.queries.screening import claim_screening_attempts
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_admin_status_read_does_not_start_rollout() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
-    async with maker() as session:
+async def test_admin_status_read_does_not_start_rollout(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_maker() as session:
         state = await get_rollout(None, session, "v3")
         assert state == {
             "active_version": 2,
@@ -97,7 +99,11 @@ async def test_admin_status_read_does_not_start_rollout() -> None:
             "qualification_converged": False,
             "cohort_size": 0,
             "cohort_ready_count": 0,
+            # No rollout row exists, so nothing has frozen a target yet.
+            "rescore_cohort_target": None,
+            "max_rescore_cohort_size": 25,
             "priority_cohort_size": 5,
+            "priority_cohort_target": None,
             "priority_complete": False,
             "members": [],
         }
@@ -112,7 +118,6 @@ async def test_admin_status_read_does_not_start_rollout() -> None:
         assert control["status"] == "inactive"
         count = await session.scalar(select(func.count(BenchmarkRollout.rollout_id)))
         assert count == 0
-    await engine.dispose()
 
 
 def _capabilities(now: datetime) -> tuple[dict, dict]:
@@ -295,21 +300,27 @@ async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRo
                 signature="ab" * 64,
                 capabilities=capabilities,
                 stack=stack,
+                # A v10+ validator always advertises capacity; an absent blob is
+                # unreadable evidence and can never justify revoking a lease.
+                benchmark_capacity={
+                    "configured_slots": 1,
+                    "healthy_slots": ["slot-0"],
+                    "admission": "accepting",
+                    "active": [],
+                },
             )
         )
     await session.flush()
     return agent_ids, rollout
 
 
-async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
     expected_v4: list[UUID] = []
     expected_v3: list[UUID] = []
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         for version, count in ((4, 6), (3, 10), (2, 5)):
             for rank in range(count):
                 agent_id = uuid4()
@@ -355,16 +366,13 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras() -> 
         ]
         assert len(cohort) == 10
         assert not any("v2" in member.miner_hotkey for member in cohort)
-    await engine.dispose()
 
 
-async def test_rollout_idles_validator_until_fleet_finishes_priority_five() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_rollout_idles_validator_until_fleet_finishes_priority_five(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         priority_ids, rollout = await _seed_rollout(session, now)
         sixth_id = uuid4()
         session.add(
@@ -497,18 +505,15 @@ async def test_rollout_idles_validator_until_fleet_finishes_priority_five() -> N
         assert sixth_ticket is not None and sixth_ticket.agent_id == sixth_id
         assert await active_bench_version(session) == CANARY_BENCH_VERSION
         assert not await maybe_activate_rollout(session, rollout, now=now)
-    await engine.dispose()
 
 
-async def test_source_backfill_gate_waits_for_full_inherited_top_ten() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_source_backfill_gate_waits_for_full_inherited_top_ten(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         agent_ids, rollout = await _seed_rollout(session, now)
-        for position in range(6, RESCORE_COHORT_SIZE + 1):
+        for position in range(6, DEFAULT_RESCORE_COHORT_SIZE + 1):
             agent_id = uuid4()
             agent_ids.append(agent_id)
             session.add(
@@ -541,7 +546,7 @@ async def test_source_backfill_gate_waits_for_full_inherited_top_ten() -> None:
             )
 
         for position, agent_id in enumerate(agent_ids, start=1):
-            validator_count = 2 if position == RESCORE_COHORT_SIZE else 3
+            validator_count = 2 if position == DEFAULT_RESCORE_COHORT_SIZE else 3
             for validator in range(validator_count):
                 session.add(
                     Score(
@@ -555,14 +560,14 @@ async def test_source_backfill_gate_waits_for_full_inherited_top_ten() -> None:
                         tool_mean=0.8,
                         memory_mean=0.8,
                         median_ms=1,
-                        n=(15 if position == RESCORE_COHORT_SIZE else 114),
+                        n=(15 if position == DEFAULT_RESCORE_COHORT_SIZE else 114),
                         details={"bench_version": CANARY_BENCH_VERSION},
                         generated_at=now,
                     )
                 )
         await session.flush()
         assert not await rollout_cohort_complete(
-            session, rollout=rollout, cohort_size=RESCORE_COHORT_SIZE
+            session, rollout=rollout, cohort_size=DEFAULT_RESCORE_COHORT_SIZE
         )
         assert await rollout_cohort_complete(session, rollout=rollout, cohort_size=5)
 
@@ -587,7 +592,7 @@ async def test_source_backfill_gate_waits_for_full_inherited_top_ten() -> None:
         # Three smoke-profile rows are a raw quorum but cannot rank and must
         # not open source-era capacity.
         assert not await rollout_cohort_complete(
-            session, rollout=rollout, cohort_size=RESCORE_COHORT_SIZE
+            session, rollout=rollout, cohort_size=DEFAULT_RESCORE_COHORT_SIZE
         )
         smoke_scores = (
             (
@@ -605,18 +610,15 @@ async def test_source_backfill_gate_waits_for_full_inherited_top_ten() -> None:
             score.n = 114
         await session.flush()
         assert await rollout_cohort_complete(
-            session, rollout=rollout, cohort_size=RESCORE_COHORT_SIZE
+            session, rollout=rollout, cohort_size=DEFAULT_RESCORE_COHORT_SIZE
         )
-    await engine.dispose()
 
 
-async def test_frozen_top_five_barrier_remains_raw_three_of_three() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_frozen_top_five_barrier_remains_raw_three_of_three(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         priority_ids, rollout = await _seed_rollout(session, now)
         sixth_id = uuid4()
         session.add(
@@ -679,18 +681,13 @@ async def test_frozen_top_five_barrier_remains_raw_three_of_three() -> None:
         )
         assert ticket is not None
         assert ticket.agent_id == sixth_id
-    await engine.dispose()
 
 
-async def test_parallel_rollout_slots_stay_distinct_inside_frozen_priority_five() -> (
-    None
-):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_parallel_rollout_slots_stay_distinct_inside_frozen_priority_five(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         priority_ids, _rollout = await _seed_rollout(session, now)
         slot0 = await issue_rollout_ticket(
             session,
@@ -709,16 +706,13 @@ async def test_parallel_rollout_slots_stay_distinct_inside_frozen_priority_five(
         assert slot0 is not None and slot1 is not None
         assert slot0.agent_id != slot1.agent_id
         assert {slot0.agent_id, slot1.agent_id}.issubset(set(priority_ids))
-    await engine.dispose()
 
 
-async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         agent_ids, rollout = await _seed_rollout(session, now)
         v2_only_id = uuid4()
         session.add(
@@ -869,16 +863,13 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically() 
             and row.details["bench_version"] == CANARY_BENCH_VERSION
             for row in v3_ledger
         )
-    await engine.dispose()
 
 
-async def test_ineligible_qualified_member_does_not_block_remaining_work() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_ineligible_qualified_member_does_not_block_remaining_work(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         agent_ids, _ = await _seed_rollout(session, now)
         agent = await session.get(Agent, agent_ids[2])
         assert agent is not None
@@ -906,16 +897,13 @@ async def test_ineligible_qualified_member_does_not_block_remaining_work() -> No
             UUID(member["agent_id"])
             for member in (await rollout_state(session))["members"]
         ] == agent_ids
-    await engine.dispose()
 
 
-async def test_rollout_screened_only_skips_and_releases_source_only_work() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_rollout_screened_only_skips_and_releases_source_only_work(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         agent_ids, rollout = await _seed_rollout(session, now)
         for agent_id in agent_ids:
             agent = await session.get(Agent, agent_id)
@@ -950,7 +938,9 @@ async def test_rollout_screened_only_skips_and_releases_source_only_work() -> No
             bench_version=rollout.desired_version,
             validator_hotkey="validator-b",
             status=TicketStatus.ISSUED,
-            issued_at=now,
+            # Old enough that the validator has had time to advertise the slot;
+            # its heartbeat says it is not, which is genuine idleness.
+            issued_at=now - timedelta(minutes=10),
             deadline=now + timedelta(minutes=90),
             attempt_count=1,
             manual_retry_grants=0,
@@ -992,18 +982,13 @@ async def test_rollout_screened_only_skips_and_releases_source_only_work() -> No
             is None
         )
         assert running.status == TicketStatus.ISSUED
-    await engine.dispose()
 
 
-async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists() -> (
-    None
-):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         agent_ids, rollout = await _seed_rollout(session, now)
         ordinary_id = uuid4()
         session.add(
@@ -1022,7 +1007,9 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists()
             bench_version=2,
             validator_hotkey="validator-a",
             status=TicketStatus.ISSUED,
-            issued_at=now,
+            # Past the reporting grace, so validator-a's empty capacity blob is
+            # evidence the slot really is idle rather than merely starting up.
+            issued_at=now - timedelta(minutes=10),
             deadline=now + timedelta(minutes=90),
             attempt_count=1,
             manual_retry_grants=0,
@@ -1145,7 +1132,65 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists()
             is None
         )
         assert no_target_source_ticket.status == TicketStatus.ISSUED
-    await engine.dispose()
+
+
+async def test_rollout_never_preempts_a_lease_behind_a_frozen_capacity_blob(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The rollout lane carried the looser copy of the revocation. A validator
+    whose heartbeat ingest has stalled must keep its in-flight lease here too --
+    the blob is a cache of the last successful ingest, not a liveness probe."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with session_maker() as session, session.begin():
+        _, rollout = await _seed_rollout(session, now)
+        ordinary_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=ordinary_id,
+                miner_hotkey="ordinary-miner",
+                name="ordinary-v2-work",
+                sha256="ab" * 32,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=9,
+                created_at=now + timedelta(minutes=1),
+            )
+        )
+        live_source_ticket = ValidatorTicket(
+            agent_id=ordinary_id,
+            bench_version=2,
+            validator_hotkey="validator-a",
+            status=TicketStatus.ISSUED,
+            issued_at=now - timedelta(minutes=19),
+            deadline=now + timedelta(minutes=71),
+            attempt_count=1,
+            manual_retry_grants=0,
+        )
+        session.add(live_source_ticket)
+        heartbeat = await session.get(ValidatorHeartbeat, "validator-a")
+        assert heartbeat is not None
+        # Four minutes without a successful ingest: still inside the five-minute
+        # window every other gate uses, so the validator is served work as
+        # normal, but far too old to prove a slot is empty. This is the window
+        # the destroyed v7 runs died in.
+        heartbeat.seen_at = now - timedelta(minutes=4)
+        await session.flush()
+
+        assert (
+            await issue_rollout_ticket(
+                session,
+                validator_hotkey="validator-a",
+                now=now,
+                ttl=timedelta(minutes=90),
+            )
+            is None
+        )
+        assert live_source_ticket.status == TicketStatus.ISSUED
+        assert live_source_ticket.deadline.replace(tzinfo=UTC) == now + timedelta(
+            minutes=71
+        )
+        assert (
+            await session.scalar(select(func.count()).select_from(ValidatorLeaseAudit))
+        ) == 0
 
 
 @pytest.mark.parametrize(
@@ -1153,14 +1198,11 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists()
     [TicketPurpose.CONTINUAL_RETEST, TicketPurpose.LEGACY_UNCLASSIFIED],
 )
 async def test_rollout_does_not_serve_or_preempt_noncanonical_lease(
+    session_maker: async_sessionmaker[AsyncSession],
     purpose: TicketPurpose,
 ) -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         _, rollout = await _seed_rollout(session, now)
         ordinary_id = uuid4()
         session.add(
@@ -1197,17 +1239,14 @@ async def test_rollout_does_not_serve_or_preempt_noncanonical_lease(
         assert issued is None
         assert lease.status == TicketStatus.ISSUED
         assert lease.bench_version != rollout.desired_version
-    await engine.dispose()
 
 
-async def test_v3_score_drop_qualifies_and_rescreens_new_top_five_agent() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_v3_score_drop_qualifies_and_rescreens_new_top_five_agent(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
     rising_id = uuid4()
-    async with maker() as session:
+    async with session_maker() as session:
         async with session.begin():
             initial_ids, rollout = await _seed_rollout(session, now)
             session.add(
@@ -1285,19 +1324,14 @@ async def test_v3_score_drop_qualifies_and_rescreens_new_top_five_agent() -> Non
             rising = await session.get(Agent, rising_id)
             assert rising is not None
             assert rising.status == AgentStatus.SCORED
-    await engine.dispose()
 
 
-async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently() -> (
-    None
-):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
     rising_id = uuid4()
-    async with maker() as session:
+    async with session_maker() as session:
         async with session.begin():
             initial_ids, rollout = await _seed_rollout(session, now)
             session.add(
@@ -1438,17 +1472,14 @@ async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently()
             assert ticket is not None
             assert ticket.agent_id == rising_id
             assert ticket.bench_version == CANARY_BENCH_VERSION
-    await engine.dispose()
 
 
-async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
     rising_id = uuid4()
-    async with maker() as session:
+    async with session_maker() as session:
         async with session.begin():
             initial_ids, rollout = await _seed_rollout(session, now)
             session.add(
@@ -1599,17 +1630,14 @@ async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards() ->
             assert audit.payload["seed_source"] == "source_scores_canonical_min"
             assert audit.payload["dataset_seed"] == 41
             assert audit.payload["dataset_sha256"] == "e" * 64
-    await engine.dispose()
 
 
-async def test_multiple_legacy_score_seeds_use_canonical_minimum() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_multiple_legacy_score_seeds_use_canonical_minimum(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
     rising_id = uuid4()
-    async with maker() as session:
+    async with session_maker() as session:
         async with session.begin():
             initial_ids, rollout = await _seed_rollout(session, now)
             session.add(
@@ -1693,15 +1721,12 @@ async def test_multiple_legacy_score_seeds_use_canonical_minimum() -> None:
         assert audit.payload["seed_source"] == "source_scores_canonical_min"
         assert audit.payload["dataset_seed"] == 41
         assert audit.payload["dataset_sha256"] == "e" * 64
-    await engine.dispose()
 
 
-async def test_only_one_open_rollout_across_collecting_and_blocked_states() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
-    async with maker() as session:
+async def test_only_one_open_rollout_across_collecting_and_blocked_states(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_maker() as session:
         session.add_all(
             [
                 BenchmarkRollout(
@@ -1723,16 +1748,13 @@ async def test_only_one_open_rollout_across_collecting_and_blocked_states() -> N
         with pytest.raises(IntegrityError):
             await session.flush()
         await session.rollback()
-    await engine.dispose()
 
 
-async def test_capable_validator_cannot_automatically_seed_rollout_work() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_capable_validator_cannot_automatically_seed_rollout_work(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         for position in range(1, 6):
             agent_id = uuid4()
             session.add(
@@ -1840,17 +1862,14 @@ async def test_capable_validator_cannot_automatically_seed_rollout_work() -> Non
         assert audit.payload["actor"] == "backroom:test"
         assert audit.payload["reason"] == "operator opens shipped benchmark"
         assert set(audit.payload["seed_sources"].values()) == {"legacy_pin"}
-    await engine.dispose()
 
 
-async def test_admin_start_is_idempotent_after_unique_transition_activation() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_admin_start_is_idempotent_after_unique_transition_activation(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
     rollout_id = uuid4()
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         session.add(
             BenchmarkRollout(
                 rollout_id=rollout_id,
@@ -1862,7 +1881,7 @@ async def test_admin_start_is_idempotent_after_unique_transition_activation() ->
                 activated_at=now,
             )
         )
-    async with maker() as session:
+    async with session_maker() as session:
         with pytest.raises(HTTPException, match="type .* exactly"):
             await start_rollout(
                 None,
@@ -1907,20 +1926,16 @@ async def test_admin_start_is_idempotent_after_unique_transition_activation() ->
         with pytest.raises(IntegrityError):
             await session.flush()
         await session.rollback()
-    await engine.dispose()
 
 
 @pytest.mark.parametrize("capable_count", [0, 1, 2])
 async def test_rollout_start_requires_one_capable_validator_and_matches_telemetry(
+    session_maker: async_sessionmaker[AsyncSession],
     capable_count: int,
 ) -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC).replace(microsecond=0)
     capabilities, stack = _capabilities(now)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         for index in range(capable_count):
             session.add(
                 ValidatorHeartbeat(
@@ -1955,18 +1970,15 @@ async def test_rollout_start_requires_one_capable_validator_and_matches_telemetr
                 session, now=now, desired_version=CANARY_BENCH_VERSION
             )
             assert guarded["v3_capable_validator_count"] == capable_count
-    await engine.dispose()
 
 
-async def test_v7_rollout_start_requires_route_and_manifest_intersection() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_v7_rollout_start_requires_route_and_manifest_intersection(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
     capabilities, stack = _capabilities(now)
     capabilities["scorer_benchmarks"]["v7_calibration"]["manifest_sha256"] = "d" * 64
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         session.add(
             ValidatorHeartbeat(
                 validator_hotkey="validator-mismatched-manifest",
@@ -1991,7 +2003,6 @@ async def test_v7_rollout_start_requires_route_and_manifest_intersection() -> No
             )
         assert exc_info.value.status_code == 409
         assert "exact route and manifest match" in str(exc_info.value.detail)
-    await engine.dispose()
 
 
 def _heartbeat(
@@ -2034,13 +2045,36 @@ async def test_capability_gate_is_parameterised_per_bench_version() -> None:
     assert not heartbeat_supports_version(legacy_v7, now=now, version=7)
 
 
-async def test_second_rollout_while_one_is_open_raises_conflict_not_integrity() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_capable_validator_counts_agree_with_the_per_version_state(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The batched count is the same answer, from one heartbeat read.
+
+    Target discovery needs this number for every shipped contract. It used to
+    get it by running the full ``rollout_state`` derivation once per contract,
+    so the two must stay identical or the cheap path is a different guarantee.
+    """
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    versions = [2, 3, 4, 5, 6]
+    async with session_maker() as session, session.begin():
+        session.add(_heartbeat("v4-only", now, versions=[2, 4]))
+        session.add(_heartbeat("v3-only", now, versions=[2, 3]))
+        session.add(_heartbeat("also-v4", now, versions=[2, 4]))
+        await session.flush()
+
+        batched = await capable_validator_counts(session, versions=versions, now=now)
+
+        assert batched == {2: 3, 3: 1, 4: 2, 5: 0, 6: 0}
+        for version in versions:
+            state = await rollout_state(session, now=now, capability_version=version)
+            assert batched[version] == state["canary_capable_validator_count"]
+
+
+async def test_second_rollout_while_one_is_open_raises_conflict_not_integrity(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with session_maker() as session, session.begin():
         members, pins = await _seed_members(session, now)
         await create_rollout_snapshot(
             session,
@@ -2060,7 +2094,6 @@ async def test_second_rollout_while_one_is_open_raises_conflict_not_integrity() 
                 desired_version=4,
             )
         assert "only one benchmark rollout may be open" in str(exc_info.value)
-    await engine.dispose()
 
 
 async def _seed_members(
@@ -2099,13 +2132,11 @@ async def _seed_members(
     return members, pins
 
 
-async def test_supersede_frees_the_open_slot_for_the_next_rollout() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_supersede_frees_the_open_slot_for_the_next_rollout(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         members, pins = await _seed_members(session, now)
         stale = await create_rollout_snapshot(
             session,
@@ -2151,16 +2182,13 @@ async def test_supersede_frees_the_open_slot_for_the_next_rollout() -> None:
         assert fresh.desired_version == 4
         assert fresh.status == "collecting"
         await session.flush()
-    await engine.dispose()
 
 
-async def test_superseded_rollout_issues_no_tickets_and_never_activates() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_superseded_rollout_issues_no_tickets_and_never_activates(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         _agent_ids, rollout = await _seed_rollout(session, now)
         assert await supersede_open_rollout(
             session, actor="nick", reason="abandoned", now=now
@@ -2177,16 +2205,13 @@ async def test_superseded_rollout_issues_no_tickets_and_never_activates() -> Non
         assert not await maybe_activate_rollout(session, rollout, now=now)
         assert rollout.status == "superseded"
         assert await active_bench_version(session) == 2
-    await engine.dispose()
 
 
-async def test_supersede_refuses_rollout_after_priority_cohort_owns_authority() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_supersede_refuses_rollout_after_priority_cohort_owns_authority(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
         assert await active_bench_version(session) == CANARY_BENCH_VERSION
 
@@ -2199,16 +2224,13 @@ async def test_supersede_refuses_rollout_after_priority_cohort_owns_authority() 
             )
 
         assert rollout.status == "collecting"
-    await engine.dispose()
 
 
-async def test_operator_can_select_fully_qualified_superseded_authority() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_operator_can_select_fully_qualified_superseded_authority(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
         rollout.status = "superseded"
         await session.flush()
@@ -2235,16 +2257,13 @@ async def test_operator_can_select_fully_qualified_superseded_authority() -> Non
         assert audit is not None
         assert audit.payload["previous_active_version"] == 2
         assert audit.payload["bench_version"] == CANARY_BENCH_VERSION
-    await engine.dispose()
 
 
-async def test_operator_cannot_select_v7_after_proxy_key_rollback() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_operator_cannot_select_v7_after_proxy_key_rollback(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
         rollout.status = "superseded"
         await session.flush()
@@ -2265,16 +2284,13 @@ async def test_operator_cannot_select_v7_after_proxy_key_rollback() -> None:
             )
 
         assert await active_bench_version(session) == 2
-    await engine.dispose()
 
 
-async def test_activated_rollout_cannot_be_superseded() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_activated_rollout_cannot_be_superseded(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         session.add(
             BenchmarkRollout(
                 rollout_id=uuid4(),
@@ -2290,16 +2306,13 @@ async def test_activated_rollout_cannot_be_superseded() -> None:
         with pytest.raises(RolloutConflictError) as exc_info:
             await supersede_open_rollout(session, actor="nick", reason="oops", now=now)
         assert "activated" in str(exc_info.value)
-    await engine.dispose()
 
 
-async def test_admin_supersede_endpoint_audits_and_refuses_activated() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_admin_supersede_endpoint_audits_and_refuses_activated(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session:
+    async with session_maker() as session:
         async with session.begin():
             members, pins = await _seed_members(session, now)
             await create_rollout_snapshot(
@@ -2337,16 +2350,13 @@ async def test_admin_supersede_endpoint_audits_and_refuses_activated() -> None:
                 ),
             )
         assert exc_info.value.status_code == 409
-    await engine.dispose()
 
 
-async def test_admin_start_route_is_parameterised_by_version() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_admin_start_route_is_parameterised_by_version(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session:
+    async with session_maker() as session:
         async with session.begin():
             for index in range(2):
                 session.add(_heartbeat(f"validator-{index}", now, versions=[2, 4]))
@@ -2366,7 +2376,6 @@ async def test_admin_start_route_is_parameterised_by_version() -> None:
         with pytest.raises(HTTPException) as not_found:
             await get_rollout(None, session, "banana")
         assert not_found.value.status_code == 404
-    await engine.dispose()
 
 
 async def _seed_desired_quorum_cohort(
@@ -2411,7 +2420,15 @@ async def _seed_desired_quorum_cohort(
     return agent_ids, rollout
 
 
-async def test_activation_requires_five_ranked_desired_quorum_agents() -> None:
+@pytest.mark.parametrize(
+    ("smoke_indices", "held_indices"),
+    [((0,), ()), ((), (0,))],
+)
+async def test_activation_requires_five_ranked_desired_quorum_agents(
+    session_maker: async_sessionmaker[AsyncSession],
+    smoke_indices: tuple[int, ...],
+    held_indices: tuple[int, ...],
+) -> None:
     # Activation is the last point the full-emission-set guarantee can be
     # enforced: afterwards open_rollout() is None, so list_eligible_ledger reads
     # the desired version unconditionally and its own threshold no longer
@@ -2419,56 +2436,51 @@ async def test_activation_requires_five_ranked_desired_quorum_agents() -> None:
     # its own today (COHORT_SIZE == MIN_DESIRED_AUTHORITY_AGENTS), so these
     # assert the guarantee, not which gate fired; the isolating case is
     # test_activation_refused_when_only_ranked_quorum_count_is_short.
-    for smoke_indices, held_indices in (((0,), ()), ((), (0,))):
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
-        maker = async_sessionmaker(engine, expire_on_commit=False)
-        now = datetime.now(UTC).replace(microsecond=0)
-        async with maker() as session, session.begin():
-            _agent_ids, rollout = await _seed_desired_quorum_cohort(
-                session,
-                now,
-                smoke_indices=smoke_indices,
-                held_indices=held_indices,
-            )
-            # Raw row counts look like a complete cohort quorum.
-            raw_counts = (
-                await session.execute(
-                    select(Score.agent_id, func.count(Score.validator_hotkey))
-                    .where(Score.bench_version == CANARY_BENCH_VERSION)
-                    .group_by(Score.agent_id)
-                )
-            ).all()
-            assert [count for _agent_id, count in raw_counts] == [3] * 5
-            # Ranked, eligible quorums are what actually matter, and are short.
-            assert (
-                await count_ranked_quorum_agents(
-                    session, bench_version=CANARY_BENCH_VERSION
-                )
-                == MIN_DESIRED_AUTHORITY_AGENTS - 1
-            )
-            assert (
-                await maybe_activate_rollout(
-                    session,
-                    rollout,
-                    now=now,
-                    inference_requirements=_activation_requirements(),
-                )
-                is False
-            )
-            assert rollout.status == "collecting"
-            assert await active_bench_version(session) == 2
-        await engine.dispose()
-
-
-async def test_same_coldkey_generations_fill_one_rollout_position() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+    #
+    # Parametrised rather than looped: each case needs a pristine database, which
+    # the loop used to get by building a throwaway in-memory SQLite per iteration.
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
+        _agent_ids, rollout = await _seed_desired_quorum_cohort(
+            session,
+            now,
+            smoke_indices=smoke_indices,
+            held_indices=held_indices,
+        )
+        # Raw row counts look like a complete cohort quorum.
+        raw_counts = (
+            await session.execute(
+                select(Score.agent_id, func.count(Score.validator_hotkey))
+                .where(Score.bench_version == CANARY_BENCH_VERSION)
+                .group_by(Score.agent_id)
+            )
+        ).all()
+        assert [count for _agent_id, count in raw_counts] == [3] * 5
+        # Ranked, eligible quorums are what actually matter, and are short.
+        assert (
+            await count_ranked_quorum_agents(
+                session, bench_version=CANARY_BENCH_VERSION
+            )
+            == MIN_DESIRED_AUTHORITY_AGENTS - 1
+        )
+        assert (
+            await maybe_activate_rollout(
+                session,
+                rollout,
+                now=now,
+                inference_requirements=_activation_requirements(),
+            )
+            is False
+        )
+        assert rollout.status == "collecting"
+        assert await active_bench_version(session) == 2
+
+
+async def test_same_coldkey_generations_fill_one_rollout_position(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with session_maker() as session, session.begin():
         agent_ids, _rollout = await _seed_desired_quorum_cohort(session, now)
         for index, agent_id in enumerate(agent_ids):
             agent = await session.get(Agent, agent_id)
@@ -2498,10 +2510,10 @@ async def test_same_coldkey_generations_fill_one_rollout_position() -> None:
             )
             == MIN_DESIRED_AUTHORITY_AGENTS - 1
         )
-    await engine.dispose()
 
 
 async def test_activation_refused_when_only_ranked_quorum_count_is_short(
+    session_maker: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Isolates the new precondition: every legacy activation check is satisfied
@@ -2509,12 +2521,8 @@ async def test_activation_refused_when_only_ranked_quorum_count_is_short(
     # member) and only the ranked-quorum count is short. Without the
     # precondition this cohort would activate into a four-agent pool and the
     # KOTH tail would go short.
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         agent_ids, rollout = await _seed_desired_quorum_cohort(
             session, now, smoke_indices=(0,)
         )
@@ -2543,19 +2551,16 @@ async def test_activation_refused_when_only_ranked_quorum_count_is_short(
             is False
         )
         assert rollout.status == "collecting"
-    await engine.dispose()
 
 
-async def test_activation_at_five_ranked_quorums_keeps_a_full_emission_set() -> None:
+async def test_activation_at_five_ranked_quorums_keeps_a_full_emission_set(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     # The invariant that actually matters: it holds ACROSS the activation
     # boundary. Before, the ledger is pinned to v2 with five entries; after, it
     # is wholly on v4 and still has five.
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
         assert (
             await count_ranked_quorum_agents(
@@ -2581,7 +2586,6 @@ async def test_activation_at_five_ranked_quorums_keeps_a_full_emission_set() -> 
         assert {row.agent_id for row in ledger} == set(agent_ids)
         assert {row.bench_version for row in ledger} == {CANARY_BENCH_VERSION}
         assert all(row.eligible for row in ledger)
-    await engine.dispose()
 
 
 @pytest.mark.parametrize(
@@ -2604,14 +2608,12 @@ async def test_activation_at_five_ranked_quorums_keeps_a_full_emission_set() -> 
     ids=("proxy-disabled", "provider-key-removed", "manifest-drift", "stale-route"),
 )
 async def test_v7_top_five_authority_requires_live_exact_inference_route(
-    requirements: InferenceActivationRequirements, stale_route: bool
+    session_maker: async_sessionmaker[AsyncSession],
+    requirements: InferenceActivationRequirements,
+    stale_route: bool,
 ) -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC).replace(microsecond=0)
-    async with maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
         if stale_route:
             route = await session.get(
@@ -2634,10 +2636,11 @@ async def test_v7_top_five_authority_requires_live_exact_inference_route(
         )
         assert rollout.status == "collecting"
         assert await persisted_active_bench_version(session) == 2
-    await engine.dispose()
 
 
-async def test_rollout_state_active_version_matches_start_guard_authority() -> None:
+async def test_rollout_state_active_version_matches_start_guard_authority(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
     """rollout_state's active_version must equal active_bench_version.
 
     Regression for the spurious "active benchmark changed: expected v5, found v4"
@@ -2654,11 +2657,7 @@ async def test_rollout_state_active_version_matches_start_guard_authority() -> N
     (superseded, from=5) and the latest activated row (desired=4) disagree; both
     reports must nonetheless agree with each other.
     """
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
-    async with maker() as session:
+    async with session_maker() as session:
         base = datetime(2026, 7, 1, tzinfo=UTC)
         # Older transition, activated: this is what the weight-setting guard treats
         # as authoritative (latest activated desired_version == 4).
@@ -2693,4 +2692,151 @@ async def test_rollout_state_active_version_matches_start_guard_authority() -> N
         # The invariant the fix guarantees: the value the UI echoes back as
         # expected_active_version is exactly what the start guard checks.
         assert state["active_version"] == guard
-    await engine.dispose()
+
+
+async def _seed_eligible_v2_era(session, now: datetime, *, count: int) -> None:
+    """``count`` distinctly-owned v2 agents any rollout could inherit."""
+    for position in range(1, count + 1):
+        agent_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=agent_id,
+                miner_hotkey=f"miner-cohort-{position}",
+                name=f"cohort-{position}",
+                sha256=f"{position:064x}",
+                status=AgentStatus.SCORED,
+                screening_policy_version=9,
+                screened_image_sha256=f"{position:064x}",
+                screened_image_size_bytes=1024,
+                screened_image_id=f"sha256:{position:064x}",
+                screened_image_ref=f"ditto-screen/{agent_id}:latest",
+                screened_image_upload_id=uuid4(),
+                screened_image_verified_at=now,
+                dataset_seed=position,
+                dataset_sha256="c" * 64,
+                dataset_run_size="full",
+                created_at=now + timedelta(seconds=position),
+            )
+        )
+        for validator in range(3):
+            session.add(
+                Score(
+                    agent_id=agent_id,
+                    bench_version=2,
+                    validator_hotkey=f"legacy-{validator}",
+                    run_id=f"cohort-v2-{position}-{validator}",
+                    signature="aa",
+                    seed=position,
+                    composite=1 - position / 1000,
+                    tool_mean=0.5,
+                    memory_mean=0.5,
+                    median_ms=1,
+                    n=114,
+                    details={"bench_version": 2},
+                    generated_at=now,
+                )
+            )
+    capabilities, stack = _capabilities(now)
+    session.add(
+        ValidatorHeartbeat(
+            validator_hotkey="validator-cohort",
+            software_version="1.0.0",
+            protocol_version=12,
+            code_digest="d" * 64,
+            state="polling",
+            first_seen_at=now,
+            reported_at=now,
+            seen_at=now,
+            signature="ab" * 64,
+            capabilities=capabilities,
+            stack=stack,
+        )
+    )
+    _add_ready_v7_route(session, now)
+
+
+async def _start_for_cohort_size(
+    session_maker: async_sessionmaker[AsyncSession], configured: int | None
+) -> dict:
+    """Start a rollout with 12 eligible inherited agents under a given policy."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with session_maker() as session, session.begin():
+        await _seed_eligible_v2_era(session, now, count=12)
+        if configured is not None:
+            await insert_queue_policy_settings_revision(
+                session,
+                parent_revision=0,
+                scope="*",
+                settings={"rescore_cohort_size": configured},
+                checksum="b" * 64,
+                reason="the subnet is scaling; widen the rescore cohort",
+                actor="peyton@omniaura.ai",
+            )
+    generator = AsyncMock()
+    generator.generate.return_value = "e" * 64
+    async with session_maker() as session:
+        state = await start_rollout(
+            None,
+            session,
+            generator,
+            str(CANARY_BENCH_VERSION),
+            AdminRolloutStartRequest(
+                reason="operator opens shipped benchmark",
+                actor="backroom:test",
+                confirmation=f"START BENCHMARK V{CANARY_BENCH_VERSION}",
+                expected_active_version=2,
+            ),
+        )
+        await session.rollback()
+        async with session.begin():
+            rollout = await open_rollout(session)
+            assert rollout is not None
+            audit = await session.scalar(
+                select(BenchmarkRolloutAudit).where(
+                    BenchmarkRolloutAudit.rollout_id == rollout.rollout_id,
+                    BenchmarkRolloutAudit.event == "cohort_frozen",
+                )
+            )
+            assert audit is not None
+            result = {
+                "state": state,
+                "target": rollout.rescore_cohort_target,
+                "cohort_size": rollout.cohort_size,
+                "audit_target": audit.payload["rescore_cohort_target"],
+            }
+    return result
+
+
+async def test_rollout_start_defaults_to_the_inherited_top_ten(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    result = await _start_for_cohort_size(session_maker, None)
+    assert result["target"] == 10
+    assert result["cohort_size"] == 10
+    assert result["audit_target"] == 10
+    assert result["state"]["rescore_cohort_target"] == 10
+    assert result["state"]["max_rescore_cohort_size"] == 25
+    assert len(result["state"]["members"]) == 10
+
+
+async def test_rollout_start_freezes_the_configured_cohort_size(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The operator's 10 -> 25 change lands on the next start and is recorded."""
+    result = await _start_for_cohort_size(session_maker, 25)
+    assert result["target"] == 25
+    # Only twelve inherited agents are eligible, so the cohort is what the two
+    # prior eras could supply -- the target is the ceiling, not a quota.
+    assert result["cohort_size"] == 12
+    assert result["audit_target"] == 25
+    assert result["state"]["rescore_cohort_target"] == 25
+    assert len(result["state"]["members"]) == 12
+
+
+async def test_rollout_start_honors_a_narrowed_cohort_size(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    result = await _start_for_cohort_size(session_maker, 5)
+    assert result["target"] == 5
+    assert result["cohort_size"] == 5
+    assert len(result["state"]["members"]) == 5

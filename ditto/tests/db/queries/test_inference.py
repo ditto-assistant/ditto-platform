@@ -10,11 +10,13 @@ from ditto.api_server.config import InferenceProxyConfig
 from ditto.db.models import (
     Agent,
     AgentStatus,
+    InferenceGrant,
     InferenceProviderRoute,
     InferenceRoutingPolicy,
     ValidatorTicket,
 )
 from ditto.db.queries.inference import (
+    InferenceDecline,
     activate_inference_grant,
     begin_inference_request,
     ensure_inference_grant,
@@ -198,7 +200,7 @@ async def test_v7_grant_requires_and_binds_one_calibrated_dynamic_route(
         assert activated is not None
         bearer = activated[1]
         nonce = uuid4()
-        assert await begin_inference_request(
+        started = await begin_inference_request(
             session,
             grant_id=grant.grant_id,
             nonce=nonce,
@@ -209,6 +211,8 @@ async def test_v7_grant_requires_and_binds_one_calibrated_dynamic_route(
             config=config,
             request_kind="embedding",
         )
+        assert isinstance(started, tuple)
+        request = started[1]
         assert await finish_inference_request(
             session,
             grant_id=grant.grant_id,
@@ -221,12 +225,14 @@ async def test_v7_grant_requires_and_binds_one_calibrated_dynamic_route(
             usage_available=True,
             now=now,
             upstream_provider=config.embedding_provider,
+            upstream_attempts=3,
         )
         assert grant.embedding_request_count == 1
         assert grant.embedding_tokens == 250_000
         assert grant.embedding_cost_microusd == 1_000
         assert grant.request_count == 0
         assert grant.prompt_tokens == 0
+        assert request.upstream_attempts == 3
 
 
 @pytest.mark.asyncio
@@ -431,6 +437,238 @@ async def test_ticket_request_rate_is_bounded_after_requests_finish(
             cost_microusd=0,
             usage_available=True,
             now=now,
+        )
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=10,
+                now=now,
+                config=config,
+            )
+            is None
+        )
+
+
+async def _live_v7_embedding_grant(session: AsyncSession, config: InferenceProxyConfig):
+    """A live v7 grant whose embedding lane is admissible.
+
+    The grant row is written directly rather than through
+    ``ensure_inference_grant``, which for v7 additionally requires a calibrated
+    ``InferenceProviderRoute``. The classifier under test never reads the route
+    -- it reads the ticket's liveness and the lane's counters -- so that fixture
+    would be setup no assertion here depends on.
+    """
+    now = datetime.now(UTC)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="miner-embedding",
+        name="embedding-lane",
+        sha256="ef" * 32,
+        status=AgentStatus.EVALUATING,
+        created_at=now,
+    )
+    ticket = ValidatorTicket(
+        agent_id=agent.agent_id,
+        validator_hotkey="validator-embedding",
+        slot_id="slot-0",
+        status=TicketStatus.ISSUED,
+        issued_at=now,
+        deadline=now + timedelta(minutes=20),
+        bench_version=7,
+        attempt_count=1,
+    )
+    session.add_all([agent, ticket])
+    await session.flush()
+    grant = InferenceGrant(
+        grant_id=uuid4(),
+        agent_id=agent.agent_id,
+        bench_version=7,
+        validator_hotkey=ticket.validator_hotkey,
+        slot_id=ticket.slot_id,
+        ticket_deadline=ticket.deadline,
+        status="pending",
+        bearer_digest=None,
+        broker_public_key=None,
+        generation=0,
+        allowed_models=["qwen/qwen3-32b"],
+        route_provider="test-provider",
+        route_profile="openrouter-route-test-v1",
+        request_budget=config.request_budget,
+        token_budget=config.token_budget,
+        embedding_model=config.embedding_model,
+        embedding_profile=config.embedding_profile,
+        embedding_provider=config.embedding_provider,
+        embedding_dimensions=config.embedding_dimensions,
+        embedding_request_budget=config.embedding_request_budget,
+        embedding_token_budget=config.embedding_token_budget,
+        embedding_request_count=0,
+        embedding_tokens=0,
+        embedding_cost_microusd=0,
+        embedding_active_requests=0,
+        request_count=0,
+        prompt_tokens=0,
+        completion_tokens=0,
+        cost_microusd=0,
+        active_requests=0,
+        expires_at=ticket.deadline,
+    )
+    session.add(grant)
+    await session.flush()
+    activated = await activate_inference_grant(
+        session,
+        grant_id=grant.grant_id,
+        validator_hotkey=ticket.validator_hotkey,
+        broker_public_key="broker-key",
+        now=now,
+        config=config,
+    )
+    assert activated is not None
+    return ticket, activated[0], activated[1], now
+
+
+@pytest.mark.asyncio
+async def test_full_embedding_lane_is_backpressure_not_a_lost_lease(
+    session: AsyncSession,
+) -> None:
+    """A saturated lane and a revoked lease must not look alike.
+
+    Both used to return ``None`` and both became a ``429``, which dittobench-api
+    reads as "the platform took my ticket away" and answers by discarding the
+    whole run. That was survivable only while the limit was a constant nobody
+    could move. Now that an operator can lower it from backroom under a live
+    run, the two cases have to be told apart or the emergency brake destroys
+    every run it touches.
+    """
+    config = replace(_config(), embedding_per_ticket_concurrency=1)
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_v7_embedding_grant(session, config)
+        first = await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=uuid4(),
+            bearer=bearer,
+            model=config.embedding_model,
+            token_reservation=10,
+            now=now,
+            config=config,
+            request_kind="embedding",
+        )
+        assert isinstance(first, tuple)
+
+        # Second concurrent embedding: the lane is full, the lease is healthy.
+        second = await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=uuid4(),
+            bearer=bearer,
+            model=config.embedding_model,
+            token_reservation=10,
+            now=now,
+            config=config,
+            request_kind="embedding",
+        )
+        assert second is InferenceDecline.AT_CAPACITY
+
+
+@pytest.mark.asyncio
+async def test_revoked_lease_still_fails_closed_on_the_embedding_lane(
+    session: AsyncSession,
+) -> None:
+    """The fail-closed class is untouched: a dead ticket still returns ``None``."""
+    config = replace(_config(), embedding_per_ticket_concurrency=8)
+    async with session.begin():
+        ticket, grant, bearer, now = await _live_v7_embedding_grant(session, config)
+        ticket.status = TicketStatus.EXPIRED
+        await session.flush()
+        declined = await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=uuid4(),
+            bearer=bearer,
+            model=config.embedding_model,
+            token_reservation=10,
+            now=now,
+            config=config,
+            request_kind="embedding",
+        )
+        assert declined is None
+
+
+@pytest.mark.asyncio
+async def test_raised_per_ticket_limit_actually_admits_concurrent_embeddings(
+    session: AsyncSession,
+) -> None:
+    """The point of the whole change, asserted end to end on the admission path.
+
+    Embeddings are ~63% of a v7 run's inference requests and were admitted one
+    at a time. This is the assertion that the limit is what was serialising
+    them, and that raising it is not a no-op.
+    """
+    config = replace(_config(), embedding_per_ticket_concurrency=8)
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_v7_embedding_grant(session, config)
+        admitted = 0
+        for _ in range(8):
+            reserved = await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model=config.embedding_model,
+                token_reservation=10,
+                now=now,
+                config=config,
+                request_kind="embedding",
+            )
+            if isinstance(reserved, tuple):
+                admitted += 1
+        assert admitted == 8
+        assert grant.embedding_active_requests == 8
+
+        # And the ceiling still holds at the ninth.
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model=config.embedding_model,
+                token_reservation=10,
+                now=now,
+                config=config,
+                request_kind="embedding",
+            )
+            is InferenceDecline.AT_CAPACITY
+        )
+
+
+@pytest.mark.asyncio
+async def test_chat_capacity_refusal_is_unchanged(session: AsyncSession) -> None:
+    """Chat keeps its historical ``None``/429.
+
+    Its limits are boot-time constants that cannot move under a live ticket, so
+    a chat capacity refusal is not a new hazard and its wire behaviour is left
+    exactly as the v7 rollout is currently observing it.
+    """
+    config = replace(_config(), per_ticket_concurrency=1)
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_grant(session)
+        assert isinstance(
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=10,
+                now=now,
+                config=config,
+            ),
+            tuple,
         )
         assert (
             await begin_inference_request(

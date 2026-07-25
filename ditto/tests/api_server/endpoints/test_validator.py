@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, call
 from uuid import UUID, uuid4
 
@@ -22,12 +23,10 @@ import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_models.agent_status import AgentStatus
@@ -38,6 +37,10 @@ from ditto.api_models.benchmark_capacity import (
 from ditto.api_models.benchmark_progress import (
     BenchmarkProgress,
     benchmark_progress_signing_token,
+)
+from ditto.api_models.queue_policy_settings import (
+    PrevGenCarryoverSettings,
+    QueuePolicySettings,
 )
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.stack_health import (
@@ -69,6 +72,7 @@ from ditto.api_server.endpoints.validator import (
     _heartbeat_signing_message,
     _issue_source_backfill_ticket,
 )
+from ditto.api_server.fingerprint import reference_corpus_provenance
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_AGENT_NOT_EVALUATABLE,
     ERROR_CODE_AGENT_NOT_FOUND,
@@ -79,14 +83,20 @@ from ditto.chain.models import NeuronInfo
 from ditto.db.models import (
     Agent,
     AthReview,
-    Base,
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
+    ConfirmationScore,
+    ContinualRetestSettingsRevision,
     Score,
     ScreenerHeartbeat,
     ValidatorHeartbeat,
+    ValidatorLeaseAudit,
     ValidatorTicket,
+)
+from ditto.db.queries.confirmation_scores import (
+    ConfirmationSeedScore,
+    append_confirmation_scores,
 )
 from ditto.db.queries.tickets import MAX_INFRA_RETRY_GRANTS
 
@@ -602,6 +612,11 @@ def _progress(
     }
 
 
+def _as_utc(value: datetime) -> datetime:
+    """The SQLite unit-test fallback hands back naive datetimes; compare in UTC."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 async def _score_to_quorum(
     client: httpx.AsyncClient,
     agent_id: UUID,
@@ -633,29 +648,6 @@ async def _score_to_quorum(
 
 
 # --- DB + dependency wiring ------------------------------------------------
-
-
-@pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield eng
-    finally:
-        await eng.dispose()
-
-
-@pytest.fixture
-def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 def _install_db(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
@@ -800,6 +792,7 @@ async def _seed_validator_heartbeat(
     capabilities: dict[str, object] | None = None,
     stack: dict[str, object] | None = None,
     state: str = "polling",
+    benchmark_capacity: dict[str, object] | None = None,
 ) -> None:
     now = seen_at or datetime.now(UTC)
     async with maker() as s, s.begin():
@@ -818,6 +811,7 @@ async def _seed_validator_heartbeat(
                 benchmark_progress_agent_id=None,
                 capabilities=capabilities,
                 stack=stack,
+                benchmark_capacity=benchmark_capacity,
                 reported_at=now,
                 seen_at=now,
                 signature="ab" * 64,
@@ -923,6 +917,13 @@ _V9_STACK_HEALTH: dict[str, object] = {
         "observed_at": 1_784_017_200,
     },
 }
+
+
+def _quorum_capabilities() -> dict[str, object]:
+    """A fresh, mutable v12+ capability set (signed score quorum is required)."""
+    capabilities = json.loads(json.dumps(_V9_CAPABILITIES))
+    capabilities["signed_score_quorum"] = True
+    return dict(capabilities)
 
 
 def _screener_heartbeat_payload(
@@ -1161,6 +1162,111 @@ class TestHeartbeat:
         ]
         assert public["active_benchmark"] == public["active_benchmarks"][0]
 
+    async def test_capacity_validation_failure_still_advances_liveness(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A broken capacity payload must not make a live validator look dead.
+
+        Liveness (``seen_at`` / ``reported_at``) is proven by the signature alone.
+        When payload validation blows up — here a ``KeyError`` from a stage
+        missing from ``_STAGE_ORDER``, the exact shape of #430, which no
+        ``except HeartbeatProgressRegressionError`` catches — the ingest must
+        keep the liveness write and drop only the work payload. Rolling both back
+        is what froze the capacity blob that a lease revocation then acted on,
+        destroying three healthy v7 runs (#437).
+        """
+        agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent, slot_id="slot-0")
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        def _capacity(progress: dict[str, object]) -> dict[str, object]:
+            return {
+                "configured_slots": 1,
+                "healthy_slots": ["slot-0"],
+                "admission": "accepting",
+                "active": [
+                    {
+                        "slot_id": "slot-0",
+                        "agent_id": str(agent),
+                        "bench_version": 2,
+                        "progress": progress,
+                    }
+                ],
+            }
+
+        base_ts = int(datetime.now(UTC).timestamp()) - 10
+        first_progress = _progress("running_benchmark", completed=3, total=10)
+        first = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                timestamp=base_ts,
+                protocol_version=10,
+                state="running_benchmark",
+                active_agent_id=agent,
+                benchmark_progress=first_progress,
+                capabilities=_V9_CAPABILITIES,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=_capacity(first_progress),
+            ),
+        )
+        assert first.status_code == 200, first.text
+        async with session_maker() as s:
+            stored = await s.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert stored is not None
+            assert stored.benchmark_capacity is not None
+            before_seen_at = _as_utc(stored.seen_at)
+            before_reported_at = _as_utc(stored.reported_at)
+
+        # The next heartbeat carries a slot the loop compares against the stored
+        # one, so the patched validator is reached while the row locks are held.
+        def _boom(*_args: object) -> None:
+            raise KeyError("generating_dataset")
+
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator._validate_same_lease_progress", _boom
+        )
+
+        second_progress = _progress("running_benchmark", completed=6, total=10)
+        second = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                timestamp=base_ts + 5,
+                protocol_version=10,
+                state="running_benchmark",
+                active_agent_id=agent,
+                benchmark_progress=second_progress,
+                capabilities=_V9_CAPABILITIES,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=_capacity(second_progress),
+            ),
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["accepted"] is True
+
+        async with session_maker() as s:
+            stored = await s.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert stored is not None
+            # Liveness advanced: this validator does not read as heartbeat_stale.
+            assert _as_utc(stored.seen_at) > before_seen_at
+            assert _as_utc(stored.reported_at) > before_reported_at
+            assert _as_utc(stored.reported_at) == datetime.fromtimestamp(
+                base_ts + 5, tz=UTC
+            )
+            # The payload — and only the payload — was dropped. A NULL capacity
+            # makes the next `/job` claim fail closed (428) instead of letting a
+            # revocation act on a frozen blob.
+            assert stored.benchmark_capacity is None
+            assert stored.active_agent_id is None
+
     async def test_v10_accepts_v7_scorer_advertisement_without_v11_calibration(
         self,
         app: FastAPI,
@@ -1229,6 +1335,166 @@ class TestHeartbeat:
             ),
         )
         assert accepted_v11.status_code == 200, accepted_v11.text
+
+    async def test_v15_publishes_the_evidence_behind_the_scorer_status(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The TAO.com sidecar, end to end.
+
+        Its ``/v1/capabilities`` route 404d, so the validator reported
+        ``legacy_v2`` with every identity field null -- byte-identical to a real
+        pre-capabilities scorer. The fleet view read ``warning`` beside
+        ``accepting`` while the validator took leases it could never finish.
+        With the probe the same heartbeat is publicly ``critical`` and says why.
+        """
+        _install_db(app, session_maker)
+        _install_chain(app)
+        capabilities = _quorum_capabilities()
+        capabilities["scorer_benchmarks"] = {
+            "status": "legacy_v2",
+            "supported_bench_versions": [2],
+            "probe": {
+                "outcome": "http_error",
+                "observed_at": 1_784_020_800,
+                "http_status": 404,
+                "consecutive_failures": 97,
+            },
+        }
+        capacity = {
+            "configured_slots": 1,
+            "healthy_slots": ["slot-0"],
+            "admission": "accepting",
+            "active": [],
+        }
+
+        accepted = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=15,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert accepted.status_code == 200, accepted.text
+
+        public = (await client.get("/api/v1/public/validators")).json()["validators"][0]
+        assert public["scorer_liveness"] == "not_serving"
+        assert public["health"] == "critical"
+        assert "scorer not serving: http 404 (97 in a row)" in public["health_reasons"]
+        probe = public["capabilities"]["scorer_benchmarks"]["probe"]
+        assert probe["outcome"] == "http_error"
+        assert probe["http_status"] == 404
+        assert probe.get("last_served_at") is None
+        # Admission semantics are deliberately untouched by this change: the
+        # validator is now visibly broken, and whether it should stop accepting
+        # work is a separate fleet-wide policy decision.
+        assert public["admission"] == "accepting"
+
+    async def test_probe_evidence_requires_protocol_v15(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A validator cannot claim an old protocol and send a new field.
+
+        The signed envelope and the declared protocol have to agree, or the
+        platform cannot reason about what a given protocol number guarantees.
+        """
+        _install_db(app, session_maker)
+        _install_chain(app)
+        capabilities = _quorum_capabilities()
+        scorer = cast(dict[str, object], capabilities["scorer_benchmarks"])
+        scorer["probe"] = {
+            "outcome": "served",
+            "observed_at": 1_784_020_800,
+            "http_status": 200,
+            "last_served_at": 1_784_020_800,
+        }
+        capacity = {
+            "configured_slots": 1,
+            "healthy_slots": ["slot-0"],
+            "admission": "accepting",
+            "active": [],
+        }
+
+        rejected = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=14,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert rejected.status_code == 422, rejected.text
+
+        accepted = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=15,
+                capabilities=capabilities,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert accepted.status_code == 200, accepted.text
+
+    async def test_a_v14_validator_keeps_working_against_a_v15_platform(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Old validators must be unaffected while the fleet rolls forward.
+
+        Nothing about their signing bytes changed, so the only observable
+        difference is that they read ``unreported`` rather than claiming a
+        liveness they never measured.
+        """
+        _install_db(app, session_maker)
+        _install_chain(app)
+        capacity = {
+            "configured_slots": 1,
+            "healthy_slots": ["slot-0"],
+            "admission": "accepting",
+            "active": [],
+        }
+
+        accepted = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=14,
+                capabilities=_quorum_capabilities(),
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert accepted.status_code == 200, accepted.text
+
+        public = (await client.get("/api/v1/public/validators")).json()["validators"][0]
+        assert public["scorer_liveness"] == "unreported"
+        assert public["health"] != "critical"
+        assert public["capabilities"]["scorer_benchmarks"]["probe"] is None
+        # No scorer-liveness reason is invented for software that cannot report
+        # one; the reasons it does carry are the pre-existing stack findings.
+        assert not [
+            reason
+            for reason in public["health_reasons"]
+            if reason.startswith("scorer ")
+        ]
 
     async def test_malformed_stored_stack_health_is_omitted_publicly(
         self,
@@ -1499,6 +1765,35 @@ class TestHeartbeat:
         assert rollout_snapshot["desired_bench_version"] == 3
         assert rollout_snapshot["benchmark_rollout_status"] == "collecting"
 
+    async def test_operations_snapshot_keeps_live_work_and_bounds_history(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        active_id = await _seed_agent(
+            session_maker, status=AgentStatus.SCREENING, name="active-agent"
+        )
+        for index in range(51):
+            await _seed_agent(
+                session_maker,
+                status=AgentStatus.SCORED,
+                name=f"scored-agent-{index}",
+                created_at=datetime(2026, 7, 24, 12, index, tzinfo=UTC),
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/operations")
+
+        assert response.status_code == 200
+        activity = response.json()["activity"]
+        assert activity["total"] == 52
+        assert activity["count"] == 51
+        assert activity["status_counts"]["screening"] == 1
+        assert activity["status_counts"]["scored"] == 51
+        assert sum(entry["status"] == "scored" for entry in activity["entries"]) == 50
+        assert any(entry["agent_id"] == str(active_id) for entry in activity["entries"])
+
     async def test_operations_snapshot_surfaces_different_reported_agent(
         self,
         app: FastAPI,
@@ -1651,11 +1946,20 @@ class TestHeartbeat:
                     "stage": "running_benchmark",
                     "completed_checks": 51,
                     "total_checks": 114,
-                    "percent": 45,
+                    "percent": 44,
                     "stalled": False,
+                    # ``slot_id`` joined the public payload in 9e81a3f
+                    # (2026-07-22, bounded validator capacity); see
+                    # ``api_models/public.py`` where it defaults to
+                    # "slot-0". This exhaustive comparison was never
+                    # updated and the test has been red on BOTH dialects
+                    # since -- invisible because it is ``e2e``-marked and
+                    # pytest addopts deselected ``e2e``.
+                    "slot_id": "slot-0",
                 }
             if progress["stage"] in {"finalizing", "submitting_result"}:
-                assert shown["percent"] == 95
+                # Only a terminal stage may report a full bar.
+                assert shown["percent"] == 100
                 assert shown["completed_checks"] == shown["total_checks"] == 114
 
         pipeline = (
@@ -2404,6 +2708,7 @@ class TestArtifact:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, bench_version=3)
         _install_db(app, session_maker)
         _install_chain(app)
         storage = _install_storage(app)
@@ -2419,6 +2724,7 @@ class TestArtifact:
         assert body["download_url"].startswith("https://")
         assert body["screened_image_url"] is None
         assert body["screened_image_sha256"] is None
+        assert body["bench_version"] == 3
         storage.presigned_get_url.assert_awaited_once()
         assert (
             storage.presigned_get_url.await_args.kwargs["key"]
@@ -2432,6 +2738,7 @@ class TestArtifact:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, bench_version=3)
         upload_id = uuid4()
         async with session_maker() as session, session.begin():
             agent = await session.get(Agent, agent_id)
@@ -2458,9 +2765,72 @@ class TestArtifact:
         assert body["screened_image_size_bytes"] == 123
         assert body["screened_image_id"] == "sha256:" + "34" * 32
         assert body["screened_image_ref"] == f"ditto-screen/{agent_id}:latest"
+        assert body["bench_version"] == 3
         assert storage.presigned_get_url.await_args_list[1].kwargs["key"] == (
             f"{agent_id}/screened-images/{upload_id}.tar"
         )
+
+    async def test_without_open_ticket_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
+        )
+        assert response.status_code == 409
+        assert "no open scoring ticket" in response.json()["message"]
+        storage.presigned_get_url.assert_not_awaited()
+
+    async def test_expired_ticket_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(
+            session_maker,
+            agent_id,
+            deadline=datetime.now(UTC) - timedelta(seconds=1),
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
+        )
+        assert response.status_code == 409
+        storage.presigned_get_url.assert_not_awaited()
+
+    async def test_ticket_for_other_validator_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        other = bittensor.Keypair.create_from_uri("//Dave")
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, keypair=other)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
+        )
+        assert response.status_code == 409
+        storage.presigned_get_url.assert_not_awaited()
 
     async def test_unknown_agent_returns_404(
         self,
@@ -2488,6 +2858,7 @@ class TestArtifact:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
         _install_db(app, session_maker)
         _install_chain(app)
         _install_storage(app)
@@ -2505,6 +2876,7 @@ class TestArtifact:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
         _install_db(app, session_maker)
         _install_chain(app)
         _install_storage(app)
@@ -2525,6 +2897,110 @@ class TestArtifact:
 
 
 class TestRequestJob:
+    async def test_source_backfill_declines_while_the_new_era_has_work(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Retired-era work is strictly last, fleet-wide -- not per validator.
+
+        Reaching this helper only means the polling validator's own new-era
+        lanes came back empty, which happens constantly while the queue is deep.
+        Leasing a v6 artifact on that evidence takes a slot away from a v7 queue
+        the validator simply could not see.
+        """
+        now = datetime.now(UTC)
+        rollout = MagicMock(
+            rollout_id=uuid4(), from_version=6, desired_version=7, cohort_size=10
+        )
+        session = AsyncMock()
+        session.get_bind = MagicMock(
+            return_value=MagicMock(dialect=MagicMock(name="sqlite"))
+        )
+        # No live lease on this slot, so the helper reaches new admission.
+        session.scalar = AsyncMock(return_value=None)
+        issue = AsyncMock(return_value=MagicMock())
+        outstanding = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.heartbeat_supports_version",
+            MagicMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.rollout_cohort_complete",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr("ditto.api_server.endpoints.validator.issue_ticket", issue)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.desired_era_work_outstanding",
+            outstanding,
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator._desired_era_capable_hotkeys",
+            AsyncMock(return_value={"validator-a"}),
+        )
+
+        blocked = await _issue_source_backfill_ticket(
+            session,
+            rollout=rollout,
+            heartbeat=MagicMock(),
+            validator_hotkey="validator-a",
+            now=now,
+            artifact_mode="screened_only",
+            validator_running_benchmark=False,
+            slot_id="slot-1",
+            carryover_settings=PrevGenCarryoverSettings(enabled=True),
+        )
+
+        assert blocked is None
+        issue.assert_not_awaited()
+        outstanding.assert_awaited()
+
+    async def test_source_backfill_resumes_a_live_lease_despite_the_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate guards new admission, never a benchmark already running.
+
+        Declining to resume would strand the lease until it expired and burn a
+        retry attempt for a submission that did nothing wrong.
+        """
+        now = datetime.now(UTC)
+        rollout = MagicMock(
+            rollout_id=uuid4(), from_version=6, desired_version=7, cohort_size=10
+        )
+        session = AsyncMock()
+        session.get_bind = MagicMock(
+            return_value=MagicMock(dialect=MagicMock(name="sqlite"))
+        )
+        issued = MagicMock()
+        issue = AsyncMock(return_value=issued)
+        outstanding = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.heartbeat_supports_version",
+            MagicMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.rollout_cohort_complete",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr("ditto.api_server.endpoints.validator.issue_ticket", issue)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.desired_era_work_outstanding",
+            outstanding,
+        )
+
+        ticket = await _issue_source_backfill_ticket(
+            session,
+            rollout=rollout,
+            heartbeat=MagicMock(),
+            validator_hotkey="validator-a",
+            now=now,
+            artifact_mode="screened_only",
+            validator_running_benchmark=True,
+            slot_id="slot-1",
+            carryover_settings=PrevGenCarryoverSettings(enabled=True),
+        )
+
+        assert ticket is issued
+        outstanding.assert_not_awaited()
+
     async def test_source_backfill_waits_for_top_ten_then_reuses_v6_allocator(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2591,7 +3067,13 @@ class TestRequestJob:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         now = datetime.now(UTC)
-        cohort = (await _seed_top5_emission_set(session_maker, bench_version=7))[:5]
+        cohort = (
+            await _seed_top5_emission_set(
+                session_maker,
+                bench_version=7,
+                seed_heartbeats=False,
+            )
+        )[:5]
         source_agent = await _seed_agent(
             session_maker,
             status=AgentStatus.EVALUATING,
@@ -2843,6 +3325,7 @@ class TestRequestJob:
                 validator_hotkey=validator_hotkey,
                 bench_version=3,
                 rollout_started_at=started_at,
+                settings=QueuePolicySettings(),
             )
             for completed in range(1, 4):
                 agent_id = uuid4()
@@ -2875,6 +3358,7 @@ class TestRequestJob:
                     validator_hotkey=validator_hotkey,
                     bench_version=3,
                     rollout_started_at=started_at,
+                    settings=QueuePolicySettings(),
                 )
                 assert due is (completed != 2)
 
@@ -3284,7 +3768,9 @@ class TestRequestJob:
                     bench_version=2,
                     validator_hotkey=_VALIDATOR_HOTKEY,
                     status=TicketStatus.ISSUED,
-                    issued_at=now,
+                    # Old enough that a heartbeat reporting no work is evidence
+                    # of idleness rather than a run still starting up.
+                    issued_at=now - timedelta(minutes=10),
                     deadline=now + timedelta(minutes=90),
                     attempt_count=1,
                     manual_retry_grants=0,
@@ -3304,6 +3790,65 @@ class TestRequestJob:
             )
             assert ticket is not None
             assert ticket.status == expected_status
+
+    async def test_job_claim_does_not_destroy_a_run_behind_a_frozen_capacity_blob(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """End to end over the shape that lost three v7 runs: heartbeat ingest
+        has been failing for four minutes, so the stored capacity blob still
+        shows an empty slot while the benchmark underneath keeps scoring. The
+        next job claim must leave that lease alone."""
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        capabilities = {
+            **_V7_CAPABILITIES,
+            "require_screened_image": True,
+            "source_build_fallback": False,
+        }
+        now = datetime.now(UTC)
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=7,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+            state="polling",
+            seen_at=now - timedelta(minutes=4),
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    bench_version=2,
+                    validator_hotkey=_VALIDATOR_HOTKEY,
+                    status=TicketStatus.ISSUED,
+                    issued_at=now - timedelta(minutes=19),
+                    deadline=now + timedelta(minutes=71),
+                    attempt_count=1,
+                    manual_retry_grants=0,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert response.status_code == 204
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+            )
+            assert ticket is not None
+            assert ticket.status == TicketStatus.ISSUED
+            assert ticket.attempt_count == 1
+            assert (
+                await session.scalar(
+                    select(func.count()).select_from(ValidatorLeaseAudit)
+                )
+            ) == 0
 
     async def test_stale_heartbeat_cannot_claim_work(
         self,
@@ -4526,15 +5071,12 @@ class TestAntiCopyGate:
             assert held.status == AgentStatus.ATH_PENDING_REVIEW
             assert held.duplicate_of == incumbent
             assert "sha256" in (held.review_reason or "")
+            provenance = reference_corpus_provenance()
             assert review.algorithm_provenance == {
                 "snapshot": "score-finalization",
                 "algorithm_version": "reference-aware-v2",
-                "canonical_reference_revision": (
-                    "959cd69a1a8d3b0defbfb8296518adb7d4f17c14"
-                ),
-                "reference_corpus_id": (
-                    "21dc06cd72aafefb56d0e89e8b3127280dda249ae26cb649ee855185121e9ce6"
-                ),
+                "canonical_reference_revision": provenance["revision"],
+                "reference_corpus_id": provenance["corpus_id"],
                 "reference_exclusion_mode": "starter-kit-mainline-history",
                 "backfilled": False,
                 "opened_at_source": "agent_finalized_audit",
@@ -5192,7 +5734,12 @@ def test_infra_retry_backoff_doubles_and_caps() -> None:
         prev = current
 
 
-def _install_chain_with_block(app: FastAPI, *, block_number: int) -> None:
+def _install_chain_with_block(
+    app: FastAPI,
+    *,
+    block_number: int,
+    extra_keypairs: tuple[bittensor.Keypair, ...] = (),
+) -> None:
     from ditto.chain.models import BlockInfo
 
     neurons = [
@@ -5203,7 +5750,7 @@ def _install_chain_with_block(app: FastAPI, *, block_number: int) -> None:
             stake=1000.0,
             validator_permit=True,
         )
-        for uid, keypair in enumerate(_KEYPAIRS, start=1)
+        for uid, keypair in enumerate((*_KEYPAIRS, *extra_keypairs), start=1)
     ]
 
     async def _chain() -> MagicMock:
@@ -5221,8 +5768,11 @@ async def _seed_top5_emission_set(
     maker: async_sessionmaker[AsyncSession],
     *,
     bench_version: int = 2,
+    composites: list[float] | None = None,
+    composite_stderr: float = 0.03,
+    seed_heartbeats: bool = True,
 ) -> list[UUID]:
-    composites = [0.90, 0.88, 0.86, 0.84, 0.82, 0.80]
+    composites = composites or [0.90, 0.88, 0.86, 0.84, 0.82, 0.80]
     agent_ids = [
         await _seed_agent(
             maker,
@@ -5250,29 +5800,49 @@ async def _seed_top5_emission_set(
                         memory_mean=composite,
                         median_ms=100,
                         n=114,
-                        details={"bench_version": 2, "composite_stderr": 0.03},
+                        details={
+                            "bench_version": bench_version,
+                            "composite_stderr": composite_stderr,
+                        },
                         generated_at=datetime.now(UTC),
                     )
                 )
+    if seed_heartbeats:
+        for keypair in _KEYPAIRS:
+            await _seed_validator_heartbeat(
+                maker,
+                keypair=keypair,
+                protocol_version=13,
+            )
     return agent_ids
 
 
-def _top5_job_payload(champion: UUID, member: UUID) -> dict[str, str]:
+def _top5_job_payload(
+    champion: UUID,
+    member: UUID,
+    *,
+    keypair: bittensor.Keypair = _KEYPAIR,
+) -> dict[str, str]:
     nonce = uuid4()
     requested_at = datetime.now(UTC)
     requested = requested_at.isoformat(timespec="microseconds")
+    validator_hotkey = keypair.ss58_address
     message = (
         "validator-top5-confirmation-job:v1:"
-        f"{_VALIDATOR_HOTKEY}:{champion}:{member}:{nonce}:{requested}"
+        f"{validator_hotkey}:{champion}:{member}:{nonce}:{requested}"
     ).encode()
     return {
-        "validator_hotkey": _VALIDATOR_HOTKEY,
+        "validator_hotkey": validator_hotkey,
         "champion_agent_id": str(champion),
         "member_agent_id": str(member),
         "nonce": str(nonce),
         "requested_at": requested_at.isoformat(),
-        "signature": _KEYPAIR.sign(message).hex(),
+        "signature": keypair.sign(message).hex(),
     }
+
+
+def _top5_auth_header(keypair: bittensor.Keypair) -> dict[str, str]:
+    return {"X-Validator-Hotkey": keypair.ss58_address}
 
 
 def _top5_score_payload(
@@ -5311,6 +5881,473 @@ def _top5_score_payload(
 
 
 class TestTop5ConfirmationLane:
+    async def test_emission_set_uses_completed_wave_mean_for_champion(
+        self,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Retest claims and the validator ledger must agree on the incumbent.
+
+        A completed continual wave can preserve an older incumbent even when a
+        newer agent leads the raw three-score median.  Omitting the quorum and
+        completed-wave samples here made every healthy validator claim the raw
+        leader and receive a 409 from the authoritative job endpoint.
+        """
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            bench_version=6,
+            composites=[0.90, 0.92, 0.86, 0.84, 0.82, 0.80],
+        )
+        seed = 123456
+        async with session_maker() as session, session.begin():
+            for index, agent_id in enumerate(agent_ids[:5]):
+                session.add(
+                    ConfirmationScore(
+                        agent_id=agent_id,
+                        validator_hotkey=_VALIDATOR_HOTKEY,
+                        bench_version=6,
+                        seed=seed,
+                        composite=1.0 if index == 0 else 0.0,
+                        run_id=f"completed-wave-{index}",
+                        signature=None,
+                    )
+                )
+
+        from ditto.api_server.endpoints.validator import _current_emission_set
+
+        async with session_maker() as session:
+            members = await _current_emission_set(session, canonical_version=6)
+
+        assert members[0].agent_id == agent_ids[0]
+        assert members[0].quorum_composites == (0.90, 0.90, 0.90)
+        assert members[0].completed_wave_composites == (1.0,)
+
+    async def test_requires_single_seed_capable_validator_protocol(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member, *_ = await _seed_top5_emission_set(
+            session_maker,
+            seed_heartbeats=False,
+        )
+        await _seed_validator_heartbeat(session_maker, protocol_version=12)
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 428
+        assert "protocol 13" in response.json()["message"]
+
+    async def test_requires_fresh_validator_heartbeat(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member, *_ = await _seed_top5_emission_set(
+            session_maker,
+            seed_heartbeats=False,
+        )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 428
+        assert "fresh heartbeat" in response.json()["message"]
+
+    async def test_distributes_concurrent_claims_across_least_covered_members(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, second, third = agent_ids[:3]
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        first = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[0]),
+            json=_top5_job_payload(champion, champion, keypair=_KEYPAIRS[0]),
+        )
+        assert first.status_code == 200, first.text
+
+        repeated_champion = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[1]),
+            json=_top5_job_payload(champion, champion, keypair=_KEYPAIRS[1]),
+        )
+        assert repeated_champion.status_code == 409
+        assert "less confirmation coverage" in repeated_champion.json()["message"]
+
+        second_claim = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[1]),
+            json=_top5_job_payload(champion, second, keypair=_KEYPAIRS[1]),
+        )
+        assert second_claim.status_code == 200, second_claim.text
+
+        repeated_second = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[2]),
+            json=_top5_job_payload(champion, second, keypair=_KEYPAIRS[2]),
+        )
+        assert repeated_second.status_code == 409
+        assert "less confirmation coverage" in repeated_second.json()["message"]
+
+        third_claim = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[2]),
+            json=_top5_job_payload(champion, third, keypair=_KEYPAIRS[2]),
+        )
+        assert third_claim.status_code == 200, third_claim.text
+
+    async def test_protocol_13_validator_without_canonical_score_can_claim(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Fleet additions may append evidence without changing canonical k=3."""
+        champion, *_ = await _seed_top5_emission_set(session_maker)
+        await _seed_validator_heartbeat(
+            session_maker,
+            keypair=_DAVE,
+            protocol_version=13,
+        )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1, extra_keypairs=(_DAVE,))
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_DAVE),
+            json=_top5_job_payload(champion, champion, keypair=_DAVE),
+        )
+
+        assert response.status_code == 200, response.text
+        async with session_maker() as session:
+            canonical = await session.get(Score, (champion, 2, _DAVE.ss58_address))
+            ticket = await session.get(
+                ValidatorTicket,
+                (champion, 2, _DAVE.ss58_address),
+            )
+        assert canonical is None
+        assert ticket is not None
+        assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
+
+    async def test_confirmation_retry_cooldown_defers_then_releases_member(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, *_ = await _seed_top5_emission_set(session_maker)
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=champion,
+                    bench_version=2,
+                    validator_hotkey=_VALIDATOR_HOTKEY,
+                    status=TicketStatus.EXPIRED,
+                    purpose=TicketPurpose.CONTINUAL_RETEST,
+                    purpose_revision=1,
+                    issued_at=now - timedelta(hours=1),
+                    deadline=now - timedelta(minutes=30),
+                    retry_after=now + timedelta(minutes=30),
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        deferred = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, champion),
+        )
+        assert deferred.status_code == 409
+
+        async with session_maker() as session, session.begin():
+            ticket = await session.get(
+                ValidatorTicket,
+                (champion, 2, _VALIDATOR_HOTKEY),
+            )
+            assert ticket is not None
+            ticket.retry_after = datetime.now(UTC) - timedelta(seconds=1)
+
+        released = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, champion),
+        )
+        assert released.status_code == 200, released.text
+
+    async def test_claim_uses_version_aware_koth_band_decay(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # At v6 the 0.006 lead clears the decayed band around the older 0.900
+        # incumbent, but it does not clear the legacy flat 0.007 band. The
+        # validator ledger fold and public projection both carry bench_version;
+        # the claim verifier must do the same or it rejects the real champion.
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            bench_version=6,
+            composites=[0.900, 0.906, 0.86, 0.84, 0.82, 0.80],
+            composite_stderr=0.0,
+        )
+        champion = agent_ids[1]
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=6,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now,
+                    activated_at=now,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+        generator = MagicMock(run_size="full")
+        generator.generate = AsyncMock(
+            side_effect=lambda seed, *, bench_version: hashlib.sha256(
+                f"{bench_version}:{seed}".encode()
+            ).hexdigest()
+        )
+        app.dependency_overrides[get_dataset_generator] = lambda: generator
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, champion),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(champion)
+
+    async def test_completed_wave_champion_can_claim_the_next_wave(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The claim fold must match the completed-wave scoring ledger fold.
+
+        A complete shared-seed wave can legitimately dethrone the canonical-score
+        incumbent.  Rechecking the claim against a fold with confirmation history
+        disabled would reject every subsequent claim with a stale champion and
+        permanently stop the retest lane.
+        """
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            composites=[0.90, 0.906, 0.86, 0.84, 0.82, 0.80],
+            composite_stderr=0.0,
+        )
+        old_champion, new_champion = agent_ids[:2]
+        cohort = agent_ids[:5]
+        completed_seeds = champion_anchored_seeds(
+            old_champion,
+            version=2,
+            max_seeds=16,
+        )[:2]
+        async with session_maker() as session, session.begin():
+            await append_confirmation_scores(
+                session,
+                rows=[
+                    ConfirmationSeedScore(
+                        agent_id,
+                        _VALIDATOR_HOTKEY,
+                        seed,
+                        0.95 if agent_id == new_champion else 0.80,
+                        f"completed-wave-{agent_id}-{seed}",
+                        None,
+                    )
+                    for agent_id in cohort
+                    for seed in completed_seeds
+                ],
+                bench_version=2,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(new_champion, new_champion),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(new_champion)
+
+    async def test_rejects_out_of_cadence_claim_without_canonical_tail(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        async with session_maker() as session, session.begin():
+            champion_row = await session.get(Agent, champion)
+            assert champion_row is not None
+            champion_row.dataset_seed_block = 1
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=361)
+        app.state.config = replace(app.state.config, top5_backoff_base=2)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 409
+        assert "not due" in response.json()["message"]
+
+    async def test_idle_retest_switch_uses_spare_validator_capacity(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        async with session_maker() as session, session.begin():
+            champion_row = await session.get(Agent, champion)
+            assert champion_row is not None
+            champion_row.dataset_seed_block = 1
+            session.add(
+                ContinualRetestSettingsRevision(
+                    parent_revision=0,
+                    scope="*",
+                    settings={
+                        "aggregate_mode": "fleet_ready",
+                        "idle_retests_enabled": True,
+                    },
+                    checksum="a" * 64,
+                    reason="use spare capacity for bounded continual retests",
+                    actor="operator@example.com",
+                )
+            )
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+        _install_chain_with_block(app, block_number=361)
+        app.state.config = replace(app.state.config, top5_backoff_base=2)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
+    async def test_allows_out_of_cadence_claim_while_canonical_tail_drains(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        draining_agent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="canonical-tail",
+            miner_hotkey="5CanonicalTailMiner",
+        )
+        async with session_maker() as session, session.begin():
+            champion_row = await session.get(Agent, champion)
+            assert champion_row is not None
+            champion_row.dataset_seed_block = 1
+        await _seed_ticket(
+            session_maker,
+            draining_agent,
+            keypair=_KEYPAIRS[1],
+            deadline=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=361)
+        app.state.config = replace(app.state.config, top5_backoff_base=2)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["agent_id"] == str(member)
+
+    async def test_allows_out_of_cadence_claim_just_after_canonical_tail_finishes(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        finished_agent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCORED,
+            name="canonical-tail-finished",
+            miner_hotkey="5CanonicalTailFinishedMiner",
+        )
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            champion_row = await session.get(Agent, champion)
+            assert champion_row is not None
+            champion_row.dataset_seed_block = 1
+            session.add(
+                ValidatorTicket(
+                    agent_id=finished_agent,
+                    bench_version=2,
+                    validator_hotkey=_KEYPAIRS[1].ss58_address,
+                    status=TicketStatus.SCORED,
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
+                    purpose_revision=1,
+                    issued_at=now - timedelta(minutes=30),
+                    deadline=now + timedelta(minutes=60),
+                    updated_at=now - timedelta(minutes=1),
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=361)
+        app.state.config = replace(app.state.config, top5_backoff_base=2)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
     @pytest.mark.parametrize(
         "purpose",
         [TicketPurpose.CANONICAL_QUORUM, TicketPurpose.LEGACY_UNCLASSIFIED],
@@ -5359,7 +6396,10 @@ class TestTop5ConfirmationLane:
         from ditto.api_server.crn import champion_anchored_seeds
 
         agent_ids = await _seed_top5_emission_set(session_maker)
-        champion, member = agent_ids[0], agent_ids[1]
+        # This lease was valid when issued, but the member has since fallen out
+        # of the current five. Deployment must not strand already-running old
+        # multi-seed work; its live signed ticket remains the authorization.
+        champion, member = agent_ids[0], agent_ids[5]
         deadline = datetime.now(UTC) + timedelta(minutes=30)
         await _seed_ticket(
             session_maker,
@@ -5398,7 +6438,11 @@ class TestTop5ConfirmationLane:
         session_maker: async_sessionmaker[AsyncSession],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        agent_ids = await _seed_top5_emission_set(session_maker, bench_version=7)
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            bench_version=7,
+            seed_heartbeats=False,
+        )
         champion, member = agent_ids[0], agent_ids[1]
         now = datetime.now(UTC)
         profile = "openrouter-route-a471cd87ae7df5b9-v1"
@@ -5425,7 +6469,7 @@ class TestTop5ConfirmationLane:
         }
         await _seed_validator_heartbeat(
             session_maker,
-            protocol_version=11,
+            protocol_version=13,
             capabilities=capabilities,
             stack=_V7_STACK,
         )
@@ -5500,7 +6544,7 @@ class TestTop5ConfirmationLane:
         from ditto.api_server.crn import champion_anchored_seeds
 
         expected_seeds = list(
-            champion_anchored_seeds(champion, version=7, max_seeds=16)[:2]
+            champion_anchored_seeds(champion, version=7, max_seeds=16)[:1]
         )
         assert [pin["seed"] for pin in body["confirmation_datasets"]] == expected_seeds
         assert all(pin["run_size"] == "full" for pin in body["confirmation_datasets"])
@@ -5572,3 +6616,464 @@ class TestTop5ConfirmationLane:
         )
         assert response.status_code == 409
         assert "emission set" in response.json()["message"]
+
+
+def _v3_capable_capabilities(*, now: datetime) -> dict[str, object]:
+    """Capabilities that satisfy ``heartbeat_supports_version`` for v3."""
+    return {
+        **_V7_CAPABILITIES,
+        "scorer_benchmarks": {
+            "status": "fresh_verified",
+            "supported_bench_versions": [2, 3],
+            "observed_at": int(now.timestamp()),
+            "software_version": "1.2.2",
+            "source_revision": "2" * 40,
+        },
+    }
+
+
+async def _seed_top5_rollout_standdown_fixture(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    rollout_status: str | None = "collecting",
+    desired_version_capable: bool = True,
+    settings: dict[str, object] | None = None,
+    emission_bench_version: int = 2,
+) -> tuple[UUID, UUID]:
+    """A due top-five cohort plus an optional open 2 -> 3 rollout."""
+    agent_ids = await _seed_top5_emission_set(
+        maker, bench_version=emission_bench_version, seed_heartbeats=False
+    )
+    now = datetime.now(UTC)
+    capabilities = (
+        _v3_capable_capabilities(now=now)
+        if desired_version_capable
+        # A validator that cannot serve the desired version can never take
+        # cohort work, so the rollout is not competing with it at all.
+        else {**_V7_CAPABILITIES, "scorer_benchmarks": None}
+    )
+    for keypair in _KEYPAIRS:
+        await _seed_validator_heartbeat(
+            maker,
+            keypair=keypair,
+            protocol_version=13,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+        )
+    async with maker() as session, session.begin():
+        champion_row = await session.get(Agent, agent_ids[0])
+        assert champion_row is not None
+        champion_row.dataset_seed_block = 1
+        if rollout_status is not None:
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status=rollout_status,
+                    cohort_size=5,
+                    created_at=now - timedelta(hours=1),
+                    activated_at=(now if rollout_status == "activated" else None),
+                )
+            )
+        if settings is not None:
+            session.add(
+                ContinualRetestSettingsRevision(
+                    parent_revision=0,
+                    scope="*",
+                    settings=settings,
+                    checksum="b" * 64,
+                    reason="operator override for rollout stand-down policy",
+                    actor="operator@example.com",
+                )
+            )
+    return agent_ids[0], agent_ids[1]
+
+
+class TestTop5RolloutStanddown:
+    """Continual retests yield scarce validator slots to an open rollout."""
+
+    @staticmethod
+    def _install(app: FastAPI, session_maker: async_sessionmaker[AsyncSession]) -> None:
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+        _install_chain_with_block(app, block_number=0)
+
+    async def test_stands_down_capable_validator_while_rollout_collects(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(session_maker)
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 409
+        message = response.json()["message"]
+        # The refusal must name the rollout, or an operator reads it as a bug.
+        assert "standing down" in message
+        assert "benchmark version 3" in message
+        async with session_maker() as session:
+            issued = await session.scalar(
+                select(func.count()).where(
+                    ValidatorTicket.purpose == TicketPurpose.CONTINUAL_RETEST
+                )
+            )
+        assert issued == 0
+
+    async def test_stands_down_while_rollout_is_blocked_ineligible(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, rollout_status="blocked_ineligible"
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 409
+        assert "standing down" in response.json()["message"]
+
+    async def test_resumes_after_rollout_activates(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Activation retires the rollout, and retests confirm the new era."""
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, rollout_status="activated", emission_bench_version=3
+        )
+        self._install(app, session_maker)
+        generator = MagicMock(run_size="full")
+        generator.generate = AsyncMock(return_value="ab" * 32)
+        app.dependency_overrides[get_dataset_generator] = lambda: generator
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
+    async def test_resumes_after_rollout_is_superseded(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, rollout_status="superseded"
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
+    async def test_no_open_rollout_leaves_the_lane_untouched(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, rollout_status=None
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
+    async def test_validator_that_cannot_serve_the_rollout_keeps_retesting(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Yield only the capacity the rollout can actually consume."""
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, desired_version_capable=False
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
+    async def test_all_mode_stands_down_incapable_validators_too(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker,
+            desired_version_capable=False,
+            settings={
+                "aggregate_mode": "fleet_ready",
+                "idle_retests_enabled": False,
+                "rollout_standdown": "all",
+            },
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 409
+        assert "standing down" in response.json()["message"]
+
+    async def test_operator_override_forces_retests_during_a_rollout(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker,
+            settings={
+                "aggregate_mode": "fleet_ready",
+                "idle_retests_enabled": False,
+                "rollout_standdown": "off",
+            },
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
+    async def test_in_flight_wave_still_reports_during_a_rollout(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The stand-down gates issuance only; leased waves finish intact."""
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, rollout_status=None
+        )
+        self._install(app, session_maker)
+        leased = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+        assert leased.status_code == 200, leased.text
+        deadline = datetime.fromisoformat(leased.json()["deadline"])
+        seeds = list(champion_anchored_seeds(champion, version=2, max_seeds=16)[:2])
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="collecting",
+                    cohort_size=5,
+                    created_at=datetime.now(UTC),
+                )
+            )
+
+        reported = await client.post(
+            f"/api/v1/validator/agent/{member}/top5-confirmation-score",
+            json=_top5_score_payload(
+                member,
+                deadline=deadline,
+                seeds=seeds,
+                composites=[0.81, 0.83],
+            ),
+        )
+
+        assert reported.status_code == 200, reported.text
+
+
+class TestReissuedLeaseKeepsSlotProgress:
+    """A lease re-issued in place must not blank its slot in the fleet view.
+
+    The platform refreshes ``deadline`` on an existing ticket row, but the
+    validator keeps signing progress with the deadline it was handed at claim
+    time. Confirming the slot on that stamp evicted a healthy run from the
+    stored capacity, so slot-1 rendered as "Benchmark progress not reported"
+    while slot-0 reported normally -- and the revoker then read the same absence
+    as evidence the slot was idle.
+    """
+
+    async def test_deadline_drift_still_publishes_every_active_slot(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        first = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, name="slot-a"
+        )
+        second = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="slot-b",
+            miner_hotkey="5SecondMiner" + "x" * 35,
+        )
+        await _seed_ticket(session_maker, first, slot_id="slot-0", bench_version=7)
+        await _seed_ticket(session_maker, second, slot_id="slot-1", bench_version=7)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        first_progress = _progress("running_benchmark", completed=3, total=283)
+        # Signed against the deadline this slot cached before its lease was
+        # re-issued. One microsecond of drift used to be enough to erase it.
+        drifted = _progress(
+            "running_benchmark",
+            completed=61,
+            total=283,
+            ticket_deadline=_TICKET_DEADLINE + timedelta(microseconds=1),
+        )
+        capacity = {
+            "configured_slots": 4,
+            "healthy_slots": ["slot-0", "slot-1", "slot-2", "slot-3"],
+            "admission": "accepting",
+            "active": [
+                {
+                    "slot_id": "slot-0",
+                    "agent_id": str(first),
+                    "bench_version": 7,
+                    "progress": first_progress,
+                },
+                {
+                    "slot_id": "slot-1",
+                    "agent_id": str(second),
+                    "bench_version": 7,
+                    "progress": drifted,
+                },
+            ],
+        }
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=10,
+                state="running_benchmark",
+                active_agent_id=first,
+                benchmark_progress=first_progress,
+                capabilities=_V9_CAPABILITIES,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert response.status_code == 200, response.text
+
+        public = (await client.get("/api/v1/public/validators")).json()["validators"][0]
+        assert [item["slot_id"] for item in public["active_benchmarks"]] == [
+            "slot-0",
+            "slot-1",
+        ]
+        by_slot = {item["slot_id"]: item for item in public["active_benchmarks"]}
+        assert by_slot["slot-1"]["stage"] == "running_benchmark"
+        assert by_slot["slot-1"]["completed_checks"] == 61
+        # Every assigned slot resolves to real progress, so nothing renders as
+        # "Benchmark progress not reported".
+        assert all(item["stage"] is not None for item in public["assigned_benchmarks"])
+
+    async def test_unconfirmed_slot_is_recorded_as_a_claim(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The signed occupancy claim is stored whole, before confirmation."""
+        agent = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, name="slot-a"
+        )
+        stray = uuid4()
+        await _seed_ticket(session_maker, agent, slot_id="slot-0", bench_version=7)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        confirmed = _progress("running_benchmark", completed=3, total=283)
+        capacity = {
+            "configured_slots": 2,
+            "healthy_slots": ["slot-0", "slot-1"],
+            "admission": "accepting",
+            "active": [
+                {
+                    "slot_id": "slot-0",
+                    "agent_id": str(agent),
+                    "bench_version": 7,
+                    "progress": confirmed,
+                },
+                {
+                    # No ticket for this one: it drops out of the confirmed
+                    # capacity but must survive as a claim.
+                    "slot_id": "slot-1",
+                    "agent_id": str(stray),
+                    "bench_version": 7,
+                    "progress": _progress("running_benchmark", completed=9, total=283),
+                },
+            ],
+        }
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=10,
+                state="running_benchmark",
+                active_agent_id=agent,
+                benchmark_progress=confirmed,
+                capabilities=_V9_CAPABILITIES,
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=capacity,
+            ),
+        )
+        assert response.status_code == 200, response.text
+        async with session_maker() as s:
+            row = await s.get(ValidatorHeartbeat, _KEYPAIR.ss58_address)
+            assert row is not None
+            stored = row.benchmark_capacity
+            assert stored is not None
+            assert [slot["slot_id"] for slot in stored["active"]] == ["slot-0"]
+            assert row.claimed_slots == [
+                {"slot_id": "slot-0", "agent_id": str(agent)},
+                {"slot_id": "slot-1", "agent_id": str(stray)},
+            ]

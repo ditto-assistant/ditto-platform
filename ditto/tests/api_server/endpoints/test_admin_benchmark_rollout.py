@@ -1,5 +1,6 @@
 """HTTP contract tests for the guarded benchmark rollout control plane."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -9,16 +10,17 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import get_session
+from ditto.api_server.endpoints import admin_benchmark_rollout
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     MINIMUM_ROLLOUT_START_VALIDATORS,
 )
@@ -28,7 +30,6 @@ from ditto.api_server.middleware.error_envelope import (
 )
 from ditto.db.models import (
     Agent,
-    Base,
     BenchmarkRollout,
     Score,
     ValidatorHeartbeat,
@@ -51,12 +52,28 @@ _LAGGING = "bench_version query param required (supported: 2, 3)"
 
 
 @pytest.fixture
-async def rollout_maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False)
-    await engine.dispose()
+def instrumented_maker(
+    engine: AsyncEngine,
+) -> tuple[async_sessionmaker[AsyncSession], list[str]]:
+    """A session maker that records every statement the handler actually runs.
+
+    The listener is attached to the root ``engine`` fixture *after* it has
+    reset the worker database, so the reset's own DDL is not recorded.
+    """
+    statements: list[str] = []
+
+    @event.listens_for(engine.sync_engine, "before_cursor_execute")
+    def _record(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    return async_sessionmaker(engine, expire_on_commit=False), statements
 
 
 def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
@@ -231,9 +248,9 @@ def _start_payload() -> dict[str, Any]:
 async def test_control_discovery_is_authenticated_read_only_and_dynamic(
     app: FastAPI,
     client: httpx.AsyncClient,
-    rollout_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    _install(app, rollout_maker)
+    _install(app, session_maker)
 
     denied = await client.get("/api/v1/admin/benchmark-rollout")
     assert denied.status_code == 401
@@ -250,12 +267,140 @@ async def test_control_discovery_is_authenticated_read_only_and_dynamic(
     )
 
 
+async def test_control_reads_the_cohort_once_and_never_writes(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    instrumented_maker: tuple[async_sessionmaker[AsyncSession], list[str]],
+) -> None:
+    """One page load is one cohort read, whatever the console is showing.
+
+    The operator console loads this on every view. It used to derive the whole
+    cohort/quorum picture once per *shipped contract* just to read one integer
+    out of each, so shipping a benchmark made the operator's status page slower
+    -- and with the per-case ``details`` breakdown hydrated for every scored
+    agent on each pass, slow enough to blow through the console's own timeout.
+    """
+    maker, statements = instrumented_maker
+    _install(app, maker)
+    now = datetime.now(UTC).replace(microsecond=0)
+    members = await _seed_start_ready(maker, now)
+    async with maker() as session, session.begin():
+        await create_rollout_snapshot(
+            session,
+            members=members,
+            datasets={
+                member.agent_id: DatasetPin(
+                    seed=index, sha256="c" * 64, run_size="full"
+                )
+                for index, member in enumerate(members, start=1)
+            },
+            now=now,
+            from_version=2,
+            desired_version=_TARGET,
+        )
+    generator = _StubGenerator()
+    app.state.dataset_generator = generator
+    statements.clear()
+
+    response = await client.get("/api/v1/admin/benchmark-rollout", headers=_HEADERS)
+
+    assert response.status_code == 200, response.text
+    # Flat in the number of shipped contracts. Six contracts once cost 106
+    # statements here; the count must not track ``benchmark_contracts()``.
+    assert len(statements) <= 30, "\n".join(statements)
+    # And the ranking read must not drag the per-case breakdown along with it:
+    # that column is kilobytes per score row, for every scored agent.
+    assert all("details" not in statement for statement in statements), statements
+    # A read is a read: no rollout is opened, advanced, or activated, and the
+    # generate-service is never dialled from the status path.
+    assert not [
+        statement
+        for statement in statements
+        if statement.lstrip()[:6].upper() in ("INSERT", "UPDATE", "DELETE")
+    ]
+    assert generator.calls == []
+    assert await _rollout_count(maker) == 1
+
+
+async def test_control_degrades_the_slow_section_instead_of_hanging(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lagging qualification lookup costs that section, not the whole page.
+
+    The budget is shared: the handler spends it on the core read first and only
+    then on the qualification loop. So this test is only meaningful while the
+    *real* core read fits inside the budget -- otherwise the core read times out
+    and the handler 503s, which is the sibling test's scenario, not this one.
+
+    On in-memory SQLite the core read was ~1ms and 0.05s was ample. On a real
+    Postgres under ``-n auto`` it measures 39-132ms, i.e. straddling a 0.05s
+    budget, which made this test fail roughly one run in three. 2.0s clears the
+    measured worst case by ~15x while staying far under both the 12.0s
+    production value and the 60s stub hang. Nothing asserted below changed; this
+    is the test's own speed knob, not a property of the endpoint.
+    """
+    _install(app, session_maker)
+
+    async def _slow(*_args: object, **_kwargs: object) -> dict[str, object]:
+        await asyncio.sleep(60)
+        raise AssertionError("the budget should have expired first")
+
+    monkeypatch.setattr(admin_benchmark_rollout, "ROLLOUT_STATUS_BUDGET_SECONDS", 2.0)
+    monkeypatch.setattr(admin_benchmark_rollout, "authority_selection_state", _slow)
+
+    response = await client.get("/api/v1/admin/benchmark-rollout", headers=_HEADERS)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # The durable rollout status -- the part the operator came for -- survives.
+    assert body["active_version"] == 2
+    assert body["status"] == "inactive"
+    assert [contract["version"] for contract in body["contracts"]] == [2, 3, 4, 5, 6, 7]
+    # Fail closed on what could not be proven: no candidate is offered for
+    # activation, and the omission is named rather than mistaken for "none".
+    assert body["active_contract_candidates"] == []
+    assert body["degraded_sections"] == ["active_contract_candidates"]
+
+
+async def test_control_names_the_database_when_the_core_read_overruns(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the core state there is nothing useful to return -- so say why.
+
+    The operator chased a missing endpoint and a bad admin token for an hour
+    because a slow read reached them as a bare client-side abort. A 503 that
+    names the database is the whole point of bounding this server-side.
+    """
+    _install(app, session_maker)
+
+    async def _slow(*_args: object, **_kwargs: object) -> dict[str, object]:
+        await asyncio.sleep(60)
+        raise AssertionError("the budget should have expired first")
+
+    monkeypatch.setattr(admin_benchmark_rollout, "ROLLOUT_STATUS_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(admin_benchmark_rollout, "rollout_state", _slow)
+
+    response = await client.get("/api/v1/admin/benchmark-rollout", headers=_HEADERS)
+
+    assert response.status_code == 503, response.text
+    message = response.json()["message"]
+    assert "read budget" in message
+    assert "database" in message
+    assert "token" in message
+
+
 async def test_start_requires_full_guard_payload_and_exact_confirmation(
     app: FastAPI,
     client: httpx.AsyncClient,
-    rollout_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    _install(app, rollout_maker)
+    _install(app, session_maker)
 
     missing = await client.post("/api/v1/admin/benchmark-rollout/4", headers=_HEADERS)
     assert missing.status_code == 422
@@ -290,12 +435,12 @@ async def test_start_requires_full_guard_payload_and_exact_confirmation(
 async def test_start_reports_a_lagging_generate_service_as_a_named_502(
     app: FastAPI,
     client: httpx.AsyncClient,
-    rollout_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     """The generator lags this API by a deploy; that is a 502, never a bare 500."""
-    _install(app, rollout_maker)
+    _install(app, session_maker)
     now = datetime.now(UTC).replace(microsecond=0)
-    await _seed_start_ready(rollout_maker, now)
+    await _seed_start_ready(session_maker, now)
     generator = _StubGenerator(DataPipelineError(_LAGGING))
     app.state.dataset_generator = generator
 
@@ -319,19 +464,19 @@ async def test_start_reports_a_lagging_generate_service_as_a_named_502(
     assert [version for _seed, version in generator.calls] == [_TARGET]
     # Nothing half-started: the failed attempt leaves no rollout behind, so a
     # retry after the generator is deployed is a clean start, not a 409.
-    assert await _rollout_count(rollout_maker) == 0
+    assert await _rollout_count(session_maker) == 0
 
 
 async def test_reposting_an_existing_rollout_also_502s_on_a_lagging_generator(
     app: FastAPI,
     client: httpx.AsyncClient,
-    rollout_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     """Re-POSTing is the natural operator retry, so it must not be the 500 route."""
-    _install(app, rollout_maker)
+    _install(app, session_maker)
     now = datetime.now(UTC).replace(microsecond=0)
-    members = await _seed_start_ready(rollout_maker, now)
-    async with rollout_maker() as session, session.begin():
+    members = await _seed_start_ready(session_maker, now)
+    async with session_maker() as session, session.begin():
         await create_rollout_snapshot(
             session,
             members=members,
@@ -370,12 +515,12 @@ async def test_reposting_an_existing_rollout_also_502s_on_a_lagging_generator(
 async def test_start_still_succeeds_when_the_generator_ships_the_target(
     app: FastAPI,
     client: httpx.AsyncClient,
-    rollout_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     """Anti-no-op guard: the 502 wrapper swallows nothing on the happy path."""
-    _install(app, rollout_maker)
+    _install(app, session_maker)
     now = datetime.now(UTC).replace(microsecond=0)
-    members = await _seed_start_ready(rollout_maker, now)
+    members = await _seed_start_ready(session_maker, now)
     generator = _StubGenerator()
     app.state.dataset_generator = generator
 
@@ -394,4 +539,4 @@ async def test_start_still_succeeds_when_the_generator_ships_the_target(
     assert {UUID(member["agent_id"]) for member in body["members"]} == {
         member.agent_id for member in members
     }
-    assert await _rollout_count(rollout_maker) == 1
+    assert await _rollout_count(session_maker) == 1

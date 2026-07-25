@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import bittensor
+import httpx
 import pytest
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -12,10 +13,13 @@ from ditto.api_models.inference import InferenceExchangeRequest, InferenceGrantO
 from ditto.api_server.endpoints.inference import (
     _bounded_provider_cost,
     _exchange_message,
+    _locked_grant_model,
     _locked_upstream_payload,
     _output_token_limit,
+    _post_provider_with_retry,
     _provider_preferences,
     _provider_rejection_is_route_observable,
+    _ProviderCallError,
     _proxy_message,
     _public_embedding_response,
     _public_provider_response,
@@ -24,6 +28,56 @@ from ditto.api_server.endpoints.inference import (
     _validated_embedding_payload,
 )
 from ditto.api_server.endpoints.validator import _verify_signature
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_policy_retries_explicit_transient_statuses() -> None:
+    statuses = iter((503, 429, 200))
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(next(statuses), request=request)
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _post_provider_with_retry(
+            client,
+            "https://provider.example/v1/request",
+            payload={"model": "test"},
+            headers={},
+            sleep=no_sleep,
+        )
+
+    assert result.response.status_code == 200
+    assert result.attempts == 3
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_policy_does_not_repeat_ambiguous_read_timeout() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("provider response timed out", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(_ProviderCallError) as raised:
+            await _post_provider_with_retry(
+                client,
+                "https://provider.example/v1/request",
+                payload={"model": "test"},
+                headers={},
+            )
+
+    assert raised.value.attempts == 1
+    assert raised.value.timed_out is True
+    assert calls == 1
 
 
 def _exchange(keypair: bittensor.Keypair) -> InferenceExchangeRequest:
@@ -487,3 +541,172 @@ def test_legacy_offer_omits_additive_v7_route_identity() -> None:
     encoded = offer.model_dump(mode="json")
     assert "provider" not in encoded
     assert "profile_revision" not in encoded
+
+
+class _FakeGrant:
+    """Minimal stand-in for the ORM row the proxy loads after proof verification."""
+
+    def __init__(self, *, bench_version: int, allowed_models: list[str]) -> None:
+        self.bench_version = bench_version
+        self.allowed_models = allowed_models
+        self.grant_id = uuid4()
+        self.agent_id = uuid4()
+        self.slot_id = "slot-0"
+
+
+class _FakeConfig:
+    allowed_models = ("qwen/qwen3-32b", "openai/gpt-oss-20b")
+
+
+def test_v7_serves_the_ticket_model_regardless_of_what_the_agent_asked_for() -> None:
+    """A miner controls every byte of the request body; the ticket is authoritative.
+
+    Pre-v7 harnesses default DITTOBENCH_MODEL to qwen/qwen3-32b, which is in the
+    globally permitted set, so without this the agent — not the ticket — picked
+    the scored model.
+    """
+    grant = _FakeGrant(bench_version=7, allowed_models=["openai/gpt-oss-20b"])
+    resolved = _locked_grant_model(
+        grant, requested="qwen/qwen3-32b", config=_FakeConfig()
+    )
+    assert resolved == "openai/gpt-oss-20b"
+
+
+def test_v7_matching_request_resolves_to_the_same_locked_model() -> None:
+    grant = _FakeGrant(bench_version=7, allowed_models=["openai/gpt-oss-20b"])
+    assert (
+        _locked_grant_model(grant, requested="openai/gpt-oss-20b", config=_FakeConfig())
+        == "openai/gpt-oss-20b"
+    )
+
+
+def test_v7_model_mismatch_is_recorded_as_an_evasion_signal(caplog) -> None:
+    grant = _FakeGrant(bench_version=7, allowed_models=["openai/gpt-oss-20b"])
+    with caplog.at_level("WARNING"):
+        _locked_grant_model(grant, requested="qwen/qwen3-32b", config=_FakeConfig())
+    assert any(
+        "model mismatch" in record.getMessage()
+        and "qwen/qwen3-32b" in record.getMessage()
+        and "openai/gpt-oss-20b" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_v7_grant_without_a_pinned_model_fails_closed() -> None:
+    grant = _FakeGrant(bench_version=7, allowed_models=[])
+    with pytest.raises(HTTPException) as excinfo:
+        _locked_grant_model(grant, requested="openai/gpt-oss-20b", config=_FakeConfig())
+    assert excinfo.value.status_code == 409
+
+
+def test_pre_v7_model_selection_semantics_are_unchanged() -> None:
+    """Historical replay must not move: the caller still chooses from the set."""
+    grant = _FakeGrant(bench_version=6, allowed_models=["openai/gpt-oss-20b"])
+    assert (
+        _locked_grant_model(grant, requested="qwen/qwen3-32b", config=_FakeConfig())
+        == "qwen/qwen3-32b"
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        _locked_grant_model(grant, requested="anthropic/claude", config=_FakeConfig())
+    assert excinfo.value.status_code == 403
+
+
+def test_embedding_vectors_pass_through_without_per_element_validation() -> None:
+    """Vector contents are forwarded as parsed; the envelope is still checked.
+
+    Per-element float validation cost 42us per 768-dim vector on the shared
+    event loop, and the trusted broker re-validates every element for NaN/Inf
+    before any harness sees it (inference_broker.go:1144-1151). Dropping the
+    duplicate check must not weaken anything that is O(vectors) rather than
+    O(floats): arity, ordering, vector length, model identity, and usage all
+    still fail closed below.
+    """
+    model = "perplexity/pplx-embed-v1-0.6b"
+
+    # A payload that the old per-element validator would have rejected and the
+    # passthrough forwards verbatim. This is the behavior change, stated
+    # explicitly so a future reader sees it was chosen, not overlooked.
+    exotic = [float("nan"), float("inf"), -float("inf")] + [0.5] * 765
+    public, prompt_tokens = _public_embedding_response(
+        {
+            "object": "list",
+            "model": model,
+            "data": [{"object": "embedding", "index": 0, "embedding": exotic}],
+            "usage": {"prompt_tokens": 3, "total_tokens": 3},
+        },
+        model=model,
+        dimensions=768,
+        input_count=1,
+    )
+    assert prompt_tokens == 3
+    assert public["data"][0]["embedding"] is exotic
+
+    # Everything cheap stays enforced.
+    vector = [0.0] * 768
+    for broken in (
+        # wrong arity vs the request
+        {
+            "model": model,
+            "data": [{"object": "embedding", "index": 0, "embedding": vector}],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1},
+        },
+        # out-of-order / misaligned index
+        {
+            "model": model,
+            "data": [
+                {"object": "embedding", "index": 1, "embedding": vector},
+                {"object": "embedding", "index": 0, "embedding": vector},
+            ],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1},
+        },
+        # truncated vector: length is still validated, only elements are not
+        {
+            "model": model,
+            "data": [
+                {"object": "embedding", "index": 0, "embedding": [0.0] * 512},
+                {"object": "embedding", "index": 1, "embedding": vector},
+            ],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1},
+        },
+        # a vector that is not a list at all
+        {
+            "model": model,
+            "data": [
+                {"object": "embedding", "index": 0, "embedding": "not-a-vector"},
+                {"object": "embedding", "index": 1, "embedding": vector},
+            ],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1},
+        },
+        # missing usage: metering depends on it, so it must still fail closed
+        {
+            "model": model,
+            "data": [
+                {"object": "embedding", "index": 0, "embedding": vector},
+                {"object": "embedding", "index": 1, "embedding": vector},
+            ],
+        },
+    ):
+        with pytest.raises(HTTPException, match="invalid provider response"):
+            _public_embedding_response(
+                broken, model=model, dimensions=768, input_count=2
+            )
+
+
+def test_embedding_model_mismatch_still_refuses_rather_than_substituting() -> None:
+    """#428's request-side policy is unchanged by the response passthrough.
+
+    Chat substitutes the ticket model; embeddings refuse, because silently
+    rewriting the model would change the vector space under a caller that is
+    validating dimensions. The two paths differ on purpose, and the response
+    passthrough must not disturb that: the guarantee lives on the request side.
+    """
+    model = "perplexity/pplx-embed-v1-0.6b"
+    payload = {
+        "model": "embeddinggemma",
+        "input": ["one"],
+        "dimensions": 768,
+        "encoding_format": "float",
+    }
+    with pytest.raises(HTTPException) as refused:
+        _validated_embedding_payload(payload, model=model, dimensions=768)
+    assert refused.value.status_code == 400

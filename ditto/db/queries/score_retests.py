@@ -25,6 +25,12 @@ from ditto.db.queries.audit import (
     SCORE_RETEST_EVENTS,
     append_audit_entry,
 )
+from ditto.db.queries.lease_liveness import (
+    LeaseLiveness,
+    lease_liveness,
+    record_declined_force_expiry,
+    record_lease_revocation,
+)
 
 REPLACEMENT_TICKET_TTL = timedelta(minutes=90)
 _FINALIZED_STATUSES = (AgentStatus.SCORED, AgentStatus.LIVE)
@@ -163,8 +169,35 @@ async def activate_next_score_retest(
                 deadline = deadline.replace(tzinfo=UTC)
             if deadline > now and supports_version(issued.bench_version):
                 return issued
-            if validator_running_benchmark and deadline > now:
-                return None
+            liveness = LeaseLiveness(idle=True, reason="lease_deadline_passed")
+            if deadline > now:
+                # The lease has not expired; the validator merely stopped
+                # advertising this benchmark version. Closing it here ends a run
+                # that may still be scoring, so it needs the same positive proof
+                # of idleness the issuance lanes now require -- an absent slot in
+                # a capacity blob that can silently freeze is not proof.
+                liveness = await lease_liveness(
+                    session,
+                    ticket=issued,
+                    validator_hotkey=validator_hotkey,
+                    slot_id=slot_id,
+                    now=now,
+                    running_benchmark_reported=validator_running_benchmark,
+                )
+                if not liveness.idle:
+                    record_declined_force_expiry(
+                        ticket=issued, liveness=liveness, context="score_retest"
+                    )
+                    return None
+            await record_lease_revocation(
+                session,
+                ticket=issued,
+                now=now,
+                liveness=liveness,
+                context="score_retest",
+                action="closed_unserviceable",
+                requested_bench_version=issued.bench_version,
+            )
             issued.status = TicketStatus.SCORED
             issued.retry_after = None
             await _close_unserviceable(

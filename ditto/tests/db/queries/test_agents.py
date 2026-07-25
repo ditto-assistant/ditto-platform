@@ -17,8 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import undefer_group
 
 from ditto.db import IntegrityError as DbIntegrityError
-from ditto.db.models import Agent, AgentStatus
+from ditto.db.models import Agent, AgentStatus, EvaluationPayment
 from ditto.db.queries.agents import (
+    SubmissionCooldownError,
+    enforce_submission_cooldown,
     get_agent_by_id,
     get_latest_agent_by_hotkey,
     insert_agent,
@@ -65,6 +67,27 @@ async def _seed_agent(
     async with session.begin():
         session.add(row)
     return row
+
+
+async def _seed_payment_owner(
+    session: AsyncSession,
+    *,
+    agent: Agent,
+    miner_coldkey: str = "5CKOwner",
+) -> None:
+    async with session.begin():
+        session.add(
+            EvaluationPayment(
+                block_hash="0x" + agent.agent_id.hex,
+                extrinsic_index=0,
+                agent_id=agent.agent_id,
+                miner_hotkey=agent.miner_hotkey,
+                miner_coldkey=miner_coldkey,
+                amount_rao=1,
+                dest_address="5Destination",
+                timestamp=datetime.now(UTC),
+            )
+        )
 
 
 class TestInsertAgentHappyPath:
@@ -198,6 +221,39 @@ class TestInsertAgentHappyPath:
             )
         ).scalar_one()
         assert row.status == AgentStatus.UPLOADED
+
+
+class TestSubmissionCooldown:
+    async def test_rejects_until_one_hour_after_latest_submission(
+        self, session: AsyncSession
+    ) -> None:
+        now = datetime.now(UTC)
+        agent = await _seed_agent(session, created_at=now - timedelta(minutes=15))
+        await _seed_payment_owner(session, agent=agent)
+
+        with pytest.raises(SubmissionCooldownError) as info:
+            async with session.begin():
+                await enforce_submission_cooldown(
+                    session,
+                    miner_coldkey="5CKOwner",
+                    cooldown=timedelta(hours=1),
+                )
+
+        assert info.value.retry_at >= now + timedelta(minutes=44)
+
+    async def test_allows_after_one_hour(self, session: AsyncSession) -> None:
+        agent = await _seed_agent(
+            session,
+            created_at=datetime.now(UTC) - timedelta(hours=1, seconds=1),
+        )
+        await _seed_payment_owner(session, agent=agent)
+
+        async with session.begin():
+            await enforce_submission_cooldown(
+                session,
+                miner_coldkey="5CKOwner",
+                cooldown=timedelta(hours=1),
+            )
 
 
 class TestInsertAgentConstraintViolations:

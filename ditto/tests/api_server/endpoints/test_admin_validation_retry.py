@@ -8,12 +8,11 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_models.agent_status import AgentStatus
@@ -22,10 +21,10 @@ from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.dependencies import get_session
 from ditto.db.models import (
     Agent,
-    Base,
     Score,
     ScoreAuditEntry,
     ValidatorHeartbeat,
+    ValidatorQueueWithdrawal,
     ValidatorRetryRecovery,
     ValidatorTicket,
 )
@@ -50,19 +49,9 @@ _FUTURE = datetime(2099, 1, 1, tzinfo=UTC)
 
 
 @pytest.fixture
-async def retry_engine() -> AsyncIterator[AsyncEngine]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(engine.sync_engine, "connect")
-    def _fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield engine
-    await engine.dispose()
+def retry_engine(engine: AsyncEngine) -> AsyncEngine:
+    """Local alias for the root Postgres ``engine``."""
+    return engine
 
 
 @pytest.fixture
@@ -90,12 +79,19 @@ async def _seed(
     composites: list[float] | None = None,
 ) -> UUID:
     agent_id = uuid4()
+    # Each call seeds an *independent* submission, so it needs its own identity:
+    # ``agents_hotkey_name_version_key`` makes (miner_hotkey, name, version)
+    # unique, and several tests here seed two or three agents. The name used to
+    # be the constant "valid-agent", which only worked because that constraint
+    # is declared ``.ddl_if(dialect="postgresql")`` in ditto/db/models.py and so
+    # was never created under SQLite's ``create_all``. No assertion in this file
+    # reads the name this helper generates.
     async with maker() as session, session.begin():
         session.add(
             Agent(
                 agent_id=agent_id,
                 miner_hotkey="5Miner",
-                name="valid-agent",
+                name=f"valid-agent-{agent_id.hex[:8]}",
                 version=1,
                 sha256=agent_id.hex * 2,
                 status=AgentStatus.EVALUATING,
@@ -337,6 +333,143 @@ async def test_manual_grant_allows_exactly_one_more_same_version_issue(
     assert ticket is not None and ticket.agent_id == agent_id
     assert ticket.attempt_count == 3
     assert ticket.manual_retry_grants == 1
+
+
+async def test_withdraw_failed_submission_preserves_history_and_stops_assignment(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker)
+    _install(app, retry_maker)
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    assert detail.status_code == 200
+    assert detail.json()["withdrawal_allowed"] is True
+
+    request_id = uuid4()
+    payload = {
+        "request_id": str(request_id),
+        "expected_snapshot": detail.json()["snapshot"],
+        "reason": "Three validator scoring failures exhausted every retry budget",
+        "confirmation": "REMOVE FROM VALIDATOR QUEUE",
+    }
+    response = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/withdraw",
+        headers=_HEADERS,
+        json=payload,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["idempotent"] is False
+
+    replay = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/withdraw",
+        headers=_HEADERS,
+        json=payload,
+    )
+    assert replay.status_code == 200
+    assert replay.json()["idempotent"] is True
+
+    triage = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    assert triage.status_code == 200
+    assert all(row["agent_id"] != str(agent_id) for row in triage.json()["submissions"])
+
+    async with retry_maker() as session, session.begin():
+        issued = await issue_ticket(
+            session,
+            validator_hotkey="validator-0",
+            now=datetime.now(UTC) + timedelta(seconds=1),
+            ttl=timedelta(minutes=90),
+            bench_version=DEFAULT_BENCH_VERSION,
+        )
+    assert issued is None
+
+    async with retry_maker() as session:
+        agent = await session.get(Agent, agent_id)
+        tickets = list(
+            (
+                await session.scalars(
+                    select(ValidatorTicket).where(ValidatorTicket.agent_id == agent_id)
+                )
+            ).all()
+        )
+        withdrawal = await session.get(ValidatorQueueWithdrawal, request_id)
+    assert agent is not None and agent.status == AgentStatus.EVALUATING
+    assert len(tickets) == 4
+    assert withdrawal is not None and len(withdrawal.ticket_snapshot) == 4
+
+
+async def test_withdraw_fails_closed_when_snapshot_moves_or_ticket_is_active(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker)
+    _install(app, retry_maker)
+    stale = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/withdraw",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": "0" * 64,
+            "reason": "Three validator scoring failures exhausted every retry budget",
+            "confirmation": "REMOVE FROM VALIDATOR QUEUE",
+        },
+    )
+    assert stale.status_code == 409
+
+    async with retry_maker() as session, session.begin():
+        ticket = await session.get(ValidatorTicket, (agent_id, 2, "validator-0"))
+        assert ticket is not None
+        ticket.status = TicketStatus.ISSUED
+        ticket.deadline = _FUTURE
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    assert detail.json()["withdrawal_allowed"] is False
+    denied = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/withdraw",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": detail.json()["snapshot"],
+            "reason": "Three validator scoring failures exhausted every retry budget",
+            "confirmation": "REMOVE FROM VALIDATOR QUEUE",
+        },
+    )
+    assert denied.status_code == 409
+
+
+async def test_withdraw_remains_available_after_operator_retry_limit(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker)
+    async with retry_maker() as session, session.begin():
+        for index in range(3):
+            session.add(
+                ValidatorRetryRecovery(
+                    recovery_id=uuid4(),
+                    agent_id=agent_id,
+                    actor="operator",
+                    reason="Prior validator infrastructure recovery",
+                    expected_snapshot=str(index) * 64,
+                    score_count=0,
+                    bench_version=DEFAULT_BENCH_VERSION,
+                    ticket_snapshot=[],
+                    granted_validator_hotkeys=[f"validator-{index}"],
+                    created_at=_T0 + timedelta(minutes=index),
+                )
+            )
+    _install(app, retry_maker)
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    assert detail.status_code == 200
+    assert detail.json()["recovery_allowed"] is False
+    assert detail.json()["withdrawal_allowed"] is True
 
 
 async def test_replace_one_validators_score_and_reissue_same_ticket(

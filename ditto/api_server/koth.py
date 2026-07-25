@@ -53,6 +53,8 @@ class KothEntry:
     raw_rank: int
     bench_version: int = 1
     composite_stderr: float | None = None
+    quorum_composites: tuple[float, ...] | None = None
+    completed_wave_composites: tuple[float, ...] | None = None
     confirmation_composites: tuple[float, ...] | None = None
     confirmation_seeds: tuple[int, ...] | None = None
 
@@ -182,7 +184,7 @@ def project_koth(entries: Sequence[KothEntry]) -> KothProjection | None:
         sorted(
             (entry for entry in scored if entry.miner_hotkey != champion.miner_hotkey),
             key=lambda entry: (
-                -entry.composite,
+                -effective_composite(entry),
                 entry.first_seen,
                 entry.agent_id,
             ),
@@ -190,7 +192,11 @@ def project_koth(entries: Sequence[KothEntry]) -> KothProjection | None:
     )
     raw_leader = sorted(
         scored,
-        key=lambda entry: (-entry.composite, entry.first_seen, entry.agent_id),
+        key=lambda entry: (
+            -effective_composite(entry),
+            entry.first_seen,
+            entry.agent_id,
+        ),
     )[0]
     decision = (
         None
@@ -214,7 +220,36 @@ def _confirmations(entry: KothEntry) -> tuple[float, ...] | None:
     return values
 
 
-def _effective_composite(entry: KothEntry) -> float:
+def _validated_composites(
+    values: tuple[float, ...] | None, *, minimum: int
+) -> tuple[float, ...] | None:
+    if values is None or len(values) < minimum:
+        return None
+    if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in values):
+        return None
+    return values
+
+
+def effective_composite(entry: KothEntry) -> float:
+    """Return the score that drives the continual leaderboard and weight fold.
+
+    An agent starts on the robust three-validator median stored in
+    ``entry.composite``. Once at least one completed cohort wave exists, the
+    estimator has four or more independent observations and switches to the
+    arithmetic mean of the three signed quorum scores plus one score per wave.
+    Partial waves are never supplied here, so a faster cohort member cannot move
+    the leaderboard before its peers complete the same seed.
+
+    Older in-row confirmation bundles remain a compatibility fallback for
+    already-issued pre-wave work. They may settle a paired KOTH comparison, but
+    do not masquerade as completed continual-score waves.
+    """
+    quorum = _validated_composites(entry.quorum_composites, minimum=3)
+    waves = _validated_composites(entry.completed_wave_composites, minimum=1)
+    if quorum is not None and len(quorum) == 3 and waves is not None:
+        samples = (*quorum, *waves)
+        return math.fsum(samples) / len(samples)
+
     values = _confirmations(entry)
     if values is None:
         return entry.composite
@@ -223,6 +258,11 @@ def _effective_composite(entry: KothEntry) -> float:
     if len(ordered) % 2:
         return ordered[midpoint]
     return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
+def _effective_composite(entry: KothEntry) -> float:
+    """Backward-compatible private alias for existing callers and tests."""
+    return effective_composite(entry)
 
 
 def _stderr(entry: KothEntry) -> float | None:

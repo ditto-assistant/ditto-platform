@@ -15,6 +15,14 @@ SN118 publishes publicly and how. Implementation tracked per section below.
    researchers who want full per-epoch telemetry.
 3. **Public read API = yes.** Add a rate-limited, no-auth read endpoint so the
    dashboard (and anyone) can read the leaderboard without a validator hotkey.
+4. **Submitted source becomes public after finalization.** Every cleared
+   submission becomes downloadable after the configured embargo (24 hours by
+   default, operator-shortenable to 6 hours) from its third accepted validator
+   score. The clock is derived from immutable score insertion timestamps, so the
+   policy applies retroactively without a backfill. Scores from different
+   benchmark versions never combine into a quorum. Quarantined, held, and
+   rejected submissions remain private unless an operator clears them; a clear
+   uses the original quorum time rather than restarting the embargo.
 
 ## Anti-gaming posture (the load-bearing rule)
 
@@ -105,9 +113,15 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   `registered` is a live chain decoration, not platform ownership: `false`
   preserves the immutable submission and score while excluding that hotkey from
   active weights and emissions; `null` means the chain snapshot was unavailable.
-  The optional chain lookup has a one-second deadline and a bounded, short-lived
-  in-process snapshot cache, so Pylon latency or failure cannot fail the public
-  leaderboard. The dashboard presents `null` explicitly as unknown and requires
+  Each entry also carries `artifact_release`, the submission-specific source
+  state described below; source visibility is independent of KOTH rank.
+  The optional chain lookup has a short deadline and a bounded in-process
+  snapshot cache, so Pylon latency or failure cannot fail the public
+  leaderboard. A failed refresh keeps serving the last successful mapping and
+  sets the response-level `registration_stale` flag rather than blanking the
+  column: the values stay real, just not re-confirmed as of that response. Only
+  when there is no recent good read at all does `registered` go `null`.
+  The dashboard presents `null` explicitly as unknown and requires
   the KOTH projection before showing champion or recipient treatment.
   **Never** included: `seed` (anti-overfit), `per_case` `expected`/`called` (the
   answer key), sha256/signature/validator_hotkey (integrity-internal). The full
@@ -119,8 +133,9 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   miner can confirm progress before a score exists. Screening failures expose a
   stable failure category; anti-copy holds expose the matched agent and signal
   summary. Internal review and ban states are collapsed to `under_review` /
-  `rejected`. Artifact locations, hashes, payments, and raw screener/build logs
-  are never included.
+  `rejected`. `artifact_release` exposes only the derived quorum/embargo state;
+  signed download URLs, source hashes, payments, and raw screener/build logs are
+  never included in this listing.
 - `GET /api/v1/public/agent/{agent_id}/pipeline` → versioned screening history,
   validator assignment progress, and `provisional_scores` as soon as the
   platform accepts them. Each score exposes only `composite`, the post-commit
@@ -163,14 +178,15 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   than fabricated metrics.
 - `GET /api/v1/public/submissions?limit=` → `{ generated_at, count, quorum,
   submissions: [ { agent_id, miner_hotkey, status, score_count,
-  median_composite, dataset_seed, dataset_sha256, last_scored_at } ] }`.
+  median_composite, dataset_seed, dataset_sha256, last_scored_at,
+  artifact_release } ] }`.
   The index over the **k=3 transparency records**, most recently scored first.
   Only settled public scores (`scored` / `live`) appear; held-for-review and
   still-evaluating agents are excluded so a provisional or accused agent is never
   surfaced.
 - `GET /api/v1/public/agent/{agent_id}/scores` → `{ agent_id, miner_hotkey,
   status, quorum, score_count, median_composite, dataset_seed, dataset_sha256,
-  dataset_run_size, scores: [ { validator_hotkey, composite, tool_mean,
+  dataset_run_size, artifact_release, scores: [ { validator_hotkey, composite, tool_mean,
   memory_mean, median_ms, n, seed, run_id, signature, generated_at } ] }`.
   The full k=3 breakdown for one finalized agent: *which* validators scored it,
   each one's exact numbers + sr25519 signature (self-verifying against the
@@ -179,6 +195,15 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   an unknown or not-yet-public agent. This is the one surface that intentionally
   exposes `validator_hotkey` + raw `seed` (see the anti-gaming posture above); it
   still omits `per_case`.
+- `GET /api/v1/public/agent/{agent_id}/artifact` → `{ agent_id, bench_version,
+  sha256, finalized_at, download_url, expires_at }`.
+  Returns a five-minute private-bucket URL only when one benchmark version has
+  three independently inserted score rows, the configured embargo has elapsed since the
+  third row, and the agent is currently in a cleared finalized state (`scored`
+  or legacy `live`). Before the deadline it fails with 425; unknown,
+  held-for-review, quarantined, and rejected agents fail closed with 404. The
+  response is `private, no-store`. A fourth score, re-score, benchmark rollover,
+  leaderboard change, or deregistration never resets the original clock.
 - `GET /api/v1/public/agent/{agent_id}/dataset` → `{ agent_id, miner_hotkey,
   seed, run_size, dataset_sha256, bench_version, dataset_seed_block(+hash),
   artifact }`.
@@ -232,6 +257,15 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   miner a validator's **top choice** when it has that validator's highest revealed
   miner weight, and counts **validator support** whenever it has any revealed
   weight. The term **champion** is reserved for the KOTH emissions projection.
+  The chain read is cached and refreshed in the background (one in-flight read
+  process-wide, no matter how many clients are polling), so a served response
+  never waits on chain. `generated_at` is therefore when the matrix was read
+  rather than when the response was served, and `age_seconds` is the gap. When a
+  re-read fails, the last known good matrix is served with `stale: true` instead
+  of a 503 — the block it pins is still real chain state, just older — and a
+  reader should label it rather than treat the matrix as absent. A 503 is
+  reserved for having never read the matrix, or having last read it so long ago
+  that presenting it would misrepresent current chain state.
 - `GET /api/v1/public/health` → subnet rollup **from what the platform records**:
   `miners`, `scored_miners`, `scored_agents`, `last_scored_at`, `scores_24h`,
   `avg_latency_ms`. Note: no `success_rate` — the platform only ever sees a
@@ -268,6 +302,21 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   digests, and provenance are self-reported compatibility telemetry: the
   validator signature proves who reported them, not independent host or image
   attestation. Signatures and arbitrary host/container fields remain private.
+
+  Heartbeat protocol v15 adds `capabilities.scorer_benchmarks.probe`: the
+  observation behind the scorer status rather than the conclusion drawn from it.
+  It carries `outcome` (`served`, `served_degraded`, `http_error`, `unreadable`,
+  `timeout`, `connect_error`, `not_probed`), the `observed_at` of the probe, the
+  `http_status` when the scorer answered, a `reason` when a readable reply was
+  partly rejected, `last_served_at`, and `consecutive_failures`. Without it a
+  scorer that never answered and a scorer that answered with something unusable
+  are identical on the wire: both report null identity fields. The field is
+  additive and optional, so a pre-v15 reporter signs exactly the bytes it always
+  did and reads `scorer_liveness: unreported`, never a claim that its scorer is
+  fine. A validator whose probe reports no usable answer is published as
+  `health: critical`, which is why `critical` joins the fleet health values.
+  Reporting is deliberately not a precondition for acceptance: telemetry that
+  can silence a validator is worse than telemetry that is missing.
 
   Heartbeat protocol v4 optionally signs a ticket-bound benchmark stage and
   aggregate `completed`/`total` check counts. The platform revalidates the live
@@ -347,6 +396,8 @@ for the deep dive. Sections:
 - **Submission pipeline** — recent agent uploads, miner hotkey, public lifecycle
   stage, screening/review evidence, submission time, and accepted provisional
   composites with reproducibility commands, visible before scoring completes.
+  Each submission shows its current source-release embargo and exposes a download
+  control once available.
 - **Leaderboard** — rank, miner, composite, category radar sparkline, weight %,
   trend arrow; champion highlighted.
 - **Miner drill-down** — composite history, category radar, ATH badge, best run

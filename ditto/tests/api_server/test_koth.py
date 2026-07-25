@@ -10,6 +10,7 @@ import pytest
 from ditto.api_server.koth import (
     BLOCKS_PER_TEMPO,
     KothEntry,
+    effective_composite,
     emission_set,
     project_koth,
     tempo_index,
@@ -28,6 +29,8 @@ def _entry(
     confirmations: tuple[float, ...] | None = None,
     seeds: tuple[int, ...] | None = None,
     bench_version: int = 1,
+    quorum: tuple[float, ...] | None = None,
+    waves: tuple[float, ...] | None = None,
 ) -> KothEntry:
     return KothEntry(
         miner_hotkey="5" + str(marker) * 47,
@@ -37,9 +40,29 @@ def _entry(
         raw_rank=marker,
         bench_version=bench_version,
         composite_stderr=stderr,
+        quorum_composites=quorum,
+        completed_wave_composites=waves,
         confirmation_composites=confirmations,
         confirmation_seeds=seeds,
     )
+
+
+def test_completed_waves_switch_from_quorum_median_to_rolling_mean() -> None:
+    entry = _entry(
+        1,
+        0.8,
+        minutes=0,
+        quorum=(0.7, 0.8, 0.9),
+        waves=(0.5, 1.0),
+    )
+
+    assert effective_composite(entry) == pytest.approx(0.78)
+
+
+def test_partial_or_missing_wave_keeps_canonical_median() -> None:
+    entry = _entry(1, 0.8, minutes=0, quorum=(0.7, 0.8, 0.9))
+
+    assert effective_composite(entry) == 0.8
 
 
 @pytest.mark.parametrize("bench_version", [6, 7, 8])

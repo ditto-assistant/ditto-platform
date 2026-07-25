@@ -140,6 +140,12 @@ class PublicCaseResult(BaseModel):
     correct case would reveal ``expected``), and the seed-derived ``case_id``.
     Combined with per-submission seed rotation, this lets anyone inspect a run's
     per-case strengths/weaknesses without learning anything that helps overfit.
+
+    ``notes`` is drawn from a **closed vocabulary** of mechanical verdicts. The
+    scorers themselves interpolate dataset content into some notes (the matched
+    distractor value, required/forbidden argument names); the public projection
+    rebuilds each note from validated primitives and drops anything it does not
+    recognize, so the value a note was rendered around never reaches the wire.
     """
 
     category: Annotated[
@@ -155,7 +161,13 @@ class PublicCaseResult(BaseModel):
     ]
     notes: Annotated[
         list[str] | None,
-        Field(default=None, description="Scorer's mechanical notes (no answers)."),
+        Field(
+            default=None,
+            description=(
+                "Scorer's mechanical notes, from a closed vocabulary (no answers, "
+                "no dataset values, no agent-supplied text)."
+            ),
+        ),
     ]
 
 
@@ -270,6 +282,53 @@ class PublicCompositeBreakdown(BaseModel):
     final_composite: Annotated[float, Field(ge=0.0, le=1.0)]
 
 
+class PublicArtifactRelease(BaseModel):
+    """Public-source eligibility derived from a submission's score quorum."""
+
+    status: Literal[
+        "awaiting_quorum", "under_review", "embargoed", "available", "unavailable"
+    ]
+    bench_version: Annotated[int | None, Field(default=None, ge=1)] = None
+    score_quorum: Annotated[int, Field(default=3, ge=1)] = 3
+    embargo_hours: Annotated[int, Field(default=6, ge=1)] = 6
+    finalized_at: datetime | None = None
+    crowned_at: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description=(
+                "When this agent first became the KOTH king (eligibility marker). "
+                "Null for a submission that has never held the crown."
+            ),
+        ),
+    ] = None
+    weight_confirmed_at: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description=(
+                "When validators' revealed on-chain weights (post commit-reveal) "
+                "were first seen set on this king. Source release is king-only and "
+                "the embargo window is measured from this instant; null while a "
+                "king still awaits on-chain confirmation."
+            ),
+        ),
+    ] = None
+    available_at: datetime | None = None
+    download_available: bool = False
+
+
+class PublicArtifactDownload(BaseModel):
+    """Short-lived download credential for an embargo-cleared source tarball."""
+
+    agent_id: UUID
+    bench_version: Annotated[int, Field(ge=1)]
+    sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    finalized_at: datetime
+    download_url: Annotated[str, Field(min_length=1)]
+    expires_at: datetime
+
+
 class PublicLeaderboardEntry(BaseModel):
     """One miner's best score, aggregate-only, for public display.
 
@@ -327,6 +386,7 @@ class PublicLeaderboardEntry(BaseModel):
             description="Winning submission's version; null for legacy uploads.",
         ),
     ] = None
+    artifact_release: PublicArtifactRelease | None = None
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Miner's SS58 hotkey.")
     ]
@@ -370,9 +430,34 @@ class PublicLeaderboardEntry(BaseModel):
         Field(
             ge=0.0,
             le=1.0,
-            description="Best composite in [0,1].",
+            description=(
+                "Canonical three-validator median in [0,1]. Preserved for score "
+                "provenance; use official_composite for current ranking."
+            ),
         ),
     ]
+    official_composite: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Composite used for the current leaderboard and weight fold. It "
+                "starts as the canonical three-validator median, then becomes "
+                "the arithmetic mean of those three scores plus every completed "
+                "continual cohort-wave score. Partial waves never enter it."
+            ),
+        ),
+    ]
+    aggregate_method: Literal["canonical_median", "continual_mean"] = "canonical_median"
+    aggregate_sample_count: Annotated[int, Field(ge=3)] = 3
+    completed_wave_count: Annotated[int, Field(ge=0)] = 0
+    initial_quorum_composites: list[Annotated[float, Field(ge=0.0, le=1.0)]] = Field(
+        default_factory=list
+    )
+    completed_wave_composites: list[Annotated[float, Field(ge=0.0, le=1.0)]] = Field(
+        default_factory=list
+    )
     raw_composite: Annotated[
         float | None,
         Field(
@@ -380,6 +465,49 @@ class PublicLeaderboardEntry(BaseModel):
             ge=0.0,
             le=1.0,
             description="Pre-efficiency v5 quality score, when present.",
+        ),
+    ] = None
+    efficiency_bonus: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=0.1,
+            description=(
+                "Frozen platform-side relative token-efficiency bonus fraction "
+                "(bench_version >= 7 only). Assigned once against the frozen "
+                "cohort snapshot of the epoch this submission finalized in and "
+                "never recomputed. Strictly additive: never negative, capped at "
+                "the epoch's frozen B_max. Null below bench_version 7, while "
+                "the bonus is disabled/inactive, or before assignment."
+            ),
+        ),
+    ] = None
+    effective_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.1,
+            description=(
+                "composite * (1 + efficiency_bonus): the platform-side ranking "
+                "score with the frozen bonus applied. The validator's composite "
+                "is never modified; this is a separate, derived field so the UI "
+                "can show provenance (base, bonus, effective) distinctly. Null "
+                "whenever efficiency_bonus is null."
+            ),
+        ),
+    ] = None
+    efficiency_snapshot_id: Annotated[
+        UUID | None,
+        Field(
+            default=None,
+            description=(
+                "Id of the frozen cohort snapshot the bonus was computed "
+                "against (the bonus_reference provenance pointer); resolvable "
+                "at /public/efficiency/snapshots/{snapshot_id}. Null whenever "
+                "efficiency_bonus is null."
+            ),
         ),
     ] = None
     composite_stderr: Annotated[
@@ -722,6 +850,176 @@ class PublicKothEmissions(BaseModel):
     recipients: list[PublicEmissionRecipient] = Field(default_factory=list)
 
 
+class PublicEfficiencyStatus(BaseModel):
+    """Where the relative token-efficiency bonus stands for a displayed board.
+
+    Only present for bench_version >= 7 boards while the bonus feature is
+    enabled. ``active=false`` means the frozen cohort has not reached the
+    ``n_min`` activation gate (after lineage dedupe) — every bonus is zero and
+    entries carry null efficiency fields until a later epoch activates.
+    """
+
+    active: Annotated[
+        bool,
+        Field(description="Whether the governing frozen cohort awards bonuses."),
+    ]
+    bench_version: Annotated[int, Field(ge=7)]
+    run_size: Annotated[
+        str, Field(description="Generator profile of the cohort (ranked = full).")
+    ]
+    epoch_index: Annotated[
+        int,
+        Field(description="Efficiency epoch ordinal of the governing snapshot."),
+    ]
+    snapshot_id: Annotated[
+        UUID,
+        Field(
+            description=(
+                "Frozen cohort snapshot id; resolvable at "
+                "/public/efficiency/snapshots/{snapshot_id}."
+            )
+        ),
+    ]
+    cohort_size: Annotated[
+        int,
+        Field(ge=0, description="Deduped qualified cohort members at freeze time."),
+    ]
+    n_min: Annotated[
+        int, Field(ge=2, description="Activation gate on the deduped cohort size.")
+    ]
+    bonus_cap: Annotated[
+        float,
+        Field(
+            gt=0.0,
+            le=0.1,
+            description="Frozen tier-1 bonus fraction B_max (the value at P25).",
+        ),
+    ]
+    curve_version: Annotated[
+        int,
+        Field(
+            default=1,
+            ge=1,
+            description=(
+                "Frozen bonus-curve policy: 1 = single-tier (cap at/below "
+                "P25), 2 = two-tier (cap ramps to deep_bonus_cap between P25 "
+                "and the deep frontier, then saturates flat)."
+            ),
+        ),
+    ] = 1
+    deep_bonus_cap: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0.0,
+            le=0.1,
+            description=(
+                "Frozen tier-2 saturation cap (two-tier curve only): the flat "
+                "bonus at or below the deep frontier. Null under the "
+                "single-tier policy."
+            ),
+        ),
+    ] = None
+    deep_frontier_tokens: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            description=(
+                "The deep frontier in tokens (deep_frontier_ratio x P25): "
+                "usage at or below it earns the flat deep_bonus_cap — no "
+                "extra reward for racing further toward zero. Null while "
+                "inactive or under the single-tier policy."
+            ),
+        ),
+    ] = None
+    reference_p25_tokens: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            description=(
+                "Efficient-quartile frontier (nearest-rank P25 of the cohort's "
+                "audited chat token totals): the tier-1 full-bonus point. "
+                "Null while inactive."
+            ),
+        ),
+    ] = None
+    reference_median_tokens: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            description=(
+                "Cohort median of audited chat token totals: usage at or above "
+                "it earns zero bonus (linear in between). Null while inactive."
+            ),
+        ),
+    ] = None
+
+
+class PublicEfficiencyCohortMember(BaseModel):
+    """One frozen cohort entry, public-safe (no raw lineage digests)."""
+
+    agent_id: UUID
+    miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    composite: Annotated[float, Field(ge=0.0, le=1.0)]
+    memory_mean: Annotated[float, Field(ge=0.0, le=1.0)]
+    token_total: Annotated[
+        float,
+        Field(ge=0.0, description="Audited chat token total (quorum median)."),
+    ]
+    lineage_group: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Opaque ordinal of this entry's lineage within the snapshot. "
+                "The raw lineage digest (normalized-source / artifact hash) is "
+                "moderation-adjacent and never exposed."
+            ),
+        ),
+    ]
+    collapsed_agent_ids: Annotated[
+        list[UUID],
+        Field(
+            default_factory=list,
+            description=(
+                "Other qualified agents collapsed into this entry because they "
+                "shared its lineage (one lineage cannot define the frontier)."
+            ),
+        ),
+    ]
+
+
+class PublicEfficiencySnapshotResponse(BaseModel):
+    """One immutable frozen cohort snapshot — the full audit record a bonus is
+    reproducible from (membership, floors, reference statistics)."""
+
+    snapshot_id: UUID
+    bench_version: Annotated[int, Field(ge=7)]
+    run_size: str
+    epoch_index: int
+    active: bool
+    cohort_limit: Annotated[int, Field(ge=2)]
+    n_min: Annotated[int, Field(ge=2)]
+    bonus_cap: Annotated[float, Field(gt=0.0, le=0.1)]
+    curve_version: Annotated[int, Field(default=1, ge=1)] = 1
+    deep_bonus_cap: Annotated[float | None, Field(default=None, gt=0.0, le=0.1)] = None
+    deep_frontier_ratio: Annotated[
+        float | None, Field(default=None, gt=0.0, lt=1.0)
+    ] = None
+    quality_floor: Annotated[float, Field(ge=0.0, le=1.0)]
+    memory_floor: Annotated[float, Field(ge=0.0, le=1.0)]
+    reference_p25_tokens: Annotated[float | None, Field(default=None, ge=0.0)] = None
+    reference_median_tokens: Annotated[float | None, Field(default=None, ge=0.0)] = None
+    computed_at: datetime
+    members: Annotated[
+        list[PublicEfficiencyCohortMember],
+        Field(default_factory=list, description="Frozen deduped cohort entries."),
+    ]
+
+
 class PublicLeaderboardResponse(BaseModel):
     """Raw score standings plus the current KOTH emissions projection."""
 
@@ -775,6 +1073,31 @@ class PublicLeaderboardResponse(BaseModel):
             )
         ),
     ]
+    continual_aggregate_active: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether completed continual waves currently update rankings and "
+                "validator weights. Activation is global and fail-closed until every "
+                "recently-live validator supports the required protocol."
+            )
+        ),
+    ] = False
+    continual_aggregate_required_protocol: Annotated[int, Field(ge=1)] = 14
+    registration_stale: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "True when each entry's `registered` / `miner_uid` come from a "
+                "previous successful chain read because the latest one failed. "
+                "The values are still real, just not confirmed as of this "
+                "response; a reader should label them rather than discard them. "
+                "`registered` is null (genuinely unknown) instead when there is "
+                "no recent good read to fall back on."
+            ),
+        ),
+    ] = False
     entries: Annotated[
         list[PublicLeaderboardEntry],
         Field(default_factory=list, description="Ranked miners, best composite first."),
@@ -786,6 +1109,19 @@ class PublicLeaderboardResponse(BaseModel):
             description=(
                 "Current KOTH fold over finalized, full-benchmark entries on the "
                 "current benchmark. Null when no entry can receive emissions."
+            ),
+        ),
+    ] = None
+    efficiency: Annotated[
+        PublicEfficiencyStatus | None,
+        Field(
+            default=None,
+            description=(
+                "Relative token-efficiency bonus status for this board. Null "
+                "below bench_version 7, while the feature is disabled, or "
+                "before the first cohort snapshot is frozen. active=false "
+                "means the frozen cohort has not reached its n_min activation "
+                "gate and every bonus is zero."
             ),
         ),
     ] = None
@@ -810,12 +1146,41 @@ class PublicValidatorWeightVector(BaseModel):
 class PublicChainWeightsResponse(BaseModel):
     """Block-consistent SN118 weight matrix read from Subtensor storage."""
 
-    generated_at: datetime
+    generated_at: Annotated[
+        datetime,
+        Field(
+            description=(
+                "When this matrix was read from chain (UTC) — not when the "
+                "response was served. The read is cached, so a response can be "
+                "served some time after `generated_at`; `age_seconds` is the gap."
+            )
+        ),
+    ]
     netuid: Annotated[int, Field(ge=0)]
     block: Annotated[int, Field(ge=0)]
     block_hash: Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{64}$")]
     owner_hotkey: Annotated[str | None, Field(default=None, pattern=_SS58_PATTERN)]
     vectors: list[PublicValidatorWeightVector] = Field(default_factory=list)
+    stale: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "True when the most recent attempt to re-read the matrix failed "
+                "and this is the last known good one. The block it pins is real "
+                "chain state, just older than a normal response; a reader should "
+                "label it rather than treat the matrix as absent."
+            ),
+        ),
+    ] = False
+    age_seconds: Annotated[
+        float,
+        Field(
+            default=0.0,
+            ge=0.0,
+            description="Seconds between the chain read and this response.",
+        ),
+    ] = 0.0
 
 
 class PublicValidatorScore(BaseModel):
@@ -987,6 +1352,7 @@ class PublicSubmissionScores(BaseModel):
         str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
     ]
     status: Annotated[str, Field(description='Public status ("scored" or "live").')]
+    artifact_release: PublicArtifactRelease
     quorum: Annotated[
         int, Field(ge=1, description="Validators required to finalize (k=3).")
     ]
@@ -1050,6 +1416,7 @@ class PublicSubmissionSummary(BaseModel):
         str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
     ]
     status: Annotated[str, Field(description='Public status ("scored" or "live").')]
+    artifact_release: PublicArtifactRelease
     score_count: Annotated[
         int, Field(ge=0, description="Score rows recorded for this agent.")
     ]
@@ -1091,7 +1458,15 @@ class PublicSubmissionsResponse(BaseModel):
 
 
 class PublicBenchmarkProgress(BaseModel):
-    """Ticket-validated and coarsened public benchmark progress allowlist."""
+    """Ticket-validated public benchmark progress allowlist.
+
+    The allowlist itself is unchanged and remains closed: stage plus aggregate
+    counts, never per-case identity, question text, verdicts, seeds or timings.
+    ``percent`` is no longer quantized to 5% buckets — it is derived from the
+    exact ``completed_checks``/``total_checks`` already on this model, which an
+    observer can divide anyway, so the quantizer degraded the progress bar
+    without withholding anything.
+    """
 
     agent_id: UUID
     slot_id: str = "slot-0"
@@ -1105,17 +1480,31 @@ class PublicBenchmarkProgress(BaseModel):
     stage: BenchmarkProgressStage | None = None
     completed_checks: Annotated[int | None, Field(default=None, ge=0)] = None
     total_checks: Annotated[int | None, Field(default=None, ge=1)] = None
-    percent: Annotated[int | None, Field(default=None, ge=0, le=95, multiple_of=5)] = (
-        None
-    )
+    percent: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=0,
+            le=100,
+            description=(
+                "Exact completion percentage from the reported check counts. "
+                "Held below 100 until the run reaches finalizing/submitting, so "
+                "a full bar always means the work is actually finished."
+            ),
+        ),
+    ] = None
     stalled: Annotated[
         bool,
         Field(
             default=False,
             description=(
-                "The run has sat in an early stage (preparing/building/starting "
-                "the harness) far longer than that stage should take, so it is "
-                "very likely stuck rather than progressing."
+                "The run has taken far longer than its own reported progress "
+                "allows — either sitting in an early stage (preparing/building/"
+                "generating/starting the harness) past the point that stage "
+                "should ever take, or running with a check count too frozen to "
+                "explain the elapsed time. Distinct from validator liveness: a "
+                "stalled run still heartbeats, while a validator that has "
+                "stopped reporting is surfaced as offline/heartbeat_stale."
             ),
         ),
     ] = False
@@ -1148,6 +1537,7 @@ class PublicActivityEntry(BaseModel):
             )
         ),
     ]
+    artifact_release: PublicArtifactRelease
     submitted_at: Annotated[
         datetime, Field(description="When the platform accepted the upload (UTC).")
     ]
@@ -1802,7 +2192,15 @@ class PublicHealthResponse(BaseModel):
 
 
 FleetAvailability = Literal["available", "stale", "offline", "paused", "unknown"]
-FleetHealth = Literal["healthy", "warning", "unknown"]
+# ``critical`` is reserved for a validator that cannot do the one job it exists
+# to do. A scorer that is not serving belongs there and not next to a stalled
+# disk: both were ``warning`` before, and the fleet view could not tell an
+# inconvenience from a validator taking leases it can never complete.
+FleetHealth = Literal["healthy", "warning", "critical", "unknown"]
+# Whether the validator's scorer actually answered its capability probe.
+# ``unreported`` covers both a validator too old to carry probe evidence and one
+# that carried none; it is never a claim that the scorer is fine.
+ScorerLiveness = Literal["serving", "degraded", "not_serving", "unreported"]
 ValidatorAssignmentState = Literal[
     # The validator is doing exactly the work the platform leased it.
     "synchronized",
@@ -1859,6 +2257,19 @@ class PublicValidatorHeartbeat(BaseModel):
     online: bool
     availability: FleetAvailability
     health: FleetHealth
+    scorer_liveness: Annotated[
+        ScorerLiveness,
+        Field(
+            default="unreported",
+            description=(
+                "Whether the validator's scorer answered its `/v1/capabilities` "
+                "probe: `serving`, `degraded` (answered, part of the reply "
+                "rejected), `not_serving` (no usable answer), or `unreported` "
+                "(no probe evidence on this heartbeat). Requires heartbeat "
+                "protocol 15; older validators always read `unreported`."
+            ),
+        ),
+    ]
     health_reasons: Annotated[
         list[str],
         Field(

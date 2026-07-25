@@ -14,6 +14,7 @@ from ditto.db.models import Agent, ConfirmationScore
 from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
+    completed_confirmation_wave_seeds,
     confirmation_composites_by_seed,
     confirmation_depths,
     confirmation_history_by_agent,
@@ -113,6 +114,17 @@ class TestAppendConfirmationScores:
 
 
 class TestConfirmationAggregates:
+    def test_only_complete_cohort_waves_are_fold_eligible(self) -> None:
+        first, second, third = uuid4(), uuid4(), uuid4()
+        assert completed_confirmation_wave_seeds(
+            member_ids=[first, second, third],
+            seeds_by_agent={
+                first: [100, 200, 300],
+                second: [100, 200],
+                third: [100],
+            },
+        ) == frozenset({100})
+
     async def test_composites_by_seed_medians_across_validators(
         self, session: AsyncSession
     ) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -21,12 +21,14 @@ from ditto.api_models.benchmark_progress import (
     BenchmarkProgressStage,
 )
 from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.validator_capabilities import ValidatorCapabilities
 from ditto.db.models import (
     Agent,
     ScreenerHeartbeat,
     ValidatorHeartbeat,
     ValidatorTicket,
 )
+from ditto.metrics import VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,14 +37,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Every member of ``BenchmarkProgressStage`` must appear here. ``_STAGE_ORDER`` is
+# subscripted directly by :func:`_validate_same_lease_progress`, so a missing
+# stage raises ``KeyError`` — not ``HeartbeatProgressRegressionError`` — which no
+# call site catches. That escapes as a 500 from the heartbeat ingest, freezing
+# ``seen_at`` and making an actively scoring validator read as heartbeat_stale:
+# exactly the "stuck stream looks like a stuck run" confusion this module is
+# supposed to resolve. ``generating_dataset`` was added to the wire enum without
+# being added here. mypy cannot catch it (a ``dict[Literal, int]`` literal need
+# not be exhaustive), so ``test_stage_order_covers_every_wire_stage`` does.
 _STAGE_ORDER: dict[BenchmarkProgressStage, int] = {
     "preparing": 0,
     "building_harness": 1,
-    "starting_harness": 2,
-    "running_benchmark": 3,
-    "finalizing": 4,
-    "submitting_result": 5,
-    "failed_retrying": 6,
+    "generating_dataset": 2,
+    "starting_harness": 3,
+    "running_benchmark": 4,
+    "finalizing": 5,
+    "submitting_result": 6,
+    "failed_retrying": 7,
 }
 
 
@@ -164,6 +176,49 @@ def _reconcile_capacity_progress(
     )
 
 
+def _regresses_within_run(
+    row: ValidatorHeartbeat,
+    *,
+    benchmark_progress: dict | None,
+    active_agent_id: UUID | None,
+    validator_hotkey: str,
+) -> bool:
+    """Whether the incoming progress walks the stored progress backwards.
+
+    True means "keep what is stored as the public display floor". This is a pure
+    read over already-loaded values so callers can guard it without a savepoint.
+    """
+    if row.benchmark_progress is None or benchmark_progress is None:
+        return False
+    try:
+        previous_progress = _parse_progress(row.benchmark_progress)
+        current_progress = _parse_progress(benchmark_progress)
+    except ValidationError:
+        # A malformed stored or incoming blob is not a reason to reject an
+        # authenticated liveness report. Fail open: skip monotonicity and
+        # accept the incoming progress.
+        return False
+    if row.benchmark_progress_agent_id != active_agent_id or not _is_same_run(
+        previous_progress, current_progress
+    ):
+        # A changed lease or run_token rebaselines: the fresh run restarts its
+        # counts legitimately, so monotonicity does not apply across the boundary.
+        return False
+    # Same lease, same run: enforce monotonicity, but fail open on a regression.
+    try:
+        _validate_same_lease_progress(previous_progress, current_progress)
+    except HeartbeatProgressRegressionError:
+        logger.info(
+            "validator heartbeat kept prior progress after regression "
+            "validator=%s stored_stage=%s incoming_stage=%s",
+            validator_hotkey,
+            previous_progress.stage,
+            current_progress.stage,
+        )
+        return True
+    return False
+
+
 async def upsert_validator_heartbeat(
     session: AsyncSession,
     *,
@@ -182,6 +237,7 @@ async def upsert_validator_heartbeat(
     stack: dict | None = None,
     stack_health: dict | None = None,
     benchmark_capacity: dict | None = None,
+    claimed_slots: list[dict] | None = None,
 ) -> tuple[ValidatorHeartbeat, bool]:
     """Persist only a strictly newer heartbeat; return ``(row, accepted)``."""
     row = await session.scalar(
@@ -209,6 +265,7 @@ async def upsert_validator_heartbeat(
             "stack": stack,
             "stack_health": stack_health,
             "benchmark_capacity": benchmark_capacity,
+            "claimed_slots": claimed_slots,
             "reported_at": reported_at,
             "seen_at": seen_at,
             "signature": signature,
@@ -258,38 +315,26 @@ async def upsert_validator_heartbeat(
             existing_reported_at = existing_reported_at.replace(tzinfo=UTC)
         if reported_at <= existing_reported_at:
             return row, False
-        if row.benchmark_progress is not None and benchmark_progress is not None:
-            previous_progress: BenchmarkProgress | None
-            current_progress: BenchmarkProgress | None
-            try:
-                previous_progress = _parse_progress(row.benchmark_progress)
-                current_progress = _parse_progress(benchmark_progress)
-            except ValidationError:
-                # A malformed stored or incoming blob is not a reason to reject an
-                # authenticated liveness report. Fail open: skip monotonicity and
-                # accept the incoming progress.
-                previous_progress = None
-                current_progress = None
-            if (
-                previous_progress is not None
-                and current_progress is not None
-                and row.benchmark_progress_agent_id == active_agent_id
-                and _is_same_run(previous_progress, current_progress)
-            ):
-                # Same lease, same run: enforce monotonicity, but fail open on a
-                # regression. A changed run_token skips this block entirely and
-                # rebaselines (the fresh run restarts its counts legitimately).
-                try:
-                    _validate_same_lease_progress(previous_progress, current_progress)
-                except HeartbeatProgressRegressionError:
-                    keep_stored_progress = True
-                    logger.info(
-                        "validator heartbeat kept prior progress after regression "
-                        "validator=%s stored_stage=%s incoming_stage=%s",
-                        validator_hotkey,
-                        previous_progress.stage,
-                        current_progress.stage,
-                    )
+        # Payload reasoning, not liveness. It runs on data already in memory, so
+        # a failure here cannot poison the transaction — but it must not escape
+        # either, because everything below it is the liveness write.
+        try:
+            keep_stored_progress = _regresses_within_run(
+                row,
+                benchmark_progress=benchmark_progress,
+                active_agent_id=active_agent_id,
+                validator_hotkey=validator_hotkey,
+            )
+        except Exception as error:  # noqa: BLE001 - liveness must not depend on payload
+            keep_stored_progress = False
+            VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED.labels(
+                stage="progress_monotonicity", reason=type(error).__name__
+            ).inc()
+            logger.exception(
+                "validator heartbeat skipped progress monotonicity after an "
+                "unexpected failure validator=%s",
+                validator_hotkey,
+            )
     row.software_version = software_version
     row.protocol_version = protocol_version
     row.code_digest = code_digest
@@ -299,9 +344,23 @@ async def upsert_validator_heartbeat(
     row.capabilities = capabilities
     row.stack = stack
     row.stack_health = stack_health
-    row.benchmark_capacity = _reconcile_capacity_progress(
-        row.benchmark_capacity if not is_new else None, benchmark_capacity
-    )
+    try:
+        row.benchmark_capacity = _reconcile_capacity_progress(
+            row.benchmark_capacity if not is_new else None, benchmark_capacity
+        )
+    except Exception as error:  # noqa: BLE001 - liveness must not depend on payload
+        # Reconciliation only smooths per-slot display; the incoming capacity was
+        # already ticket-validated by the caller. Store it unreconciled rather
+        # than losing the liveness write this assignment sits inside.
+        row.benchmark_capacity = benchmark_capacity
+        VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED.labels(
+            stage="capacity_reconcile", reason=type(error).__name__
+        ).inc()
+        logger.exception(
+            "validator heartbeat stored unreconciled capacity after an "
+            "unexpected failure validator=%s",
+            validator_hotkey,
+        )
     if benchmark_progress is not None and not keep_stored_progress:
         row.benchmark_progress = benchmark_progress
         row.benchmark_progress_reported = True
@@ -316,6 +375,10 @@ async def upsert_validator_heartbeat(
         # private monotonic floor across idle/polling/downgrade heartbeats. The
         # public view follows this flag and therefore clears immediately.
         row.benchmark_progress_reported = False
+    # Straight off the verified signature: no reconciliation, no monotonicity.
+    # This is the validator's own statement about which slots it is busy on, and
+    # it is only ever read to REFUSE a revocation.
+    row.claimed_slots = claimed_slots
     row.reported_at = reported_at
     row.seen_at = seen_at
     row.signature = signature
@@ -333,6 +396,48 @@ async def list_validator_heartbeats(
         )
     )
     return list(result)
+
+
+async def live_validator_fleet_supports_protocol(
+    session: AsyncSession,
+    *,
+    minimum_protocol: int,
+    bench_version: int,
+    now: datetime,
+    freshness: timedelta = timedelta(minutes=15),
+) -> bool:
+    """Whether every recently-live benchmark-capable validator supports a contract.
+
+    Readiness is global within the fleet that can actually score ``bench_version``.
+    Legacy validators and unrelated scorer stacks cannot consume its continual
+    retest work and therefore must not hold its aggregate fold inactive. An empty
+    capable fleet still fails closed, and every capable member must meet the
+    protocol floor so compatible validators receive byte-equivalent semantics.
+    """
+    heartbeats = list(
+        await session.scalars(
+            select(ValidatorHeartbeat).where(
+                ValidatorHeartbeat.seen_at >= now - freshness
+            )
+        )
+    )
+    protocols: list[int] = []
+    for heartbeat in heartbeats:
+        try:
+            capabilities = ValidatorCapabilities.model_validate_json(
+                json.dumps(heartbeat.capabilities)
+            )
+        except ValidationError:
+            continue
+        scorer = capabilities.scorer_benchmarks
+        if (
+            scorer is None
+            or scorer.status != "fresh_verified"
+            or bench_version not in scorer.supported_bench_versions
+        ):
+            continue
+        protocols.append(heartbeat.protocol_version)
+    return bool(protocols) and min(protocols) >= minimum_protocol
 
 
 async def list_active_validator_work(

@@ -35,6 +35,7 @@ Lifecycle + scope decisions (documented so they're easy to revisit):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -44,6 +45,7 @@ import re
 import statistics
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -51,7 +53,7 @@ from uuid import UUID, uuid4
 import bittensor
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import (
@@ -77,6 +79,10 @@ from ditto.api_models.benchmark_capacity import (
 from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.benchmark_progress import benchmark_progress_signing_token
 from ditto.api_models.inference import InferenceGrantOffer
+from ditto.api_models.queue_policy_settings import (
+    PrevGenCarryoverSettings,
+    QueuePolicySettings,
+)
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.stack_health import (
     ValidatorStackHealth,
@@ -95,11 +101,16 @@ from ditto.api_models.validator_capabilities import (
     validator_artifact_mode,
     validator_identity_signing_token,
 )
+from ditto.api_models.validator_slot_settings import ValidatorSlotSettings
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
 from ditto.api_server.benchmark_rollout import (
     refresh_rolling_qualification,
 )
 from ditto.api_server.config import ValidatorCompatibilityConfig
+from ditto.api_server.continual_retest_settings import (
+    ContinualRetestSettingsResolver,
+    rollout_standdown_reason,
+)
 from ditto.api_server.crn import champion_anchored_seeds
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
@@ -119,14 +130,28 @@ from ditto.api_server.koth import (
     top5_round_is_due,
 )
 from ditto.api_server.onchain_seed import derive_validator_seed
+from ditto.api_server.queue_policy_settings import (
+    DEFAULT_SETTINGS as QUEUE_POLICY_DEFAULTS,
+)
+from ditto.api_server.queue_policy_settings import (
+    QueuePolicySettingsResolver,
+)
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
+from ditto.api_server.validator_slot_settings import (
+    DEFAULT_SETTINGS as SLOT_SETTINGS_DEFAULT,
+)
+from ditto.api_server.validator_slot_settings import (
+    ValidatorSlotSettingsResolver,
+    allowed_slot_count,
+)
 from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
     AthReview,
     BenchmarkDataset,
     BenchmarkRollout,
+    ConfirmationScore,
     InferenceGrant,
     Score,
     ValidatorHeartbeat,
@@ -143,6 +168,7 @@ from ditto.db.queries.audit import (
     get_latest_score_retest_event,
 )
 from ditto.db.queries.benchmark_admission import activated_rollout_for_version
+from ditto.db.queries.benchmark_carryover import carryover_agent_ids
 from ditto.db.queries.benchmark_rollout import (
     LEGACY_BENCH_VERSION,
     active_bench_version,
@@ -154,14 +180,21 @@ from ditto.db.queries.benchmark_rollout import (
 from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
+    completed_confirmation_wave_seeds,
     confirmation_composites_by_seed,
 )
+from ditto.db.queries.desired_era_backlog import desired_era_work_outstanding
 from ditto.db.queries.heartbeats import (
     HeartbeatProgressRegressionError,
     _validate_same_lease_progress,
     upsert_validator_heartbeat,
 )
 from ditto.db.queries.inference import ensure_inference_grant, revoke_ticket_inference
+from ditto.db.queries.king_reign import (
+    list_unconfirmed_kings,
+    record_first_crowned,
+    record_weight_confirmed,
+)
 from ditto.db.queries.payments import get_miner_coldkey_for_agent
 from ditto.db.queries.score_retests import activate_next_score_retest
 from ditto.db.queries.scores import (
@@ -175,6 +208,7 @@ from ditto.db.queries.scores import (
 from ditto.db.queries.tickets import (
     MAX_INFRA_RETRY_GRANTS,
     RETRY_COOLDOWN,
+    get_live_slot_ticket,
     get_open_ticket,
     infra_retry_backoff,
     issue_confirmation_ticket,
@@ -185,6 +219,7 @@ from ditto.db.queries.validator_auth import (
     ValidatorRequestReplayError,
     consume_validator_nonce,
 )
+from ditto.metrics import VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED
 
 if TYPE_CHECKING:
     from ditto.api_server.config import InferenceProxyConfig
@@ -305,11 +340,22 @@ def _transform_audit_verdict(
 
 router = APIRouter(prefix="/validator", tags=["validator"])
 
-# Three fresh-submission jobs for every one rollout-tail job. The counter is
-# per validator, so every validator rotates through both lanes and new agents
-# can still reach the three-validator scoring quorum.
-_FRESH_SUBMISSION_SLOTS = frozenset((0, 1, 3))
-_LANE_CYCLE_SIZE = 4
+
+def _queue_policy_resolver(request: Request) -> QueuePolicySettingsResolver | None:
+    """The queue-policy cache, when the app has one bound.
+
+    ``None`` means the app was built without one (some tests construct routers
+    directly), in which case callers use the shipped defaults -- the same values
+    that were hard-coded before this became operator policy.
+    """
+    return getattr(request.app.state, "queue_policy_settings", None)
+
+
+async def _resolve_queue_policy(request: Request) -> QueuePolicySettings:
+    resolver = _queue_policy_resolver(request)
+    if resolver is None:
+        return QUEUE_POLICY_DEFAULTS
+    return await resolver.resolve(getattr(request.app.state, "session_maker", None))
 
 
 async def _fresh_submission_lane_due(
@@ -318,7 +364,22 @@ async def _fresh_submission_lane_due(
     validator_hotkey: str,
     bench_version: int,
     rollout_started_at: datetime,
+    settings: QueuePolicySettings,
 ) -> bool:
+    """Whether this validator's next rollout-era job serves a fresh submission.
+
+    The lane split defaults to three fresh-submission jobs for every one
+    rollout-tail job. The counter is per validator, so every validator rotates
+    through both lanes and new agents can still reach the three-validator
+    scoring quorum.
+
+    The split is operator policy
+    (``ditto.api_models.queue_policy_settings.QueuePolicySettings``), but the
+    modulus is deliberately immutable while a rollout is open: this count is
+    measured from ``rollout_started_at``, so changing the cycle length would
+    reassign every validator's position in it discontinuously. The admin
+    endpoint refuses such a write rather than letting it land here.
+    """
     completed_since_rollout = await session.scalar(
         select(func.count())
         .select_from(ValidatorTicket)
@@ -329,8 +390,114 @@ async def _fresh_submission_lane_due(
             ValidatorTicket.created_at >= rollout_started_at,
         )
     )
-    return int(completed_since_rollout or 0) % _LANE_CYCLE_SIZE in (
-        _FRESH_SUBMISSION_SLOTS
+    return settings.fresh_submission_lane_due(int(completed_since_rollout or 0))
+
+
+# Unparseable slot ids sort above every cap, so an unrecognised id is declined
+# rather than silently treated as slot zero.
+_UNRANKED_SLOT = 1 << 16
+
+
+def _slot_ordinal(slot_id: str) -> int:
+    """Return the ordinal N of a ``slot-N`` id, or a value above every cap.
+
+    The validator numbers its slots densely from zero, so the ordinal is what
+    the operator cap compares against. Anything that does not parse fails
+    closed.
+    """
+    prefix, _, suffix = slot_id.partition("-")
+    if prefix != "slot" or not suffix.isdigit():
+        return _UNRANKED_SLOT
+    return int(suffix)
+
+
+def _heartbeat_disk_percent(heartbeat: ValidatorHeartbeat | None) -> int | None:
+    """Read the last reported host disk usage, or None when it is unknown.
+
+    Unknown is deliberately not treated as a tripped breaker: a validator that
+    reports no metrics must not lose the slots it already had.
+    """
+    if heartbeat is None:
+        return None
+    metrics = heartbeat.system_metrics
+    if not isinstance(metrics, dict):
+        return None
+    value = metrics.get("disk_percent")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+async def _validator_slot_settings(request: Request) -> ValidatorSlotSettings:
+    """Resolve the operator slot cap, falling back to the conservative default.
+
+    A missing resolver (an app built without lifespan) must not uncap the
+    fleet, so the default policy is returned instead of an unbounded one.
+    """
+    resolver: ValidatorSlotSettingsResolver | None = getattr(
+        request.app.state, "validator_slot_settings", None
+    )
+    if resolver is None:
+        return SLOT_SETTINGS_DEFAULT
+    return await resolver.resolve(getattr(request.app.state, "session_maker", None))
+
+
+PREV_GEN_CARRYOVER_DEFAULTS = QUEUE_POLICY_DEFAULTS.prev_gen_carryover
+"""Previous-generation policy in force when a caller supplies none.
+
+The shipped defaults, so an omitted policy makes retired-era work stricter --
+never looser -- than an operator's stored revision would.
+"""
+
+
+async def _desired_era_capable_hotkeys(
+    session: AsyncSession, *, rollout: BenchmarkRollout, now: datetime
+) -> set[str]:
+    """Validators whose fresh signed heartbeat advertises the desired version.
+
+    The fleet that could actually take desired-era work. A stale or
+    source-version-only heartbeat is not part of it, so a validator that cannot
+    serve the new era never makes the previous generation look like it is
+    crowding anything.
+    """
+    heartbeats = (await session.scalars(select(ValidatorHeartbeat))).all()
+    return {
+        candidate.validator_hotkey
+        for candidate in heartbeats
+        if heartbeat_supports_version(
+            candidate, now=now, version=rollout.desired_version
+        )
+    }
+
+
+async def _prev_gen_lane_open(
+    session: AsyncSession,
+    *,
+    rollout: BenchmarkRollout,
+    now: datetime,
+    settings: PrevGenCarryoverSettings,
+) -> bool:
+    """Whether previous-generation work may issue at all on this poll.
+
+    Strict priority, shared by both previous-generation lanes: reaching the tail
+    of ``request_job`` only proves that *this* validator found no desired-era
+    work, and that happens constantly while the queue is deep (one ticket per
+    agent/version/validator, one generation per owner, per-validator cooldowns).
+    Leasing retired-era work on that evidence takes a slot away from a queue the
+    validator simply could not see.
+
+    See :mod:`ditto.db.queries.desired_era_backlog` for why the fleet-wide
+    answer errs toward "still outstanding" and why it nonetheless terminates.
+    """
+    if not settings.require_desired_era_drained:
+        return True
+    return not await desired_era_work_outstanding(
+        session,
+        rollout=rollout,
+        now=now,
+        capable_validator_hotkeys=await _desired_era_capable_hotkeys(
+            session, rollout=rollout, now=now
+        ),
     )
 
 
@@ -344,9 +511,21 @@ async def _issue_source_backfill_ticket(
     artifact_mode: Literal["legacy", "prefer_screened", "screened_only"],
     validator_running_benchmark: bool,
     slot_id: str,
+    # Defaults to the conservative policy so an omitted cap narrows the
+    # backfill budget rather than widening it.
+    slot_settings: ValidatorSlotSettings = SLOT_SETTINGS_DEFAULT,
+    carryover_settings: PrevGenCarryoverSettings = PREV_GEN_CARRYOVER_DEFAULTS,
     resume_only: bool = False,
 ) -> ValidatorTicket | None:
-    """Use otherwise-idle capacity after the inherited cohort settles."""
+    """Use otherwise-idle capacity after the desired era has nothing to give.
+
+    Retired-era work is previous-generation work, exactly like the adopted
+    carryover below, so both answer to the same operator policy
+    (``queue_policy.prev_gen_carryover``): it issues only into a genuinely empty
+    desired-era queue. A lease already in flight is never revoked -- the gate
+    guards new admission, not resumption, because expiring a running benchmark
+    would burn a retry attempt for a submission that did nothing wrong.
+    """
     if heartbeat is None or not heartbeat_supports_version(
         heartbeat, now=now, version=rollout.from_version
     ):
@@ -391,6 +570,12 @@ async def _issue_source_backfill_ticket(
         )
     if resume_only:
         return None
+    # New retired-era admission only. Checked before the fleet lock so a poll
+    # that is going to decline anyway does not serialize behind one that is not.
+    if not await _prev_gen_lane_open(
+        session, rollout=rollout, now=now, settings=carryover_settings
+    ):
+        return None
     if is_postgresql:
         acquired_fleet_lock = await session.scalar(
             select(
@@ -426,8 +611,19 @@ async def _issue_source_backfill_ticket(
                 )
             except ValidationError:
                 continue
+            # Count the slots the platform will actually fill, not the ones the
+            # host merely advertises. Validators advertise headroom so the cap
+            # can be raised without a release; counting that headroom here would
+            # widen the source-backfill budget to capacity that never receives a
+            # ticket, and drown the desired version this reservation protects.
             slot_count = (
-                len(capacity.healthy_slots) if capacity.admission == "accepting" else 0
+                allowed_slot_count(
+                    slot_settings,
+                    advertised_slots=len(capacity.healthy_slots),
+                    disk_percent=_heartbeat_disk_percent(candidate),
+                )
+                if capacity.admission == "accepting"
+                else 0
             )
         else:
             slot_count = 1
@@ -460,6 +656,73 @@ async def _issue_source_backfill_ticket(
     )
 
 
+async def _issue_prev_gen_carryover_ticket(
+    session: AsyncSession,
+    *,
+    rollout: BenchmarkRollout,
+    heartbeat: ValidatorHeartbeat | None,
+    validator_hotkey: str,
+    now: datetime,
+    settings: PrevGenCarryoverSettings,
+    target_inference_ready: bool,
+    validator_running_benchmark: bool,
+    slot_id: str,
+) -> ValidatorTicket | None:
+    """Lease an adopted previous-generation submission in the new era.
+
+    The third leg of the carryover contract. Admission (the carryover row) and
+    generation (the desired-version dataset) are both already in place before
+    this can find anything, but neither is enough on its own: every existing
+    desired-version issuance path in this endpoint passes
+    ``submitted_at_or_after=rollout.created_at``, which filters on
+    ``Agent.created_at``, so a fully admitted and fully datasetted
+    previous-generation agent is leased by NO other path. ``only_agent_ids``
+    replaces that arrival filter with the explicit adopted set.
+
+    Deliberately confined to the **cohort lane**. The fresh-submission lane
+    exists to keep new miners from starving behind a transition, and diluting it
+    with a backlog drain would undo that. The caller therefore only reaches here
+    when the validator's lane slot is not a fresh-submission slot and both the
+    fresh lane and the inherited cohort had nothing to give.
+
+    By default it also waits for the inherited cohort to settle, on the same
+    precedent as :func:`_issue_source_backfill_ticket` ("use otherwise-idle
+    capacity after the inherited cohort settles"): carryover rides on a
+    transition and must never be able to delay the one it is riding on.
+
+    Lane position is necessary but not sufficient, so it additionally waits for
+    the desired-era queue to be fleet-wide empty -- see :func:`_prev_gen_lane_open`.
+    """
+    if not settings.enabled or not target_inference_ready:
+        return None
+    if heartbeat is None or not heartbeat_supports_version(
+        heartbeat, now=now, version=rollout.desired_version
+    ):
+        return None
+    if settings.require_cohort_complete and not await rollout_cohort_complete(
+        session, rollout=rollout, cohort_size=rollout.cohort_size
+    ):
+        return None
+    if not await _prev_gen_lane_open(
+        session, rollout=rollout, now=now, settings=settings
+    ):
+        return None
+    adopted = await carryover_agent_ids(session, rollout=rollout)
+    if not adopted:
+        return None
+    return await issue_ticket(
+        session,
+        validator_hotkey=validator_hotkey,
+        now=now,
+        ttl=_TICKET_TTL,
+        bench_version=rollout.desired_version,
+        artifact_mode="screened_only",
+        validator_running_benchmark=validator_running_benchmark,
+        slot_id=slot_id,
+        only_agent_ids=adopted,
+    )
+
+
 # How long a pre-signed artifact URL stays valid.
 _ARTIFACT_URL_TTL = timedelta(minutes=5)
 
@@ -474,6 +737,11 @@ _TICKET_TTL = timedelta(minutes=90)
 # the database for the same window, making replay rejection consistent across
 # every API replica without introducing another secret.
 _JOB_REQUEST_MAX_AGE = timedelta(minutes=2)
+# Throttle + timeout for the post-commit on-chain weight-confirmation sweep that
+# arms a king's public source-release window. Bounds how often the score path
+# reads the revealed weight matrix while any king still awaits confirmation.
+_KING_WEIGHT_CHECK_INTERVAL = timedelta(minutes=5)
+_KING_WEIGHT_CHECK_TIMEOUT_SECONDS = 5.0
 _QUALIFICATION_REFRESH_INTERVAL_SECONDS = 30.0
 _qualification_refresh_due = 0.0
 
@@ -954,6 +1222,172 @@ def _verify_signature(hotkey: str, payload: bytes, signature_hex: str) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class _HeartbeatWork:
+    """The ticket-validated work a heartbeat claims, ready to persist.
+
+    Separate from the *liveness* half of a heartbeat (``seen_at`` /
+    ``reported_at`` / identity / health), which is proven by the signature alone
+    and must be storable even when nothing here can be derived.
+    """
+
+    active_agent_id: UUID | None
+    benchmark_progress: dict | None
+    benchmark_capacity: BenchmarkCapacity | None
+    # The signed occupancy claim, kept whole even when confirmation narrows
+    # ``benchmark_capacity``. Never used to grant work or accept a score --
+    # only to refuse a revocation. See ``ValidatorHeartbeat.claimed_slots``.
+    claimed_slots: list[dict] | None = None
+
+
+# What a heartbeat stores when its work payload cannot be validated: alive, but
+# making no claim about what it is running.
+_LIVENESS_ONLY_WORK = _HeartbeatWork(
+    active_agent_id=None,
+    benchmark_progress=None,
+    benchmark_capacity=None,
+    claimed_slots=None,
+)
+
+
+def _claimed_slots(capacity: BenchmarkCapacity | None) -> list[dict] | None:
+    """Project the signed capacity onto its bare (slot, agent) occupancy claim."""
+    if capacity is None:
+        return None
+    return [
+        {"slot_id": slot.slot_id, "agent_id": str(slot.agent_id)}
+        for slot in capacity.active
+    ]
+
+
+async def _validated_heartbeat_work(
+    session: AsyncSession,
+    *,
+    validator_hotkey: str,
+    request_body: ValidatorHeartbeatRequest,
+    now: datetime,
+) -> _HeartbeatWork:
+    """Project the signed work claim onto what the ledger actually agrees with.
+
+    Every slot is confirmed against a live ticket and a scoreable agent under
+    ``FOR UPDATE``, so the stored capacity cannot describe work whose lease is
+    being revoked concurrently. Callers must run this where a failure is
+    containable (a savepoint): it row-locks, and it is the half of the ingest
+    that can fail on a payload the validator is legitimately allowed to send.
+    """
+    stored_active_agent_id = request_body.active_agent_id
+    stored_benchmark_progress = (
+        request_body.benchmark_progress.model_dump(mode="json")
+        if request_body.benchmark_progress is not None
+        else None
+    )
+    stored_benchmark_capacity = request_body.benchmark_capacity
+    # Captured BEFORE the confirmation filter below. A slot that fails to confirm
+    # is dropped from the stored capacity, and the lease liveness gate reads that
+    # absence as positive evidence the slot is idle -- so without this the filter
+    # can hand the revoker a false idle verdict for a run that is very much alive.
+    claimed = _claimed_slots(stored_benchmark_capacity)
+    if stored_benchmark_capacity is not None:
+        previous_heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
+        previous_slots = {}
+        if previous_heartbeat is not None and isinstance(
+            previous_heartbeat.benchmark_capacity, dict
+        ):
+            with contextlib.suppress(ValidationError):
+                previous_capacity = BenchmarkCapacity.model_validate(
+                    previous_heartbeat.benchmark_capacity
+                )
+                previous_slots = {
+                    slot.slot_id: slot for slot in previous_capacity.active
+                }
+        valid_active = []
+        for slot in stored_benchmark_capacity.active:
+            agent = await get_agent_by_id(
+                session, agent_id=slot.agent_id, for_update=True
+            )
+            # Identity, not deadline stamp. A re-issued lease moves the deadline
+            # the validator cached, and matching on it evicted a live slot from
+            # the stored capacity: its progress vanished from the fleet view and
+            # the revoker then read the absence as proof the slot was idle.
+            ticket = await get_live_slot_ticket(
+                session,
+                agent_id=slot.agent_id,
+                validator_hotkey=validator_hotkey,
+                slot_id=slot.slot_id,
+                now=now,
+                for_update=True,
+            )
+            if (
+                ticket is not None
+                and agent is not None
+                and agent.status in _SCOREABLE_STATUSES
+            ):
+                previous_slot = previous_slots.get(slot.slot_id)
+                if previous_slot is not None:
+                    try:
+                        _validate_same_lease_progress(
+                            previous_slot.progress, slot.progress
+                        )
+                    except HeartbeatProgressRegressionError:
+                        slot = previous_slot
+                valid_active.append(slot)
+            else:
+                logger.info(
+                    "validator heartbeat dropped stale slot progress "
+                    "validator=%s slot=%s",
+                    validator_hotkey,
+                    slot.slot_id,
+                )
+        valid_active.sort(key=lambda slot: slot.slot_id)
+        stored_benchmark_capacity = stored_benchmark_capacity.model_copy(
+            update={"active": valid_active}
+        )
+        primary = (
+            sorted(valid_active, key=lambda slot: slot.slot_id)[0]
+            if valid_active
+            else None
+        )
+        stored_active_agent_id = primary.agent_id if primary is not None else None
+        stored_benchmark_progress = (
+            primary.progress.model_dump(mode="json") if primary is not None else None
+        )
+    if (
+        stored_benchmark_capacity is None
+        and request_body.benchmark_progress is not None
+    ):
+        assert request_body.active_agent_id is not None
+        agent = await get_agent_by_id(
+            session, agent_id=request_body.active_agent_id, for_update=True
+        )
+        ticket = await get_open_ticket(
+            session,
+            agent_id=request_body.active_agent_id,
+            validator_hotkey=validator_hotkey,
+            now=now,
+            deadline=request_body.benchmark_progress.ticket_deadline,
+            bench_version=None,
+            for_update=True,
+        )
+        if ticket is None or agent is None or agent.status not in _SCOREABLE_STATUSES:
+            # Ticket-bound progress is optional decoration. A benchmark can
+            # outlive or lose its lease, but that must not discard an
+            # otherwise valid signed liveness/health report. Persist the
+            # authenticated fail-open projection without stale work context;
+            # tickets, submissions, benchmarks, and scores are untouched.
+            stored_active_agent_id = None
+            stored_benchmark_progress = None
+            logger.info(
+                "validator heartbeat dropped stale ticket-bound progress validator=%s",
+                validator_hotkey,
+            )
+    return _HeartbeatWork(
+        active_agent_id=stored_active_agent_id,
+        benchmark_progress=stored_benchmark_progress,
+        benchmark_capacity=stored_benchmark_capacity,
+        claimed_slots=claimed,
+    )
+
+
 @router.post(
     "/heartbeat",
     response_model=ValidatorHeartbeatResponse,
@@ -1036,111 +1470,47 @@ async def heartbeat(
 
     reported_at = datetime.fromtimestamp(request_body.timestamp, tz=UTC)
     async with session.begin():
-        stored_active_agent_id = request_body.active_agent_id
-        stored_benchmark_progress = (
-            request_body.benchmark_progress.model_dump(mode="json")
-            if request_body.benchmark_progress is not None
-            else None
-        )
-        stored_benchmark_capacity = request_body.benchmark_capacity
-        if stored_benchmark_capacity is not None:
-            previous_heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
-            previous_slots = {}
-            if previous_heartbeat is not None and isinstance(
-                previous_heartbeat.benchmark_capacity, dict
-            ):
-                with contextlib.suppress(ValidationError):
-                    previous_capacity = BenchmarkCapacity.model_validate(
-                        previous_heartbeat.benchmark_capacity
-                    )
-                    previous_slots = {
-                        slot.slot_id: slot for slot in previous_capacity.active
-                    }
-            valid_active = []
-            for slot in stored_benchmark_capacity.active:
-                agent = await get_agent_by_id(
-                    session, agent_id=slot.agent_id, for_update=True
-                )
-                ticket = await get_open_ticket(
+        try:
+            # SAVEPOINT, not a bare try: deriving the work payload row-locks
+            # tickets and agents, so a database-level failure inside it (lock
+            # timeout, deadlock) would otherwise poison the surrounding
+            # transaction and take the liveness write down with it anyway.
+            # Rolling back to the savepoint releases those reads and locks and
+            # leaves the transaction usable for the upsert below.
+            async with session.begin_nested():
+                work = await _validated_heartbeat_work(
                     session,
-                    agent_id=slot.agent_id,
                     validator_hotkey=validator_hotkey,
+                    request_body=request_body,
                     now=now,
-                    deadline=slot.progress.ticket_deadline,
-                    bench_version=slot.bench_version,
-                    slot_id=slot.slot_id,
-                    for_update=True,
                 )
-                if (
-                    ticket is not None
-                    and agent is not None
-                    and agent.status in _SCOREABLE_STATUSES
-                ):
-                    previous_slot = previous_slots.get(slot.slot_id)
-                    if previous_slot is not None:
-                        try:
-                            _validate_same_lease_progress(
-                                previous_slot.progress, slot.progress
-                            )
-                        except HeartbeatProgressRegressionError:
-                            slot = previous_slot
-                    valid_active.append(slot)
-                else:
-                    logger.info(
-                        "validator heartbeat dropped stale slot progress "
-                        "validator=%s slot=%s",
-                        validator_hotkey,
-                        slot.slot_id,
-                    )
-            valid_active.sort(key=lambda slot: slot.slot_id)
-            stored_benchmark_capacity = stored_benchmark_capacity.model_copy(
-                update={"active": valid_active}
+        except Exception as error:  # noqa: BLE001 - liveness must not depend on payload
+            # Fail OPEN on liveness. The signature already proved this validator
+            # is alive and on schedule; whatever went wrong concerns only what it
+            # *claims to be doing*. Storing the liveness-only projection keeps
+            # `seen_at` moving so the fleet does not read the validator as
+            # heartbeat_stale, and drops the work payload rather than freezing
+            # the previous one — a frozen capacity blob is what let a lease
+            # revocation destroy healthy v7 runs (#437). With capacity NULL the
+            # next `/job` claim fails closed with 428 (fresh valid benchmark
+            # capacity is required) instead of revoking live work.
+            # The occupancy claim comes straight off the verified signature and
+            # needs no ledger read, so it survives a failed work validation. It
+            # only ever refuses a revocation, so keeping it is the safe side.
+            work = replace(
+                _LIVENESS_ONLY_WORK,
+                claimed_slots=_claimed_slots(request_body.benchmark_capacity),
             )
-            primary = (
-                sorted(valid_active, key=lambda slot: slot.slot_id)[0]
-                if valid_active
-                else None
+            VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED.labels(
+                stage="work_validation", reason=type(error).__name__
+            ).inc()
+            logger.exception(
+                "validator heartbeat stored liveness-only after work payload "
+                "validation failed validator=%s protocol=%s state=%s",
+                validator_hotkey,
+                request_body.protocol_version,
+                request_body.state,
             )
-            stored_active_agent_id = primary.agent_id if primary is not None else None
-            stored_benchmark_progress = (
-                primary.progress.model_dump(mode="json")
-                if primary is not None
-                else None
-            )
-        if (
-            stored_benchmark_capacity is None
-            and request_body.benchmark_progress is not None
-        ):
-            assert request_body.active_agent_id is not None
-            agent = await get_agent_by_id(
-                session, agent_id=request_body.active_agent_id, for_update=True
-            )
-            ticket = await get_open_ticket(
-                session,
-                agent_id=request_body.active_agent_id,
-                validator_hotkey=validator_hotkey,
-                now=now,
-                deadline=request_body.benchmark_progress.ticket_deadline,
-                bench_version=None,
-                for_update=True,
-            )
-            if (
-                ticket is None
-                or agent is None
-                or agent.status not in _SCOREABLE_STATUSES
-            ):
-                # Ticket-bound progress is optional decoration. A benchmark can
-                # outlive or lose its lease, but that must not discard an
-                # otherwise valid signed liveness/health report. Persist the
-                # authenticated fail-open projection without stale work context;
-                # tickets, submissions, benchmarks, and scores are untouched.
-                stored_active_agent_id = None
-                stored_benchmark_progress = None
-                logger.info(
-                    "validator heartbeat dropped stale ticket-bound progress "
-                    "validator=%s",
-                    validator_hotkey,
-                )
         # Progress monotonicity is enforced fail-open inside the query: a
         # genuine same-run regression keeps the previously stored progress
         # (never moving the public display backward) but never rejects an
@@ -1152,13 +1522,13 @@ async def heartbeat(
             protocol_version=request_body.protocol_version,
             code_digest=request_body.code_digest,
             state=request_body.state,
-            active_agent_id=stored_active_agent_id,
+            active_agent_id=work.active_agent_id,
             system_metrics=(
                 request_body.system_metrics.model_dump(mode="json")
                 if request_body.system_metrics is not None
                 else None
             ),
-            benchmark_progress=stored_benchmark_progress,
+            benchmark_progress=work.benchmark_progress,
             capabilities=(
                 request_body.capabilities.model_dump(mode="json", exclude_none=True)
                 if request_body.capabilities is not None
@@ -1175,10 +1545,11 @@ async def heartbeat(
                 else None
             ),
             benchmark_capacity=(
-                stored_benchmark_capacity.model_dump(mode="json")
-                if stored_benchmark_capacity is not None
+                work.benchmark_capacity.model_dump(mode="json")
+                if work.benchmark_capacity is not None
                 else None
             ),
+            claimed_slots=work.claimed_slots,
             reported_at=reported_at,
             seen_at=now,
             signature=request_body.signature,
@@ -1243,6 +1614,15 @@ async def request_job(
     await _assert_validator_permitted(
         chain, netuid, payload.validator_hotkey, network=network
     )
+
+    # Resolved before the transaction opens: the resolver may open its own
+    # session to refill a cold cache, and doing that inside this transaction
+    # would nest sessions on the hot path.
+    queue_policy = await _resolve_queue_policy(request)
+    # Resolve the operator slot cap on the resolver's own session, before the
+    # request transaction opens: reading it on `session` here would autobegin and
+    # break the `session.begin()` below.
+    slot_settings = await _validator_slot_settings(request)
 
     job: JobResponse | None = None
     async with session.begin():
@@ -1335,6 +1715,28 @@ async def request_job(
                 or slot_id not in capacity.healthy_slots
             ):
                 return Response(status_code=204)
+            # Operator slot cap. Validators advertise the capacity their host
+            # can offer; how much of it the fleet actually uses is an operator
+            # decision that must be changeable from backroom without a release.
+            # Slots are numbered densely from zero, so declining every ordinal
+            # at or above the cap is a hard ceiling on new leases per validator
+            # regardless of what the heartbeat advertises.
+            #
+            # A slot already running a benchmark is exempt, and every path that
+            # resumes a live lease is downstream of this gate: without the
+            # exemption, lowering the cap would strand the in-flight leases on
+            # the ordinals it removed until they expired, burning a retry
+            # attempt each. Lowering the cap must cost the fleet nothing but new
+            # work. The exemption cannot be forged -- heartbeat ingest drops any
+            # active slot with no matching open ticket -- so ``capacity.active``
+            # only ever names slots the platform itself leased.
+            allowed_slots = allowed_slot_count(
+                slot_settings,
+                advertised_slots=capacity.configured_slots,
+                disk_percent=_heartbeat_disk_percent(heartbeat),
+            )
+            if not slot_running_benchmark and _slot_ordinal(slot_id) >= allowed_slots:
+                return Response(status_code=204)
         if rollout is not None:
             fresh_lane_due = (
                 target_inference_ready
@@ -1347,6 +1749,7 @@ async def request_job(
                     validator_hotkey=payload.validator_hotkey,
                     bench_version=rollout.desired_version,
                     rollout_started_at=rollout.created_at,
+                    settings=queue_policy,
                 )
             )
             ticket = (
@@ -1392,6 +1795,18 @@ async def request_job(
                     submitted_at_or_after=rollout.created_at,
                     fifo_start_at=rollout.created_at,
                     completion_first=True,
+                    slot_id=slot_id,
+                )
+            if ticket is None and not fresh_lane_due:
+                ticket = await _issue_prev_gen_carryover_ticket(
+                    session,
+                    rollout=rollout,
+                    heartbeat=heartbeat,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                    settings=queue_policy.prev_gen_carryover,
+                    target_inference_ready=target_inference_ready,
+                    validator_running_benchmark=slot_running_benchmark,
                     slot_id=slot_id,
                 )
         else:
@@ -1452,6 +1867,7 @@ async def request_job(
                     artifact_mode=artifact_mode,
                     validator_running_benchmark=slot_running_benchmark,
                     slot_id=slot_id,
+                    slot_settings=slot_settings,
                     resume_only=True,
                 )
             if ticket is None and rollout is None:
@@ -1528,6 +1944,8 @@ async def request_job(
                     artifact_mode=artifact_mode,
                     validator_running_benchmark=slot_running_benchmark,
                     slot_id=slot_id,
+                    slot_settings=slot_settings,
+                    carryover_settings=queue_policy.prev_gen_carryover,
                 )
             if ticket is None and rollout is not None:
                 return Response(status_code=204)
@@ -1668,8 +2086,14 @@ async def _current_koth_entries(
     session: AsyncSession,
     *,
     canonical_version: int,
+    completed_waves_only: bool = True,
 ) -> list[KothEntry]:
-    """Build the active-version KOTH fold, including append-only confirmations."""
+    """Build the active-version KOTH fold from canonical or completed evidence.
+
+    Confirmation evidence is admitted only as a complete cohort wave. Partial
+    results remain append-only and public for audit, but cannot move the crown
+    while sibling leases for the same seed are still running.
+    """
     from ditto.api_server.endpoints.scoring import (
         _confirmation_composites,
         _confirmation_seeds,
@@ -1696,6 +2120,28 @@ async def _current_koth_entries(
         agent_ids=[row.agent_id for row in rows],
         bench_version=canonical_version,
     )
+    raw_entries = [
+        KothEntry(
+            miner_hotkey=row.miner_hotkey,
+            agent_id=row.agent_id,
+            composite=row.composite,
+            first_seen=row.first_seen,
+            raw_rank=rank,
+            bench_version=row.bench_version,
+            composite_stderr=_ledger_stderr(
+                row.details if isinstance(row.details, dict) else {},
+                quorum.get(row.agent_id, []),
+            ),
+        )
+        for rank, row in enumerate(rows, start=1)
+    ]
+    raw_members = emission_set(project_koth(raw_entries))
+    completed_seeds = completed_confirmation_wave_seeds(
+        member_ids=[member.agent_id for member in raw_members],
+        seeds_by_agent={
+            agent_id: values.keys() for agent_id, values in history.items()
+        },
+    )
     entries: list[KothEntry] = []
     for rank, row in enumerate(rows, start=1):
         details = row.details if isinstance(row.details, dict) else {}
@@ -1704,7 +2150,18 @@ async def _current_koth_entries(
         legacy_composites = _confirmation_composites(details)
         if legacy_seeds is not None and legacy_composites is not None:
             merged.update(zip(legacy_seeds, legacy_composites, strict=False))
-        merged.update(history.get(row.agent_id, {}))
+        if completed_waves_only:
+            merged.update(
+                {
+                    seed: value
+                    for seed, value in history.get(row.agent_id, {}).items()
+                    if seed in completed_seeds
+                }
+            )
+        else:
+            # Compatibility view for leases issued before cohort-wave gating.
+            # New KOTH/ledger projections must never use this mode.
+            merged.update(history.get(row.agent_id, {}))
         confirmations = tuple(sorted(merged.items())) if len(merged) >= 2 else None
         entries.append(
             KothEntry(
@@ -1713,7 +2170,15 @@ async def _current_koth_entries(
                 composite=row.composite,
                 first_seen=row.first_seen,
                 raw_rank=rank,
+                bench_version=row.bench_version,
                 composite_stderr=_ledger_stderr(details, quorum.get(row.agent_id, [])),
+                quorum_composites=tuple(quorum.get(row.agent_id, [])) or None,
+                completed_wave_composites=tuple(
+                    value
+                    for seed, value in sorted(history.get(row.agent_id, {}).items())
+                    if seed in completed_seeds
+                )
+                or None,
                 confirmation_composites=(
                     tuple(value for _seed, value in confirmations)
                     if confirmations is not None
@@ -1733,17 +2198,68 @@ async def _current_emission_set(
     session: AsyncSession,
     *,
     canonical_version: int,
+    completed_waves_only: bool = True,
 ) -> tuple[KothEntry, ...]:
-    entries = await _current_koth_entries(session, canonical_version=canonical_version)
+    entries = await _current_koth_entries(
+        session,
+        canonical_version=canonical_version,
+        completed_waves_only=completed_waves_only,
+    )
     return emission_set(project_koth(entries))
+
+
+async def _confirm_king_onchain_weights(
+    app_state: Any,
+    chain: ChainClient,
+    session: AsyncSession,
+    *,
+    now: datetime,
+) -> None:
+    """Arm any ever-king's public window once the chain confirms its weights.
+
+    Reads the REVEALED weight matrix (post commit-reveal) and stamps
+    ``weight_confirmed_at`` for every ever-king miner that now has validator
+    weight set on it. Erring toward weights, not realized emission magnitude, so
+    a genuine king is never trapped private. Throttled via ``app_state`` so the
+    score path reads the chain at most once per interval while a king is pending;
+    once no king is unconfirmed, it does zero chain work. The caller wraps this
+    best-effort so a chain hiccup never fails an already-committed score.
+    """
+    last_checked = getattr(app_state, "king_weight_checked_at", None)
+    if last_checked is not None and (now - last_checked) < _KING_WEIGHT_CHECK_INTERVAL:
+        return
+    app_state.king_weight_checked_at = now
+    pending = await list_unconfirmed_kings(session)
+    # Release the read transaction so the (potentially multi-second) chain call
+    # never holds a DB transaction open, and so the write below can open its own.
+    await session.rollback()
+    if not pending:
+        return
+    netuid = app_state.config.chain.netuid
+    snapshot = await asyncio.wait_for(
+        chain.get_weights(netuid), timeout=_KING_WEIGHT_CHECK_TIMEOUT_SECONDS
+    )
+    weighted_hotkeys = {
+        weight.hotkey for vector in snapshot.vectors for weight in vector.weights
+    }
+    confirmed = [agent_id for agent_id, hotkey in pending if hotkey in weighted_hotkeys]
+    if confirmed:
+        async with session.begin():
+            for agent_id in confirmed:
+                await record_weight_confirmed(session, agent_id=agent_id, now=now)
 
 
 async def _champion_anchored_seed_set(
     session: AsyncSession,
     *,
     canonical_version: int,
+    completed_waves_only: bool = True,
 ) -> frozenset[int]:
-    members = await _current_emission_set(session, canonical_version=canonical_version)
+    members = await _current_emission_set(
+        session,
+        canonical_version=canonical_version,
+        completed_waves_only=completed_waves_only,
+    )
     if not members:
         return frozenset()
     return frozenset(
@@ -1760,9 +2276,10 @@ async def _top5_confirmation_seed_plan(
     *,
     champion_agent_id: UUID,
     member_agent_id: UUID,
+    cohort_member_ids: tuple[UUID, ...],
     canonical_version: int,
 ) -> tuple[int, ...]:
-    """Mirror the validator's bounded next-seed plan from durable history."""
+    """Return at most one seed: the cohort's current incomplete wave."""
     full = champion_anchored_seeds(
         champion_agent_id,
         version=canonical_version,
@@ -1770,23 +2287,138 @@ async def _top5_confirmation_seed_plan(
     )
     history = await confirmation_composites_by_seed(
         session,
-        agent_ids=[champion_agent_id, member_agent_id],
+        agent_ids=cohort_member_ids,
         bench_version=canonical_version,
     )
-    champion_seeds = history.get(champion_agent_id, {})
-    covered = 0
-    for seed in full:
-        if seed not in champion_seeds:
-            break
-        covered += 1
-    target_depth = min(len(full), max(covered + 1, 3))
-    anchor = full[:target_depth]
-    member_seeds = history.get(member_agent_id, {})
-    missing = tuple(seed for seed in anchor if seed not in member_seeds)
-    if member_agent_id == champion_agent_id:
-        return missing
-    member_depth = sum(seed in member_seeds for seed in anchor)
-    return missing if member_depth >= target_depth - 1 else missing[:2]
+    completed = completed_confirmation_wave_seeds(
+        member_ids=cohort_member_ids,
+        seeds_by_agent={
+            agent_id: values.keys() for agent_id, values in history.items()
+        },
+    )
+    next_seed = next((seed for seed in full if seed not in completed), None)
+    if next_seed is None or next_seed in history.get(member_agent_id, {}):
+        return ()
+    return (next_seed,)
+
+
+async def _top5_member_is_least_covered(
+    session: AsyncSession,
+    *,
+    members: tuple[KothEntry, ...],
+    requested_member_id: UUID,
+    wave_seed: int,
+    validator_hotkey: str,
+    canonical_version: int,
+    now: datetime,
+) -> bool:
+    """Admit one unclaimed member in the current one-seed cohort wave."""
+    member_ids = [member.agent_id for member in members]
+    if requested_member_id not in member_ids:
+        return False
+
+    existing_live = await session.scalar(
+        select(ValidatorTicket)
+        .where(
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
+        )
+        .limit(1)
+    )
+    if existing_live is not None:
+        return (
+            existing_live.agent_id == requested_member_id
+            and existing_live.bench_version == canonical_version
+            and existing_live.purpose == TicketPurpose.CONTINUAL_RETEST
+            and existing_live.seed == wave_seed
+        )
+
+    history = await confirmation_composites_by_seed(
+        session,
+        agent_ids=member_ids,
+        bench_version=canonical_version,
+    )
+    eligible: list[UUID] = []
+    for member_id in member_ids:
+        latest_retest = await get_latest_score_retest_event(
+            session,
+            agent_id=member_id,
+            validator_hotkey=validator_hotkey,
+        )
+        if (
+            latest_retest is not None
+            and latest_retest.event == EVENT_SCORE_RETEST_REQUESTED
+        ):
+            continue
+        existing_ticket = await session.get(
+            ValidatorTicket,
+            (member_id, canonical_version, validator_hotkey),
+        )
+        if existing_ticket is not None and existing_ticket.retry_after is not None:
+            retry_after = existing_ticket.retry_after
+            if retry_after.tzinfo is None:
+                retry_after = retry_after.replace(tzinfo=UTC)
+            if retry_after > now:
+                continue
+        if wave_seed not in history.get(member_id, {}):
+            eligible.append(member_id)
+    if requested_member_id not in eligible:
+        return False
+
+    active_rows = await session.execute(
+        select(ValidatorTicket.agent_id).where(
+            ValidatorTicket.agent_id.in_(eligible),
+            ValidatorTicket.bench_version == canonical_version,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
+            ValidatorTicket.purpose == TicketPurpose.CONTINUAL_RETEST,
+            or_(ValidatorTicket.seed == wave_seed, ValidatorTicket.seed.is_(None)),
+        )
+    )
+    return requested_member_id not in set(active_rows.scalars())
+
+
+async def _canonical_tail_is_draining(
+    session: AsyncSession,
+    *,
+    requesting_validator: str,
+    canonical_version: int,
+    now: datetime,
+) -> bool:
+    """Whether current-version quorum work is finishing or just finished.
+
+    Honest validators ask for canonical work before entering the continual
+    top-five lane.  While the last canonical leases are still running, a
+    validator that received no job would otherwise sit idle until the next
+    scheduled confirmation tempo.  Treat that bounded tail-drain window as
+    spare capacity without opening the continual lane permanently between
+    tempos.  Keep the window open for one canonical lease TTL after the last
+    score lands: otherwise the final score closes the live-ticket predicate
+    before the idle validators' next poll, recreating the idle gap this guard
+    exists to fill.
+    """
+    recently_settled_after = now - _TICKET_TTL
+    active_agent_id = await session.scalar(
+        select(ValidatorTicket.agent_id)
+        .where(
+            ValidatorTicket.bench_version == canonical_version,
+            ValidatorTicket.validator_hotkey != requesting_validator,
+            ValidatorTicket.purpose == TicketPurpose.CANONICAL_QUORUM,
+            or_(
+                (
+                    (ValidatorTicket.status == TicketStatus.ISSUED)
+                    & (ValidatorTicket.deadline > now)
+                ),
+                (
+                    (ValidatorTicket.status == TicketStatus.SCORED)
+                    & (ValidatorTicket.updated_at >= recently_settled_after)
+                ),
+            ),
+        )
+        .limit(1)
+    )
+    return active_agent_id is not None
 
 
 @router.post(
@@ -1842,6 +2474,12 @@ async def request_top5_confirmation_job(
         network=config.chain.subtensor_network,
     )
     block = await chain.get_latest_block()
+    continual_resolver: ContinualRetestSettingsResolver = (
+        request.app.state.continual_retest_settings
+    )
+    continual_settings = await continual_resolver.resolve(
+        getattr(request.app.state, "session_maker", None)
+    )
 
     async with session.begin():
         await _assert_validator_compatible(
@@ -1865,6 +2503,45 @@ async def request_top5_confirmation_job(
             ) from exc
         canonical_version = await active_bench_version(session)
         heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
+        if heartbeat is None or heartbeat.protocol_version < 13:
+            raise HTTPException(
+                status_code=428,
+                detail=(
+                    "a fresh heartbeat with protocol 13 is required for "
+                    "single-seed top-five retests"
+                ),
+            )
+        # Yield previous-generation rescoring to an open rollout. This is a
+        # stand-down at issuance only: a lease already held elsewhere still runs
+        # and reports, so no shared-seed wave is torn in half, and the
+        # `open_rollout` predicate lifts the stand-down by itself on activation
+        # or supersede. `active_bench_version` and the k=3 quorum are untouched.
+        standdown_rollout = await open_rollout(session)
+        standdown = rollout_standdown_reason(
+            continual_settings,
+            open_rollout_desired_version=(
+                standdown_rollout.desired_version
+                if standdown_rollout is not None
+                else None
+            ),
+            validator_supports_desired_version=(
+                standdown_rollout is not None
+                and heartbeat_supports_version(
+                    heartbeat, now=now, version=standdown_rollout.desired_version
+                )
+            ),
+        )
+        if standdown is not None:
+            assert standdown_rollout is not None
+            logger.info(
+                "continual retest standing down validator=%s active_version=%s "
+                "rollout_desired_version=%s mode=%s",
+                payload.validator_hotkey,
+                canonical_version,
+                standdown_rollout.desired_version,
+                continual_settings.rollout_standdown,
+            )
+            raise HTTPException(status_code=409, detail=standdown)
         v7_calibration = None
         if canonical_version >= 7:
             try:
@@ -1891,7 +2568,8 @@ async def request_top5_confirmation_job(
                     detail="fresh benchmark v7 inference capability is required",
                 )
         members = await _current_emission_set(
-            session, canonical_version=canonical_version
+            session,
+            canonical_version=canonical_version,
         )
         if not members or members[0].agent_id != payload.champion_agent_id:
             raise HTTPException(
@@ -1906,17 +2584,52 @@ async def request_top5_confirmation_job(
         champion = await get_agent_by_id(session, agent_id=payload.champion_agent_id)
         assert champion is not None
         crown_block = champion.dataset_seed_block or block.number
-        if not top5_round_is_due(
+        scheduled_round = top5_round_is_due(
             block.number,
             crown_block,
             base=config.top5_backoff_base,
             doubling_k=config.top5_backoff_doubling_tempos,
             cap=config.top5_backoff_cap,
+        )
+        spare_capacity_round = (
+            not scheduled_round
+            and await _canonical_tail_is_draining(
+                session,
+                requesting_validator=payload.validator_hotkey,
+                canonical_version=canonical_version,
+                now=now,
+            )
+        )
+        if (
+            not scheduled_round
+            and not spare_capacity_round
+            and not continual_settings.idle_retests_enabled
         ):
             raise HTTPException(
                 status_code=409,
                 detail="top-5 shared-seed rescore round is not due at this block",
             )
+        if session.get_bind().dialect.name == "postgresql":
+            await session.execute(
+                select(
+                    func.pg_advisory_xact_lock(
+                        func.hashtextextended("top5-confirmation-fairness", 0)
+                    )
+                )
+            )
+        seeds = await _top5_confirmation_seed_plan(
+            session,
+            champion_agent_id=payload.champion_agent_id,
+            member_agent_id=payload.member_agent_id,
+            cohort_member_ids=tuple(member.agent_id for member in members),
+            canonical_version=canonical_version,
+        )
+        if not seeds:
+            raise HTTPException(
+                status_code=409,
+                detail="the requested member has no pending confirmation seeds",
+            )
+        wave_seed = seeds[0]
         confirmation_datasets: list[ConfirmationDatasetPin] = []
         if canonical_version >= 3:
             if generator.run_size is None:
@@ -1924,27 +2637,28 @@ async def request_top5_confirmation_job(
                     status_code=503,
                     detail="top-5 confirmation dataset generation is unavailable",
                 )
-            seeds = await _top5_confirmation_seed_plan(
-                session,
-                champion_agent_id=payload.champion_agent_id,
-                member_agent_id=payload.member_agent_id,
-                canonical_version=canonical_version,
-            )
-            if not seeds:
-                raise HTTPException(
-                    status_code=409,
-                    detail="the requested member has no pending confirmation seeds",
-                )
             confirmation_datasets = [
                 ConfirmationDatasetPin(
-                    seed=seed,
+                    seed=wave_seed,
                     dataset_sha256=await generator.generate(
-                        seed, bench_version=canonical_version
+                        wave_seed, bench_version=canonical_version
                     ),
                     run_size=generator.run_size,
                 )
-                for seed in seeds
             ]
+        if not await _top5_member_is_least_covered(
+            session,
+            members=members,
+            requested_member_id=payload.member_agent_id,
+            wave_seed=wave_seed,
+            validator_hotkey=payload.validator_hotkey,
+            canonical_version=canonical_version,
+            now=now,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="another top-five member has less confirmation coverage",
+            )
         ticket = await issue_confirmation_ticket(
             session,
             agent_id=payload.member_agent_id,
@@ -1952,11 +2666,19 @@ async def request_top5_confirmation_job(
             now=now,
             ttl=_TICKET_TTL,
             bench_version=canonical_version,
+            seed=(wave_seed if confirmation_datasets else None),
+            dataset_sha256=(
+                confirmation_datasets[0].dataset_sha256
+                if confirmation_datasets
+                else None
+            ),
         )
         if ticket is None:
             raise HTTPException(
                 status_code=409,
-                detail="validator has another live assignment or no prior quorum slot",
+                detail=(
+                    "validator has another live assignment or this retest is deferred"
+                ),
             )
         agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
         assert agent is not None
@@ -2125,22 +2847,46 @@ async def submit_top5_confirmation_score(
             ticket.purpose = TicketPurpose.CONTINUAL_RETEST
             ticket.purpose_revision = 1
             ticket.legacy_completion_allowed = False
-        members = await _current_emission_set(
-            session, canonical_version=canonical_version
-        )
-        if agent_id not in {member.agent_id for member in members}:
-            raise HTTPException(
-                status_code=409,
-                detail="agent left the current emission set before submission",
+        if ticket.seed is not None:
+            if seeds != [ticket.seed]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="confirmation report does not match the leased wave seed",
+                )
+        else:
+            # Bounded compatibility for already-issued bundle leases. New
+            # protocol-13 tickets are pinned to exactly one seed above and do
+            # not become invalid merely because rollout filtering changed the
+            # projected champion while this old run was in flight. The live
+            # ticket is the membership authorization; seeds remain bounded to
+            # either the completed-wave or legacy partial-wave champion, plus
+            # a seed already accepted from a sibling in that same old wave.
+            allowed = set(
+                await _champion_anchored_seed_set(
+                    session, canonical_version=canonical_version
+                )
             )
-        allowed = await _champion_anchored_seed_set(
-            session, canonical_version=canonical_version
-        )
-        if any(seed not in allowed for seed in seeds):
-            raise HTTPException(
-                status_code=409,
-                detail="confirmation report contains a non-canonical seed",
+            allowed.update(
+                await _champion_anchored_seed_set(
+                    session,
+                    canonical_version=canonical_version,
+                    completed_waves_only=False,
+                )
             )
+            allowed.update(
+                (
+                    await session.scalars(
+                        select(ConfirmationScore.seed).where(
+                            ConfirmationScore.bench_version == canonical_version
+                        )
+                    )
+                ).all()
+            )
+            if any(seed not in allowed for seed in seeds):
+                raise HTTPException(
+                    status_code=409,
+                    detail="confirmation report contains a non-canonical seed",
+                )
         await append_confirmation_scores(
             session,
             rows=[
@@ -2396,6 +3142,7 @@ async def _validator_artifact_routing(
     responses={
         401: {"description": "Missing/invalid validator auth."},
         404: {"description": "No agent with the given id."},
+        409: {"description": "No open scoring ticket for this validator/agent."},
         422: {"description": "Malformed UUID path parameter."},
         503: {"description": "Chain unavailable for the permit check."},
     },
@@ -2412,7 +3159,12 @@ async def agent_artifact(
     x_validator_artifact_requested_at: Annotated[datetime | None, Header()] = None,
     x_validator_artifact_signature: Annotated[str | None, Header()] = None,
 ) -> ArtifactResponse:
-    """Return an artifact URL after fresh proof of validator-key possession."""
+    """Return an artifact URL after fresh proof of validator-key possession.
+
+    Download is bound to an unexpired ``ISSUED`` scoring ticket for this
+    validator and agent. Possession alone is not enough to bulk-fetch competitor
+    source or screened images.
+    """
     response.headers["Cache-Control"] = "no-store"
     if (
         x_validator_hotkey is None
@@ -2473,6 +3225,14 @@ async def agent_artifact(
                 ValidatorTicket.deadline > now,
             )
         )
+        if ticket is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "no open scoring ticket for this validator and agent "
+                    "(never issued, expired, or already scored)"
+                ),
+            )
     url = await storage.presigned_get_url(
         key=_artifact_key(agent_id),
         expires_in=int(_ARTIFACT_URL_TTL.total_seconds()),
@@ -2487,9 +3247,10 @@ async def agent_artifact(
             expires_in=int(_ARTIFACT_URL_TTL.total_seconds()),
         )
     logger.info(
-        "validator=%s fetched artifact url for agent_id=%s",
+        "validator=%s fetched artifact url for agent_id=%s bench_version=%s",
         x_validator_hotkey,
         agent_id,
+        ticket.bench_version,
     )
     return ArtifactResponse(
         agent_id=agent_id,
@@ -2501,7 +3262,7 @@ async def agent_artifact(
         screened_image_size_bytes=agent.screened_image_size_bytes,
         screened_image_id=agent.screened_image_id,
         screened_image_ref=agent.screened_image_ref,
-        bench_version=ticket.bench_version if ticket is not None else None,
+        bench_version=ticket.bench_version,
         screening_policy_version=agent.screening_policy_version,
     )
 
@@ -3251,6 +4012,40 @@ async def submit_score(
         # false score failure because the independent v3 dataset renderer is
         # temporarily unavailable; the next score/verdict/admin retry converges.
         logger.exception("rolling benchmark qualification refresh failed")
+
+    # Record when the CURRENT KOTH champion first took the throne, so the
+    # king-only public source-release embargo can reveal its source one window
+    # later. This reads whoever is champion NOW (any committed score, including
+    # a confirmation-driven dethrone, can have changed it), not the submitter.
+    # Post-commit and best-effort: the score is already canonical, so a
+    # recording hiccup must never surface as a score failure, and the write-once
+    # timestamp is never moved by a later re-coronation.
+    try:
+        async with session.begin():
+            champion_members = await _current_emission_set(
+                session, canonical_version=await active_bench_version(session)
+            )
+            if champion_members:
+                await record_first_crowned(
+                    session,
+                    agent_id=champion_members[0].agent_id,
+                    now=audit_now,
+                )
+    except Exception:
+        logger.exception("king-reign recording failed")
+
+    # Arm a king's public source-release window only once the chain agrees:
+    # confirm (post commit-reveal) that validators' REVEALED weights are set on
+    # the miner. Best-effort and post-commit: never fail an already-canonical
+    # score because a chain read hiccups.
+    try:
+        await _confirm_king_onchain_weights(
+            request.app.state, chain, session, now=audit_now
+        )
+    except (ChainError, TimeoutError):
+        logger.warning("king weight-confirmation chain read failed", exc_info=True)
+    except Exception:
+        logger.exception("king weight-confirmation failed")
 
     logger.info(
         "score recorded agent_id=%s validator=%s run_id=%s composite=%.3f status=%s",

@@ -19,12 +19,10 @@ import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_models.agent_status import AgentStatus
@@ -68,7 +66,6 @@ from ditto.chain import ChainError
 from ditto.chain.models import BlockInfo, NeuronInfo
 from ditto.db.models import (
     Agent,
-    Base,
     BenchmarkDataset,
     BenchmarkRollout,
     EvaluationPayment,
@@ -337,29 +334,6 @@ def test_v2_canonical_signing_matches_screener_contract(stage: str) -> None:
 
 
 # --- DB + dependency wiring ------------------------------------------------
-
-
-@pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield eng
-    finally:
-        await eng.dispose()
-
-
-@pytest.fixture
-def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 class _FakeGenerator:
@@ -2999,11 +2973,14 @@ class TestArtifact:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
         _install_db(app, session_maker)
         _install_chain(app)
-        _install_chain(app)
         storage = _install_storage(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = claim.json()["items"][0]["attempt_id"]
 
         response = await client.get(
-            f"/api/v1/screener/agent/{agent_id}/artifact", headers=_AUTH_HEADER
+            f"/api/v1/screener/agent/{agent_id}/artifact",
+            headers=_AUTH_HEADER,
+            params={"attempt_id": attempt_id},
         )
         assert response.status_code == 200
         body = response.json()
@@ -3014,6 +2991,86 @@ class TestArtifact:
             storage.presigned_get_url.await_args.kwargs["key"]
             == f"{agent_id}/agent.tar.gz"
         )
+
+    async def test_active_claim_without_attempt_query_still_allows_download(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_storage(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        assert claim.status_code == 200
+
+        response = await client.get(
+            f"/api/v1/screener/agent/{agent_id}/artifact", headers=_AUTH_HEADER
+        )
+        assert response.status_code == 200
+        assert response.json()["agent_id"] == str(agent_id)
+
+    async def test_without_active_attempt_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/screener/agent/{agent_id}/artifact", headers=_AUTH_HEADER
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+        storage.presigned_get_url.assert_not_awaited()
+
+    async def test_wrong_attempt_id_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_storage(app)
+        await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+
+        response = await client.get(
+            f"/api/v1/screener/agent/{agent_id}/artifact",
+            headers=_AUTH_HEADER,
+            params={"attempt_id": str(uuid4())},
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+
+    async def test_expired_attempt_returns_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        storage = _install_storage(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
+        async with session_maker() as session, session.begin():
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            assert attempt is not None
+            attempt.started_at = datetime.now(UTC) - timedelta(minutes=2)
+            attempt.deadline = datetime.now(UTC) - timedelta(minutes=1)
+
+        response = await client.get(
+            f"/api/v1/screener/agent/{agent_id}/artifact",
+            headers=_AUTH_HEADER,
+            params={"attempt_id": str(attempt_id)},
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+        storage.presigned_get_url.assert_not_awaited()
 
     async def test_unknown_agent_returns_404(
         self,
@@ -4667,7 +4724,7 @@ class TestQuarantineReviewContext:
             "agentic-source-review-tripwire"
         ]
 
-    async def test_posted_inconclusive_outcome_is_rejected_not_a_rejection(
+    async def test_inconclusive_finishes_attempt_and_preserves_lease_backoff(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -4685,16 +4742,39 @@ class TestQuarantineReviewContext:
                 passed=False,
                 attempt_id=attempt_id,
                 outcome="inconclusive",
+                reason_code="behavioral-oracle-inconclusive",
             ),
         )
-        assert response.status_code == 409
-        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+        assert response.status_code == 200
+        assert response.json()["status"] == AgentStatus.SCREENING_FAILED
         async with session_maker() as session:
             refreshed = await session.get(Agent, agent_id)
             assert refreshed is not None
-            # The claim moved it to screening; the rejected non-verdict
-            # must not advance or reject it.
-            assert refreshed.status == AgentStatus.SCREENING
+            assert refreshed.status == AgentStatus.SCREENING_FAILED
+            assert refreshed.screening_reason == (
+                "Screening was inconclusive; retry scheduled"
+            )
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            assert attempt is not None
+            assert attempt.status == "expired"
+            assert attempt.finished_at is not None
+            assert attempt.deadline > attempt.finished_at
+            assert attempt.reason_code == "behavioral-oracle-inconclusive"
+
+        # Completing the attempt must not hot-loop the ambiguous submission.
+        blocked = await client.post(_CLAIM_URL)
+        assert blocked.status_code == 200
+        assert blocked.json()["items"] == []
+
+        # Once the original lease deadline passes, the ordinary bounded retry
+        # path becomes eligible again.
+        async with session_maker() as session, session.begin():
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            assert attempt is not None
+            attempt.deadline = attempt.started_at
+        retry = await client.post(_CLAIM_URL)
+        assert retry.status_code == 200
+        assert retry.json()["items"][0]["agent_id"] == str(agent_id)
 
     async def test_missing_context_is_404(
         self,

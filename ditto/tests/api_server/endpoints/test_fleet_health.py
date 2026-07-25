@@ -120,10 +120,19 @@ def test_recent_early_stage_is_not_stalled() -> None:
     assert _benchmark_stalled("building_harness", started, now) is False
 
 
-def test_running_benchmark_is_never_stalled() -> None:
-    # A long-running benchmark can legitimately run to the 75-minute cap, so it
-    # must never be flagged stalled no matter how long it has been going.
+def test_running_benchmark_is_never_stalled_on_wall_clock_alone() -> None:
+    # A long-running benchmark can legitimately run to the 75-minute cap, so
+    # elapsed time by itself must never flag it. It is now judged against its own
+    # reported check count instead (see TestBenchmarkStallDetection in
+    # test_public.py); with no count reported there is nothing to judge, and an
+    # absent report must not be read as a wedged run.
     now = datetime.now(UTC)
     started = now - timedelta(hours=1)
     assert _benchmark_stalled("running_benchmark", started, now) is False
+    assert (
+        _benchmark_stalled("running_benchmark", started, now, completed=None) is False
+    )
     assert _benchmark_stalled(None, started, now) is False
+    # A count that has plainly not kept up with the clock is the one case that
+    # does flag: 3 checks cannot account for an hour.
+    assert _benchmark_stalled("running_benchmark", started, now, completed=3) is True

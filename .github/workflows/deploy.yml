@@ -7,8 +7,17 @@ name: Deploy
 # out of band by the infra repo's envs/gcp-platform Terraform + Ansible. This
 # workflow only ships new code: it authenticates via Workload Identity Federation
 # (no static keys), IAP-SSHes into the matching VM, and runs scripts/update.sh
-# (fetch -> reset -> uv sync -> load the optional Taostats key directly from
-# Secret Manager -> ensure Pylon -> migrate -> pm2 reload).
+# (fetch -> reset -> preflight -> uv sync -> load the optional Taostats key
+# directly from Secret Manager -> ensure Pylon -> migrate -> pm2 reload ->
+# verify the app is serving the commit that was checked out).
+#
+# A green run means the public host answered /health on the revision the deploy
+# put there. It does NOT mean only that a script exited 0: update.sh compares
+# the running process's commit against the checkout, and the health check below
+# compares the public host's against what update.sh reported. Both gates exist
+# because a deploy that stops midway leaves new code checked out and the old
+# process serving, which looks identical to success at the git layer
+# (2026-07-25).
 #
 # GitHub secrets (no values committed):
 #   Repo-level:
@@ -86,6 +95,7 @@ jobs:
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
       - name: Deploy (IAP SSH -> scripts/update.sh)
+        id: deploy
         # `sudo -iu deploy bash -lc` runs a LOGIN shell as deploy so uv/pm2/docker
         # are on PATH (a bare `sudo -u deploy` uses a minimal secure_path and
         # would fail on `uv`/`pm2`). DITTO_UPLOAD_PAYMENT_ADDRESS is the env-scoped
@@ -96,25 +106,73 @@ jobs:
         # API key is read on the VM from `platform-taostats-api-key` in Secret
         # Manager via the attached runtime service account, never passed through
         # this job.
+        #
+        # This checkout deliberately duplicates update.sh's own fetch/reset, and
+        # it is the reason update.sh cannot simply "migrate before checking out":
+        # by the time the script runs, the host is already on the new revision.
+        # update.sh handles that -- it asks the RUNNING process which commit it
+        # is serving before it changes anything, and rolls the checkout back to
+        # that revision if the deploy fails before pm2 restarts.
+        #
+        # `set -o pipefail` is explicit: the default shell for a `run:` block is
+        # `bash -e`, WITHOUT pipefail, so a failing gcloud on the left of the
+        # `tee` pipe below would otherwise be masked by tee's exit 0 -- the same
+        # class of "failure reported as success" this deploy path already had.
         run: |
+          set -euo pipefail
           gcloud compute ssh "${{ steps.target.outputs.vm }}" \
             --zone "$GCP_ZONE" \
             --tunnel-through-iap \
             --quiet \
-            --command "sudo -iu deploy bash -lc 'cd /opt/ditto-platform && git fetch --prune origin && git checkout -fB ${{ steps.target.outputs.branch }} origin/${{ steps.target.outputs.branch }} && git reset --hard origin/${{ steps.target.outputs.branch }} && DITTO_DEPLOY_BRANCH=${{ steps.target.outputs.branch }} DITTO_UPLOAD_PAYMENT_ADDRESS=${{ secrets.DITTO_UPLOAD_PAYMENT_ADDRESS }} DITTO_DASHBOARD_WANDB_URL=${{ vars.DITTO_DASHBOARD_WANDB_URL }} ./scripts/update.sh'"
+            --command "sudo -iu deploy bash -lc 'cd /opt/ditto-platform && git fetch --prune origin && git checkout -fB ${{ steps.target.outputs.branch }} origin/${{ steps.target.outputs.branch }} && git reset --hard origin/${{ steps.target.outputs.branch }} && DITTO_DEPLOY_BRANCH=${{ steps.target.outputs.branch }} DITTO_UPLOAD_PAYMENT_ADDRESS=${{ secrets.DITTO_UPLOAD_PAYMENT_ADDRESS }} DITTO_DASHBOARD_WANDB_URL=${{ vars.DITTO_DASHBOARD_WANDB_URL }} ./scripts/update.sh'" \
+            2>&1 | tee /tmp/deploy.log
+          # update.sh's last line on success. Not github.sha: the host resets to
+          # origin/<branch>, which may already carry a newer push, and asserting
+          # against this job's SHA would red a deploy that is actually correct.
+          commit="$(sed -n 's/^deployed-commit=//p' /tmp/deploy.log | tail -n 1)"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "host was left on: ${commit:-<not reported>}"
 
       - name: Health check
-        # Hits the public Caddy endpoint, so it depends on public DNS + the VM's
-        # cert being issued. Window is generous (≈3 min) for a first/cold deploy
-        # (uv build + app import + Caddy ACME). A red here after a green deploy
-        # step usually means DNS/cert, not the app.
+        # Second gate, from outside the VM. update.sh already verified the app is
+        # serving /health on the host's own port AND that the process reports the
+        # commit that was checked out, so this one covers the path the host cannot
+        # see: public DNS, the VM's cert, and -- once relay hosts exist -- whether
+        # the name actually resolves to the host that was just deployed. Window is
+        # generous (≈3 min) for a first/cold deploy (uv build + app import + Caddy
+        # ACME). A red here after a green deploy step points at DNS/cert/Caddy
+        # rather than the app -- but confirm that against the deploy step's own
+        # health output before assuming it.
+        #
+        # A 200 alone is not enough: an old process behind Caddy answers 200 all
+        # day. When update.sh reported a commit, this waits for the public name to
+        # serve that same commit. When it did not (an older update.sh on the host,
+        # or a checkout without git history), the commit assertion is skipped with
+        # a warning rather than failing the deploy on a missing fact.
+        env:
+          EXPECTED_COMMIT: ${{ steps.deploy.outputs.commit }}
         run: |
+          set -uo pipefail
           host="${{ steps.target.outputs.host }}"
+          if [ -z "$EXPECTED_COMMIT" ]; then
+            echo "::warning::deploy step reported no commit; checking liveness only"
+          fi
           for i in $(seq 1 20); do
-            if curl -fsS "https://$host/health" >/dev/null; then
-              echo "healthy: https://$host/health"; exit 0
+            if curl -fsS "https://$host/health" -o /tmp/health.json; then
+              if [ -z "$EXPECTED_COMMIT" ]; then
+                echo "healthy: https://$host/health"; exit 0
+              fi
+              served="$(python3 -c 'import json,sys; print(json.load(open("/tmp/health.json")).get("commit",""))')"
+              if [ "$served" = "$EXPECTED_COMMIT" ]; then
+                echo "healthy: https://$host/health on commit $served"; exit 0
+              fi
+              echo "serving commit ${served:-<none>}, waiting for $EXPECTED_COMMIT ($i/20)…"
+            else
+              echo "waiting for health ($i/20)…"
             fi
-            echo "waiting for health ($i/20)…"; sleep 9
+            sleep 9
           done
           echo "health check failed for https://$host/health" >&2
+          echo "expected commit $EXPECTED_COMMIT; last response:" >&2
+          cat /tmp/health.json >&2 || true
           exit 1

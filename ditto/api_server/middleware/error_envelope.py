@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI
@@ -43,6 +44,7 @@ from ditto.api_server.pricing import (
     PriceTooStaleError,
     PricingError,
 )
+from ditto.db.queries.agents import SubmissionCooldownError
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,7 @@ logger = logging.getLogger(__name__)
 # codes so callers can branch on the specific failure mode.
 ERROR_CODE_AGENT_NOT_FOUND = 1200
 ERROR_CODE_HOTKEY_AGENT_NOT_FOUND = 1201
+ERROR_CODE_SUBMISSION_COOLDOWN = 1105
 
 # Platform error codes (3xxx range per CODE-REVIEW-CHECKLIST).
 ERROR_CODE_UNHANDLED = 3000
@@ -88,17 +91,25 @@ def _envelope(error_code: int, message: str) -> dict[str, Any]:
     }
 
 
-def _envelope_response(status_code: int, error_code: int, message: str) -> JSONResponse:
+def _envelope_response(
+    status_code: int,
+    error_code: int,
+    message: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     """Build the canonical JSON response with the request id echoed on a header.
 
     Header is set here as backup so error responses still carry the id
     even on code paths where ``RequestIDMiddleware`` cannot set it.
     """
     rid = request_id_var.get()
+    response_headers = dict(headers or {})
+    response_headers[REQUEST_ID_HEADER] = rid
     return JSONResponse(
         status_code=status_code,
         content=_envelope(error_code, message),
-        headers={REQUEST_ID_HEADER: rid},
+        headers=response_headers,
     )
 
 
@@ -110,7 +121,12 @@ def register_exception_handlers(app: FastAPI) -> None:
         _request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
         message = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-        return _envelope_response(exc.status_code, ERROR_CODE_HTTP_EXCEPTION, message)
+        return _envelope_response(
+            exc.status_code,
+            ERROR_CODE_HTTP_EXCEPTION,
+            message,
+            headers=dict(exc.headers or {}),
+        )
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error_handler(
@@ -121,6 +137,20 @@ def register_exception_handlers(app: FastAPI) -> None:
         logger.warning(f"request validation failed: {exc.errors()}")
         return _envelope_response(
             422, ERROR_CODE_VALIDATION, "request validation failed"
+        )
+
+    @app.exception_handler(SubmissionCooldownError)
+    async def _submission_cooldown_handler(
+        _request: Request, exc: SubmissionCooldownError
+    ) -> JSONResponse:
+        retry_after = max(
+            1, int((exc.retry_at - datetime.now(UTC)).total_seconds()) + 1
+        )
+        return _envelope_response(
+            429,
+            ERROR_CODE_SUBMISSION_COOLDOWN,
+            f"owner coldkey may submit again at {exc.retry_at.isoformat()}",
+            headers={"Retry-After": str(retry_after)},
         )
 
     @app.exception_handler(OracleUnreachableError)

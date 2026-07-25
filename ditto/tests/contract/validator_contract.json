@@ -407,6 +407,44 @@
         ],
         "default": null
       },
+      "continual_aggregate_method": {
+        "anyOf": [
+          {
+            "const": "mean_after_quorum",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "effective_composite": {
+        "anyOf": [
+          {
+            "maximum": 1.1,
+            "minimum": 0.0,
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "efficiency_bonus": {
+        "anyOf": [
+          {
+            "maximum": 0.1,
+            "minimum": 0.0,
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
       "first_seen": {
         "format": "date-time",
         "type": "string"
@@ -603,6 +641,44 @@
                   "type": "integer"
                 },
                 "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "continual_aggregate_method": {
+            "anyOf": [
+              {
+                "const": "mean_after_quorum",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "effective_composite": {
+            "anyOf": [
+              {
+                "maximum": 1.1,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "efficiency_bonus": {
+            "anyOf": [
+              {
+                "maximum": 0.1,
+                "minimum": 0.0,
+                "type": "number"
               },
               {
                 "type": "null"
@@ -1726,6 +1802,17 @@
             ],
             "default": null
           },
+          "probe": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ScorerLivenessProbe"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "software_version": {
             "anyOf": [
               {
@@ -1781,6 +1868,81 @@
         "required": [
           "status",
           "supported_bench_versions"
+        ],
+        "type": "object"
+      },
+      "ScorerLivenessProbe": {
+        "additionalProperties": false,
+        "properties": {
+          "consecutive_failures": {
+            "default": 0,
+            "maximum": 2147483647,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "http_status": {
+            "anyOf": [
+              {
+                "maximum": 599,
+                "minimum": 100,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "last_served_at": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "observed_at": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "outcome": {
+            "enum": [
+              "served",
+              "served_degraded",
+              "http_error",
+              "unreadable",
+              "timeout",
+              "connect_error",
+              "not_probed"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "invalid_json",
+                  "malformed_capabilities",
+                  "unsupported_bench_version",
+                  "calibration_unreadable",
+                  "identity_mismatch"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "outcome",
+          "observed_at"
         ],
         "type": "object"
       },

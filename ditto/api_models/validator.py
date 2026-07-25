@@ -566,6 +566,19 @@ class ValidatorHeartbeatRequest(BaseModel):
                 )
         elif self.benchmark_capacity is not None:
             raise ValueError("benchmark capacity requires heartbeat protocol v10")
+        # v15 adds scorer liveness evidence. It is never *required*: telemetry
+        # that can silence a validator is worse than telemetry that is missing,
+        # and a v15 heartbeat that omits it already reads "unreported" in the
+        # fleet view. What is refused is a validator claiming an older protocol
+        # while sending a newer field, which would let the signed envelope and
+        # the declared protocol disagree.
+        if (
+            self.protocol_version < 15
+            and self.capabilities is not None
+            and self.capabilities.scorer_benchmarks is not None
+            and self.capabilities.scorer_benchmarks.probe is not None
+        ):
+            raise ValueError("scorer liveness probe requires heartbeat protocol v15")
         return self
 
 
@@ -1125,6 +1138,45 @@ class LedgerEntry(BaseModel):
                 "fold's paired-evidence source: the KOTH fold groups these by "
                 "seed. Additive-optional: absent means the fold falls back to the "
                 "legacy in-row arrays (then the unpaired band)."
+            ),
+        ),
+    ] = None
+    continual_aggregate_method: Literal["mean_after_quorum"] | None = Field(
+        default=None,
+        description=(
+            "Activation marker for validator protocol v14+. When present, the "
+            "weight fold uses the arithmetic mean of the three signed quorum "
+            "scores plus one aggregate per completed continual cohort wave. "
+            "Older validators ignore this additive field."
+        ),
+    )
+    efficiency_bonus: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=0.1,
+            description=(
+                "Frozen platform-side relative token-efficiency bonus fraction "
+                "for this entry (bench_version >= 7). Populated only while the "
+                "platform's DITTO_EFFICIENCY_BONUS_FOLD_ENABLED flag is on; "
+                "absent otherwise so existing folds are byte-identical. "
+                "Advisory until the subnet's weight fold ships a consensus "
+                "change that consumes it — a validator must never fold this "
+                "field unilaterally."
+            ),
+        ),
+    ] = None
+    effective_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.1,
+            description=(
+                "composite * (1 + efficiency_bonus), the platform-side ranking "
+                "score with the frozen bonus applied. Additive-optional, gated "
+                "with efficiency_bonus; the signed composite is never modified."
             ),
         ),
     ] = None

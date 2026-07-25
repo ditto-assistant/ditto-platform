@@ -180,7 +180,7 @@
     .banner.show { display: flex; }
 
     /* ── Network snapshot ───────────────────────────────────── */
-    .cards { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 1px; margin: 22px 0; }
+    .cards { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1px; margin: 22px 0; }
     .card {
       background: var(--bg-elev); border: 1px solid var(--border);
       border-radius: var(--radius); padding: 16px 18px; position: relative; overflow: hidden;
@@ -600,7 +600,9 @@
     .retry-chip { display: inline-flex; align-items: center; width: fit-content; margin-top: 5px; padding: 1px 6px; border-radius: 5px; font: 750 9.5px/1.5 var(--sans); letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
     .retry-chip.exhausted { color: var(--danger); border: 1px solid color-mix(in oklab, var(--danger) 50%, transparent); background: color-mix(in oklab, var(--danger) 13%, transparent); }
     .retry-chip.cooling { color: var(--warn); border: 1px solid color-mix(in oklab, var(--warn) 45%, transparent); background: color-mix(in oklab, var(--warn) 10%, transparent); }
-    .pipeline-stuck-count { flex: 0 0 auto; margin-left: 6px; padding: 0 6px; border-radius: 999px; color: var(--danger); background: color-mix(in oklab, var(--danger) 14%, transparent); font: 750 10px/1.6 var(--sans); }
+    .pipeline-stuck-count { flex: 0 0 auto; margin-left: 6px; padding: 0 6px; border: 0; border-radius: 999px; color: var(--danger); background: color-mix(in oklab, var(--danger) 14%, transparent); font: 750 10px/1.6 var(--sans); cursor: pointer; }
+    .pipeline-stuck-count:hover, .pipeline-stuck-count[aria-pressed="true"] { background: color-mix(in oklab, var(--danger) 24%, transparent); }
+    .pipeline-stuck-count:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
     .pipeline-item-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 3px; color: var(--text-faint); font-family: var(--mono); font-size: 11.5px; }
     .pipeline-item-priority-detail { display: block; margin-top: 4px; color: var(--text-dim); font: 600 10px/1.35 var(--mono); }
     .pipeline-item-qualification-detail { display: block; margin-top: 4px; color: var(--accent-2); font: 650 9.5px/1.35 var(--mono); text-wrap: pretty; }
@@ -876,6 +878,30 @@
     .pipeline-detail-state { margin: 0; padding: var(--detail-space-md) 0; color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
     .pipeline-detail-state.loading { color: var(--text-faint); }
     .pipeline-detail-state.error { color: var(--warn); }
+    .artifact-release-card {
+      display: grid;
+      gap: var(--detail-space-sm);
+      margin-top: var(--detail-space-lg);
+      padding: var(--detail-space-lg);
+      border: 1px solid color-mix(in oklab, var(--accent) 34%, var(--border));
+      border-radius: 10px;
+      background: color-mix(in oklab, var(--accent) 6%, transparent);
+    }
+    .artifact-release-head { display: flex; align-items: center; justify-content: space-between; gap: var(--detail-space-md); }
+    .artifact-release-head h4 { margin: 0; color: var(--text); font-size: 13px; font-weight: 750; }
+    .artifact-release-state { color: var(--text-dim); font: 700 10.5px/1.3 var(--mono); text-transform: uppercase; }
+    .artifact-release-state.available { color: var(--good); }
+    .artifact-release-state.embargoed { color: var(--warn); }
+    .artifact-release-state.under_review { color: var(--danger); }
+    .artifact-release-detail { margin: 0; color: var(--text-dim); font-size: 12.5px; line-height: 1.5; text-wrap: pretty; }
+    .artifact-release-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--detail-space-sm) var(--detail-space-md); }
+    .artifact-download { min-height: 36px; }
+    .artifact-download-status { color: var(--text-faint); font-size: 11.5px; line-height: 1.4; }
+    .artifact-download-status.error { color: var(--bad); }
+    .source-release-note { display: block; margin-top: 6px; color: var(--text-faint); font-size: 11px; line-height: 1.35; }
+    .source-release-note.available { color: var(--good); }
+    .source-release-note.embargoed { color: var(--warn); }
+    .source-release-note.under_review { color: var(--danger); }
     .screening-dispute {
       padding: var(--detail-space-lg);
       border: 1px solid color-mix(in oklab, var(--warn) 48%, var(--border));
@@ -1452,7 +1478,11 @@
     .banner b { color: var(--banner-strong); }
 
     .cards {
-      grid-template-columns: repeat(7, minmax(0, 1fr));
+      /* Six columns because the snapshot holds exactly nine tiles: the primary
+         card spans 2x2 and the remaining eight fill four cells on each of its
+         two rows. Adding or removing a tile changes this arithmetic, so re-check
+         the column count rather than leaving a gap in the last row. */
+      grid-template-columns: repeat(6, minmax(0, 1fr));
       margin: 0 0 36px;
       border: 1px solid var(--border);
       background: var(--border);
@@ -1473,7 +1503,6 @@
     .card.primary .label { color: var(--accent); font-size: 11px; }
     .card.primary .value { margin-top: 12px; font-size: 52px; }
     .card.primary .context { max-width: 20ch; margin-top: 12px; color: var(--text-dim); font-size: 12px; line-height: 1.45; }
-    .cards > .card:last-child { grid-column: span 2; }
 
     /* Third-party harnesses are deliberately kept outside the leaderboard.
        This comparison panel can grow by adding evidence records in JS without
@@ -2032,6 +2061,7 @@
     .fleet-ledger-row strong { font-family: var(--display); font-size: 23px; font-weight: 400; line-height: 1; font-variant-numeric: tabular-nums; }
     .fleet-ledger-row > span:last-child { color: var(--text-dim); font: 650 10px/1.2 var(--mono); text-transform: uppercase; }
     .fleet-ledger-row.healthy .fleet-ledger-dot { background: var(--good); }
+    .fleet-ledger-row.critical .fleet-ledger-dot { background: var(--danger); }
     .fleet-ledger-row.warning .fleet-ledger-dot { background: var(--warn); }
     .fleet-ledger-row.stale .fleet-ledger-dot { background: var(--warn); }
     .fleet-ledger-row.offline .fleet-ledger-dot { background: var(--danger); }
@@ -2082,6 +2112,11 @@
     .fleet-meter-track i { display: block; width: calc(var(--value) * 1%); height: 100%; background: var(--good); }
     .fleet-meter.warn .fleet-meter-track i { background: var(--warn); }
     .fleet-meter-value { color: var(--text); font: 10px/1 var(--mono); font-variant-numeric: tabular-nums; }
+    /* One row per concurrent benchmark slot, stacked inside the work cell so
+       the fleet table keeps its column count as slot counts grow. */
+    .fleet-slot { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+    .fleet-slot + .fleet-slot { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border); }
+    .fleet-slot > .fleet-protocol { flex: none; font-variant-numeric: tabular-nums; }
     .fleet-container-health { color: var(--text); font: 10px/1.35 var(--mono); white-space: nowrap; }
     .fleet-container-health.bad { color: var(--danger); }
     .fleet-unreported { color: var(--text-faint); font-size: 11px; }
@@ -2299,7 +2334,6 @@
       <div class="card"><div class="glow" style="background:var(--accent)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="Distinct miners with at least one scored run on the board (provisional runs included).">Miners Scored</span></div><div class="value" id="c-miners">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="The highest composite among ranked full-benchmark runs. Start with 0.5 × tool mean + 0.5 × memory mean, apply the benchmark quality gates, then apply the v5 token-efficiency multiplier. Token efficiency can remove at most 10%. Provisional runs are excluded.">Top Composite</span></div><div class="value" id="c-top">–</div></div>
       <div class="card"><div class="glow" style="background:var(--accent-2)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median Composite</span></div><div class="value" id="c-median">–</div></div>
-      <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" id="c-baseline-tip" data-tooltip="Reference baseline: the stock (unmodified) starter-kit harness on the locked model, averaged over 25 seeds at run_size=full. Source: dittobench-api docs/BASELINES.md.">Reference Baseline</span></div><div class="value" id="c-baseline">–</div></div>
       <div class="card"><div class="label"><span class="tip" tabindex="0" data-tooltip="All validator score records stored by the platform, including the independent scores that make up each finalized result.">Total scores</span></div><div class="value" id="h-scores">–</div></div>
       <div class="card"><div class="label"><span class="tip" tabindex="0" data-tooltip="Validators currently reporting heartbeat-capable software to the platform.">Validators</span></div><div class="value" id="h-validators">–</div></div>
       <div class="card"><div class="glow" style="background:var(--gold)"></div><div class="label"><span class="tip" tabindex="0" data-tooltip="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top Gap</span></div><div class="value" id="c-spread">–</div></div>
@@ -2349,7 +2383,7 @@
             <th scope="col" class="sortable" data-sort="name"><span class="tip" tabindex="0" data-tooltip="The miner's best-scoring agent, with its current SN118 UID and on-chain hotkey below. Open either identity for details, or copy the hotkey.">Best-scoring agent</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" style="width:128px"><span class="tip" id="emissions-col-tip" tabindex="0" data-tooltip="Current KOTH role. The incumbent champion takes a fixed share of the miner pool; a participation tail splits the remainder.">Emissions</span></th>
             <th scope="col" class="hide-md sortable" data-sort="bench" style="width:180px"><span class="tip" tabindex="0" data-tooltip="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under. Sort to group runs by benchmark version.">Model</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" style="width:230px" class="sortable" data-sort="composite"><span class="tip" tabindex="0" data-tooltip="Headline score in [0,1]. The base is the equal-weight tool/memory average (½·tool + ½·memory); the benchmark quality gates then multiply it down (the 'gates −%' chip shows how much, mostly the conversational-sanity gate), and v5 token efficiency can remove at most 10% more (the 'token' chip). That is why the composite is not simply the tool/memory average. The band is ±1 standard error.">Composite</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" style="width:230px" class="sortable" data-sort="composite"><span class="tip" tabindex="0" data-tooltip="Current leaderboard score in [0,1]. It starts as the median of the first three accepted validator scores. After each full top-five cohort wave completes, it becomes the arithmetic mean of those original three scores plus one aggregate per completed wave, so continual retests can move it up or down. Partial waves never count.">Current score</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="hide-sm sortable" data-sort="tool" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="hide-sm sortable" data-sort="memory" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Memory subscore, not the overall composite used for rank. It is the mean across memory cases: did the agent recall and reason over stored facts across sessions, over time, and while resisting injected instructions?">Memory</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="num hide-sm sortable" data-sort="latency" style="width:96px"><span class="tip" tabindex="0" data-tooltip="Median per-case response time for the run, and how many cases were scored (a full benchmark is ~114 cases).">Latency</span><span class="sarrow" aria-hidden="true">▲</span></th>
@@ -2432,6 +2466,7 @@
 
         <aside class="fleet-ledger" aria-label="Fleet status summary">
           <div class="fleet-ledger-row healthy"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-healthy">–</strong><span>Healthy</span></div>
+          <div class="fleet-ledger-row critical"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-critical">–</strong><span>Critical</span></div>
           <div class="fleet-ledger-row warning"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-warning">–</strong><span>Warning</span></div>
           <div class="fleet-ledger-row stale"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-stale">–</strong><span>Stale</span></div>
           <div class="fleet-ledger-row offline"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-offline">–</strong><span>Offline</span></div>
@@ -2738,6 +2773,8 @@
     var lastEmissions = null;
     var lastActivityEntries = [];
     var pipelineEntries = [];
+    var pipelineStatusCounts = {};
+    var pipelineShowStuck = false;
     var pipelineLoaded = false;
     var pipelineUnavailable = false;
     var activityUnavailable = false;
@@ -3093,7 +3130,8 @@
     // the ordering stays on one comparable scale. Agents with no settled median
     // (first scored during the rollout) fall back to their authoritative value.
     function displayComposite(e) {
-      return rolloutSettledView && e.settled_composite != null ? e.settled_composite : e.composite;
+      if (rolloutSettledView && e.settled_composite != null) return e.settled_composite;
+      return e.official_composite != null ? e.official_composite : e.composite;
     }
 
     // Consensus constants are read from the fold the API reports, never written
@@ -3161,6 +3199,128 @@
           marginText(effectiveMargin) + (scale < 1 ? " effective v6+ hysteresis." : " fixed hysteresis.") + band +
           " A lead inside the band is not rejected: both agents are re-scored on shared confirmation seeds and the next fold decides on the paired comparison.");
       el.classList.add("show");
+    }
+
+    var artifactDownloadLoading = {};
+
+    function artifactReleaseCopy(release) {
+      if (!release) return null;
+      var hours = Number(release.embargo_hours) || 48;
+      var bench = release.bench_version == null ? "" : " on Bench v" + release.bench_version;
+      if (release.status === "available") {
+        return {
+          state: "available",
+          label: "Source public",
+          detail: "This king's source" + bench + " cleared its " + hours + "-hour public window after on-chain weights were set on it. The download link lasts five minutes."
+        };
+      }
+      if (release.status === "embargoed") {
+        return {
+          state: "embargoed",
+          label: "Privacy window",
+          detail: release.available_at
+            ? "Source unlocks " + relTimeUntil(release.available_at) + ", " + hours + " hours after validators' on-chain weights were set on this king" + bench + "."
+            : "King-only source: unlocks " + hours + " hours after validators' on-chain weights are confirmed on this miner (commit-reveal). Awaiting that on-chain confirmation."
+        };
+      }
+      if (release.status === "under_review") {
+        var elapsed = release.available_at && Date.parse(release.available_at) <= Date.now();
+        return {
+          state: "under_review",
+          label: "Held for review",
+          detail: "Source stays private while review is active. If cleared, its king reveal timing still applies" +
+            (elapsed ? ", so this source will be public immediately." : ".")
+        };
+      }
+      if (release.status === "awaiting_quorum") {
+        return {
+          state: "awaiting_quorum",
+          label: "Awaiting 3/3",
+          detail: "Source remains private until three validators score the same benchmark version. Source is only ever released for the leaderboard king."
+        };
+      }
+      return {
+        state: "unavailable",
+        label: "Source private",
+        detail: "Source is private: only the leaderboard king's source is ever released, and only after on-chain weights confirm its reign. This submission has not qualified."
+      };
+    }
+
+    function artifactReleaseNote(release) {
+      var copy = artifactReleaseCopy(release);
+      if (!copy || ["available", "embargoed", "under_review"].indexOf(copy.state) < 0) return "";
+      return '<span class="source-release-note ' + esc(copy.state) + '">' + esc(copy.label) +
+        (copy.state === "embargoed" && release.available_at ? " · " + esc(relTimeUntil(release.available_at)) : "") + '</span>';
+    }
+
+    function renderArtifactRelease(release, agentId) {
+      var copy = artifactReleaseCopy(release);
+      if (!copy) return "";
+      var canDownload = copy.state === "available" && release.download_available === true;
+      var action = canDownload
+        ? '<div class="artifact-release-actions"><button class="btn ghost artifact-download" type="button" data-artifact-download="' + esc(agentId) + '">' +
+            '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>' +
+            '<span class="artifact-download-label">Download submitted source</span></button>' +
+            '<span class="artifact-download-status" data-artifact-status="' + esc(agentId) + '" role="status" aria-live="polite"></span></div>'
+        : "";
+      return '<section class="artifact-release-card" aria-label="Submitted source release">' +
+        '<div class="artifact-release-head"><h4>Submitted source</h4><span class="artifact-release-state ' + esc(copy.state) + '">' + esc(copy.label) + '</span></div>' +
+        '<p class="artifact-release-detail">' + esc(copy.detail) + '</p>' + action + '</section>';
+    }
+
+    function downloadArtifact(agentId, button) {
+      if (!agentId || !button || artifactDownloadLoading[agentId]) return;
+      artifactDownloadLoading[agentId] = true;
+      button.disabled = true;
+      var label = button.querySelector(".artifact-download-label");
+      var card = button.closest(".artifact-release-card");
+      var detail = card ? card.querySelector(".artifact-download-status") : null;
+      if (label) label.textContent = "Preparing download…";
+      if (detail) {
+        detail.classList.remove("error");
+        detail.textContent = "Creating a private five-minute link…";
+      }
+      var ctrl = new AbortController();
+      var to = setTimeout(function () { ctrl.abort(); }, 8000);
+      fetch(API_BASE + "/public/agent/" + encodeURIComponent(agentId) + "/artifact", {
+        signal: ctrl.signal,
+        cache: "no-store",
+        headers: { accept: "application/json" }
+      }).then(function (response) {
+        clearTimeout(to);
+        return response.json().catch(function () { return {}; }).then(function (data) {
+          if (!response.ok) {
+            var message = typeof data.message === "string"
+              ? data.message
+              : (typeof data.detail === "string" ? data.detail : "Source is not available yet (HTTP " + response.status + ").");
+            throw new Error(message);
+          }
+          return data;
+        });
+      }, function (error) {
+        clearTimeout(to);
+        throw error;
+      }).then(function (data) {
+        if (!data.download_url) throw new Error("The download credential was missing.");
+        // Same-tab navigation: a synthetic _blank click after the async fetch
+        // is popup-blocked in Safari, and `download` is ignored cross-origin.
+        // The tarball URL answers with an attachment, so the page stays put.
+        window.location.assign(data.download_url);
+        if (detail) detail.textContent = "Download started · the private link expires in five minutes.";
+      }).catch(function (error) {
+        if (detail) {
+          detail.classList.add("error");
+          detail.textContent = error && error.name === "AbortError"
+            ? "The download request timed out. Try again."
+            : (error.message || "Could not prepare the download. Try again.");
+        }
+      }).finally(function () {
+        delete artifactDownloadLoading[agentId];
+        if (button.isConnected) {
+          button.disabled = false;
+          if (label) label.textContent = "Download submitted source";
+        }
+      });
     }
 
     // The emissions-column tooltip states the split. Both numbers are fold
@@ -3342,10 +3502,7 @@
         ? "DittoBench v" + active + " → v" + desired + " rollout"
         : "DittoBench v" + active + (benchHasOlderRuns ? " · older runs marked" : "");
     }
-    // Stock reference-harness baseline (dittobench-api docs/BASELINES.md): the
-    // composite a submission must beat, from 24 seeds at run_size=full on the
-    // locked model. Tied to the bench_version it was measured on; refresh from a
-    // new calibration run when the benchmark version bumps.
+
     // Leaderboard view state. The board keeps every entry (ranks, search and the
     // rank-movement snapshot are computed over the whole field); this only
     // controls what is DISPLAYED. Scored is the default tab because a
@@ -3434,22 +3591,6 @@
       renderActivityFilterControls();
       renderBoardRows();
     }
-
-    // Reference baseline per benchmark version: the stock (unmodified)
-    // starter-kit harness on the locked model. Source of every number:
-    // dittobench-api docs/BASELINES.md. Keyed by version rather than held as a
-    // single constant so an older board view still shows ITS baseline instead of
-    // a bare dash, and so a version we have not measured yet says so explicitly
-    // rather than looking like a rendering failure.
-    //
-    // Add a version here only from a published run. A baseline is measured, not
-    // estimated, and an invented number here would be indistinguishable on the
-    // page from a real one.
-    var REFERENCE_BASELINES = {
-      2: { composite: 0.492, method: "24 seeds at run_size=full", run: "Run 1" },
-      3: { composite: 0.445, method: "25 seeds at run_size=full", run: "Run 3 (transform audit)" },
-      4: { composite: 0.429, method: "one full run, seed 20260719", run: "Run 5" }
-    };
 
     // Off-network comparison records. Every point is one retained practice run
     // measured now against an immutable historical contract, then positioned at
@@ -3546,6 +3687,27 @@
       if (s < 86400) return Math.floor(s / 3600) + "h ago";
       return Math.floor(s / 86400) + "d ago";
     }
+    // Future-facing twin of relTime for deadlines (embargo unlock times).
+    function relTimeUntil(iso) {
+      var t = new Date(iso).getTime();
+      if (isNaN(t)) return "–";
+      var s = (t - Date.now()) / 1000;
+      if (s <= 0) return "any moment now";
+      if (s < 60) return "in " + Math.ceil(s) + "s";
+      if (s < 3600) return "in " + Math.ceil(s / 60) + "m";
+      if (s < 86400) return "in " + Math.ceil(s / 3600) + "h";
+      return "in " + Math.ceil(s / 86400) + "d";
+    }
+    // Elapsed-seconds twin of relTime, for API-reported ages (staleness markers)
+    // rather than timestamps. Takes seconds because that is what the API sends.
+    function relDuration(seconds) {
+      var s = Number(seconds);
+      if (!isFinite(s) || s < 0) return "–";
+      if (s < 60) return Math.floor(s) + "s";
+      if (s < 3600) return Math.floor(s / 60) + "m";
+      if (s < 86400) return Math.floor(s / 3600) + "h";
+      return Math.floor(s / 86400) + "d";
+    }
     function esc(s) {
       return String(s).replace(/[&<>"']/g, function (c) {
         return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
@@ -3619,6 +3781,14 @@
         summary += revealedLabel + " is the most common validator top choice at " + championCounts[revealedLeader] + " of " + minerVectors + ". ";
       }
       summary += "Block " + Number(snapshot.block).toLocaleString() + ". Commit-reveal can make this lag active commitments; Yuma combines validator inputs stake-weightedly.";
+      // The API serves the last good matrix rather than nothing when a chain
+      // re-read fails, so say so instead of silently presenting old data as
+      // current. The panel stays up either way: dropping it for a tick and
+      // restoring it on the next one is the "flicker" this replaced.
+      if (snapshot.stale) {
+        summary += " Chain re-read is currently failing; this is the last matrix successfully read" +
+          (snapshot.age_seconds ? ", " + relDuration(snapshot.age_seconds) + " ago" : "") + ".";
+      }
       copy.textContent = summary;
       observation.classList.add("show");
     }
@@ -4102,27 +4272,6 @@
       activeBench = benchState.active || activeBench;
       desiredBench = benchState.desired || desiredBench || activeBench;
       currentBench = benchState.selected || currentBench;
-      // Reference-baseline card: only meaningful while the board runs the
-      // bench_version the baseline was measured on; otherwise it would mislead.
-      // Show the baseline for the version the board is actually showing, so a
-      // v2 or v3 view is never blank. Only a version with no published run reads
-      // as pending, and it says which version is missing rather than just "–".
-      var baseline = REFERENCE_BASELINES[currentBench];
-      document.getElementById("c-baseline").innerHTML =
-        baseline ? fx(baseline.composite) : "not yet measured";
-      var baselineTip = document.getElementById("c-baseline-tip");
-      if (baselineTip) {
-        baselineTip.setAttribute("data-tooltip",
-          baseline
-            ? "Reference baseline: the stock (unmodified) starter-kit harness on the locked model, " +
-              baseline.method + ", measured on bench_version " + currentBench + " (" + baseline.run +
-              "). Source: dittobench-api docs/BASELINES.md. This is the score a submission must beat " +
-              "to be worth submitting; it is not the score that wins, which is the champion's."
-            : "No reference baseline has been measured on bench_version " + (currentBench || "?") +
-              " yet. A baseline is a real run of the stock starter-kit harness on the locked model, so it " +
-              "cannot be carried over from an earlier version: composites are only comparable within one " +
-              "benchmark version. Until it is measured, compare against the leaderboard rather than a baseline.");
-      }
       // Header badge names the CURRENT benchmark, and notes when older runs are on
       // the board (which are individually marked in their rows).
       // "Older" = an explicit lower version OR a legacy run with no version recorded
@@ -4143,12 +4292,17 @@
       var notice = document.getElementById("leaderboard-notice");
       var inactive = entries.filter(function (e) { return e.registered === false; });
       var registrationUnknown = entries.filter(function (e) { return e.registered == null; });
+      var collectedContinualWaves = entries.some(function (e) {
+        return Number(e.completed_wave_count) > 0;
+      });
       // Chain unreachable for the whole snapshot: the notice above already
       // explains it once, so we suppress the identical per-row "registration
       // unknown" badge. Per-row badges still show when registration data exists
       // but a specific row is unregistered/dereg.
       chainRegistrationUnknown = entries.length > 0 && registrationUnknown.length === entries.length;
       var historicalView = data.selection_mode === "historical";
+      var continualPending = !historicalView && collectedContinualWaves &&
+        data.continual_aggregate_active !== true;
       title.textContent = historicalView
         ? "Bench v" + data.current_bench_version + " history"
         : finalizedEntries.length ? "Current rollout leaderboard" : (provisional.length ? "Provisional leaderboard" : "Current rollout leaderboard");
@@ -4166,7 +4320,11 @@
         ? "Rows rank by their settled v" + activeBench + " score while v" + data.desired_bench_version +
           " collects. Validator weights stay on v" + activeBench + " until the v" + data.desired_bench_version + " rollout fully activates."
         : "This pool drives validator weights.";
-      if (provisional.length || inactive.length || registrationUnknown.length) {
+      // Registration values that are real but were read a moment ago rather than
+      // just now. Distinct from `registrationUnknown` (no usable read at all):
+      // the rows keep their badges and only gain this one-line caveat.
+      var registrationStale = data.registration_stale === true;
+      if (provisional.length || inactive.length || registrationUnknown.length || registrationStale || continualPending) {
         notice.classList.add("show");
         var notices = [];
         if (provisional.length) notices.push('<strong>Provisional standings.</strong> ' + provisional.length +
@@ -4176,6 +4334,8 @@
           ' scored hotkey' + (inactive.length === 1 ? ' is' : 's are') +
           ' not currently registered on SN118. Their submissions and scores are retained, but they are excluded from active weights and emissions until the same hotkey registers again.');
         if (registrationUnknown.length) notices.push('<strong>Registration unavailable.</strong> Current SN118 registration could not be confirmed. The deterministic KOTH fold remains visible, but actual chain eligibility and active-rank styling stay unknown until registration is confirmed.');
+        else if (registrationStale) notices.push('<strong>Registration not confirmed just now.</strong> The latest SN118 registration read failed, so the registration column below is the last one successfully read rather than a live confirmation. The values are real; they are simply not re-confirmed as of this refresh.');
+        if (continualPending) notices.push('<strong>Continual score activation pending.</strong> Completed retest waves are preserved as observations, but rankings and weights remain on the canonical three-score median until every recently-live validator supports protocol ' + esc(data.continual_aggregate_required_protocol || 14) + '. The contract activates globally, never per validator.');
         notice.innerHTML = notices.join(' ');
       } else {
         notice.classList.remove("show");
@@ -4479,7 +4639,7 @@
     function renderLeaderboardUnavailable() {
       lastEntries = [];
       renderSignatures.leaderboard = null;
-      ["c-miners", "c-top", "c-median", "c-baseline", "c-spread"].forEach(function (id) {
+      ["c-miners", "c-top", "c-median", "c-spread"].forEach(function (id) {
         document.getElementById(id).textContent = "–";
       });
       var badge = document.getElementById("bench-badge");
@@ -4529,17 +4689,57 @@
       // The stashed stderr describes the authoritative composite; when the cell
       // shows the settled value instead (mid-rollout, agent already on the new
       // version) the band would be attached to the wrong number, drop it.
-      var band = v === e.composite ? errBand(v, e.composite_stderr) : "";
+      var band = v === e.composite && e.aggregate_method !== "continual_mean"
+        ? errBand(v, e.composite_stderr) : "";
       var row = '<div class="metric"><div class="barwrap">' + band +
         '<div class="bar composite" style="width:' + w.toFixed(1) + '%"></div></div>' +
         '<span class="mval">' + fx(v) + '</span></div>';
       var spark = sparkSvg(e.history);
+      var variance = continualVarianceSvg(e);
       var chip = rolloutChip(e);
+      var continualChip = continualScoreChip(e);
       var gateChip = qualityGateChip(e);
       var tokenChip = tokenPenaltyChip(e);
-      var line2 = (spark || chip || gateChip || tokenChip)
-        ? '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-height:16px">' + spark + chip + gateChip + tokenChip + '</div>' : "";
+      var line2 = (spark || variance || chip || continualChip || gateChip || tokenChip)
+        ? '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-height:16px">' + spark + variance + chip + continualChip + gateChip + tokenChip + '</div>' : "";
       return '<td><div class="cwrap">' + row + line2 + '</div></td>';
+    }
+
+    function continualVarianceSvg(e) {
+      if (!e || e.aggregate_method !== "continual_mean") return "";
+      var initial = (e.initial_quorum_composites || []).map(Number).filter(Number.isFinite);
+      var waves = (e.completed_wave_composites || []).map(Number).filter(Number.isFinite);
+      var samples = initial.concat(waves);
+      if (samples.length < 4) return "";
+      var x = function (value) { return 3 + Math.max(0, Math.min(1, value)) * 94; };
+      var low = Math.min.apply(null, samples);
+      var high = Math.max.apply(null, samples);
+      var mean = Number(e.official_composite);
+      var dots = initial.map(function (value) {
+        return '<circle cx="' + x(value).toFixed(1) + '" cy="8" r="2.1" fill="var(--muted)" />';
+      }).join("") + waves.map(function (value) {
+        return '<circle cx="' + x(value).toFixed(1) + '" cy="8" r="2.3" fill="var(--gold)" />';
+      }).join("");
+      var title = "Score observations: initial quorum " + initial.map(fx).join(", ") +
+        "; completed waves " + waves.map(fx).join(", ") +
+        "; range " + fx(low) + "–" + fx(high) + "; current mean " + fx(mean) + ".";
+      return '<svg class="spark tip" tabindex="0" role="img" aria-label="' + esc(title) +
+        '" data-tooltip="' + esc(title) + '" viewBox="0 0 100 16">' +
+        '<line x1="' + x(low).toFixed(1) + '" y1="8" x2="' + x(high).toFixed(1) +
+        '" y2="8" stroke="var(--border)" stroke-width="2" />' + dots +
+        '<line x1="' + x(mean).toFixed(1) + '" y1="2" x2="' + x(mean).toFixed(1) +
+        '" y2="14" stroke="var(--accent)" stroke-width="1.5" /></svg>';
+    }
+
+    function continualScoreChip(e) {
+      if (!e || e.aggregate_method !== "continual_mean") return "";
+      var waves = Number(e.completed_wave_count) || 0;
+      var samples = Number(e.aggregate_sample_count) || (3 + waves);
+      var title = "Current leaderboard score: arithmetic mean of the original three validator scores plus " +
+        waves + " completed cohort " + (waves === 1 ? "wave" : "waves") +
+        ". Partial waves do not count.";
+      return '<span class="rollout-chip settled tip" tabindex="0" data-tooltip="' + esc(title) + '">' +
+        esc(samples + "-sample mean · " + waves + (waves === 1 ? " wave" : " waves")) + '</span>';
     }
     // Why the composite is not simply the tool/memory average: the base IS that
     // average (½·tool + ½·memory), and the benchmark quality gates (chiefly the
@@ -4835,11 +5035,16 @@
       // into two columns. The full dataset hash and the free-form blocks (per-case
       // table, glossaries) render full width below the columns.
       function group(head, body) { return body ? '<div class="stat-group"><div class="stat-head">' + head + '</div>' + body + '</div>' : ""; }
+      var official = displayComposite(e);
+      var rolling = e.aggregate_method === "continual_mean";
       var overview =
         stat("Best-scoring agent", agentName(e.agent_name)) +
         stat("Submission", agentVersionLabel(e.agent_version)) +
-        stat("Composite", fx(e.composite) +
-          (e.composite_stderr != null ? "  ± " + fx(e.composite_stderr) + " SE" : "")) +
+        stat("Current leaderboard score", fx(official) +
+          (rolling
+            ? "  · mean of " + e.aggregate_sample_count + " scores (" + e.completed_wave_count + " completed " + (e.completed_wave_count === 1 ? "wave" : "waves") + ")"
+            : (e.composite_stderr != null ? "  ± " + fx(e.composite_stderr) + " SE" : "") + "  · canonical quorum median")) +
+        (rolling ? stat("Initial quorum median", fx(e.composite) + "  · first 3 accepted validator scores") : "") +
         stat("Tool mean", fx(e.tool_mean) + "  (" + pct(e.tool_mean) + ")") +
         stat("Memory mean", fx(e.memory_mean) + "  (" + pct(e.memory_mean) + ")") +
         (e.calibration_brier != null
@@ -4872,6 +5077,7 @@
         : "";
       document.getElementById("d-stats").innerHTML =
         reviewPacketButton(e) +
+        renderArtifactRelease(e.artifact_release, e.agent_id) +
         '<div class="stat-cols">' + colStats + '</div>' +
         '<div id="d-consensus"></div>' +
         pc +
@@ -5311,6 +5517,13 @@
       ev.stopPropagation();
       loadRunTelemetry(button);
     });
+    document.addEventListener("click", function (ev) {
+      var button = ev.target.closest("[data-artifact-download]");
+      if (!button) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      downloadArtifact(button.getAttribute("data-artifact-download"), button);
+    });
     document.addEventListener("keydown", function (ev) {
       var copy = ev.target.closest(".copy");
       if (!copy || (ev.key !== "Enter" && ev.key !== " ")) return;
@@ -5362,6 +5575,14 @@
       }
     });
     document.getElementById("pipeline-overview").addEventListener("click", function (ev) {
+      var stuckFilter = ev.target.closest("[data-pipeline-stuck-filter]");
+      if (stuckFilter) {
+        ev.preventDefault();
+        pipelineShowStuck = !pipelineShowStuck;
+        renderSignatures.pipeline = null;
+        renderPipelineBoard({ entries: pipelineEntries, status_counts: pipelineStatusCounts }, false);
+        return;
+      }
       var item = ev.target.closest("[data-pipeline-i]");
       if (item && !item.matches("[data-entity-link]")) openActivityEntry(pipelineEntries[+item.getAttribute("data-pipeline-i")]);
     });
@@ -5755,8 +5976,17 @@
       if (!progress || !progress.stage) return "Benchmark progress not reported";
       if (progress.stage === "failed_retrying") return "Failed · a new attempt will start shortly";
       if (progress.stalled) {
-        return benchmarkStageLabel(progress.stage) + " · stalled" +
-          (progress.started_at ? ", no progress for " + elapsedDuration(progress.started_at) : "");
+        // Say what the run has actually done, not just how long it has been
+        // going: "3 of 281 checks after 45m" is diagnosable, "no progress for
+        // 45m" reads as a reporting gap and sends the operator to the wrong
+        // place. The validator is still heartbeating here — a validator that has
+        // gone quiet shows up separately as offline or stale.
+        var stalledFor = progress.started_at ? " after " + elapsedDuration(progress.started_at) : "";
+        if (progress.completed_checks != null && progress.total_checks != null) {
+          return benchmarkStageLabel(progress.stage) + " · stalled · " +
+            progress.completed_checks + " of " + progress.total_checks + " checks" + stalledFor;
+        }
+        return benchmarkStageLabel(progress.stage) + " · stalled" + stalledFor;
       }
       if (progress.percent == null) return benchmarkStageLabel(progress.stage) + " · working…";
       var text = "Benchmark " + progress.percent + "%";
@@ -5798,7 +6028,10 @@
       var ariaText = (versionLabel ? versionLabel + ". " : "") + label + ". " + text;
       var bar;
       if (determinate) {
-        var value = Math.max(0, Math.min(95, Number(progress.percent) || 0));
+        // The server already holds percent below 100 until the run reaches a
+        // terminal stage, so clamp only to the bar's own domain. Clamping to 95
+        // here would re-flatten the exact percentage the API now publishes.
+        var value = Math.max(0, Math.min(100, Number(progress.percent) || 0));
         bar = '<progress max="100" value="' + value + '" aria-label="' + esc(ariaText) + '"></progress>';
       } else {
         bar = '<span class="bench-bar" role="img" aria-label="' + esc(ariaText) + '"><i></i></span>';
@@ -6008,22 +6241,6 @@
       return summary;
     }
 
-    function confirmationCohorts(pipeline) {
-      var cohorts = {};
-      (pipeline.confirmation_scores || []).forEach(function (score) {
-        var key = benchmarkVersionKey(score.bench_version);
-        if (!cohorts[key]) cohorts[key] = [];
-        cohorts[key].push(score);
-      });
-      return Object.keys(cohorts).sort(function (a, b) {
-        if (a === "unknown") return 1;
-        if (b === "unknown") return -1;
-        return Number(b) - Number(a);
-      }).map(function (key) {
-        return { key: key, scores: cohorts[key] };
-      });
-    }
-
     function cohortMedian(scores) {
       var values = scores.map(function (score) { return Number(score.composite); }).sort(function (a, b) { return a - b; });
       var middle = Math.floor(values.length / 2);
@@ -6199,7 +6416,7 @@
             '<span class="benchmark-cohort-summary">Canonical quorum · ' + esc(Math.min(cohort.scores.length, quorum)) + ' of ' + esc(quorum) + '</span></div>' +
           '<p class="accepted-score-note">' + esc(note) + ' Every seed is fixed only after submission commitment, so it makes the completed evaluation reproducible without allowing the already-submitted artifact to be retuned.</p>' +
           '<div class="accepted-score-list">' + rows + '</div>' +
-          (median == null ? "" : '<p class="accepted-score-final">' + esc(benchmarkVersionLabel(cohort.key)) + ' official aggregate: ' + fx(median) + ' · canonical median of ' + quorum + '</p>') +
+          (median == null ? "" : '<p class="accepted-score-final">' + esc(benchmarkVersionLabel(cohort.key)) + ' initial quorum aggregate: ' + fx(median) + ' · canonical median of ' + quorum + '. Completed continual waves then move the current leaderboard score.</p>') +
         '</div>';
       }).join("");
       return '<section class="pipeline-section" aria-labelledby="pipeline-accepted-scores">' +
@@ -6209,45 +6426,48 @@
     }
 
     function renderConfirmationScores(pipeline) {
-      var cohorts = confirmationCohorts(pipeline);
+      var boardEntry = (lastEntries || []).find(function (entry) {
+        return entry.agent_id === pipeline.agent_id;
+      });
+      var completedWaves = boardEntry && Array.isArray(boardEntry.completed_wave_composites)
+        ? boardEntry.completed_wave_composites.map(Number).filter(Number.isFinite)
+        : [];
       var activeVersion = Number(pipeline.active_bench_version);
       var currentAttempts = (pipeline.validation_attempts || []).filter(function (attempt) {
         return Number(attempt.bench_version) === activeVersion;
       });
       var counts = retestAttemptCounts(currentAttempts);
-      if (!cohorts.length && !counts.running && !counts.assigned && !counts.expired) return "";
+      if (!completedWaves.length && !counts.running && !counts.assigned && !counts.expired) return "";
       var state = [];
       if (counts.running) state.push(counts.running + " running");
       if (counts.assigned) state.push(counts.assigned + " assigned");
       if (counts.expired) state.push(counts.expired + " expired");
-      var rows = cohorts.map(function (cohort) {
-        var seedScores = cohort.scores.slice().sort(function (a, b) {
-          var left = String(a.seed);
-          var right = String(b.seed);
-          return left.length - right.length || left.localeCompare(right);
-        }).map(function (score) {
-          return '<div class="accepted-score">' +
-            '<div><span class="accepted-score-value">' + fx(score.composite) + '</span>' +
-              '<span class="accepted-score-label"><span class="bench-version-badge">' +
-                esc(benchmarkVersionLabel(benchmarkVersionKey(score.bench_version))) +
-              '</span>Accepted shared seed <code>' + esc(score.seed) + '</code> · ' +
-                entityAnchor("validator", score.validator_hotkey, "Validator " + shortKey(score.validator_hotkey)) +
-                (score.accepted_at ? " · " + relTime(score.accepted_at) : "") + '</span></div>' +
-          '</div>';
-        }).join("");
-        return '<div class="benchmark-cohort">' +
-          '<div class="benchmark-cohort-heading"><h5>' + esc(benchmarkVersionLabel(cohort.key)) + '</h5>' +
-            '<span class="benchmark-cohort-summary">' + esc(cohort.scores.length) +
-              ' accepted seed ' + (cohort.scores.length === 1 ? "result" : "results") + '</span></div>' +
-          '<p class="accepted-score-note">Append-only shared-seed evidence. These results refine top-five confidence and do not replace the canonical median.</p>' +
-          '<div class="accepted-score-list">' + seedScores + '</div></div>';
+      var rows = completedWaves.map(function (score, index) {
+        return '<div class="accepted-score">' +
+          '<div><span class="accepted-score-value">' + fx(score) + '</span>' +
+            '<span class="accepted-score-label"><span class="bench-version-badge">' +
+              esc(benchmarkVersionLabel(benchmarkVersionKey(activeVersion))) +
+            '</span>Completed cohort wave ' + esc(index + 1) + ' · consensus aggregate</span></div>' +
+        '</div>';
       }).join("");
+      var aggregate = boardEntry && boardEntry.aggregate_method === "continual_mean"
+        ? '<p class="accepted-score-final">Current leaderboard score: ' + fx(boardEntry.official_composite) +
+          ' · arithmetic mean of the initial three scores plus ' + esc(boardEntry.completed_wave_count) +
+          ' completed cohort ' + (boardEntry.completed_wave_count === 1 ? "wave" : "waves") +
+          ' (' + esc(boardEntry.aggregate_sample_count) + ' samples total).</p>'
+        : completedWaves.length
+        ? '<p class="accepted-score-note">' + esc(completedWaves.length) + ' full cohort ' +
+          (completedWaves.length === 1 ? 'wave is' : 'waves are') +
+          ' recorded. The initial three-score median remains authoritative until the compatible continual-mean rollout activates.</p>'
+        : '<p class="accepted-score-note">No full cohort wave has completed for this agent yet, so the initial three-score median still drives its leaderboard position.</p>';
       return '<section class="pipeline-section" aria-labelledby="pipeline-confirmation-scores">' +
         '<div class="pipeline-section-heading"><h4 id="pipeline-confirmation-scores">Continual top-five retests</h4>' +
           (state.length ? '<span class="benchmark-cohort-summary">' + esc(state.join(" · ")) + '</span>' : "") +
         '</div>' +
-        '<p class="accepted-score-note">Additional shared-seed runs are tracked separately from the fixed three-score canonical quorum.</p>' +
-        (rows || '<p class="pipeline-detail-state">No continual retest seed result has landed yet.</p>') +
+        aggregate +
+        '<p class="accepted-score-note">The initial quorum remains immutable provenance. The current leaderboard score continually adjusts up or down as full cohort waves complete.</p>' +
+        '<p class="accepted-score-note">Only completed cohort-wave aggregates are shown here. Partial, legacy, and superseded raw retest rows remain in the audit ledger but are omitted from the score list.</p>' +
+        (rows ? '<div class="accepted-score-list">' + rows + '</div>' : '<p class="pipeline-detail-state">No completed continual retest wave yet.</p>') +
       '</section>';
     }
 
@@ -6533,11 +6753,12 @@
       var retests = retestAttemptCounts(((pipeline && pipeline.validation_attempts) || []).filter(function (attempt) {
         return !currentCohort || benchmarkVersionKey(attempt.bench_version) === currentCohort.key;
       }));
-      var acceptedRetests = ((pipeline && pipeline.confirmation_scores) || []).filter(function (score) {
-        return !currentCohort || benchmarkVersionKey(score.bench_version) === currentCohort.key;
-      }).length;
+      var boardEntry = (lastEntries || []).find(function (entry) {
+        return pipeline && entry.agent_id === pipeline.agent_id;
+      });
+      var acceptedRetests = Math.max(0, Number(boardEntry && boardEntry.completed_wave_count) || 0);
       var retestFact = [];
-      if (acceptedRetests) retestFact.push(acceptedRetests + " accepted seed " + (acceptedRetests === 1 ? "result" : "results"));
+      if (acceptedRetests) retestFact.push(acceptedRetests + " completed " + (acceptedRetests === 1 ? "wave" : "waves"));
       if (retests.running) retestFact.push(retests.running + " running");
       if (retests.assigned) retestFact.push(retests.assigned + " assigned");
       if (retests.expired) retestFact.push(retests.expired + " expired");
@@ -6564,6 +6785,7 @@
             '</dl>' + reviewPacketButton(e) +
           '</section>' +
         '</div>' +
+        renderArtifactRelease(e.artifact_release, e.agent_id) +
         (stateMessage ? '<p class="pipeline-detail-state ' + esc(stateClass || "") + '">' + esc(stateMessage) + '</p>' : '') +
       '</div>';
     }
@@ -6700,10 +6922,11 @@
       pipelineLoaded = true;
       pipelineUnavailable = unavailable;
       pipelineEntries = unavailable ? [] : entries;
+      if (data && data.status_counts) pipelineStatusCounts = data.status_counts;
       renderPolicyRescreenNotice(entries, unavailable);
       // Skip the board rebuild when nothing that affects it changed (entries,
       // availability, or the screener overlay), preserving any expanded state.
-      if (!sectionChanged("pipeline", { entries: pipelineEntries, unavailable: unavailable, screeners: fleetReports.screeners })) {
+      if (!sectionChanged("pipeline", { entries: pipelineEntries, counts: pipelineStatusCounts, unavailable: unavailable, screeners: fleetReports.screeners, showStuck: pipelineShowStuck })) {
         updateSearch();
         return;
       }
@@ -6732,8 +6955,18 @@
         var stuckCount = indexed.reduce(function (n, item) {
           return n + (item.entry.retry_state === "exhausted" ? 1 : 0);
         }, 0);
-        count.innerHTML = esc(String(indexed.length)) + (stuckCount
-          ? '<span class="pipeline-stuck-count" title="' + esc(stuckCount + " submission" + (stuckCount === 1 ? "" : "s") + " exhausted the validator retry budget and need an operator retry grant.") + '">' + esc(String(stuckCount)) + ' stuck</span>'
+        if (column.status === "waiting_validator") {
+          indexed = indexed.filter(function (item) {
+            return pipelineShowStuck
+              ? item.entry.retry_state === "exhausted"
+              : item.entry.retry_state !== "exhausted";
+          });
+        }
+        var authoritativeCount = column.statuses.reduce(function (total, status) {
+          return total + Number(pipelineStatusCounts[status] || 0);
+        }, 0);
+        count.innerHTML = esc(String(authoritativeCount)) + (stuckCount
+          ? '<button type="button" class="pipeline-stuck-count" data-pipeline-stuck-filter aria-pressed="' + (pipelineShowStuck ? "true" : "false") + '" title="' + esc((pipelineShowStuck ? "Show actionable queue. " : "Show stuck submissions. ") + stuckCount + " submission" + (stuckCount === 1 ? "" : "s") + " exhausted the validator retry budget and need an operator retry grant.") + '">' + esc(String(stuckCount)) + ' stuck</button>'
           : "");
         stage.setAttribute("data-active", indexed.length ? "true" : "false");
         if (!indexed.length) {
@@ -6777,7 +7010,13 @@
             benchmark +
             '</a>';
         }).join("");
-        body.innerHTML = visible;
+        var visiblePopulation = column.status === "waiting_validator"
+          ? (pipelineShowStuck ? stuckCount : Math.max(0, authoritativeCount - stuckCount))
+          : authoritativeCount;
+        var hiddenCount = Math.max(0, visiblePopulation - indexed.length);
+        body.innerHTML = visible + (hiddenCount
+          ? '<div class="pipeline-more">' + esc(hiddenCount + " older " + (hiddenCount === 1 ? "submission" : "submissions")) + ' in Activity</div>'
+          : '');
       });
       refreshElapsedFlag();
       updateSearch();
@@ -6846,12 +7085,14 @@
             entityAnchor("agent", e.duplicate_of, duplicateLabel(e)) + '</span>';
         }
         var accessibleName = agentLabel(e.name, e.version);
+        var sourceCopy = artifactReleaseCopy(e.artifact_release);
         return '<tr tabindex="0" data-activity-i="' + i + '" aria-label="' +
-          esc("View details for " + accessibleName + ", " + stage[0] + ", " + progress) + '">' +
+          esc("View details for " + accessibleName + ", " + stage[0] + ", " + progress +
+            (sourceCopy ? ", " + sourceCopy.label : "")) + '">' +
           '<td><span class="agent-name">' + esc(agentName(e.name)) + '</span>' + agentVersionBadge(e.version) +
           '<span class="agent-id copyable" title="' + esc(id) + '"><span>' + esc(id.slice(0, 8)) + '</span>' + copyButton(id, "agent ID") + '</span></td>' +
           '<td class="hide-sm"><span class="hotkey copyable" title="' + esc(e.miner_hotkey) + '"><span>' + esc(shortKey(e.miner_hotkey)) + '</span>' + copyButton(e.miner_hotkey, "miner hotkey") + '</span></td>' +
-          '<td class="stage-cell"><span class="stage ' + stage[1] + '">' + stage[0] + '</span>' + evidence + '</td>' +
+          '<td class="stage-cell"><span class="stage ' + stage[1] + '">' + stage[0] + '</span>' + evidence + artifactReleaseNote(e.artifact_release) + '</td>' +
           '<td><span class="validation-progress' + (progress === "Not started" ? " pending" : "") + '">' + esc(progress) + '</span></td>' +
           '<td class="num hide-sm" title="' + esc(e.submitted_at) + '">' + relTime(e.submitted_at) + '</td>' +
           '</tr>';
@@ -6967,6 +7208,10 @@
     }
 
     function fleetStatus(entry) {
+      // A scorer that is not serving comes first: the validator cannot finish a
+      // single lease, so nothing below this is the headline.
+      if (entry.scorer_liveness === "not_serving") return ["Scorer down", "bad"];
+      if (entry.health === "critical") return ["Critical", "bad"];
       // A live-but-off-assignment validator (bad) is distinct from a quiet one
       // (warn); "assigning" is a normal hand-off and stays green via health below.
       if (entry.assignment_state === "assignment_mismatch") return ["Mismatch", "bad"];
@@ -7028,6 +7273,42 @@
           '<span class="assignment-detail"><b>Platform assignment</b> ' + staleAssignment + '</span>';
       }
       return "";
+    }
+
+    // Every slot a validator could show work on, ordered by ordinal. The union
+    // matters: a validator running on a slot outside its reported
+    // configured_slots range would otherwise have that job silently dropped
+    // from the fleet view, which is exactly when an operator needs to see it.
+    function validatorSlotIds(entry) {
+      var seen = {};
+      var configured = Math.max(1, Number(entry.configured_slots) || 1);
+      for (var index = 0; index < configured; index += 1) seen["slot-" + index] = true;
+      (entry.healthy_slots || []).forEach(function (slotId) {
+        if (slotId) seen[slotId] = true;
+      });
+      [entry.active_benchmarks || [], entry.assigned_benchmarks || []].forEach(function (list) {
+        list.forEach(function (benchmark) {
+          if (benchmark && benchmark.slot_id) seen[benchmark.slot_id] = true;
+        });
+      });
+      return Object.keys(seen).sort(function (a, b) {
+        return slotOrdinal(a) - slotOrdinal(b);
+      });
+    }
+
+    function slotOrdinal(slotId) {
+      var parsed = parseInt(String(slotId).replace(/^slot-/, ""), 10);
+      return isNaN(parsed) ? Number.MAX_SAFE_INTEGER : parsed;
+    }
+
+    // True when any slot is reporting a stage, not just the lowest one. Keying
+    // this off a single slot hid live progress whenever slot zero was idle.
+    function anyBenchmarkStage(entry) {
+      var benchmarks = entry.active_benchmarks || [];
+      for (var index = 0; index < benchmarks.length; index += 1) {
+        if (benchmarks[index] && benchmarks[index].stage) return true;
+      }
+      return !!(entry.active_benchmark && entry.active_benchmark.stage);
     }
 
 
@@ -7153,10 +7434,38 @@
       };
       var chip = statusChips[scorer.status] || [scorer.status, "unknown"];
       var out = vstat("Scorer status", '<span class="stage ' + chip[1] + '">' + esc(chip[0]) + '</span>');
+      out += renderScorerProbe(scorer.probe);
       out += vstat("Supported benchmarks", esc((scorer.supported_bench_versions || []).map(function (v) { return "v" + v; }).join(", ") || "–"));
       if (scorer.observed_at != null) out += vstat("Capability observed", unixTimeHtml(scorer.observed_at));
       if (scorer.software_version) out += vstat("Scorer version", esc(scorer.software_version));
       if (scorer.source_revision) out += vstat("Scorer revision", monoValue(scorer.source_revision, "scorer source revision"), true);
+      return out;
+    }
+
+    // The status above is what the validator concluded. This is what its probe
+    // saw, which is the part that separates a scorer that never answered from
+    // one that answered with something unusable.
+    function renderScorerProbe(probe) {
+      if (!probe) return vstat("Scorer probe", '<span class="muted">Not reported (requires heartbeat protocol 15)</span>');
+      var outcomeChips = {
+        served: ["Serving", "good"],
+        served_degraded: ["Serving, reply partly rejected", "warn"],
+        http_error: ["No usable answer", "bad"],
+        unreadable: ["Answered, reply unusable", "bad"],
+        timeout: ["Probe timed out", "bad"],
+        connect_error: ["Connection failed", "bad"],
+        not_probed: ["Not probed", "unknown"]
+      };
+      var chip = outcomeChips[probe.outcome] || [probe.outcome, "unknown"];
+      var detail = "";
+      if (probe.http_status != null) detail += " · HTTP " + probe.http_status;
+      if (probe.reason) detail += " · " + probe.reason;
+      if (probe.consecutive_failures) detail += " · " + probe.consecutive_failures + " in a row";
+      var out = vstat("Scorer probe", '<span class="stage ' + chip[1] + '">' + esc(chip[0]) + '</span>' + esc(detail));
+      out += vstat("Probe observed", unixTimeHtml(probe.observed_at));
+      out += vstat("Last served", probe.last_served_at != null
+        ? unixTimeHtml(probe.last_served_at)
+        : '<span class="muted">Not since this validator started</span>');
       return out;
     }
 
@@ -7172,7 +7481,21 @@
       report += vstat("Platform received", isoTimeHtml(entry.seen_at));
       var assignment = renderValidatorAssignment(entry);
       if (assignment) report += vstat("Assignment", assignment);
-      else if (entry.active_benchmark) report += vstat("Active benchmark", renderBenchmarkProgress(entry.active_benchmark, true));
+      report += vstat("Slots", esc(
+        String((entry.healthy_slots || []).length) + " healthy of " +
+        String(entry.configured_slots || 1) + " · " + String(entry.admission || "accepting")));
+      var activeSlots = entry.active_benchmarks || [];
+      if (activeSlots.length) {
+        // One row per running job. The modal used to show only the lowest slot,
+        // so a second concurrent benchmark was invisible here.
+        activeSlots.slice().sort(function (a, b) {
+          return slotOrdinal(a.slot_id) - slotOrdinal(b.slot_id);
+        }).forEach(function (benchmark) {
+          report += vstat(benchmark.slot_id || "slot-0", renderBenchmarkProgress(benchmark, true));
+        });
+      } else if (!assignment && entry.active_benchmark) {
+        report += vstat("Active benchmark", renderBenchmarkProgress(entry.active_benchmark, true));
+      }
 
       var caps = "";
       var c = entry.capabilities;
@@ -7269,9 +7592,13 @@
     }
 
     function updateFleetLedger(entries) {
-      var counts = { healthy: 0, warning: 0, stale: 0, offline: 0, paused: 0, unknown: 0 };
+      var counts = { healthy: 0, critical: 0, warning: 0, stale: 0, offline: 0, paused: 0, unknown: 0 };
       entries.forEach(function (entry) {
-        if (entry.assignment_state === "assignment_mismatch") counts.warning++;
+        // Critical is counted before availability: a validator whose scorer is
+        // not serving is broken whether or not it is also quiet, and burying it
+        // under "stale" is how it stayed invisible.
+        if (entry.health === "critical") counts.critical++;
+        else if (entry.assignment_state === "assignment_mismatch") counts.warning++;
         else if (entry.availability === "stale") counts.stale++;
         else if (entry.availability === "offline") counts.offline++;
         else if (entry.availability === "paused") counts.paused++;
@@ -7285,7 +7612,7 @@
     }
 
     function resetFleetLedger() {
-      ["healthy", "warning", "stale", "offline", "paused", "unknown"].forEach(function (key) {
+      ["healthy", "critical", "warning", "stale", "offline", "paused", "unknown"].forEach(function (key) {
         document.getElementById("fleet-count-" + key).textContent = "–";
       });
     }
@@ -7387,10 +7714,7 @@
             assignedBySlot[benchmark.slot_id || "slot-0"] = benchmark;
           });
           var healthySlots = entry.healthy_slots || [];
-          var slotCount = Math.max(1, Number(entry.configured_slots) || 1);
-          var slotRows = [];
-          for (var slotIndex = 0; slotIndex < slotCount; slotIndex += 1) {
-            var slotId = "slot-" + slotIndex;
+          var slotRows = validatorSlotIds(entry).map(function (slotId) {
             var benchmark = activeBySlot[slotId] || assignedBySlot[slotId];
             var slotState = benchmark
               ? renderBenchmarkProgress(benchmark, true)
@@ -7399,8 +7723,8 @@
                 : (healthySlots.indexOf(slotId) >= 0
                   ? '<span class="stage success">Idle</span>'
                   : '<span class="stage warn">Unavailable</span>'));
-            slotRows.push('<div title="' + esc(slotId) + '"><span class="fleet-protocol">' + esc(slotId) + '</span> ' + slotState + '</div>');
-          }
+            return '<div class="fleet-slot" title="' + esc(slotId) + '"><span class="fleet-protocol">' + esc(slotId) + '</span> ' + slotState + '</div>';
+          });
           slotWork = slotRows.join("");
         }
         var currentWork = slotWork || assignmentState || (singular === "validator" && entry.active_benchmark
@@ -7408,7 +7732,7 @@
           : (singular === "screener" && entry.screening_progress ? renderScreenerProgress(entry) : active));
         var hasGranularProgress =
           assignmentState ||
-          (singular === "validator" && entry.active_benchmark && entry.active_benchmark.stage) ||
+          (singular === "validator" && anyBenchmarkStage(entry)) ||
           (singular === "screener" && entry.screening_progress);
         var workStatus = hasGranularProgress
           ? ""
@@ -7766,8 +8090,11 @@
           document.getElementById("h-validators").textContent = data.validators.reported_count;
           renderPipelineBoard(data.activity, false);
           renderFleet();
+          var visibleHistory = data.activity.count < data.activity.total
+            ? " · recent history shown; full history in Activity"
+            : "";
           document.getElementById("operations-snapshot").textContent =
-            "Pipeline and fleet reconciled · " + relTime(data.generated_at);
+            "Pipeline and fleet reconciled" + visibleHistory + " · " + relTime(data.generated_at);
         })
         .catch(function () {
           fleetUnavailable.validators = true;
@@ -7999,7 +8326,18 @@
       Promise.allSettled([getJSON(leaderboardPath), getJSON("/public/weights"), getJSON("/public/bench/rollout")])
         .then(function (results) {
           var lb = results[0], weights = results[1], rollout = results[2];
-          lastChainWeights = leaderboardVersionView === "current" && weights.status === "fulfilled" ? weights.value : null;
+          if (leaderboardVersionView !== "current") {
+            // A historical board is not the block the current matrix describes,
+            // so the overlay genuinely does not apply.
+            lastChainWeights = null;
+          } else if (weights.status === "fulfilled") {
+            lastChainWeights = weights.value;
+          }
+          // else: keep the previous matrix rather than blanking the chain
+          // observation panel for one tick and refilling it on the next — that
+          // one-poll disappearance is what read as the dashboard "flickering".
+          // The API now serves last-known-good with `stale` set, so this only
+          // covers a client-side network blip or a genuinely cold cache.
           renderRollout(rollout.status === "fulfilled" ? rollout.value : null);
           if (lb.status === "fulfilled") {
             lastLeaderboardData = lb.value;

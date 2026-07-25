@@ -1012,6 +1012,197 @@ class ConfirmationScore(Base):
     )
 
 
+class EfficiencyCohortSnapshot(Base):
+    """One frozen relative token-efficiency cohort (bench_version >= 7).
+
+    The platform-side relative bonus (:mod:`ditto.api_server.efficiency`)
+    freezes, once per efficiency epoch, the quality-qualified lineage-deduped
+    cohort for a ``(bench_version, run_size)`` board together with its robust
+    reference statistics (nearest-rank P25 frontier + median zero point) and
+    the quality floors in force. Rows are **append-only and immutable**: a new
+    epoch inserts a new row; nothing ever UPDATEs or deletes one, so every
+    published bonus stays reproducible from stored data alone. The
+    deterministic validator composite is never derived from or affected by
+    this table.
+    """
+
+    __tablename__ = "efficiency_cohort_snapshots"
+
+    snapshot_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    """Client-generated UUID; referenced by ``efficiency_bonuses`` rows."""
+
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Benchmark contract the cohort was drawn from (always >= 7)."""
+
+    run_size: Mapped[str] = mapped_column(Text, nullable=False)
+    """Generator profile of the cohort's runs (``full`` for ranked boards)."""
+
+    epoch_index: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    """Platform efficiency epoch ordinal (fixed UTC windows since the Unix
+    epoch; see :func:`ditto.api_server.efficiency.epoch_index_for`)."""
+
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    """Whether the cohort met ``n_min`` after lineage dedupe. Inactive
+    snapshots freeze the observation but award no bonus."""
+
+    cohort_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Top-N cap on cohort membership in force at freeze time."""
+
+    n_min: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Minimum deduped cohort size required for activation."""
+
+    bonus_cap: Mapped[float] = mapped_column(Float, nullable=False)
+    """Tier-1 maximum bonus fraction (``B_max``) frozen for this epoch: the
+    value the curve reaches at the P25 frontier."""
+
+    curve_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+    """Bonus-curve policy this snapshot was frozen under
+    (:data:`ditto.api_server.efficiency.CURVE_VERSION_SINGLE_TIER` /
+    ``CURVE_VERSION_TWO_TIER``). Stored so a historical snapshot reproduces
+    its bonuses under ITS policy forever, regardless of later curve changes."""
+
+    deep_bonus_cap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """Tier-2 saturation cap frozen for this epoch (two-tier curve only):
+    the flat bonus at or below the deep frontier. ``>= bonus_cap``, <= 0.10.
+    Null under the single-tier policy."""
+
+    deep_frontier_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """Deep frontier as a fraction of the P25 reference (two-tier curve
+    only), in (0, 1). Null under the single-tier policy."""
+
+    quality_floor: Mapped[float] = mapped_column(Float, nullable=False)
+    """Composite floor (``Q_min``) applied at freeze time."""
+
+    memory_floor: Mapped[float] = mapped_column(Float, nullable=False)
+    """Memory-mean floor (``M_min``) applied at freeze time, so a harness
+    cannot buy efficiency by sacrificing the memory half."""
+
+    reference_p25_tokens: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """Efficient-quartile frontier (nearest-rank P25 of cohort audited chat
+    token totals); null while inactive."""
+
+    reference_median_tokens: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """Cohort median of audited chat token totals (the zero-bonus point);
+    null while inactive."""
+
+    members: Mapped[list | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    """Frozen cohort membership: a list of ``{agent_id, miner_hotkey,
+    lineage_key, composite, memory_mean, token_total, collapsed_agent_ids}``
+    dicts, the full audit record a bonus is reproducible from. Lineage keys
+    are moderation-adjacent digests; public projections expose only opaque
+    group ordinals, never the raw keys."""
+
+    computed_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """When this immutable snapshot was frozen (UTC). Never updated."""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "bench_version",
+            "run_size",
+            "epoch_index",
+            name="efficiency_cohort_snapshots_epoch_key",
+        ),
+        CheckConstraint(
+            "bench_version >= 7",
+            name="efficiency_cohort_snapshots_bench_version_check",
+        ),
+        CheckConstraint(
+            "bonus_cap > 0 AND bonus_cap <= 0.1",
+            name="efficiency_cohort_snapshots_cap_check",
+        ),
+        CheckConstraint(
+            "deep_bonus_cap IS NULL OR "
+            "(deep_bonus_cap >= bonus_cap AND deep_bonus_cap <= 0.1)",
+            name="efficiency_cohort_snapshots_deep_cap_check",
+        ),
+        CheckConstraint(
+            "deep_frontier_ratio IS NULL OR "
+            "(deep_frontier_ratio > 0 AND deep_frontier_ratio < 1)",
+            name="efficiency_cohort_snapshots_deep_frontier_check",
+        ),
+        CheckConstraint(
+            "curve_version >= 1",
+            name="efficiency_cohort_snapshots_curve_version_check",
+        ),
+        CheckConstraint("n_min >= 2", name="efficiency_cohort_snapshots_n_min_check"),
+        Index(
+            "efficiency_cohort_snapshots_board_idx",
+            "bench_version",
+            "run_size",
+            "epoch_index",
+        ),
+    )
+
+
+class EfficiencyBonus(Base):
+    """One agent's frozen relative token-efficiency bonus (bench_version >= 7).
+
+    Insert-once per ``(agent_id, bench_version)``: assigned against the frozen
+    cohort snapshot of the epoch the submission finalized in (strictly-upside
+    zero rows included, so "no bonus" is as frozen as "5%") and **never
+    updated**, so a published effective score can never drift when later
+    submissions arrive. ``effective_composite = composite * (1 + bonus)`` is
+    derived at read time; the validator's composite is never modified.
+    """
+
+    __tablename__ = "efficiency_bonuses"
+
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """FK to ``agents.agent_id``. PK part 1."""
+
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Benchmark contract of the bonused board. PK part 2."""
+
+    snapshot_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """The frozen cohort snapshot this bonus was computed against (the
+    ``bonus_reference`` provenance pointer)."""
+
+    token_total: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """The audited chat token total the bonus was computed from (median of
+    the quorum's complete relay-metered totals); null when no quorum row
+    carried complete audited usage (bonus is then necessarily 0)."""
+
+    bonus: Mapped[float] = mapped_column(Float, nullable=False)
+    """The frozen additive bonus fraction in ``[0, 0.1]``; never negative."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """When this immutable row was assigned (UTC). Never updated."""
+
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "agent_id", "bench_version", name="efficiency_bonuses_pkey"
+        ),
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="CASCADE",
+            name="efficiency_bonuses_agent_id_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_id"],
+            ["efficiency_cohort_snapshots.snapshot_id"],
+            name="efficiency_bonuses_snapshot_id_fkey",
+        ),
+        CheckConstraint(
+            "bonus >= 0 AND bonus <= 0.1", name="efficiency_bonuses_bonus_range_check"
+        ),
+        CheckConstraint(
+            "bench_version >= 7", name="efficiency_bonuses_bench_version_check"
+        ),
+        Index("efficiency_bonuses_snapshot_idx", "snapshot_id"),
+    )
+
+
 class BenchmarkDataset(Base):
     """Immutable dataset pin for one agent and benchmark version."""
 
@@ -1048,6 +1239,34 @@ class BenchmarkRollout(Base):
     desired_version: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     cohort_size: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    rescore_cohort_target: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=10, server_default=text("10")
+    )
+    """How many inherited agents this rollout set out to rescore.
+
+    Frozen from the operator setting
+    (``queue_policy_settings_revisions.settings.rescore_cohort_size``) at
+    START and never rewritten, so a later revision cannot resize an in-flight
+    rollout and a historical rollout stays explainable. ``cohort_size`` is how
+    many members were actually qualified; this is the size that was aimed for.
+    """
+    priority_cohort_target: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=5, server_default=text("5")
+    )
+    """How many top inherited positions must hold a target-version quorum here.
+
+    Frozen from ``queue_policy_settings_revisions.settings.priority_cohort_size``
+    at START, for the same reason as ``rescore_cohort_target``: this is the gate
+    that decides when the rollout may take ledger authority, and re-gating a
+    transition already in flight would move the finish line underneath it.
+
+    Distinct from ``ditto.db.queries.benchmark_rollout.PRIORITY_COHORT_SIZE``,
+    which stays a constant. That constant serves two fused meanings -- the
+    rollout activation gate AND the KOTH top-five emission set. Only the former
+    is queue policy; the latter is a consensus quantity that must keep matching
+    ``MIN_DESIRED_AUTHORITY_AGENTS``. This column is the tunable half, and the
+    constant remains its floor.
+    """
     blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -1066,6 +1285,26 @@ class BenchmarkRollout(Base):
             # before new transitions were narrowed to ten members.
             "cohort_size BETWEEN 5 AND 25",
             name="benchmark_rollout_bounded_members",
+        ),
+        CheckConstraint(
+            # Same storage ceiling as cohort_size: an operator may widen the
+            # target from the default ten up to twenty-five, never past it.
+            # Deliberately NOT related to cohort_size by a constraint --
+            # pre-existing 11-25 member rollouts backfilled a target that is
+            # their own size, and an in-flight rollout is legitimately below it.
+            "rescore_cohort_target BETWEEN 5 AND 25",
+            name="benchmark_rollout_bounded_rescore_target",
+        ),
+        CheckConstraint(
+            # Floor is the KOTH emission-set size: a priority gate below five
+            # would let the ledger flip to the desired version with fewer
+            # recipients than the emission split expects. Ceiling is the same
+            # storage bound as the rescore target. Deliberately NOT constrained
+            # to be <= rescore_cohort_target in SQL: the wire model already
+            # rejects that combination, and a CHECK spanning both columns would
+            # make backfilling a legacy 11-25-member rollout order-dependent.
+            "priority_cohort_target BETWEEN 5 AND 25",
+            name="benchmark_rollout_bounded_priority_target",
         ),
         CheckConstraint(
             # 'superseded' is terminal: an operator abandoned the rollout before
@@ -1109,6 +1348,57 @@ class BenchmarkRolloutMember(Base):
         ),
         ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="RESTRICT"),
         CheckConstraint("position > 0", name="benchmark_member_position"),
+    )
+
+
+class BenchmarkRolloutCarryover(Base):
+    """A previous-generation submission the new benchmark era adopted.
+
+    Deliberately a **separate table** from :class:`BenchmarkRolloutMember`
+    rather than a ``kind`` discriminator on it. Every existing query that counts
+    or lists rollout members treats "row in ``benchmark_rollout_members``" as
+    "inherited rescore cohort": ``cohort_size``, ``rollout_cohort_complete``,
+    ``rollout_cohort_score_complete``, ``_validate_frozen_members``,
+    ``rollout_state``'s member list, ``active_bench_version``,
+    ``authority_selection_state``, and ``issue_rollout_ticket``. A discriminator
+    would require a ``kind`` filter on every one of them, and missing a single
+    filter would silently re-gate an open rollout's activation on agents that
+    were never part of its cohort. A separate table cannot be accidentally
+    included by any of those queries.
+
+    The row is the sole admission credential for a carried-over submission (see
+    ``ditto.db.queries.benchmark_admission.benchmark_admission_predicate``), and
+    it is only ever written in the same transaction that pins the agent's
+    desired-version :class:`BenchmarkDataset`. That is what makes admission and
+    dataset generation inseparable rather than merely coordinated.
+    """
+
+    __tablename__ = "benchmark_rollout_carryover"
+
+    rollout_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    """1-based adoption order, so the operator cap is auditable after the fact."""
+    frozen_score_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Prior-era accepted score count at adoption time, for audit."""
+    frozen_owner_key: Mapped[str] = mapped_column(Text, nullable=False)
+    """The owner key this row was deduped under (``coldkey:``/``hotkey:``)."""
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint("rollout_id", "agent_id"),
+        UniqueConstraint("rollout_id", "position"),
+        ForeignKeyConstraint(
+            ["rollout_id"], ["benchmark_rollouts.rollout_id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="RESTRICT"),
+        CheckConstraint("position > 0", name="benchmark_carryover_position"),
+        CheckConstraint(
+            "frozen_score_count BETWEEN 0 AND 2",
+            name="benchmark_carryover_frozen_score_count",
+        ),
     )
 
 
@@ -1165,6 +1455,17 @@ class ValidatorHeartbeat(Base):
     benchmark_capacity: Mapped[dict | None] = mapped_column(
         _JSON_VARIANT, nullable=True
     )
+    # The slots the validator's SIGNED capacity claimed as busy, recorded before
+    # the ticket-confirmation filter in ``_validated_heartbeat_work`` narrows
+    # ``benchmark_capacity`` to work the ledger could confirm. A slot can be
+    # genuinely occupied and still fail confirmation (a re-issued lease moves the
+    # deadline the validator cached, so the exact-deadline lookup misses), and
+    # ``benchmark_capacity`` alone cannot tell "this slot is free" apart from
+    # "this slot's progress did not confirm". Only ever used to REFUSE a
+    # revocation, never to grant work or accept a score, so an over-broad claim
+    # costs the validator its own throughput and nothing else.
+    # Shape: ``[{"slot_id": "slot-0", "agent_id": "<uuid>"}, ...]``.
+    claimed_slots: Mapped[list | None] = mapped_column(_JSON_VARIANT, nullable=True)
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )
@@ -1330,6 +1631,143 @@ class ScreenerReviewSettingsRevision(Base):
             "parent_revision",
             name="screener_review_settings_scope_parent_key",
         ),
+    )
+
+
+class ArtifactReleaseSettingsRevision(Base):
+    """Append-only, operator-audited public source embargo revision."""
+
+    __tablename__ = "artifact_release_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    embargo_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "embargo_hours BETWEEN 6 AND 48",
+            name="artifact_release_settings_embargo_hours_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="artifact_release_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="artifact_release_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="artifact_release_settings_actor_check",
+        ),
+        UniqueConstraint(
+            "parent_revision",
+            name="artifact_release_settings_parent_revision_key",
+        ),
+    )
+
+
+class SubmissionSettingsRevision(Base):
+    """Append-only, operator-audited miner submission cooldown revision."""
+
+    __tablename__ = "submission_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    cooldown_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "cooldown_seconds BETWEEN 60 AND 86400",
+            name="submission_settings_cooldown_seconds_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="submission_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="submission_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="submission_settings_actor_check",
+        ),
+        UniqueConstraint(
+            "parent_revision",
+            name="submission_settings_parent_revision_key",
+        ),
+    )
+
+
+class UploadAdmissionReservation(Base):
+    """Short-lived pre-payment reservation for one payment coldkey."""
+
+    __tablename__ = "upload_admission_reservations"
+
+    miner_coldkey: Mapped[str] = mapped_column(Text, primary_key=True)
+    token: Mapped[UUID] = mapped_column(
+        SaUUID(as_uuid=True), unique=True, nullable=False
+    )
+    miner_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    settings_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    cooldown_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "cooldown_seconds BETWEEN 60 AND 86400",
+            name="upload_admission_cooldown_seconds_check",
+        ),
+        CheckConstraint(
+            "length(sha256) = 64",
+            name="upload_admission_sha256_length_check",
+        ),
+        Index("upload_admission_expires_at_idx", "expires_at"),
+    )
+
+
+class AgentKingship(Base):
+    """King-reign ledger gating public source release, in two write-once stages.
+
+    ``first_crowned_at`` marks that the agent was ever the KOTH champion
+    (eligibility). ``weight_confirmed_at`` marks the first time validators'
+    REVEALED on-chain weights (post commit-reveal) were seen set on this miner;
+    it is ``NULL`` until then. The public window is king-only and measured from
+    ``weight_confirmed_at`` -- so a genuine, on-chain-backed king reveals one
+    window later, while an agent that merely touched the crown off-chain waits
+    until the chain confirms it. Both timestamps are write-once and never move.
+    Written on the validator score path (post-commit); the gate only reads them.
+    """
+
+    __tablename__ = "agent_kingship"
+
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    first_crowned_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    weight_confirmed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="CASCADE"),
     )
 
 
@@ -1922,6 +2360,9 @@ class InferenceRequest(Base):
     )
     cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     upstream_provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    upstream_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     timed_out: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     started_at: Mapped[datetime] = mapped_column(
@@ -1948,7 +2389,63 @@ class InferenceRequest(Base):
             "reserved_tokens > 0", name="inference_requests_reserved_tokens"
         ),
         CheckConstraint("generation > 0", name="inference_requests_generation"),
+        CheckConstraint(
+            "upstream_attempts >= 0", name="inference_requests_upstream_attempts"
+        ),
         Index("inference_requests_started_idx", "started_at"),
+    )
+
+
+class ValidatorLeaseAudit(Base):
+    """Append-only record of every lease the platform revoked before its deadline.
+
+    Force-expiring a live lease destroys an in-flight benchmark run and spends
+    one of the agent's bounded same-version retries, and until this table existed
+    it left no trace at all: no log line, no row, no metric, just a ticket whose
+    ``deadline`` had been silently rewritten to the moment of the revocation. A
+    day of investigation went into reconstructing three such events from ticket
+    timestamps alone. Every revocation now records the evidence it acted on, so
+    the next one is a query rather than an archaeology project.
+
+    Not part of the score audit chain: no score, verdict, or miner-visible
+    outcome is created or replaced here, only a lease lifecycle event.
+    """
+
+    __tablename__ = "validator_lease_audit"
+
+    audit_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
+    slot_id: Mapped[str] = mapped_column(Text, nullable=False)
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    """What happened to the lease; ``force_expired`` today."""
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    """The liveness reason code that admitted the revocation."""
+    context: Mapped[str] = mapped_column(Text, nullable=False)
+    """Which issuance path revoked it (``issue_ticket``, ``issue_rollout_ticket``,
+    ``score_retest``)."""
+    evidence: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    """The heartbeat freshness, capacity snapshot, and lease age acted on."""
+    recorded_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "bench_version > 0",
+            name="validator_lease_audit_bench_version_positive",
+        ),
+        Index(
+            "validator_lease_audit_agent_idx",
+            "agent_id",
+            "recorded_at",
+        ),
+        Index(
+            "validator_lease_audit_validator_idx",
+            "validator_hotkey",
+            "recorded_at",
+        ),
     )
 
 
@@ -2012,6 +2509,64 @@ class ValidatorRetryRecovery(Base):
             "bench_version",
             "expected_snapshot",
             name="validator_retry_recoveries_agent_snapshot_key",
+        ),
+    )
+
+
+class ValidatorQueueWithdrawal(Base):
+    """One audited, benchmark-scoped removal from validator assignment.
+
+    The submission, payment, artifact, scores, and ticket history remain intact.
+    A later benchmark era is a separate eligibility decision, so a withdrawal
+    never becomes an implicit permanent miner verdict.
+    """
+
+    __tablename__ = "validator_queue_withdrawals"
+
+    withdrawal_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    score_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    ticket_snapshot: Mapped[list[dict]] = mapped_column(_JSON_VARIANT, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="RESTRICT",
+            name="validator_queue_withdrawals_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "bench_version > 0",
+            name="validator_queue_withdrawals_bench_version_positive",
+        ),
+        CheckConstraint(
+            "score_count >= 0",
+            name="validator_queue_withdrawals_score_count_nonnegative",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="validator_queue_withdrawals_actor_length",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="validator_queue_withdrawals_reason_length",
+        ),
+        UniqueConstraint(
+            "agent_id",
+            "bench_version",
+            name="validator_queue_withdrawals_agent_bench_key",
+        ),
+        Index(
+            "validator_queue_withdrawals_created_idx",
+            "created_at",
+            "withdrawal_id",
         ),
     )
 
@@ -2124,4 +2679,307 @@ class ScoreAuditEntry(Base):
     __table_args__ = (
         UniqueConstraint("entry_hash", name="score_audit_log_entry_hash_key"),
         Index("score_audit_log_agent_id_idx", "agent_id"),
+    )
+
+
+class EfficiencyBonusSettingsRevision(Base):
+    """Append-only, operator-audited relative-efficiency-bonus policy revision.
+
+    The hot-swappable successor to the ``DITTO_EFFICIENCY_BONUS_*`` boot env
+    (:class:`ditto.api_server.config.EfficiencyBonusConfig`): each row freezes a
+    full policy (both booleans + all eight numeric knobs) as JSON, and the
+    compute path reads the latest one at run time (short TTL) so a backroom
+    change lands with no redeploy. Rows are **append-only**: nothing UPDATEs or
+    deletes one, so the audit trail is complete. When no row exists the env seed
+    governs, so an untouched deployment is byte-identical to pre-change.
+
+    Scope is subnet-global (only ``*``); the column mirrors the other revision
+    tables' shape and leaves room for future per-board scoping. The frozen knobs
+    that reproduce a published bonus live on ``efficiency_cohort_snapshots``, not
+    here, so changing this policy never mutates an already-frozen snapshot.
+    """
+
+    __tablename__ = "efficiency_bonus_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope = '*' OR length(scope) BETWEEN 1 AND 63",
+            name="efficiency_bonus_settings_scope_check",
+        ),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="efficiency_bonus_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="efficiency_bonus_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="efficiency_bonus_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="efficiency_bonus_settings_actor_check",
+        ),
+        Index(
+            "efficiency_bonus_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="efficiency_bonus_settings_scope_parent_key",
+        ),
+    )
+
+
+class ContinualRetestSettingsRevision(Base):
+    """Append-only operator policy for continual aggregation and idle waves."""
+
+    __tablename__ = "continual_retest_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("scope = '*'", name="continual_retest_settings_scope_check"),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="continual_retest_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="continual_retest_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="continual_retest_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="continual_retest_settings_actor_check",
+        ),
+        Index(
+            "continual_retest_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="continual_retest_settings_scope_parent_key",
+        ),
+    )
+
+
+class QueuePolicySettingsRevision(Base):
+    """Append-only operator policy for the validator queue.
+
+    Cohort sizing, the per-validator fresh-vs-cohort lane split, the provisional
+    contender lane, and the previous-generation carryover gate. Each revision
+    stores the WHOLE policy rather than a diff, so any historical revision is
+    reconstructable on its own and a read never merges partial revisions.
+
+    Fields are consumed on three different schedules -- frozen at rollout start,
+    live-but-rollout-locked, and plain live. See
+    ``ditto.api_models.queue_policy_settings`` for which is which and why it
+    matters.
+    """
+
+    __tablename__ = "queue_policy_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("scope = '*'", name="queue_policy_settings_scope_check"),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="queue_policy_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="queue_policy_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="queue_policy_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="queue_policy_settings_actor_check",
+        ),
+        Index(
+            "queue_policy_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="queue_policy_settings_scope_parent_key",
+        ),
+    )
+
+
+class InferenceConcurrencySettingsRevision(Base):
+    """Append-only operator policy for the hosted v7 embedding lane.
+
+    Governs how many hosted embedding requests may be in flight per ticket, per
+    validator, and fleet-wide. Scoped tightly on purpose: the chat lane keeps its
+    boot-time configuration, and the local-Ollama lane used by bench_version 2-6
+    is not reachable from this table at all.
+
+    Each revision stores the WHOLE policy rather than a diff, so any historical
+    revision is reconstructable on its own and a read never merges partials. See
+    ``ditto.api_models.inference_concurrency_settings`` for the bounds and why
+    the shipped defaults sit above what the validator will ever ask for.
+    """
+
+    __tablename__ = "inference_concurrency_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope = '*'", name="inference_concurrency_settings_scope_check"
+        ),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="inference_concurrency_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="inference_concurrency_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="inference_concurrency_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="inference_concurrency_settings_actor_check",
+        ),
+        Index(
+            "inference_concurrency_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="inference_concurrency_settings_scope_parent_key",
+        ),
+    )
+
+
+class ValidatorSlotSettingsRevision(Base):
+    """Append-only, operator-audited concurrent-benchmark-slot policy revision.
+
+    A validator advertises its own slot capacity in the heartbeat (bounded to
+    eight by the protocol) and the platform used to honor it unconditionally.
+    Each row here freezes a full policy as JSON -- the per-validator cap plus the
+    disk-utilization circuit breaker -- and ticket dispatch reads the latest one
+    at run time (short TTL) so an operator can cap or ramp fleet parallelism from
+    backroom with no redeploy. Rows are **append-only**: nothing UPDATEs or
+    deletes one, so the audit trail of every cap change is complete.
+
+    When no row exists the module default in
+    ``ditto.api_server.validator_slot_settings`` governs (cap 2), which is also
+    the fallback for every failure path -- an unreadable policy holds the fleet
+    conservative rather than uncapping it.
+
+    Scope is subnet-global (only ``*``); the column mirrors the other revision
+    tables' shape and leaves room for future per-validator scoping.
+    """
+
+    __tablename__ = "validator_slot_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope = '*' OR length(scope) BETWEEN 1 AND 63",
+            name="validator_slot_settings_scope_check",
+        ),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="validator_slot_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="validator_slot_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="validator_slot_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="validator_slot_settings_actor_check",
+        ),
+        Index(
+            "validator_slot_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        # The optimistic-concurrency key: two writers that both read revision N
+        # as current cannot both append a child of N.
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="validator_slot_settings_scope_parent_key",
+        ),
     )

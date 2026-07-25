@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_contract import (
@@ -27,6 +27,7 @@ from ditto.db.models import (
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutAudit,
+    BenchmarkRolloutCarryover,
     BenchmarkRolloutMember,
     InferenceProviderRoute,
     InferenceRoutingPolicy,
@@ -50,12 +51,35 @@ LEGACY_BENCH_VERSION = 2
 # Compatibility name for callers/tests that need the newest *shipped* contract.
 # This is discovery metadata only: it no longer opens or selects a rollout.
 CANARY_BENCH_VERSION = latest_benchmark_contract().version
+# Two fused meanings, deliberately kept in one constant only as a FLOOR:
+#
+# 1. The KOTH top-five (``rolling_top_five``) -- a consensus quantity that must
+#    keep matching ``MIN_DESIRED_AUTHORITY_AGENTS``. Not operator policy.
+# 2. Historically also the rollout ACTIVATION GATE: how many top inherited
+#    positions must hold a target-version quorum before the rollout may take
+#    ledger authority.
+#
+# Meaning (2) is now operator policy, frozen per rollout onto
+# ``BenchmarkRollout.priority_cohort_target``. Read that column, never this
+# constant, when asking how wide an existing rollout's gate is. This constant
+# survives as meaning (1) and as the configurable floor for meaning (2).
 PRIORITY_COHORT_SIZE = 5
-# New benchmark transitions rescore only the inherited top ten. The database
-# still permits older 11-25-member rollout snapshots so historical audit rows
-# remain readable and an in-flight rollout created by an older deployment can
-# finish without destructive member deletion.
-RESCORE_COHORT_SIZE = 10
+# How many inherited agents a new benchmark transition rescores when no operator
+# revision has ever been written. This is only the DEFAULT: the effective size
+# is the operator policy in ``queue_policy_settings_revisions``, read once
+# at rollout start and frozen onto ``BenchmarkRollout.rescore_cohort_target``.
+#
+# Never read this constant to decide how large an EXISTING rollout should grow
+# -- read ``rollout.rescore_cohort_target``. A rollout that froze ten members
+# must stay a ten-member rollout even after the operator widens the policy to
+# twenty-five, or an in-flight cohort would silently grow underneath the
+# validators already scoring it.
+DEFAULT_RESCORE_COHORT_SIZE = 10
+# The storage ceiling, mirrored by the ``benchmark_rollout_bounded_members`` and
+# ``benchmark_rollout_bounded_rescore_target`` CHECK constraints. It is also the
+# upper bound an operator may configure. Older 11-25-member rollout snapshots
+# predate the top-ten default; they remain readable and an in-flight rollout
+# created by an older deployment still finishes without member deletion.
 MAX_PERSISTED_RESCORE_COHORT_SIZE = 25
 SCORING_QUORUM = 3
 # How many agents must hold a COMPLETE, ranked desired-version quorum before
@@ -247,15 +271,24 @@ async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]
     if source_version is None:
         source_version = await active_bench_version(session)
     target_version = rollout.desired_version if rollout is not None else None
-    agents = list(
-        await session.scalars(select(Agent).where(Agent.status == AgentStatus.SCORED))
-    )
-    if not agents:
-        return []
-    scores = list(
-        await session.scalars(
-            select(Score).where(
-                Score.agent_id.in_([agent.agent_id for agent in agents]),
+    # Column-scoped on purpose. Hydrating ORM ``Score`` entities pulls the
+    # per-case ``details`` breakdown -- kilobytes per row, for every scored
+    # agent -- and this ranking reads five scalars. Fetching whole rows made an
+    # operator's read of the rollout status the most expensive query in the API.
+    rows = (
+        await session.execute(
+            select(
+                Agent.agent_id,
+                Agent.miner_hotkey,
+                Agent.created_at,
+                Score.bench_version,
+                Score.composite,
+                Score.validator_hotkey,
+                Score.n,
+            )
+            .join(Score, Score.agent_id == Agent.agent_id)
+            .where(
+                Agent.status == AgentStatus.SCORED,
                 Score.bench_version.in_(
                     (source_version, target_version)
                     if target_version is not None
@@ -263,16 +296,19 @@ async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]
                 ),
             )
         )
-    )
-    by_agent: dict[UUID, dict[int, list[Score]]] = {}
-    for score in scores:
-        by_agent.setdefault(score.agent_id, {}).setdefault(
-            score.bench_version, []
-        ).append(score)
+    ).all()
+    if not rows:
+        return []
+    identities: dict[UUID, tuple[str, datetime]] = {}
+    by_agent: dict[UUID, dict[int, list[tuple[float, str, int]]]] = {}
+    for row in rows:
+        identities[row.agent_id] = (row.miner_hotkey, row.created_at)
+        by_agent.setdefault(row.agent_id, {}).setdefault(row.bench_version, []).append(
+            (row.composite, row.validator_hotkey, row.n)
+        )
 
-    candidates: list[tuple[Agent, float]] = []
-    for agent in agents:
-        versions = by_agent.get(agent.agent_id, {})
+    candidates: list[tuple[UUID, float]] = []
+    for agent_id, versions in by_agent.items():
         selected = (
             versions.get(target_version, []) if target_version is not None else []
         )
@@ -280,36 +316,35 @@ async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]
             selected = versions.get(source_version, [])
         if not selected:
             continue
-        middle = sorted(
-            selected, key=lambda row: (row.composite, row.validator_hotkey)
-        )[(len(selected) - 1) // 2]
-        if middle.n < 100 or middle.composite <= 0:
+        composite, _hotkey, cases = sorted(selected, key=lambda row: (row[0], row[1]))[
+            (len(selected) - 1) // 2
+        ]
+        if cases < 100 or composite <= 0:
             continue
-        candidates.append((agent, float(middle.composite)))
+        candidates.append((agent_id, float(composite)))
 
     from ditto.db.queries.payments import get_miner_coldkeys_for_agents
 
     coldkeys = await get_miner_coldkeys_for_agents(
-        session, agent_ids={agent.agent_id for agent, _ in candidates}
+        session, agent_ids={agent_id for agent_id, _ in candidates}
     )
     # Keep one best generation per payment-time coldkey before taking the
     # network-wide top five. Legacy rows without payment provenance remain
     # isolated by hotkey.
-    candidates.sort(key=lambda item: (-item[1], item[0].created_at, item[0].agent_id))
+    candidates.sort(key=lambda item: (-item[1], identities[item[0]][1], item[0]))
     unique: list[RolloutSnapshotMember] = []
     seen_owners: set[str] = set()
-    for agent, composite in candidates:
+    for agent_id, composite in candidates:
+        miner_hotkey = identities[agent_id][0]
         owner = (
-            f"coldkey:{coldkeys[agent.agent_id]}"
-            if agent.agent_id in coldkeys
-            else f"hotkey:{agent.miner_hotkey}"
+            f"coldkey:{coldkeys[agent_id]}"
+            if agent_id in coldkeys
+            else f"hotkey:{miner_hotkey}"
         )
         if owner in seen_owners:
             continue
         seen_owners.add(owner)
-        unique.append(
-            RolloutSnapshotMember(agent.agent_id, agent.miner_hotkey, composite)
-        )
+        unique.append(RolloutSnapshotMember(agent_id, miner_hotkey, composite))
         if len(unique) == PRIORITY_COHORT_SIZE:
             break
     return unique
@@ -319,7 +354,7 @@ async def historical_rescore_cohort(
     session: AsyncSession,
     *,
     source_version: int,
-    limit: int = RESCORE_COHORT_SIZE,
+    limit: int = DEFAULT_RESCORE_COHORT_SIZE,
 ) -> list[RolloutSnapshotMember]:
     """Freeze the prior-era rescore cohort without admitting the whole ledger.
 
@@ -327,12 +362,19 @@ async def historical_rescore_cohort(
     ``limit`` finalized distinct miners, the next older scored benchmark fills
     the remaining positions. No third historical era is consulted: this is the
     explicit "combine two previous benchmark iterations" fallback, not an
-    unbounded backfill of every legacy submission.
+    unbounded backfill of every legacy submission. That contract is enforced by
+    the ``.limit(2)`` on the version query below and is independent of
+    ``limit`` -- widening the cohort to twenty-five can only return fewer
+    members from the same two eras, never reach into a third.
+
+    The upper bound is the storage ceiling, not the default cohort size: an
+    operator may configure any size in ``[5, 25]``, so validating against the
+    default would make raising the setting throw.
     """
-    if limit < PRIORITY_COHORT_SIZE or limit > RESCORE_COHORT_SIZE:
+    if not PRIORITY_COHORT_SIZE <= limit <= MAX_PERSISTED_RESCORE_COHORT_SIZE:
         raise ValueError(
             f"rollout cohort limit must be between {PRIORITY_COHORT_SIZE} "
-            f"and {RESCORE_COHORT_SIZE}"
+            f"and {MAX_PERSISTED_RESCORE_COHORT_SIZE}"
         )
     versions = list(
         await session.scalars(
@@ -510,11 +552,15 @@ async def active_bench_version(session: AsyncSession) -> int:
     if open_transition is not None:
         from ditto.db.queries.scores import count_ranked_quorum_agents
 
+        # The gate width is the target this rollout FROZE at start, not the live
+        # operator setting: re-gating a transition already in flight would move
+        # its finish line underneath the validators scoring it.
+        priority_target = open_transition.priority_cohort_target
         priority_ids = set(
             await session.scalars(
                 select(BenchmarkRolloutMember.agent_id).where(
                     BenchmarkRolloutMember.rollout_id == open_transition.rollout_id,
-                    BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE,
+                    BenchmarkRolloutMember.position <= priority_target,
                 )
             )
         )
@@ -523,8 +569,12 @@ async def active_bench_version(session: AsyncSession) -> int:
             bench_version=open_transition.desired_version,
             agent_ids=priority_ids,
         )
+        # MIN_DESIRED_AUTHORITY_AGENTS stays a constant on purpose. It is the
+        # KOTH emission-set size, so it is a consensus quantity, not queue
+        # policy: below it the ledger flip would have fewer recipients than the
+        # emission split expects. The priority target above is the tunable half.
         if (
-            len(priority_ids) == PRIORITY_COHORT_SIZE
+            len(priority_ids) == priority_target
             and ready >= MIN_DESIRED_AUTHORITY_AGENTS
         ):
             if (
@@ -600,6 +650,61 @@ async def open_rollout(
     return await session.scalar(statement)
 
 
+async def arrival_bench_version(session: AsyncSession, *, agent: Agent) -> int:
+    """Return the benchmark era one submission's *arrival* places it in.
+
+    A submission received after an open rollout starts enters the desired era
+    immediately: its dataset is rendered there and validators lease it there
+    through the fresh-submission lane. So does an older submission the rollout
+    has ADOPTED as previous-generation carryover: it already holds a
+    desired-version dataset pin and is leased in the new era, so a later policy
+    rescreen must regenerate it there rather than back in the era it was
+    stranded in. Other older submissions stay on the active version unless they
+    separately qualify for the rollout cohort — cohort membership is a different
+    lane with different rules, so it is deliberately not considered here;
+    callers that care must check it themselves.
+
+    This mirrors :func:`ditto.db.queries.benchmark_admission.
+    benchmark_admission_predicate`'s ``created_at >= rollout.created_at`` and
+    carryover disjuncts, in Python, for one already-loaded agent.
+    """
+    bench_version = await active_bench_version(session)
+    rollout = await open_rollout(session)
+    if rollout is None:
+        return bench_version
+    if agent.created_at >= rollout.created_at:
+        return int(rollout.desired_version)
+    # The EXISTS is inlined on the model rather than delegated to
+    # ``ditto.db.queries.benchmark_carryover``: that module needs this one's
+    # ``DatasetPin``, so importing it back would be a cycle.
+    if await session.scalar(
+        select(
+            exists().where(
+                BenchmarkRolloutCarryover.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutCarryover.agent_id == agent.agent_id,
+            )
+        )
+    ):
+        return int(rollout.desired_version)
+    return bench_version
+
+
+async def agent_is_rollout_member(
+    session: AsyncSession, *, rollout: BenchmarkRollout, agent_id: UUID
+) -> bool:
+    """Whether one agent is a frozen member of ``rollout``'s inherited cohort."""
+    return bool(
+        await session.scalar(
+            select(
+                exists().where(
+                    BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                    BenchmarkRolloutMember.agent_id == agent_id,
+                )
+            )
+        )
+    )
+
+
 async def rollout_for_transition(
     session: AsyncSession,
     *,
@@ -633,7 +738,7 @@ async def rollout_for_desired_version(
     )
 
 
-async def _audit(
+async def append_rollout_audit(
     session: AsyncSession,
     rollout: BenchmarkRollout,
     event: str,
@@ -641,6 +746,7 @@ async def _audit(
     *,
     now: datetime,
 ) -> None:
+    """Append one row to a rollout's operator/public-safe history."""
     session.add(
         BenchmarkRolloutAudit(
             audit_id=uuid4(),
@@ -650,6 +756,12 @@ async def _audit(
             recorded_at=now,
         )
     )
+
+
+# Module-private alias so this module's many existing call sites read unchanged.
+# The public name exists because previous-generation carryover lives in its own
+# module and must not reach across for a private helper.
+_audit = append_rollout_audit
 
 
 async def supersede_open_rollout(
@@ -718,15 +830,18 @@ async def authority_selection_state(
             "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
             "blocked_reason": "no rollout history exists for this contract",
         }
+    # This rollout's own frozen gate width, so a historical contract's
+    # authority verdict never changes when the live policy is retuned.
+    priority_target = rollout.priority_cohort_target
     priority_ids = set(
         await session.scalars(
             select(BenchmarkRolloutMember.agent_id).where(
                 BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
-                BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE,
+                BenchmarkRolloutMember.position <= priority_target,
             )
         )
     )
-    if len(priority_ids) != PRIORITY_COHORT_SIZE:
+    if len(priority_ids) != priority_target:
         return {
             "version": bench_version,
             "ready": False,
@@ -847,11 +962,46 @@ async def create_rollout_snapshot(
     now: datetime,
     from_version: int = DEFAULT_BENCH_VERSION,
     desired_version: int = CANARY_BENCH_VERSION,
+    rescore_cohort_target: int = DEFAULT_RESCORE_COHORT_SIZE,
+    priority_cohort_target: int = PRIORITY_COHORT_SIZE,
     audit_context: dict[str, Any] | None = None,
 ) -> BenchmarkRollout:
-    """Freeze a bounded prior-era cohort and target dataset pins, idempotently."""
+    """Freeze a bounded prior-era cohort and target dataset pins, idempotently.
+
+    ``rescore_cohort_target`` and ``priority_cohort_target`` are the operator
+    policy at the moment of the start. Both are written onto the rollout row and
+    never rewritten, so a later policy revision cannot resize or re-gate this
+    rollout and a historical rollout can always be explained by the shape it was
+    actually built to.
+    """
     if desired_version <= from_version:
         raise ValueError("a benchmark rollout must move the version forward")
+    if (
+        not PRIORITY_COHORT_SIZE
+        <= rescore_cohort_target
+        <= MAX_PERSISTED_RESCORE_COHORT_SIZE
+    ):
+        raise ValueError(
+            f"rollout rescore cohort target must be between {PRIORITY_COHORT_SIZE} "
+            f"and {MAX_PERSISTED_RESCORE_COHORT_SIZE}"
+        )
+    if (
+        not PRIORITY_COHORT_SIZE
+        <= priority_cohort_target
+        <= MAX_PERSISTED_RESCORE_COHORT_SIZE
+    ):
+        raise ValueError(
+            f"rollout priority cohort target must be between {PRIORITY_COHORT_SIZE} "
+            f"and {MAX_PERSISTED_RESCORE_COHORT_SIZE}"
+        )
+    if priority_cohort_target > rescore_cohort_target:
+        # The gate would wait on inherited positions the cohort never fills, so
+        # the rollout could never activate. The wire model rejects this too; this
+        # is the guard for internal callers that bypass it.
+        raise ValueError(
+            f"rollout priority cohort target {priority_cohort_target} cannot exceed "
+            f"its rescore cohort target {rescore_cohort_target}"
+        )
     if session.get_bind().dialect.name == "postgresql":
         # One global rollout lock name, deliberately NOT keyed on the version:
         # only one rollout may be open at a time, so every transition must
@@ -879,8 +1029,11 @@ async def create_rollout_snapshot(
             f"{conflicting.desired_version} is still {conflicting.status}; only one "
             "benchmark rollout may be open at a time"
         )
-    if not PRIORITY_COHORT_SIZE <= len(members) <= RESCORE_COHORT_SIZE:
-        raise ValueError("a benchmark rollout requires between five and ten members")
+    if not PRIORITY_COHORT_SIZE <= len(members) <= rescore_cohort_target:
+        raise ValueError(
+            f"a benchmark rollout requires between {PRIORITY_COHORT_SIZE} and "
+            f"{rescore_cohort_target} members"
+        )
     if len({m.agent_id for m in members}) != len(members):
         raise ValueError("benchmark rollout agents must be distinct")
     if len({m.miner_hotkey for m in members}) != len(members):
@@ -894,6 +1047,8 @@ async def create_rollout_snapshot(
         desired_version=desired_version,
         status="collecting",
         cohort_size=len(members),
+        rescore_cohort_target=rescore_cohort_target,
+        priority_cohort_target=priority_cohort_target,
         created_at=now,
     )
     session.add(rollout)
@@ -1039,6 +1194,31 @@ def heartbeat_supports_version(
     )
 
 
+async def capable_validator_counts(
+    session: AsyncSession,
+    *,
+    versions: Sequence[int],
+    now: datetime | None = None,
+) -> dict[int, int]:
+    """Count fresh, identity-matched scorers for many versions in one read.
+
+    :func:`rollout_state` answers this for a single version, but it derives the
+    whole cohort and quorum picture on the way. Target discovery needs the count
+    for every shipped contract, and paying the cohort derivation once per
+    contract is what made the operator's read of the rollout status scale with
+    the number of shipped benchmarks rather than staying flat.
+    """
+    now = now or datetime.now(UTC)
+    heartbeats = list(await session.scalars(select(ValidatorHeartbeat)))
+    return {
+        version: sum(
+            heartbeat_supports_version(heartbeat, now=now, version=version)
+            for heartbeat in heartbeats
+        )
+        for version in versions
+    }
+
+
 async def rollout_cohort_complete(
     session: AsyncSession,
     *,
@@ -1115,9 +1295,18 @@ async def issue_rollout_ticket(
     # Retained as a keyword-compatible parameter for mixed platform callers;
     # the version contract, not an operator-wide routing flag, governs this.
     _ = artifact_mode
+    from ditto.db.queries.tickets import expire_overdue_tickets
+
     rollout = await open_rollout(session, for_update=True)
     if rollout is None:
         return None
+    # Mirrors the canonical issuance path. This lane could previously be entered
+    # without any sweep, so the only thing clearing an overdue lease off the slot
+    # was the revocation below -- which is why that query had to match overdue
+    # rows and could not carry a ``deadline > now`` filter. Sweeping first lets
+    # the revocation narrow to genuinely live leases without stranding the slot
+    # behind the one-issued-per-validator-slot unique index.
+    await expire_overdue_tickets(session, now=now)
     heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
     if heartbeat is None or not heartbeat_supports_version(
         heartbeat, now=now, version=rollout.desired_version
@@ -1199,10 +1388,13 @@ async def issue_rollout_ticket(
         )
         .exists()
     )
+    # This rollout's frozen gate width, so retuning the live policy never
+    # changes which members an in-flight rollout prioritises.
+    priority_target = rollout.priority_cohort_target
     priority_complete = await rollout_cohort_score_complete(
         session,
         rollout=rollout,
-        cohort_size=PRIORITY_COHORT_SIZE,
+        cohort_size=priority_target,
     )
     member_statement = (
         select(BenchmarkRolloutMember)
@@ -1222,7 +1414,7 @@ async def issue_rollout_ticket(
         # that has already scored every incomplete priority member idles until
         # another validator closes those quorums; it must not skip to rank 6.
         member_statement = member_statement.where(
-            BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE
+            BenchmarkRolloutMember.position <= priority_target
         )
     member = await session.scalar(
         member_statement.order_by(
@@ -1245,6 +1437,11 @@ async def issue_rollout_ticket(
             ValidatorTicket.validator_hotkey == validator_hotkey,
             ValidatorTicket.slot_id == slot_id,
             ValidatorTicket.status == TicketStatus.ISSUED,
+            # Overdue leases are the deadline sweep's business, not a
+            # revocation's: the sweep above has already flipped them and set the
+            # cooldown from the deadline rather than from now. Without this the
+            # sweep and this branch disagreed about the same row.
+            ValidatorTicket.deadline > now,
         )
         .limit(1)
         .with_for_update()
@@ -1255,12 +1452,24 @@ async def issue_rollout_ticket(
             or competing_ticket.purpose_revision <= 0
         ):
             return None
-        if validator_running_benchmark:
+        # Same fail-safe rule as the canonical issuance path, through the same
+        # gate: revoke only on fresh, post-issuance, positive evidence that the
+        # slot is idle. This copy was the looser of the two (it matched overdue
+        # leases as well), so routing both through one helper is what keeps them
+        # from drifting apart again.
+        from ditto.db.queries.lease_liveness import maybe_force_expire_lease
+
+        if not await maybe_force_expire_lease(
+            session,
+            ticket=competing_ticket,
+            validator_hotkey=validator_hotkey,
+            slot_id=slot_id,
+            now=now,
+            context="issue_rollout_ticket",
+            running_benchmark_reported=validator_running_benchmark,
+            requested_bench_version=rollout.desired_version,
+        ):
             return None
-        competing_ticket.status = TicketStatus.EXPIRED
-        competing_ticket.deadline = now
-        competing_ticket.retry_after = now
-        await session.flush()
     ticket = await session.get(
         ValidatorTicket,
         (member.agent_id, rollout.desired_version, validator_hotkey),
@@ -1439,7 +1648,13 @@ async def rollout_state(
             "qualification_converged": False,
             "cohort_size": 0,
             "cohort_ready_count": 0,
+            # No rollout row, so nothing has frozen a target yet. The size the
+            # NEXT start will freeze is the operator policy, served by
+            # GET /admin/queue-policy-settings.
+            "rescore_cohort_target": None,
+            "max_rescore_cohort_size": MAX_PERSISTED_RESCORE_COHORT_SIZE,
             "priority_cohort_size": PRIORITY_COHORT_SIZE,
+            "priority_cohort_target": None,
             "priority_complete": False,
             "members": [],
         }
@@ -1470,8 +1685,10 @@ async def rollout_state(
     current_top = await rolling_top_five(session)
     current_top_ids = {member.agent_id for member in current_top}
     qualified_ids = {member.agent_id for member in members}
+    # This rollout's frozen activation gate width.
+    priority_target = rollout.priority_cohort_target
     priority_member_ids = {
-        member.agent_id for member in members if member.position <= PRIORITY_COHORT_SIZE
+        member.agent_id for member in members if member.position <= priority_target
     }
     ranked_quorum_agents = await count_ranked_quorum_agents(
         session,
@@ -1482,9 +1699,9 @@ async def rollout_state(
         counts.get(member.agent_id, 0) >= SCORING_QUORUM for member in members
     )
     priority_members = [
-        member for member in members if member.position <= PRIORITY_COHORT_SIZE
+        member for member in members if member.position <= priority_target
     ]
-    priority_complete = len(priority_members) == PRIORITY_COHORT_SIZE and all(
+    priority_complete = len(priority_members) == priority_target and all(
         counts.get(member.agent_id, 0) >= SCORING_QUORUM for member in priority_members
     )
     return {
@@ -1499,11 +1716,23 @@ async def rollout_state(
         # DEPRECATED alias of canary_capable_validator_count; see above.
         "v3_capable_validator_count": capable_count,
         "current_hybrid_top_five": [str(member.agent_id) for member in current_top],
+        # Deliberately still PRIORITY_COHORT_SIZE: `current_top` is
+        # `rolling_top_five`, the KOTH top five, which is a consensus quantity
+        # rather than this rollout's activation gate. Swapping it for the
+        # tunable target would silently redefine "converged".
         "qualification_converged": len(current_top) == PRIORITY_COHORT_SIZE
         and current_top_ids.issubset(qualified_ids),
         "cohort_size": rollout.cohort_size,
         "cohort_ready_count": cohort_ready_count,
-        "priority_cohort_size": PRIORITY_COHORT_SIZE,
+        # What this rollout froze at start. Immune to later policy revisions,
+        # so a historical rollout is always explainable by the size it aimed
+        # for -- `cohort_size` is how many members it actually qualified.
+        "rescore_cohort_target": rollout.rescore_cohort_target,
+        "max_rescore_cohort_size": MAX_PERSISTED_RESCORE_COHORT_SIZE,
+        # The gate width this rollout froze at start. Identical to
+        # PRIORITY_COHORT_SIZE for every rollout that predates the setting.
+        "priority_cohort_size": priority_target,
+        "priority_cohort_target": priority_target,
         "priority_complete": priority_complete,
         "members": [
             {

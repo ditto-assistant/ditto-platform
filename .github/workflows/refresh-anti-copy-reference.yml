@@ -1,0 +1,82 @@
+name: Refresh anti-copy reference
+
+on:
+  schedule:
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: refresh-anti-copy-reference
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out platform
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check out official starter kit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ditto-assistant/dittobench-starter-kit
+          path: .reference/dittobench-starter-kit
+          fetch-depth: 0
+
+      - name: Regenerate deterministic reference bundles
+        run: python scripts/build_reference_fingerprints.py .reference/dittobench-starter-kit
+
+      - name: Open or refresh reference update PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: automation/starter-kit-reference
+        run: |
+          if git diff --quiet -- ditto/anticopy/reference_*_v2.bin ditto/anticopy/reference_manifest_v2.json; then
+            echo "Anti-copy reference already matches official starter-kit main."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"; then
+            if git diff --quiet "refs/remotes/origin/$BRANCH" -- \
+              ditto/anticopy/reference_lexical_v2.bin \
+              ditto/anticopy/reference_normalized_v2.bin \
+              ditto/anticopy/reference_prompt_v2.bin \
+              ditto/anticopy/reference_manifest_v2.json; then
+              echo "Existing reference update PR already carries these bytes."
+              exit 0
+            fi
+          fi
+
+          git checkout -B "$BRANCH"
+          git add \
+            ditto/anticopy/reference_lexical_v2.bin \
+            ditto/anticopy/reference_normalized_v2.bin \
+            ditto/anticopy/reference_prompt_v2.bin \
+            ditto/anticopy/reference_manifest_v2.json
+          git commit -m "chore: refresh starter-kit anti-copy reference"
+
+          remote_oid="$(git ls-remote --heads origin "refs/heads/$BRANCH" | cut -f1)"
+          if [ -n "$remote_oid" ]; then
+            git push \
+              --force-with-lease="refs/heads/$BRANCH:$remote_oid" \
+              origin "HEAD:refs/heads/$BRANCH"
+          else
+            git push origin "HEAD:refs/heads/$BRANCH"
+          fi
+
+          if ! gh pr view "$BRANCH" --json url >/dev/null 2>&1; then
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore: refresh starter-kit anti-copy reference" \
+              --body "Refresh the provenance-aware anti-copy bundles from the official starter-kit mainline. Review and deploy this PR, then run the fingerprint backfill dry-run before separately authorizing metadata-only apply."
+          fi

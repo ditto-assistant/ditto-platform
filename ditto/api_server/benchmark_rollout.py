@@ -18,6 +18,7 @@ from ditto.api_server.inference_routing import (
     aggregate_profile_revision,
     benchmark_model,
 )
+from ditto.api_server.queue_policy_settings import resolve_queue_policy_settings
 from ditto.db.models import (
     Agent,
     BenchmarkDataset,
@@ -25,9 +26,14 @@ from ditto.db.models import (
     BenchmarkRolloutMember,
     Score,
 )
+from ditto.db.queries.benchmark_carryover import (
+    StrandedCandidate,
+    adopt_carryover_agent,
+    stranded_prev_gen_candidates,
+)
 from ditto.db.queries.benchmark_rollout import (
     MAX_PERSISTED_RESCORE_COHORT_SIZE,
-    RESCORE_COHORT_SIZE,
+    PRIORITY_COHORT_SIZE,
     DatasetPin,
     InferenceActivationRequirements,
     RolloutSnapshotMember,
@@ -81,14 +87,41 @@ class PendingQualification:
     existing_sha256: str | None = None
 
 
+@dataclass(frozen=True)
+class PendingCarryover:
+    """A stranded prior-era submission plus the target-version input it needs.
+
+    ``qualification.member`` is a synthetic :class:`RolloutSnapshotMember` built
+    only so :func:`qualification_candidate`'s seed resolution can be reused; its
+    ``composite`` is meaningless here and is never persisted. Carryover rows have
+    no frozen composite because carryover is not a ranked cohort position.
+    """
+
+    candidate: StrandedCandidate
+    qualification: PendingQualification
+
+
 async def _rollout_rescore_cohort(
     session: AsyncSession, *, rollout: BenchmarkRollout
 ) -> list[RolloutSnapshotMember]:
-    """Preserve already-frozen members, then fill new rollouts to the top ten.
+    """Preserve already-frozen members, then fill the rollout to ITS OWN target.
+
+    The size read here is ``rollout.rescore_cohort_target`` -- the operator
+    policy frozen onto this row when the rollout started -- never the live
+    setting. That is the whole answer to "what happens if an operator raises the
+    cohort size to 25 while a 10-member rollout is open?": nothing. This rollout
+    keeps filling to 10 and the new value applies to the next rollout only.
+
+    The alternative (reading the live policy) would let a backroom write grow an
+    in-flight cohort underneath the validators already scoring it, silently
+    moving the completion bar that gates the authority switch. Membership being
+    append-only makes that *safe*, but it does not make it *predictable*, and an
+    operator raising a policy default should not extend an in-flight transition
+    they have already been told the shape of.
 
     Older deployments created cohorts as large as 25. Those durable rows and
-    their accepted scores are never deleted; only rollouts that have not
-    already crossed the new bound are filled to ten.
+    their accepted scores are never deleted; a rollout already at or above its
+    target is returned untouched.
     """
     existing = (
         (
@@ -103,6 +136,14 @@ async def _rollout_rescore_cohort(
     )
     if len(existing) > MAX_PERSISTED_RESCORE_COHORT_SIZE:
         raise RuntimeError("existing benchmark rollout exceeds the top-25 bound")
+    target = rollout.rescore_cohort_target
+    if not PRIORITY_COHORT_SIZE <= target <= MAX_PERSISTED_RESCORE_COHORT_SIZE:
+        # A CHECK constraint already guarantees this; fail loudly rather than
+        # silently rescoring an unbounded cohort if a row is ever hand-edited.
+        raise RuntimeError(
+            f"benchmark rollout rescore target {target} is outside "
+            f"[{PRIORITY_COHORT_SIZE}, {MAX_PERSISTED_RESCORE_COHORT_SIZE}]"
+        )
     cohort = [
         RolloutSnapshotMember(
             member.agent_id,
@@ -111,19 +152,19 @@ async def _rollout_rescore_cohort(
         )
         for member in existing
     ]
-    if len(existing) >= RESCORE_COHORT_SIZE:
+    if len(existing) >= target:
         return cohort
     seen = {member.agent_id for member in cohort}
     for member in await historical_rescore_cohort(
         session,
         source_version=rollout.from_version,
-        limit=RESCORE_COHORT_SIZE,
+        limit=target,
     ):
         if member.agent_id in seen:
             continue
         cohort.append(member)
         seen.add(member.agent_id)
-        if len(cohort) == RESCORE_COHORT_SIZE:
+        if len(cohort) == target:
             break
     return cohort
 
@@ -232,7 +273,7 @@ async def qualification_candidate(
 async def rolling_qualification_blockers(
     session: AsyncSession, *, generator_run_size: str | None
 ) -> list[dict[str, str]]:
-    """Describe inherited top-ten agents that automatic qualification cannot add."""
+    """Describe inherited cohort agents that automatic qualification cannot add."""
     rollout = await open_rollout(session)
     if rollout is None:
         return []
@@ -271,6 +312,105 @@ async def ensure_rolling_qualification(
     return False
 
 
+async def _select_carryover(
+    session: AsyncSession,
+    *,
+    rollout: BenchmarkRollout,
+    generator_run_size: str | None,
+    now: datetime,
+) -> list[PendingCarryover]:
+    """Phase one of the carryover pass: pick adoptees and resolve their seeds.
+
+    The operator gate is checked first and nothing else runs when it is off, so
+    the shipped default costs exactly one settings SELECT and leaves every query
+    below unexecuted. Blocked candidates are logged the way the cohort pass logs
+    its own, since the reasons are the same typed reasons from
+    :func:`qualification_candidate`.
+    """
+    settings = (await resolve_queue_policy_settings(session)).prev_gen_carryover
+    if not settings.enabled:
+        return []
+    selected: list[PendingCarryover] = []
+    for candidate in await stranded_prev_gen_candidates(
+        session, rollout=rollout, settings=settings, now=now
+    ):
+        qualification, reason = await qualification_candidate(
+            session,
+            source_bench_version=rollout.from_version,
+            target_bench_version=rollout.desired_version,
+            member=RolloutSnapshotMember(
+                candidate.agent_id, candidate.miner_hotkey, 0.0
+            ),
+            generator_run_size=generator_run_size,
+        )
+        if qualification is None:
+            logger.warning(
+                "benchmark carryover blocked agent_id=%s reason=%s",
+                candidate.agent_id,
+                reason,
+            )
+            continue
+        selected.append(
+            PendingCarryover(candidate=candidate, qualification=qualification)
+        )
+    return selected
+
+
+async def _adopt_carryover(
+    session: AsyncSession,
+    *,
+    rollout: BenchmarkRollout,
+    rendered: list[tuple[PendingCarryover, str]],
+    now: datetime,
+) -> int:
+    """Phase three: pin each rendered dataset and its admission row together.
+
+    Re-resolves the seed under the rollout lock and skips any candidate whose
+    input moved while the generator was running, exactly like the cohort pass, so
+    a concurrent refresh can never pin a dataset that no longer matches. The
+    carryover row and the dataset are written by one call
+    (:func:`adopt_carryover_agent`) inside this transaction, which is what makes
+    admission unable to outrun generation.
+    """
+    adopted = 0
+    for adoption, sha256 in rendered:
+        current, _reason = await qualification_candidate(
+            session,
+            source_bench_version=rollout.from_version,
+            target_bench_version=rollout.desired_version,
+            member=adoption.qualification.member,
+            generator_run_size=adoption.qualification.run_size,
+        )
+        if current != adoption.qualification:
+            logger.warning(
+                "benchmark carryover changed during render agent_id=%s",
+                adoption.candidate.agent_id,
+            )
+            continue
+        if await adopt_carryover_agent(
+            session,
+            rollout=rollout,
+            candidate=adoption.candidate,
+            dataset=DatasetPin(
+                seed=adoption.qualification.seed,
+                sha256=sha256,
+                run_size=adoption.qualification.run_size,
+                seed_block=adoption.qualification.seed_block,
+                seed_block_hash=adoption.qualification.seed_block_hash,
+            ),
+            now=now,
+            audit_context={"seed_source": adoption.qualification.seed_source},
+        ):
+            adopted += 1
+    if adopted:
+        logger.info(
+            "benchmark carryover adopted rollout_id=%s agents=%s",
+            rollout.rollout_id,
+            adopted,
+        )
+    return adopted
+
+
 async def refresh_rolling_qualification(
     session: AsyncSession,
     *,
@@ -278,20 +418,31 @@ async def refresh_rolling_qualification(
     now: datetime,
     inference_config: InferenceProxyConfig | None = None,
 ) -> int:
-    """Converge the frozen inherited top-ten cohort and try activation.
+    """Converge the frozen inherited rescore cohort and try activation.
 
     Dataset rendering deliberately happens between transactions: the generator
     is a network service and must never run while holding rollout/agent locks.
     The second transaction rechecks membership, so concurrent refreshes are
     idempotent.
+
+    Previous-generation carryover converges here too, as a second pass with the
+    same three-phase shape rather than a loop of its own -- one convergence loop
+    means one place where "selected, rendered, pinned" can be reasoned about. It
+    is gated on operator policy and ships disabled, in which case it costs one
+    settings SELECT and runs no carryover query at all.
+
+    Returns the number of inherited cohort members appended. Carryover adoptions
+    are deliberately excluded from that count: callers read it as cohort
+    progress toward activation, and carryover does not move that bar.
     """
     pending: list[PendingQualification] = []
+    carryover_pending: list[PendingCarryover] = []
     async with session.begin():
         rollout = await open_rollout(session)
         if rollout is None:
             return 0
         cohort = await _rollout_rescore_cohort(session, rollout=rollout)
-        if len(cohort) < 5:
+        if len(cohort) < PRIORITY_COHORT_SIZE:
             logger.error(
                 "benchmark rollout cannot build inherited cohort rollout_id=%s "
                 "eligible_members=%s",
@@ -323,6 +474,12 @@ async def refresh_rolling_qualification(
             pending.append(candidate)
         rollout_id: UUID = rollout.rollout_id
         desired_version = rollout.desired_version
+        carryover_pending = await _select_carryover(
+            session,
+            rollout=rollout,
+            generator_run_size=generator.run_size,
+            now=now,
+        )
 
     rendered: list[tuple[PendingQualification, str]] = []
     for candidate in pending:
@@ -332,6 +489,17 @@ async def refresh_rolling_qualification(
                 candidate.existing_sha256
                 or await generator.generate(
                     candidate.seed, bench_version=desired_version
+                ),
+            )
+        )
+    carryover_rendered: list[tuple[PendingCarryover, str]] = []
+    for adoption in carryover_pending:
+        carryover_rendered.append(
+            (
+                adoption,
+                adoption.qualification.existing_sha256
+                or await generator.generate(
+                    adoption.qualification.seed, bench_version=desired_version
                 ),
             )
         )
@@ -379,6 +547,9 @@ async def refresh_rolling_qualification(
                 now=now,
                 audit_context={"seed_source": candidate.seed_source},
             )
+        await _adopt_carryover(
+            session, rollout=rollout, rendered=carryover_rendered, now=now
+        )
         await maybe_activate_rollout(
             session,
             rollout,

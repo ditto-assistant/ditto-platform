@@ -11,8 +11,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
@@ -20,16 +22,14 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.public import PublicSystemMetrics
+from ditto.api_models.public import PublicBenchmarkProgress, PublicSystemMetrics
 from ditto.api_models.screener import (
     SCREENING_POLICY_VERSION,
     SourceReviewEvidenceItem,
@@ -60,10 +60,12 @@ from ditto.chain.models import (
 )
 from ditto.db.models import (
     Agent,
+    AgentKingship,
+    ArtifactReleaseSettingsRevision,
     AthReview,
-    Base,
     BenchmarkDataset,
     BenchmarkRollout,
+    EvaluationPayment,
     Score,
     ScreeningAttempt,
     ScreeningQuarantine,
@@ -81,6 +83,27 @@ from ditto.db.queries.scores import upsert_score
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 _VALIDATOR_C = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+
+def _scorer_capabilities(now: datetime, *, versions: list[int]) -> dict:
+    return {
+        "screened_images": True,
+        "require_screened_image": True,
+        "source_build_fallback": False,
+        "full_stack_managed": True,
+        "stack_updater": True,
+        "sandbox_egress_restricted": True,
+        "ticket_inference": False,
+        "signed_score_quorum": False,
+        "executor_isolation": "ephemeral_vm",
+        "scorer_benchmarks": {
+            "status": "fresh_verified",
+            "supported_bench_versions": versions,
+            "observed_at": int(now.timestamp()),
+            "software_version": "1.0.0",
+            "source_revision": "a" * 40,
+        },
+    }
 
 
 def test_v5_token_telemetry_public_parser_is_typed_and_fail_closed() -> None:
@@ -216,27 +239,101 @@ def test_composite_breakdown_shows_no_token_penalty_when_within_budget() -> None
     assert breakdown.token_penalty == 0.0
 
 
-@pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
+# The generator release each bench version pins, and the version flag that
+# release accepts. These are not cosmetic: v0.7.0 predates `-bench-version` and
+# fails with "flag provided but not defined" if it is passed, while every
+# release from v0.8.0 on requires it (the flag defaults to 0 and the binary
+# exits 2 with "-bench-version is required"). Each row below was verified by
+# running the rendered command against the real generator and confirming it
+# exits 0 and prints a dataset_sha256.
+_EXPECTED_DATASET_COMMANDS = (
+    (2, "v0.7.0", ""),
+    (3, "v0.8.0", " -bench-version 3"),
+    (4, "v0.9.0", " -bench-version 4"),
+    (5, "v0.10.0", " -bench-version 5"),
+    (6, "v0.11.1", " -bench-version 6"),
+    (7, "v0.12.0", " -bench-version 7"),
+)
 
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
 
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield eng
-    finally:
-        await eng.dispose()
+def test_datagen_version_map_pins_every_supported_bench_version() -> None:
+    """The pins are an immutable public contract; 2-6 must never drift."""
+    assert public_endpoint._DATAGEN_VERSION_BY_BENCH_VERSION == {
+        2: "v0.7.0",
+        3: "v0.8.0",
+        4: "v0.9.0",
+        5: "v0.10.0",
+        6: "v0.11.1",
+        7: "v0.12.0",
+    }
 
 
-@pytest.fixture
-def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
+@pytest.mark.parametrize(
+    ("bench_version", "datagen_version", "version_flag"), _EXPECTED_DATASET_COMMANDS
+)
+def test_dataset_command_renders_a_runnable_generator_invocation(
+    bench_version: int, datagen_version: str, version_flag: str
+) -> None:
+    """Both public commands must actually run, not just look plausible.
+
+    A command that exits 2 is worse than no command at all: it still reads as
+    auditable to anyone skimming the leaderboard.
+    """
+    base = (
+        "go run github.com/ditto-assistant/dittobench-datagen/cmd/"
+        f"generate@{datagen_version}{version_flag} -seed 987654321 -run-size full"
+    )
+
+    verification = public_endpoint._dataset_command(
+        seed=987654321,
+        run_size="full",
+        bench_version=bench_version,
+        sha_only=True,
+    )
+    reproduction = public_endpoint._dataset_command(
+        seed=987654321,
+        run_size="full",
+        bench_version=bench_version,
+        sha_only=False,
+    )
+
+    assert verification == f"{base} -sha"
+    assert reproduction == f"{base} -out dataset.json"
+
+
+def test_dataset_command_omits_version_flag_only_for_the_release_lacking_it() -> None:
+    """v0.7.0 rejects `-bench-version`; v0.8.0+ require it."""
+    for bench_version, _, _ in _EXPECTED_DATASET_COMMANDS:
+        command = public_endpoint._dataset_command(
+            seed=1,
+            run_size="small",
+            bench_version=bench_version,
+            sha_only=True,
+        )
+        assert command is not None
+        assert ("-bench-version" in command) is (bench_version != 2)
+
+
+def test_dataset_command_is_withheld_when_the_generator_pin_is_unknown() -> None:
+    """An unpinned epoch renders nothing rather than an unrunnable command."""
+    assert (
+        public_endpoint._dataset_command(
+            seed=1, run_size="full", bench_version=8, sha_only=True
+        )
+        is None
+    )
+    assert (
+        public_endpoint._dataset_command(
+            seed=1, run_size="full", bench_version=None, sha_only=True
+        )
+        is None
+    )
+    assert (
+        public_endpoint._dataset_command(
+            seed=1, run_size="enormous", bench_version=7, sha_only=True
+        )
+        is None
+    )
 
 
 def _install_db(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
@@ -381,6 +478,22 @@ async def _seed_top_five_floor(
         )
 
 
+async def _seed_top_ten_floor(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    tenth_place: float = 0.60,
+    bench_version: int = DEFAULT_BENCH_VERSION,
+) -> None:
+    for rank, marker in enumerate("ABCDEFGHJK"):
+        composite = tenth_place + (9 - rank) * 0.01
+        await _seed_k3(
+            maker,
+            miner="5" + marker * 47,
+            composites=[composite, composite, composite],
+            details={"bench_version": bench_version},
+        )
+
+
 async def _seed_agent(
     maker: async_sessionmaker[AsyncSession],
     *,
@@ -414,24 +527,71 @@ async def _seed_agent(
     return str(agent_id)
 
 
+async def _seed_payment(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    agent_id: str,
+    miner_hotkey: str,
+    miner_coldkey: str,
+    index: int,
+) -> None:
+    """Attach a payment-time coldkey to a seeded submission.
+
+    The owner identity the validator ticket allocator and the emission ledger
+    both partition on lives here, not on the agent row.
+    """
+    async with maker() as s, s.begin():
+        s.add(
+            EvaluationPayment(
+                block_hash=f"0xpayment-{index}",
+                extrinsic_index=index,
+                agent_id=UUID(agent_id),
+                miner_hotkey=miner_hotkey,
+                miner_coldkey=miner_coldkey,
+                amount_rao=1,
+                tao_usd_rate=Decimal("1"),
+                dest_address="5Destination",
+                timestamp=datetime.now(UTC),
+            )
+        )
+
+
+async def _drain_weight_refreshes(app: FastAPI) -> None:
+    """Await any in-flight background weight-matrix refresh.
+
+    The endpoint refreshes off the request path, so a test that wants to observe
+    the *result* of a refresh has to wait for it rather than assume the next
+    request sees it.
+    """
+    tasks = getattr(app.state, "public_chain_weights_tasks", None)
+    if isinstance(tasks, set) and tasks:
+        await asyncio.gather(*list(tasks), return_exceptions=True)
+
+
+def _weights_snapshot() -> ChainWeightsSnapshot:
+    """One revealed vector, enough to assert the projection and the cache."""
+    return ChainWeightsSnapshot(
+        netuid=118,
+        block=8_639_503,
+        block_hash="0x" + "ab" * 32,
+        owner_hotkey=_MINER_B,
+        vectors=(
+            ChainWeightVector(
+                validator_uid=25,
+                validator_hotkey=_VALIDATOR_C,
+                weights=(ChainWeight(uid=169, hotkey=_MINER_A, value=14745),),
+            ),
+        ),
+    )
+
+
 class TestPublicChainWeights:
     async def test_returns_native_revealed_weight_matrix(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
-        snapshot = ChainWeightsSnapshot(
-            netuid=118,
-            block=8_639_503,
-            block_hash="0x" + "ab" * 32,
-            owner_hotkey=_MINER_B,
-            vectors=(
-                ChainWeightVector(
-                    validator_uid=25,
-                    validator_hotkey=_VALIDATOR_C,
-                    weights=(ChainWeight(uid=169, hotkey=_MINER_A, value=14745),),
-                ),
-            ),
+        app.state.chain = SimpleNamespace(
+            get_weights=AsyncMock(return_value=_weights_snapshot())
         )
-        app.state.chain = SimpleNamespace(get_weights=AsyncMock(return_value=snapshot))
 
         response = await client.get("/api/v1/public/weights")
 
@@ -474,6 +634,201 @@ class TestPublicChainWeights:
         response = await client.get("/api/v1/public/weights")
 
         assert response.status_code == 503
+
+    async def test_caches_the_matrix_instead_of_reading_chain_per_request(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        app.state.chain = SimpleNamespace(
+            get_weights=AsyncMock(return_value=_weights_snapshot())
+        )
+
+        first = await client.get("/api/v1/public/weights")
+        second = await client.get("/api/v1/public/weights")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["block"] == 8_639_503
+        assert second.json()["stale"] is False
+        # The whole point: N dashboard polls must not become N substrate reads.
+        app.state.chain.get_weights.assert_awaited_once_with(118)
+
+    async def test_concurrent_requests_trigger_a_single_chain_read(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        reads = 0
+
+        async def _slow_read(_netuid: int) -> ChainWeightsSnapshot:
+            nonlocal reads
+            reads += 1
+            started.set()
+            await release.wait()
+            return _weights_snapshot()
+
+        app.state.chain = SimpleNamespace(get_weights=_slow_read)
+        first = asyncio.create_task(client.get("/api/v1/public/weights"))
+        await started.wait()
+        # A second caller arriving mid-read has no cache to fall back on, so it
+        # waits on the same single-flight read rather than opening its own.
+        second = asyncio.create_task(client.get("/api/v1/public/weights"))
+        await asyncio.sleep(0)
+        release.set()
+        responses = await asyncio.gather(first, second)
+
+        assert [r.status_code for r in responses] == [200, 200]
+        assert reads == 1
+
+    async def test_a_cached_response_never_waits_on_the_chain_read(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        release = asyncio.Event()
+
+        async def _slow_read(_netuid: int) -> ChainWeightsSnapshot:
+            await release.wait()
+            return _weights_snapshot()
+
+        app.state.chain = SimpleNamespace(
+            get_weights=AsyncMock(return_value=_weights_snapshot())
+        )
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+
+        # Cache expired, and the refresh now blocks indefinitely. The request
+        # must still return the cached matrix rather than wait out the read.
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_CACHE_TTL_SECONDS", 0.0)
+        app.state.chain = SimpleNamespace(get_weights=_slow_read)
+
+        response = await asyncio.wait_for(
+            client.get("/api/v1/public/weights"), timeout=5
+        )
+
+        assert response.status_code == 200
+        assert response.json()["block"] == 8_639_503
+        release.set()
+        await _drain_weight_refreshes(app)
+
+    async def test_serves_last_known_good_marked_stale_when_refresh_fails(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        get_weights = AsyncMock(return_value=_weights_snapshot())
+        app.state.chain = SimpleNamespace(get_weights=get_weights)
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+
+        # Expire the cache so the next request refreshes, then fail that refresh.
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_CACHE_TTL_SECONDS", 0.0)
+        monkeypatch.setattr(
+            public_endpoint, "_CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS", 0.0
+        )
+        get_weights.side_effect = ChainError("rpc unavailable")
+        get_weights.return_value = None
+
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+        await _drain_weight_refreshes(app)
+        response = await client.get("/api/v1/public/weights")
+
+        # A transient upstream failure must not blank the panel: the last good
+        # matrix is still served, explicitly labeled stale.
+        assert response.status_code == 200
+        body = response.json()
+        assert body["stale"] is True
+        assert body["block"] == 8_639_503
+        assert body["vectors"][0]["validator_hotkey"] == _VALIDATOR_C
+        assert body["age_seconds"] >= 0.0
+
+    async def test_serves_last_known_good_when_refresh_times_out(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        get_weights = AsyncMock(return_value=_weights_snapshot())
+        app.state.chain = SimpleNamespace(get_weights=get_weights)
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+
+        async def _never_returns(_netuid: int) -> ChainWeightsSnapshot:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_CACHE_TTL_SECONDS", 0.0)
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_TIMEOUT_SECONDS", 0.001)
+        monkeypatch.setattr(
+            public_endpoint, "_CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS", 0.0
+        )
+        app.state.chain = SimpleNamespace(get_weights=_never_returns)
+
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+        await _drain_weight_refreshes(app)
+        response = await client.get("/api/v1/public/weights")
+
+        assert response.status_code == 200
+        assert response.json()["stale"] is True
+
+    async def test_backs_off_instead_of_retrying_a_failing_read_per_request(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        get_weights = AsyncMock(side_effect=ChainError("rpc unavailable"))
+        app.state.chain = SimpleNamespace(get_weights=get_weights)
+
+        first = await client.get("/api/v1/public/weights")
+        second = await client.get("/api/v1/public/weights")
+
+        assert [first.status_code, second.status_code] == [503, 503]
+        # A 503 is not stored by the response cache, so without this backoff the
+        # next poll would immediately run another doomed multi-second read — the
+        # loop that made this endpoint fail a quarter of the time in prod.
+        assert get_weights.await_count == 1
+
+    async def test_reverts_to_503_once_the_cached_matrix_is_too_old(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        get_weights = AsyncMock(return_value=_weights_snapshot())
+        app.state.chain = SimpleNamespace(get_weights=get_weights)
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_CACHE_TTL_SECONDS", 0.0)
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_MAX_STALE_SECONDS", -1.0)
+        monkeypatch.setattr(
+            public_endpoint, "_CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS", 0.0
+        )
+        get_weights.side_effect = ChainError("rpc unavailable")
+
+        response = await client.get("/api/v1/public/weights")
+
+        # Serving indefinitely-old chain state would misrepresent it; past the
+        # ceiling the endpoint says nothing rather than something wrong.
+        assert response.status_code == 503
+
+    async def test_logs_the_exception_type_when_the_read_times_out(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        async def _never_returns(_netuid: int) -> ChainWeightsSnapshot:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        app.state.chain = SimpleNamespace(get_weights=_never_returns)
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_TIMEOUT_SECONDS", 0.001)
+
+        with caplog.at_level(logging.WARNING, logger=public_endpoint.__name__):
+            assert (await client.get("/api/v1/public/weights")).status_code == 503
+
+        # `asyncio.wait_for` raises a bare TimeoutError whose str() is "", which
+        # is how this warning used to log an empty message and explain nothing.
+        assert any(
+            "TimeoutError" in record.getMessage() for record in caplog.records
+        ), [r.getMessage() for r in caplog.records]
 
 
 class TestPublicBenchmarkTimeline:
@@ -647,21 +1002,43 @@ class TestPublicLeaderboard:
             details={"bench_version": DEFAULT_BENCH_VERSION},
             created_at=datetime(2026, 6, 1, tzinfo=UTC),
         )
-        await _seed_k3(
+        tail_id = await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.80, 0.80, 0.80],
             details={"bench_version": DEFAULT_BENCH_VERSION},
             created_at=datetime(2026, 6, 2, tzinfo=UTC),
         )
-        # The champion accumulated three champion-anchored shared-seed rescores.
+        # A wave counts only after every emission-set member has the seed.
         async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_C,
+                    software_version="0.27.0",
+                    protocol_version=13,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                    capabilities=_scorer_capabilities(
+                        now, versions=[DEFAULT_BENCH_VERSION]
+                    ),
+                )
+            )
             await append_confirmation_scores(
                 s,
                 rows=[
                     ConfirmationSeedScore(
-                        UUID(champion_id), "5V1", seed, 0.90, f"r{seed}", None
+                        UUID(agent_id),
+                        "5V1",
+                        seed,
+                        0.90,
+                        f"r{agent_id}-{seed}",
+                        None,
                     )
+                    for agent_id in (champion_id, tail_id)
                     for seed in (100, 200, 300)
                 ],
                 bench_version=DEFAULT_BENCH_VERSION,
@@ -669,9 +1046,43 @@ class TestPublicLeaderboard:
             )
         _install_db(app, session_maker)
 
+        mixed = (await client.get("/api/v1/public/leaderboard")).json()
+        mixed_entries = {entry["agent_id"]: entry for entry in mixed["entries"]}
+        assert mixed["continual_aggregate_active"] is False
+        assert mixed_entries[tail_id]["official_composite"] == pytest.approx(0.80)
+        assert mixed_entries[tail_id]["aggregate_method"] == "canonical_median"
+        assert mixed_entries[tail_id]["completed_wave_count"] == 3
+        mixed_recipients = {
+            recipient["agent_id"]: recipient
+            for recipient in mixed["emissions"]["recipients"]
+        }
+        assert mixed_recipients[champion_id]["shared_seed_confirmations"] == 0
+
+        async with session_maker() as s, s.begin():
+            heartbeat = await s.get(ValidatorHeartbeat, _VALIDATOR_C)
+            assert heartbeat is not None
+            heartbeat.protocol_version = 14
+            heartbeat.software_version = "0.28.0"
+
         body = (await client.get("/api/v1/public/leaderboard")).json()
+        assert body["continual_aggregate_active"] is True
+        assert body["continual_aggregate_required_protocol"] == 14
         recipients = {r["agent_id"]: r for r in body["emissions"]["recipients"]}
+        entries = {entry["agent_id"]: entry for entry in body["entries"]}
         assert recipients[champion_id]["shared_seed_confirmations"] == 3
+        assert entries[champion_id]["composite"] == pytest.approx(0.90)
+        assert entries[champion_id]["official_composite"] == pytest.approx(0.90)
+        assert entries[champion_id]["aggregate_method"] == "continual_mean"
+        assert entries[champion_id]["aggregate_sample_count"] == 6
+        assert entries[champion_id]["completed_wave_count"] == 3
+        assert entries[champion_id]["initial_quorum_composites"] == pytest.approx(
+            [0.90, 0.90, 0.90]
+        )
+        assert entries[champion_id]["completed_wave_composites"] == pytest.approx(
+            [0.90, 0.90, 0.90]
+        )
+        assert entries[tail_id]["composite"] == pytest.approx(0.80)
+        assert entries[tail_id]["official_composite"] == pytest.approx(0.85)
 
     async def test_marks_deregistered_scores_retained_but_emission_ineligible(
         self,
@@ -765,6 +1176,108 @@ class TestPublicLeaderboard:
         assert entry["registered"] is None
         assert entry["emission_eligible"] is None
 
+    async def test_failed_registration_refresh_keeps_the_last_known_good_mapping(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.7, 0.8, 0.9],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+        )
+        _install_db(app, session_maker)
+        get_recent_neurons = AsyncMock(
+            return_value=[SimpleNamespace(hotkey=_MINER_A, uid=42)]
+        )
+        app.state.chain = SimpleNamespace(get_recent_neurons=get_recent_neurons)
+        # The snapshot bakes its expiry in at write time, so the TTL has to be
+        # zeroed before the first read for the second one to attempt a refresh.
+        monkeypatch.setattr(public_endpoint, "_REGISTRATION_CACHE_TTL_SECONDS", 0.0)
+
+        first = (await client.get("/api/v1/public/leaderboard")).json()
+        assert first["entries"][0]["registered"] is True
+        assert first["registration_stale"] is False
+
+        get_recent_neurons.side_effect = ChainError("pylon unavailable")
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        # The row keeps its real registration rather than flipping every row on
+        # the board to "unknown" for one poll and back on the next.
+        entry = body["entries"][0]
+        assert entry["registered"] is True
+        assert entry["miner_uid"] == 42
+        assert body["registration_stale"] is True
+
+    async def test_registration_becomes_unknown_once_the_last_read_is_too_old(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.7, 0.8, 0.9],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+        )
+        _install_db(app, session_maker)
+        get_recent_neurons = AsyncMock(
+            return_value=[SimpleNamespace(hotkey=_MINER_A, uid=42)]
+        )
+        app.state.chain = SimpleNamespace(get_recent_neurons=get_recent_neurons)
+        monkeypatch.setattr(public_endpoint, "_REGISTRATION_CACHE_TTL_SECONDS", 0.0)
+        assert (await client.get("/api/v1/public/leaderboard")).status_code == 200
+
+        monkeypatch.setattr(public_endpoint, "_REGISTRATION_MAX_STALE_SECONDS", -1.0)
+        get_recent_neurons.side_effect = ChainError("pylon unavailable")
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        assert body["entries"][0]["registered"] is None
+        assert body["registration_stale"] is False
+
+    async def test_logs_the_exception_type_when_registration_read_times_out(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.7, 0.8, 0.9],
+            details={"bench_version": 2},
+        )
+        _install_db(app, session_maker)
+
+        async def _never_returns(_netuid: int) -> list[object]:
+            await asyncio.Event().wait()
+            return []
+
+        app.state.chain = SimpleNamespace(get_recent_neurons=_never_returns)
+        monkeypatch.setattr(
+            public_endpoint, "_REGISTRATION_LOOKUP_TIMEOUT_SECONDS", 0.001
+        )
+
+        with caplog.at_level(logging.WARNING, logger=public_endpoint.__name__):
+            assert (await client.get("/api/v1/public/leaderboard")).status_code == 200
+
+        # `asyncio.timeout` raises a bare TimeoutError whose str() is "": this
+        # warning used to fire hundreds of times a day with an empty message.
+        assert any(
+            "registration read failed" in record.getMessage()
+            and "TimeoutError" in record.getMessage()
+            for record in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
     async def test_includes_pre_quorum_scores_as_provisional_feedback(
         self,
         app: FastAPI,
@@ -791,6 +1304,70 @@ class TestPublicLeaderboard:
         assert entry["score_count"] == 2
         assert entry["score_quorum"] == 3
         assert entry["bench_version"] == DEFAULT_BENCH_VERSION
+
+    async def test_provisional_overlay_gives_one_row_per_coldkey_not_per_hotkey(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The overlay must group the way the emission ledger does.
+
+        ``list_eligible_ledger`` ranks one row per payment-time coldkey, so a
+        coldkey funding several hotkeys holds one board position. Keyed on the
+        hotkey, the provisional overlay showed an owner a second row — and even
+        showed a provisional row beside its own finalized one.
+        """
+        shared_coldkey = "5SharedProvisionalColdkey"
+        settled_coldkey = "5SettledColdkey"
+        best_provisional = await _seed_k3(
+            session_maker,
+            miner="5" + "P" * 47,
+            composites=[0.80, 0.80],
+            status=AgentStatus.EVALUATING,
+        )
+        sibling_provisional = await _seed_k3(
+            session_maker,
+            miner="5" + "Q" * 47,
+            composites=[0.75],
+            status=AgentStatus.EVALUATING,
+        )
+        finalized = await _seed_k3(
+            session_maker,
+            miner="5" + "R" * 47,
+            composites=[0.70, 0.70, 0.70],
+        )
+        # Same owner as ``finalized``, and scoring higher: without owner
+        # grouping this outranks its own settled row on the public board.
+        shadow_provisional = await _seed_k3(
+            session_maker,
+            miner="5" + "S" * 47,
+            composites=[0.85],
+            status=AgentStatus.EVALUATING,
+        )
+        for index, (agent_id, hotkey, coldkey) in enumerate(
+            (
+                (best_provisional, "5" + "P" * 47, shared_coldkey),
+                (sibling_provisional, "5" + "Q" * 47, shared_coldkey),
+                (finalized, "5" + "R" * 47, settled_coldkey),
+                (shadow_provisional, "5" + "S" * 47, settled_coldkey),
+            ),
+            start=1,
+        ):
+            await _seed_payment(
+                session_maker,
+                agent_id=agent_id,
+                miner_hotkey=hotkey,
+                miner_coldkey=coldkey,
+                index=index,
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        listed = [entry["agent_id"] for entry in body["entries"]]
+        assert listed == [finalized, best_provisional]
+        assert body["count"] == 2
 
     async def test_open_rollout_exposes_settled_and_rollout_state_per_entry(
         self,
@@ -1255,6 +1832,263 @@ class TestPublicHealth:
         }
 
 
+def _liveness_row(
+    now: datetime, *, protocol_version: int, scorer: dict | None
+) -> SimpleNamespace:
+    """One stored heartbeat row, healthy in every respect except the scorer."""
+    capabilities = _scorer_capabilities(now, versions=[2, 3])
+    if scorer is None:
+        capabilities.pop("scorer_benchmarks")
+    else:
+        capabilities["scorer_benchmarks"] = scorer
+    component = {
+        "health": "healthy",
+        "required": True,
+        "observed_at": int(now.timestamp()),
+        "ready": True,
+    }
+    return SimpleNamespace(
+        validator_hotkey=_VALIDATOR_C,
+        software_version="0.29.6",
+        protocol_version=protocol_version,
+        state="idle",
+        active_agent_id=None,
+        system_metrics={
+            "collected_at": int(now.timestamp()),
+            "cpu_percent": 10,
+            "memory_percent": 20,
+            "disk_percent": 30,
+            "docker": {
+                "status": "healthy",
+                "running_containers": 6,
+                "unhealthy_containers": 0,
+            },
+        },
+        benchmark_progress=None,
+        benchmark_capacity=None,
+        capabilities=capabilities,
+        stack={
+            "mode": "managed",
+            "compose_schema": 2,
+            "release_descriptor_digest": "sha256:" + "c" * 64,
+            "components": {
+                name: {
+                    "image_digest": "sha256:" + "d" * 64,
+                    "provenance": "signed_descriptor",
+                }
+                for name in (
+                    "ditto_subnet",
+                    "dittobench_api",
+                    "sandbox_docker",
+                    "model_relay",
+                    "pylon",
+                    "ollama",
+                )
+            },
+        },
+        stack_health={
+            name: dict(component)
+            for name in (
+                "ditto_subnet",
+                "dittobench_api",
+                "sandbox_docker",
+                "model_relay",
+                "pylon",
+                "ollama",
+            )
+        },
+        first_seen_at=now - timedelta(days=1),
+        reported_at=now,
+        seen_at=now,
+    )
+
+
+class TestScorerLivenessSurfacing:
+    """A validator whose scorer is not serving must not read like a warning.
+
+    Both incidents that produced the probe showed the same thing on the fleet
+    view: a validator that could not complete a single lease, rendered beside
+    every validator that merely had a full disk.
+    """
+
+    def _entry(self, *, protocol_version: int, scorer: dict | None):
+        now = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+        response = public_endpoint._validator_heartbeats_response(
+            rows=[_liveness_row(now, protocol_version=protocol_version, scorer=scorer)],
+            assignments=[],
+            active_work=[],
+            now=now,
+        )
+        return response.validators[0]
+
+    def test_a_scorer_that_never_answered_reads_critical(self) -> None:
+        """The TAO.com sidecar: 404 on every probe, previously ``warning``."""
+        entry = self._entry(
+            protocol_version=15,
+            scorer={
+                "status": "legacy_v2",
+                "supported_bench_versions": [2],
+                "probe": {
+                    "outcome": "http_error",
+                    "observed_at": 1_784_000_000,
+                    "http_status": 404,
+                    "consecutive_failures": 97,
+                },
+            },
+        )
+
+        assert entry.scorer_liveness == "not_serving"
+        assert entry.health == "critical"
+        assert entry.health_reasons == ["scorer not serving: http 404 (97 in a row)"]
+
+    def test_a_partly_rejected_capability_reply_is_not_healthy(self) -> None:
+        """The v7 parse bug: ``fresh_verified`` and green while v7 was gone."""
+        now = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+        entry = self._entry(
+            protocol_version=15,
+            scorer={
+                "status": "fresh_verified",
+                "supported_bench_versions": [2, 3, 4, 5, 6],
+                "observed_at": int(now.timestamp()),
+                "software_version": "0.29.4",
+                "source_revision": "a" * 40,
+                "probe": {
+                    "outcome": "served_degraded",
+                    "observed_at": int(now.timestamp()),
+                    "http_status": 200,
+                    "reason": "calibration_unreadable",
+                    "last_served_at": int(now.timestamp()),
+                    "consecutive_failures": 1,
+                },
+            },
+        )
+
+        # Every other signal is still green: identity verified, stack healthy.
+        assert entry.stack_health is not None
+        assert entry.stack_health.dittobench_api.health == "healthy"
+        assert entry.scorer_liveness == "degraded"
+        assert entry.health == "warning"
+        assert entry.health_reasons == ["scorer degraded: calibration_unreadable"]
+
+    def test_a_serving_scorer_stays_healthy_and_carries_no_reasons(self) -> None:
+        now = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+        entry = self._entry(
+            protocol_version=15,
+            scorer={
+                "status": "fresh_verified",
+                "supported_bench_versions": [2, 3],
+                "observed_at": int(now.timestamp()),
+                "software_version": "0.29.6",
+                "source_revision": "a" * 40,
+                "probe": {
+                    "outcome": "served",
+                    "observed_at": int(now.timestamp()),
+                    "http_status": 200,
+                    "last_served_at": int(now.timestamp()),
+                },
+            },
+        )
+
+        assert entry.scorer_liveness == "serving"
+        assert entry.health_reasons == []
+        assert entry.health == "healthy"
+
+    def test_a_validator_below_protocol_15_reads_unreported_not_broken(self) -> None:
+        """Forward compatibility: the fleet must not go red during the roll-out."""
+        now = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+        entry = self._entry(
+            protocol_version=14,
+            scorer={
+                "status": "fresh_verified",
+                "supported_bench_versions": [2, 3],
+                "observed_at": int(now.timestamp()),
+                "software_version": "0.29.6",
+                "source_revision": "a" * 40,
+            },
+        )
+
+        assert entry.scorer_liveness == "unreported"
+        assert entry.health_reasons == []
+        assert entry.health != "critical"
+
+    def test_a_v15_validator_that_reports_no_probe_is_still_called_out(self) -> None:
+        """Silence from software that can speak is itself a finding."""
+        now = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+        entry = self._entry(
+            protocol_version=15,
+            scorer={
+                "status": "fresh_verified",
+                "supported_bench_versions": [2, 3],
+                "observed_at": int(now.timestamp()),
+                "software_version": "0.29.6",
+                "source_revision": "a" * 40,
+            },
+        )
+
+        assert entry.scorer_liveness == "unreported"
+        assert entry.health_reasons == ["scorer liveness not reported"]
+        assert entry.health == "warning"
+
+    @pytest.mark.parametrize(
+        ("probe", "expected", "reason"),
+        [
+            pytest.param(
+                {"outcome": "connect_error", "consecutive_failures": 3},
+                "not_serving",
+                "scorer not serving: connect_error (3 in a row)",
+                id="refused",
+            ),
+            pytest.param(
+                {"outcome": "timeout", "consecutive_failures": 1},
+                "not_serving",
+                "scorer not serving: timeout",
+                id="timeout",
+            ),
+            pytest.param(
+                {
+                    "outcome": "http_error",
+                    "http_status": 401,
+                    "consecutive_failures": 1,
+                },
+                "not_serving",
+                "scorer not serving: http 401",
+                id="unauthorized",
+            ),
+            pytest.param(
+                {
+                    "outcome": "unreadable",
+                    "http_status": 200,
+                    "reason": "invalid_json",
+                    "consecutive_failures": 1,
+                },
+                "not_serving",
+                "scorer not serving: invalid_json",
+                id="parse-error",
+            ),
+            pytest.param(
+                {"outcome": "not_probed"},
+                "unreported",
+                "scorer was not probed",
+                id="mock-mode",
+            ),
+        ],
+    )
+    def test_every_failure_mode_names_itself(
+        self, probe: dict, expected: str, reason: str
+    ) -> None:
+        entry = self._entry(
+            protocol_version=15,
+            scorer={
+                "status": "legacy_v2",
+                "supported_bench_versions": [2],
+                "probe": {"observed_at": 1_784_000_000, **probe},
+            },
+        )
+
+        assert entry.scorer_liveness == expected
+        assert entry.health_reasons == [reason]
+
+
 class TestPublicFleet:
     def test_stale_boundaries_and_recovery_after_delayed_heartbeat(self) -> None:
         now = datetime(2026, 7, 14, 20, 0, tzinfo=UTC)
@@ -1364,6 +2198,7 @@ class TestPublicFleet:
                 ),
                 active_benchmark=None,
                 stack_health=_stack(),
+                scorer_reasons=[],
             )
             == []
         )
@@ -1380,11 +2215,20 @@ class TestPublicFleet:
             ),
             active_benchmark=None,
             stack_health=_stack(dittobench_api=_component("degraded")),
+            scorer_reasons=["scorer not serving: http 404"],
         )
-        assert reasons == ["memory 95%", "dittobench_api: degraded"]
+        assert reasons == [
+            "memory 95%",
+            "dittobench_api: degraded",
+            "scorer not serving: http 404",
+        ]
         # No metrics reported explains an otherwise-unknown badge.
         assert public_endpoint._health_reasons(
-            state="idle", metrics=None, active_benchmark=None, stack_health=None
+            state="idle",
+            metrics=None,
+            active_benchmark=None,
+            stack_health=None,
+            scorer_reasons=[],
         ) == ["host metrics not reported"]
 
     async def test_validator_name_response_is_allowlisted_to_reporters(
@@ -1536,6 +2380,7 @@ class TestPublicActivity:
             "name",
             "version",
             "status",
+            "artifact_release",
             "submitted_at",
             "last_scored_at",
             "screening_reason",
@@ -1561,7 +2406,7 @@ class TestPublicActivity:
         serialized = resp.text
         for private_field in (
             "sha256",
-            "artifact",
+            "download_url",
             "payment",
             "SECRET_FROM_BUILD",
         ):
@@ -1631,9 +2476,7 @@ class TestPublicActivity:
         assert entry["version"] == 4
         assert entry["miner_hotkey"] == _MINER_A
         assert entry["status"] == "under_review"
-        assert datetime.fromisoformat(entry["review_opened_at"]) == opened_at.replace(
-            tzinfo=None
-        )
+        assert datetime.fromisoformat(entry["review_opened_at"]) == opened_at
         assert entry["review_reason"] == "Submission requires ATH similarity review"
         assert entry["score_count"] == 3
         assert entry["provisional_composite"] == pytest.approx(0.7)
@@ -1650,13 +2493,66 @@ class TestPublicActivity:
         ):
             assert private_value not in serialized
 
+    async def test_previous_generation_rows_rank_behind_the_current_era(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A stranded backlog must not appear to hold the head of the queue.
+
+        Pre-rollout submissions are served only by the carryover and
+        source-backfill lanes, which issue into an empty current-era queue and
+        nothing else. Ranking them by arrival alone told miners the opposite of
+        the order the fleet actually works in -- the exact report this fixes.
+        """
+        rollout_started = datetime(2026, 7, 18, 14, 30, tzinfo=UTC)
+        stranded_id = await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.EVALUATING,
+            name="stranded-prev-gen",
+            created_at=rollout_started - timedelta(days=3),
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        fresh_id = await _seed_agent(
+            session_maker,
+            miner=_MINER_B,
+            status=AgentStatus.EVALUATING,
+            name="fresh-current-era",
+            created_at=rollout_started + timedelta(days=1),
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                # Live production shape: authority taken, qualification still
+                # settling, so the rollout row is "collecting" not "activated".
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=1,
+                    desired_version=2,
+                    status="collecting",
+                    cohort_size=5,
+                    created_at=rollout_started,
+                )
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/activity")
+        by_id = {entry["agent_id"]: entry for entry in response.json()["entries"]}
+
+        # Older by arrival, last by priority.
+        assert by_id[fresh_id]["validator_queue_rank"] == 1
+        assert by_id[stranded_id]["validator_queue_rank"] == 2
+        assert by_id[stranded_id]["status"] == "waiting_validator"
+
     async def test_exposes_queue_priority_with_provisional_composites(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        await _seed_top_five_floor(session_maker, fifth_place=0.60)
+        await _seed_top_ten_floor(session_maker, tenth_place=0.60)
         zero_id = await _seed_agent(
             session_maker,
             miner=_MINER_A,
@@ -1709,6 +2605,77 @@ class TestPublicActivity:
         assert by_id[one_high_id]["provisional_composite"] == pytest.approx(0.95)
         assert by_id[high_id]["provisional_composite"] == pytest.approx(0.85)
         assert by_id[low_id]["provisional_composite"] == pytest.approx(0.25)
+
+    async def test_contender_lane_gives_one_slot_per_coldkey_not_per_hotkey(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The preview must group contenders the way the allocator does.
+
+        ``issue_ticket``'s contender lane partitions on the payment-time coldkey
+        (``emission_owner_key``), so one coldkey funding two hotkeys occupies a
+        single contender slot. Grouping the preview by hotkey handed that owner
+        two slots and pushed every miner below it one rank too deep.
+        """
+        shared_coldkey = "5SharedColdkeyFundingTwoHotkeys"
+        best_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.90],
+            status=AgentStatus.EVALUATING,
+        )
+        sibling_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.89],
+            status=AgentStatus.EVALUATING,
+        )
+        unscored_id = await _seed_agent(
+            session_maker,
+            miner=_VALIDATOR_C,
+            status=AgentStatus.EVALUATING,
+            name="unscored",
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=best_id,
+            miner_hotkey=_MINER_A,
+            miner_coldkey=shared_coldkey,
+            index=1,
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=sibling_id,
+            miner_hotkey=_MINER_B,
+            miner_coldkey=shared_coldkey,
+            index=2,
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=unscored_id,
+            miner_hotkey=_VALIDATOR_C,
+            miner_coldkey="5IndependentColdkey",
+            index=3,
+        )
+        async with session_maker() as session, session.begin():
+            for agent_id in (best_id, sibling_id):
+                agent = await session.get(Agent, UUID(agent_id))
+                assert agent is not None
+                agent.screening_policy_version = SCREENING_POLICY_VERSION
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/activity")
+        by_id = {entry["agent_id"]: entry for entry in response.json()["entries"]}
+
+        # Only the owner's best submission takes a contender slot. Its sibling
+        # drops to the ordinary queue, where the untouched submission's coverage
+        # priority (zero scores) puts it ahead.
+        assert by_id[best_id]["validator_queue_rank"] == 1
+        assert by_id[unscored_id]["validator_queue_rank"] == 2
+        assert by_id[sibling_id]["validator_queue_rank"] == 3
 
     async def test_filters_complete_dataset_before_paginating_with_counts(
         self,
@@ -2056,7 +3023,7 @@ class TestPublicActivity:
                         policy_version=SCREENING_POLICY_VERSION,
                         manifest_digest="ab" * 32,
                         finding_digest=private_finding.canonical_digest(),
-                        reason_code="suspicious_source",
+                        reason_code="suspicious-source",
                         evidence=[
                             {
                                 "module_id": "agentic-source-review",
@@ -2121,7 +3088,7 @@ class TestPublicActivity:
                         screener_hotkey=_MINER_B,
                         policy_version=SCREENING_POLICY_VERSION,
                         manifest_digest="ab" * 32,
-                        reason_code="suspicious_source",
+                        reason_code="suspicious-source",
                         status="resolved",
                         resolved_at=now,
                         resolved_by="admin@example.com",
@@ -2140,9 +3107,7 @@ class TestPublicActivity:
         attempt = response.json()["screening_attempts"][0]
         assert attempt["status"] == "quarantined"
         assert attempt["quarantine_resolution"] == "release"
-        assert datetime.fromisoformat(attempt["quarantine_resolved_at"]) == now.replace(
-            tzinfo=None
-        )
+        assert datetime.fromisoformat(attempt["quarantine_resolved_at"]) == now
         assert attempt["quarantine_resolution_reason"] == (
             "Manual review found no prohibited behavior"
         )
@@ -2207,7 +3172,7 @@ class TestPublicActivity:
                         policy_version=SCREENING_POLICY_VERSION,
                         manifest_digest="ab" * 32,
                         finding_digest=finding.canonical_digest(),
-                        reason_code="suspicious_source",
+                        reason_code="suspicious-source",
                         evidence=[
                             {
                                 "module_id": "agentic-source-review",
@@ -2348,7 +3313,7 @@ class TestPublicActivity:
                                 "score": composite,
                                 "correct": False,
                                 "latency_ms": 500,
-                                "notes": ["answer did not match"],
+                                "notes": ["no deterministic value match"],
                                 "expected": "private answer key",
                                 "called": ["private tool trace"],
                                 "case_id": f"private-{index}",
@@ -2391,7 +3356,7 @@ class TestPublicActivity:
             assert case["kind"] == "memory"
             assert case["correct"] is False
             assert case["latency_ms"] == 500
-            assert case["notes"] == ["answer did not match"]
+            assert case["notes"] == ["no deterministic value match"]
         for leaked in (
             '"expected"',
             '"called"',
@@ -2537,16 +3502,11 @@ class TestPublicActivity:
         assert [work["bench_version"] for work in activity["active_benchmarks"]] == [3]
 
         operations = (await client.get("/api/v1/public/operations")).json()
-        operations_entry = next(
-            entry
-            for entry in operations["activity"]["entries"]
-            if entry["agent_id"] == str(agent_id)
-        )
         assert operations["active_bench_version"] == 4
-        assert operations_entry["status"] == "not_queued"
-        assert operations_entry["score_count"] == 1
-        assert operations_entry["provisional_composite"] == pytest.approx(0.391897)
-        assert operations_entry["validator_queue_rank"] is None
+        assert not any(
+            entry["agent_id"] == str(agent_id)
+            for entry in operations["activity"]["entries"]
+        )
         assert operations["activity"]["status_counts"]["not_queued"] == 1
 
         pipeline = (
@@ -2651,9 +3611,14 @@ class TestPublicActivity:
             datetime.fromisoformat(by_id[str(cooling_id)]["retry_after"])
             == cooldown_until
         )
-        # Rejected (not EVALUATING): no retry_state, despite exhausted tickets.
-        assert by_id[str(rejected_id)]["retry_state"] is None
-        assert by_id[str(rejected_id)]["retry_after"] is None
+        # Rejected history is intentionally omitted from the live board snapshot;
+        # the complete Activity feed still exposes it without a retry label.
+        assert str(rejected_id) not in by_id
+        rejected = (
+            await client.get("/api/v1/public/activity", params={"q": str(rejected_id)})
+        ).json()["entries"][0]
+        assert rejected["retry_state"] is None
+        assert rejected["retry_after"] is None
 
     async def test_progress_is_multi_validator_allowlisted_and_recursively_redacted(
         self,
@@ -2740,7 +3705,7 @@ class TestPublicActivity:
         first = next(
             progress for progress in shown if progress["completed_checks"] == 51
         )
-        assert first["percent"] == 45
+        assert first["percent"] == 44  # 51/114 exactly, no 5% bucket.
         assert first["bench_version"] == 2
         assert first["total_checks"] == 114
         assert datetime.fromisoformat(first["started_at"].replace("Z", "+00:00")) == (
@@ -2749,7 +3714,7 @@ class TestPublicActivity:
         threshold = next(
             progress for progress in shown if progress["completed_checks"] == 3
         )
-        assert threshold["percent"] == 40  # 3/8 = 37.5%, rounded half-up.
+        assert threshold["percent"] == 37  # 3/8 = 37.5%, truncated, not bucketed.
         activity = responses[1].json()["entries"][0]
         assert len(activity["active_benchmarks"]) == 2
         pipeline = responses[2].json()
@@ -2794,6 +3759,127 @@ class TestPublicActivity:
 
         for response in responses:
             assert_redacted(response.json())
+
+    async def test_per_case_notes_are_a_closed_vocabulary_not_scorer_free_text(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The Go scorers interpolate DATASET content into several per-case notes:
+        # the memory grader embeds the distractor value it matched, and the
+        # trajectory scorer embeds required/forbidden argument names. Those notes
+        # must not reach an unauthenticated, CDN-cached response — least of all
+        # `provisional_scores`, which is served BEFORE the /agent/{id}/dataset
+        # reveal gate that holds answer keys until a run is finalized.
+        distractor = "DISTRACTOR_CANARY_DO_NOT_PUBLISH"
+        arg_key = "ARGKEY_CANARY_DO_NOT_PUBLISH"
+        forbidden_arg = "FORBIDDENARG_CANARY_DO_NOT_PUBLISH"
+        misrouted_tool = "TOOLNAME_CANARY_DO_NOT_PUBLISH"
+        future_note = "EXPECTED_ANSWER_CANARY_DO_NOT_PUBLISH"
+        rogue_kind = "canary_leak"
+        sentinels = (
+            distractor,
+            arg_key,
+            forbidden_arg,
+            misrouted_tool,
+            future_note,
+            rogue_kind,
+        )
+        planted_notes = [
+            # Mechanical notes that must SURVIVE, verbatim.
+            "deterministic value match",
+            "1 extra/unexpected tool call(s)",
+            "capped: observable case not executed via tool_endpoint "
+            "(self-report untrusted)",
+            "judged correct=false grounded=true",
+            # Value-bearing notes: the verdict survives, the value must not.
+            f'surfaced a wrong same-attribute value "{distractor}" (scored 0)',
+            f"wrong value for arg {arg_key}",
+            f"forbidden arg present: {forbidden_arg}",
+            f"misrouted a memory request to a non-memory tool: {misrouted_tool}",
+            # A note a future scorer might add, and a rogue AnswerKind smuggled
+            # through an otherwise-known template: both dropped by default.
+            f"expected answer was {future_note}",
+            f"deterministic {rogue_kind} match",
+        ]
+        details = {
+            "bench_version": 2,
+            "per_case": [
+                {
+                    "kind": "memory",
+                    "category": "temporal_reasoning",
+                    "score": 0.5,
+                    "correct": False,
+                    "latency_ms": 500,
+                    "notes": planted_notes,
+                }
+            ],
+        }
+
+        # Finalized (k=3) — reaches /leaderboard and /agent/{id}/scores.
+        finalized_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+            details=details,
+        )
+        # Provisional (accepted, pre-quorum) — reaches /pipeline provisional_scores.
+        provisional_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_B,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        async with session_maker() as session, session.begin():
+            await upsert_score(
+                session,
+                agent_id=provisional_id,
+                validator_hotkey=_VALIDATOR_C,
+                run_id="provisional-notes",
+                seed=42,
+                composite=0.5,
+                tool_mean=0.5,
+                memory_mean=0.5,
+                median_ms=500,
+                n=114,
+                generated_at=datetime.now(UTC),
+                signature="ab" * 64,
+                details=details,
+            )
+        _install_db(app, session_maker)
+
+        responses = [
+            await client.get("/api/v1/public/leaderboard"),
+            await client.get("/api/v1/public/activity"),
+            await client.get(f"/api/v1/public/agent/{provisional_id}/pipeline"),
+            await client.get(f"/api/v1/public/agent/{finalized_id}/scores"),
+        ]
+        assert all(response.status_code == 200 for response in responses)
+        # No planted dataset value appears anywhere, on any endpoint.
+        for response in responses:
+            for sentinel in sentinels:
+                assert sentinel not in response.text
+
+        published = (
+            await client.get(f"/api/v1/public/agent/{provisional_id}/pipeline")
+        ).json()["provisional_scores"][0]["case_results"][0]["notes"]
+        assert published == [
+            "deterministic value match",
+            "1 extra/unexpected tool call(s)",
+            "capped: observable case not executed via tool_endpoint "
+            "(self-report untrusted)",
+            "judged correct=false grounded=true",
+            # The verdicts are kept; the values they were rendered around are gone.
+            "surfaced a wrong same-attribute value (scored 0)",
+            "wrong value for a required arg",
+            "forbidden arg present",
+            "misrouted a memory request to a non-memory tool",
+        ]
+        # The finalized projection publishes exactly the same closed vocabulary.
+        assert responses[3].json()["scores"][0]["case_results"][0]["notes"] == published
 
     async def test_live_work_marks_only_its_own_bench_version_attempt(
         self,
@@ -3590,6 +4676,466 @@ class TestPublicSubmissionScores:
         assert body["submissions"] == []
 
 
+async def _set_score_created_times(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    agent_id: str,
+    created_at: list[datetime],
+) -> None:
+    async with maker() as session, session.begin():
+        scores = list(
+            (
+                await session.execute(
+                    select(Score)
+                    .where(Score.agent_id == UUID(agent_id))
+                    .order_by(Score.bench_version, Score.validator_hotkey)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(scores) == len(created_at)
+        for score, recorded_at in zip(scores, created_at, strict=True):
+            score.created_at = recorded_at
+
+
+_UNSET = object()
+
+
+async def _crown(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    agent_id: str,
+    first_crowned_at: datetime,
+    weight_confirmed_at: datetime | None | object = _UNSET,
+) -> None:
+    """Mark an agent as having held the KOTH crown.
+
+    By default the on-chain weight confirmation is stamped at the same instant
+    (a fully armed king). Pass ``weight_confirmed_at=None`` for an ever-king that
+    has not yet been confirmed on-chain, so its window has not started.
+    """
+    confirmed = (
+        first_crowned_at if weight_confirmed_at is _UNSET else weight_confirmed_at
+    )
+    async with maker() as session, session.begin():
+        session.add(
+            AgentKingship(
+                agent_id=UUID(agent_id),
+                first_crowned_at=first_crowned_at,
+                weight_confirmed_at=confirmed,
+            )
+        )
+
+
+class TestPublicArtifactRelease:
+    async def test_default_releases_the_king_source_after_the_48h_reign_window(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        first_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        second_id = await _seed_k3(
+            session_maker, miner=_MINER_B, composites=[0.7, 0.8, 0.9]
+        )
+        for agent_id in (first_id, second_id):
+            await _set_score_created_times(
+                session_maker,
+                agent_id=agent_id,
+                created_at=[
+                    now - timedelta(hours=50),
+                    now - timedelta(hours=49),
+                    now - timedelta(hours=48, minutes=1),
+                ],
+            )
+            # Both agents have held the crown for longer than the 48h window.
+            await _crown(
+                session_maker,
+                agent_id=agent_id,
+                first_crowned_at=now - timedelta(hours=48, minutes=1),
+            )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+        storage.presigned_get_url.side_effect = lambda **kwargs: (
+            f"https://objects.example/{kwargs['key']}"
+        )
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        submissions = (await client.get("/api/v1/public/submissions")).json()
+        releases = {
+            entry["agent_id"]: entry["artifact_release"]
+            for entry in submissions["submissions"]
+        }
+        assert set(releases) == {first_id, second_id}
+        assert all(release["status"] == "available" for release in releases.values())
+        assert all(release["embargo_hours"] == 48 for release in releases.values())
+        assert all(
+            release["download_available"] is True for release in releases.values()
+        )
+
+        for agent_id in (first_id, second_id):
+            response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+            assert response.status_code == 200
+            assert response.headers["Cache-Control"] == "private, no-store"
+            body = response.json()
+            assert body["agent_id"] == agent_id
+            assert body["bench_version"] == 2
+            assert body["sha256"] == "ab" * 32
+            assert body["download_url"].endswith(f"{agent_id}/agent.tar.gz")
+
+        assert {
+            call.kwargs["key"] for call in storage.presigned_get_url.await_args_list
+        } == {
+            f"{first_id}/agent.tar.gz",
+            f"{second_id}/agent.tar.gz",
+        }
+        assert all(
+            call.kwargs["expires_in"] == 300
+            for call in storage.presigned_get_url.await_args_list
+        )
+        assert {
+            call.kwargs["attachment_filename"]
+            for call in storage.presigned_get_url.await_args_list
+        } == {
+            f"ditto-agent-{first_id}.tar.gz",
+            f"ditto-agent-{second_id}.tar.gz",
+        }
+
+    async def test_fourth_score_does_not_restart_the_quorum_embargo(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6, 0.7],
+        )
+        await _set_score_created_times(
+            session_maker,
+            agent_id=agent_id,
+            created_at=[
+                now - timedelta(hours=27),
+                now - timedelta(hours=26),
+                now - timedelta(hours=25),
+                now - timedelta(minutes=5),
+            ],
+        )
+        await _crown(
+            session_maker,
+            agent_id=agent_id,
+            first_crowned_at=now - timedelta(hours=49),
+        )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+        storage.presigned_get_url.return_value = "https://objects.example/source"
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+        assert response.status_code == 200
+
+    async def test_shortened_setting_releases_existing_quorums_retroactively(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        await _set_score_created_times(
+            session_maker,
+            agent_id=agent_id,
+            created_at=[
+                now - timedelta(hours=8),
+                now - timedelta(hours=7),
+                now - timedelta(hours=6, minutes=1),
+            ],
+        )
+        # King since just over the shortened 6-hour window ago.
+        await _crown(
+            session_maker,
+            agent_id=agent_id,
+            first_crowned_at=now - timedelta(hours=6, minutes=1),
+        )
+        async with session_maker() as session, session.begin():
+            # The migration chain seeds the operative default, so a new
+            # revision must chain onto the current head -- parent_revision is
+            # UNIQUE and the table is never empty in production.
+            head = await session.scalar(
+                select(func.max(ArtifactReleaseSettingsRevision.revision))
+            )
+            session.add(
+                ArtifactReleaseSettingsRevision(
+                    parent_revision=head or 0,
+                    embargo_hours=6,
+                    reason="Complete the staged privacy rollout",
+                    actor="operator@example.com",
+                )
+            )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+        storage.presigned_get_url.return_value = "https://objects.example/source"
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+        assert response.status_code == 200
+        submission = (await client.get("/api/v1/public/submissions")).json()[
+            "submissions"
+        ][0]
+        assert submission["artifact_release"]["embargo_hours"] == 6
+        assert submission["artifact_release"]["status"] == "available"
+
+    async def test_embargo_and_review_hold_fail_closed(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        embargoed_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        held_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.9, 0.9, 0.9],
+            status=AgentStatus.ATH_PENDING_REVIEW,
+        )
+        await _set_score_created_times(
+            session_maker,
+            agent_id=embargoed_id,
+            created_at=[
+                now - timedelta(hours=3),
+                now - timedelta(hours=2),
+                now - timedelta(hours=1),
+            ],
+        )
+        # King only an hour ago, so still inside the 48h window: embargoed.
+        await _crown(
+            session_maker,
+            agent_id=embargoed_id,
+            first_crowned_at=now - timedelta(hours=1),
+        )
+        await _set_score_created_times(
+            session_maker,
+            agent_id=held_id,
+            created_at=[
+                now - timedelta(hours=10),
+                now - timedelta(hours=9),
+                now - timedelta(hours=8),
+            ],
+        )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        embargoed = await client.get(f"/api/v1/public/agent/{embargoed_id}/artifact")
+        assert embargoed.status_code == 425
+        assert "embargoed until" in embargoed.json()["message"]
+        held = await client.get(f"/api/v1/public/agent/{held_id}/artifact")
+        assert held.status_code == 404
+        storage.presigned_get_url.assert_not_awaited()
+
+        entries = (await client.get("/api/v1/public/activity")).json()["entries"]
+        held_entry = next(entry for entry in entries if entry["agent_id"] == held_id)
+        assert held_entry["artifact_release"]["status"] == "under_review"
+        assert held_entry["artifact_release"]["download_available"] is False
+
+    async def test_scores_from_different_versions_do_not_form_a_quorum(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5],
+            status=AgentStatus.SCORED,
+            details={"bench_version": 2},
+        )
+        async with session_maker() as session, session.begin():
+            await upsert_score(
+                session,
+                agent_id=UUID(agent_id),
+                validator_hotkey=_VALIDATOR_C,
+                bench_version=3,
+                run_id="run-v3",
+                seed=1,
+                composite=0.6,
+                tool_mean=0.6,
+                memory_mean=0.6,
+                median_ms=500,
+                n=110,
+                generated_at=datetime.now(UTC) - timedelta(hours=10),
+                details={"bench_version": 3},
+            )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        submissions = (await client.get("/api/v1/public/submissions")).json()
+        assert submissions["submissions"][0]["artifact_release"]["status"] == (
+            "awaiting_quorum"
+        )
+        # Never held the crown, so the source is king-only private (404), not a
+        # timed embargo (425).
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+        assert response.status_code == 404
+        storage.presigned_get_url.assert_not_awaited()
+
+    async def test_only_the_king_source_is_released(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        # A finalized submission that has never held the crown.
+        commoner_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        # A submission that briefly reigned 49h ago and has since lost the crown.
+        former_king_id = await _seed_k3(
+            session_maker, miner=_MINER_B, composites=[0.7, 0.8, 0.9]
+        )
+        await _crown(
+            session_maker,
+            agent_id=former_king_id,
+            first_crowned_at=now - timedelta(hours=49),
+        )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+        storage.presigned_get_url.return_value = "https://objects.example/source"
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        releases = {
+            entry["agent_id"]: entry["artifact_release"]
+            for entry in (await client.get("/api/v1/public/submissions")).json()[
+                "submissions"
+            ]
+        }
+        # The commoner's source is never released, even though it finalized 3/3.
+        assert releases[commoner_id]["status"] == "unavailable"
+        assert releases[commoner_id]["download_available"] is False
+        assert releases[commoner_id]["crowned_at"] is None
+        # The former king's brief reign still releases its source one window on.
+        assert releases[former_king_id]["status"] == "available"
+        assert releases[former_king_id]["download_available"] is True
+        assert releases[former_king_id]["crowned_at"] is not None
+
+        commoner = await client.get(f"/api/v1/public/agent/{commoner_id}/artifact")
+        assert commoner.status_code == 404
+        king = await client.get(f"/api/v1/public/agent/{former_king_id}/artifact")
+        assert king.status_code == 200
+        storage.presigned_get_url.assert_awaited_once()
+
+    async def test_king_source_is_embargoed_until_the_window_elapses(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.7, 0.8, 0.9]
+        )
+        # Crowned only an hour ago: still inside the default 48h window.
+        await _crown(
+            session_maker,
+            agent_id=agent_id,
+            first_crowned_at=now - timedelta(hours=1),
+        )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        release = (await client.get("/api/v1/public/submissions")).json()[
+            "submissions"
+        ][0]["artifact_release"]
+        assert release["status"] == "embargoed"
+        assert release["download_available"] is False
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+        assert response.status_code == 425
+        assert "embargoed until" in response.json()["message"]
+        storage.presigned_get_url.assert_not_awaited()
+
+    async def test_ever_king_awaiting_onchain_weight_stays_embargoed(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.7, 0.8, 0.9]
+        )
+        # Touched the crown 49h ago, but the chain has not yet confirmed weights
+        # were set on it: the window has NOT started, even though 48h elapsed.
+        await _crown(
+            session_maker,
+            agent_id=agent_id,
+            first_crowned_at=now - timedelta(hours=49),
+            weight_confirmed_at=None,
+        )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        release = (await client.get("/api/v1/public/submissions")).json()[
+            "submissions"
+        ][0]["artifact_release"]
+        assert release["status"] == "embargoed"
+        assert release["download_available"] is False
+        assert release["available_at"] is None
+        assert release["crowned_at"] is not None
+        assert release["weight_confirmed_at"] is None
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+        assert response.status_code == 425
+        assert "on-chain" in response.json()["message"]
+        storage.presigned_get_url.assert_not_awaited()
+
+
 async def _seed_audit(maker: async_sessionmaker[AsyncSession], *, n: int) -> None:
     """Append ``n`` chained score entries to the audit log."""
     async with maker() as s, s.begin():
@@ -4143,3 +5689,205 @@ def test_bench_glossary_explains_every_v5_category_and_metric() -> None:
         "token_efficiency",
     ):
         assert key in metrics, f"undocumented metric: {key}"
+
+
+class TestBenchmarkStallDetection:
+    """``_benchmark_stalled`` must separate a stuck run from a stuck stream.
+
+    The operator complaint this answers is "I cannot tell whether the bench is
+    wedged or the reporting is". Those are two different faults with two
+    different owners, and they are computed from two different signals:
+    ``stalled`` reads the run's own reported progress against elapsed time, while
+    liveness (``online`` / ``heartbeat_stale``) reads ``seen_at``. A run that is
+    frozen but reporting must read stalled-and-online; a validator that has gone
+    quiet must not be reported as a stalled run.
+    """
+
+    _START = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+
+    def test_an_early_stage_stalls_on_wall_clock_alone(self) -> None:
+        """Pre-run stages have no count to judge, so the clock is all there is."""
+        assert not public_endpoint._benchmark_stalled(
+            "generating_dataset", self._START, self._START + timedelta(minutes=14)
+        )
+        assert public_endpoint._benchmark_stalled(
+            "generating_dataset", self._START, self._START + timedelta(minutes=16)
+        )
+
+    def test_a_healthy_running_benchmark_is_never_called_stalled(self) -> None:
+        """A v7 run near its real ~4s/check pace must stay clean throughout.
+
+        This is the regression that matters most: mislabelling a working run as
+        stuck is worse than the missing signal it replaces, because it trains the
+        operator to ignore the badge.
+        """
+        for completed in range(0, 282, 7):
+            elapsed = timedelta(seconds=4 * completed)
+            assert not public_endpoint._benchmark_stalled(
+                "running_benchmark",
+                self._START,
+                self._START + elapsed,
+                completed=completed,
+            )
+
+    def test_a_frozen_running_benchmark_is_flagged(self) -> None:
+        """A count stuck at 3/281 cannot explain three quarters of an hour."""
+        assert public_endpoint._benchmark_stalled(
+            "running_benchmark",
+            self._START,
+            self._START + timedelta(minutes=45),
+            completed=3,
+        )
+
+    def test_the_startup_grace_covers_a_slow_first_check(self) -> None:
+        """Zero completed checks is normal for a while; it is not yet a stall."""
+        assert not public_endpoint._benchmark_stalled(
+            "running_benchmark",
+            self._START,
+            self._START + timedelta(minutes=14),
+            completed=0,
+        )
+        assert public_endpoint._benchmark_stalled(
+            "running_benchmark",
+            self._START,
+            self._START + timedelta(minutes=16),
+            completed=0,
+        )
+
+    def test_an_unreported_count_does_not_invent_a_stall(self) -> None:
+        """Missing telemetry is not evidence of a wedged run.
+
+        A validator that reports the stage but omits counts (an older protocol, or
+        a poll that degraded to unknown) must fall back to the plain grace window
+        rather than being treated as frozen at zero.
+        """
+        for elapsed in (timedelta(minutes=14), timedelta(hours=1), timedelta(hours=9)):
+            assert not public_endpoint._benchmark_stalled(
+                "running_benchmark",
+                self._START,
+                self._START + elapsed,
+                completed=None,
+            )
+
+    def test_a_terminal_stage_is_never_stalled(self) -> None:
+        """Finalizing and submitting are bounded by the validator, not by us."""
+        for stage in ("finalizing", "submitting_result", "failed_retrying"):
+            assert not public_endpoint._benchmark_stalled(
+                stage,  # type: ignore[arg-type]
+                self._START,
+                self._START + timedelta(hours=6),
+                completed=281,
+            )
+
+    def test_stall_is_independent_of_reporting_liveness(self) -> None:
+        """The two signals are orthogonal, and must be computed independently.
+
+        ``_benchmark_stalled`` is a pure function of the run's own progress and
+        never consults ``seen_at``; a stalled run therefore still reads online so
+        long as it keeps heartbeating. Asserting both here pins the separation
+        that makes the badge trustworthy.
+        """
+        now = self._START + timedelta(minutes=45)
+        assert public_endpoint._benchmark_stalled(
+            "running_benchmark", self._START, now, completed=3
+        )
+        online, _availability, _health = _fleet_classification(
+            state="running_benchmark", seen_at=now, now=now, metrics=None
+        )
+        assert online is True
+
+
+class TestPublicProgressResolution:
+    """``percent`` is exact, and the allowlist it lives in stays closed.
+
+    The 5% quantizer was removed because it withheld nothing: ``completed_checks``
+    and ``total_checks`` are published exactly on the same model, so the ratio was
+    always derivable. These tests pin both halves of that argument — the
+    resolution is now exact, *and* nothing per-case rode in alongside it.
+    """
+
+    @staticmethod
+    def _progress(
+        stage: str, completed: int | None, total: int | None
+    ) -> PublicBenchmarkProgress:
+        now = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+        work = SimpleNamespace(
+            agent=SimpleNamespace(agent_id=uuid4(), name="lihai"),
+            ticket=SimpleNamespace(slot_id="slot-0", bench_version=7, issued_at=now),
+            progress=SimpleNamespace(stage=stage, completed=completed, total=total),
+        )
+        return public_endpoint._public_benchmark_progress(work, now)  # type: ignore[arg-type]
+
+    def test_percent_is_exact_not_bucketed(self) -> None:
+        """Consecutive checks now move the bar; they used to be invisible.
+
+        On a 281-check v7 run a 5% bucket was ~14 checks, so fourteen consecutive
+        completions rendered as no change at all. That is the "is it stuck?"
+        feeling the operations page was producing.
+        """
+        assert self._progress("running_benchmark", 53, 281).percent == 18
+        assert self._progress("running_benchmark", 54, 281).percent == 19
+        assert self._progress("running_benchmark", 140, 281).percent == 49
+
+    def test_a_full_bar_means_finished(self) -> None:
+        """281/281 is held at 99% until the run leaves the scoring stages."""
+        assert self._progress("running_benchmark", 281, 281).percent == 99
+        assert self._progress("finalizing", 281, 281).percent == 100
+        assert self._progress("submitting_result", 281, 281).percent == 100
+
+    def test_counts_and_percent_agree(self) -> None:
+        """The published percent must be reproducible from the published counts."""
+        rendered = self._progress("running_benchmark", 53, 281)
+        assert rendered.completed_checks == 53
+        assert rendered.total_checks == 281
+        assert rendered.percent == rendered.completed_checks * 100 // (
+            rendered.total_checks
+        )
+
+    def test_an_unreported_count_publishes_no_percent(self) -> None:
+        assert self._progress("preparing", None, None).percent is None
+
+    def test_no_per_case_field_rides_along(self) -> None:
+        """The in-flight allowlist stays closed.
+
+        Per-case identity, question text, verdicts, seeds and timings are all
+        excluded from live progress by construction. This is not stylistic: the
+        dataset seed is drawn after screening and published only post-hoc
+        (anti-overfit), and the run's canary case is identifiable from its
+        category alone, so a live per-case feed would defeat both. Any new field
+        here must be argued on that basis first.
+        """
+        rendered = self._progress("running_benchmark", 53, 281)
+        published = rendered.model_dump(mode="json")
+        assert set(published) == {
+            "agent_id",
+            "slot_id",
+            "agent_name",
+            "bench_version",
+            "started_at",
+            "stage",
+            "completed_checks",
+            "total_checks",
+            "percent",
+            "stalled",
+        }
+        forbidden = {
+            "case_id",
+            "case_category",
+            "category",
+            "prompt",
+            "question",
+            "expected",
+            "called",
+            "canary",
+            "seed",
+            "dataset_sha256",
+            "per_case",
+            "partial",
+            "verdict",
+            "correct",
+            "notes",
+            "latency_ms",
+            "run_token",
+        }
+        assert forbidden.isdisjoint(published)

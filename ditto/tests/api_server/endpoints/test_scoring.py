@@ -1,6 +1,6 @@
 """Unit tests for :mod:`ditto.api_server.endpoints.scoring`.
 
-Exercises ``GET /scoring/scores`` against in-memory SQLite with the chain
+Exercises ``GET /scoring/scores`` against a real Postgres with the chain
 permit-check mocked. The ledger read + ordering is covered at the query level in
 ``tests/db/queries/test_scores.py``; here we assert the endpoint's auth gate and
 wire shape.
@@ -17,13 +17,10 @@ import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 import ditto.api_server.endpoints.scoring as scoring_mod
@@ -31,7 +28,7 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.dependencies import get_chain_client, get_session
 from ditto.api_server.middleware.error_envelope import ERROR_CODE_VALIDATOR_AUTH
 from ditto.chain.models import NeuronInfo
-from ditto.db.models import Agent, Base
+from ditto.db.models import Agent, ValidatorHeartbeat
 from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
@@ -43,6 +40,27 @@ _VALIDATOR_HOTKEY = _KEYPAIR.ss58_address
 _MINER = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 _AUTH_HEADER = {"X-Validator-Hotkey": _VALIDATOR_HOTKEY}
+
+
+def _scorer_capabilities(now: datetime, *, versions: list[int]) -> dict:
+    return {
+        "screened_images": True,
+        "require_screened_image": True,
+        "source_build_fallback": False,
+        "full_stack_managed": True,
+        "stack_updater": True,
+        "sandbox_egress_restricted": True,
+        "ticket_inference": False,
+        "signed_score_quorum": False,
+        "executor_isolation": "ephemeral_vm",
+        "scorer_benchmarks": {
+            "status": "fresh_verified",
+            "supported_bench_versions": versions,
+            "observed_at": int(now.timestamp()),
+            "software_version": "1.0.0",
+            "source_revision": "a" * 40,
+        },
+    }
 
 
 def _ledger_headers(
@@ -61,29 +79,6 @@ def _ledger_headers(
         "X-Validator-Ledger-Requested-At": requested_at.isoformat(),
         "X-Validator-Ledger-Signature": signing_keypair.sign(signed).hex(),
     }
-
-
-@pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield eng
-    finally:
-        await eng.dispose()
-
-
-@pytest.fixture
-def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 def _install_db(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
@@ -180,6 +175,8 @@ class TestScoringLedger:
         assert body["entries"][0]["composite"] == pytest.approx(0.9)
         assert body["entries"][0]["signature"] == "ab" * 64
         assert body["entries"][0]["bench_version"] == 2
+        # No fleet capability evidence means the additive contract fails closed.
+        assert body["entries"][0]["continual_aggregate_method"] is None
         assert body["entries"][0]["score_proofs"] == [
             {
                 "validator_hotkey": _VALIDATOR_HOTKEY,
@@ -197,6 +194,65 @@ class TestScoringLedger:
         # a real full run.
         assert body["entries"][0]["n"] == 20
         assert len(body["entries"][0]["score_proofs"]) == 1
+
+    async def test_continual_mean_activates_globally_only_for_protocol_14_fleet(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _seed_scored(session_maker, miner=_MINER, composite=0.9)
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add_all(
+                [
+                    ValidatorHeartbeat(
+                        validator_hotkey=_VALIDATOR_HOTKEY,
+                        software_version="0.28.0",
+                        protocol_version=14,
+                        code_digest="ab" * 32,
+                        state="idle",
+                        reported_at=now,
+                        seen_at=now,
+                        signature="cd" * 64,
+                        capabilities=_scorer_capabilities(now, versions=[2]),
+                    ),
+                    ValidatorHeartbeat(
+                        validator_hotkey=_MINER_B,
+                        software_version="0.27.0",
+                        protocol_version=13,
+                        code_digest="ef" * 32,
+                        state="idle",
+                        reported_at=now,
+                        seen_at=now,
+                        signature="12" * 64,
+                        capabilities=_scorer_capabilities(now, versions=[2]),
+                    ),
+                ]
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        mixed = await client.get("/api/v1/scoring/scores", headers=_ledger_headers())
+        assert mixed.status_code == 200
+        mixed_entry = mixed.json()["entries"][0]
+        assert mixed_entry["continual_aggregate_method"] is None
+        assert mixed_entry["confirmation_composites"] is None
+        assert mixed_entry["confirmation_seeds"] is None
+        assert mixed_entry["confirmation_history"] is None
+
+        async with session_maker() as session, session.begin():
+            legacy = await session.get(ValidatorHeartbeat, _MINER_B)
+            assert legacy is not None
+            legacy.protocol_version = 14
+            legacy.software_version = "0.28.0"
+
+        ready = await client.get("/api/v1/scoring/scores", headers=_ledger_headers())
+        assert ready.status_code == 200
+        assert (
+            ready.json()["entries"][0]["continual_aggregate_method"]
+            == "mean_after_quorum"
+        )
 
     async def test_empty_ledger(
         self,
@@ -527,6 +583,20 @@ class TestScoringLedgerConfirmationHistory:
 
         aid = uuid4()
         async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_HOTKEY,
+                    software_version="0.28.0",
+                    protocol_version=14,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                    capabilities=_scorer_capabilities(now, versions=[2]),
+                )
+            )
             s.add(
                 Agent(
                     agent_id=aid,

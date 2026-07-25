@@ -53,6 +53,60 @@ are never silently reshuffled. At least one fresh, identity-matched validator
 must advertise the selected target before it can start; additional compatible
 validators can join asynchronously.
 
+## Operator-configurable rescore cohort size
+
+How many inherited agents a transition re-scores is subnet policy, not a
+constant. It defaults to the historical **ten** and an operator may set it
+anywhere in `[5, 25]` from backroom as the subnet scales, with no redeploy:
+
+```text
+GET  /api/v1/admin/queue-policy-settings
+POST /api/v1/admin/queue-policy-settings
+```
+
+The POST is an append-only revision carrying the complete policy, an
+`expected_revision` compare-and-swap, an actor + reason, and the exact typed
+confirmation `APPLY BENCHMARK ROLLOUT SETTINGS`. The table
+(`queue_policy_settings_revisions`) is never updated or deleted, so every
+change is recoverable history. Unlike rollout *activation*, this control **is**
+exposed over MCP — it is policy for a future transition, not an action on a live
+one.
+
+Three properties make the semantics unsurprising:
+
+* **Bounds, enforced at every layer.** `5 <= rescore_cohort_size <= 25` in the
+  backroom tool schema, the request model, `historical_rescore_cohort`,
+  `create_rollout_snapshot`, and a `CHECK` constraint. Five is
+  `PRIORITY_COHORT_SIZE`, the KOTH emission set, below which the authority
+  switch could not be satisfied. Twenty-five is the persisted storage ceiling
+  (`benchmark_rollout_bounded_members`). Out-of-range input is refused; nothing
+  is clamped.
+* **The value is frozen at START, not read continuously.** A rollout records the
+  policy in force when it was started as `benchmark_rollouts.rescore_cohort_target`
+  and every downstream consumer — the qualification backfill, the blocker
+  report, quarantine impact analysis — reads *that* column, never the live
+  setting. So raising the policy from ten to twenty-five **while a rollout is
+  open does nothing to that rollout**: it keeps filling to ten, and the new
+  value applies to the next transition. Membership being append-only would make
+  growing an in-flight cohort safe, but not predictable — it would silently move
+  the completion bar that gates the authority switch under validators already
+  scoring the cohort. `GET /admin/queue-policy-settings` reports the open
+  rollout's frozen target beside the configured one so the difference is visible
+  rather than inferred.
+* **Historical rollouts stay explainable.** The frozen target is on the rollout
+  row *and* in the immutable `cohort_frozen` audit payload, so "why did the v6→v7
+  transition rescore twelve agents?" is answerable from the record alone.
+  `cohort_size` (how many members actually qualified) and
+  `rescore_cohort_target` (how many it was built to) are deliberately separate:
+  the target is a ceiling, not a quota, and a transition inheriting only twelve
+  eligible agents freezes twelve under a target of twenty-five.
+
+Widening the cohort does **not** widen the historical search. The backfill still
+consults exactly the two most recent scored benchmark eras; a larger target can
+only admit more of those same two, never reach into a third. A rollout started
+at twenty-five rescores a strict superset of the one it would have started at
+ten, in the same order.
+
 Only capable validators receive target-version cohort tickets. Scores, tickets,
 retry budgets, datasets, leases, and uniqueness are keyed by benchmark version.
 At one or two distinct target scores, the active version remains authoritative

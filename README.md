@@ -49,7 +49,7 @@ dependency-light `ditto-screening-protocol` package, pinned to an exact commit.
 
 | Method & path | Purpose |
 | --- | --- |
-| `GET /health` | Liveness + DB/chain readiness + build commit |
+| `GET /health` | Liveness + DB/chain readiness + running vs checked-out commit |
 | `GET /metrics` | Prometheus metrics |
 | `GET /api/v1/upload/eval-pricing` | Quote the upload fee in rao (CoinGecko TAO/USD oracle) |
 | `POST /api/v1/upload/check` | Pre-payment validation (signature, registration, size, accidental identical-upload detection) |
@@ -159,21 +159,68 @@ volume across restarts; `docker compose down -v` for a hard reset.
 ## Running on a host with pm2 (staging / production)
 
 The API is a long-lived process; we run it under [pm2](https://pm2.keymetrics.io/)
-on the host (the database and object store stay in Docker). Logs and zero-downtime
-updates are first-class.
+on the host (the database and object store stay in Docker). Logs, restarts, and
+scripted updates are first-class.
 
 ```sh
 npm install -g pm2           # one-time, if not present
 ./scripts/start.sh           # infra up + migrate + start API under pm2
 pm2 logs ditto-api           # tail logs
 pm2 status                   # process state
-./scripts/update.sh          # git pull + uv sync + migrate + zero-downtime reload
+./scripts/update.sh          # git pull + uv sync + migrate + pm2 reload + health gate
 ./scripts/stop.sh            # stop the API process
 ```
 
 - pm2 config: [`scripts/ecosystem.config.js`](scripts/ecosystem.config.js)
 - Logs are written to `./logs/ditto-api.{out,err}.log` and via `pm2 logs`.
 - `pm2 startup` + `pm2 save` will resurrect the process across host reboots.
+- **Updates are not zero-downtime.** The app runs as a single `fork`-mode pm2
+  process, so `pm2 reload` has no second instance to shift traffic onto and
+  degrades to a stop/start: expect ~6s of refused connections per deploy
+  (measured). Cluster mode would close that gap and is an open operator
+  decision, not something the reload command papers over today.
+- **`pm2 reload` does not reconcile how a process is launched.** `script`,
+  `interpreter`, `interpreter_args`, `exec_mode`, and `cwd` are kept from pm2's
+  saved dump even when `ecosystem.config.js` changes them; `args` and env *are*
+  reconciled. Changing `script` and reloading therefore runs the OLD program
+  with the NEW args, which is how a deploy once left the API in `waiting
+  restart` with pid 0 while the site served 502. `scripts/update.sh` now diffs
+  the running launch identity against the config
+  ([`scripts/pm2_deploy_plan.js`](scripts/pm2_deploy_plan.js)) and does
+  `pm2 delete` + `pm2 start` for that app when they differ, so this is handled;
+  if you ever bypass `update.sh`, recreate the app rather than reloading it.
+- **`update.sh` fails the deploy if the app does not come back.** After
+  starting or reloading it polls `/health` on the local port and exits non-zero
+  with the tail of `logs/ditto-api.err.log` if the API is not serving within
+  `DITTO_HEALTH_TIMEOUT` (default 120s). The one-shot image-cleanup job is
+  cron-driven with `autorestart: false`, so `stopped` is its correct state and
+  is not treated as a failure.
+- **A deploy only passes when the process reports the commit that was checked
+  out.** Being checked out and being in effect are different facts. `/health`
+  carries the commit resolved at the *process's* boot, and the deploy gate
+  compares it against `git rev-parse HEAD`; a 200 from a build older than the
+  checkout fails the deploy. `/health` also reports `checked_out_commit` and
+  `commit_drift` so the question "is this host running what it has checked
+  out?" can be answered at any time, not just during a deploy. Drift is
+  reported, never enforced — it does not change the HTTP status, because
+  pulling a serving host out of rotation over stale code turns a deploy problem
+  into an outage.
+- **Divergent Alembic heads stop the deploy in preflight, not mid-sequence.**
+  Two migrations that each extend the same parent and merge independently make
+  `alembic upgrade head` refuse to run. `update.sh` now asserts a single head
+  *before* `uv sync` or the database is touched, using
+  `scripts/check_migration_order.py --head` (stdlib only, no venv), and prints
+  every head plus the exact `alembic merge` that reconciles them. `heads`
+  (plural) was deliberately **not** adopted: applying two unreconciled branches
+  in an order nobody reviewed can produce a schema neither branch intended.
+- **A deploy that fails before pm2 restarts rolls the checkout back.** The old
+  process is still serving in that window, so the checkout is reset to the
+  revision `/health` reports and dependencies are re-synced — the host stops
+  claiming a deploy that never took effect. After pm2 has been restarted the
+  checkout is left alone; going back from there is a deploy of the previous
+  revision, not a `git reset`. Every attempt is recorded in
+  `logs/last-deploy.json` (result, stage, target, rollback), which is also the
+  fallback rollback target when the API cannot answer for itself.
 
 ---
 

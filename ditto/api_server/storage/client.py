@@ -151,13 +151,22 @@ class S3StorageClient:
         )
         return StoredObject(key=key, size_bytes=len(body), sha256=sha256)
 
-    async def presigned_get_url(self, *, key: str, expires_in: int = 300) -> str:
+    async def presigned_get_url(
+        self,
+        *,
+        key: str,
+        expires_in: int = 300,
+        attachment_filename: str | None = None,
+    ) -> str:
         """Return a pre-signed GET URL the validator daemon can stream from.
 
         The URL embeds a time-limited signature, so the bucket can stay
         private while the daemon pulls the tarball directly from object
         storage (no proxying bytes through the API). ``expires_in`` bounds
-        the validity window in seconds.
+        the validity window in seconds. ``attachment_filename`` signs a
+        ``Content-Disposition: attachment`` response override so a browser
+        hitting the URL saves the object under that name instead of
+        rendering it or falling back to the key's basename.
 
         Generating a pre-signed URL is a local signing operation — no
         network round trip and no existence check — so a URL for a missing
@@ -177,9 +186,14 @@ class S3StorageClient:
                 use_ssl=self._config.use_tls,
                 config=self._client_config,
             ) as s3:
+                params: dict[str, str] = {"Bucket": self._config.bucket, "Key": key}
+                if attachment_filename is not None:
+                    params["ResponseContentDisposition"] = (
+                        f'attachment; filename="{attachment_filename}"'
+                    )
                 return await s3.generate_presigned_url(
                     "get_object",
-                    Params={"Bucket": self._config.bucket, "Key": key},
+                    Params=params,
                     ExpiresIn=expires_in,
                 )
         except (ClientError, BotoCoreError) as e:
