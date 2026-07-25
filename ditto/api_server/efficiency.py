@@ -498,7 +498,9 @@ async def _finalized_ranked_rows(session: AsyncSession) -> list[LedgerRow]:
         list_eligible_ledger,
     )
 
-    rows = await list_eligible_ledger(session, include_fingerprints=False)
+    rows = await list_eligible_ledger(
+        session, include_fingerprints=False, include_details=False
+    )
     ranked = [row for row in rows if row.eligible]
     counts = await get_score_counts(
         session,

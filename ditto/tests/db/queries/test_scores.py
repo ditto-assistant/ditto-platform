@@ -169,6 +169,28 @@ class TestListEligibleLedger:
     async def test_empty_when_nothing_scored(self, session: AsyncSession) -> None:
         assert await list_eligible_ledger(session) == []
 
+    async def test_can_omit_large_score_details(self, session: AsyncSession) -> None:
+        agent = await _seed_scored(
+            session,
+            miner=_MINER,
+            composite=0.8,
+            created_at=_GEN_AT,
+        )
+        await _upsert(
+            session,
+            agent.agent_id,
+            composite=0.8,
+            details={"per_case": [{"large": "payload"}]},
+        )
+
+        full = await list_eligible_ledger(session)
+        narrow = await list_eligible_ledger(session, include_details=False)
+
+        assert full[0].details == {"per_case": [{"large": "payload"}]}
+        assert narrow[0].details is None
+        assert narrow[0].agent_id == full[0].agent_id
+        assert narrow[0].composite == full[0].composite
+
     async def test_best_agent_per_miner_only(self, session: AsyncSession) -> None:
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
         # Same miner, two scored agents; only the higher composite should appear.

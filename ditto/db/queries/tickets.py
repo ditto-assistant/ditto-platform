@@ -135,7 +135,10 @@ async def get_score_priority_floors(
     eligible = [
         row
         for row in await list_eligible_ledger(
-            session, include_fingerprints=False, bench_version=bench_version
+            session,
+            include_fingerprints=False,
+            include_details=False,
+            bench_version=bench_version,
         )
         if row.eligible
     ]

@@ -68,7 +68,9 @@ async def cleanup_screened_images(
     async with session_maker() as session, session.begin():
         champions = {
             row.agent_id
-            for row in await list_eligible_ledger(session, include_fingerprints=False)
+            for row in await list_eligible_ledger(
+                session, include_fingerprints=False, include_details=False
+            )
         }
         rows = (
             await session.scalars(
