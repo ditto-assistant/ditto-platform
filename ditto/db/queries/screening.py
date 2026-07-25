@@ -31,12 +31,13 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 # Expired attempts under the current policy after which an agent is parked for
-# operator review instead of re-queued forever. An inconclusive screen (the
-# harness never completes the private audit) submits no verdict, so its lease
-# expires; a permanently-inconclusive agent would otherwise re-attempt every
-# lease indefinitely. Only "expired" attempts count -- infrastructure "failed"
-# attempts are usually screener-side, so a screener outage must not mass-park
-# every in-flight agent.
+# operator review instead of re-queued forever. An inconclusive screen is
+# completed as an early-expired lease and remains in backoff until its original
+# deadline; legacy workers still express the same state by letting the running
+# lease expire naturally. A permanently-inconclusive agent would otherwise
+# re-attempt every lease indefinitely. Only "expired" attempts count --
+# infrastructure "failed" attempts are usually screener-side, so a screener
+# outage must not mass-park every in-flight agent.
 MAX_SCREENING_EXPIRIES = 5
 
 # Duplicate-owner statuses. A later cross-miner submission of the SAME bytes is
@@ -341,10 +342,16 @@ async def claim_screening_attempts(
     # stated reason, so a refused artifact could return under a newer policy that
     # never re-derived the original finding.
     await expire_screening_attempts(session, now=now)
-    has_running = exists(
+    has_running_or_backoff = exists(
         select(ScreeningAttempt.attempt_id).where(
             ScreeningAttempt.agent_id == Agent.agent_id,
-            ScreeningAttempt.status == "running",
+            or_(
+                ScreeningAttempt.status == "running",
+                and_(
+                    ScreeningAttempt.status == "expired",
+                    ScreeningAttempt.deadline > now,
+                ),
+            ),
         )
     )
     rolling_qualified = exists(
@@ -428,7 +435,7 @@ async def claim_screening_attempts(
                 candidate_payment,
                 candidate_payment.agent_id == Agent.agent_id,
             )
-            .where(eligible, ~has_running, ~earlier_pending)
+            .where(eligible, ~has_running_or_backoff, ~earlier_pending)
             .order_by(*screening_priority_order())
             .limit(limit)
             .with_for_update(of=Agent, skip_locked=True)

@@ -4750,7 +4750,7 @@ class TestQuarantineReviewContext:
             "agentic-source-review-tripwire"
         ]
 
-    async def test_posted_inconclusive_outcome_is_rejected_not_a_rejection(
+    async def test_inconclusive_finishes_attempt_and_preserves_lease_backoff(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -4768,16 +4768,39 @@ class TestQuarantineReviewContext:
                 passed=False,
                 attempt_id=attempt_id,
                 outcome="inconclusive",
+                reason_code="behavioral-oracle-inconclusive",
             ),
         )
-        assert response.status_code == 409
-        assert response.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+        assert response.status_code == 200
+        assert response.json()["status"] == AgentStatus.SCREENING_FAILED
         async with session_maker() as session:
             refreshed = await session.get(Agent, agent_id)
             assert refreshed is not None
-            # The claim moved it to screening; the rejected non-verdict
-            # must not advance or reject it.
-            assert refreshed.status == AgentStatus.SCREENING
+            assert refreshed.status == AgentStatus.SCREENING_FAILED
+            assert refreshed.screening_reason == (
+                "Screening was inconclusive; retry scheduled"
+            )
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            assert attempt is not None
+            assert attempt.status == "expired"
+            assert attempt.finished_at is not None
+            assert attempt.deadline > attempt.finished_at
+            assert attempt.reason_code == "behavioral-oracle-inconclusive"
+
+        # Completing the attempt must not hot-loop the ambiguous submission.
+        blocked = await client.post(_CLAIM_URL)
+        assert blocked.status_code == 200
+        assert blocked.json()["items"] == []
+
+        # Once the original lease deadline passes, the ordinary bounded retry
+        # path becomes eligible again.
+        async with session_maker() as session, session.begin():
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            assert attempt is not None
+            attempt.deadline = attempt.started_at
+        retry = await client.post(_CLAIM_URL)
+        assert retry.status_code == 200
+        assert retry.json()["items"][0]["agent_id"] == str(agent_id)
 
     async def test_missing_context_is_404(
         self,
