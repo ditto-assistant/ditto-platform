@@ -13,6 +13,7 @@ from ditto.api_models.inference import InferenceExchangeRequest, InferenceGrantO
 from ditto.api_server.endpoints.inference import (
     _bounded_provider_cost,
     _exchange_message,
+    _locked_grant_model,
     _locked_upstream_payload,
     _output_token_limit,
     _post_provider_with_retry,
@@ -540,3 +541,71 @@ def test_legacy_offer_omits_additive_v7_route_identity() -> None:
     encoded = offer.model_dump(mode="json")
     assert "provider" not in encoded
     assert "profile_revision" not in encoded
+
+
+class _FakeGrant:
+    """Minimal stand-in for the ORM row the proxy loads after proof verification."""
+
+    def __init__(self, *, bench_version: int, allowed_models: list[str]) -> None:
+        self.bench_version = bench_version
+        self.allowed_models = allowed_models
+        self.grant_id = uuid4()
+        self.agent_id = uuid4()
+        self.slot_id = "slot-0"
+
+
+class _FakeConfig:
+    allowed_models = ("qwen/qwen3-32b", "openai/gpt-oss-20b")
+
+
+def test_v7_serves_the_ticket_model_regardless_of_what_the_agent_asked_for() -> None:
+    """A miner controls every byte of the request body; the ticket is authoritative.
+
+    Pre-v7 harnesses default DITTOBENCH_MODEL to qwen/qwen3-32b, which is in the
+    globally permitted set, so without this the agent — not the ticket — picked
+    the scored model.
+    """
+    grant = _FakeGrant(bench_version=7, allowed_models=["openai/gpt-oss-20b"])
+    resolved = _locked_grant_model(
+        grant, requested="qwen/qwen3-32b", config=_FakeConfig()
+    )
+    assert resolved == "openai/gpt-oss-20b"
+
+
+def test_v7_matching_request_resolves_to_the_same_locked_model() -> None:
+    grant = _FakeGrant(bench_version=7, allowed_models=["openai/gpt-oss-20b"])
+    assert (
+        _locked_grant_model(grant, requested="openai/gpt-oss-20b", config=_FakeConfig())
+        == "openai/gpt-oss-20b"
+    )
+
+
+def test_v7_model_mismatch_is_recorded_as_an_evasion_signal(caplog) -> None:
+    grant = _FakeGrant(bench_version=7, allowed_models=["openai/gpt-oss-20b"])
+    with caplog.at_level("WARNING"):
+        _locked_grant_model(grant, requested="qwen/qwen3-32b", config=_FakeConfig())
+    assert any(
+        "model mismatch" in record.getMessage()
+        and "qwen/qwen3-32b" in record.getMessage()
+        and "openai/gpt-oss-20b" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_v7_grant_without_a_pinned_model_fails_closed() -> None:
+    grant = _FakeGrant(bench_version=7, allowed_models=[])
+    with pytest.raises(HTTPException) as excinfo:
+        _locked_grant_model(grant, requested="openai/gpt-oss-20b", config=_FakeConfig())
+    assert excinfo.value.status_code == 409
+
+
+def test_pre_v7_model_selection_semantics_are_unchanged() -> None:
+    """Historical replay must not move: the caller still chooses from the set."""
+    grant = _FakeGrant(bench_version=6, allowed_models=["openai/gpt-oss-20b"])
+    assert (
+        _locked_grant_model(grant, requested="qwen/qwen3-32b", config=_FakeConfig())
+        == "qwen/qwen3-32b"
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        _locked_grant_model(grant, requested="anthropic/claude", config=_FakeConfig())
+    assert excinfo.value.status_code == 403
