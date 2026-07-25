@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
+from ditto.api_models.screener_review_settings import AdminShadowReviewObservation
 
 QuarantineResolution = Literal["release", "rescreen", "reject"]
 DisputeResolution = Literal["release", "uphold"]
@@ -342,6 +343,13 @@ class AdminQuarantineContext(BaseModel):
     """A bounded sample (at most 20); use ``duplicate_summary`` for counts."""
 
     duplicate_summary: AdminDuplicateSummary
+    shadow_review: AdminShadowReviewObservation | None = None
+    """The L2/L3 agentic source review for this quarantine's attempt, when one
+    was recorded. **Non-authoritative:** shadow mode cannot quarantine, reject
+    or ban, so this is advisory signal an operator weighs against the L1
+    finding --- most usefully when the two disagree. Null is the normal case:
+    the reviewer runs only while shadow mode is on, and no quarantine raised
+    before it existed has a row."""
 
 
 class AdminQuarantineBatchContextRequest(BaseModel):
@@ -519,6 +527,7 @@ __all__ = [
     "AdminScreeningSubmissionList",
     "AdminScreeningRescreenRequest",
     "AdminScreeningRescreenResponse",
+    "AdminShadowReviewObservation",
     "AdminSourceExcerpt",
     "AdminSourceFileEntry",
     "AdminSourceLine",

@@ -4308,6 +4308,7 @@ class TestQuarantineReviewContext:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
         finding_model: SourceReviewFinding | None = None,
+        shadow: dict | None = None,
         **payload_overrides: object,
     ) -> tuple[UUID, dict]:
         app.state.config = replace(
@@ -4319,6 +4320,12 @@ class TestQuarantineReviewContext:
         _install_chain(app)
         claimed = await client.post(_CLAIM_URL)
         attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+        if shadow is not None:
+            # Production ordering: the shadow reviewer reports while the lease
+            # is still running, before the authoritative verdict lands.
+            await self._observe_shadow(
+                client, session_maker, agent_id, attempt_id, shadow
+            )
         finding = finding_model or _review_finding()
         digest = finding.canonical_digest()
         payload = _result_payload(
@@ -4337,6 +4344,61 @@ class TestQuarantineReviewContext:
             f"/api/v1/screener/agent/{agent_id}/result", json=payload
         )
         return agent_id, {"response": response, "finding": finding}
+
+    async def _observe_shadow(
+        self,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        agent_id: UUID,
+        attempt_id: UUID,
+        overrides: dict,
+    ) -> dict:
+        """Record one L2/L3 observation against a still-running attempt."""
+        settings = ScreenerReviewSettings(mode="shadow")
+        checksum = _review_settings_checksum(settings)
+        async with session_maker() as session, session.begin():
+            revision = ScreenerReviewSettingsRevision(
+                parent_revision=0,
+                scope="ditto-screener-prod",
+                settings=settings.model_dump(mode="json"),
+                checksum=checksum,
+                reason="bounded shadow canary",
+                actor="test",
+            )
+            session.add(revision)
+            await session.flush()
+            revision_id = revision.revision
+        payload = {
+            "attempt_id": str(attempt_id),
+            "artifact_sha256": _SHA256,
+            "settings_revision": revision_id,
+            "settings_scope": "ditto-screener-prod",
+            "settings_checksum": checksum,
+            "disposition": "safe",
+            "risk_level": "low",
+            "categories": ["none"],
+            "finding_digest": None,
+            "resolution_basis": "authoritative_model_tool_path",
+            "clearance_path": "l3_adjudicated_safe",
+            "critic_disposition": "confirm_safe",
+            "adjudicator_disposition": "confirm_safe",
+            "response_models": ["moonshotai/kimi-k3", "openai/gpt-5.6-sol"],
+            "response_providers": ["openrouter", "openrouter"],
+            "usage": {
+                "input_tokens": 41000,
+                "output_tokens": 3100,
+                "cached_input_tokens": 26000,
+                "reasoning_tokens": 900,
+                "estimated_cost_usd": 0.82,
+                "reported_cost_usd": 0.79,
+            },
+            **overrides,
+        }
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/shadow-review", json=payload
+        )
+        assert response.status_code == 200
+        return payload
 
     async def test_review_payloads_are_stored_listed_and_digest_verified(
         self,
@@ -4508,6 +4570,80 @@ class TestQuarantineReviewContext:
             "same_owner": 1,
             "sample_truncated": False,
         }
+
+    async def test_context_carries_the_attempt_shadow_review(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The case that motivates surfacing this at all: L1 quarantined on a
+        # high-risk finding while the L2/L3 escalation adjudicated it safe.
+        agent_id, ctx = await self._quarantine(app, client, session_maker, shadow={})
+        assert ctx["response"].status_code == 200
+
+        listing = await client.get(
+            "/api/v1/admin/screening-quarantines", headers=_ADMIN_HEADERS
+        )
+        item = listing.json()["items"][0]
+        quarantine_id = item["quarantine_id"]
+        context = await client.get(
+            f"/api/v1/admin/screening-quarantines/{quarantine_id}/context",
+            headers=_ADMIN_HEADERS,
+        )
+        assert context.status_code == 200
+        shadow = context.json()["shadow_review"]
+        assert shadow is not None
+        # Keyed to this quarantine's own attempt, not merely the agent.
+        assert shadow["attempt_id"] == item["attempt_id"]
+        assert shadow["agent_id"] == str(agent_id)
+        assert shadow["disposition"] == "safe"
+        assert shadow["risk_level"] == "low"
+        assert shadow["categories"] == ["none"]
+        assert shadow["resolution_basis"] == "authoritative_model_tool_path"
+        assert shadow["clearance_path"] == "l3_adjudicated_safe"
+        assert shadow["critic_disposition"] == "confirm_safe"
+        assert shadow["adjudicator_disposition"] == "confirm_safe"
+        assert shadow["usage"]["estimated_cost_usd"] == 0.82
+        assert shadow["created_at"]
+        # Advisory only: the L1 quarantine stands untouched beside it.
+        assert context.json()["quarantine"]["finding"]["risk_level"] == "high"
+        assert context.json()["agent"]["agent_status"] == AgentStatus.QUARANTINED
+
+        # The same observation reaches the batch fan-out the queue workbench
+        # uses, so a reviewer sees it however they opened the case.
+        batch = await client.post(
+            "/api/v1/admin/screening-quarantines/batch-context",
+            headers=_ADMIN_HEADERS,
+            json={"quarantine_ids": [quarantine_id]},
+        )
+        assert batch.status_code == 200
+        batched = batch.json()["items"][0]["context"]["shadow_review"]
+        assert batched == shadow
+
+    async def test_context_without_a_shadow_review_reports_null(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # Shadow mode off, or a quarantine older than the reviewer: the field
+        # is absent rather than an error, and every other section still builds.
+        _agent_id, ctx = await self._quarantine(app, client, session_maker)
+        assert ctx["response"].status_code == 200
+
+        listing = await client.get(
+            "/api/v1/admin/screening-quarantines", headers=_ADMIN_HEADERS
+        )
+        quarantine_id = listing.json()["items"][0]["quarantine_id"]
+        context = await client.get(
+            f"/api/v1/admin/screening-quarantines/{quarantine_id}/context",
+            headers=_ADMIN_HEADERS,
+        )
+        assert context.status_code == 200
+        body = context.json()
+        assert body["shadow_review"] is None
+        assert body["quarantine"]["quarantine_id"] == quarantine_id
 
     async def test_batch_context_and_signed_preview_reject_changed_decisions(
         self,

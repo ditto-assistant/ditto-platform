@@ -83,6 +83,7 @@ from ditto.api_server.dependencies import (
 )
 from ditto.api_server.endpoints.screener import _derive_dataset_seed
 from ditto.api_server.endpoints.validator import ChainDep
+from ditto.api_server.shadow_review import shadow_review_observation
 from ditto.api_server.source_inspect import (
     MAX_READ_LINES,
     MAX_TARBALL_BYTES,
@@ -97,6 +98,7 @@ from ditto.db.models import (
     BenchmarkRolloutMember,
     EvaluationPayment,
     Score,
+    ScreenerShadowReview,
     ScreeningAttempt,
     ScreeningDispute,
     ScreeningQuarantine,
@@ -965,6 +967,15 @@ async def _build_quarantine_context(
         .all()
     )
 
+    # Advisory L2/L3 telemetry for this quarantine's own attempt. Optional by
+    # construction: shadow mode can be off, and quarantines predating the
+    # reviewer have no row at all.
+    shadow_row = await session.scalar(
+        select(ScreenerShadowReview).where(
+            ScreenerShadowReview.attempt_id == quarantine.attempt_id
+        )
+    )
+
     total_submissions = int(
         (
             await session.scalar(
@@ -1182,6 +1193,9 @@ async def _build_quarantine_context(
             cross_owner=cross_owner_count,
             same_owner=same_owner_count,
             sample_truncated=cross_owner_count + same_owner_count > len(duplicate_rows),
+        ),
+        shadow_review=(
+            shadow_review_observation(shadow_row) if shadow_row is not None else None
         ),
     )
 
