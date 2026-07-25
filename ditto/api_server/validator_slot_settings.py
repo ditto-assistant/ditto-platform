@@ -13,10 +13,11 @@ session maker; when no maker is wired (unit tests without lifespan) it returns
 :data:`DEFAULT_SETTINGS`.
 
 **Fail closed, always.** Every path that cannot produce a stored policy -- no
-revision, no session maker, unparseable JSON, a database error -- returns
-:data:`DEFAULT_SETTINGS`, i.e. a cap of 2. There is deliberately no code path
-here that answers "uncapped": a database outage must not silently hand the fleet
-eight-way parallelism.
+revision, no session maker, unparseable JSON, *any* failure of the read --
+returns :data:`DEFAULT_SETTINGS`, i.e. a cap of 2. There is deliberately no code
+path here that answers "uncapped", and none that raises: a database outage must
+neither silently hand the fleet eight-way parallelism nor 500 the ticket-issue
+path. See the comment on the read's ``except`` arm for why it is broad.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import ValidationError
-from sqlalchemy.exc import SQLAlchemyError
 
 from ditto.api_models.validator_slot_settings import (
     EffectiveValidatorSlotSettings,
@@ -173,7 +173,22 @@ class ValidatorSlotSettingsResolver:
             try:
                 async with session_maker() as session:
                     row = await latest_validator_slot_settings_revision(session)
-            except SQLAlchemyError:
+            except Exception:
+                # Deliberately broad, and deliberately NOT `SQLAlchemyError`.
+                # The invariant this arm exists to hold is "no failure path
+                # uncaps the fleet" (#433), and that is a statement about every
+                # way the read can fail -- not about one library's exception
+                # tree. Enumerating types gets this wrong in practice: asyncpg
+                # raises a bare `ConnectionRefusedError` (an `OSError`) when
+                # Postgres is down, which SQLAlchemy never wraps, so a
+                # type-enumerated guard let the single most likely outage --
+                # the database being unreachable -- escape this arm entirely.
+                # Anything else the read can raise (a DNS failure, a pool
+                # timeout, an SSL handshake error, a driver bug) has the same
+                # correct answer: hold the conservative cap. `BaseException` is
+                # deliberately still allowed through, so `CancelledError` and
+                # shutdown are not swallowed.
+                #
                 # Fail CLOSED and do not cache: the conservative default stands
                 # until the database answers again. Never uncap on an outage.
                 logger.warning(
