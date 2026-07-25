@@ -15,6 +15,7 @@ lock guarantees one validator cannot hold two live assignments across agents.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
@@ -241,6 +242,7 @@ async def issue_ticket(
     fifo_start_at: datetime | None = None,
     completion_first: bool = False,
     slot_id: str = "slot-0",
+    only_agent_ids: Collection[UUID] | None = None,
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
@@ -258,6 +260,16 @@ async def issue_ticket(
     its cooldown and only once for the same benchmark version. Returns the
     ticket, or ``None`` when there is no work for this validator ("no job for
     you"). Runs inside the caller's transaction.
+
+    ``only_agent_ids`` narrows the candidate set to an explicit id list and, when
+    set, suppresses ``submitted_at_or_after``. The two cannot both apply: the
+    caller that names ids has already decided membership, and the arrival-time
+    filter exists to express "this era's submissions only" -- which is precisely
+    what a previous-generation carryover list is not. Every other eligibility
+    rule (screening policy, versioned dataset, rollout admission, per-owner
+    serialization, attempt caps) still applies unchanged, so a named agent that
+    is not genuinely leasable still yields ``None``. Default ``None`` leaves
+    every existing caller's behaviour untouched.
     """
     # No row exists to lock before a validator's first claim. Serialize that
     # gap explicitly on Postgres; the unique partial index remains the durable
@@ -602,7 +614,9 @@ async def issue_ticket(
             candidate = candidate.where(eligible_screened_image)
         if rollout_admitted is not None:
             candidate = candidate.where(rollout_admitted)
-        if submitted_at_or_after is not None:
+        if only_agent_ids is not None:
+            candidate = candidate.where(Agent.agent_id.in_(set(only_agent_ids)))
+        elif submitted_at_or_after is not None:
             candidate = candidate.where(Agent.created_at >= submitted_at_or_after)
         if skipped:
             candidate = candidate.where(Agent.agent_id.not_in(skipped))

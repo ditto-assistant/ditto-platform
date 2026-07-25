@@ -78,7 +78,10 @@ from ditto.api_models.benchmark_capacity import (
 from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.benchmark_progress import benchmark_progress_signing_token
 from ditto.api_models.inference import InferenceGrantOffer
-from ditto.api_models.queue_policy_settings import QueuePolicySettings
+from ditto.api_models.queue_policy_settings import (
+    PrevGenCarryoverSettings,
+    QueuePolicySettings,
+)
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.stack_health import (
     ValidatorStackHealth,
@@ -156,6 +159,7 @@ from ditto.db.queries.audit import (
     get_latest_score_retest_event,
 )
 from ditto.db.queries.benchmark_admission import activated_rollout_for_version
+from ditto.db.queries.benchmark_carryover import carryover_agent_ids
 from ditto.db.queries.benchmark_rollout import (
     LEGACY_BENCH_VERSION,
     active_bench_version,
@@ -500,6 +504,66 @@ async def _issue_source_backfill_ticket(
         artifact_mode=artifact_mode,
         validator_running_benchmark=validator_running_benchmark,
         slot_id=slot_id,
+    )
+
+
+async def _issue_prev_gen_carryover_ticket(
+    session: AsyncSession,
+    *,
+    rollout: BenchmarkRollout,
+    heartbeat: ValidatorHeartbeat | None,
+    validator_hotkey: str,
+    now: datetime,
+    settings: PrevGenCarryoverSettings,
+    target_inference_ready: bool,
+    validator_running_benchmark: bool,
+    slot_id: str,
+) -> ValidatorTicket | None:
+    """Lease an adopted previous-generation submission in the new era.
+
+    The third leg of the carryover contract. Admission (the carryover row) and
+    generation (the desired-version dataset) are both already in place before
+    this can find anything, but neither is enough on its own: every existing
+    desired-version issuance path in this endpoint passes
+    ``submitted_at_or_after=rollout.created_at``, which filters on
+    ``Agent.created_at``, so a fully admitted and fully datasetted
+    previous-generation agent is leased by NO other path. ``only_agent_ids``
+    replaces that arrival filter with the explicit adopted set.
+
+    Deliberately confined to the **cohort lane**. The fresh-submission lane
+    exists to keep new miners from starving behind a transition, and diluting it
+    with a backlog drain would undo that. The caller therefore only reaches here
+    when the validator's lane slot is not a fresh-submission slot and both the
+    fresh lane and the inherited cohort had nothing to give.
+
+    By default it also waits for the inherited cohort to settle, on the same
+    precedent as :func:`_issue_source_backfill_ticket` ("use otherwise-idle
+    capacity after the inherited cohort settles"): carryover rides on a
+    transition and must never be able to delay the one it is riding on.
+    """
+    if not settings.enabled or not target_inference_ready:
+        return None
+    if heartbeat is None or not heartbeat_supports_version(
+        heartbeat, now=now, version=rollout.desired_version
+    ):
+        return None
+    if settings.require_cohort_complete and not await rollout_cohort_complete(
+        session, rollout=rollout, cohort_size=rollout.cohort_size
+    ):
+        return None
+    adopted = await carryover_agent_ids(session, rollout=rollout)
+    if not adopted:
+        return None
+    return await issue_ticket(
+        session,
+        validator_hotkey=validator_hotkey,
+        now=now,
+        ttl=_TICKET_TTL,
+        bench_version=rollout.desired_version,
+        artifact_mode="screened_only",
+        validator_running_benchmark=validator_running_benchmark,
+        slot_id=slot_id,
+        only_agent_ids=adopted,
     )
 
 
@@ -1446,6 +1510,18 @@ async def request_job(
                     submitted_at_or_after=rollout.created_at,
                     fifo_start_at=rollout.created_at,
                     completion_first=True,
+                    slot_id=slot_id,
+                )
+            if ticket is None and not fresh_lane_due:
+                ticket = await _issue_prev_gen_carryover_ticket(
+                    session,
+                    rollout=rollout,
+                    heartbeat=heartbeat,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                    settings=queue_policy.prev_gen_carryover,
+                    target_inference_ready=target_inference_ready,
+                    validator_running_benchmark=slot_running_benchmark,
                     slot_id=slot_id,
                 )
         else:

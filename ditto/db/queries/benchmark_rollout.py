@@ -27,6 +27,7 @@ from ditto.db.models import (
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutAudit,
+    BenchmarkRolloutCarryover,
     BenchmarkRolloutMember,
     InferenceProviderRoute,
     InferenceRoutingPolicy,
@@ -654,18 +655,36 @@ async def arrival_bench_version(session: AsyncSession, *, agent: Agent) -> int:
 
     A submission received after an open rollout starts enters the desired era
     immediately: its dataset is rendered there and validators lease it there
-    through the fresh-submission lane. Older submissions stay on the active
-    version unless they separately qualify for the rollout cohort — cohort
-    membership is a different lane with different rules, so it is deliberately
-    not considered here; callers that care must check it themselves.
+    through the fresh-submission lane. So does an older submission the rollout
+    has ADOPTED as previous-generation carryover: it already holds a
+    desired-version dataset pin and is leased in the new era, so a later policy
+    rescreen must regenerate it there rather than back in the era it was
+    stranded in. Other older submissions stay on the active version unless they
+    separately qualify for the rollout cohort — cohort membership is a different
+    lane with different rules, so it is deliberately not considered here;
+    callers that care must check it themselves.
 
     This mirrors :func:`ditto.db.queries.benchmark_admission.
-    benchmark_admission_predicate`'s ``created_at >= rollout.created_at``
-    disjunct, in Python, for one already-loaded agent.
+    benchmark_admission_predicate`'s ``created_at >= rollout.created_at`` and
+    carryover disjuncts, in Python, for one already-loaded agent.
     """
     bench_version = await active_bench_version(session)
     rollout = await open_rollout(session)
-    if rollout is not None and agent.created_at >= rollout.created_at:
+    if rollout is None:
+        return bench_version
+    if agent.created_at >= rollout.created_at:
+        return int(rollout.desired_version)
+    # The EXISTS is inlined on the model rather than delegated to
+    # ``ditto.db.queries.benchmark_carryover``: that module needs this one's
+    # ``DatasetPin``, so importing it back would be a cycle.
+    if await session.scalar(
+        select(
+            exists().where(
+                BenchmarkRolloutCarryover.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutCarryover.agent_id == agent.agent_id,
+            )
+        )
+    ):
         return int(rollout.desired_version)
     return bench_version
 
@@ -719,7 +738,7 @@ async def rollout_for_desired_version(
     )
 
 
-async def _audit(
+async def append_rollout_audit(
     session: AsyncSession,
     rollout: BenchmarkRollout,
     event: str,
@@ -727,6 +746,7 @@ async def _audit(
     *,
     now: datetime,
 ) -> None:
+    """Append one row to a rollout's operator/public-safe history."""
     session.add(
         BenchmarkRolloutAudit(
             audit_id=uuid4(),
@@ -736,6 +756,12 @@ async def _audit(
             recorded_at=now,
         )
     )
+
+
+# Module-private alias so this module's many existing call sites read unchanged.
+# The public name exists because previous-generation carryover lives in its own
+# module and must not reach across for a private helper.
+_audit = append_rollout_audit
 
 
 async def supersede_open_rollout(

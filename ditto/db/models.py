@@ -1351,6 +1351,57 @@ class BenchmarkRolloutMember(Base):
     )
 
 
+class BenchmarkRolloutCarryover(Base):
+    """A previous-generation submission the new benchmark era adopted.
+
+    Deliberately a **separate table** from :class:`BenchmarkRolloutMember`
+    rather than a ``kind`` discriminator on it. Every existing query that counts
+    or lists rollout members treats "row in ``benchmark_rollout_members``" as
+    "inherited rescore cohort": ``cohort_size``, ``rollout_cohort_complete``,
+    ``rollout_cohort_score_complete``, ``_validate_frozen_members``,
+    ``rollout_state``'s member list, ``active_bench_version``,
+    ``authority_selection_state``, and ``issue_rollout_ticket``. A discriminator
+    would require a ``kind`` filter on every one of them, and missing a single
+    filter would silently re-gate an open rollout's activation on agents that
+    were never part of its cohort. A separate table cannot be accidentally
+    included by any of those queries.
+
+    The row is the sole admission credential for a carried-over submission (see
+    ``ditto.db.queries.benchmark_admission.benchmark_admission_predicate``), and
+    it is only ever written in the same transaction that pins the agent's
+    desired-version :class:`BenchmarkDataset`. That is what makes admission and
+    dataset generation inseparable rather than merely coordinated.
+    """
+
+    __tablename__ = "benchmark_rollout_carryover"
+
+    rollout_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    """1-based adoption order, so the operator cap is auditable after the fact."""
+    frozen_score_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Prior-era accepted score count at adoption time, for audit."""
+    frozen_owner_key: Mapped[str] = mapped_column(Text, nullable=False)
+    """The owner key this row was deduped under (``coldkey:``/``hotkey:``)."""
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint("rollout_id", "agent_id"),
+        UniqueConstraint("rollout_id", "position"),
+        ForeignKeyConstraint(
+            ["rollout_id"], ["benchmark_rollouts.rollout_id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="RESTRICT"),
+        CheckConstraint("position > 0", name="benchmark_carryover_position"),
+        CheckConstraint(
+            "frozen_score_count BETWEEN 0 AND 2",
+            name="benchmark_carryover_frozen_score_count",
+        ),
+    )
+
+
 class BenchmarkRolloutAudit(Base):
     """Append-only operator/public-safe history for benchmark transitions."""
 
