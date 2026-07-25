@@ -867,9 +867,9 @@ async def issue_ticket(
             # Completion-first admission is global, not per validator slot.
             # Every slot waits on the same FIFO head. Once the row lock is
             # acquired, re-check this validator against fresh committed state.
-            # A sibling slot waits while this validator owns the head; a
-            # validator that can no longer score the head advances to the next
-            # FIFO candidate instead of idling behind impossible work.
+            # A validator that cannot claim the head -- for any reason, live
+            # lease included -- advances to the next FIFO candidate instead of
+            # idling behind work it can never take.
             same_validator_blocking_status = await session.scalar(
                 select(ValidatorTicket.status)
                 .where(
@@ -896,17 +896,28 @@ async def issue_ticket(
                 )
                 .limit(1)
             )
-            if same_validator_blocking_status == TicketStatus.ISSUED:
-                # A sibling slot must not advance while this validator already
-                # owns the FIFO head. Let another validator fill the remaining
-                # quorum slots first.
-                return None
             if same_validator_blocking_status is not None:
                 # This validator cannot contribute another score to the FIFO
-                # head (it already scored it, is cooling down, or exhausted its
-                # retry budget). Keeping it parked here can idle the entire
-                # fleet when every remaining scorer is similarly ineligible.
-                # Preserve FIFO among work this validator can actually claim.
+                # head: it already holds a live lease on it, already scored it,
+                # is cooling down, or exhausted its retry budget. One ticket per
+                # (agent, version, validator) is the composite primary key, so
+                # none of those states can be advanced by trying again here --
+                # the head's remaining quorum slots belong to OTHER validators
+                # either way.
+                #
+                # The live-lease case used to return no job at all, which was
+                # correct while a validator ran one benchmark at a time: there
+                # was no sibling slot to serve. Since #433 a validator holds up
+                # to ``max_concurrent_slots`` leases, and returning None parked
+                # every sibling slot for the full ninety-minute lease of the
+                # head. That is fleet capacity idling in front of a queue it is
+                # allowed to serve, and it does not bring the head one score
+                # closer.
+                #
+                # Skipping preserves FIFO among the work this validator can
+                # actually claim, and the ordinary owner-serialization and
+                # quorum-occupancy checks above still bound how much of the
+                # queue one validator (or one miner) can hold at once.
                 skipped.append(agent_id)
                 continue
         break
