@@ -1,0 +1,395 @@
+"""The verdict matrix for the gate that decides whether a lease may be revoked.
+
+Every entry here is a claim about what the platform is allowed to conclude from
+one stored heartbeat. The rule the tests encode is one-directional: only a fresh,
+post-issuance observation that positively reports an empty slot may end a run.
+Everything else -- no row, a stale row, an unreadable capacity blob, a blob that
+predates the lease -- is *unknown*, and unknown must read as running.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.screener import SCREENING_POLICY_VERSION
+from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
+from ditto.db.models import (
+    Agent,
+    ValidatorHeartbeat,
+    ValidatorLeaseAudit,
+    ValidatorTicket,
+)
+from ditto.db.queries.audit import EVENT_SCORE_RETEST_REQUESTED, append_audit_entry
+from ditto.db.queries.lease_liveness import (
+    IDLE_EVIDENCE_MAX_AGE,
+    LEASE_REPORTING_GRACE,
+    LeaseLiveness,
+    force_expire_lease,
+    lease_liveness,
+)
+from ditto.db.queries.score_retests import activate_next_score_retest
+
+_NOW = datetime(2026, 7, 25, 13, 33, 16, tzinfo=UTC)
+_HOTKEY = "5Rizzo"
+_SLOT = "slot-0"
+_AGENT = uuid4()
+
+
+def _ticket(*, issued_at: datetime) -> ValidatorTicket:
+    return ValidatorTicket(
+        agent_id=_AGENT,
+        validator_hotkey=_HOTKEY,
+        bench_version=7,
+        slot_id=_SLOT,
+        status=TicketStatus.ISSUED,
+        issued_at=issued_at,
+        deadline=issued_at + timedelta(minutes=90),
+        attempt_count=1,
+        manual_retry_grants=0,
+    )
+
+
+def _capacity(*active: dict) -> dict:
+    return {
+        "configured_slots": 1,
+        "healthy_slots": [_SLOT],
+        "admission": "accepting",
+        "active": list(active),
+    }
+
+
+def _active(
+    *, agent_id: object = _AGENT, slot_id: str = _SLOT, deadline: datetime = _NOW
+) -> dict:
+    return {
+        "slot_id": slot_id,
+        "agent_id": str(agent_id),
+        "bench_version": 7,
+        "progress": {
+            "stage": "running_benchmark",
+            "completed": 143,
+            "total": 281,
+            "ticket_deadline": deadline.isoformat(),
+        },
+    }
+
+
+async def _seed_heartbeat(
+    session: AsyncSession,
+    *,
+    seen_at: datetime,
+    protocol_version: int = 11,
+    state: str = "polling",
+    benchmark_capacity: dict | None = None,
+) -> None:
+    async with session.begin():
+        session.add(
+            ValidatorHeartbeat(
+                validator_hotkey=_HOTKEY,
+                software_version="1.0.0",
+                protocol_version=protocol_version,
+                code_digest="ab" * 32,
+                state=state,
+                first_seen_at=seen_at,
+                reported_at=seen_at,
+                seen_at=seen_at,
+                signature="cd" * 64,
+                benchmark_capacity=benchmark_capacity,
+            )
+        )
+
+
+class TestLeaseLiveness:
+    async def test_no_heartbeat_row_reads_as_running(
+        self, session: AsyncSession
+    ) -> None:
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is False
+        assert verdict.reason == "heartbeat_missing"
+
+    async def test_stale_heartbeat_reads_as_running(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - IDLE_EVIDENCE_MAX_AGE - timedelta(seconds=1),
+            benchmark_capacity=_capacity(),
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is False
+        assert verdict.reason == "heartbeat_stale"
+
+    async def test_observation_predating_the_lease_reads_as_running(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_heartbeat(
+            session, seen_at=_NOW - timedelta(seconds=5), benchmark_capacity=_capacity()
+        )
+        verdict = await lease_liveness(
+            session,
+            # Issued moments ago: the run has not had time to announce itself.
+            ticket=_ticket(issued_at=_NOW - timedelta(seconds=30)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is False
+        assert verdict.reason == "evidence_predates_lease"
+
+    @pytest.mark.parametrize("capacity", [None, {"nonsense": True}])
+    async def test_unreadable_capacity_reads_as_running(
+        self, session: AsyncSession, capacity: dict | None
+    ) -> None:
+        await _seed_heartbeat(
+            session, seen_at=_NOW - timedelta(seconds=5), benchmark_capacity=capacity
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is False
+        assert verdict.reason == "capacity_unreadable"
+
+    async def test_slot_listed_active_reads_as_running(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            state="running_benchmark",
+            benchmark_capacity=_capacity(_active()),
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is False
+        assert verdict.reason == "slot_active"
+
+    async def test_same_agent_running_on_another_slot_reads_as_running(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            state="running_benchmark",
+            benchmark_capacity={
+                "configured_slots": 2,
+                "healthy_slots": ["slot-0", "slot-1"],
+                "admission": "accepting",
+                "active": [_active(slot_id="slot-1")],
+            },
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is False
+        assert verdict.reason == "agent_active_on_another_slot"
+
+    async def test_fresh_post_issuance_empty_capacity_is_idle(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            benchmark_capacity=_capacity(),
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - LEASE_REPORTING_GRACE - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is True
+        assert verdict.reason == "idle_capacity_reports_slot_free"
+        assert verdict.evidence["heartbeat_age_seconds"] == 5.0
+
+    async def test_pre_v10_reporter_falls_back_to_signed_state(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_heartbeat(
+            session, seen_at=_NOW - timedelta(seconds=5), protocol_version=7
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is True
+        assert verdict.reason == "idle_state_not_running_benchmark"
+
+    async def test_pre_v10_running_state_reads_as_running(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            protocol_version=7,
+            state="running_benchmark",
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is False
+
+    async def test_caller_reported_running_short_circuits(
+        self, session: AsyncSession
+    ) -> None:
+        await _seed_heartbeat(
+            session, seen_at=_NOW - timedelta(seconds=5), benchmark_capacity=_capacity()
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - timedelta(hours=1)),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+            running_benchmark_reported=True,
+        )
+        assert verdict.idle is False
+        assert verdict.reason == "running_benchmark_reported"
+
+    async def test_revocation_refuses_a_verdict_that_is_not_idle(
+        self, session: AsyncSession
+    ) -> None:
+        """No future call site can revoke on absence of evidence by accident."""
+        ticket = _ticket(issued_at=_NOW - timedelta(hours=1))
+        with pytest.raises(ValueError, match="not proven idle"):
+            await force_expire_lease(
+                session,
+                ticket=ticket,
+                now=_NOW,
+                liveness=LeaseLiveness(idle=False, reason="heartbeat_stale"),
+                context="issue_ticket",
+            )
+        assert ticket.status == TicketStatus.ISSUED
+
+
+class TestScoreRetestLane:
+    """The re-test lane ends a lease differently (closed unserviceable rather
+    than expired) but must apply the same evidence rule before doing it."""
+
+    async def _seed_requested_retest(
+        self, session: AsyncSession, *, issued_at: datetime
+    ) -> ValidatorTicket:
+        async with session.begin():
+            session.add(
+                Agent(
+                    agent_id=_AGENT,
+                    miner_hotkey="miner-1",
+                    name="retest-subject",
+                    sha256="ab" * 32,
+                    status=AgentStatus.SCORED,
+                    screening_policy_version=SCREENING_POLICY_VERSION,
+                    created_at=_NOW - timedelta(days=1),
+                )
+            )
+            ticket = ValidatorTicket(
+                agent_id=_AGENT,
+                validator_hotkey=_HOTKEY,
+                bench_version=7,
+                slot_id=_SLOT,
+                status=TicketStatus.ISSUED,
+                purpose=TicketPurpose.CANONICAL_QUORUM,
+                purpose_revision=1,
+                issued_at=issued_at,
+                deadline=issued_at + timedelta(minutes=90),
+                attempt_count=1,
+                manual_retry_grants=0,
+            )
+            session.add(ticket)
+            await append_audit_entry(
+                session,
+                agent_id=_AGENT,
+                validator_hotkey=_HOTKEY,
+                event=EVENT_SCORE_RETEST_REQUESTED,
+                payload={"request_id": str(uuid4()), "bench_version": 7},
+                recorded_at=issued_at,
+            )
+        return ticket
+
+    async def test_live_retest_survives_a_dropped_benchmark_version(
+        self, session: AsyncSession
+    ) -> None:
+        ticket = await self._seed_requested_retest(
+            session, issued_at=_NOW - timedelta(minutes=19)
+        )
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(minutes=4),
+            benchmark_capacity=_capacity(),
+        )
+        async with session.begin():
+            promoted = await activate_next_score_retest(
+                session,
+                validator_hotkey=_HOTKEY,
+                now=_NOW,
+                # The validator stopped advertising v7 -- but its heartbeat is
+                # four minutes stale, so nothing proves the run stopped.
+                supports_version=lambda _version: False,
+                slot_id=_SLOT,
+            )
+        assert promoted is None
+        assert ticket.status == TicketStatus.ISSUED
+
+    async def test_proven_idle_retest_is_closed_and_audited(
+        self, session: AsyncSession
+    ) -> None:
+        ticket = await self._seed_requested_retest(
+            session, issued_at=_NOW - timedelta(minutes=19)
+        )
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            benchmark_capacity=_capacity(),
+        )
+        async with session.begin():
+            promoted = await activate_next_score_retest(
+                session,
+                validator_hotkey=_HOTKEY,
+                now=_NOW,
+                supports_version=lambda _version: False,
+                slot_id=_SLOT,
+            )
+        assert promoted is None
+        assert ticket.status == TicketStatus.SCORED
+        async with session.begin():
+            audit = (await session.scalars(select(ValidatorLeaseAudit))).all()
+        assert len(audit) == 1
+        assert audit[0].action == "closed_unserviceable"
+        assert audit[0].context == "score_retest"

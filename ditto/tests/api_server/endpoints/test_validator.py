@@ -91,6 +91,7 @@ from ditto.db.models import (
     Score,
     ScreenerHeartbeat,
     ValidatorHeartbeat,
+    ValidatorLeaseAudit,
     ValidatorTicket,
 )
 from ditto.db.queries.confirmation_scores import (
@@ -809,6 +810,7 @@ async def _seed_validator_heartbeat(
     capabilities: dict[str, object] | None = None,
     stack: dict[str, object] | None = None,
     state: str = "polling",
+    benchmark_capacity: dict[str, object] | None = None,
 ) -> None:
     now = seen_at or datetime.now(UTC)
     async with maker() as s, s.begin():
@@ -827,6 +829,7 @@ async def _seed_validator_heartbeat(
                 benchmark_progress_agent_id=None,
                 capabilities=capabilities,
                 stack=stack,
+                benchmark_capacity=benchmark_capacity,
                 reported_at=now,
                 seen_at=now,
                 signature="ab" * 64,
@@ -3566,7 +3569,9 @@ class TestRequestJob:
                     bench_version=2,
                     validator_hotkey=_VALIDATOR_HOTKEY,
                     status=TicketStatus.ISSUED,
-                    issued_at=now,
+                    # Old enough that a heartbeat reporting no work is evidence
+                    # of idleness rather than a run still starting up.
+                    issued_at=now - timedelta(minutes=10),
                     deadline=now + timedelta(minutes=90),
                     attempt_count=1,
                     manual_retry_grants=0,
@@ -3586,6 +3591,65 @@ class TestRequestJob:
             )
             assert ticket is not None
             assert ticket.status == expected_status
+
+    async def test_job_claim_does_not_destroy_a_run_behind_a_frozen_capacity_blob(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """End to end over the shape that lost three v7 runs: heartbeat ingest
+        has been failing for four minutes, so the stored capacity blob still
+        shows an empty slot while the benchmark underneath keeps scoring. The
+        next job claim must leave that lease alone."""
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        capabilities = {
+            **_V7_CAPABILITIES,
+            "require_screened_image": True,
+            "source_build_fallback": False,
+        }
+        now = datetime.now(UTC)
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=7,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+            state="polling",
+            seen_at=now - timedelta(minutes=4),
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    bench_version=2,
+                    validator_hotkey=_VALIDATOR_HOTKEY,
+                    status=TicketStatus.ISSUED,
+                    issued_at=now - timedelta(minutes=19),
+                    deadline=now + timedelta(minutes=71),
+                    attempt_count=1,
+                    manual_retry_grants=0,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert response.status_code == 204
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+            )
+            assert ticket is not None
+            assert ticket.status == TicketStatus.ISSUED
+            assert ticket.attempt_count == 1
+            assert (
+                await session.scalar(
+                    select(func.count()).select_from(ValidatorLeaseAudit)
+                )
+            ) == 0
 
     async def test_stale_heartbeat_cannot_claim_work(
         self,

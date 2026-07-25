@@ -44,6 +44,7 @@ from ditto.db.models import (
     InferenceRoutingPolicy,
     Score,
     ValidatorHeartbeat,
+    ValidatorLeaseAudit,
     ValidatorTicket,
 )
 from ditto.db.queries.benchmark_rollout import (
@@ -303,6 +304,14 @@ async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRo
                 signature="ab" * 64,
                 capabilities=capabilities,
                 stack=stack,
+                # A v10+ validator always advertises capacity; an absent blob is
+                # unreadable evidence and can never justify revoking a lease.
+                benchmark_capacity={
+                    "configured_slots": 1,
+                    "healthy_slots": ["slot-0"],
+                    "admission": "accepting",
+                    "active": [],
+                },
             )
         )
     await session.flush()
@@ -958,7 +967,9 @@ async def test_rollout_screened_only_skips_and_releases_source_only_work() -> No
             bench_version=rollout.desired_version,
             validator_hotkey="validator-b",
             status=TicketStatus.ISSUED,
-            issued_at=now,
+            # Old enough that the validator has had time to advertise the slot;
+            # its heartbeat says it is not, which is genuine idleness.
+            issued_at=now - timedelta(minutes=10),
             deadline=now + timedelta(minutes=90),
             attempt_count=1,
             manual_retry_grants=0,
@@ -1030,7 +1041,9 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists()
             bench_version=2,
             validator_hotkey="validator-a",
             status=TicketStatus.ISSUED,
-            issued_at=now,
+            # Past the reporting grace, so validator-a's empty capacity blob is
+            # evidence the slot really is idle rather than merely starting up.
+            issued_at=now - timedelta(minutes=10),
             deadline=now + timedelta(minutes=90),
             attempt_count=1,
             manual_retry_grants=0,
@@ -1153,6 +1166,68 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists()
             is None
         )
         assert no_target_source_ticket.status == TicketStatus.ISSUED
+    await engine.dispose()
+
+
+async def test_rollout_never_preempts_a_lease_behind_a_frozen_capacity_blob() -> None:
+    """The rollout lane carried the looser copy of the revocation. A validator
+    whose heartbeat ingest has stalled must keep its in-flight lease here too --
+    the blob is a cache of the last successful ingest, not a liveness probe."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        _, rollout = await _seed_rollout(session, now)
+        ordinary_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=ordinary_id,
+                miner_hotkey="ordinary-miner",
+                name="ordinary-v2-work",
+                sha256="ab" * 32,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=9,
+                created_at=now + timedelta(minutes=1),
+            )
+        )
+        live_source_ticket = ValidatorTicket(
+            agent_id=ordinary_id,
+            bench_version=2,
+            validator_hotkey="validator-a",
+            status=TicketStatus.ISSUED,
+            issued_at=now - timedelta(minutes=19),
+            deadline=now + timedelta(minutes=71),
+            attempt_count=1,
+            manual_retry_grants=0,
+        )
+        session.add(live_source_ticket)
+        heartbeat = await session.get(ValidatorHeartbeat, "validator-a")
+        assert heartbeat is not None
+        # Four minutes without a successful ingest: still inside the five-minute
+        # window every other gate uses, so the validator is served work as
+        # normal, but far too old to prove a slot is empty. This is the window
+        # the destroyed v7 runs died in.
+        heartbeat.seen_at = now - timedelta(minutes=4)
+        await session.flush()
+
+        assert (
+            await issue_rollout_ticket(
+                session,
+                validator_hotkey="validator-a",
+                now=now,
+                ttl=timedelta(minutes=90),
+            )
+            is None
+        )
+        assert live_source_ticket.status == TicketStatus.ISSUED
+        assert live_source_ticket.deadline.replace(tzinfo=UTC) == now + timedelta(
+            minutes=71
+        )
+        assert (
+            await session.scalar(select(func.count()).select_from(ValidatorLeaseAudit))
+        ) == 0
     await engine.dispose()
 
 
