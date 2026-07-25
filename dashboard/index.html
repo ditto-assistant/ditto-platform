@@ -595,6 +595,14 @@
       color: var(--accent-2); background: color-mix(in oklab, var(--accent-2) 12%, transparent);
       font: 750 8.5px/1.5 var(--mono); letter-spacing: .01em; white-space: nowrap;
     }
+    /* A previous-generation row is waiting on the whole current era to drain,
+       not on its turn. Muted on purpose: it is the one badge here that means
+       "this is not moving", so it must not compete with the live queue. */
+    .pipeline-prevgen-badge {
+      flex: 0 0 auto; padding: 1px 5px; border-radius: 5px;
+      color: var(--text-dim); background: var(--bg-elev-2);
+      font: 750 8.5px/1.5 var(--mono); letter-spacing: .01em; white-space: nowrap;
+    }
     /* Retry-state chip: flags a waiting submission that is stuck (exhausted →
        needs an operator) or cooling down, from the ops feed's retry_state. */
     .retry-chip { display: inline-flex; align-items: center; width: fit-content; margin-top: 5px; padding: 1px 6px; border-radius: 5px; font: 750 9.5px/1.5 var(--sans); letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
@@ -6975,7 +6983,14 @@
         }
         var visible = indexed.map(function (item) {
           var entry = item.entry;
-          var isUpNext = column.status === "waiting_validator" && Number(entry.validator_queue_rank) === 1;
+          // A previous-generation row is reachable only by the carryover and
+          // retired-era backfill lanes, which issue nothing while any current-era
+          // submission still needs a validator. Rank 1 among those rows is first
+          // in a line that is not moving, so "Up next" -- which a miner reads as
+          // "you are about to be scored" -- must never appear on one. Two miners
+          // reported exactly that reading on one evening.
+          var isPrevGen = entry.previous_generation === true;
+          var isUpNext = column.status === "waiting_validator" && !isPrevGen && Number(entry.validator_queue_rank) === 1;
           var rescore = column.status === "evaluating" ? pipelineRescoreState(entry) : null;
           var meta = column.status === "waiting_validator" || column.status === "evaluating" || entry.status === "below_score_floor"
             ? (rescore
@@ -6996,9 +7011,10 @@
             ? "Provisional " + fx(Number(entry.provisional_composite))
             : "";
           var accessibleName = agentLabel(entry.name, entry.version);
-          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(accessibleName) + ' details' + (isUpNext ? ', up next for validator assignment' : '') + (rescore && rescore.isQualification ? ', inherited benchmark cohort qualification in progress' : '') + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
+          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(accessibleName) + ' details' + (isUpNext ? ', up next for validator assignment' : '') + (isPrevGen ? ', previous benchmark generation, waiting for the current era to finish' : '') + (rescore && rescore.isQualification ? ', inherited benchmark cohort qualification in progress' : '') + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
             '<span class="pipeline-item-heading"><span class="pipeline-item-name">' + esc(agentName(entry.name)) + '</span>' +
               (isUpNext ? '<span class="pipeline-next-badge" title="Highest current priority; validator eligibility can vary">Up next</span>' : '') +
+              (isPrevGen ? '<span class="pipeline-prevgen-badge" title="Submitted before the current benchmark version. Previous-generation work is served only after every current-era submission has a validator, so this is not advancing yet.">Prev gen</span>' : '') +
               (rescore && rescore.isQualification ? '<span class="pipeline-qualification-badge" title="Existing score remains authoritative while this inherited cohort agent qualifies on the next benchmark">Cohort → v' + esc(rescore.targetVersion) + '</span>' : '') + '</span>' +
             agentVersionBadge(entry.version) +
             '<span class="pipeline-item-meta"><span>' + esc(String(entry.agent_id || "").slice(0, 8)) + '</span><span>' + esc(meta) + '</span></span>' +
