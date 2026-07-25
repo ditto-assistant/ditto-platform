@@ -752,6 +752,7 @@ async def list_eligible_ledger(
     session: AsyncSession,
     *,
     include_fingerprints: bool = True,
+    include_details: bool = True,
     bench_version: int | None = None,
 ) -> list[LedgerRow]:
     """Return the best eligible score per payment-time coldkey.
@@ -762,6 +763,11 @@ async def list_eligible_ledger(
     only reader that compares them. The public leaderboard, validator ledger
     read, and ticket-eligibility paths were paying that serialization cost on
     every poll for data they never used.
+
+    ``include_details=False`` likewise replaces the large score telemetry JSON
+    with NULL. Queue-floor, cleanup, and efficiency-cohort consumers need only
+    scalar ranking fields; avoiding the per-case blob keeps those frequently
+    polled reads from detoasting and transferring audit payloads they discard.
 
     The persistent ledger the validator folds into KOTH+ATH weights (via
     ``GET /scoring/scores``). "Eligible" = agents in ``scored`` — this excludes
@@ -822,6 +828,9 @@ async def list_eligible_ledger(
         if bench_version is not None
         else tuple({canonical_version, desired_version} - {None})
     )
+    details_column = (
+        Score.details.label("details") if include_details else null().label("details")
+    )
     agent_best = (
         select(
             Score.agent_id.label("agent_id"),
@@ -834,7 +843,7 @@ async def list_eligible_ledger(
             Score.median_ms.label("median_ms"),
             Score.n.label("n"),
             _is_ranked().label("eligible"),
-            Score.details.label("details"),
+            details_column,
             Score.validator_hotkey.label("validator_hotkey"),
             Score.signature.label("signature"),
             # Row count in the agent's pool, so the median position is (cnt+1)/2.
