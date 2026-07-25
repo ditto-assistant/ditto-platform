@@ -12,6 +12,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import math
 import time
 from collections.abc import Awaitable, Callable
@@ -49,6 +50,8 @@ from ditto.db.queries.validator_auth import (
     ValidatorRequestReplayError,
     consume_validator_nonce,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/inference", tags=["inference"])
 _EXCHANGE_MAX_AGE = timedelta(minutes=2)
@@ -503,6 +506,38 @@ def _output_token_limit(payload: dict[str, Any], maximum: int) -> int:
     return value
 
 
+def _locked_grant_model(grant: Any, *, requested: str, config: Any) -> str:
+    """Resolve the model from the ticket, not from the caller's request body.
+
+    Benchmark v7 pins exactly one chat model per grant, so the request body is
+    advisory at best and adversarial at worst: the miner wrote the harness that
+    produced it. Return the grant's model and record any disagreement — an
+    agent asking for a model other than the one its ticket pins is a deliberate
+    act, not a typo, and is worth surfacing as an evasion signal.
+
+    Pre-v7 grants keep their original semantics exactly: the caller chooses from
+    the globally permitted set, so historical replay is unchanged.
+    """
+    if grant.bench_version < 7:
+        if requested not in config.allowed_models:
+            raise HTTPException(status_code=403, detail="model is not permitted")
+        return requested
+    if not grant.allowed_models:
+        raise HTTPException(status_code=409, detail="inference route unavailable")
+    locked = grant.allowed_models[0]
+    if requested != locked:
+        logger.warning(
+            "v7 inference model mismatch: grant=%s agent=%s slot=%s "
+            "requested=%r locked=%r — serving the locked model",
+            grant.grant_id,
+            grant.agent_id,
+            grant.slot_id,
+            requested,
+            locked,
+        )
+    return locked
+
+
 def _locked_upstream_payload(
     payload: dict[str, Any], *, model: str, max_tokens: int
 ) -> dict[str, Any]:
@@ -538,8 +573,22 @@ def _validated_embedding_payload(
     }:
         raise HTTPException(status_code=400, detail="invalid embedding request")
     inputs = payload.get("input")
+    # The embedding model is pinned by the ticket and substituted by the trusted
+    # broker before the request ever reaches here, so a disagreement is not a
+    # harness configuration choice — it means something upstream of this
+    # boundary tried to select a different embedding space. Surface it as an
+    # evasion signal, then fail closed. (Unlike chat, this stays a rejection:
+    # silently rewriting the model would change the vector space under a caller
+    # that is validating dimensions, which is strictly worse than refusing.)
+    requested_model = payload.get("model")
+    if requested_model != model:
+        logger.warning(
+            "v7 embedding model mismatch: requested=%r locked=%r — refusing",
+            requested_model,
+            model,
+        )
     if (
-        payload.get("model") != model
+        requested_model != model
         or payload.get("dimensions") != dimensions
         or payload.get("encoding_format") != "float"
         or not isinstance(inputs, list)
@@ -721,8 +770,8 @@ async def proxy_chat_completions(
     if not isinstance(payload, dict) or payload.get("stream") not in {None, False}:
         raise HTTPException(status_code=400, detail="streaming is not supported")
     _validate_request_schema(payload)
-    model = payload.get("model")
-    if not isinstance(model, str) or model not in config.allowed_models:
+    requested_model = payload.get("model")
+    if not isinstance(requested_model, str):
         raise HTTPException(status_code=403, detail="model is not permitted")
     max_tokens = _output_token_limit(payload, config.max_output_tokens)
 
@@ -756,6 +805,13 @@ async def proxy_chat_completions(
             raise HTTPException(
                 status_code=401, detail="invalid inference proof"
             ) from error
+        # The model is a property of the ticket, never of the request. A miner
+        # controls every byte of the harness that produced this body, so the
+        # only trustworthy source is the grant the platform itself minted. For
+        # v7 the grant pins exactly one model; take it and discard whatever the
+        # body asked for, so an agent cannot select a cheaper or stronger model
+        # by editing its own code. Metering below uses the same locked value.
+        model = _locked_grant_model(grant, requested=requested_model, config=config)
         reserved = await begin_inference_request(
             session,
             grant_id=x_ditto_grant,
