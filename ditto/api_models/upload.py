@@ -55,6 +55,13 @@ class UploadCheckRequest(BaseModel):
     allow_identical_rescore: bool = False
     """Explicitly permit buying another seed for byte-identical source."""
 
+    reserve_submission_slot: bool = False
+    """Reserve this owner's currently eligible slot before payment.
+
+    Older clients may leave this false. New miner clients set it true and refuse
+    to pay unless the response contains an admission token.
+    """
+
 
 class UploadCheckResponse(BaseModel):
     """Returned by ``POST /upload/check``.
@@ -84,6 +91,15 @@ class UploadCheckResponse(BaseModel):
 
     retry_at: datetime | None = None
     """UTC timestamp when an owner coldkey blocked by cooldown may retry."""
+
+    admission_token: UUID | None = None
+    """Opaque reservation consumed by the matching upload after payment."""
+
+    admission_expires_at: datetime | None = None
+    """UTC expiry of :attr:`admission_token`."""
+
+    cooldown_seconds: Annotated[int, Field(ge=60, le=86400)] | None = None
+    """Platform-controlled owner cooldown used for this decision."""
 
 
 class UploadAgentResponse(BaseModel):
