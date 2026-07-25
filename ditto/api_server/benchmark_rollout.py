@@ -27,7 +27,7 @@ from ditto.db.models import (
 )
 from ditto.db.queries.benchmark_rollout import (
     MAX_PERSISTED_RESCORE_COHORT_SIZE,
-    RESCORE_COHORT_SIZE,
+    PRIORITY_COHORT_SIZE,
     DatasetPin,
     InferenceActivationRequirements,
     RolloutSnapshotMember,
@@ -84,11 +84,24 @@ class PendingQualification:
 async def _rollout_rescore_cohort(
     session: AsyncSession, *, rollout: BenchmarkRollout
 ) -> list[RolloutSnapshotMember]:
-    """Preserve already-frozen members, then fill new rollouts to the top ten.
+    """Preserve already-frozen members, then fill the rollout to ITS OWN target.
+
+    The size read here is ``rollout.rescore_cohort_target`` -- the operator
+    policy frozen onto this row when the rollout started -- never the live
+    setting. That is the whole answer to "what happens if an operator raises the
+    cohort size to 25 while a 10-member rollout is open?": nothing. This rollout
+    keeps filling to 10 and the new value applies to the next rollout only.
+
+    The alternative (reading the live policy) would let a backroom write grow an
+    in-flight cohort underneath the validators already scoring it, silently
+    moving the completion bar that gates the authority switch. Membership being
+    append-only makes that *safe*, but it does not make it *predictable*, and an
+    operator raising a policy default should not extend an in-flight transition
+    they have already been told the shape of.
 
     Older deployments created cohorts as large as 25. Those durable rows and
-    their accepted scores are never deleted; only rollouts that have not
-    already crossed the new bound are filled to ten.
+    their accepted scores are never deleted; a rollout already at or above its
+    target is returned untouched.
     """
     existing = (
         (
@@ -103,6 +116,14 @@ async def _rollout_rescore_cohort(
     )
     if len(existing) > MAX_PERSISTED_RESCORE_COHORT_SIZE:
         raise RuntimeError("existing benchmark rollout exceeds the top-25 bound")
+    target = rollout.rescore_cohort_target
+    if not PRIORITY_COHORT_SIZE <= target <= MAX_PERSISTED_RESCORE_COHORT_SIZE:
+        # A CHECK constraint already guarantees this; fail loudly rather than
+        # silently rescoring an unbounded cohort if a row is ever hand-edited.
+        raise RuntimeError(
+            f"benchmark rollout rescore target {target} is outside "
+            f"[{PRIORITY_COHORT_SIZE}, {MAX_PERSISTED_RESCORE_COHORT_SIZE}]"
+        )
     cohort = [
         RolloutSnapshotMember(
             member.agent_id,
@@ -111,19 +132,19 @@ async def _rollout_rescore_cohort(
         )
         for member in existing
     ]
-    if len(existing) >= RESCORE_COHORT_SIZE:
+    if len(existing) >= target:
         return cohort
     seen = {member.agent_id for member in cohort}
     for member in await historical_rescore_cohort(
         session,
         source_version=rollout.from_version,
-        limit=RESCORE_COHORT_SIZE,
+        limit=target,
     ):
         if member.agent_id in seen:
             continue
         cohort.append(member)
         seen.add(member.agent_id)
-        if len(cohort) == RESCORE_COHORT_SIZE:
+        if len(cohort) == target:
             break
     return cohort
 
@@ -232,7 +253,7 @@ async def qualification_candidate(
 async def rolling_qualification_blockers(
     session: AsyncSession, *, generator_run_size: str | None
 ) -> list[dict[str, str]]:
-    """Describe inherited top-ten agents that automatic qualification cannot add."""
+    """Describe inherited cohort agents that automatic qualification cannot add."""
     rollout = await open_rollout(session)
     if rollout is None:
         return []
@@ -278,7 +299,7 @@ async def refresh_rolling_qualification(
     now: datetime,
     inference_config: InferenceProxyConfig | None = None,
 ) -> int:
-    """Converge the frozen inherited top-ten cohort and try activation.
+    """Converge the frozen inherited rescore cohort and try activation.
 
     Dataset rendering deliberately happens between transactions: the generator
     is a network service and must never run while holding rollout/agent locks.
@@ -291,7 +312,7 @@ async def refresh_rolling_qualification(
         if rollout is None:
             return 0
         cohort = await _rollout_rescore_cohort(session, rollout=rollout)
-        if len(cohort) < 5:
+        if len(cohort) < PRIORITY_COHORT_SIZE:
             logger.error(
                 "benchmark rollout cannot build inherited cohort rollout_id=%s "
                 "eligible_members=%s",

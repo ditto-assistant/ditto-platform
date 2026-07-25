@@ -1239,6 +1239,34 @@ class BenchmarkRollout(Base):
     desired_version: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     cohort_size: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    rescore_cohort_target: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=10, server_default=text("10")
+    )
+    """How many inherited agents this rollout set out to rescore.
+
+    Frozen from the operator setting
+    (``queue_policy_settings_revisions.settings.rescore_cohort_size``) at
+    START and never rewritten, so a later revision cannot resize an in-flight
+    rollout and a historical rollout stays explainable. ``cohort_size`` is how
+    many members were actually qualified; this is the size that was aimed for.
+    """
+    priority_cohort_target: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=5, server_default=text("5")
+    )
+    """How many top inherited positions must hold a target-version quorum here.
+
+    Frozen from ``queue_policy_settings_revisions.settings.priority_cohort_size``
+    at START, for the same reason as ``rescore_cohort_target``: this is the gate
+    that decides when the rollout may take ledger authority, and re-gating a
+    transition already in flight would move the finish line underneath it.
+
+    Distinct from ``ditto.db.queries.benchmark_rollout.PRIORITY_COHORT_SIZE``,
+    which stays a constant. That constant serves two fused meanings -- the
+    rollout activation gate AND the KOTH top-five emission set. Only the former
+    is queue policy; the latter is a consensus quantity that must keep matching
+    ``MIN_DESIRED_AUTHORITY_AGENTS``. This column is the tunable half, and the
+    constant remains its floor.
+    """
     blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -1257,6 +1285,26 @@ class BenchmarkRollout(Base):
             # before new transitions were narrowed to ten members.
             "cohort_size BETWEEN 5 AND 25",
             name="benchmark_rollout_bounded_members",
+        ),
+        CheckConstraint(
+            # Same storage ceiling as cohort_size: an operator may widen the
+            # target from the default ten up to twenty-five, never past it.
+            # Deliberately NOT related to cohort_size by a constraint --
+            # pre-existing 11-25 member rollouts backfilled a target that is
+            # their own size, and an in-flight rollout is legitimately below it.
+            "rescore_cohort_target BETWEEN 5 AND 25",
+            name="benchmark_rollout_bounded_rescore_target",
+        ),
+        CheckConstraint(
+            # Floor is the KOTH emission-set size: a priority gate below five
+            # would let the ledger flip to the desired version with fewer
+            # recipients than the emission split expects. Ceiling is the same
+            # storage bound as the rescore target. Deliberately NOT constrained
+            # to be <= rescore_cohort_target in SQL: the wire model already
+            # rejects that combination, and a CHECK spanning both columns would
+            # make backfilling a legacy 11-25-member rollout order-dependent.
+            "priority_cohort_target BETWEEN 5 AND 25",
+            name="benchmark_rollout_bounded_priority_target",
         ),
         CheckConstraint(
             # 'superseded' is terminal: an operator abandoned the rollout before
@@ -2628,5 +2676,64 @@ class ContinualRetestSettingsRevision(Base):
             "scope",
             "parent_revision",
             name="continual_retest_settings_scope_parent_key",
+        ),
+    )
+
+
+class QueuePolicySettingsRevision(Base):
+    """Append-only operator policy for the validator queue.
+
+    Cohort sizing, the per-validator fresh-vs-cohort lane split, the provisional
+    contender lane, and the previous-generation carryover gate. Each revision
+    stores the WHOLE policy rather than a diff, so any historical revision is
+    reconstructable on its own and a read never merges partial revisions.
+
+    Fields are consumed on three different schedules -- frozen at rollout start,
+    live-but-rollout-locked, and plain live. See
+    ``ditto.api_models.queue_policy_settings`` for which is which and why it
+    matters.
+    """
+
+    __tablename__ = "queue_policy_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("scope = '*'", name="queue_policy_settings_scope_check"),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="queue_policy_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="queue_policy_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="queue_policy_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="queue_policy_settings_actor_check",
+        ),
+        Index(
+            "queue_policy_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="queue_policy_settings_scope_parent_key",
         ),
     )

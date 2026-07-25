@@ -26,6 +26,9 @@ from ditto.api_server.endpoints.admin_miner_fees import (
 from ditto.api_server.endpoints.admin_quarantine import (
     router as admin_quarantine_router,
 )
+from ditto.api_server.endpoints.admin_queue_policy_settings import (
+    router as admin_queue_policy_settings_router,
+)
 from ditto.api_server.endpoints.admin_scoring_readiness import (
     router as admin_scoring_readiness_router,
 )
@@ -53,6 +56,7 @@ __all__ = [
     "inference_router",
     "admin_artifact_release_settings_router",
     "admin_benchmark_rollout_router",
+    "admin_queue_policy_settings_router",
     "admin_efficiency_bonus_settings_router",
     "admin_inference_routes_router",
     "admin_copy_review_router",

@@ -50,12 +50,35 @@ LEGACY_BENCH_VERSION = 2
 # Compatibility name for callers/tests that need the newest *shipped* contract.
 # This is discovery metadata only: it no longer opens or selects a rollout.
 CANARY_BENCH_VERSION = latest_benchmark_contract().version
+# Two fused meanings, deliberately kept in one constant only as a FLOOR:
+#
+# 1. The KOTH top-five (``rolling_top_five``) -- a consensus quantity that must
+#    keep matching ``MIN_DESIRED_AUTHORITY_AGENTS``. Not operator policy.
+# 2. Historically also the rollout ACTIVATION GATE: how many top inherited
+#    positions must hold a target-version quorum before the rollout may take
+#    ledger authority.
+#
+# Meaning (2) is now operator policy, frozen per rollout onto
+# ``BenchmarkRollout.priority_cohort_target``. Read that column, never this
+# constant, when asking how wide an existing rollout's gate is. This constant
+# survives as meaning (1) and as the configurable floor for meaning (2).
 PRIORITY_COHORT_SIZE = 5
-# New benchmark transitions rescore only the inherited top ten. The database
-# still permits older 11-25-member rollout snapshots so historical audit rows
-# remain readable and an in-flight rollout created by an older deployment can
-# finish without destructive member deletion.
-RESCORE_COHORT_SIZE = 10
+# How many inherited agents a new benchmark transition rescores when no operator
+# revision has ever been written. This is only the DEFAULT: the effective size
+# is the operator policy in ``queue_policy_settings_revisions``, read once
+# at rollout start and frozen onto ``BenchmarkRollout.rescore_cohort_target``.
+#
+# Never read this constant to decide how large an EXISTING rollout should grow
+# -- read ``rollout.rescore_cohort_target``. A rollout that froze ten members
+# must stay a ten-member rollout even after the operator widens the policy to
+# twenty-five, or an in-flight cohort would silently grow underneath the
+# validators already scoring it.
+DEFAULT_RESCORE_COHORT_SIZE = 10
+# The storage ceiling, mirrored by the ``benchmark_rollout_bounded_members`` and
+# ``benchmark_rollout_bounded_rescore_target`` CHECK constraints. It is also the
+# upper bound an operator may configure. Older 11-25-member rollout snapshots
+# predate the top-ten default; they remain readable and an in-flight rollout
+# created by an older deployment still finishes without member deletion.
 MAX_PERSISTED_RESCORE_COHORT_SIZE = 25
 SCORING_QUORUM = 3
 # How many agents must hold a COMPLETE, ranked desired-version quorum before
@@ -330,7 +353,7 @@ async def historical_rescore_cohort(
     session: AsyncSession,
     *,
     source_version: int,
-    limit: int = RESCORE_COHORT_SIZE,
+    limit: int = DEFAULT_RESCORE_COHORT_SIZE,
 ) -> list[RolloutSnapshotMember]:
     """Freeze the prior-era rescore cohort without admitting the whole ledger.
 
@@ -338,12 +361,19 @@ async def historical_rescore_cohort(
     ``limit`` finalized distinct miners, the next older scored benchmark fills
     the remaining positions. No third historical era is consulted: this is the
     explicit "combine two previous benchmark iterations" fallback, not an
-    unbounded backfill of every legacy submission.
+    unbounded backfill of every legacy submission. That contract is enforced by
+    the ``.limit(2)`` on the version query below and is independent of
+    ``limit`` -- widening the cohort to twenty-five can only return fewer
+    members from the same two eras, never reach into a third.
+
+    The upper bound is the storage ceiling, not the default cohort size: an
+    operator may configure any size in ``[5, 25]``, so validating against the
+    default would make raising the setting throw.
     """
-    if limit < PRIORITY_COHORT_SIZE or limit > RESCORE_COHORT_SIZE:
+    if not PRIORITY_COHORT_SIZE <= limit <= MAX_PERSISTED_RESCORE_COHORT_SIZE:
         raise ValueError(
             f"rollout cohort limit must be between {PRIORITY_COHORT_SIZE} "
-            f"and {RESCORE_COHORT_SIZE}"
+            f"and {MAX_PERSISTED_RESCORE_COHORT_SIZE}"
         )
     versions = list(
         await session.scalars(
@@ -521,11 +551,15 @@ async def active_bench_version(session: AsyncSession) -> int:
     if open_transition is not None:
         from ditto.db.queries.scores import count_ranked_quorum_agents
 
+        # The gate width is the target this rollout FROZE at start, not the live
+        # operator setting: re-gating a transition already in flight would move
+        # its finish line underneath the validators scoring it.
+        priority_target = open_transition.priority_cohort_target
         priority_ids = set(
             await session.scalars(
                 select(BenchmarkRolloutMember.agent_id).where(
                     BenchmarkRolloutMember.rollout_id == open_transition.rollout_id,
-                    BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE,
+                    BenchmarkRolloutMember.position <= priority_target,
                 )
             )
         )
@@ -534,8 +568,12 @@ async def active_bench_version(session: AsyncSession) -> int:
             bench_version=open_transition.desired_version,
             agent_ids=priority_ids,
         )
+        # MIN_DESIRED_AUTHORITY_AGENTS stays a constant on purpose. It is the
+        # KOTH emission-set size, so it is a consensus quantity, not queue
+        # policy: below it the ledger flip would have fewer recipients than the
+        # emission split expects. The priority target above is the tunable half.
         if (
-            len(priority_ids) == PRIORITY_COHORT_SIZE
+            len(priority_ids) == priority_target
             and ready >= MIN_DESIRED_AUTHORITY_AGENTS
         ):
             if (
@@ -766,15 +804,18 @@ async def authority_selection_state(
             "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
             "blocked_reason": "no rollout history exists for this contract",
         }
+    # This rollout's own frozen gate width, so a historical contract's
+    # authority verdict never changes when the live policy is retuned.
+    priority_target = rollout.priority_cohort_target
     priority_ids = set(
         await session.scalars(
             select(BenchmarkRolloutMember.agent_id).where(
                 BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
-                BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE,
+                BenchmarkRolloutMember.position <= priority_target,
             )
         )
     )
-    if len(priority_ids) != PRIORITY_COHORT_SIZE:
+    if len(priority_ids) != priority_target:
         return {
             "version": bench_version,
             "ready": False,
@@ -895,11 +936,46 @@ async def create_rollout_snapshot(
     now: datetime,
     from_version: int = DEFAULT_BENCH_VERSION,
     desired_version: int = CANARY_BENCH_VERSION,
+    rescore_cohort_target: int = DEFAULT_RESCORE_COHORT_SIZE,
+    priority_cohort_target: int = PRIORITY_COHORT_SIZE,
     audit_context: dict[str, Any] | None = None,
 ) -> BenchmarkRollout:
-    """Freeze a bounded prior-era cohort and target dataset pins, idempotently."""
+    """Freeze a bounded prior-era cohort and target dataset pins, idempotently.
+
+    ``rescore_cohort_target`` and ``priority_cohort_target`` are the operator
+    policy at the moment of the start. Both are written onto the rollout row and
+    never rewritten, so a later policy revision cannot resize or re-gate this
+    rollout and a historical rollout can always be explained by the shape it was
+    actually built to.
+    """
     if desired_version <= from_version:
         raise ValueError("a benchmark rollout must move the version forward")
+    if (
+        not PRIORITY_COHORT_SIZE
+        <= rescore_cohort_target
+        <= MAX_PERSISTED_RESCORE_COHORT_SIZE
+    ):
+        raise ValueError(
+            f"rollout rescore cohort target must be between {PRIORITY_COHORT_SIZE} "
+            f"and {MAX_PERSISTED_RESCORE_COHORT_SIZE}"
+        )
+    if (
+        not PRIORITY_COHORT_SIZE
+        <= priority_cohort_target
+        <= MAX_PERSISTED_RESCORE_COHORT_SIZE
+    ):
+        raise ValueError(
+            f"rollout priority cohort target must be between {PRIORITY_COHORT_SIZE} "
+            f"and {MAX_PERSISTED_RESCORE_COHORT_SIZE}"
+        )
+    if priority_cohort_target > rescore_cohort_target:
+        # The gate would wait on inherited positions the cohort never fills, so
+        # the rollout could never activate. The wire model rejects this too; this
+        # is the guard for internal callers that bypass it.
+        raise ValueError(
+            f"rollout priority cohort target {priority_cohort_target} cannot exceed "
+            f"its rescore cohort target {rescore_cohort_target}"
+        )
     if session.get_bind().dialect.name == "postgresql":
         # One global rollout lock name, deliberately NOT keyed on the version:
         # only one rollout may be open at a time, so every transition must
@@ -927,8 +1003,11 @@ async def create_rollout_snapshot(
             f"{conflicting.desired_version} is still {conflicting.status}; only one "
             "benchmark rollout may be open at a time"
         )
-    if not PRIORITY_COHORT_SIZE <= len(members) <= RESCORE_COHORT_SIZE:
-        raise ValueError("a benchmark rollout requires between five and ten members")
+    if not PRIORITY_COHORT_SIZE <= len(members) <= rescore_cohort_target:
+        raise ValueError(
+            f"a benchmark rollout requires between {PRIORITY_COHORT_SIZE} and "
+            f"{rescore_cohort_target} members"
+        )
     if len({m.agent_id for m in members}) != len(members):
         raise ValueError("benchmark rollout agents must be distinct")
     if len({m.miner_hotkey for m in members}) != len(members):
@@ -942,6 +1021,8 @@ async def create_rollout_snapshot(
         desired_version=desired_version,
         status="collecting",
         cohort_size=len(members),
+        rescore_cohort_target=rescore_cohort_target,
+        priority_cohort_target=priority_cohort_target,
         created_at=now,
     )
     session.add(rollout)
@@ -1272,10 +1353,13 @@ async def issue_rollout_ticket(
         )
         .exists()
     )
+    # This rollout's frozen gate width, so retuning the live policy never
+    # changes which members an in-flight rollout prioritises.
+    priority_target = rollout.priority_cohort_target
     priority_complete = await rollout_cohort_score_complete(
         session,
         rollout=rollout,
-        cohort_size=PRIORITY_COHORT_SIZE,
+        cohort_size=priority_target,
     )
     member_statement = (
         select(BenchmarkRolloutMember)
@@ -1295,7 +1379,7 @@ async def issue_rollout_ticket(
         # that has already scored every incomplete priority member idles until
         # another validator closes those quorums; it must not skip to rank 6.
         member_statement = member_statement.where(
-            BenchmarkRolloutMember.position <= PRIORITY_COHORT_SIZE
+            BenchmarkRolloutMember.position <= priority_target
         )
     member = await session.scalar(
         member_statement.order_by(
@@ -1512,7 +1596,13 @@ async def rollout_state(
             "qualification_converged": False,
             "cohort_size": 0,
             "cohort_ready_count": 0,
+            # No rollout row, so nothing has frozen a target yet. The size the
+            # NEXT start will freeze is the operator policy, served by
+            # GET /admin/queue-policy-settings.
+            "rescore_cohort_target": None,
+            "max_rescore_cohort_size": MAX_PERSISTED_RESCORE_COHORT_SIZE,
             "priority_cohort_size": PRIORITY_COHORT_SIZE,
+            "priority_cohort_target": None,
             "priority_complete": False,
             "members": [],
         }
@@ -1543,8 +1633,10 @@ async def rollout_state(
     current_top = await rolling_top_five(session)
     current_top_ids = {member.agent_id for member in current_top}
     qualified_ids = {member.agent_id for member in members}
+    # This rollout's frozen activation gate width.
+    priority_target = rollout.priority_cohort_target
     priority_member_ids = {
-        member.agent_id for member in members if member.position <= PRIORITY_COHORT_SIZE
+        member.agent_id for member in members if member.position <= priority_target
     }
     ranked_quorum_agents = await count_ranked_quorum_agents(
         session,
@@ -1555,9 +1647,9 @@ async def rollout_state(
         counts.get(member.agent_id, 0) >= SCORING_QUORUM for member in members
     )
     priority_members = [
-        member for member in members if member.position <= PRIORITY_COHORT_SIZE
+        member for member in members if member.position <= priority_target
     ]
-    priority_complete = len(priority_members) == PRIORITY_COHORT_SIZE and all(
+    priority_complete = len(priority_members) == priority_target and all(
         counts.get(member.agent_id, 0) >= SCORING_QUORUM for member in priority_members
     )
     return {
@@ -1572,11 +1664,23 @@ async def rollout_state(
         # DEPRECATED alias of canary_capable_validator_count; see above.
         "v3_capable_validator_count": capable_count,
         "current_hybrid_top_five": [str(member.agent_id) for member in current_top],
+        # Deliberately still PRIORITY_COHORT_SIZE: `current_top` is
+        # `rolling_top_five`, the KOTH top five, which is a consensus quantity
+        # rather than this rollout's activation gate. Swapping it for the
+        # tunable target would silently redefine "converged".
         "qualification_converged": len(current_top) == PRIORITY_COHORT_SIZE
         and current_top_ids.issubset(qualified_ids),
         "cohort_size": rollout.cohort_size,
         "cohort_ready_count": cohort_ready_count,
-        "priority_cohort_size": PRIORITY_COHORT_SIZE,
+        # What this rollout froze at start. Immune to later policy revisions,
+        # so a historical rollout is always explainable by the size it aimed
+        # for -- `cohort_size` is how many members it actually qualified.
+        "rescore_cohort_target": rollout.rescore_cohort_target,
+        "max_rescore_cohort_size": MAX_PERSISTED_RESCORE_COHORT_SIZE,
+        # The gate width this rollout froze at start. Identical to
+        # PRIORITY_COHORT_SIZE for every rollout that predates the setting.
+        "priority_cohort_size": priority_target,
+        "priority_cohort_target": priority_target,
         "priority_complete": priority_complete,
         "members": [
             {

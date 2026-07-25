@@ -32,12 +32,16 @@ from ditto.api_server.inference_routing import (
     aggregate_profile_revision,
     benchmark_model,
 )
+from ditto.api_server.queue_policy_settings import (
+    resolve_queue_policy_settings,
+)
 from ditto.db.models import (
     InferenceProviderRoute,
     InferenceRoutingPolicy,
     ValidatorHeartbeat,
 )
 from ditto.db.queries.benchmark_rollout import (
+    PRIORITY_COHORT_SIZE,
     DatasetPin,
     RolloutConflictError,
     active_bench_version,
@@ -522,12 +526,21 @@ async def start_rollout(
             else None
         ),
     )
-    members = await historical_rescore_cohort(session, source_version=from_version)
-    if len(members) < 5:
+    # Read the operator policy exactly once, here, and freeze it onto the
+    # rollout below. Everything downstream (backfill, blockers, telemetry) reads
+    # the frozen value, so a later revision cannot resize this rollout.
+    queue_policy = await resolve_queue_policy_settings(session)
+    rescore_cohort_target = queue_policy.rescore_cohort_size
+    priority_cohort_target = queue_policy.priority_cohort_size
+    members = await historical_rescore_cohort(
+        session, source_version=from_version, limit=rescore_cohort_target
+    )
+    if len(members) < PRIORITY_COHORT_SIZE:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"benchmark v{target} rollout requires five eligible distinct miners"
+                f"benchmark v{target} rollout requires "
+                f"{PRIORITY_COHORT_SIZE} eligible distinct miners"
             ),
         )
     pins: dict = {}
@@ -570,6 +583,8 @@ async def start_rollout(
             now=now,
             from_version=from_version,
             desired_version=target,
+            rescore_cohort_target=rescore_cohort_target,
+            priority_cohort_target=priority_cohort_target,
             audit_context={
                 "origin": "admin",
                 "actor": payload.actor,
@@ -577,6 +592,11 @@ async def start_rollout(
                 "from_version": from_version,
                 "desired_version": target,
                 "seed_sources": seed_sources,
+                # Recorded in the immutable audit trail as well as on the row,
+                # so the size this rollout was built to is recoverable even if
+                # the row is later inspected without its policy history.
+                "rescore_cohort_target": rescore_cohort_target,
+                "priority_cohort_target": priority_cohort_target,
             },
         )
     except RolloutConflictError as exc:
