@@ -1855,11 +1855,12 @@ class TestHeartbeat:
                     "stage": "running_benchmark",
                     "completed_checks": 51,
                     "total_checks": 114,
-                    "percent": 45,
+                    "percent": 44,
                     "stalled": False,
                 }
             if progress["stage"] in {"finalizing", "submitting_result"}:
-                assert shown["percent"] == 95
+                # Only a terminal stage may report a full bar.
+                assert shown["percent"] == 100
                 assert shown["completed_checks"] == shown["total_checks"] == 114
 
         pipeline = (

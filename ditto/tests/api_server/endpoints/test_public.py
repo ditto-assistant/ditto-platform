@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.public import PublicSystemMetrics
+from ditto.api_models.public import PublicBenchmarkProgress, PublicSystemMetrics
 from ditto.api_models.screener import (
     SCREENING_POLICY_VERSION,
     SourceReviewEvidenceItem,
@@ -3516,7 +3516,7 @@ class TestPublicActivity:
         first = next(
             progress for progress in shown if progress["completed_checks"] == 51
         )
-        assert first["percent"] == 45
+        assert first["percent"] == 44  # 51/114 exactly, no 5% bucket.
         assert first["bench_version"] == 2
         assert first["total_checks"] == 114
         assert datetime.fromisoformat(first["started_at"].replace("Z", "+00:00")) == (
@@ -3525,7 +3525,7 @@ class TestPublicActivity:
         threshold = next(
             progress for progress in shown if progress["completed_checks"] == 3
         )
-        assert threshold["percent"] == 40  # 3/8 = 37.5%, rounded half-up.
+        assert threshold["percent"] == 37  # 3/8 = 37.5%, truncated, not bucketed.
         activity = responses[1].json()["entries"][0]
         assert len(activity["active_benchmarks"]) == 2
         pipeline = responses[2].json()
@@ -5373,3 +5373,205 @@ def test_bench_glossary_explains_every_v5_category_and_metric() -> None:
         "token_efficiency",
     ):
         assert key in metrics, f"undocumented metric: {key}"
+
+
+class TestBenchmarkStallDetection:
+    """``_benchmark_stalled`` must separate a stuck run from a stuck stream.
+
+    The operator complaint this answers is "I cannot tell whether the bench is
+    wedged or the reporting is". Those are two different faults with two
+    different owners, and they are computed from two different signals:
+    ``stalled`` reads the run's own reported progress against elapsed time, while
+    liveness (``online`` / ``heartbeat_stale``) reads ``seen_at``. A run that is
+    frozen but reporting must read stalled-and-online; a validator that has gone
+    quiet must not be reported as a stalled run.
+    """
+
+    _START = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+
+    def test_an_early_stage_stalls_on_wall_clock_alone(self) -> None:
+        """Pre-run stages have no count to judge, so the clock is all there is."""
+        assert not public_endpoint._benchmark_stalled(
+            "generating_dataset", self._START, self._START + timedelta(minutes=14)
+        )
+        assert public_endpoint._benchmark_stalled(
+            "generating_dataset", self._START, self._START + timedelta(minutes=16)
+        )
+
+    def test_a_healthy_running_benchmark_is_never_called_stalled(self) -> None:
+        """A v7 run near its real ~4s/check pace must stay clean throughout.
+
+        This is the regression that matters most: mislabelling a working run as
+        stuck is worse than the missing signal it replaces, because it trains the
+        operator to ignore the badge.
+        """
+        for completed in range(0, 282, 7):
+            elapsed = timedelta(seconds=4 * completed)
+            assert not public_endpoint._benchmark_stalled(
+                "running_benchmark",
+                self._START,
+                self._START + elapsed,
+                completed=completed,
+            )
+
+    def test_a_frozen_running_benchmark_is_flagged(self) -> None:
+        """A count stuck at 3/281 cannot explain three quarters of an hour."""
+        assert public_endpoint._benchmark_stalled(
+            "running_benchmark",
+            self._START,
+            self._START + timedelta(minutes=45),
+            completed=3,
+        )
+
+    def test_the_startup_grace_covers_a_slow_first_check(self) -> None:
+        """Zero completed checks is normal for a while; it is not yet a stall."""
+        assert not public_endpoint._benchmark_stalled(
+            "running_benchmark",
+            self._START,
+            self._START + timedelta(minutes=14),
+            completed=0,
+        )
+        assert public_endpoint._benchmark_stalled(
+            "running_benchmark",
+            self._START,
+            self._START + timedelta(minutes=16),
+            completed=0,
+        )
+
+    def test_an_unreported_count_does_not_invent_a_stall(self) -> None:
+        """Missing telemetry is not evidence of a wedged run.
+
+        A validator that reports the stage but omits counts (an older protocol, or
+        a poll that degraded to unknown) must fall back to the plain grace window
+        rather than being treated as frozen at zero.
+        """
+        for elapsed in (timedelta(minutes=14), timedelta(hours=1), timedelta(hours=9)):
+            assert not public_endpoint._benchmark_stalled(
+                "running_benchmark",
+                self._START,
+                self._START + elapsed,
+                completed=None,
+            )
+
+    def test_a_terminal_stage_is_never_stalled(self) -> None:
+        """Finalizing and submitting are bounded by the validator, not by us."""
+        for stage in ("finalizing", "submitting_result", "failed_retrying"):
+            assert not public_endpoint._benchmark_stalled(
+                stage,  # type: ignore[arg-type]
+                self._START,
+                self._START + timedelta(hours=6),
+                completed=281,
+            )
+
+    def test_stall_is_independent_of_reporting_liveness(self) -> None:
+        """The two signals are orthogonal, and must be computed independently.
+
+        ``_benchmark_stalled`` is a pure function of the run's own progress and
+        never consults ``seen_at``; a stalled run therefore still reads online so
+        long as it keeps heartbeating. Asserting both here pins the separation
+        that makes the badge trustworthy.
+        """
+        now = self._START + timedelta(minutes=45)
+        assert public_endpoint._benchmark_stalled(
+            "running_benchmark", self._START, now, completed=3
+        )
+        online, _availability, _health = _fleet_classification(
+            state="running_benchmark", seen_at=now, now=now, metrics=None
+        )
+        assert online is True
+
+
+class TestPublicProgressResolution:
+    """``percent`` is exact, and the allowlist it lives in stays closed.
+
+    The 5% quantizer was removed because it withheld nothing: ``completed_checks``
+    and ``total_checks`` are published exactly on the same model, so the ratio was
+    always derivable. These tests pin both halves of that argument — the
+    resolution is now exact, *and* nothing per-case rode in alongside it.
+    """
+
+    @staticmethod
+    def _progress(
+        stage: str, completed: int | None, total: int | None
+    ) -> PublicBenchmarkProgress:
+        now = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+        work = SimpleNamespace(
+            agent=SimpleNamespace(agent_id=uuid4(), name="lihai"),
+            ticket=SimpleNamespace(slot_id="slot-0", bench_version=7, issued_at=now),
+            progress=SimpleNamespace(stage=stage, completed=completed, total=total),
+        )
+        return public_endpoint._public_benchmark_progress(work, now)  # type: ignore[arg-type]
+
+    def test_percent_is_exact_not_bucketed(self) -> None:
+        """Consecutive checks now move the bar; they used to be invisible.
+
+        On a 281-check v7 run a 5% bucket was ~14 checks, so fourteen consecutive
+        completions rendered as no change at all. That is the "is it stuck?"
+        feeling the operations page was producing.
+        """
+        assert self._progress("running_benchmark", 53, 281).percent == 18
+        assert self._progress("running_benchmark", 54, 281).percent == 19
+        assert self._progress("running_benchmark", 140, 281).percent == 49
+
+    def test_a_full_bar_means_finished(self) -> None:
+        """281/281 is held at 99% until the run leaves the scoring stages."""
+        assert self._progress("running_benchmark", 281, 281).percent == 99
+        assert self._progress("finalizing", 281, 281).percent == 100
+        assert self._progress("submitting_result", 281, 281).percent == 100
+
+    def test_counts_and_percent_agree(self) -> None:
+        """The published percent must be reproducible from the published counts."""
+        rendered = self._progress("running_benchmark", 53, 281)
+        assert rendered.completed_checks == 53
+        assert rendered.total_checks == 281
+        assert rendered.percent == rendered.completed_checks * 100 // (
+            rendered.total_checks
+        )
+
+    def test_an_unreported_count_publishes_no_percent(self) -> None:
+        assert self._progress("preparing", None, None).percent is None
+
+    def test_no_per_case_field_rides_along(self) -> None:
+        """The in-flight allowlist stays closed.
+
+        Per-case identity, question text, verdicts, seeds and timings are all
+        excluded from live progress by construction. This is not stylistic: the
+        dataset seed is drawn after screening and published only post-hoc
+        (anti-overfit), and the run's canary case is identifiable from its
+        category alone, so a live per-case feed would defeat both. Any new field
+        here must be argued on that basis first.
+        """
+        rendered = self._progress("running_benchmark", 53, 281)
+        published = rendered.model_dump(mode="json")
+        assert set(published) == {
+            "agent_id",
+            "slot_id",
+            "agent_name",
+            "bench_version",
+            "started_at",
+            "stage",
+            "completed_checks",
+            "total_checks",
+            "percent",
+            "stalled",
+        }
+        forbidden = {
+            "case_id",
+            "case_category",
+            "category",
+            "prompt",
+            "question",
+            "expected",
+            "called",
+            "canary",
+            "seed",
+            "dataset_sha256",
+            "per_case",
+            "partial",
+            "verdict",
+            "correct",
+            "notes",
+            "latency_ms",
+            "run_token",
+        }
+        assert forbidden.isdisjoint(published)

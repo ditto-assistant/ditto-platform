@@ -357,6 +357,14 @@ _BENCHMARK_STALL_EARLY_STAGES: frozenset[BenchmarkProgressStage] = frozenset(
     {"preparing", "building_harness", "generating_dataset", "starting_harness"}
 )
 _BENCHMARK_STALL_AFTER = timedelta(minutes=15)
+# Elapsed-time allowance a single completed check buys a ``running_benchmark``
+# run before it reads as stalled. Deliberately an order of magnitude above the
+# real per-check cost (v7 runs near 4s/check) so that only a genuinely frozen
+# count trips it, never a slow-but-moving one. With the 15-minute startup grace
+# a full 281-check v7 run may take ~4.8 hours before it is called stalled, well
+# past the validator's own 75-minute cap — the signal is a floor on wedged runs,
+# not a competing timeout.
+_BENCHMARK_STALL_PER_CHECK = timedelta(seconds=60)
 _PUBLIC_ACTIVITY_STATUSES = frozenset(
     {
         "waiting_screening",
@@ -812,26 +820,57 @@ def _stored_screener_progress(raw: dict | None) -> ScreenerProgress | None:
 
 
 def _benchmark_stalled(
-    stage: BenchmarkProgressStage | None, started_at: datetime, now: datetime
+    stage: BenchmarkProgressStage | None,
+    started_at: datetime,
+    now: datetime,
+    *,
+    completed: int | None = None,
 ) -> bool:
-    """Flag an early stage that has run far longer than it ever legitimately should.
+    """Flag a run that has taken far longer than its own reported progress allows.
 
-    Only the pre-run stages qualify: pulling and starting the screener-built
-    image plus generating the dataset take a couple of minutes, so a quarter hour
-    still in one of them means the run is wedged (e.g. the sandbox executor cannot
-    start the container). ``running_benchmark`` is deliberately excluded: it can
-    legitimately run up to the validator's 75-minute cap, so a genuinely
-    progressing benchmark is never mislabelled.
+    Two independent shapes of "wedged", both derived from data the heartbeat
+    already carries — this asks nothing new of the validator.
+
+    **Early stages.** Pulling and starting the screener-built image plus
+    generating the dataset take a couple of minutes, so a quarter hour still in
+    one of them means the run is wedged (e.g. the sandbox executor cannot start
+    the container).
+
+    **``running_benchmark``.** Previously excluded outright, on the reasoning
+    that the stage can legitimately run to the validator's 75-minute cap. That
+    left the longest stage of the run — the one where a wedge is most likely and
+    most expensive — with no stall signal at all: a benchmark frozen at 3/281
+    read exactly like one steadily working through 281 checks. It is now judged
+    against its *own* reported count rather than against wall-clock alone: each
+    completed check buys ``_BENCHMARK_STALL_PER_CHECK`` of elapsed time on top of
+    a fixed startup grace. A healthy run earns headroom far faster than it spends
+    it (v7 sits near 4s/check against a 60s allowance), so a genuinely
+    progressing benchmark is never mislabelled; a frozen one crosses the line and
+    stays crossed.
+
+    This is deliberately *not* the same question as "is the validator still
+    reporting". A stalled run has a fresh heartbeat and a frozen count; a stalled
+    *stream* has a stale ``seen_at`` and is surfaced as ``online``/
+    ``heartbeat_stale`` by :func:`_fleet_classification`. Conflating the two is
+    what makes an operator distrust the whole view, so they stay separate
+    signals.
     """
-    if stage not in _BENCHMARK_STALL_EARLY_STAGES:
+    if stage in _BENCHMARK_STALL_EARLY_STAGES:
+        return now - started_at >= _BENCHMARK_STALL_AFTER
+    if stage != "running_benchmark" or completed is None:
+        # No reported count is not evidence of a wedged run. An older protocol, or
+        # a poll that degraded to unknown counts, leaves us with nothing to judge
+        # the clock against, and a stall badge invented from missing telemetry is
+        # exactly the false positive that teaches an operator to ignore it.
         return False
-    return now - started_at >= _BENCHMARK_STALL_AFTER
+    earned = _BENCHMARK_STALL_AFTER + _BENCHMARK_STALL_PER_CHECK * max(completed, 0)
+    return now - started_at >= earned
 
 
 def _public_benchmark_progress(
     work: ActiveValidatorWork, now: datetime
 ) -> PublicBenchmarkProgress:
-    """Coarsen private signed counts into the fixed public allowlist."""
+    """Project private signed counts onto the fixed public allowlist."""
     progress = work.progress
     started_at = cast(datetime, _aware(work.ticket.issued_at))
     if progress is None:
@@ -846,18 +885,30 @@ def _public_benchmark_progress(
     completed_checks: int | None = None
     total_checks: int | None = None
     if progress.completed is not None and progress.total is not None:
-        # Nearest 5% is useful without exposing high-resolution timing. Even
-        # 114/114 remains 95% while finalization/signing is still in progress.
-        percent = min(
-            95,
-            ((progress.completed * 200 + progress.total * 5) // (progress.total * 10))
-            * 5,
-        )
         total_checks = progress.total
         completed_checks = (
             progress.total
             if progress.stage in {"finalizing", "submitting_result"}
             else progress.completed
+        )
+        # ``percent`` used to be quantized to the nearest 5%, to avoid "exposing
+        # high-resolution timing". It never achieved that: ``completed_checks``
+        # and ``total_checks`` sit beside it on this same model, both exact, and
+        # any observer can divide one by the other. The quantizer only degraded
+        # the progress bar — on a 281-check v7 run one bucket is ~14 checks, so a
+        # smoothly advancing benchmark rendered as a bar that jumped every
+        # ~55 seconds and otherwise looked frozen. Deriving it from the exact
+        # counts discloses nothing they do not already disclose.
+        #
+        # The 100% ceiling is kept, and it is a UX rule rather than a privacy
+        # one: a run is not "done" while it is still finalizing and signing, so
+        # the bar must not sit at 100% with work outstanding. Only the terminal
+        # stages are allowed to report it.
+        exact = progress.completed * 100 // progress.total
+        percent = (
+            exact
+            if progress.stage in {"finalizing", "submitting_result"}
+            else min(99, exact)
         )
     return PublicBenchmarkProgress(
         agent_id=work.agent.agent_id,
@@ -869,7 +920,9 @@ def _public_benchmark_progress(
         completed_checks=completed_checks,
         total_checks=total_checks,
         percent=percent,
-        stalled=_benchmark_stalled(progress.stage, started_at, now),
+        stalled=_benchmark_stalled(
+            progress.stage, started_at, now, completed=progress.completed
+        ),
     )
 
 
