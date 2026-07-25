@@ -21,6 +21,7 @@ from ditto.api_models.benchmark_progress import (
     BenchmarkProgressStage,
 )
 from ditto.api_models.ticket_status import TicketStatus
+from ditto.api_models.validator_capabilities import ValidatorCapabilities
 from ditto.db.models import (
     Agent,
     ScreenerHeartbeat,
@@ -339,24 +340,41 @@ async def live_validator_fleet_supports_protocol(
     session: AsyncSession,
     *,
     minimum_protocol: int,
+    bench_version: int,
     now: datetime,
     freshness: timedelta = timedelta(minutes=15),
 ) -> bool:
-    """Whether every recently-live validator supports one additive contract.
+    """Whether every recently-live benchmark-capable validator supports a contract.
 
-    This is deliberately a *global* fleet predicate, not request negotiation:
-    every validator must receive byte-equivalent ledger semantics during an
-    asynchronous client rollout.  An empty fleet fails closed.  A legacy
-    validator that returns within the operational stale window disables the new
-    contract globally again, so mixed fleets never split their weight fold.
+    Readiness is global within the fleet that can actually score ``bench_version``.
+    Legacy validators and unrelated scorer stacks cannot consume its continual
+    retest work and therefore must not hold its aggregate fold inactive. An empty
+    capable fleet still fails closed, and every capable member must meet the
+    protocol floor so compatible validators receive byte-equivalent semantics.
     """
-    protocols = list(
+    heartbeats = list(
         await session.scalars(
-            select(ValidatorHeartbeat.protocol_version).where(
+            select(ValidatorHeartbeat).where(
                 ValidatorHeartbeat.seen_at >= now - freshness
             )
         )
     )
+    protocols: list[int] = []
+    for heartbeat in heartbeats:
+        try:
+            capabilities = ValidatorCapabilities.model_validate_json(
+                json.dumps(heartbeat.capabilities)
+            )
+        except ValidationError:
+            continue
+        scorer = capabilities.scorer_benchmarks
+        if (
+            scorer is None
+            or scorer.status != "fresh_verified"
+            or bench_version not in scorer.supported_bench_versions
+        ):
+            continue
+        protocols.append(heartbeat.protocol_version)
     return bool(protocols) and min(protocols) >= minimum_protocol
 
 

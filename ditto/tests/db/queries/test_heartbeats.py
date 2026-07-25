@@ -18,7 +18,10 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_progress import BenchmarkProgress
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.db.models import Agent, ValidatorHeartbeat
-from ditto.db.queries.heartbeats import upsert_validator_heartbeat
+from ditto.db.queries.heartbeats import (
+    live_validator_fleet_supports_protocol,
+    upsert_validator_heartbeat,
+)
 
 _HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 _DEADLINE = datetime(2030, 1, 1, tzinfo=UTC)
@@ -86,6 +89,135 @@ async def _upsert(
 def _stored(row: ValidatorHeartbeat) -> BenchmarkProgress:
     assert row.benchmark_progress is not None
     return BenchmarkProgress.model_validate_json(json.dumps(row.benchmark_progress))
+
+
+def _fleet_heartbeat(
+    hotkey: str,
+    *,
+    now: datetime,
+    protocol_version: int,
+    supported_bench_versions: list[int] | None,
+) -> ValidatorHeartbeat:
+    capabilities = None
+    if supported_bench_versions is not None:
+        capabilities = {
+            "screened_images": True,
+            "require_screened_image": True,
+            "source_build_fallback": False,
+            "full_stack_managed": True,
+            "stack_updater": True,
+            "sandbox_egress_restricted": True,
+            "ticket_inference": False,
+            "signed_score_quorum": False,
+            "executor_isolation": "ephemeral_vm",
+            "scorer_benchmarks": {
+                "status": "fresh_verified",
+                "supported_bench_versions": supported_bench_versions,
+                "observed_at": int(now.timestamp()),
+                "software_version": "1.0.0",
+                "source_revision": "a" * 40,
+            },
+        }
+    return ValidatorHeartbeat(
+        validator_hotkey=hotkey,
+        software_version="1.0.0",
+        protocol_version=protocol_version,
+        code_digest="ab" * 32,
+        state="polling",
+        first_seen_at=now,
+        reported_at=now,
+        seen_at=now,
+        signature="ab" * 64,
+        capabilities=capabilities,
+    )
+
+
+async def test_fleet_protocol_gate_ignores_live_non_participating_validators(
+    session: AsyncSession,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with session.begin():
+        session.add_all(
+            [
+                _fleet_heartbeat(
+                    "bench-6-capable",
+                    now=now,
+                    protocol_version=14,
+                    supported_bench_versions=[2, 6],
+                ),
+                _fleet_heartbeat(
+                    "legacy-validator",
+                    now=now,
+                    protocol_version=6,
+                    supported_bench_versions=None,
+                ),
+                _fleet_heartbeat(
+                    "other-benchmark",
+                    now=now,
+                    protocol_version=8,
+                    supported_bench_versions=[2, 5],
+                ),
+            ]
+        )
+
+    assert await live_validator_fleet_supports_protocol(
+        session,
+        minimum_protocol=14,
+        bench_version=6,
+        now=now,
+    )
+
+
+async def test_fleet_protocol_gate_requires_every_capable_validator(
+    session: AsyncSession,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with session.begin():
+        session.add_all(
+            [
+                _fleet_heartbeat(
+                    "current-capable",
+                    now=now,
+                    protocol_version=14,
+                    supported_bench_versions=[2, 6],
+                ),
+                _fleet_heartbeat(
+                    "old-capable",
+                    now=now,
+                    protocol_version=13,
+                    supported_bench_versions=[2, 6],
+                ),
+            ]
+        )
+
+    assert not await live_validator_fleet_supports_protocol(
+        session,
+        minimum_protocol=14,
+        bench_version=6,
+        now=now,
+    )
+
+
+async def test_fleet_protocol_gate_fails_closed_without_capable_validators(
+    session: AsyncSession,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with session.begin():
+        session.add(
+            _fleet_heartbeat(
+                "legacy-validator",
+                now=now,
+                protocol_version=6,
+                supported_bench_versions=None,
+            )
+        )
+
+    assert not await live_validator_fleet_supports_protocol(
+        session,
+        minimum_protocol=14,
+        bench_version=6,
+        now=now,
+    )
 
 
 async def test_same_run_regression_is_fail_open_and_keeps_previous(

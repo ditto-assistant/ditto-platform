@@ -85,6 +85,27 @@ _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 _VALIDATOR_C = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
 
+def _scorer_capabilities(now: datetime, *, versions: list[int]) -> dict:
+    return {
+        "screened_images": True,
+        "require_screened_image": True,
+        "source_build_fallback": False,
+        "full_stack_managed": True,
+        "stack_updater": True,
+        "sandbox_egress_restricted": True,
+        "ticket_inference": False,
+        "signed_score_quorum": False,
+        "executor_isolation": "ephemeral_vm",
+        "scorer_benchmarks": {
+            "status": "fresh_verified",
+            "supported_bench_versions": versions,
+            "observed_at": int(now.timestamp()),
+            "software_version": "1.0.0",
+            "source_revision": "a" * 40,
+        },
+    }
+
+
 def test_v5_token_telemetry_public_parser_is_typed_and_fail_closed() -> None:
     details = {
         "token_usage": {
@@ -782,6 +803,9 @@ class TestPublicLeaderboard:
                     reported_at=now,
                     seen_at=now,
                     signature="cd" * 64,
+                    capabilities=_scorer_capabilities(
+                        now, versions=[DEFAULT_BENCH_VERSION]
+                    ),
                 )
             )
             await append_confirmation_scores(

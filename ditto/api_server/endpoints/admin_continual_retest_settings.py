@@ -27,6 +27,7 @@ from ditto.api_server.continual_retest_settings import (
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
 from ditto.db.models import ContinualRetestSettingsRevision as RevisionRow
+from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.continual_retest_settings import (
     GLOBAL_SCOPE,
     insert_continual_retest_settings_revision,
@@ -73,9 +74,11 @@ def _resolver(request: Request) -> ContinualRetestSettingsResolver:
 
 
 async def _fleet_ready(session: AsyncSession) -> bool:
+    bench_version = await active_bench_version(session)
     return await live_validator_fleet_supports_protocol(
         session,
         minimum_protocol=_REQUIRED_PROTOCOL,
+        bench_version=bench_version,
         now=datetime.now(UTC),
         freshness=_FRESHNESS,
     )

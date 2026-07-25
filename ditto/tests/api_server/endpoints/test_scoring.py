@@ -45,6 +45,27 @@ _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 _AUTH_HEADER = {"X-Validator-Hotkey": _VALIDATOR_HOTKEY}
 
 
+def _scorer_capabilities(now: datetime, *, versions: list[int]) -> dict:
+    return {
+        "screened_images": True,
+        "require_screened_image": True,
+        "source_build_fallback": False,
+        "full_stack_managed": True,
+        "stack_updater": True,
+        "sandbox_egress_restricted": True,
+        "ticket_inference": False,
+        "signed_score_quorum": False,
+        "executor_isolation": "ephemeral_vm",
+        "scorer_benchmarks": {
+            "status": "fresh_verified",
+            "supported_bench_versions": versions,
+            "observed_at": int(now.timestamp()),
+            "software_version": "1.0.0",
+            "source_revision": "a" * 40,
+        },
+    }
+
+
 def _ledger_headers(
     *,
     nonce: UUID | None = None,
@@ -220,6 +241,7 @@ class TestScoringLedger:
                         reported_at=now,
                         seen_at=now,
                         signature="cd" * 64,
+                        capabilities=_scorer_capabilities(now, versions=[2]),
                     ),
                     ValidatorHeartbeat(
                         validator_hotkey=_MINER_B,
@@ -230,6 +252,7 @@ class TestScoringLedger:
                         reported_at=now,
                         seen_at=now,
                         signature="12" * 64,
+                        capabilities=_scorer_capabilities(now, versions=[2]),
                     ),
                 ]
             )
@@ -597,6 +620,7 @@ class TestScoringLedgerConfirmationHistory:
                     reported_at=now,
                     seen_at=now,
                     signature="cd" * 64,
+                    capabilities=_scorer_capabilities(now, versions=[2]),
                 )
             )
             s.add(
