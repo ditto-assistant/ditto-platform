@@ -19,34 +19,48 @@ from ditto.db.queries.tickets import issue_ticket
 pytestmark = pytest.mark.integration
 
 
-async def test_same_validator_slots_do_not_advance_past_fifo_head() -> None:
+async def test_same_validator_slots_walk_the_fifo_head_downwards() -> None:
+    """Concurrent sibling slots take the two oldest rows -- and stop there.
+
+    This asserted the pre-#433 single-slot invariant: one slot wins the head
+    and the sibling parks on ``None`` until the lease drains. ditto-platform#449
+    deliberately relaxed that. One ticket per ``(agent, bench_version,
+    validator)`` is the composite primary key, so a validator already holding
+    the head can never add a second score to it -- the head's remaining quorum
+    slots belong to other validators no matter what the sibling does. Parking
+    bought the head nothing and idled a slot for the whole ninety-minute lease.
+
+    What completion-first still guarantees is that a slot takes the oldest row
+    it is *eligible* for. So the two slots must land on the two oldest rows and
+    leave ``newest`` alone: advancing past the head is not permission to reach
+    arbitrarily far down the queue.
+    """
     engine = create_db_engine()
     maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC).replace(microsecond=0)
     oldest = uuid4()
     newer = uuid4()
+    newest = uuid4()
     async with maker() as session, session.begin():
         await session.execute(text("TRUNCATE TABLE agents CASCADE"))
         session.add_all(
             [
                 Agent(
-                    agent_id=oldest,
-                    miner_hotkey="completion-first-oldest",
-                    name="completion-first-oldest",
-                    sha256="a" * 64,
+                    agent_id=agent_id,
+                    miner_hotkey=f"completion-first-{label}",
+                    name=f"completion-first-{label}",
+                    sha256=letter * 64,
                     status=AgentStatus.EVALUATING,
                     screening_policy_version=SCREENING_POLICY_VERSION,
-                    created_at=now,
-                ),
-                Agent(
-                    agent_id=newer,
-                    miner_hotkey="completion-first-newer",
-                    name="completion-first-newer",
-                    sha256="b" * 64,
-                    status=AgentStatus.EVALUATING,
-                    screening_policy_version=SCREENING_POLICY_VERSION,
-                    created_at=now + timedelta(minutes=1),
-                ),
+                    created_at=now + timedelta(minutes=index),
+                )
+                for index, (agent_id, label, letter) in enumerate(
+                    [
+                        (oldest, "oldest", "a"),
+                        (newer, "newer", "b"),
+                        (newest, "newest", "c"),
+                    ]
+                )
             ]
         )
 
@@ -63,15 +77,31 @@ async def test_same_validator_slots_do_not_advance_past_fifo_head() -> None:
             return ticket.agent_id if ticket is not None else None
 
     outcomes = await asyncio.gather(claim("slot-0"), claim("slot-1"))
-    assert outcomes.count(oldest) == 1
-    assert outcomes.count(None) == 1
-    assert newer not in outcomes
+    # A parked sibling -- the #449 regression -- shows up here as a ``None``.
+    assert None not in outcomes
+    # Two distinct rows: never a second lease on the head, and never the same
+    # row twice. Which slot wins the head is a race, so compare as a set.
+    assert set(outcomes) == {oldest, newer}
 
     async with maker() as session:
-        newer_tickets = await session.scalar(
-            select(func.count()).where(ValidatorTicket.agent_id == newer)
+        # Reaching past the next FIFO candidate is the opposite failure, and it
+        # is the one that would break the ordering the public queue preview
+        # promises miners. ``newest`` must be untouched.
+        newest_tickets = await session.scalar(
+            select(func.count()).where(ValidatorTicket.agent_id == newest)
         )
-    assert newer_tickets == 0
+        issued = (
+            await session.execute(
+                select(ValidatorTicket.agent_id, ValidatorTicket.slot_id).where(
+                    ValidatorTicket.status == TicketStatus.ISSUED
+                )
+            )
+        ).all()
+    assert newest_tickets == 0
+    assert len(issued) == 2
+    assert {agent_id for agent_id, _ in issued} == {oldest, newer}
+    # Each lease belongs to its own slot; one slot must not hold both.
+    assert {slot_id for _, slot_id in issued} == {"slot-0", "slot-1"}
     await engine.dispose()
 
 
