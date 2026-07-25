@@ -310,6 +310,7 @@ async def scores(
         fleet_protocol_ready = await live_validator_fleet_supports_protocol(
             session,
             minimum_protocol=_CONTINUAL_MEAN_PROTOCOL,
+            bench_version=canonical_version,
             now=auth_now,
         )
         continual_settings = await request.app.state.continual_retest_settings.resolve(
