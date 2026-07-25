@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -10,10 +9,8 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_models.agent_status import AgentStatus
@@ -22,24 +19,7 @@ from ditto.api_server.screened_image_cleanup import (
     screened_image_key,
 )
 from ditto.api_server.storage import ListedObject, MultipartUpload
-from ditto.db.models import Agent, Base
-
-
-@pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    """Create an isolated schema for one cleanup test."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    try:
-        yield engine
-    finally:
-        await engine.dispose()
-
-
-@pytest.fixture
-def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
+from ditto.db.models import Agent
 
 
 def _agent(*, status: AgentStatus, created_at: datetime) -> Agent:

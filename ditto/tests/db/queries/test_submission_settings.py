@@ -1,12 +1,10 @@
 """Race and lifecycle tests for pre-payment upload admission."""
 
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from ditto.db.models import Base
 from ditto.db.queries.agents import SubmissionCooldownError
 from ditto.db.queries.submission_settings import (
     EffectiveSubmissionSettings,
@@ -15,16 +13,6 @@ from ditto.db.queries.submission_settings import (
 )
 
 pytestmark = pytest.mark.asyncio
-
-
-@pytest.fixture
-async def session() -> AsyncIterator[AsyncSession]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    async with AsyncSession(engine, expire_on_commit=False) as db:
-        yield db
-    await engine.dispose()
 
 
 async def test_admission_remains_valid_during_extended_paid_upload_recovery(

@@ -30,7 +30,8 @@ from ditto.api_server.validator_slot_settings import (
     disk_ceiling_tripped,
     settings_from_row,
 )
-from ditto.db.models import Base, ValidatorSlotSettingsRevision
+from ditto.db.models import ValidatorSlotSettingsRevision
+from ditto.tests.pgharness import Dsn
 
 _ADMIN_TOKEN = "test-admin-token-at-least-32-characters"
 _ADMIN_HEADERS = {"Authorization": f"Bearer {_ADMIN_TOKEN}"}
@@ -38,12 +39,15 @@ _URL = "/api/v1/admin/validator-slot-settings"
 
 
 @pytest.fixture
-async def settings_maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False)
-    await engine.dispose()
+def settings_maker(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> async_sessionmaker[AsyncSession]:
+    """Alias onto the root real-Postgres fixture in ``ditto/tests/conftest.py``.
+
+    Aliasing rather than renaming keeps every test signature in this file
+    untouched, so the diff cannot change what is asserted.
+    """
+    return session_maker
 
 
 def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
@@ -396,10 +400,27 @@ class TestResolverFailClosed:
         assert await resolver.resolve(None) == DEFAULT_SETTINGS
         assert DEFAULT_SETTINGS.max_concurrent_slots == 2
 
-    async def test_database_error_holds_the_default_cap(self) -> None:
-        """A DB outage must never uncap the fleet."""
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-        maker = async_sessionmaker(engine)  # table never created -> OperationalError
+    async def test_database_error_holds_the_default_cap(
+        self, postgres_admin_dsn: Dsn
+    ) -> None:
+        """A DB outage must never uncap the fleet.
+
+        Keeps the original shape -- a reachable database in which the table
+        does not exist -- but on real Postgres: the harness's admin database
+        is migrated by nobody, so the read raises
+        ``ProgrammingError(UndefinedTableError)`` into the resolver's
+        ``except SQLAlchemyError`` arm.
+
+        A *refused connection* is deliberately not used here even though it
+        looks like the more realistic outage. asyncpg raises
+        ``ConnectionRefusedError`` -- a bare ``OSError`` that SQLAlchemy does
+        not wrap -- so it sails straight past ``except SQLAlchemyError`` and
+        out of ``resolve()``. That is worth someone's attention on its own
+        (see the PR description); it is not this test's subject, and pinning
+        it here would silently convert a fail-closed test into a fail-open one.
+        """
+        engine = create_async_engine(postgres_admin_dsn.sqlalchemy)
+        maker = async_sessionmaker(engine)
         resolver = ValidatorSlotSettingsResolver(ttl_seconds=0)
         try:
             assert await resolver.resolve(maker) == DEFAULT_SETTINGS

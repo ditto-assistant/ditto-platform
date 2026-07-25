@@ -218,7 +218,30 @@ def _run_update(
     _write_executable(fake_bin / "gcloud", gcloud_source)
     _write_executable(fake_bin / "timeout", 'shift\nexec "$@"\n')
 
-    env = os.environ.copy()
+    # update.sh promotes selected DITTO_* variables from its own environment
+    # into .env.deploy, so an ambient value silently overrides what a test
+    # asked for. That made these tests pass only on a machine whose shell had
+    # never sourced .env -- true of CI until the integration suite started
+    # needing DITTO_UPLOAD_PAYMENT_ADDRESS, and false for anyone running
+    # `make test-integration` locally. Start from an environment with every
+    # variable the script consumes stripped, so the only values in play are
+    # the ones the caller passes in.
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in {
+            "DITTO_COMPOSE_SERVICES",
+            "DITTO_DASHBOARD_WANDB_URL",
+            "DITTO_DEPLOY_BRANCH",
+            "DITTO_HEALTH_TIMEOUT",
+            "DITTO_TAOSTATS_API_KEY",
+            "DITTO_TAOSTATS_SECRET_ID",
+            "DITTO_TAOSTATS_SECRET_PROJECT",
+            "DITTO_TAOSTATS_VALIDATOR_NAMES_URL",
+            "DITTO_UPLOAD_PAYMENT_ADDRESS",
+        }
+    }
     env.update(deploy_env_vars or {})
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["DITTO_HEALTH_TIMEOUT"] = health_timeout

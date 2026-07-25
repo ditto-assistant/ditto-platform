@@ -23,12 +23,10 @@ import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_models.agent_status import AgentStatus
@@ -82,7 +80,6 @@ from ditto.chain.models import NeuronInfo
 from ditto.db.models import (
     Agent,
     AthReview,
-    Base,
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
@@ -648,29 +645,6 @@ async def _score_to_quorum(
 
 
 # --- DB + dependency wiring ------------------------------------------------
-
-
-@pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield eng
-    finally:
-        await eng.dispose()
-
-
-@pytest.fixture
-def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 def _install_db(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
@@ -1971,6 +1945,14 @@ class TestHeartbeat:
                     "total_checks": 114,
                     "percent": 44,
                     "stalled": False,
+                    # ``slot_id`` joined the public payload in 9e81a3f
+                    # (2026-07-22, bounded validator capacity); see
+                    # ``api_models/public.py`` where it defaults to
+                    # "slot-0". This exhaustive comparison was never
+                    # updated and the test has been red on BOTH dialects
+                    # since -- invisible because it is ``e2e``-marked and
+                    # pytest addopts deselected ``e2e``.
+                    "slot_id": "slot-0",
                 }
             if progress["stage"] in {"finalizing", "submitting_result"}:
                 # Only a terminal stage may report a full bar.

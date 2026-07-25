@@ -6,28 +6,14 @@ from dataclasses import replace
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ditto.api_server.dependencies import get_session
-from ditto.db.models import Base
 
 pytestmark = pytest.mark.asyncio
 
 _ADMIN_TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_ADMIN_TOKEN}"}
-
-
-@pytest.fixture
-async def settings_maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False)
-    await engine.dispose()
 
 
 def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
@@ -40,7 +26,13 @@ def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
     app.dependency_overrides[get_session] = _session
 
 
-def _payload(seconds: int, expected: int = 0) -> dict[str, object]:
+# Migration f4b8c2d91a70 seeds one revision (revision=1, parent_revision=0,
+# cooldown_seconds=3600, actor="migration"), so the first operator write on a
+# real database expects revision 1. The suite previously defaulted to 0 because
+# `Base.metadata.create_all` left the table empty -- a baseline that only
+# reaches `effective_submission_settings`'s `latest is None` fallback, which
+# production has not been able to hit since that migration landed.
+def _payload(seconds: int, expected: int = 1) -> dict[str, object]:
     return {
         "expected_revision": expected,
         "cooldown_seconds": seconds,
@@ -53,9 +45,9 @@ def _payload(seconds: int, expected: int = 0) -> dict[str, object]:
 async def test_defaults_to_one_hour_and_appends_audited_revision(
     app: FastAPI,
     client: httpx.AsyncClient,
-    settings_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    _install(app, settings_maker)
+    _install(app, session_maker)
     initial = await client.get("/api/v1/admin/submission-settings", headers=_HEADERS)
     assert initial.status_code == 200
     assert initial.json()["current"]["cooldown_seconds"] == 3600
@@ -73,9 +65,9 @@ async def test_defaults_to_one_hour_and_appends_audited_revision(
 async def test_rejects_stale_revision_wrong_confirmation_and_unsafe_bounds(
     app: FastAPI,
     client: httpx.AsyncClient,
-    settings_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    _install(app, settings_maker)
+    _install(app, session_maker)
     first = await client.post(
         "/api/v1/admin/submission-settings",
         headers=_HEADERS,

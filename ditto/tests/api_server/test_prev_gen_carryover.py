@@ -12,19 +12,12 @@ change is safe to merge:
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from typing import Any
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
-import pytest
-from sqlalchemy import event, select
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.queue_policy_settings import (
@@ -35,7 +28,6 @@ from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
 from ditto.db.models import (
     Agent,
-    Base,
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutAudit,
@@ -54,31 +46,6 @@ _NOW = _ROLLOUT_START + timedelta(days=2)
 _FROM_VERSION = 6
 _DESIRED_VERSION = 7
 _COHORT = 5
-
-
-@pytest.fixture
-async def session() -> AsyncIterator[AsyncSession]:
-    """SQLite-in-memory session, matching ``ditto/tests/db/conftest.py``.
-
-    Declared locally because ``ditto/tests/api_server/conftest.py`` builds app
-    fixtures rather than bare sessions, and this module exercises the
-    convergence service directly.
-    """
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(engine.sync_engine, "connect")
-    def _enable_fk(dbapi_connection: Any, _: Any) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        async with async_sessionmaker(engine, expire_on_commit=False)() as sess:
-            yield sess
-    finally:
-        await engine.dispose()
 
 
 def _generator() -> AsyncMock:

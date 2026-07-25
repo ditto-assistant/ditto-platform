@@ -8,12 +8,11 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_models.agent_status import AgentStatus
@@ -22,7 +21,6 @@ from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.dependencies import get_session
 from ditto.db.models import (
     Agent,
-    Base,
     Score,
     ScoreAuditEntry,
     ValidatorHeartbeat,
@@ -51,19 +49,9 @@ _FUTURE = datetime(2099, 1, 1, tzinfo=UTC)
 
 
 @pytest.fixture
-async def retry_engine() -> AsyncIterator[AsyncEngine]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(engine.sync_engine, "connect")
-    def _fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield engine
-    await engine.dispose()
+def retry_engine(engine: AsyncEngine) -> AsyncEngine:
+    """Local alias for the root Postgres ``engine``."""
+    return engine
 
 
 @pytest.fixture
@@ -91,12 +79,19 @@ async def _seed(
     composites: list[float] | None = None,
 ) -> UUID:
     agent_id = uuid4()
+    # Each call seeds an *independent* submission, so it needs its own identity:
+    # ``agents_hotkey_name_version_key`` makes (miner_hotkey, name, version)
+    # unique, and several tests here seed two or three agents. The name used to
+    # be the constant "valid-agent", which only worked because that constraint
+    # is declared ``.ddl_if(dialect="postgresql")`` in ditto/db/models.py and so
+    # was never created under SQLite's ``create_all``. No assertion in this file
+    # reads the name this helper generates.
     async with maker() as session, session.begin():
         session.add(
             Agent(
                 agent_id=agent_id,
                 miner_hotkey="5Miner",
-                name="valid-agent",
+                name=f"valid-agent-{agent_id.hex[:8]}",
                 version=1,
                 sha256=agent_id.hex * 2,
                 status=AgentStatus.EVALUATING,

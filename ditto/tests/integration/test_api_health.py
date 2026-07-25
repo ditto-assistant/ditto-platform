@@ -36,6 +36,7 @@ async def _running_app() -> AsyncIterator[FastAPI]:
 class TestApiHealthIntegration:
     """End-to-end happy path against the real stack."""
 
+    @pytest.mark.needs_chain
     async def test_health_returns_200_with_all_deps_up(self):
         async with (
             _running_app() as app,

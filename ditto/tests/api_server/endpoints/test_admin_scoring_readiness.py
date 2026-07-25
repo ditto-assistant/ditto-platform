@@ -8,12 +8,10 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_models.agent_status import AgentStatus
@@ -21,7 +19,6 @@ from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_server.dependencies import get_session
 from ditto.db.models import (
     Agent,
-    Base,
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
@@ -33,19 +30,9 @@ _T0 = datetime(2026, 7, 21, 4, tzinfo=UTC)
 
 
 @pytest.fixture
-async def sr_engine() -> AsyncIterator[AsyncEngine]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(engine.sync_engine, "connect")
-    def _fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield engine
-    await engine.dispose()
+def sr_engine(engine: AsyncEngine) -> AsyncEngine:
+    """Local alias for the root Postgres ``engine``."""
+    return engine
 
 
 @pytest.fixture

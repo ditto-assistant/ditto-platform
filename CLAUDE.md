@@ -68,10 +68,27 @@ enforces all four; Python checks run on 3.11 and 3.12.
 
 ## Testing
 
-- `pytest` markers `slow`, `integration`, `localnet`, `e2e` are excluded by
-  default. Unit tests use a SQLite fallback (`aiosqlite`); integration tests need
-  the live Docker stack.
+- **Every database test runs against a real Postgres.** `ditto/tests/pgharness.py`
+  starts an ambient container (`ditto-platform-test-postgres`, port 15433) on
+  demand, migrates a template database with the real Alembic chain, and gives
+  each xdist worker its own clone. Nothing to set up: `make test` just works.
+- Use the root `engine` / `session_maker` / `session` fixtures
+  (`ditto/tests/conftest.py`). Do **not** build a `create_async_engine(...)`
+  inline in a test — that is the copy-paste habit this harness replaced.
+- Commits in tests are real commits. There is no rollback-isolation tier, and
+  adding one for the concurrency/accounting tests would re-hide the exact bug
+  class (#438) the Postgres migration exists to catch.
+- Markers `slow`, `localnet`, and `needs_chain` are excluded by default.
+  `integration` and `e2e` are **not** — they were, and the consequence was that
+  the #438 regression test never ran in CI. `needs_chain` is exactly two tests
+  that assert on data only a live subtensor can produce; everything a container
+  can provide (Postgres, MinIO) is provisioned in CI instead of excluded. Do not
+  widen it.
+- There is no SQLite tier any more, and `aiosqlite` is gone from the dev
+  dependency group. If a test needs a database, it gets the real one.
 - Put unit tests next to the package they cover under `ditto/tests/<package>`.
+- `make test-db-reset` forces a template rebuild; `make test-db-clean` reaps
+  every harness-owned database.
 
 ## Gotchas
 

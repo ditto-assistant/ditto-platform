@@ -8,14 +8,9 @@ next compute read with no restart.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-
-import pytest
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_models.efficiency_settings import EfficiencyBonusSettings
@@ -27,26 +22,10 @@ from ditto.api_server.efficiency_settings import (
     seed_settings,
     settings_from_row,
 )
-from ditto.db.models import Base, EfficiencyBonusSettingsRevision
+from ditto.db.models import EfficiencyBonusSettingsRevision
 from ditto.db.queries.efficiency_settings import (
     insert_efficiency_settings_revision,
 )
-
-
-@pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield eng
-    finally:
-        await eng.dispose()
-
-
-@pytest.fixture
-def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 async def _write_revision(

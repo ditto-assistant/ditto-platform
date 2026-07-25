@@ -16,6 +16,7 @@ import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.endpoints.upload import (
@@ -1178,7 +1179,11 @@ class TestUploadAgentChainOutageDuringVerify:
 
 class TestUploadReleasesSessionDuringSlowWork:
     async def test_no_transaction_held_across_tarball_read(
-        self, app: FastAPI, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+        session_maker: async_sessionmaker[AsyncSession],
     ):
         """The pooled session must hold NO transaction while the tarball streams.
 
@@ -1187,17 +1192,11 @@ class TestUploadReleasesSessionDuringSlowWork:
         fingerprinting), or concurrent slow uploads pin every pool slot
         (the 2026-07-16 production outage).
         """
-        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
         from ditto.api_server.dependencies import get_session
         from ditto.api_server.endpoints import upload as upload_mod
-        from ditto.db.models import Base
         from ditto.db.queries.bans import is_hotkey_banned as real_is_hotkey_banned
 
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        maker = async_sessionmaker(engine, expire_on_commit=False)
+        maker = session_maker
         session_holder: dict[str, Any] = {}
 
         async def _real_session():
@@ -1231,4 +1230,3 @@ class TestUploadReleasesSessionDuringSlowWork:
 
         assert response.status_code == 200, response.text
         assert seen["in_transaction"] is False
-        await engine.dispose()

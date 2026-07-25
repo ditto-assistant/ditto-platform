@@ -2,17 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
 
 from ditto.api_models.inference_concurrency_settings import (
     InferenceConcurrencySettings,
@@ -23,7 +16,6 @@ from ditto.api_server.inference_concurrency_settings import (
     apply_settings,
     settings_from_row,
 )
-from ditto.db.models import Base
 from ditto.db.queries.inference_concurrency_settings import (
     insert_inference_concurrency_settings_revision,
 )
@@ -32,20 +24,9 @@ from ditto.tests.db.queries.test_inference import _config
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield eng
-    finally:
-        await eng.dispose()
-
-
-@pytest.fixture
-def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
+# The local `engine` / `session_maker` fixtures are gone: the root
+# conftest provides both names against a real Postgres, so this file
+# migrates by deletion and every test signature stays as it was.
 
 
 def _row(settings: object, revision: int = 1) -> Any:
