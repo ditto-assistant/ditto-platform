@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_contract import (
@@ -609,6 +609,43 @@ async def open_rollout(
     if for_update:
         statement = statement.with_for_update()
     return await session.scalar(statement)
+
+
+async def arrival_bench_version(session: AsyncSession, *, agent: Agent) -> int:
+    """Return the benchmark era one submission's *arrival* places it in.
+
+    A submission received after an open rollout starts enters the desired era
+    immediately: its dataset is rendered there and validators lease it there
+    through the fresh-submission lane. Older submissions stay on the active
+    version unless they separately qualify for the rollout cohort — cohort
+    membership is a different lane with different rules, so it is deliberately
+    not considered here; callers that care must check it themselves.
+
+    This mirrors :func:`ditto.db.queries.benchmark_admission.
+    benchmark_admission_predicate`'s ``created_at >= rollout.created_at``
+    disjunct, in Python, for one already-loaded agent.
+    """
+    bench_version = await active_bench_version(session)
+    rollout = await open_rollout(session)
+    if rollout is not None and agent.created_at >= rollout.created_at:
+        return int(rollout.desired_version)
+    return bench_version
+
+
+async def agent_is_rollout_member(
+    session: AsyncSession, *, rollout: BenchmarkRollout, agent_id: UUID
+) -> bool:
+    """Whether one agent is a frozen member of ``rollout``'s inherited cohort."""
+    return bool(
+        await session.scalar(
+            select(
+                exists().where(
+                    BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                    BenchmarkRolloutMember.agent_id == agent_id,
+                )
+            )
+        )
+    )
 
 
 async def rollout_for_transition(

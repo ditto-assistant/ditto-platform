@@ -100,7 +100,7 @@ from ditto.db.models import (
     ScreeningQuarantine,
 )
 from ditto.db.queries.agents import get_agent_by_id
-from ditto.db.queries.benchmark_rollout import active_bench_version, open_rollout
+from ditto.db.queries.benchmark_rollout import arrival_bench_version
 from ditto.db.queries.heartbeats import (
     prune_stale_screener_heartbeats,
     upsert_screener_heartbeat,
@@ -1443,10 +1443,7 @@ async def submit_result(
             existing = await get_agent_by_id(session, agent_id=agent_id)
             if existing is None:
                 raise AgentNotFoundError(f"no agent with id={agent_id}")
-            bench_version = await active_bench_version(session)
-            rollout = await open_rollout(session)
-            if rollout is not None and existing.created_at >= rollout.created_at:
-                bench_version = rollout.desired_version
+            bench_version = await arrival_bench_version(session, agent=existing)
             versioned_dataset = await session.get(
                 BenchmarkDataset, (agent_id, bench_version)
             )
