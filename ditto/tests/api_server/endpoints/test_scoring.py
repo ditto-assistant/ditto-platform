@@ -324,12 +324,17 @@ class TestScoringLedger:
         assert first.status_code == 200
         assert replay.status_code == 409
 
+    # The offset, not the timestamp. Parametrize arguments are evaluated once
+    # at collection time, so a literal `datetime.now(UTC) + timedelta(minutes=3)`
+    # here is three minutes past *collection*, and the endpoint's window
+    # (`_LEDGER_REQUEST_MAX_AGE`) is two minutes wide. Any run that reached this
+    # test more than a minute after collection -- i.e. the full suite, always --
+    # saw the future case drift back inside the window and get a 200. The stale
+    # case only ever got staler, which is why the bug presented as one
+    # perpetually-red parametrization rather than two.
     @pytest.mark.parametrize(
-        "requested_at",
-        [
-            datetime.now(UTC) - timedelta(minutes=3),
-            datetime.now(UTC) + timedelta(minutes=3),
-        ],
+        "skew",
+        [timedelta(minutes=-3), timedelta(minutes=3)],
         ids=["stale", "too-far-in-future"],
     )
     async def test_out_of_window_ledger_proof_returns_409(
@@ -337,13 +342,13 @@ class TestScoringLedger:
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
-        requested_at: datetime,
+        skew: timedelta,
     ) -> None:
         _install_db(app, session_maker)
         _install_chain(app)
         resp = await client.get(
             "/api/v1/scoring/scores",
-            headers=_ledger_headers(requested_at=requested_at),
+            headers=_ledger_headers(requested_at=datetime.now(UTC) + skew),
         )
         assert resp.status_code == 409
 

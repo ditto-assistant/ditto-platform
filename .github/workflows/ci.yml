@@ -131,12 +131,20 @@ jobs:
           # this a broken container turns the entire database suite green --
           # the exact green-on-broken mode this migration exists to delete.
           DITTO_REQUIRE_POSTGRES: "1"
-          # The `integration` tests build the real FastAPI app from env via
-          # parse_api_server_config_from_env, so the app config has to exist
-          # here or they fail at construction. None of these are secrets:
-          # the payment address is the well-known //Alice dev key and is
-          # never spent (PaymentVerifier is stubbed in those tests), and the
-          # MinIO credentials belong to the throwaway container above.
+          # Same rule for the object store: never skip the upload tests
+          # because the bucket was unreachable. Inert while
+          # STORAGE_ENDPOINT_URL is set explicitly below (that short-circuits
+          # minioharness), and the safety net if it ever stops being.
+          DITTO_REQUIRE_OBJECT_STORAGE: "1"
+          # Every variable below now has a test-only default in
+          # ditto/tests/env_defaults.py, so CI would be green without this
+          # block. It is kept because CI should pin what it runs against
+          # rather than inherit a fixture, and because an explicitly-set
+          # value always wins over a default -- which is itself worth
+          # exercising on every PR. None of these are secrets: the payment
+          # address is the well-known //Alice dev key and is never spent
+          # (PaymentVerifier is stubbed in those tests), and the MinIO
+          # credentials belong to the throwaway container above.
           DITTO_UPLOAD_PAYMENT_ADDRESS: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
           # ChainConfig refuses to construct without credentials, so these are
           # needed to *build* the app even though nothing here reaches Pylon:
