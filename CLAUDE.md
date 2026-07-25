@@ -72,6 +72,18 @@ enforces all four; Python checks run on 3.11 and 3.12.
   starts an ambient container (`ditto-platform-test-postgres`, port 15433) on
   demand, migrates a template database with the real Alembic chain, and gives
   each xdist worker its own clone. Nothing to set up: `make test` just works.
+- **The upload tests run against a real object store**, provisioned the same way
+  by `ditto/tests/minioharness.py` (`ditto-platform-test-minio`, port 19000).
+- **`uv run pytest` needs no environment.** `ditto/tests/env_defaults.py` seeds
+  the variables the config parsers require — `DITTO_UPLOAD_PAYMENT_ADDRESS`,
+  `PYLON_OPEN_ACCESS_TOKEN`, `STORAGE_*` — with obviously-fake fixtures, applied
+  in `pytest_configure`. `.env` is gitignored and is not copied into worktrees,
+  so this is what keeps a fresh clone and every worktree-based agent green.
+  Anything already set wins. **Do not move these defaults into
+  `ditto/api_server/config.py`**: production must keep failing loudly, since a
+  platform that boots on a placeholder receive address is far worse than a red
+  test. A newly-required variable without a default fails
+  `ditto/tests/test_env_defaults.py`, which names it.
 - Use the root `engine` / `session_maker` / `session` fixtures
   (`ditto/tests/conftest.py`). Do **not** build a `create_async_engine(...)`
   inline in a test — that is the copy-paste habit this harness replaced.

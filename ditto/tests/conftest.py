@@ -31,6 +31,15 @@ of parallelism there is nothing left to invert.
 ``POSTGRES_*`` is exported to point at the worker's own database, so the
 integration files that call ``create_db_engine()`` inline -- with no fixture
 at all -- become worker-isolated without being edited.
+
+Environment
+-----------
+The database is not the only thing a fresh checkout used to be missing.
+:func:`pytest_configure` seeds the rest of the required environment from
+``ditto/tests/env_defaults.py`` before collection, so ``uv run pytest`` is
+green on a clone with no ``.env`` and nothing exported. Those defaults are
+test-only on purpose -- see that module for why production must keep failing
+loudly instead.
 """
 
 from __future__ import annotations
@@ -47,10 +56,24 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from ditto.tests import pgharness
+from ditto.tests import minioharness, pgharness
+from ditto.tests.env_defaults import apply_test_env_defaults
 
 if TYPE_CHECKING:
     from ditto.tests.pgharness import Dsn, WorkerDatabase
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Seed the test-only environment defaults before anything is collected.
+
+    A hook rather than an autouse fixture because fixtures run *after*
+    collection, and module-level code in a test file is entitled to read the
+    environment. Runs once per process, which under ``-n auto`` means once
+    per xdist worker -- each worker is its own interpreter with its own
+    ``os.environ``.
+    """
+    del config
+    apply_test_env_defaults()
 
 
 def _worker_id() -> str:
@@ -110,6 +133,41 @@ def worker_database(postgres_admin_dsn: Dsn) -> Iterator[WorkerDatabase]:
             else:
                 os.environ[key] = value
         pgharness.drop_worker_database(postgres_admin_dsn, name)
+
+
+@pytest.fixture(scope="session")
+def object_storage() -> Iterator[None]:
+    """A real S3 endpoint with the agents bucket, provisioned on demand.
+
+    The storage counterpart of :func:`worker_database`, and the same
+    argument: the four ``integration`` upload tests build their config from
+    the environment and stream real bytes, so they need a store that
+    actually stores. Provisioning it here is what removes ``make stack-up``
+    from the list of things a fresh clone has to know about.
+
+    Unlike the database there is no per-worker isolation, because there is
+    nothing to isolate: object keys are UUID-prefixed, so two workers cannot
+    collide, and no test lists the bucket.
+
+    A provisioning failure is a **skip** on a laptop and a **hard error**
+    under ``DITTO_REQUIRE_OBJECT_STORAGE=1``.
+    """
+    try:
+        resolved = minioharness.resolve_storage_env()
+    except Exception as exc:
+        if minioharness._require():
+            raise
+        pytest.skip(f"real object storage unavailable: {exc}")
+    previous = {key: os.environ.get(key) for key in resolved}
+    os.environ.update(resolved)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 @pytest.fixture

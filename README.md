@@ -282,13 +282,29 @@ so a supervisor restarts cleanly.
 ## Testing
 
 ```sh
-make test                 # fast unit suite (default markers excluded)
-make test-integration     # serial; requires the live Docker stack (make stack-up)
+make test                 # the whole suite; nothing to set up first
+make test-integration     # narrows to the integration tier
+make test-chain           # the two tests that need a live subtensor
 ```
 
-Test markers (`slow`, `integration`, `localnet`, `e2e`) are excluded by default;
-the unit suite uses all available CPU cores through `pytest-xdist`. CI runs
-`ruff`, `mypy`, and `pytest` on every PR and on `main`.
+**`uv run pytest` is green on a fresh clone with no `.env` and nothing
+exported.** Postgres and MinIO are ambient containers the harness starts on
+demand (`ditto/tests/pgharness.py`, `ditto/tests/minioharness.py`), on test-only
+ports so they cannot be confused with the compose stack. The environment
+variables the config parsers require — `DITTO_UPLOAD_PAYMENT_ADDRESS`,
+`PYLON_OPEN_ACCESS_TOKEN`, `STORAGE_*` — are defaulted to obviously-fake
+fixtures by `ditto/tests/env_defaults.py`.
+
+Those defaults are **test-only**, and deliberately so: the server itself still
+refuses to boot on a missing or placeholder payment address, because a platform
+that silently accepts one is far worse than a red test. Anything already set —
+your `.env`, an exported variable, CI's explicit block — always wins. Adding a
+newly-required variable without a test default fails
+`ditto/tests/test_env_defaults.py`, which names the variable.
+
+`slow`, `localnet`, and `needs_chain` are excluded by default; `integration` and
+`e2e` are not. The suite uses all available CPU cores through `pytest-xdist`. CI
+runs `ruff`, `mypy`, `faircopy`, and `pytest` on every PR and on `main`.
 
 ---
 
