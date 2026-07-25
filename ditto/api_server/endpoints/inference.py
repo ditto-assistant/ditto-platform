@@ -811,9 +811,7 @@ async def proxy_chat_completions(
         # v7 the grant pins exactly one model; take it and discard whatever the
         # body asked for, so an agent cannot select a cheaper or stronger model
         # by editing its own code. Metering below uses the same locked value.
-        model = _locked_grant_model(
-            grant, requested=requested_model, config=config
-        )
+        model = _locked_grant_model(grant, requested=requested_model, config=config)
         reserved = await begin_inference_request(
             session,
             grant_id=x_ditto_grant,
