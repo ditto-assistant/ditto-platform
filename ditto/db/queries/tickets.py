@@ -45,7 +45,11 @@ from ditto.db.queries.benchmark_admission import (
     validator_queue_admission_predicate,
 )
 from ditto.db.queries.lease_liveness import maybe_force_expire_lease
-from ditto.db.queries.scores import SCORING_QUORUM, list_eligible_ledger
+from ditto.db.queries.scores import (
+    SCORING_QUORUM,
+    emission_owner_key,
+    list_eligible_ledger,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -536,13 +540,7 @@ async def issue_ticket(
         .scalar_subquery()
     )
     contender_payment = aliased(EvaluationPayment)
-    contender_owner = case(
-        (
-            contender_payment.miner_coldkey.is_not(None),
-            literal("coldkey:") + contender_payment.miner_coldkey,
-        ),
-        else_=literal("hotkey:") + contender.miner_hotkey,
-    )
+    contender_owner = emission_owner_key(agent=contender, payment=contender_payment)
     contender_per_miner = (
         select(
             contender.agent_id.label("agent_id"),

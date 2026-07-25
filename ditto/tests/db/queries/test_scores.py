@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -20,6 +20,7 @@ from ditto.db.models import (
 from ditto.db.queries.scores import (
     MIN_ELIGIBLE_CASES,
     list_eligible_ledger,
+    list_provisional_ledger,
     list_scores_for_agent,
     quorum_composites,
     upsert_score,
@@ -29,6 +30,7 @@ _MINER = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 _VALIDATOR = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 _GEN_AT = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
+_FIRST_SEEN = datetime(2026, 6, 8, 9, 0, 0, tzinfo=UTC)
 
 
 async def _seed_agent(session: AsyncSession) -> Agent:
@@ -559,6 +561,70 @@ class TestListEligibleLedger:
         assert len(ledger) == 1
         assert ledger[0].composite == pytest.approx(0.55)
         assert ledger[0].eligible is True
+
+
+class TestListProvisionalLedger:
+    async def test_returns_one_row_per_coldkey_not_per_hotkey(
+        self, session: AsyncSession
+    ) -> None:
+        """The provisional overlay must group the way the emission ledger does.
+
+        :func:`list_eligible_ledger` partitions on ``emission_owner``, so one
+        coldkey funding two hotkeys holds one board position. Grouping the
+        provisional feed by hotkey previewed a second position it never gets.
+        """
+        best = await _seed_scored(
+            session,
+            miner=_MINER,
+            composite=0.90,
+            created_at=_FIRST_SEEN,
+            status=AgentStatus.EVALUATING,
+            n=MIN_ELIGIBLE_CASES,
+            coldkey="5SharedColdkey",
+        )
+        await _seed_scored(
+            session,
+            miner=_MINER_B,
+            composite=0.89,
+            created_at=_FIRST_SEEN + timedelta(minutes=1),
+            status=AgentStatus.EVALUATING,
+            n=MIN_ELIGIBLE_CASES,
+            coldkey="5SharedColdkey",
+        )
+
+        rows = await list_provisional_ledger(session)
+
+        assert [(row.agent_id, row.miner_coldkey) for row, _count in rows] == [
+            (best.agent_id, "5SharedColdkey")
+        ]
+
+    async def test_unpaid_legacy_rows_stay_separate_owners(
+        self, session: AsyncSession
+    ) -> None:
+        """The hotkey fallback must not collapse every payment-less row into one."""
+        first = await _seed_scored(
+            session,
+            miner=_MINER,
+            composite=0.90,
+            created_at=_FIRST_SEEN,
+            status=AgentStatus.EVALUATING,
+            n=MIN_ELIGIBLE_CASES,
+        )
+        second = await _seed_scored(
+            session,
+            miner=_MINER_B,
+            composite=0.89,
+            created_at=_FIRST_SEEN + timedelta(minutes=1),
+            status=AgentStatus.EVALUATING,
+            n=MIN_ELIGIBLE_CASES,
+        )
+
+        rows = await list_provisional_ledger(session)
+
+        assert {row.agent_id for row, _count in rows} == {
+            first.agent_id,
+            second.agent_id,
+        }
 
 
 class TestListScoresForBenchVersion:

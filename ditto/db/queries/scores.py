@@ -304,6 +304,19 @@ def emission_owner_key(
 _emission_owner_key = emission_owner_key
 
 
+def emission_owner(*, miner_hotkey: str, miner_coldkey: str | None) -> str:
+    """In-Python counterpart of :func:`emission_owner_key`.
+
+    Preview and overlay code that groups already-loaded rows must produce the
+    same owner key the allocator's SQL does, or it reports a queue the
+    validators will not honour. ``is None`` (not falsiness) mirrors the SQL
+    ``IS NOT NULL`` exactly.
+    """
+    if miner_coldkey is not None:
+        return f"coldkey:{miner_coldkey}"
+    return f"hotkey:{miner_hotkey}"
+
+
 @dataclass(frozen=True)
 class HealthRollup:
     """Aggregate subnet-health counters for the public dashboard.
@@ -1149,7 +1162,7 @@ async def list_provisional_ledger(
     *,
     bench_version: int | None = None,
 ) -> list[tuple[LedgerRow, int]]:
-    """Return each unfinalized miner's best partially scored submission.
+    """Return each unfinalized owner's best partially scored submission.
 
     This is a public-feedback read only. It deliberately considers only agents
     still in ``evaluating`` with at least one accepted score; validator weights
@@ -1157,14 +1170,22 @@ async def list_provisional_ledger(
     the finalized ``scored`` status. Numeric fields are medians of the accepted
     reports available so far. Opaque run details are omitted because, before
     quorum, no single validator row is the canonical result.
+
+    One row per *owner*, matching how :func:`list_eligible_ledger` partitions
+    the finalized board: a coldkey funding several hotkeys holds one emission
+    position, so its provisional overlay must not preview several either.
     """
     from ditto.db.queries.benchmark_rollout import active_bench_version
 
     canonical_version = bench_version or await active_bench_version(session)
     rows = (
         await session.execute(
-            select(Agent, Score)
+            select(Agent, Score, EvaluationPayment.miner_coldkey)
             .join(Score, Score.agent_id == Agent.agent_id)
+            .outerjoin(
+                EvaluationPayment,
+                EvaluationPayment.agent_id == Agent.agent_id,
+            )
             .where(
                 Agent.status == AgentStatus.EVALUATING,
                 Score.bench_version == canonical_version,
@@ -1178,14 +1199,14 @@ async def list_provisional_ledger(
         )
     ).all()
 
-    by_agent: dict[UUID, tuple[Agent, list[Score]]] = {}
-    for agent, score in rows:
+    by_agent: dict[UUID, tuple[Agent, str | None, list[Score]]] = {}
+    for agent, score, miner_coldkey in rows:
         if agent.agent_id not in by_agent:
-            by_agent[agent.agent_id] = (agent, [])
-        by_agent[agent.agent_id][1].append(score)
+            by_agent[agent.agent_id] = (agent, miner_coldkey, [])
+        by_agent[agent.agent_id][2].append(score)
 
     candidates: list[tuple[LedgerRow, int]] = []
-    for agent, scores in by_agent.values():
+    for agent, miner_coldkey, scores in by_agent.values():
         if not scores:
             continue
         representative = sorted(
@@ -1212,6 +1233,7 @@ async def list_provisional_ledger(
                     validator_hotkey=representative.validator_hotkey,
                     signature=representative.signature,
                     status=AgentStatus.EVALUATING,
+                    miner_coldkey=miner_coldkey,
                     bench_version=representative.bench_version,
                     median_ms=median_ms,
                     n=n,
@@ -1230,10 +1252,16 @@ async def list_provisional_ledger(
             str(candidate[0].agent_id),
         ),
     )
-    best_by_miner: dict[str, tuple[LedgerRow, int]] = {}
+    best_by_owner: dict[str, tuple[LedgerRow, int]] = {}
     for candidate in candidates:
-        best_by_miner.setdefault(candidate[0].miner_hotkey, candidate)
-    return list(best_by_miner.values())
+        best_by_owner.setdefault(
+            emission_owner(
+                miner_hotkey=candidate[0].miner_hotkey,
+                miner_coldkey=candidate[0].miner_coldkey,
+            ),
+            candidate,
+        )
+    return list(best_by_owner.values())
 
 
 async def list_scored_bench_versions(session: AsyncSession) -> list[int]:
