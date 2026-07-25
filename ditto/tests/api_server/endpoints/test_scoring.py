@@ -325,11 +325,11 @@ class TestScoringLedger:
         assert replay.status_code == 409
 
     @pytest.mark.parametrize(
-        "requested_at",
-        [
-            datetime.now(UTC) - timedelta(minutes=3),
-            datetime.now(UTC) + timedelta(minutes=3),
-        ],
+        # Offsets, not absolute timestamps: parametrize arguments are evaluated at
+        # collection time, so a frozen `now + 3 minutes` stops being in the future
+        # once the suite takes longer than the window to reach this test.
+        "offset",
+        [timedelta(minutes=-3), timedelta(minutes=3)],
         ids=["stale", "too-far-in-future"],
     )
     async def test_out_of_window_ledger_proof_returns_409(
@@ -337,13 +337,13 @@ class TestScoringLedger:
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
-        requested_at: datetime,
+        offset: timedelta,
     ) -> None:
         _install_db(app, session_maker)
         _install_chain(app)
         resp = await client.get(
             "/api/v1/scoring/scores",
-            headers=_ledger_headers(requested_at=requested_at),
+            headers=_ledger_headers(requested_at=datetime.now(UTC) + offset),
         )
         assert resp.status_code == 409
 
