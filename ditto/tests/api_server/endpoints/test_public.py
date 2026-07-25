@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -550,24 +551,42 @@ async def _seed_agent(
     return str(agent_id)
 
 
+async def _drain_weight_refreshes(app: FastAPI) -> None:
+    """Await any in-flight background weight-matrix refresh.
+
+    The endpoint refreshes off the request path, so a test that wants to observe
+    the *result* of a refresh has to wait for it rather than assume the next
+    request sees it.
+    """
+    tasks = getattr(app.state, "public_chain_weights_tasks", None)
+    if isinstance(tasks, set) and tasks:
+        await asyncio.gather(*list(tasks), return_exceptions=True)
+
+
+def _weights_snapshot() -> ChainWeightsSnapshot:
+    """One revealed vector, enough to assert the projection and the cache."""
+    return ChainWeightsSnapshot(
+        netuid=118,
+        block=8_639_503,
+        block_hash="0x" + "ab" * 32,
+        owner_hotkey=_MINER_B,
+        vectors=(
+            ChainWeightVector(
+                validator_uid=25,
+                validator_hotkey=_VALIDATOR_C,
+                weights=(ChainWeight(uid=169, hotkey=_MINER_A, value=14745),),
+            ),
+        ),
+    )
+
+
 class TestPublicChainWeights:
     async def test_returns_native_revealed_weight_matrix(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
-        snapshot = ChainWeightsSnapshot(
-            netuid=118,
-            block=8_639_503,
-            block_hash="0x" + "ab" * 32,
-            owner_hotkey=_MINER_B,
-            vectors=(
-                ChainWeightVector(
-                    validator_uid=25,
-                    validator_hotkey=_VALIDATOR_C,
-                    weights=(ChainWeight(uid=169, hotkey=_MINER_A, value=14745),),
-                ),
-            ),
+        app.state.chain = SimpleNamespace(
+            get_weights=AsyncMock(return_value=_weights_snapshot())
         )
-        app.state.chain = SimpleNamespace(get_weights=AsyncMock(return_value=snapshot))
 
         response = await client.get("/api/v1/public/weights")
 
@@ -610,6 +629,201 @@ class TestPublicChainWeights:
         response = await client.get("/api/v1/public/weights")
 
         assert response.status_code == 503
+
+    async def test_caches_the_matrix_instead_of_reading_chain_per_request(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        app.state.chain = SimpleNamespace(
+            get_weights=AsyncMock(return_value=_weights_snapshot())
+        )
+
+        first = await client.get("/api/v1/public/weights")
+        second = await client.get("/api/v1/public/weights")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["block"] == 8_639_503
+        assert second.json()["stale"] is False
+        # The whole point: N dashboard polls must not become N substrate reads.
+        app.state.chain.get_weights.assert_awaited_once_with(118)
+
+    async def test_concurrent_requests_trigger_a_single_chain_read(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        reads = 0
+
+        async def _slow_read(_netuid: int) -> ChainWeightsSnapshot:
+            nonlocal reads
+            reads += 1
+            started.set()
+            await release.wait()
+            return _weights_snapshot()
+
+        app.state.chain = SimpleNamespace(get_weights=_slow_read)
+        first = asyncio.create_task(client.get("/api/v1/public/weights"))
+        await started.wait()
+        # A second caller arriving mid-read has no cache to fall back on, so it
+        # waits on the same single-flight read rather than opening its own.
+        second = asyncio.create_task(client.get("/api/v1/public/weights"))
+        await asyncio.sleep(0)
+        release.set()
+        responses = await asyncio.gather(first, second)
+
+        assert [r.status_code for r in responses] == [200, 200]
+        assert reads == 1
+
+    async def test_a_cached_response_never_waits_on_the_chain_read(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        release = asyncio.Event()
+
+        async def _slow_read(_netuid: int) -> ChainWeightsSnapshot:
+            await release.wait()
+            return _weights_snapshot()
+
+        app.state.chain = SimpleNamespace(
+            get_weights=AsyncMock(return_value=_weights_snapshot())
+        )
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+
+        # Cache expired, and the refresh now blocks indefinitely. The request
+        # must still return the cached matrix rather than wait out the read.
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_CACHE_TTL_SECONDS", 0.0)
+        app.state.chain = SimpleNamespace(get_weights=_slow_read)
+
+        response = await asyncio.wait_for(
+            client.get("/api/v1/public/weights"), timeout=5
+        )
+
+        assert response.status_code == 200
+        assert response.json()["block"] == 8_639_503
+        release.set()
+        await _drain_weight_refreshes(app)
+
+    async def test_serves_last_known_good_marked_stale_when_refresh_fails(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        get_weights = AsyncMock(return_value=_weights_snapshot())
+        app.state.chain = SimpleNamespace(get_weights=get_weights)
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+
+        # Expire the cache so the next request refreshes, then fail that refresh.
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_CACHE_TTL_SECONDS", 0.0)
+        monkeypatch.setattr(
+            public_endpoint, "_CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS", 0.0
+        )
+        get_weights.side_effect = ChainError("rpc unavailable")
+        get_weights.return_value = None
+
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+        await _drain_weight_refreshes(app)
+        response = await client.get("/api/v1/public/weights")
+
+        # A transient upstream failure must not blank the panel: the last good
+        # matrix is still served, explicitly labeled stale.
+        assert response.status_code == 200
+        body = response.json()
+        assert body["stale"] is True
+        assert body["block"] == 8_639_503
+        assert body["vectors"][0]["validator_hotkey"] == _VALIDATOR_C
+        assert body["age_seconds"] >= 0.0
+
+    async def test_serves_last_known_good_when_refresh_times_out(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        get_weights = AsyncMock(return_value=_weights_snapshot())
+        app.state.chain = SimpleNamespace(get_weights=get_weights)
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+
+        async def _never_returns(_netuid: int) -> ChainWeightsSnapshot:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_CACHE_TTL_SECONDS", 0.0)
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_TIMEOUT_SECONDS", 0.001)
+        monkeypatch.setattr(
+            public_endpoint, "_CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS", 0.0
+        )
+        app.state.chain = SimpleNamespace(get_weights=_never_returns)
+
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+        await _drain_weight_refreshes(app)
+        response = await client.get("/api/v1/public/weights")
+
+        assert response.status_code == 200
+        assert response.json()["stale"] is True
+
+    async def test_backs_off_instead_of_retrying_a_failing_read_per_request(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        get_weights = AsyncMock(side_effect=ChainError("rpc unavailable"))
+        app.state.chain = SimpleNamespace(get_weights=get_weights)
+
+        first = await client.get("/api/v1/public/weights")
+        second = await client.get("/api/v1/public/weights")
+
+        assert [first.status_code, second.status_code] == [503, 503]
+        # A 503 is not stored by the response cache, so without this backoff the
+        # next poll would immediately run another doomed multi-second read — the
+        # loop that made this endpoint fail a quarter of the time in prod.
+        assert get_weights.await_count == 1
+
+    async def test_reverts_to_503_once_the_cached_matrix_is_too_old(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        get_weights = AsyncMock(return_value=_weights_snapshot())
+        app.state.chain = SimpleNamespace(get_weights=get_weights)
+        assert (await client.get("/api/v1/public/weights")).status_code == 200
+
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_CACHE_TTL_SECONDS", 0.0)
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_MAX_STALE_SECONDS", -1.0)
+        monkeypatch.setattr(
+            public_endpoint, "_CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS", 0.0
+        )
+        get_weights.side_effect = ChainError("rpc unavailable")
+
+        response = await client.get("/api/v1/public/weights")
+
+        # Serving indefinitely-old chain state would misrepresent it; past the
+        # ceiling the endpoint says nothing rather than something wrong.
+        assert response.status_code == 503
+
+    async def test_logs_the_exception_type_when_the_read_times_out(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        async def _never_returns(_netuid: int) -> ChainWeightsSnapshot:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        app.state.chain = SimpleNamespace(get_weights=_never_returns)
+        monkeypatch.setattr(public_endpoint, "_CHAIN_WEIGHTS_TIMEOUT_SECONDS", 0.001)
+
+        with caplog.at_level(logging.WARNING, logger=public_endpoint.__name__):
+            assert (await client.get("/api/v1/public/weights")).status_code == 503
+
+        # `asyncio.wait_for` raises a bare TimeoutError whose str() is "", which
+        # is how this warning used to log an empty message and explain nothing.
+        assert any(
+            "TimeoutError" in record.getMessage() for record in caplog.records
+        ), [r.getMessage() for r in caplog.records]
 
 
 class TestPublicBenchmarkTimeline:
@@ -956,6 +1170,108 @@ class TestPublicLeaderboard:
         entry = response.json()["entries"][0]
         assert entry["registered"] is None
         assert entry["emission_eligible"] is None
+
+    async def test_failed_registration_refresh_keeps_the_last_known_good_mapping(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.7, 0.8, 0.9],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+        )
+        _install_db(app, session_maker)
+        get_recent_neurons = AsyncMock(
+            return_value=[SimpleNamespace(hotkey=_MINER_A, uid=42)]
+        )
+        app.state.chain = SimpleNamespace(get_recent_neurons=get_recent_neurons)
+        # The snapshot bakes its expiry in at write time, so the TTL has to be
+        # zeroed before the first read for the second one to attempt a refresh.
+        monkeypatch.setattr(public_endpoint, "_REGISTRATION_CACHE_TTL_SECONDS", 0.0)
+
+        first = (await client.get("/api/v1/public/leaderboard")).json()
+        assert first["entries"][0]["registered"] is True
+        assert first["registration_stale"] is False
+
+        get_recent_neurons.side_effect = ChainError("pylon unavailable")
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        # The row keeps its real registration rather than flipping every row on
+        # the board to "unknown" for one poll and back on the next.
+        entry = body["entries"][0]
+        assert entry["registered"] is True
+        assert entry["miner_uid"] == 42
+        assert body["registration_stale"] is True
+
+    async def test_registration_becomes_unknown_once_the_last_read_is_too_old(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.7, 0.8, 0.9],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+        )
+        _install_db(app, session_maker)
+        get_recent_neurons = AsyncMock(
+            return_value=[SimpleNamespace(hotkey=_MINER_A, uid=42)]
+        )
+        app.state.chain = SimpleNamespace(get_recent_neurons=get_recent_neurons)
+        monkeypatch.setattr(public_endpoint, "_REGISTRATION_CACHE_TTL_SECONDS", 0.0)
+        assert (await client.get("/api/v1/public/leaderboard")).status_code == 200
+
+        monkeypatch.setattr(public_endpoint, "_REGISTRATION_MAX_STALE_SECONDS", -1.0)
+        get_recent_neurons.side_effect = ChainError("pylon unavailable")
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+
+        assert body["entries"][0]["registered"] is None
+        assert body["registration_stale"] is False
+
+    async def test_logs_the_exception_type_when_registration_read_times_out(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.7, 0.8, 0.9],
+            details={"bench_version": 2},
+        )
+        _install_db(app, session_maker)
+
+        async def _never_returns(_netuid: int) -> list[object]:
+            await asyncio.Event().wait()
+            return []
+
+        app.state.chain = SimpleNamespace(get_recent_neurons=_never_returns)
+        monkeypatch.setattr(
+            public_endpoint, "_REGISTRATION_LOOKUP_TIMEOUT_SECONDS", 0.001
+        )
+
+        with caplog.at_level(logging.WARNING, logger=public_endpoint.__name__):
+            assert (await client.get("/api/v1/public/leaderboard")).status_code == 200
+
+        # `asyncio.timeout` raises a bare TimeoutError whose str() is "": this
+        # warning used to fire hundreds of times a day with an empty message.
+        assert any(
+            "registration read failed" in record.getMessage()
+            and "TimeoutError" in record.getMessage()
+            for record in caplog.records
+        ), [r.getMessage() for r in caplog.records]
 
     async def test_includes_pre_quorum_scores_as_provisional_feedback(
         self,

@@ -12,7 +12,8 @@
 # .env — there Postgres is the dedicated PG VM and object storage is GCS, so only
 # the Pylon sidecar runs locally.
 #
-# Idempotent: safe to re-run. Use scripts/update.sh for zero-downtime deploys.
+# Idempotent: safe to re-run. Use scripts/update.sh to deploy a new revision
+# (that reload is a stop/start, not zero-downtime -- see ecosystem.config.js).
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

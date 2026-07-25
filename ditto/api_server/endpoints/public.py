@@ -270,10 +270,40 @@ _TIMELINE_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=3600"
 # with no request at all, and any correction lands within the hour.
 _SETTLED_BENCH_CACHE_CONTROL = "public, max-age=3600, stale-while-revalidate=86400"
 _ARTIFACT_DOWNLOAD_TTL_SECONDS = 5 * 60
-_REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 1.0
+# One Pylon metagraph read, behind the 15s cache below, so this fires at most
+# once every 15s no matter how many viewers are polling. 1.0s was too tight for
+# a normal Pylon round trip under load and was the direct cause of a recurring
+# "registration unknown" flash across every leaderboard row.
+_REGISTRATION_LOOKUP_TIMEOUT_SECONDS = 3.0
 _REGISTRATION_CACHE_TTL_SECONDS = 15.0
 _REGISTRATION_FAILURE_CACHE_TTL_SECONDS = 5.0
-_CHAIN_WEIGHTS_TIMEOUT_SECONDS = 4.0
+# How long a *successful* registration mapping may keep being served after
+# refreshes start failing. Registration only decorates the durable ledger, so a
+# few minutes of slightly-old UIDs is far better for a reader than flipping the
+# whole board to "unknown"; past this the mapping stops being evidence of
+# anything current and the board does report unknown.
+_REGISTRATION_MAX_STALE_SECONDS = 600.0
+# `get_weights` opens a fresh substrate websocket and fully exhausts two storage
+# maps; in prod that measured 10-21s, not the low seconds the old 4s budget
+# assumed. Nearly every read was therefore killed before it could finish. Because
+# PublicCacheMiddleware only stores 200s, each resulting 503 also left nothing
+# cached, so the very next poll ran another doomed read: a self-sustaining
+# failure loop that 503'd ~25% of requests to this endpoint, each 503 blanking
+# the dashboard's chain-observation panel for that tick. The budget now exceeds
+# the real cost of the read instead of guaranteeing it gets cancelled.
+_CHAIN_WEIGHTS_TIMEOUT_SECONDS = 30.0
+# The revealed matrix only changes when validators reveal, which is epoch scale
+# (~72 min), so this is still far finer-grained than the data moves. Deliberately
+# longer than the 30s max-age this endpoint declares: the response cache absorbs
+# the polling, and this absorbs the response cache's own expiries.
+_CHAIN_WEIGHTS_CACHE_TTL_SECONDS = 60.0
+# Backoff after a failed refresh, so an upstream outage cannot put us back in the
+# read-fail-retry-immediately loop described above.
+_CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS = 30.0
+# Ceiling on serving a cached matrix once refreshes fail. Past this the block it
+# pins is too old to present even as explicitly stale, and the endpoint reverts
+# to 503 rather than implying the chain state is roughly current.
+_CHAIN_WEIGHTS_MAX_STALE_SECONDS = 1800.0
 _TRANSCRIPT_MAX_BYTES = 32 << 20
 _TRANSCRIPT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # Historical reproduction must fail closed: only benchmark epochs whose exact
@@ -342,10 +372,163 @@ _PUBLIC_ACTIVITY_STATUSES = frozenset(
 )
 
 
+def _error_detail(error: BaseException) -> str:
+    """Render an exception so a message-less type still logs something usable.
+
+    ``asyncio.wait_for`` / ``asyncio.timeout`` raise a bare ``TimeoutError()``
+    with no args, so the obvious ``logger.warning("...: %s", error)`` renders the
+    empty string. That is how the two upstream-read warnings below ended up
+    firing thousands of times a day while saying nothing at all about why. Lead
+    with the class name so a timeout is always distinguishable from a chain
+    error, even when the exception itself carries no text.
+    """
+    text = str(error).strip()
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
 @dataclass(frozen=True)
 class _RegistrationSnapshot:
+    """A registration mapping plus the provenance needed to age it out.
+
+    ``read_at`` is when the underlying chain read actually succeeded (not when
+    this snapshot object was built), so a mapping re-armed after a failed refresh
+    keeps reporting its true age. ``stale`` says the last refresh failed and this
+    is a previous good read being served on.
+    """
+
     expires_at: float
     uids_by_hotkey: dict[str, int] | None
+    read_at: float
+    stale: bool = False
+
+
+@dataclass(frozen=True)
+class _ChainWeightsSnapshot:
+    """The last successfully read weight matrix, with its read time."""
+
+    payload: PublicChainWeightsResponse
+    read_at: float
+
+
+def _chain_weights_lock(request: Request) -> asyncio.Lock:
+    """Return the process-wide single-flight lock for the weight-matrix read.
+
+    Created lazily on first use like the snapshot itself. The event loop is
+    single-threaded, so there is no race between the check and the assignment.
+    """
+    lock = getattr(request.app.state, "public_chain_weights_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        request.app.state.public_chain_weights_lock = lock
+    return lock
+
+
+def _cached_chain_weights(request: Request) -> _ChainWeightsSnapshot | None:
+    """Return the cached weight matrix, ignoring anything of an unexpected shape."""
+    cached = getattr(request.app.state, "public_chain_weights", None)
+    return cached if isinstance(cached, _ChainWeightsSnapshot) else None
+
+
+def _chain_weights_payload(
+    request: Request, snapshot: _ChainWeightsSnapshot
+) -> PublicChainWeightsResponse:
+    """Stamp the cached matrix with its age and whether refreshes are failing.
+
+    ``stale`` means the most recent *attempt* to re-read the chain failed, which
+    is the thing a reader actually needs to know. It is not merely "older than
+    the TTL": a matrix a few seconds past its refresh window is being refreshed
+    right now and is not worth flagging.
+    """
+    failed_at = getattr(request.app.state, "public_chain_weights_failed_at", None)
+    return snapshot.payload.model_copy(
+        update={
+            "stale": isinstance(failed_at, float) and failed_at > snapshot.read_at,
+            "age_seconds": round(max(0.0, time.monotonic() - snapshot.read_at), 1),
+        }
+    )
+
+
+def _schedule_chain_weights_refresh(request: Request) -> None:
+    """Kick off a background refresh, at most one at a time.
+
+    Serve-while-revalidate. The cached matrix goes out on *this* request while
+    the slow chain read happens off the request path. Refreshing inline instead
+    would make whichever poller happened to arrive at TTL expiry wait out a
+    multi-second read — and because PublicCacheMiddleware single-flights misses,
+    every client that arrived during that window would wait with it.
+    """
+    lock = _chain_weights_lock(request)
+    failed_at = getattr(request.app.state, "public_chain_weights_failed_at", None)
+    recently_failed = (
+        isinstance(failed_at, float)
+        and time.monotonic() - failed_at < _CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS
+    )
+    if lock.locked() or recently_failed:
+        return
+
+    async def _refresh() -> None:
+        async with lock:
+            await _refresh_chain_weights(request)
+
+    task = asyncio.create_task(_refresh())
+    # asyncio only holds a weak reference to a running task, so an unreferenced
+    # one can be garbage-collected mid-read. Keep it alive until it completes.
+    tasks = getattr(request.app.state, "public_chain_weights_tasks", None)
+    if not isinstance(tasks, set):
+        tasks = set()
+        request.app.state.public_chain_weights_tasks = tasks
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def _refresh_chain_weights(request: Request) -> _ChainWeightsSnapshot | None:
+    """Read the matrix from chain and cache it, or return ``None`` on failure.
+
+    Callers must hold :func:`_chain_weights_lock`; this is the only place that
+    opens a substrate connection for this endpoint.
+    """
+    chain = getattr(request.app.state, "chain", None)
+    config = getattr(request.app.state, "config", None)
+    get_weights = getattr(chain, "get_weights", None)
+    if chain is None or config is None or not callable(get_weights):
+        return None
+    try:
+        snapshot = await asyncio.wait_for(
+            get_weights(config.chain.netuid), timeout=_CHAIN_WEIGHTS_TIMEOUT_SECONDS
+        )
+    except (ChainError, TimeoutError) as error:
+        request.app.state.public_chain_weights_failed_at = time.monotonic()
+        logger.warning(
+            "public chain weights refresh failed after %.1fs: %s",
+            _CHAIN_WEIGHTS_TIMEOUT_SECONDS,
+            _error_detail(error),
+        )
+        return None
+    refreshed = _ChainWeightsSnapshot(
+        payload=PublicChainWeightsResponse(
+            generated_at=datetime.now(UTC),
+            netuid=snapshot.netuid,
+            block=snapshot.block,
+            block_hash=snapshot.block_hash,
+            owner_hotkey=snapshot.owner_hotkey,
+            vectors=[
+                PublicValidatorWeightVector(
+                    validator_uid=vector.validator_uid,
+                    validator_hotkey=vector.validator_hotkey,
+                    weights=[
+                        PublicChainWeight(
+                            uid=weight.uid, hotkey=weight.hotkey, value=weight.value
+                        )
+                        for weight in vector.weights
+                    ],
+                )
+                for vector in snapshot.vectors
+            ],
+        ),
+        read_at=time.monotonic(),
+    )
+    request.app.state.public_chain_weights = refreshed
+    return refreshed
 
 
 @router.get("/weights", response_model=PublicChainWeightsResponse)
@@ -358,42 +541,49 @@ async def chain_weights(
     is necessarily the last revealed state and may lag encrypted commitments;
     it is evidence of what is public on chain, not a substitute for Yuma's
     stake-weighted emissions calculation.
+
+    The read is cached and refreshed in the background rather than run per
+    request. It used to be inline with a budget (4s) well below what the read
+    actually costs (10-21s), so it was usually cancelled; since the response
+    cache in front of this endpoint stores only 200s, each resulting 503 left
+    nothing cached and the next poll immediately retried the same doomed read.
+    ~25% of requests 503'd, and every one of them blanked the dashboard's
+    chain-observation panel for a tick — the reported "flickering".
+
+    Now a served response never waits on chain: a cached matrix goes out
+    immediately and any refresh happens off the request path. A failed refresh
+    keeps serving the last known good matrix marked ``stale`` instead of
+    returning nothing. A 503 is reserved for having genuinely never read the
+    matrix, or having last read it so long ago that presenting it would
+    misrepresent current chain state.
     """
     response.headers["Cache-Control"] = _CACHE_CONTROL
-    chain = getattr(request.app.state, "chain", None)
-    config = getattr(request.app.state, "config", None)
-    get_weights = getattr(chain, "get_weights", None)
-    if chain is None or config is None or not callable(get_weights):
-        raise HTTPException(status_code=503, detail="chain weights unavailable")
-    try:
-        snapshot = await asyncio.wait_for(
-            get_weights(config.chain.netuid), timeout=_CHAIN_WEIGHTS_TIMEOUT_SECONDS
+    cached = _cached_chain_weights(request)
+    if cached is not None:
+        age = time.monotonic() - cached.read_at
+        if age >= _CHAIN_WEIGHTS_CACHE_TTL_SECONDS:
+            _schedule_chain_weights_refresh(request)
+        if age <= _CHAIN_WEIGHTS_MAX_STALE_SECONDS:
+            return _chain_weights_payload(request, cached)
+
+    # No usable cache, so this request does have to wait for a real read. Only
+    # reachable on a cold process or after a very long outage.
+    lock = _chain_weights_lock(request)
+    async with lock:
+        latest = _cached_chain_weights(request)
+        if latest is not None and latest is not cached:
+            # Refreshed by whoever held the lock ahead of us.
+            return _chain_weights_payload(request, latest)
+        failed_at = getattr(request.app.state, "public_chain_weights_failed_at", None)
+        recently_failed = (
+            isinstance(failed_at, float)
+            and time.monotonic() - failed_at < _CHAIN_WEIGHTS_FAILURE_BACKOFF_SECONDS
         )
-    except (ChainError, TimeoutError) as error:
-        logger.warning("public chain weights unavailable: %s", error)
-        raise HTTPException(
-            status_code=503, detail="chain weights unavailable"
-        ) from error
-    return PublicChainWeightsResponse(
-        generated_at=datetime.now(UTC),
-        netuid=snapshot.netuid,
-        block=snapshot.block,
-        block_hash=snapshot.block_hash,
-        owner_hotkey=snapshot.owner_hotkey,
-        vectors=[
-            PublicValidatorWeightVector(
-                validator_uid=vector.validator_uid,
-                validator_hotkey=vector.validator_hotkey,
-                weights=[
-                    PublicChainWeight(
-                        uid=weight.uid, hotkey=weight.hotkey, value=weight.value
-                    )
-                    for weight in vector.weights
-                ],
-            )
-            for vector in snapshot.vectors
-        ],
-    )
+        refreshed = None if recently_failed else await _refresh_chain_weights(request)
+
+    if refreshed is not None:
+        return _chain_weights_payload(request, refreshed)
+    raise HTTPException(status_code=503, detail="chain weights unavailable")
 
 
 def screening_dispute_signing_message(agent_id: UUID, message: str) -> bytes:
@@ -1464,7 +1654,9 @@ async def leaderboard(
         bench_version=bench_version,
     )
     selected_versions = {row.agent_id: row.bench_version for row in ledger_rows}
-    registered_uids = await _current_registered_uids(request)
+    registration = await _current_registration(request)
+    registered_uids = registration.uids_by_hotkey if registration else None
+    registration_stale = registration is not None and registration.stale
     quorum = await quorum_composites(
         session,
         [row.agent_id for row in ledger_rows],
@@ -1728,6 +1920,7 @@ async def leaderboard(
         selection_mode="historical" if bench_version is not None else "authoritative",
         continual_aggregate_active=continual_mean_active,
         continual_aggregate_required_protocol=_CONTINUAL_MEAN_PROTOCOL,
+        registration_stale=registration_stale,
         entries=entries,
         emissions=(
             None
@@ -1841,12 +2034,37 @@ async def efficiency_snapshot(
     )
 
 
-async def _current_registered_uids(request: Request) -> dict[str, int] | None:
-    """Current subnet hotkeys and UIDs, or ``None`` when chain data is unavailable.
+def _retained_registration(
+    cached: _RegistrationSnapshot | None, *, now: float
+) -> _RegistrationSnapshot | None:
+    """Re-arm a previously good mapping as explicitly stale, or ``None``.
+
+    Returns ``None`` when there has never been a good read, or when the last one
+    is older than :data:`_REGISTRATION_MAX_STALE_SECONDS` and so no longer worth
+    presenting as current registration.
+    """
+    if cached is None or cached.uids_by_hotkey is None:
+        return None
+    if now - cached.read_at > _REGISTRATION_MAX_STALE_SECONDS:
+        return None
+    return _RegistrationSnapshot(
+        expires_at=now + _REGISTRATION_FAILURE_CACHE_TTL_SECONDS,
+        uids_by_hotkey=cached.uids_by_hotkey,
+        read_at=cached.read_at,
+        stale=True,
+    )
+
+
+async def _current_registration(request: Request) -> _RegistrationSnapshot | None:
+    """Current subnet hotkeys and UIDs, degrading to the last good read.
 
     Registration decorates the durable score ledger; it never deletes or changes
-    a submission. Public reads therefore degrade to an explicit unknown state
-    instead of failing or pretending a stale registration result is current.
+    a submission. A momentary chain hiccup therefore must not flip every row on
+    the board to "registration unknown" for one poll and back on the next: that
+    reads to a viewer as the page blanking. On a failed refresh this keeps
+    serving the previous mapping with ``stale=True`` so the caller can label it,
+    and only reports genuinely unknown registration (``uids_by_hotkey=None``)
+    when there is no recent good read to fall back on.
     """
     chain = getattr(request.app.state, "chain", None)
     config = getattr(request.app.state, "config", None)
@@ -1854,24 +2072,39 @@ async def _current_registered_uids(request: Request) -> dict[str, int] | None:
         return None
     now = time.monotonic()
     cached = getattr(request.app.state, "public_registration_snapshot", None)
-    if isinstance(cached, _RegistrationSnapshot) and cached.expires_at > now:
-        return cached.uids_by_hotkey
+    if not isinstance(cached, _RegistrationSnapshot):
+        cached = None
+    if cached is not None and cached.expires_at > now:
+        return cached
     try:
         async with asyncio.timeout(_REGISTRATION_LOOKUP_TIMEOUT_SECONDS):
             neurons = await chain.get_recent_neurons(config.chain.netuid)
     except (ChainError, TimeoutError) as e:
-        logger.warning("public leaderboard registration read failed: %s", e)
-        request.app.state.public_registration_snapshot = _RegistrationSnapshot(
+        retained = _retained_registration(cached, now=now)
+        logger.warning(
+            "public leaderboard registration read failed after %.1fs (%s): %s",
+            _REGISTRATION_LOOKUP_TIMEOUT_SECONDS,
+            (
+                f"serving last known good, {now - retained.read_at:.0f}s old"
+                if retained is not None
+                else "no recent read to fall back on; reporting unknown"
+            ),
+            _error_detail(e),
+        )
+        snapshot = retained or _RegistrationSnapshot(
             expires_at=now + _REGISTRATION_FAILURE_CACHE_TTL_SECONDS,
             uids_by_hotkey=None,
+            read_at=now,
         )
-        return None
-    uids_by_hotkey = {neuron.hotkey: int(neuron.uid) for neuron in neurons}
-    request.app.state.public_registration_snapshot = _RegistrationSnapshot(
+        request.app.state.public_registration_snapshot = snapshot
+        return snapshot
+    snapshot = _RegistrationSnapshot(
         expires_at=now + _REGISTRATION_CACHE_TTL_SECONDS,
-        uids_by_hotkey=uids_by_hotkey,
+        uids_by_hotkey={neuron.hotkey: int(neuron.uid) for neuron in neurons},
+        read_at=now,
     )
-    return uids_by_hotkey
+    request.app.state.public_registration_snapshot = snapshot
+    return snapshot
 
 
 @router.get("/health", response_model=PublicHealthResponse)

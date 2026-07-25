@@ -159,21 +159,26 @@ volume across restarts; `docker compose down -v` for a hard reset.
 ## Running on a host with pm2 (staging / production)
 
 The API is a long-lived process; we run it under [pm2](https://pm2.keymetrics.io/)
-on the host (the database and object store stay in Docker). Logs and zero-downtime
-updates are first-class.
+on the host (the database and object store stay in Docker). Logs, restarts, and
+scripted updates are first-class.
 
 ```sh
 npm install -g pm2           # one-time, if not present
 ./scripts/start.sh           # infra up + migrate + start API under pm2
 pm2 logs ditto-api           # tail logs
 pm2 status                   # process state
-./scripts/update.sh          # git pull + uv sync + migrate + zero-downtime reload
+./scripts/update.sh          # git pull + uv sync + migrate + pm2 reload
 ./scripts/stop.sh            # stop the API process
 ```
 
 - pm2 config: [`scripts/ecosystem.config.js`](scripts/ecosystem.config.js)
 - Logs are written to `./logs/ditto-api.{out,err}.log` and via `pm2 logs`.
 - `pm2 startup` + `pm2 save` will resurrect the process across host reboots.
+- **Updates are not zero-downtime.** The app runs as a single `fork`-mode pm2
+  process, so `pm2 reload` has no second instance to shift traffic onto and
+  degrades to a stop/start: expect ~6s of refused connections per deploy
+  (measured). Cluster mode would close that gap and is an open operator
+  decision, not something the reload command papers over today.
 
 ---
 
