@@ -1932,7 +1932,14 @@ async def _benchmark_qualification_state(
     )
     validator_active = issued_ticket_active or heartbeat_active
     top_five = (
-        await historical_rescore_cohort(session, source_version=rollout.from_version)
+        # The rollout's own frozen target, not the live policy: this answers
+        # "would quarantining this agent disturb the open rollout's cohort?",
+        # and that cohort is the size the rollout froze at start.
+        await historical_rescore_cohort(
+            session,
+            source_version=rollout.from_version,
+            limit=rollout.rescore_cohort_target,
+        )
         if rollout is not None
         else []
     )

@@ -48,8 +48,8 @@ from ditto.db.models import (
 )
 from ditto.db.queries.benchmark_rollout import (
     CANARY_BENCH_VERSION,
+    DEFAULT_RESCORE_COHORT_SIZE,
     MIN_DESIRED_AUTHORITY_AGENTS,
-    RESCORE_COHORT_SIZE,
     DatasetPin,
     InferenceActivationRequirements,
     RolloutConflictError,
@@ -71,6 +71,9 @@ from ditto.db.queries.benchmark_rollout import (
     rollout_state,
     select_active_bench_version,
     supersede_open_rollout,
+)
+from ditto.db.queries.benchmark_rollout_settings import (
+    insert_benchmark_rollout_settings_revision,
 )
 from ditto.db.queries.scores import count_ranked_quorum_agents, list_eligible_ledger
 from ditto.db.queries.screening import claim_screening_attempts
@@ -98,6 +101,9 @@ async def test_admin_status_read_does_not_start_rollout() -> None:
             "qualification_converged": False,
             "cohort_size": 0,
             "cohort_ready_count": 0,
+            # No rollout row exists, so nothing has frozen a target yet.
+            "rescore_cohort_target": None,
+            "max_rescore_cohort_size": 25,
             "priority_cohort_size": 5,
             "priority_complete": False,
             "members": [],
@@ -509,7 +515,7 @@ async def test_source_backfill_gate_waits_for_full_inherited_top_ten() -> None:
     now = datetime.now(UTC).replace(microsecond=0)
     async with maker() as session, session.begin():
         agent_ids, rollout = await _seed_rollout(session, now)
-        for position in range(6, RESCORE_COHORT_SIZE + 1):
+        for position in range(6, DEFAULT_RESCORE_COHORT_SIZE + 1):
             agent_id = uuid4()
             agent_ids.append(agent_id)
             session.add(
@@ -542,7 +548,7 @@ async def test_source_backfill_gate_waits_for_full_inherited_top_ten() -> None:
             )
 
         for position, agent_id in enumerate(agent_ids, start=1):
-            validator_count = 2 if position == RESCORE_COHORT_SIZE else 3
+            validator_count = 2 if position == DEFAULT_RESCORE_COHORT_SIZE else 3
             for validator in range(validator_count):
                 session.add(
                     Score(
@@ -556,14 +562,14 @@ async def test_source_backfill_gate_waits_for_full_inherited_top_ten() -> None:
                         tool_mean=0.8,
                         memory_mean=0.8,
                         median_ms=1,
-                        n=(15 if position == RESCORE_COHORT_SIZE else 114),
+                        n=(15 if position == DEFAULT_RESCORE_COHORT_SIZE else 114),
                         details={"bench_version": CANARY_BENCH_VERSION},
                         generated_at=now,
                     )
                 )
         await session.flush()
         assert not await rollout_cohort_complete(
-            session, rollout=rollout, cohort_size=RESCORE_COHORT_SIZE
+            session, rollout=rollout, cohort_size=DEFAULT_RESCORE_COHORT_SIZE
         )
         assert await rollout_cohort_complete(session, rollout=rollout, cohort_size=5)
 
@@ -588,7 +594,7 @@ async def test_source_backfill_gate_waits_for_full_inherited_top_ten() -> None:
         # Three smoke-profile rows are a raw quorum but cannot rank and must
         # not open source-era capacity.
         assert not await rollout_cohort_complete(
-            session, rollout=rollout, cohort_size=RESCORE_COHORT_SIZE
+            session, rollout=rollout, cohort_size=DEFAULT_RESCORE_COHORT_SIZE
         )
         smoke_scores = (
             (
@@ -606,7 +612,7 @@ async def test_source_backfill_gate_waits_for_full_inherited_top_ten() -> None:
             score.n = 114
         await session.flush()
         assert await rollout_cohort_complete(
-            session, rollout=rollout, cohort_size=RESCORE_COHORT_SIZE
+            session, rollout=rollout, cohort_size=DEFAULT_RESCORE_COHORT_SIZE
         )
     await engine.dispose()
 
@@ -2723,3 +2729,148 @@ async def test_rollout_state_active_version_matches_start_guard_authority() -> N
         # expected_active_version is exactly what the start guard checks.
         assert state["active_version"] == guard
     await engine.dispose()
+
+
+async def _seed_eligible_v2_era(session, now: datetime, *, count: int) -> None:
+    """``count`` distinctly-owned v2 agents any rollout could inherit."""
+    for position in range(1, count + 1):
+        agent_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=agent_id,
+                miner_hotkey=f"miner-cohort-{position}",
+                name=f"cohort-{position}",
+                sha256=f"{position:064x}",
+                status=AgentStatus.SCORED,
+                screening_policy_version=9,
+                screened_image_sha256=f"{position:064x}",
+                screened_image_size_bytes=1024,
+                screened_image_id=f"sha256:{position:064x}",
+                screened_image_ref=f"ditto-screen/{agent_id}:latest",
+                screened_image_upload_id=uuid4(),
+                screened_image_verified_at=now,
+                dataset_seed=position,
+                dataset_sha256="c" * 64,
+                dataset_run_size="full",
+                created_at=now + timedelta(seconds=position),
+            )
+        )
+        for validator in range(3):
+            session.add(
+                Score(
+                    agent_id=agent_id,
+                    bench_version=2,
+                    validator_hotkey=f"legacy-{validator}",
+                    run_id=f"cohort-v2-{position}-{validator}",
+                    signature="aa",
+                    seed=position,
+                    composite=1 - position / 1000,
+                    tool_mean=0.5,
+                    memory_mean=0.5,
+                    median_ms=1,
+                    n=114,
+                    details={"bench_version": 2},
+                    generated_at=now,
+                )
+            )
+    capabilities, stack = _capabilities(now)
+    session.add(
+        ValidatorHeartbeat(
+            validator_hotkey="validator-cohort",
+            software_version="1.0.0",
+            protocol_version=12,
+            code_digest="d" * 64,
+            state="polling",
+            first_seen_at=now,
+            reported_at=now,
+            seen_at=now,
+            signature="ab" * 64,
+            capabilities=capabilities,
+            stack=stack,
+        )
+    )
+    _add_ready_v7_route(session, now)
+
+
+async def _start_for_cohort_size(configured: int | None) -> dict:
+    """Start a rollout with 12 eligible inherited agents under a given policy."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with maker() as session, session.begin():
+        await _seed_eligible_v2_era(session, now, count=12)
+        if configured is not None:
+            await insert_benchmark_rollout_settings_revision(
+                session,
+                parent_revision=0,
+                scope="*",
+                settings={"rescore_cohort_size": configured},
+                checksum="b" * 64,
+                reason="the subnet is scaling; widen the rescore cohort",
+                actor="peyton@omniaura.ai",
+            )
+    generator = AsyncMock()
+    generator.generate.return_value = "e" * 64
+    async with maker() as session:
+        state = await start_rollout(
+            None,
+            session,
+            generator,
+            str(CANARY_BENCH_VERSION),
+            AdminRolloutStartRequest(
+                reason="operator opens shipped benchmark",
+                actor="backroom:test",
+                confirmation=f"START BENCHMARK V{CANARY_BENCH_VERSION}",
+                expected_active_version=2,
+            ),
+        )
+        await session.rollback()
+        async with session.begin():
+            rollout = await open_rollout(session)
+            assert rollout is not None
+            audit = await session.scalar(
+                select(BenchmarkRolloutAudit).where(
+                    BenchmarkRolloutAudit.rollout_id == rollout.rollout_id,
+                    BenchmarkRolloutAudit.event == "cohort_frozen",
+                )
+            )
+            assert audit is not None
+            result = {
+                "state": state,
+                "target": rollout.rescore_cohort_target,
+                "cohort_size": rollout.cohort_size,
+                "audit_target": audit.payload["rescore_cohort_target"],
+            }
+    await engine.dispose()
+    return result
+
+
+async def test_rollout_start_defaults_to_the_inherited_top_ten() -> None:
+    result = await _start_for_cohort_size(None)
+    assert result["target"] == 10
+    assert result["cohort_size"] == 10
+    assert result["audit_target"] == 10
+    assert result["state"]["rescore_cohort_target"] == 10
+    assert result["state"]["max_rescore_cohort_size"] == 25
+    assert len(result["state"]["members"]) == 10
+
+
+async def test_rollout_start_freezes_the_configured_cohort_size() -> None:
+    """The operator's 10 -> 25 change lands on the next start and is recorded."""
+    result = await _start_for_cohort_size(25)
+    assert result["target"] == 25
+    # Only twelve inherited agents are eligible, so the cohort is what the two
+    # prior eras could supply -- the target is the ceiling, not a quota.
+    assert result["cohort_size"] == 12
+    assert result["audit_target"] == 25
+    assert result["state"]["rescore_cohort_target"] == 25
+    assert len(result["state"]["members"]) == 12
+
+
+async def test_rollout_start_honors_a_narrowed_cohort_size() -> None:
+    result = await _start_for_cohort_size(5)
+    assert result["target"] == 5
+    assert result["cohort_size"] == 5
+    assert len(result["state"]["members"]) == 5

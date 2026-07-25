@@ -51,11 +51,22 @@ LEGACY_BENCH_VERSION = 2
 # This is discovery metadata only: it no longer opens or selects a rollout.
 CANARY_BENCH_VERSION = latest_benchmark_contract().version
 PRIORITY_COHORT_SIZE = 5
-# New benchmark transitions rescore only the inherited top ten. The database
-# still permits older 11-25-member rollout snapshots so historical audit rows
-# remain readable and an in-flight rollout created by an older deployment can
-# finish without destructive member deletion.
-RESCORE_COHORT_SIZE = 10
+# How many inherited agents a new benchmark transition rescores when no operator
+# revision has ever been written. This is only the DEFAULT: the effective size
+# is the operator policy in ``benchmark_rollout_settings_revisions``, read once
+# at rollout start and frozen onto ``BenchmarkRollout.rescore_cohort_target``.
+#
+# Never read this constant to decide how large an EXISTING rollout should grow
+# -- read ``rollout.rescore_cohort_target``. A rollout that froze ten members
+# must stay a ten-member rollout even after the operator widens the policy to
+# twenty-five, or an in-flight cohort would silently grow underneath the
+# validators already scoring it.
+DEFAULT_RESCORE_COHORT_SIZE = 10
+# The storage ceiling, mirrored by the ``benchmark_rollout_bounded_members`` and
+# ``benchmark_rollout_bounded_rescore_target`` CHECK constraints. It is also the
+# upper bound an operator may configure. Older 11-25-member rollout snapshots
+# predate the top-ten default; they remain readable and an in-flight rollout
+# created by an older deployment still finishes without member deletion.
 MAX_PERSISTED_RESCORE_COHORT_SIZE = 25
 SCORING_QUORUM = 3
 # How many agents must hold a COMPLETE, ranked desired-version quorum before
@@ -330,7 +341,7 @@ async def historical_rescore_cohort(
     session: AsyncSession,
     *,
     source_version: int,
-    limit: int = RESCORE_COHORT_SIZE,
+    limit: int = DEFAULT_RESCORE_COHORT_SIZE,
 ) -> list[RolloutSnapshotMember]:
     """Freeze the prior-era rescore cohort without admitting the whole ledger.
 
@@ -338,12 +349,19 @@ async def historical_rescore_cohort(
     ``limit`` finalized distinct miners, the next older scored benchmark fills
     the remaining positions. No third historical era is consulted: this is the
     explicit "combine two previous benchmark iterations" fallback, not an
-    unbounded backfill of every legacy submission.
+    unbounded backfill of every legacy submission. That contract is enforced by
+    the ``.limit(2)`` on the version query below and is independent of
+    ``limit`` -- widening the cohort to twenty-five can only return fewer
+    members from the same two eras, never reach into a third.
+
+    The upper bound is the storage ceiling, not the default cohort size: an
+    operator may configure any size in ``[5, 25]``, so validating against the
+    default would make raising the setting throw.
     """
-    if limit < PRIORITY_COHORT_SIZE or limit > RESCORE_COHORT_SIZE:
+    if not PRIORITY_COHORT_SIZE <= limit <= MAX_PERSISTED_RESCORE_COHORT_SIZE:
         raise ValueError(
             f"rollout cohort limit must be between {PRIORITY_COHORT_SIZE} "
-            f"and {RESCORE_COHORT_SIZE}"
+            f"and {MAX_PERSISTED_RESCORE_COHORT_SIZE}"
         )
     versions = list(
         await session.scalars(
@@ -895,11 +913,27 @@ async def create_rollout_snapshot(
     now: datetime,
     from_version: int = DEFAULT_BENCH_VERSION,
     desired_version: int = CANARY_BENCH_VERSION,
+    rescore_cohort_target: int = DEFAULT_RESCORE_COHORT_SIZE,
     audit_context: dict[str, Any] | None = None,
 ) -> BenchmarkRollout:
-    """Freeze a bounded prior-era cohort and target dataset pins, idempotently."""
+    """Freeze a bounded prior-era cohort and target dataset pins, idempotently.
+
+    ``rescore_cohort_target`` is the operator policy at the moment of the start.
+    It is written onto the rollout row and never rewritten, so a later policy
+    revision cannot resize this rollout and a historical rollout can always be
+    explained by the size it was actually built to.
+    """
     if desired_version <= from_version:
         raise ValueError("a benchmark rollout must move the version forward")
+    if (
+        not PRIORITY_COHORT_SIZE
+        <= rescore_cohort_target
+        <= MAX_PERSISTED_RESCORE_COHORT_SIZE
+    ):
+        raise ValueError(
+            f"rollout rescore cohort target must be between {PRIORITY_COHORT_SIZE} "
+            f"and {MAX_PERSISTED_RESCORE_COHORT_SIZE}"
+        )
     if session.get_bind().dialect.name == "postgresql":
         # One global rollout lock name, deliberately NOT keyed on the version:
         # only one rollout may be open at a time, so every transition must
@@ -927,8 +961,11 @@ async def create_rollout_snapshot(
             f"{conflicting.desired_version} is still {conflicting.status}; only one "
             "benchmark rollout may be open at a time"
         )
-    if not PRIORITY_COHORT_SIZE <= len(members) <= RESCORE_COHORT_SIZE:
-        raise ValueError("a benchmark rollout requires between five and ten members")
+    if not PRIORITY_COHORT_SIZE <= len(members) <= rescore_cohort_target:
+        raise ValueError(
+            f"a benchmark rollout requires between {PRIORITY_COHORT_SIZE} and "
+            f"{rescore_cohort_target} members"
+        )
     if len({m.agent_id for m in members}) != len(members):
         raise ValueError("benchmark rollout agents must be distinct")
     if len({m.miner_hotkey for m in members}) != len(members):
@@ -942,6 +979,7 @@ async def create_rollout_snapshot(
         desired_version=desired_version,
         status="collecting",
         cohort_size=len(members),
+        rescore_cohort_target=rescore_cohort_target,
         created_at=now,
     )
     session.add(rollout)
@@ -1512,6 +1550,11 @@ async def rollout_state(
             "qualification_converged": False,
             "cohort_size": 0,
             "cohort_ready_count": 0,
+            # No rollout row, so nothing has frozen a target yet. The size the
+            # NEXT start will freeze is the operator policy, served by
+            # GET /admin/benchmark-rollout-settings.
+            "rescore_cohort_target": None,
+            "max_rescore_cohort_size": MAX_PERSISTED_RESCORE_COHORT_SIZE,
             "priority_cohort_size": PRIORITY_COHORT_SIZE,
             "priority_complete": False,
             "members": [],
@@ -1576,6 +1619,11 @@ async def rollout_state(
         and current_top_ids.issubset(qualified_ids),
         "cohort_size": rollout.cohort_size,
         "cohort_ready_count": cohort_ready_count,
+        # What this rollout froze at start. Immune to later policy revisions,
+        # so a historical rollout is always explainable by the size it aimed
+        # for -- `cohort_size` is how many members it actually qualified.
+        "rescore_cohort_target": rollout.rescore_cohort_target,
+        "max_rescore_cohort_size": MAX_PERSISTED_RESCORE_COHORT_SIZE,
         "priority_cohort_size": PRIORITY_COHORT_SIZE,
         "priority_complete": priority_complete,
         "members": [

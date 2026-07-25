@@ -33,6 +33,7 @@ from ditto.api_server.embedding import create_embedder
 from ditto.api_server.endpoints import (
     admin_artifact_release_settings_router,
     admin_benchmark_rollout_router,
+    admin_benchmark_rollout_settings_router,
     admin_continual_retest_settings_router,
     admin_copy_review_router,
     admin_efficiency_bonus_settings_router,
@@ -259,6 +260,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(public_router, prefix="/api/v1")
     app.include_router(admin_artifact_release_settings_router, prefix="/api/v1")
     app.include_router(admin_benchmark_rollout_router, prefix="/api/v1")
+    app.include_router(admin_benchmark_rollout_settings_router, prefix="/api/v1")
     app.include_router(admin_efficiency_bonus_settings_router, prefix="/api/v1")
     app.include_router(admin_inference_routes_router, prefix="/api/v1")
     app.include_router(admin_quarantine_router, prefix="/api/v1")

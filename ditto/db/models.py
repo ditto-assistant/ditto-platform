@@ -1239,6 +1239,17 @@ class BenchmarkRollout(Base):
     desired_version: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     cohort_size: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    rescore_cohort_target: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=10, server_default=text("10")
+    )
+    """How many inherited agents this rollout set out to rescore.
+
+    Frozen from the operator setting
+    (``benchmark_rollout_settings_revisions.settings.rescore_cohort_size``) at
+    START and never rewritten, so a later revision cannot resize an in-flight
+    rollout and a historical rollout stays explainable. ``cohort_size`` is how
+    many members were actually qualified; this is the size that was aimed for.
+    """
     blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -1257,6 +1268,15 @@ class BenchmarkRollout(Base):
             # before new transitions were narrowed to ten members.
             "cohort_size BETWEEN 5 AND 25",
             name="benchmark_rollout_bounded_members",
+        ),
+        CheckConstraint(
+            # Same storage ceiling as cohort_size: an operator may widen the
+            # target from the default ten up to twenty-five, never past it.
+            # Deliberately NOT related to cohort_size by a constraint --
+            # pre-existing 11-25 member rollouts backfilled a target that is
+            # their own size, and an in-flight rollout is legitimately below it.
+            "rescore_cohort_target BETWEEN 5 AND 25",
+            name="benchmark_rollout_bounded_rescore_target",
         ),
         CheckConstraint(
             # 'superseded' is terminal: an operator abandoned the rollout before
@@ -2628,5 +2648,59 @@ class ContinualRetestSettingsRevision(Base):
             "scope",
             "parent_revision",
             name="continual_retest_settings_scope_parent_key",
+        ),
+    )
+
+
+class BenchmarkRolloutSettingsRevision(Base):
+    """Append-only operator policy for benchmark-rollout sizing.
+
+    Currently one knob: ``rescore_cohort_size``, how many inherited agents the
+    NEXT rollout re-scores. The value is frozen onto
+    ``benchmark_rollouts.rescore_cohort_target`` at rollout start, so this table
+    is policy for future transitions and never live state for an open one.
+    """
+
+    __tablename__ = "benchmark_rollout_settings_revisions"
+
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    settings: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    checksum: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("scope = '*'", name="benchmark_rollout_settings_scope_check"),
+        CheckConstraint(
+            "length(checksum) = 64",
+            name="benchmark_rollout_settings_checksum_check",
+        ),
+        CheckConstraint(
+            "parent_revision >= 0",
+            name="benchmark_rollout_settings_parent_revision_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="benchmark_rollout_settings_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="benchmark_rollout_settings_actor_check",
+        ),
+        Index(
+            "benchmark_rollout_settings_scope_revision_idx",
+            "scope",
+            "revision",
+            unique=True,
+        ),
+        UniqueConstraint(
+            "scope",
+            "parent_revision",
+            name="benchmark_rollout_settings_scope_parent_key",
         ),
     )
