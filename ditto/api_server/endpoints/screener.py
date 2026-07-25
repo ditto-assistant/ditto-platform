@@ -1382,14 +1382,15 @@ async def submit_result(
 
     public_reason: str | None
     if payload.outcome == ScreenResultOutcome.INCONCLUSIVE:
-        # Inconclusive is explicitly a NON-verdict: the worker keeps it
-        # private (journal + lease expiry) and never posts it. Accepting one
-        # here would fall through to the legacy detail-based mapping and turn
-        # "we could not tell" into a rejection.
-        raise AgentNotScreenableError(
-            "inconclusive outcomes are not submittable verdicts"
-        )
-    if payload.outcome == ScreenResultOutcome.QUARANTINE:
+        # Inconclusive remains a NON-verdict: it neither passes nor rejects the
+        # submission. Persist the completed attempt as an early-expired lease
+        # so operators do not see work that finished minutes ago as still
+        # running. Claim selection keeps the agent in backoff until the
+        # original deadline, and the existing expiry cap still bounds repeated
+        # ambiguous results before operator review.
+        target = AgentStatus.SCREENING_FAILED
+        public_reason = "Screening was inconclusive; retry scheduled"
+    elif payload.outcome == ScreenResultOutcome.QUARANTINE:
         # A build-only attempt rebuilds an already-adjudicated submission's
         # prerequisites and runs no source review, so it must not be able to
         # re-quarantine — that would let a screener silently override the
@@ -1480,7 +1481,9 @@ async def submit_result(
             raise AgentNotFoundError(f"no agent with id={agent_id}")
         attempt: ScreeningAttempt | None = None
         attempt_status = (
-            "quarantined"
+            "expired"
+            if payload.outcome == ScreenResultOutcome.INCONCLUSIVE
+            else "quarantined"
             if target == AgentStatus.QUARANTINED
             else "passed"
             if payload.passed
