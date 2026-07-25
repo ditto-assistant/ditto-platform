@@ -2762,6 +2762,7 @@
     var lastEmissions = null;
     var lastActivityEntries = [];
     var pipelineEntries = [];
+    var pipelineStatusCounts = {};
     var pipelineLoaded = false;
     var pipelineUnavailable = false;
     var activityUnavailable = false;
@@ -6906,10 +6907,11 @@
       pipelineLoaded = true;
       pipelineUnavailable = unavailable;
       pipelineEntries = unavailable ? [] : entries;
+      if (data && data.status_counts) pipelineStatusCounts = data.status_counts;
       renderPolicyRescreenNotice(entries, unavailable);
       // Skip the board rebuild when nothing that affects it changed (entries,
       // availability, or the screener overlay), preserving any expanded state.
-      if (!sectionChanged("pipeline", { entries: pipelineEntries, unavailable: unavailable, screeners: fleetReports.screeners })) {
+      if (!sectionChanged("pipeline", { entries: pipelineEntries, counts: pipelineStatusCounts, unavailable: unavailable, screeners: fleetReports.screeners })) {
         updateSearch();
         return;
       }
@@ -6938,7 +6940,10 @@
         var stuckCount = indexed.reduce(function (n, item) {
           return n + (item.entry.retry_state === "exhausted" ? 1 : 0);
         }, 0);
-        count.innerHTML = esc(String(indexed.length)) + (stuckCount
+        var authoritativeCount = column.statuses.reduce(function (total, status) {
+          return total + Number(pipelineStatusCounts[status] || 0);
+        }, 0);
+        count.innerHTML = esc(String(authoritativeCount)) + (stuckCount
           ? '<span class="pipeline-stuck-count" title="' + esc(stuckCount + " submission" + (stuckCount === 1 ? "" : "s") + " exhausted the validator retry budget and need an operator retry grant.") + '">' + esc(String(stuckCount)) + ' stuck</span>'
           : "");
         stage.setAttribute("data-active", indexed.length ? "true" : "false");
@@ -6983,7 +6988,10 @@
             benchmark +
             '</a>';
         }).join("");
-        body.innerHTML = visible;
+        var hiddenCount = Math.max(0, authoritativeCount - indexed.length);
+        body.innerHTML = visible + (hiddenCount
+          ? '<div class="pipeline-more">' + esc(hiddenCount + " older " + (hiddenCount === 1 ? "submission" : "submissions")) + ' in Activity</div>'
+          : '');
       });
       refreshElapsedFlag();
       updateSearch();
@@ -7974,8 +7982,11 @@
           document.getElementById("h-validators").textContent = data.validators.reported_count;
           renderPipelineBoard(data.activity, false);
           renderFleet();
+          var visibleHistory = data.activity.count < data.activity.total
+            ? " · recent history shown; full history in Activity"
+            : "";
           document.getElementById("operations-snapshot").textContent =
-            "Pipeline and fleet reconciled · " + relTime(data.generated_at);
+            "Pipeline and fleet reconciled" + visibleHistory + " · " + relTime(data.generated_at);
         })
         .catch(function () {
           fleetUnavailable.validators = true;
