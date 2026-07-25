@@ -9,9 +9,9 @@ changes a handful of times a week. Five seconds is the whole latency an operator
 sees between a backroom write and the fleet obeying it.
 
 The resolver deliberately reads on its **own** session, not the caller's. The
-admission transaction holds a global advisory lock and two ``FOR UPDATE`` row
-locks; borrowing that session to read a settings row would extend the critical
-section of the most contended transaction in the system by a query.
+admission transaction holds two ``FOR UPDATE`` row locks (the grant and its
+ticket); borrowing that session to read a settings row would extend the
+critical section of the most contended transaction in the system by a query.
 
 Fails **open onto the shipped defaults** on a corrupt or unreadable row. The
 defaults are a working configuration, so the worst case of a bad revision is the
