@@ -34,43 +34,102 @@ async def test_schema_came_from_alembic_not_create_all(
     assert head, "no alembic_version row: the template was not migrated"
 
 
+_CANARY_SCHEMA = "models_canary"
+
+_CONSTRAINT_DEFS = (
+    "SELECT c.relname, pg_get_constraintdef(con.oid) AS def "
+    "FROM pg_constraint con "
+    "JOIN pg_class c ON c.oid = con.conrelid "
+    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE con.contype = 'c' AND n.nspname = :schema"
+)
+
+
+async def _check_predicates(session: AsyncSession, schema: str) -> dict[str, list[str]]:
+    """Every CHECK predicate in ``schema``, grouped by table.
+
+    Keyed on the *predicate*, never the constraint name. Names legitimately
+    differ between the two sides: SQLAlchemy's ``ck_%(table_name)s_%(...)s``
+    naming convention prefixes what ``create_all`` emits, while migrations
+    that wrote raw DDL, or that let Postgres auto-name an inline column
+    CHECK, did not. Comparing names would drown the real drift in ~44
+    cosmetic mismatches.
+    """
+    rows = (await session.execute(text(_CONSTRAINT_DEFS), {"schema": schema})).all()
+    grouped: dict[str, list[str]] = {}
+    for table, definition in rows:
+        grouped.setdefault(table, []).append(definition)
+    return {table: sorted(defs) for table, defs in grouped.items()}
+
+
 async def test_models_declare_every_constraint_the_migrations_create(
     session: AsyncSession,
 ) -> None:
     """Guard against models-vs-migrations drift.
 
     Drift is invisible while tests build their schema from the models: the
-    database enforces a rule production has and the tests never see it.
-    That is not hypothetical -- ``screening_quarantines`` has three CHECKs
+    database enforces a rule production has and the tests never see it. That
+    was not hypothetical -- ``screening_quarantines`` had three CHECKs
     (``manifest_digest``, ``finding_digest``, ``reason_code`` formats) and
-    ``validator_tickets`` has one (``seed >= 0``) that ``models.py`` does
-    not declare, so no test had ever exercised them.
+    ``validator_tickets`` one (``seed >= 0``) that ``models.py`` did not
+    declare, so no test had ever exercised them.
 
-    Ratchet, not a hard equality: tighten ``allowed`` as the gaps close,
-    never loosen it.
+    **Predicates, not counts.** This started as a count ratchet, which cannot
+    see a constraint that exists on both sides with a *weaker* rule -- and one
+    did: ``screening_attempts_reason_code_check`` was the migration's
+    ``reason_code ~ '^[a-z0-9][a-z0-9-]{0,63}$'`` but the model's
+    ``length(reason_code) BETWEEN 1 AND 64``, so the suite accepted reason
+    codes production rejects. Both sides are rendered by the same server here,
+    via ``pg_get_constraintdef``, so the comparison needs no normalization and
+    cannot be fooled by formatting.
+
+    The models side is built into a throwaway schema by ``create_all``. Not
+    ``str(CreateTable(...))``: compiled DDL text does not tell you what
+    Postgres will actually store, which is the thing the migrated side is
+    reporting.
     """
-    from sqlalchemy.dialects import postgresql
-    from sqlalchemy.schema import CreateTable
-
-    migrated = await session.scalar(
-        text(
-            "SELECT count(*) FROM pg_constraint con "
-            "JOIN pg_class c ON c.oid = con.conrelid "
-            "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE con.contype = 'c' AND n.nspname = 'public'"
+    await session.rollback()
+    async with session.begin():
+        await session.execute(text(f'DROP SCHEMA IF EXISTS "{_CANARY_SCHEMA}" CASCADE'))
+        await session.execute(text(f'CREATE SCHEMA "{_CANARY_SCHEMA}"'))
+    try:
+        connection = await session.connection(
+            execution_options={"schema_translate_map": {None: _CANARY_SCHEMA}}
         )
-    )
-    declared = sum(
-        str(CreateTable(table).compile(dialect=postgresql.dialect())).count("CHECK ")
-        for table in Base.metadata.sorted_tables
-    )
-    allowed = 4
-    assert migrated is not None
-    assert migrated - declared <= allowed, (
-        f"models.py is missing {migrated - declared} CHECK constraints that the "
-        f"migrations create (was {allowed}). Declare them on the model, or the "
-        f"suite tests a schema production does not have."
-    )
+        await connection.run_sync(Base.metadata.create_all)
+        await session.commit()
+
+        migrated = await _check_predicates(session, "public")
+        declared = await _check_predicates(session, _CANARY_SCHEMA)
+
+        assert set(migrated) - set(declared) == set(), (
+            "tables whose CHECKs the migrations create and models.py does not "
+            "declare at all"
+        )
+        drift = {
+            table: {
+                "in the migrations, not on the model": sorted(
+                    set(defs) - set(declared.get(table, ()))
+                ),
+                "on the model, not in the migrations": sorted(
+                    set(declared.get(table, ())) - set(defs)
+                ),
+            }
+            for table, defs in migrated.items()
+            if set(defs) != set(declared.get(table, ()))
+        }
+        assert drift == {}, (
+            f"models.py and the migrations disagree about CHECK constraints: "
+            f"{drift}. The migration is what production actually has, so make "
+            f"the model match it -- do not write a migration to match a stale "
+            f"model."
+        )
+    finally:
+        await session.rollback()
+        async with session.begin():
+            await session.execute(
+                text(f'DROP SCHEMA IF EXISTS "{_CANARY_SCHEMA}" CASCADE')
+            )
 
 
 async def test_reset_restores_migration_seeded_rows(session: AsyncSession) -> None:
@@ -167,12 +226,14 @@ async def test_advisory_locks_exist(session: AsyncSession) -> None:
 
 
 async def test_agent_uniqueness_constraint_is_enforced(engine: AsyncEngine) -> None:
-    """``agents_hotkey_name_version_key`` is ``ddl_if(dialect='postgresql')``.
+    """``agents_hotkey_name_version_key`` is unconditional.
 
-    It did not exist under SQLite, so two agents sharing
-    ``(miner_hotkey, name, version)`` committed happily -- while
-    ``ditto/db/queries/agents.py:139`` comments that "the UNIQUE constraint
-    remains the final invariant on both". It is now genuinely final.
+    It used to be ``ddl_if(dialect='postgresql')`` and so did not exist under
+    SQLite, where two agents sharing ``(miner_hotkey, name, version)``
+    committed happily -- while ``ditto/db/queries/agents.py:139`` comments
+    that "the UNIQUE constraint remains the final invariant on both". The
+    migration has always created it unconditionally; the model now says so
+    too, and it is genuinely final.
     """
     from datetime import UTC, datetime
     from uuid import uuid4
