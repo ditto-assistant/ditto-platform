@@ -28,6 +28,9 @@ from ditto.api_models.admin_validation_retry import (
     AdminScoreOutlierScore,
     AdminStuckSubmission,
     AdminStuckSubmissionsResponse,
+    AdminValidationQueueWithdrawal,
+    AdminValidationQueueWithdrawalRequest,
+    AdminValidationQueueWithdrawalResponse,
     AdminValidationRecovery,
     AdminValidationRetryDetail,
     AdminValidationRetryRequest,
@@ -52,6 +55,7 @@ from ditto.db.models import (
     Score,
     ScoreAuditEntry,
     ValidatorHeartbeat,
+    ValidatorQueueWithdrawal,
     ValidatorRetryRecovery,
     ValidatorTicket,
 )
@@ -72,6 +76,7 @@ from ditto.db.queries.retry_state import (
     is_exhausted,
     recovery_gate,
     resolve_bench_version,
+    withdrawal_gate,
 )
 from ditto.db.queries.score_retests import (
     REPLACEMENT_TICKET_TTL,
@@ -227,6 +232,21 @@ def _recovery_item(row: ValidatorRetryRecovery) -> AdminValidationRecovery:
     )
 
 
+def _withdrawal_item(
+    row: ValidatorQueueWithdrawal,
+) -> AdminValidationQueueWithdrawal:
+    return AdminValidationQueueWithdrawal(
+        withdrawal_id=row.withdrawal_id,
+        agent_id=row.agent_id,
+        bench_version=row.bench_version,
+        actor=row.actor,
+        reason=row.reason,
+        expected_snapshot=row.expected_snapshot,
+        score_count=row.score_count,
+        created_at=row.created_at,
+    )
+
+
 def _ticket_item(ticket: ValidatorTicket) -> AdminValidationTicket:
     return AdminValidationTicket(
         validator_hotkey=ticket.validator_hotkey,
@@ -305,6 +325,22 @@ async def _load(
         ).all()
     )
     return agent, bench_version, scores, tickets, recoveries
+
+
+async def _load_withdrawal(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    bench_version: int,
+    for_update: bool,
+) -> ValidatorQueueWithdrawal | None:
+    statement = select(ValidatorQueueWithdrawal).where(
+        ValidatorQueueWithdrawal.agent_id == agent_id,
+        ValidatorQueueWithdrawal.bench_version == bench_version,
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    return await session.scalar(statement)
 
 
 @router.get("/validation-retries", response_model=AdminStuckSubmissionsResponse)
@@ -403,6 +439,24 @@ async def get_validation_retry(
         now=datetime.now(UTC),
         bench_version=bench_version,
     )
+    withdrawal = await _load_withdrawal(
+        session,
+        agent_id=agent.agent_id,
+        bench_version=bench_version,
+        for_update=False,
+    )
+    withdrawal_allowed, withdrawal_reason = withdrawal_gate(
+        agent=agent,
+        scores=scores,
+        tickets=tickets,
+        bench_version=bench_version,
+    )
+    withdrawal_allowed = withdrawal_allowed and withdrawal is None
+    withdrawal_blocking_reason = (
+        "submission is already removed from this benchmark queue"
+        if withdrawal is not None
+        else withdrawal_reason
+    )
     return AdminValidationRetryDetail(
         agent_id=agent.agent_id,
         miner_hotkey=agent.miner_hotkey,
@@ -413,8 +467,15 @@ async def get_validation_retry(
         quorum=SCORING_QUORUM,
         snapshot=_snapshot(agent=agent, scores=scores, tickets=tickets),
         automatic_retry_available=automatic,
-        recovery_allowed=allowed,
-        blocking_reason=reason,
+        recovery_allowed=allowed and withdrawal is None,
+        blocking_reason=(
+            "submission is removed from this benchmark queue"
+            if withdrawal is not None
+            else reason
+        ),
+        withdrawal_allowed=withdrawal_allowed,
+        withdrawal_blocking_reason=withdrawal_blocking_reason,
+        withdrawal=(_withdrawal_item(withdrawal) if withdrawal is not None else None),
         tickets=[_ticket_item(ticket) for ticket in tickets],
         recoveries=[_recovery_item(row) for row in recoveries],
     )
@@ -452,6 +513,17 @@ async def _apply_recovery(
         ):
             return "skipped", "request id already used", None
         return "idempotent", None, existing
+
+    if (
+        await _load_withdrawal(
+            session,
+            agent_id=agent_id,
+            bench_version=bench_version,
+            for_update=True,
+        )
+        is not None
+    ):
+        return "skipped", "submission was removed from this benchmark queue", None
 
     current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
     if current_snapshot != expected_snapshot:
@@ -493,6 +565,88 @@ def _require_actor(x_admin_actor: str | None) -> str:
     if not 1 <= len(actor) <= 120:
         raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
     return actor
+
+
+@router.post(
+    "/validation-retries/{agent_id}/withdraw",
+    response_model=AdminValidationQueueWithdrawalResponse,
+)
+async def withdraw_failed_validation_from_queue(
+    agent_id: UUID,
+    payload: AdminValidationQueueWithdrawalRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminValidationQueueWithdrawalResponse:
+    """Stop benchmark-scoped assignment while preserving every source record."""
+
+    actor = _require_actor(x_admin_actor)
+    async with session.begin():
+        agent, bench_version, scores, tickets, _recoveries = await _load(
+            session, agent_id=agent_id, for_update=True
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+
+        existing_request = await session.get(
+            ValidatorQueueWithdrawal, payload.request_id
+        )
+        if existing_request is not None:
+            if (
+                existing_request.agent_id != agent_id
+                or existing_request.actor != actor
+                or existing_request.reason != payload.reason
+                or existing_request.expected_snapshot != payload.expected_snapshot
+            ):
+                raise HTTPException(status_code=409, detail="request id already used")
+            return AdminValidationQueueWithdrawalResponse(
+                withdrawal=_withdrawal_item(existing_request), idempotent=True
+            )
+
+        existing = await _load_withdrawal(
+            session,
+            agent_id=agent_id,
+            bench_version=bench_version,
+            for_update=True,
+        )
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="submission is already removed from this benchmark queue",
+            )
+
+        current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
+        if current_snapshot != payload.expected_snapshot:
+            raise HTTPException(status_code=409, detail="validation state changed")
+
+        allowed, reason = withdrawal_gate(
+            agent=agent,
+            scores=scores,
+            tickets=tickets,
+            bench_version=bench_version,
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=409,
+                detail=reason or "queue withdrawal unavailable",
+            )
+
+        withdrawal = ValidatorQueueWithdrawal(
+            withdrawal_id=payload.request_id,
+            agent_id=agent_id,
+            bench_version=bench_version,
+            actor=actor,
+            reason=payload.reason,
+            expected_snapshot=current_snapshot,
+            score_count=len(scores),
+            ticket_snapshot=[_ticket_wire(ticket) for ticket in tickets],
+            created_at=datetime.now(UTC),
+        )
+        session.add(withdrawal)
+        await session.flush()
+        return AdminValidationQueueWithdrawalResponse(
+            withdrawal=_withdrawal_item(withdrawal), idempotent=False
+        )
 
 
 @router.post(

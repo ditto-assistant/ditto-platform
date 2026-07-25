@@ -19,7 +19,13 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.retry_state import RetryState
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
-from ditto.db.models import Agent, Score, ValidatorRetryRecovery, ValidatorTicket
+from ditto.db.models import (
+    Agent,
+    Score,
+    ValidatorQueueWithdrawal,
+    ValidatorRetryRecovery,
+    ValidatorTicket,
+)
 from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import ticket_attempt_cap
@@ -135,6 +141,42 @@ def recovery_gate(
     return False, True, None, exhausted[:needed]
 
 
+def withdrawal_gate(
+    *,
+    agent: Agent,
+    scores: list[Score],
+    tickets: list[ValidatorTicket],
+    bench_version: int,
+) -> tuple[bool, str | None]:
+    """Allow withdrawal only after enough failed slots make quorum impossible.
+
+    Unlike another retry grant, a safe terminal queue withdrawal remains
+    available after the manual-recovery limit is spent.
+    """
+
+    if agent.status != AgentStatus.EVALUATING:
+        return False, "submission is not waiting for validator scores"
+    if agent.screening_policy_version < SCREENING_POLICY_VERSION:
+        return False, "submission is not on the current screening policy"
+    if len(scores) >= SCORING_QUORUM:
+        return False, "submission already reached scoring quorum"
+    if any(ticket.status == TicketStatus.ISSUED for ticket in tickets):
+        return False, "a validator ticket is still active"
+
+    scored_hotkeys = {score.validator_hotkey for score in scores}
+    needed = SCORING_QUORUM - len(scores)
+    exhausted = sum(
+        1
+        for ticket in tickets
+        if ticket.bench_version == bench_version
+        and ticket.validator_hotkey not in scored_hotkeys
+        and is_exhausted(ticket)
+    )
+    if exhausted < needed:
+        return False, "submission can still reach quorum automatically"
+    return True, None
+
+
 def classify_retry_state(
     *,
     automatic: bool,
@@ -247,6 +289,16 @@ async def classify_agent_retry_states(
             )
         ).all()
     }
+    withdrawals = set(
+        (
+            await session.execute(
+                select(
+                    ValidatorQueueWithdrawal.agent_id,
+                    ValidatorQueueWithdrawal.bench_version,
+                ).where(ValidatorQueueWithdrawal.agent_id.in_(id_subq))
+            )
+        ).all()
+    )
     canonical_version = await active_bench_version(session)
 
     result: dict[UUID, AgentRetryState] = {}
@@ -261,6 +313,8 @@ async def classify_agent_retry_states(
             all_scores=all_scores,
             canonical_version=canonical_version,
         )
+        if (agent_id, bench_version) in withdrawals:
+            continue
         v_scores = [s for s in all_scores if s.bench_version == bench_version]
         v_tickets = [t for t in all_tickets if t.bench_version == bench_version]
         automatic, allowed, reason, _ = recovery_gate(

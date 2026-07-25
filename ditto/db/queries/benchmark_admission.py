@@ -14,6 +14,7 @@ from ditto.db.models import (
     BenchmarkRollout,
     BenchmarkRolloutMember,
     ScoreAuditEntry,
+    ValidatorQueueWithdrawal,
     ValidatorTicket,
 )
 from ditto.db.queries.audit import benchmark_contract_refresh_event
@@ -100,18 +101,34 @@ async def admitted_agent_ids(
     if not requested:
         return set()
     rollout = await activated_rollout_for_version(session, bench_version=bench_version)
-    if rollout is None:
-        return requested
-    return set(
-        await session.scalars(
-            select(Agent.agent_id).where(
-                Agent.agent_id.in_(requested),
-                benchmark_admission_predicate(
-                    rollout=rollout, bench_version=bench_version
-                ),
-            )
-        )
+    statement = select(Agent.agent_id).where(
+        Agent.agent_id.in_(requested),
+        validator_queue_admission_predicate(bench_version=bench_version),
     )
+    if rollout is not None:
+        statement = statement.where(
+            benchmark_admission_predicate(rollout=rollout, bench_version=bench_version)
+        )
+    return set(await session.scalars(statement))
+
+
+def validator_queue_admission_predicate(
+    *,
+    bench_version: int,
+    agent: type[Agent] | AliasedClass[Agent] = Agent,
+) -> ColumnElement[bool]:
+    """Whether an agent is not withdrawn from this benchmark's queue."""
+
+    withdrawn = (
+        select(ValidatorQueueWithdrawal.agent_id)
+        .where(
+            ValidatorQueueWithdrawal.agent_id == agent.agent_id,
+            ValidatorQueueWithdrawal.bench_version == bench_version,
+        )
+        .correlate(agent)
+        .exists()
+    )
+    return ~withdrawn
 
 
 async def agent_is_admitted(
