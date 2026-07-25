@@ -140,6 +140,12 @@ class PublicCaseResult(BaseModel):
     correct case would reveal ``expected``), and the seed-derived ``case_id``.
     Combined with per-submission seed rotation, this lets anyone inspect a run's
     per-case strengths/weaknesses without learning anything that helps overfit.
+
+    ``notes`` is drawn from a **closed vocabulary** of mechanical verdicts. The
+    scorers themselves interpolate dataset content into some notes (the matched
+    distractor value, required/forbidden argument names); the public projection
+    rebuilds each note from validated primitives and drops anything it does not
+    recognize, so the value a note was rendered around never reaches the wire.
     """
 
     category: Annotated[
@@ -155,7 +161,13 @@ class PublicCaseResult(BaseModel):
     ]
     notes: Annotated[
         list[str] | None,
-        Field(default=None, description="Scorer's mechanical notes (no answers)."),
+        Field(
+            default=None,
+            description=(
+                "Scorer's mechanical notes, from a closed vocabulary (no answers, "
+                "no dataset values, no agent-supplied text)."
+            ),
+        ),
     ]
 
 
