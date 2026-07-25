@@ -44,6 +44,9 @@ from ditto.api_server.endpoints.admin_submission_settings import (
 from ditto.api_server.endpoints.admin_validation_retry import (
     router as admin_validation_retry_router,
 )
+from ditto.api_server.endpoints.admin_validator_slot_settings import (
+    router as admin_validator_slot_settings_router,
+)
 from ditto.api_server.endpoints.health import router as health_router
 from ditto.api_server.endpoints.inference import router as inference_router
 from ditto.api_server.endpoints.metrics import router as metrics_router
@@ -71,6 +74,7 @@ __all__ = [
     "admin_screener_review_settings_router",
     "admin_submission_settings_router",
     "admin_validation_retry_router",
+    "admin_validator_slot_settings_router",
     "metrics_router",
     "public_router",
     "retrieval_router",

@@ -45,6 +45,7 @@ from ditto.api_server.endpoints import (
     admin_screener_review_settings_router,
     admin_submission_settings_router,
     admin_validation_retry_router,
+    admin_validator_slot_settings_router,
     health_router,
     inference_router,
     metrics_router,
@@ -73,6 +74,7 @@ from ditto.api_server.pricing import create_price_oracle
 from ditto.api_server.queue_policy_settings import QueuePolicySettingsResolver
 from ditto.api_server.storage import create_storage_client
 from ditto.api_server.validator_names import create_validator_names
+from ditto.api_server.validator_slot_settings import ValidatorSlotSettingsResolver
 from ditto.chain import create_chain_client
 from ditto.db import create_db_engine, create_session_maker
 
@@ -229,6 +231,10 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.state.continual_retest_settings = ContinualRetestSettingsResolver()
     app.state.queue_policy_settings = QueuePolicySettingsResolver()
     app.state.inference_concurrency_settings = InferenceConcurrencySettingsResolver()
+    # Operator cap on concurrent benchmark slots per validator. Read at ticket
+    # issue time; falls back to its conservative module default (cap 2) whenever
+    # a revision cannot be read, so no failure path uncaps the fleet.
+    app.state.validator_slot_settings = ValidatorSlotSettingsResolver()
     # The object exists even when lifespan is skipped in unit tests. Its
     # snapshot path is synchronous and disabled by default; production lifespan
     # starts the optional background refresher without blocking API startup.
@@ -273,6 +279,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(admin_inference_routes_router, prefix="/api/v1")
     app.include_router(admin_quarantine_router, prefix="/api/v1")
     app.include_router(admin_validation_retry_router, prefix="/api/v1")
+    app.include_router(admin_validator_slot_settings_router, prefix="/api/v1")
     app.include_router(admin_scoring_readiness_router, prefix="/api/v1")
     app.include_router(admin_screener_review_settings_router, prefix="/api/v1")
     app.include_router(admin_submission_settings_router, prefix="/api/v1")
