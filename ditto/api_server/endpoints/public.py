@@ -3920,6 +3920,7 @@ async def agent_pipeline(
                     ticket.failure_reason,
                 ),
                 failed_at=ticket.failed_at,
+                attempt_count=ticket.attempt_count,
             )
             for ticket in tickets
         ],

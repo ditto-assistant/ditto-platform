@@ -6859,7 +6859,23 @@
           label = ["Retest expired", "warn"];
         }
         var failureLabel = validatorFailureLabel(a.failure_reason);
-        if (!a.actively_running && failureLabel) label = [failureLabel + " · deferred", "warn"];
+        // A ticket row is a lease SLOT, rewritten in place on every reissue:
+        // issued_at resets and attempt_count bumps, while failure_reason /
+        // failed_at are deliberately preserved as an audit trail. So a recorded
+        // failure does not necessarily describe the lease shown here. It is
+        // history whenever the row has since gone terminal-scored (the platform
+        // only accepts a fail_job against an *issued* lease, so a scored row's
+        // failure must predate its last reissue) or whenever failed_at is older
+        // than issued_at. Treating that as the current state painted every
+        // successful quorum input "Scoring run failed · deferred", stamped with
+        // the superseded failure's timestamp -- so a fully scored submission
+        // looked like three failures and its accepted scores looked unexplained.
+        var priorFailure = !!failureLabel && (
+          a.status === "scored" ||
+          (a.failed_at && a.issued_at && new Date(a.failed_at) < new Date(a.issued_at))
+        );
+        var currentFailure = !!failureLabel && !priorFailure;
+        if (!a.actively_running && currentFailure) label = [failureLabel + " · deferred", "warn"];
         var continual = a.purpose === "continual_retest";
         var canonical = a.purpose === "canonical_quorum";
         var purposeLabel = continual
@@ -6878,7 +6894,10 @@
         else if (a.status === "issued") meta += " has this assignment";
         else if (a.status === "expired") meta += " did not submit a score";
         else meta += " submitted a score";
-        if (failureLabel) meta += " · reported " + failureLabel.toLowerCase();
+        var attempts = Number(a.attempt_count) || 1;
+        if (attempts > 1) meta += " on attempt " + attempts;
+        if (currentFailure) meta += " · reported " + failureLabel.toLowerCase();
+        else if (priorFailure) meta += " · an earlier attempt reported " + failureLabel.toLowerCase();
         if (a.deadline && (a.actively_running || a.status === "issued")) {
           meta += " · score due " + new Date(a.deadline).toLocaleString();
         } else if (a.deadline && a.status === "expired") {
@@ -6886,13 +6905,17 @@
         }
         var benchmark = a.benchmark_progress ? renderBenchmarkProgress(a.benchmark_progress, false) : "";
         var benchLabel = a.bench_version == null ? "Bench unknown" : "Bench v" + a.bench_version;
+        // Date the row by the lease it describes. Falling back to failed_at for
+        // a superseded failure stamped a freshly reissued (or already scored)
+        // lease with an hours-old time, which read as the row being stale.
+        var when = currentFailure && a.failed_at ? a.failed_at : a.issued_at;
         return '<div class="attempt"><div><span class="bench-version-badge">' + esc(benchLabel) + '</span></div>' +
           '<div class="attempt-main"><b><span class="stage ' + label[1] + '">' + esc(a.actively_running ? "Scoring now" : label[0]) + retryInfo + '</span></b>' +
           '<div class="attempt-meta">' + esc(purposeLabel) +
             entityAnchor("validator", a.validator_hotkey, "Validator " + shortKey(a.validator_hotkey)) +
             esc(meta.slice((purposeLabel + "Validator " + shortKey(a.validator_hotkey)).length)) +
           '</div>' + benchmark + '</div>' +
-          '<div class="attempt-time" title="' + esc(a.failed_at || a.issued_at) + '">' + relTime(a.failed_at || a.issued_at) + '</div></div>';
+          '<div class="attempt-time" title="' + esc(when) + '">' + relTime(when) + '</div></div>';
       }
       var validation = benchmarkCohorts(pipeline).map(function (cohort) {
         var attempts = cohort.attempts.map(renderValidationAttempt).join("");

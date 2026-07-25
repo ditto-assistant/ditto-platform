@@ -1804,7 +1804,17 @@ class CreateScreeningDisputeResponse(BaseModel):
 
 
 class PublicValidationAttempt(BaseModel):
-    """One validator ticket for either quorum scoring or continual retesting."""
+    """One validator ticket for either quorum scoring or continual retesting.
+
+    A ticket row is a *lease slot*, not an append-only attempt log: the composite
+    PK keeps one row per (agent, bench version, validator) and every reissue
+    rewrites it in place, bumping :attr:`attempt_count` and resetting
+    :attr:`issued_at`. ``failure_reason``/``failed_at`` are deliberately
+    preserved across that reissue, so they can describe a *previous* lease that
+    has since been retried and even scored. Consumers must read them relative to
+    ``issued_at`` — a ``failed_at`` older than ``issued_at`` belongs to an
+    earlier lease and is history, not the current state of this slot.
+    """
 
     validator_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
     status: Annotated[str, Field(pattern=r"^(issued|scored|expired)$")]
@@ -1818,6 +1828,9 @@ class PublicValidationAttempt(BaseModel):
         None
     )
     failed_at: datetime | None = None
+    attempt_count: Annotated[int, Field(ge=1)] = 1
+    """Leases issued to this validator for this agent/bench version. Greater
+    than one means earlier attempts preceded the one described here."""
 
 
 class PublicConfirmationScore(BaseModel):
