@@ -98,8 +98,14 @@ const relayApp = (port, index) => ({
     POSTGRES_POOL_MIN_SIZE: "5",
     POSTGRES_POOL_MAX_SIZE: "12",
     // Dashboard validator-name enrichment is in-memory only and a relay serves
-    // no dashboard, so skip its refresher and its Taostats calls.
+    // no dashboard, so skip its refresher and its Taostats calls. BOTH must be
+    // cleared: config validation requires the URL and the key to be set or
+    // unset together, and .env is shared with ditto-api, which sets the key.
+    // Clearing only the URL crash-loops the relay at boot with
+    // "DITTO_TAOSTATS_VALIDATOR_NAMES_URL and DITTO_TAOSTATS_API_KEY must be
+    // set together" -- which is the config layer failing loudly, as intended.
     DITTO_TAOSTATS_VALIDATOR_NAMES_URL: "",
+    DITTO_TAOSTATS_API_KEY: "",
   },
   autorestart: true,
   max_restarts: 10,
