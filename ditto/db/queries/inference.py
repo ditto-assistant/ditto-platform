@@ -697,6 +697,52 @@ async def finish_inference_request(
     return deliverable
 
 
+async def ticket_inference_revoked_mid_lease(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    bench_version: int,
+    validator_hotkey: str,
+    ticket_deadline: datetime,
+) -> bool:
+    """Did the platform itself terminate this still-live lease's inference?
+
+    Answers one question, from the platform's own records rather than from a
+    validator's self-report: while this exact lease was open, did the platform
+    revoke the inference grant it had minted for it?
+
+    Only two code paths set ``revoked`` while a ticket is still open --
+    :func:`activate_inference_grant` and :func:`begin_inference_request` -- and
+    both do it for the same family of reasons: the owning ticket is no longer
+    ISSUED, its deadline was rewritten, or its deadline has passed. Every one of
+    those is platform or validator state. None of them is reachable from
+    anything an agent controls, so this cannot be induced by a miner to farm
+    free attempts.
+
+    Scoping to ``ticket_deadline`` is what keeps the answer about *this* lease.
+    The third writer, :func:`revoke_ticket_inference`, runs only as cleanup once
+    a ticket has been scored or failed -- by which point the lease is closed and
+    a later attempt carries a fresh deadline -- so its writes cannot be mistaken
+    for a mid-lease revocation here.
+
+    ``exhausted`` is deliberately not counted. That status means the agent spent
+    the request budget it was given, which is the agent's own doing and must
+    keep costing it an attempt.
+    """
+    revoked = await session.scalar(
+        select(func.count())
+        .select_from(InferenceGrant)
+        .where(
+            InferenceGrant.agent_id == agent_id,
+            InferenceGrant.bench_version == bench_version,
+            InferenceGrant.validator_hotkey == validator_hotkey,
+            InferenceGrant.ticket_deadline == ticket_deadline,
+            InferenceGrant.status == "revoked",
+        )
+    )
+    return bool(revoked)
+
+
 __all__ = [
     "activate_inference_grant",
     "bearer_digest",
@@ -705,4 +751,5 @@ __all__ = [
     "ensure_inference_grant",
     "finish_inference_request",
     "revoke_ticket_inference",
+    "ticket_inference_revoked_mid_lease",
 ]
