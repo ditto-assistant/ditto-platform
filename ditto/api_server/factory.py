@@ -36,6 +36,7 @@ from ditto.api_server.endpoints import (
     admin_continual_retest_settings_router,
     admin_copy_review_router,
     admin_efficiency_bonus_settings_router,
+    admin_inference_concurrency_settings_router,
     admin_inference_routes_router,
     admin_miner_fees_router,
     admin_quarantine_router,
@@ -55,6 +56,9 @@ from ditto.api_server.endpoints import (
     validator_router,
 )
 from ditto.api_server.errors import ApiServerLifespanError
+from ditto.api_server.inference_concurrency_settings import (
+    InferenceConcurrencySettingsResolver,
+)
 from ditto.api_server.inference_routing import ProviderRouteRefresher
 from ditto.api_server.middleware import (
     AuthPassThroughMiddleware,
@@ -224,6 +228,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     )
     app.state.continual_retest_settings = ContinualRetestSettingsResolver()
     app.state.queue_policy_settings = QueuePolicySettingsResolver()
+    app.state.inference_concurrency_settings = InferenceConcurrencySettingsResolver()
     # The object exists even when lifespan is skipped in unit tests. Its
     # snapshot path is synchronous and disabled by default; production lifespan
     # starts the optional background refresher without blocking API startup.
@@ -263,6 +268,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(admin_artifact_release_settings_router, prefix="/api/v1")
     app.include_router(admin_benchmark_rollout_router, prefix="/api/v1")
     app.include_router(admin_queue_policy_settings_router, prefix="/api/v1")
+    app.include_router(admin_inference_concurrency_settings_router, prefix="/api/v1")
     app.include_router(admin_efficiency_bonus_settings_router, prefix="/api/v1")
     app.include_router(admin_inference_routes_router, prefix="/api/v1")
     app.include_router(admin_quarantine_router, prefix="/api/v1")

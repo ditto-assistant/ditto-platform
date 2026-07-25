@@ -255,9 +255,9 @@ class ApiServerConfig:
             embedding_dimensions=768,
             embedding_request_budget=100_000,
             embedding_token_budget=1_000_000_000,
-            embedding_per_ticket_concurrency=1,
-            embedding_per_validator_concurrency=8,
-            embedding_global_concurrency=32,
+            embedding_per_ticket_concurrency=12,
+            embedding_per_validator_concurrency=48,
+            embedding_global_concurrency=96,
             embedding_per_ticket_requests_per_minute=10_000,
             embedding_per_validator_requests_per_minute=40_000,
             embedding_global_requests_per_minute=100_000,
@@ -442,13 +442,13 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
                 os.environ.get("DITTO_EMBEDDING_TOKEN_BUDGET", "1000000000")
             ),
             embedding_per_ticket_concurrency=int(
-                os.environ.get("DITTO_EMBEDDING_TICKET_CONCURRENCY", "1")
+                os.environ.get("DITTO_EMBEDDING_TICKET_CONCURRENCY", "12")
             ),
             embedding_per_validator_concurrency=int(
-                os.environ.get("DITTO_EMBEDDING_VALIDATOR_CONCURRENCY", "8")
+                os.environ.get("DITTO_EMBEDDING_VALIDATOR_CONCURRENCY", "48")
             ),
             embedding_global_concurrency=int(
-                os.environ.get("DITTO_EMBEDDING_GLOBAL_CONCURRENCY", "32")
+                os.environ.get("DITTO_EMBEDDING_GLOBAL_CONCURRENCY", "96")
             ),
             embedding_per_ticket_requests_per_minute=int(
                 os.environ.get("DITTO_EMBEDDING_TICKET_RPM", "10000")
