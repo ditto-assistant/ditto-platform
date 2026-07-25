@@ -48,6 +48,47 @@ def aggregate_is_active(
     return fleet_protocol_ready
 
 
+def rollout_standdown_reason(
+    settings: ContinualRetestSettings,
+    *,
+    open_rollout_desired_version: int | None,
+    validator_supports_desired_version: bool,
+) -> str | None:
+    """Why this validator must not start a previous-generation retest now.
+
+    Continual retests re-score the ACTIVE benchmark generation. While a rollout
+    collects, the fleet's scarce benchmark slots are the same ones the cohort
+    needs to reach quorum on the DESIRED generation, so a fresh retest lease
+    directly delays the thing the rollout exists to do. Returning a reason keeps
+    the refusal self-describing at the call site and in the operator API.
+
+    ``capable_validators`` (the default) yields only the capacity the rollout can
+    actually use: a validator that does not advertise the desired version can
+    never take cohort work, so standing it down would idle real capacity for zero
+    rollout benefit. It keeps confirming the active generation as usual.
+
+    This is deliberately a stand-down at *issuance* only. An already-leased wave
+    runs and reports to completion, so shared-seed wave semantics are never torn
+    in half, and the stand-down lifts on its own the moment ``open_rollout``
+    stops returning a row -- that is, on activation or supersede.
+    """
+    if open_rollout_desired_version is None:
+        return None
+    if settings.rollout_standdown == "off":
+        return None
+    if (
+        settings.rollout_standdown == "capable_validators"
+        and not validator_supports_desired_version
+    ):
+        return None
+    return (
+        "continual retests are standing down while benchmark version "
+        f"{open_rollout_desired_version} is collecting; validator capacity is "
+        "reserved for rollout qualification and retests resume automatically "
+        "once the rollout activates or is superseded"
+    )
+
+
 @dataclass
 class _CacheEntry:
     settings: ContinualRetestSettings
