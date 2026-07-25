@@ -49,6 +49,7 @@ def _payload(
     expected_revision: int = 0,
     aggregate_mode: str = "fleet_ready",
     idle_retests_enabled: bool = False,
+    rollout_standdown: str = "capable_validators",
 ) -> dict[str, object]:
     return {
         "expected_revision": expected_revision,
@@ -56,6 +57,7 @@ def _payload(
         "settings": {
             "aggregate_mode": aggregate_mode,
             "idle_retests_enabled": idle_retests_enabled,
+            "rollout_standdown": rollout_standdown,
         },
         "reason": "operator-approved continual retest policy change",
         "actor": "operator@example.com",
@@ -75,7 +77,10 @@ async def test_defaults_are_safe_and_revision_is_audited(
     assert initial.json()["effective"]["settings"] == {
         "aggregate_mode": "fleet_ready",
         "idle_retests_enabled": False,
+        "rollout_standdown": "capable_validators",
     }
+    assert initial.json()["effective"]["open_rollout_desired_version"] is None
+    assert initial.json()["effective"]["rollout_standdown_active"] is False
 
     updated = await client.post(
         _URL,
@@ -132,4 +137,93 @@ async def test_aggregate_modes_are_explicit() -> None:
     assert not aggregate_is_active(
         ContinualRetestSettings(aggregate_mode="disabled"),
         fleet_protocol_ready=True,
+    )
+
+
+async def test_open_rollout_surfaces_the_standdown_state(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    settings_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """An operator must be able to see why retests went quiet."""
+    from datetime import UTC, datetime, timedelta
+    from uuid import uuid4
+
+    from ditto.db.models import BenchmarkRollout
+
+    _install(app, settings_maker)
+    async with settings_maker() as session, session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=6,
+                desired_version=7,
+                status="collecting",
+                cohort_size=5,
+                created_at=datetime.now(UTC) - timedelta(hours=1),
+            )
+        )
+
+    collecting = await client.get(_URL, headers=_HEADERS)
+    assert collecting.status_code == 200, collecting.text
+    effective = collecting.json()["effective"]
+    assert effective["open_rollout_desired_version"] == 7
+    assert effective["rollout_standdown_active"] is True
+
+    override = _payload(rollout_standdown="off")
+    applied = await client.post(_URL, headers=_HEADERS, json=override)
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["settings"]["rollout_standdown"] == "off"
+
+    forced = await client.get(_URL, headers=_HEADERS)
+    assert forced.json()["effective"]["open_rollout_desired_version"] == 7
+    assert forced.json()["effective"]["rollout_standdown_active"] is False
+
+
+async def test_rollout_standdown_modes_are_explicit() -> None:
+    from ditto.api_models.continual_retest_settings import ContinualRetestSettings
+    from ditto.api_server.continual_retest_settings import rollout_standdown_reason
+
+    default = ContinualRetestSettings()
+    assert default.rollout_standdown == "capable_validators"
+    # No open rollout is the only state in which the lane is unconditionally on.
+    assert (
+        rollout_standdown_reason(
+            default,
+            open_rollout_desired_version=None,
+            validator_supports_desired_version=True,
+        )
+        is None
+    )
+    reason = rollout_standdown_reason(
+        default,
+        open_rollout_desired_version=7,
+        validator_supports_desired_version=True,
+    )
+    assert reason is not None
+    assert "resume automatically" in reason
+    # Capacity the rollout cannot consume keeps confirming the active era.
+    assert (
+        rollout_standdown_reason(
+            default,
+            open_rollout_desired_version=7,
+            validator_supports_desired_version=False,
+        )
+        is None
+    )
+    assert (
+        rollout_standdown_reason(
+            ContinualRetestSettings(rollout_standdown="all"),
+            open_rollout_desired_version=7,
+            validator_supports_desired_version=False,
+        )
+        is not None
+    )
+    assert (
+        rollout_standdown_reason(
+            ContinualRetestSettings(rollout_standdown="off"),
+            open_rollout_desired_version=7,
+            validator_supports_desired_version=True,
+        )
+        is None
     )

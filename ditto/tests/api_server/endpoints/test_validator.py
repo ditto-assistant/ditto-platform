@@ -6181,3 +6181,315 @@ class TestTop5ConfirmationLane:
         )
         assert response.status_code == 409
         assert "emission set" in response.json()["message"]
+
+
+def _v3_capable_capabilities(*, now: datetime) -> dict[str, object]:
+    """Capabilities that satisfy ``heartbeat_supports_version`` for v3."""
+    return {
+        **_V7_CAPABILITIES,
+        "scorer_benchmarks": {
+            "status": "fresh_verified",
+            "supported_bench_versions": [2, 3],
+            "observed_at": int(now.timestamp()),
+            "software_version": "1.2.2",
+            "source_revision": "2" * 40,
+        },
+    }
+
+
+async def _seed_top5_rollout_standdown_fixture(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    rollout_status: str | None = "collecting",
+    desired_version_capable: bool = True,
+    settings: dict[str, object] | None = None,
+    emission_bench_version: int = 2,
+) -> tuple[UUID, UUID]:
+    """A due top-five cohort plus an optional open 2 -> 3 rollout."""
+    agent_ids = await _seed_top5_emission_set(
+        maker, bench_version=emission_bench_version, seed_heartbeats=False
+    )
+    now = datetime.now(UTC)
+    capabilities = (
+        _v3_capable_capabilities(now=now)
+        if desired_version_capable
+        # A validator that cannot serve the desired version can never take
+        # cohort work, so the rollout is not competing with it at all.
+        else {**_V7_CAPABILITIES, "scorer_benchmarks": None}
+    )
+    for keypair in _KEYPAIRS:
+        await _seed_validator_heartbeat(
+            maker,
+            keypair=keypair,
+            protocol_version=13,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+        )
+    async with maker() as session, session.begin():
+        champion_row = await session.get(Agent, agent_ids[0])
+        assert champion_row is not None
+        champion_row.dataset_seed_block = 1
+        if rollout_status is not None:
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status=rollout_status,
+                    cohort_size=5,
+                    created_at=now - timedelta(hours=1),
+                    activated_at=(now if rollout_status == "activated" else None),
+                )
+            )
+        if settings is not None:
+            session.add(
+                ContinualRetestSettingsRevision(
+                    parent_revision=0,
+                    scope="*",
+                    settings=settings,
+                    checksum="b" * 64,
+                    reason="operator override for rollout stand-down policy",
+                    actor="operator@example.com",
+                )
+            )
+    return agent_ids[0], agent_ids[1]
+
+
+class TestTop5RolloutStanddown:
+    """Continual retests yield scarce validator slots to an open rollout."""
+
+    @staticmethod
+    def _install(app: FastAPI, session_maker: async_sessionmaker[AsyncSession]) -> None:
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+        _install_chain_with_block(app, block_number=0)
+
+    async def test_stands_down_capable_validator_while_rollout_collects(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(session_maker)
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 409
+        message = response.json()["message"]
+        # The refusal must name the rollout, or an operator reads it as a bug.
+        assert "standing down" in message
+        assert "benchmark version 3" in message
+        async with session_maker() as session:
+            issued = await session.scalar(
+                select(func.count()).where(
+                    ValidatorTicket.purpose == TicketPurpose.CONTINUAL_RETEST
+                )
+            )
+        assert issued == 0
+
+    async def test_stands_down_while_rollout_is_blocked_ineligible(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, rollout_status="blocked_ineligible"
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 409
+        assert "standing down" in response.json()["message"]
+
+    async def test_resumes_after_rollout_activates(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Activation retires the rollout, and retests confirm the new era."""
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, rollout_status="activated", emission_bench_version=3
+        )
+        self._install(app, session_maker)
+        generator = MagicMock(run_size="full")
+        generator.generate = AsyncMock(return_value="ab" * 32)
+        app.dependency_overrides[get_dataset_generator] = lambda: generator
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
+    async def test_resumes_after_rollout_is_superseded(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, rollout_status="superseded"
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
+    async def test_no_open_rollout_leaves_the_lane_untouched(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, rollout_status=None
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
+    async def test_validator_that_cannot_serve_the_rollout_keeps_retesting(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Yield only the capacity the rollout can actually consume."""
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, desired_version_capable=False
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
+    async def test_all_mode_stands_down_incapable_validators_too(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker,
+            desired_version_capable=False,
+            settings={
+                "aggregate_mode": "fleet_ready",
+                "idle_retests_enabled": False,
+                "rollout_standdown": "all",
+            },
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 409
+        assert "standing down" in response.json()["message"]
+
+    async def test_operator_override_forces_retests_during_a_rollout(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker,
+            settings={
+                "aggregate_mode": "fleet_ready",
+                "idle_retests_enabled": False,
+                "rollout_standdown": "off",
+            },
+        )
+        self._install(app, session_maker)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+
+    async def test_in_flight_wave_still_reports_during_a_rollout(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The stand-down gates issuance only; leased waves finish intact."""
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        champion, member = await _seed_top5_rollout_standdown_fixture(
+            session_maker, rollout_status=None
+        )
+        self._install(app, session_maker)
+        leased = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+        assert leased.status_code == 200, leased.text
+        deadline = datetime.fromisoformat(leased.json()["deadline"])
+        seeds = list(champion_anchored_seeds(champion, version=2, max_seeds=16)[:2])
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="collecting",
+                    cohort_size=5,
+                    created_at=datetime.now(UTC),
+                )
+            )
+
+        reported = await client.post(
+            f"/api/v1/validator/agent/{member}/top5-confirmation-score",
+            json=_top5_score_payload(
+                member,
+                deadline=deadline,
+                seeds=seeds,
+                composites=[0.81, 0.83],
+            ),
+        )
+
+        assert reported.status_code == 200, reported.text

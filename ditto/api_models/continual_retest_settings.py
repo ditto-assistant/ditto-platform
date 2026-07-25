@@ -15,6 +15,9 @@ class ContinualRetestSettings(BaseModel):
 
     aggregate_mode: Literal["disabled", "fleet_ready", "enabled"] = "fleet_ready"
     idle_retests_enabled: bool = False
+    rollout_standdown: Literal["off", "capable_validators", "all"] = (
+        "capable_validators"
+    )
 
 
 class ContinualRetestSettingsRevision(BaseModel):
@@ -41,6 +44,8 @@ class EffectiveContinualRetestSettings(BaseModel):
     fleet_protocol_ready: bool
     aggregate_active: bool
     max_age_seconds: float
+    open_rollout_desired_version: int | None = None
+    rollout_standdown_active: bool = False
 
 
 class AdminContinualRetestSettingsRequest(BaseModel):

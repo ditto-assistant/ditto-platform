@@ -22,12 +22,13 @@ from ditto.api_server.continual_retest_settings import (
     DEFAULT_SETTINGS,
     ContinualRetestSettingsResolver,
     aggregate_is_active,
+    rollout_standdown_reason,
     settings_from_row,
 )
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
 from ditto.db.models import ContinualRetestSettingsRevision as RevisionRow
-from ditto.db.queries.benchmark_rollout import active_bench_version
+from ditto.db.queries.benchmark_rollout import active_bench_version, open_rollout
 from ditto.db.queries.continual_retest_settings import (
     GLOBAL_SCOPE,
     insert_continual_retest_settings_revision,
@@ -93,6 +94,18 @@ async def get_settings(
     history = await list_continual_retest_settings_revisions(session)
     settings = settings_from_row(latest)
     fleet_ready = await _fleet_ready(session)
+    rollout = await open_rollout(session)
+    desired_version = rollout.desired_version if rollout is not None else None
+    # Reported for the fleet, so the operator sees the stand-down that a
+    # rollout-capable validator hits rather than guessing why retests went quiet.
+    standdown_active = (
+        rollout_standdown_reason(
+            settings,
+            open_rollout_desired_version=desired_version,
+            validator_supports_desired_version=True,
+        )
+        is not None
+    )
     return AdminContinualRetestSettingsResponse(
         current=[_revision(latest)] if latest is not None else [],
         history=[_revision(row) for row in history],
@@ -108,6 +121,8 @@ async def get_settings(
                 settings, fleet_protocol_ready=fleet_ready
             ),
             max_age_seconds=resolver.ttl_seconds,
+            open_rollout_desired_version=desired_version,
+            rollout_standdown_active=standdown_active,
         ),
     )
 

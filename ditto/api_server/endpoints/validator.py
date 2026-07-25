@@ -101,7 +101,10 @@ from ditto.api_server.benchmark_rollout import (
     refresh_rolling_qualification,
 )
 from ditto.api_server.config import ValidatorCompatibilityConfig
-from ditto.api_server.continual_retest_settings import ContinualRetestSettingsResolver
+from ditto.api_server.continual_retest_settings import (
+    ContinualRetestSettingsResolver,
+    rollout_standdown_reason,
+)
 from ditto.api_server.crn import champion_anchored_seeds
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
@@ -2107,6 +2110,37 @@ async def request_top5_confirmation_job(
                     "single-seed top-five retests"
                 ),
             )
+        # Yield previous-generation rescoring to an open rollout. This is a
+        # stand-down at issuance only: a lease already held elsewhere still runs
+        # and reports, so no shared-seed wave is torn in half, and the
+        # `open_rollout` predicate lifts the stand-down by itself on activation
+        # or supersede. `active_bench_version` and the k=3 quorum are untouched.
+        standdown_rollout = await open_rollout(session)
+        standdown = rollout_standdown_reason(
+            continual_settings,
+            open_rollout_desired_version=(
+                standdown_rollout.desired_version
+                if standdown_rollout is not None
+                else None
+            ),
+            validator_supports_desired_version=(
+                standdown_rollout is not None
+                and heartbeat_supports_version(
+                    heartbeat, now=now, version=standdown_rollout.desired_version
+                )
+            ),
+        )
+        if standdown is not None:
+            assert standdown_rollout is not None
+            logger.info(
+                "continual retest standing down validator=%s active_version=%s "
+                "rollout_desired_version=%s mode=%s",
+                payload.validator_hotkey,
+                canonical_version,
+                standdown_rollout.desired_version,
+                continual_settings.rollout_standdown,
+            )
+            raise HTTPException(status_code=409, detail=standdown)
         v7_calibration = None
         if canonical_version >= 7:
             try:
