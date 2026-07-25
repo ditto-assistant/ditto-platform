@@ -1072,6 +1072,20 @@ class PublicLeaderboardResponse(BaseModel):
         ),
     ] = False
     continual_aggregate_required_protocol: Annotated[int, Field(ge=1)] = 14
+    registration_stale: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "True when each entry's `registered` / `miner_uid` come from a "
+                "previous successful chain read because the latest one failed. "
+                "The values are still real, just not confirmed as of this "
+                "response; a reader should label them rather than discard them. "
+                "`registered` is null (genuinely unknown) instead when there is "
+                "no recent good read to fall back on."
+            ),
+        ),
+    ] = False
     entries: Annotated[
         list[PublicLeaderboardEntry],
         Field(default_factory=list, description="Ranked miners, best composite first."),
@@ -1120,12 +1134,41 @@ class PublicValidatorWeightVector(BaseModel):
 class PublicChainWeightsResponse(BaseModel):
     """Block-consistent SN118 weight matrix read from Subtensor storage."""
 
-    generated_at: datetime
+    generated_at: Annotated[
+        datetime,
+        Field(
+            description=(
+                "When this matrix was read from chain (UTC) — not when the "
+                "response was served. The read is cached, so a response can be "
+                "served some time after `generated_at`; `age_seconds` is the gap."
+            )
+        ),
+    ]
     netuid: Annotated[int, Field(ge=0)]
     block: Annotated[int, Field(ge=0)]
     block_hash: Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{64}$")]
     owner_hotkey: Annotated[str | None, Field(default=None, pattern=_SS58_PATTERN)]
     vectors: list[PublicValidatorWeightVector] = Field(default_factory=list)
+    stale: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "True when the most recent attempt to re-read the matrix failed "
+                "and this is the last known good one. The block it pins is real "
+                "chain state, just older than a normal response; a reader should "
+                "label it rather than treat the matrix as absent."
+            ),
+        ),
+    ] = False
+    age_seconds: Annotated[
+        float,
+        Field(
+            default=0.0,
+            ge=0.0,
+            description="Seconds between the chain read and this response.",
+        ),
+    ] = 0.0
 
 
 class PublicValidatorScore(BaseModel):

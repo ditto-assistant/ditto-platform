@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 #
-# Zero-downtime update for the Ditto Platform API:
+# Scripted update for the Ditto Platform API:
 #   fetch -> reset -> uv sync -> set deploy config -> ensure Pylon -> migrate -> pm2 start/reload.
+# NOT zero-downtime: ditto-api is a single fork-mode pm2 process, so the reload
+# below is a stop/start with ~6s of refused connections (measured), not a
+# rolling handover. See scripts/ecosystem.config.js.
 # Invoked on the host by the ditto-platform deploy workflow (push dev|main ->
 # IAP SSH). DITTO_DEPLOY_BRANCH defaults to the current branch; CI passes the
 # branch that was pushed so the checkout is deterministic.

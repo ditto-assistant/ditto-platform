@@ -3691,6 +3691,16 @@
       if (s < 86400) return "in " + Math.ceil(s / 3600) + "h";
       return "in " + Math.ceil(s / 86400) + "d";
     }
+    // Elapsed-seconds twin of relTime, for API-reported ages (staleness markers)
+    // rather than timestamps. Takes seconds because that is what the API sends.
+    function relDuration(seconds) {
+      var s = Number(seconds);
+      if (!isFinite(s) || s < 0) return "–";
+      if (s < 60) return Math.floor(s) + "s";
+      if (s < 3600) return Math.floor(s / 60) + "m";
+      if (s < 86400) return Math.floor(s / 3600) + "h";
+      return Math.floor(s / 86400) + "d";
+    }
     function esc(s) {
       return String(s).replace(/[&<>"']/g, function (c) {
         return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
@@ -3764,6 +3774,14 @@
         summary += revealedLabel + " is the most common validator top choice at " + championCounts[revealedLeader] + " of " + minerVectors + ". ";
       }
       summary += "Block " + Number(snapshot.block).toLocaleString() + ". Commit-reveal can make this lag active commitments; Yuma combines validator inputs stake-weightedly.";
+      // The API serves the last good matrix rather than nothing when a chain
+      // re-read fails, so say so instead of silently presenting old data as
+      // current. The panel stays up either way: dropping it for a tick and
+      // restoring it on the next one is the "flicker" this replaced.
+      if (snapshot.stale) {
+        summary += " Chain re-read is currently failing; this is the last matrix successfully read" +
+          (snapshot.age_seconds ? ", " + relDuration(snapshot.age_seconds) + " ago" : "") + ".";
+      }
       copy.textContent = summary;
       observation.classList.add("show");
     }
@@ -4295,7 +4313,11 @@
         ? "Rows rank by their settled v" + activeBench + " score while v" + data.desired_bench_version +
           " collects. Validator weights stay on v" + activeBench + " until the v" + data.desired_bench_version + " rollout fully activates."
         : "This pool drives validator weights.";
-      if (provisional.length || inactive.length || registrationUnknown.length || continualPending) {
+      // Registration values that are real but were read a moment ago rather than
+      // just now. Distinct from `registrationUnknown` (no usable read at all):
+      // the rows keep their badges and only gain this one-line caveat.
+      var registrationStale = data.registration_stale === true;
+      if (provisional.length || inactive.length || registrationUnknown.length || registrationStale || continualPending) {
         notice.classList.add("show");
         var notices = [];
         if (provisional.length) notices.push('<strong>Provisional standings.</strong> ' + provisional.length +
@@ -4305,6 +4327,7 @@
           ' scored hotkey' + (inactive.length === 1 ? ' is' : 's are') +
           ' not currently registered on SN118. Their submissions and scores are retained, but they are excluded from active weights and emissions until the same hotkey registers again.');
         if (registrationUnknown.length) notices.push('<strong>Registration unavailable.</strong> Current SN118 registration could not be confirmed. The deterministic KOTH fold remains visible, but actual chain eligibility and active-rank styling stay unknown until registration is confirmed.');
+        else if (registrationStale) notices.push('<strong>Registration not confirmed just now.</strong> The latest SN118 registration read failed, so the registration column below is the last one successfully read rather than a live confirmation. The values are real; they are simply not re-confirmed as of this refresh.');
         if (continualPending) notices.push('<strong>Continual score activation pending.</strong> Completed retest waves are preserved as observations, but rankings and weights remain on the canonical three-score median until every recently-live validator supports protocol ' + esc(data.continual_aggregate_required_protocol || 14) + '. The contract activates globally, never per validator.');
         notice.innerHTML = notices.join(' ');
       } else {
@@ -8201,7 +8224,18 @@
       Promise.allSettled([getJSON(leaderboardPath), getJSON("/public/weights"), getJSON("/public/bench/rollout")])
         .then(function (results) {
           var lb = results[0], weights = results[1], rollout = results[2];
-          lastChainWeights = leaderboardVersionView === "current" && weights.status === "fulfilled" ? weights.value : null;
+          if (leaderboardVersionView !== "current") {
+            // A historical board is not the block the current matrix describes,
+            // so the overlay genuinely does not apply.
+            lastChainWeights = null;
+          } else if (weights.status === "fulfilled") {
+            lastChainWeights = weights.value;
+          }
+          // else: keep the previous matrix rather than blanking the chain
+          // observation panel for one tick and refilling it on the next — that
+          // one-poll disappearance is what read as the dashboard "flickering".
+          // The API now serves last-known-good with `stale` set, so this only
+          // covers a client-side network blip or a genuinely cold cache.
           renderRollout(rollout.status === "fulfilled" ? rollout.value : null);
           if (lb.status === "fulfilled") {
             lastLeaderboardData = lb.value;

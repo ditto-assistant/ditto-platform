@@ -115,9 +115,13 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   active weights and emissions; `null` means the chain snapshot was unavailable.
   Each entry also carries `artifact_release`, the submission-specific source
   state described below; source visibility is independent of KOTH rank.
-  The optional chain lookup has a one-second deadline and a bounded, short-lived
-  in-process snapshot cache, so Pylon latency or failure cannot fail the public
-  leaderboard. The dashboard presents `null` explicitly as unknown and requires
+  The optional chain lookup has a short deadline and a bounded in-process
+  snapshot cache, so Pylon latency or failure cannot fail the public
+  leaderboard. A failed refresh keeps serving the last successful mapping and
+  sets the response-level `registration_stale` flag rather than blanking the
+  column: the values stay real, just not re-confirmed as of that response. Only
+  when there is no recent good read at all does `registered` go `null`.
+  The dashboard presents `null` explicitly as unknown and requires
   the KOTH projection before showing champion or recipient treatment.
   **Never** included: `seed` (anti-overfit), `per_case` `expected`/`called` (the
   answer key), sha256/signature/validator_hotkey (integrity-internal). The full
@@ -253,6 +257,15 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   miner a validator's **top choice** when it has that validator's highest revealed
   miner weight, and counts **validator support** whenever it has any revealed
   weight. The term **champion** is reserved for the KOTH emissions projection.
+  The chain read is cached and refreshed in the background (one in-flight read
+  process-wide, no matter how many clients are polling), so a served response
+  never waits on chain. `generated_at` is therefore when the matrix was read
+  rather than when the response was served, and `age_seconds` is the gap. When a
+  re-read fails, the last known good matrix is served with `stale: true` instead
+  of a 503 — the block it pins is still real chain state, just older — and a
+  reader should label it rather than treat the matrix as absent. A 503 is
+  reserved for having never read the matrix, or having last read it so long ago
+  that presenting it would misrepresent current chain state.
 - `GET /api/v1/public/health` → subnet rollup **from what the platform records**:
   `miners`, `scored_miners`, `scored_agents`, `last_scored_at`, `scores_24h`,
   `avg_latency_ms`. Note: no `success_rate` — the platform only ever sees a
