@@ -566,6 +566,19 @@ class ValidatorHeartbeatRequest(BaseModel):
                 )
         elif self.benchmark_capacity is not None:
             raise ValueError("benchmark capacity requires heartbeat protocol v10")
+        # v15 adds scorer liveness evidence. It is never *required*: telemetry
+        # that can silence a validator is worse than telemetry that is missing,
+        # and a v15 heartbeat that omits it already reads "unreported" in the
+        # fleet view. What is refused is a validator claiming an older protocol
+        # while sending a newer field, which would let the signed envelope and
+        # the declared protocol disagree.
+        if (
+            self.protocol_version < 15
+            and self.capabilities is not None
+            and self.capabilities.scorer_benchmarks is not None
+            and self.capabilities.scorer_benchmarks.probe is not None
+        ):
+            raise ValueError("scorer liveness probe requires heartbeat protocol v15")
         return self
 
 

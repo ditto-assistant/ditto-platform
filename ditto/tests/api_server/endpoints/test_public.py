@@ -1763,6 +1763,263 @@ class TestPublicHealth:
         }
 
 
+def _liveness_row(
+    now: datetime, *, protocol_version: int, scorer: dict | None
+) -> SimpleNamespace:
+    """One stored heartbeat row, healthy in every respect except the scorer."""
+    capabilities = _scorer_capabilities(now, versions=[2, 3])
+    if scorer is None:
+        capabilities.pop("scorer_benchmarks")
+    else:
+        capabilities["scorer_benchmarks"] = scorer
+    component = {
+        "health": "healthy",
+        "required": True,
+        "observed_at": int(now.timestamp()),
+        "ready": True,
+    }
+    return SimpleNamespace(
+        validator_hotkey=_VALIDATOR_C,
+        software_version="0.29.6",
+        protocol_version=protocol_version,
+        state="idle",
+        active_agent_id=None,
+        system_metrics={
+            "collected_at": int(now.timestamp()),
+            "cpu_percent": 10,
+            "memory_percent": 20,
+            "disk_percent": 30,
+            "docker": {
+                "status": "healthy",
+                "running_containers": 6,
+                "unhealthy_containers": 0,
+            },
+        },
+        benchmark_progress=None,
+        benchmark_capacity=None,
+        capabilities=capabilities,
+        stack={
+            "mode": "managed",
+            "compose_schema": 2,
+            "release_descriptor_digest": "sha256:" + "c" * 64,
+            "components": {
+                name: {
+                    "image_digest": "sha256:" + "d" * 64,
+                    "provenance": "signed_descriptor",
+                }
+                for name in (
+                    "ditto_subnet",
+                    "dittobench_api",
+                    "sandbox_docker",
+                    "model_relay",
+                    "pylon",
+                    "ollama",
+                )
+            },
+        },
+        stack_health={
+            name: dict(component)
+            for name in (
+                "ditto_subnet",
+                "dittobench_api",
+                "sandbox_docker",
+                "model_relay",
+                "pylon",
+                "ollama",
+            )
+        },
+        first_seen_at=now - timedelta(days=1),
+        reported_at=now,
+        seen_at=now,
+    )
+
+
+class TestScorerLivenessSurfacing:
+    """A validator whose scorer is not serving must not read like a warning.
+
+    Both incidents that produced the probe showed the same thing on the fleet
+    view: a validator that could not complete a single lease, rendered beside
+    every validator that merely had a full disk.
+    """
+
+    def _entry(self, *, protocol_version: int, scorer: dict | None):
+        now = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+        response = public_endpoint._validator_heartbeats_response(
+            rows=[_liveness_row(now, protocol_version=protocol_version, scorer=scorer)],
+            assignments=[],
+            active_work=[],
+            now=now,
+        )
+        return response.validators[0]
+
+    def test_a_scorer_that_never_answered_reads_critical(self) -> None:
+        """The TAO.com sidecar: 404 on every probe, previously ``warning``."""
+        entry = self._entry(
+            protocol_version=15,
+            scorer={
+                "status": "legacy_v2",
+                "supported_bench_versions": [2],
+                "probe": {
+                    "outcome": "http_error",
+                    "observed_at": 1_784_000_000,
+                    "http_status": 404,
+                    "consecutive_failures": 97,
+                },
+            },
+        )
+
+        assert entry.scorer_liveness == "not_serving"
+        assert entry.health == "critical"
+        assert entry.health_reasons == ["scorer not serving: http 404 (97 in a row)"]
+
+    def test_a_partly_rejected_capability_reply_is_not_healthy(self) -> None:
+        """The v7 parse bug: ``fresh_verified`` and green while v7 was gone."""
+        now = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+        entry = self._entry(
+            protocol_version=15,
+            scorer={
+                "status": "fresh_verified",
+                "supported_bench_versions": [2, 3, 4, 5, 6],
+                "observed_at": int(now.timestamp()),
+                "software_version": "0.29.4",
+                "source_revision": "a" * 40,
+                "probe": {
+                    "outcome": "served_degraded",
+                    "observed_at": int(now.timestamp()),
+                    "http_status": 200,
+                    "reason": "calibration_unreadable",
+                    "last_served_at": int(now.timestamp()),
+                    "consecutive_failures": 1,
+                },
+            },
+        )
+
+        # Every other signal is still green: identity verified, stack healthy.
+        assert entry.stack_health is not None
+        assert entry.stack_health.dittobench_api.health == "healthy"
+        assert entry.scorer_liveness == "degraded"
+        assert entry.health == "warning"
+        assert entry.health_reasons == ["scorer degraded: calibration_unreadable"]
+
+    def test_a_serving_scorer_stays_healthy_and_carries_no_reasons(self) -> None:
+        now = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+        entry = self._entry(
+            protocol_version=15,
+            scorer={
+                "status": "fresh_verified",
+                "supported_bench_versions": [2, 3],
+                "observed_at": int(now.timestamp()),
+                "software_version": "0.29.6",
+                "source_revision": "a" * 40,
+                "probe": {
+                    "outcome": "served",
+                    "observed_at": int(now.timestamp()),
+                    "http_status": 200,
+                    "last_served_at": int(now.timestamp()),
+                },
+            },
+        )
+
+        assert entry.scorer_liveness == "serving"
+        assert entry.health_reasons == []
+        assert entry.health == "healthy"
+
+    def test_a_validator_below_protocol_15_reads_unreported_not_broken(self) -> None:
+        """Forward compatibility: the fleet must not go red during the roll-out."""
+        now = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+        entry = self._entry(
+            protocol_version=14,
+            scorer={
+                "status": "fresh_verified",
+                "supported_bench_versions": [2, 3],
+                "observed_at": int(now.timestamp()),
+                "software_version": "0.29.6",
+                "source_revision": "a" * 40,
+            },
+        )
+
+        assert entry.scorer_liveness == "unreported"
+        assert entry.health_reasons == []
+        assert entry.health != "critical"
+
+    def test_a_v15_validator_that_reports_no_probe_is_still_called_out(self) -> None:
+        """Silence from software that can speak is itself a finding."""
+        now = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+        entry = self._entry(
+            protocol_version=15,
+            scorer={
+                "status": "fresh_verified",
+                "supported_bench_versions": [2, 3],
+                "observed_at": int(now.timestamp()),
+                "software_version": "0.29.6",
+                "source_revision": "a" * 40,
+            },
+        )
+
+        assert entry.scorer_liveness == "unreported"
+        assert entry.health_reasons == ["scorer liveness not reported"]
+        assert entry.health == "warning"
+
+    @pytest.mark.parametrize(
+        ("probe", "expected", "reason"),
+        [
+            pytest.param(
+                {"outcome": "connect_error", "consecutive_failures": 3},
+                "not_serving",
+                "scorer not serving: connect_error (3 in a row)",
+                id="refused",
+            ),
+            pytest.param(
+                {"outcome": "timeout", "consecutive_failures": 1},
+                "not_serving",
+                "scorer not serving: timeout",
+                id="timeout",
+            ),
+            pytest.param(
+                {
+                    "outcome": "http_error",
+                    "http_status": 401,
+                    "consecutive_failures": 1,
+                },
+                "not_serving",
+                "scorer not serving: http 401",
+                id="unauthorized",
+            ),
+            pytest.param(
+                {
+                    "outcome": "unreadable",
+                    "http_status": 200,
+                    "reason": "invalid_json",
+                    "consecutive_failures": 1,
+                },
+                "not_serving",
+                "scorer not serving: invalid_json",
+                id="parse-error",
+            ),
+            pytest.param(
+                {"outcome": "not_probed"},
+                "unreported",
+                "scorer was not probed",
+                id="mock-mode",
+            ),
+        ],
+    )
+    def test_every_failure_mode_names_itself(
+        self, probe: dict, expected: str, reason: str
+    ) -> None:
+        entry = self._entry(
+            protocol_version=15,
+            scorer={
+                "status": "legacy_v2",
+                "supported_bench_versions": [2],
+                "probe": {"observed_at": 1_784_000_000, **probe},
+            },
+        )
+
+        assert entry.scorer_liveness == expected
+        assert entry.health_reasons == [reason]
+
+
 class TestPublicFleet:
     def test_stale_boundaries_and_recovery_after_delayed_heartbeat(self) -> None:
         now = datetime(2026, 7, 14, 20, 0, tzinfo=UTC)
@@ -1872,6 +2129,7 @@ class TestPublicFleet:
                 ),
                 active_benchmark=None,
                 stack_health=_stack(),
+                scorer_reasons=[],
             )
             == []
         )
@@ -1888,11 +2146,20 @@ class TestPublicFleet:
             ),
             active_benchmark=None,
             stack_health=_stack(dittobench_api=_component("degraded")),
+            scorer_reasons=["scorer not serving: http 404"],
         )
-        assert reasons == ["memory 95%", "dittobench_api: degraded"]
+        assert reasons == [
+            "memory 95%",
+            "dittobench_api: degraded",
+            "scorer not serving: http 404",
+        ]
         # No metrics reported explains an otherwise-unknown badge.
         assert public_endpoint._health_reasons(
-            state="idle", metrics=None, active_benchmark=None, stack_health=None
+            state="idle",
+            metrics=None,
+            active_benchmark=None,
+            stack_health=None,
+            scorer_reasons=[],
         ) == ["host metrics not reported"]
 
     async def test_validator_name_response_is_allowlisted_to_reporters(

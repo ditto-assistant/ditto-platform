@@ -2158,7 +2158,15 @@ class PublicHealthResponse(BaseModel):
 
 
 FleetAvailability = Literal["available", "stale", "offline", "paused", "unknown"]
-FleetHealth = Literal["healthy", "warning", "unknown"]
+# ``critical`` is reserved for a validator that cannot do the one job it exists
+# to do. A scorer that is not serving belongs there and not next to a stalled
+# disk: both were ``warning`` before, and the fleet view could not tell an
+# inconvenience from a validator taking leases it can never complete.
+FleetHealth = Literal["healthy", "warning", "critical", "unknown"]
+# Whether the validator's scorer actually answered its capability probe.
+# ``unreported`` covers both a validator too old to carry probe evidence and one
+# that carried none; it is never a claim that the scorer is fine.
+ScorerLiveness = Literal["serving", "degraded", "not_serving", "unreported"]
 ValidatorAssignmentState = Literal[
     # The validator is doing exactly the work the platform leased it.
     "synchronized",
@@ -2215,6 +2223,19 @@ class PublicValidatorHeartbeat(BaseModel):
     online: bool
     availability: FleetAvailability
     health: FleetHealth
+    scorer_liveness: Annotated[
+        ScorerLiveness,
+        Field(
+            default="unreported",
+            description=(
+                "Whether the validator's scorer answered its `/v1/capabilities` "
+                "probe: `serving`, `degraded` (answered, part of the reply "
+                "rejected), `not_serving` (no usable answer), or `unreported` "
+                "(no probe evidence on this heartbeat). Requires heartbeat "
+                "protocol 15; older validators always read `unreported`."
+            ),
+        ),
+    ]
     health_reasons: Annotated[
         list[str],
         Field(
