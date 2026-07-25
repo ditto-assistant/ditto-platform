@@ -218,6 +218,103 @@ def test_composite_breakdown_shows_no_token_penalty_when_within_budget() -> None
     assert breakdown.token_penalty == 0.0
 
 
+# The generator release each bench version pins, and the version flag that
+# release accepts. These are not cosmetic: v0.7.0 predates `-bench-version` and
+# fails with "flag provided but not defined" if it is passed, while every
+# release from v0.8.0 on requires it (the flag defaults to 0 and the binary
+# exits 2 with "-bench-version is required"). Each row below was verified by
+# running the rendered command against the real generator and confirming it
+# exits 0 and prints a dataset_sha256.
+_EXPECTED_DATASET_COMMANDS = (
+    (2, "v0.7.0", ""),
+    (3, "v0.8.0", " -bench-version 3"),
+    (4, "v0.9.0", " -bench-version 4"),
+    (5, "v0.10.0", " -bench-version 5"),
+    (6, "v0.11.1", " -bench-version 6"),
+    (7, "v0.12.0", " -bench-version 7"),
+)
+
+
+def test_datagen_version_map_pins_every_supported_bench_version() -> None:
+    """The pins are an immutable public contract; 2-6 must never drift."""
+    assert public_endpoint._DATAGEN_VERSION_BY_BENCH_VERSION == {
+        2: "v0.7.0",
+        3: "v0.8.0",
+        4: "v0.9.0",
+        5: "v0.10.0",
+        6: "v0.11.1",
+        7: "v0.12.0",
+    }
+
+
+@pytest.mark.parametrize(
+    ("bench_version", "datagen_version", "version_flag"), _EXPECTED_DATASET_COMMANDS
+)
+def test_dataset_command_renders_a_runnable_generator_invocation(
+    bench_version: int, datagen_version: str, version_flag: str
+) -> None:
+    """Both public commands must actually run, not just look plausible.
+
+    A command that exits 2 is worse than no command at all: it still reads as
+    auditable to anyone skimming the leaderboard.
+    """
+    base = (
+        "go run github.com/ditto-assistant/dittobench-datagen/cmd/"
+        f"generate@{datagen_version}{version_flag} -seed 987654321 -run-size full"
+    )
+
+    verification = public_endpoint._dataset_command(
+        seed=987654321,
+        run_size="full",
+        bench_version=bench_version,
+        sha_only=True,
+    )
+    reproduction = public_endpoint._dataset_command(
+        seed=987654321,
+        run_size="full",
+        bench_version=bench_version,
+        sha_only=False,
+    )
+
+    assert verification == f"{base} -sha"
+    assert reproduction == f"{base} -out dataset.json"
+
+
+def test_dataset_command_omits_version_flag_only_for_the_release_lacking_it() -> None:
+    """v0.7.0 rejects `-bench-version`; v0.8.0+ require it."""
+    for bench_version, _, _ in _EXPECTED_DATASET_COMMANDS:
+        command = public_endpoint._dataset_command(
+            seed=1,
+            run_size="small",
+            bench_version=bench_version,
+            sha_only=True,
+        )
+        assert command is not None
+        assert ("-bench-version" in command) is (bench_version != 2)
+
+
+def test_dataset_command_is_withheld_when_the_generator_pin_is_unknown() -> None:
+    """An unpinned epoch renders nothing rather than an unrunnable command."""
+    assert (
+        public_endpoint._dataset_command(
+            seed=1, run_size="full", bench_version=8, sha_only=True
+        )
+        is None
+    )
+    assert (
+        public_endpoint._dataset_command(
+            seed=1, run_size="full", bench_version=None, sha_only=True
+        )
+        is None
+    )
+    assert (
+        public_endpoint._dataset_command(
+            seed=1, run_size="enormous", bench_version=7, sha_only=True
+        )
+        is None
+    )
+
+
 @pytest.fixture
 async def engine() -> AsyncIterator[AsyncEngine]:
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")

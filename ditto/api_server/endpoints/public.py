@@ -295,7 +295,18 @@ _DATAGEN_VERSION_BY_BENCH_VERSION = {
     4: "v0.9.0",
     5: "v0.10.0",
     6: "v0.11.1",
+    7: "v0.12.0",
 }
+# Generator releases from v0.8.0 on require an explicit `-bench-version`: the
+# flag defaults to 0 and the binary exits 2 ("-bench-version is required")
+# without it. protocol.CurrentBenchVersion is deliberately NOT a generation
+# default -- it is display/release metadata only, so canonical generation must
+# always be told its version explicitly.
+#
+# v0.7.0 predates the flag entirely and generates bench 2 unconditionally, so
+# passing `-bench-version` to it fails with "flag provided but not defined".
+# Bench 2 therefore keeps the flagless form.
+_BENCH_VERSIONS_WITHOUT_VERSION_FLAG = frozenset({2})
 _DATAGEN_RUN_SIZES = frozenset({"small", "medium", "full"})
 _VALIDATOR_ONLINE_WINDOW = timedelta(minutes=5)
 _VALIDATOR_STALE_WINDOW = timedelta(minutes=15)
@@ -2253,9 +2264,14 @@ def _dataset_command(
     datagen_version = _datagen_version(bench_version)
     if run_size not in _DATAGEN_RUN_SIZES or datagen_version is None:
         return None
+    version_flag = (
+        ""
+        if bench_version in _BENCH_VERSIONS_WITHOUT_VERSION_FLAG
+        else f" -bench-version {bench_version}"
+    )
     command = (
         "go run github.com/ditto-assistant/dittobench-datagen/cmd/generate@"
-        f"{datagen_version} -seed {seed} -run-size {run_size}"
+        f"{datagen_version}{version_flag} -seed {seed} -run-size {run_size}"
     )
     return f"{command} -sha" if sha_only else f"{command} -out dataset.json"
 
@@ -3544,8 +3560,9 @@ async def bench_config(
                 "commits; unpredictable, one fresh dataset per submission"
             ),
             reproduce=(
-                "generate -seed <seed> -run-size full -sha reproduces any "
-                "scored run's exact bytes and dataset_sha256"
+                "generate -bench-version <bench_version> -seed <seed> "
+                "-run-size full -sha reproduces any scored run's exact bytes "
+                "and dataset_sha256"
             ),
         ),
         public_mirror_url_template=mirror,
