@@ -187,7 +187,8 @@ async def list_memory_leader_timeline(
 
     Reduction stays in Python for identical SQLite/Postgres semantics and to
     avoid dialect-specific percentile functions. The covering timeline index
-    keeps the bounded v2-v6 source read cheap as historical score eras grow.
+    keeps the source read cheap as historical score eras grow, and the caller
+    passes a bounded window of versions rather than the whole ledger.
     """
 
     versions = tuple(sorted({int(version) for version in bench_versions}))
