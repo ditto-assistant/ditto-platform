@@ -1,4 +1,12 @@
-"""``GET /health`` - DB + chain reachability probe."""
+"""``GET /health`` - DB + chain reachability probe, and deploy-revision truth.
+
+Beyond liveness, this endpoint answers the question that went unasked during
+the 2026-07-25 near-outage: *is the running process on the checked-out
+revision?* ``commit`` is resolved at process start; ``checked_out_commit`` is
+re-read from the deploy directory per probe. When they disagree, the host has
+new code on disk that nothing is running -- see
+:mod:`ditto.api_server.revision`.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models import HealthResponse
+from ditto.api_server import revision
 from ditto.api_server.dependencies import get_chain_client, get_session
 from ditto.chain import ChainClient, ChainError
 
@@ -57,9 +66,17 @@ async def health(
     if overall != "ok":
         response.status_code = 503
 
+    # Revision drift is reported, never enforced: a host running yesterday's
+    # code is a deploy problem, and 503-ing it here would take the instance out
+    # of service over it. The deploy script is what fails on a mismatch.
+    running = request.app.state.commit_hash
+    checked_out = await revision.checked_out_commit()
+
     return HealthResponse(
         status=overall,
         db=db_status,
         chain=chain_status,
-        commit=request.app.state.commit_hash,
+        commit=running,
+        checked_out_commit=checked_out,
+        commit_drift=revision.commits_diverged(running, checked_out),
     )

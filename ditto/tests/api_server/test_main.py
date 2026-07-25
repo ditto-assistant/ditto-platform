@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -24,34 +23,20 @@ def _make_args(**overrides: object) -> argparse.Namespace:
 
 
 class TestResolveCommitHash:
-    def test_returns_hex_on_success(self):
-        result = MagicMock(returncode=0, stdout="abcdef1234567890\n")
-        with patch("ditto.api_server.__main__.subprocess.run", return_value=result):
+    """Boot-time resolution delegates to the shared revision helper.
+
+    The subprocess behaviour itself is covered in
+    :mod:`ditto.tests.api_server.test_revision`; what matters here is that the
+    commit stamped onto the process comes from the same resolver ``/health``
+    compares against.
+    """
+
+    def test_delegates_to_revision_module(self):
+        with patch(
+            "ditto.api_server.revision.resolve_commit_hash",
+            return_value="abcdef1234567890",
+        ):
             assert _resolve_commit_hash() == "abcdef1234567890"
-
-    def test_non_zero_exit_falls_back_to_unknown(self):
-        result = MagicMock(returncode=128, stdout="")
-        with patch("ditto.api_server.__main__.subprocess.run", return_value=result):
-            assert _resolve_commit_hash() == "unknown"
-
-    def test_empty_stdout_falls_back_to_unknown(self):
-        result = MagicMock(returncode=0, stdout="\n")
-        with patch("ditto.api_server.__main__.subprocess.run", return_value=result):
-            assert _resolve_commit_hash() == "unknown"
-
-    def test_file_not_found_falls_back_to_unknown(self):
-        with patch(
-            "ditto.api_server.__main__.subprocess.run",
-            side_effect=FileNotFoundError(),
-        ):
-            assert _resolve_commit_hash() == "unknown"
-
-    def test_timeout_falls_back_to_unknown(self):
-        with patch(
-            "ditto.api_server.__main__.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd="git", timeout=2),
-        ):
-            assert _resolve_commit_hash() == "unknown"
 
 
 class TestConfigFromArgs:

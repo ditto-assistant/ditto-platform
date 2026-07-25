@@ -12,26 +12,65 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[3]
 
+# The revision the fake checkout resolves to, and the (older) revision the
+# fake running process reports. Keeping them distinct is the point of most of
+# the tests below: "checked out" and "in service" are different facts.
+TARGET_SHA = "1111111111111111111111111111111111111111"
+RUNNING_SHA = "0000000000000000000000000000000000000000"
+
+MIGRATION = """\
+revision: str = "{revision}"
+down_revision: str | None = {down!r}
+"""
+
 
 def _write_executable(path: Path, source: str) -> None:
     path.write_text(f"#!/usr/bin/env bash\nset -eu\n{source}")
     path.chmod(0o755)
 
 
+def _write_migrations(repo: Path, *, diverged: bool = False) -> None:
+    """Lay down an alembic history for the deploy's single-head preflight.
+
+    ``diverged`` reproduces the 2026-07-25 shape: two revisions that each
+    extend the same parent and were merged independently, which is what makes
+    ``alembic upgrade head`` refuse to run.
+    """
+    versions = repo / "alembic" / "versions"
+    versions.mkdir(parents=True, exist_ok=True)
+    (versions / "2026_07_01_root.py").write_text(
+        MIGRATION.format(revision="root", down=None)
+    )
+    (versions / "2026_07_02_first.py").write_text(
+        MIGRATION.format(revision="e7b4c02a5d18", down="root")
+    )
+    if diverged:
+        (versions / "2026_07_02_second.py").write_text(
+            MIGRATION.format(revision="e5b8c31d47af", down="root")
+        )
+
+
 @contextmanager
-def _health_server(status: int = 200) -> Iterator[int]:
+def _health_server(status: int = 200, commit: str | None = TARGET_SHA) -> Iterator[int]:
     """Serve ``status`` on any path so update.sh's post-deploy probe can pass.
 
     The probe is deliberately the one thing update.sh will not fake: it requires
     a real HTTP answer on the API port. Tests therefore need a real listener.
+    ``commit`` is what the *running process* claims to be, which update.sh
+    compares against the revision it checked out.
     """
+    body = (
+        '{"status":"ok"}'
+        if commit is None
+        else f'{{"status":"ok","commit":"{commit}"}}'
+    )
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - stdlib naming
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
+            self.wfile.write(body.encode())
 
         def log_message(self, *_args: object) -> None:
             return
@@ -81,7 +120,11 @@ def _run_update(
     deploy_env_vars: dict[str, str] | None = None,
     jlist: str | None = None,
     health_status: int = 200,
+    health_commit: str | None = TARGET_SHA,
     health_timeout: str = "15",
+    uv_source: str = ":\n",
+    diverged_migrations: bool = False,
+    last_deploy_record: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str, str, int]:
     repo = tmp_path / "repo"
     scripts = repo / "scripts"
@@ -97,18 +140,42 @@ def _run_update(
     shutil.copy2(
         ROOT / "scripts" / "ecosystem.config.js", scripts / "ecosystem.config.js"
     )
+    # The single-head preflight runs this with the system python3, before
+    # `uv sync`, so it needs the real script and a real migration tree.
+    shutil.copy2(
+        ROOT / "scripts" / "check_migration_order.py",
+        scripts / "check_migration_order.py",
+    )
+    _write_migrations(repo, diverged=diverged_migrations)
     (repo / "logs").mkdir()
+    if last_deploy_record is not None:
+        (repo / "logs" / "last-deploy.json").write_text(last_deploy_record)
     (repo / ".env").write_text(initial_env)
     if initial_deploy_env is not None:
         (repo / ".env.deploy").write_text(initial_deploy_env)
 
     (repo / "jlist.json").write_text(jlist if jlist is not None else _jlist(repo))
 
+    # `git rev-parse HEAD` reads a file the fake `git reset --hard <sha>`
+    # rewrites, so a test can observe update.sh rolling the checkout back.
+    (repo / "git-head").write_text(f"{TARGET_SHA}\n")
     _write_executable(
         fake_bin / "git",
-        'if [ "${1:-}" = "rev-parse" ]; then printf "main\\n"; fi\n',
+        f'printf "%s\\n" "git $*" >> "{repo}/git-actions.log"\n'
+        'case "${1:-}" in\n'
+        "  rev-parse)\n"
+        '    if [ "${2:-}" = "--abbrev-ref" ]; then printf "main\\n";\n'
+        f'    else cat "{repo}/git-head"; fi\n'
+        "    ;;\n"
+        "  reset)\n"
+        '    case "${3:-}" in\n'
+        "      origin/*|'') : ;;\n"
+        f'      *) printf "%s\\n" "$3" > "{repo}/git-head" ;;\n'
+        "    esac\n"
+        "    ;;\n"
+        "esac\n",
     )
-    _write_executable(fake_bin / "uv", ":\n")
+    _write_executable(fake_bin / "uv", uv_source)
     _write_executable(fake_bin / "docker", ":\n")
     _write_executable(
         fake_bin / "pm2",
@@ -123,7 +190,7 @@ def _run_update(
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["DITTO_HEALTH_TIMEOUT"] = health_timeout
 
-    with _health_server(health_status) as port:
+    with _health_server(health_status, health_commit) as port:
         env["API_PORT"] = str(port)
         result = subprocess.run(
             [str(scripts / "update.sh")],
@@ -133,13 +200,29 @@ def _run_update(
             capture_output=True,
             text=True,
         )
+    # A preflight failure exits before .env.deploy is written at all, which is
+    # itself the point: nothing on the host had been touched yet.
     deploy_env = repo / ".env.deploy"
+    if not deploy_env.exists():
+        return result, (repo / ".env").read_text(), "", 0
     return (
         result,
         (repo / ".env").read_text(),
         deploy_env.read_text(),
         deploy_env.stat().st_mode & 0o777,
     )
+
+
+def _head(tmp_path: Path) -> str:
+    return (tmp_path / "repo" / "git-head").read_text().strip()
+
+
+def _git_actions(tmp_path: Path) -> str:
+    return (tmp_path / "repo" / "git-actions.log").read_text()
+
+
+def _deploy_record(tmp_path: Path) -> dict[str, str]:
+    return json.loads((tmp_path / "repo" / "logs" / "last-deploy.json").read_text())
 
 
 def test_update_loads_taostats_key_without_logging_value(tmp_path: Path) -> None:
@@ -334,3 +417,179 @@ def test_update_accepts_the_stopped_one_shot_cleanup_job(tmp_path: Path) -> None
 
     assert result.returncode == 0, result.stderr
     assert "ditto-screened-image-cleanup: stopped (one-shot" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Divergent migration heads, and what a failed deploy leaves behind.
+#
+# The 2026-07-25 near-outage: origin/main carried two alembic heads, `alembic
+# upgrade head` refused to run, and the deploy stopped with the new revision
+# checked out and the old process still serving. Every git-layer signal said
+# the deploy had landed.
+
+
+def test_update_refuses_to_deploy_divergent_migration_heads(tmp_path: Path) -> None:
+    """Two heads stop the deploy in preflight, naming both and the remedy."""
+    result, _, _, _ = _run_update(
+        tmp_path,
+        gcloud_source="exit 1\n",
+        diverged_migrations=True,
+        health_commit=RUNNING_SHA,
+    )
+
+    assert result.returncode != 0
+    assert "2 head revisions are present" in result.stderr
+    # The revisions and the exact fix, not alembic's bare "Multiple head
+    # revisions are present" from the middle of the sequence.
+    assert "e5b8c31d47af" in result.stderr
+    assert "e7b4c02a5d18" in result.stderr
+    assert "alembic merge" in result.stderr
+    # Preflight runs before pm2 is planned or touched.
+    assert not (tmp_path / "repo" / "pm2-actions.log").exists()
+
+
+def test_update_rolls_the_checkout_back_when_a_migration_fails(
+    tmp_path: Path,
+) -> None:
+    """A migration failure must not leave new code checked out and unserved.
+
+    This is the exact shape of the incident: the checkout moved, the process
+    did not, and nothing at the git layer said so. The checkout is put back to
+    the revision the running process reports, so the host stops claiming a
+    deploy that never took effect.
+    """
+    result, _, _, _ = _run_update(
+        tmp_path,
+        gcloud_source="exit 1\n",
+        # Succeed for `uv sync`, fail for `uv run alembic upgrade head`.
+        uv_source='if [ "${1:-}" = "run" ]; then\n'
+        '  echo "Multiple head revisions are present" >&2\n'
+        "  exit 1\n"
+        "fi\n",
+        health_commit=RUNNING_SHA,
+    )
+
+    assert result.returncode != 0
+    assert f"git reset --hard {RUNNING_SHA}" in _git_actions(tmp_path)
+    assert _head(tmp_path) == RUNNING_SHA
+    # pm2 is never reached, so the old process keeps serving code that once
+    # again matches the checkout.
+    assert not (tmp_path / "repo" / "pm2-actions.log").exists()
+
+    record = _deploy_record(tmp_path)
+    assert record["result"] == "failed"
+    assert record["stage"] == "migrate"
+    assert record["target_commit"] == TARGET_SHA
+    assert record["rolled_back"] == "yes"
+
+
+def test_update_leaves_the_checkout_in_place_once_pm2_has_restarted(
+    tmp_path: Path,
+) -> None:
+    """After the restart, rewinding the checkout would be the opposite lie.
+
+    The new build is what pm2 is now supervising. Going back is a deploy of
+    the previous revision, not a `git reset` behind a running process.
+    """
+    result, _, _, _ = _run_update(
+        tmp_path,
+        gcloud_source="exit 1\n",
+        jlist=_jlist(tmp_path / "repo", api_status="waiting restart"),
+        health_timeout="4",
+    )
+
+    assert result.returncode != 0
+    assert "git reset --hard" not in _git_actions(tmp_path).replace(
+        "git reset --hard origin/main", ""
+    )
+    assert _head(tmp_path) == TARGET_SHA
+    assert "pm2 was already restarted" in result.stderr
+    assert _deploy_record(tmp_path)["rolled_back"] == "no"
+
+
+def test_update_does_not_roll_back_to_a_revision_from_a_failed_deploy(
+    tmp_path: Path,
+) -> None:
+    """A failed run's target was never in service, so it is not a rollback target."""
+    result, _, _, _ = _run_update(
+        tmp_path,
+        gcloud_source="exit 1\n",
+        diverged_migrations=True,
+        health_commit=None,
+        last_deploy_record=json.dumps(
+            {"result": "failed", "target_commit": "deadbeefdeadbeef"}
+        ),
+    )
+
+    assert result.returncode != 0
+    assert "deadbeefdeadbeef" not in _git_actions(tmp_path)
+    assert _head(tmp_path) == TARGET_SHA
+    assert "Could not determine the revision in service" in result.stderr
+
+
+def test_update_falls_back_to_the_last_successful_deploy_record(
+    tmp_path: Path,
+) -> None:
+    """When the API cannot answer, the script's own record names the rollback."""
+    result, _, _, _ = _run_update(
+        tmp_path,
+        gcloud_source="exit 1\n",
+        diverged_migrations=True,
+        health_commit=None,
+        last_deploy_record=json.dumps({"result": "ok", "target_commit": RUNNING_SHA}),
+    )
+
+    assert result.returncode != 0
+    assert f"git reset --hard {RUNNING_SHA}" in _git_actions(tmp_path)
+    assert _head(tmp_path) == RUNNING_SHA
+
+
+# ---------------------------------------------------------------------------
+# Checked out is not the same as in service.
+
+
+def test_update_fails_when_the_api_serves_a_different_commit(tmp_path: Path) -> None:
+    """200 from an old build is a failed deploy, not a passed one.
+
+    pm2 online plus HTTP 200 was still not enough: the process can be serving
+    code from before the checkout. The gate asks the process what it is
+    running and compares it to what was checked out.
+    """
+    result, _, _, _ = _run_update(
+        tmp_path,
+        gcloud_source="exit 1\n",
+        health_commit=RUNNING_SHA,
+        health_timeout="4",
+    )
+
+    assert result.returncode != 0
+    assert f"is serving commit {RUNNING_SHA}" in result.stderr
+    assert f"checked out {TARGET_SHA}" in result.stderr
+    assert "never restarted into this build" in result.stderr
+
+
+def test_update_warns_but_passes_when_the_api_reports_no_commit(
+    tmp_path: Path,
+) -> None:
+    """A checkout without git history must not fail every deploy on that host."""
+    result, _, _, _ = _run_update(
+        tmp_path,
+        gcloud_source="exit 1\n",
+        health_commit=None,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "does not report a commit" in result.stderr
+
+
+def test_update_records_and_announces_the_deployed_commit(tmp_path: Path) -> None:
+    """The workflow reads the last line; the next deploy reads the record."""
+    result, _, _, _ = _run_update(tmp_path, gcloud_source="exit 1\n")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.rstrip().endswith(f"deployed-commit={TARGET_SHA}")
+
+    record = _deploy_record(tmp_path)
+    assert record["result"] == "ok"
+    assert record["stage"] == "done"
+    assert record["target_commit"] == TARGET_SHA
