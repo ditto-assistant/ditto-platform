@@ -48,9 +48,9 @@ DEFAULT_EMBEDDING_GLOBAL_CONCURRENCY = 96
 # enforces on the boot-time embedding limits, kept deliberately identical so the
 # board can never accept a value the boot check would have rejected. It exists
 # because a fat-fingered revision must not point the whole fleet at a number
-# that saturates the single platform process's admission path (see
-# `ditto/db/queries/inference.py`: every reservation, chat and embedding alike,
-# serialises on ONE `pg_advisory_xact_lock("inference")`).
+# that saturates the admission path (see `ditto/db/queries/inference.py`: a
+# reservation no longer serialises fleet-wide, but it still takes a grant-row
+# `FOR UPDATE` plus the cross-grant admission aggregates on every call).
 MAX_EMBEDDING_PER_TICKET_CONCURRENCY = 128
 MAX_EMBEDDING_PER_VALIDATOR_CONCURRENCY = 128
 MAX_EMBEDDING_GLOBAL_CONCURRENCY = 128
@@ -91,9 +91,11 @@ class InferenceConcurrencySettings(BaseModel):
     ] = DEFAULT_EMBEDDING_GLOBAL_CONCURRENCY
     """Concurrent hosted embedding requests across the whole fleet.
 
-    The one number to move cautiously. Every admission takes a **global**
-    Postgres advisory lock, so this bounds sustained pressure on a serialised
-    path that also admits chat requests.
+    The one number to move cautiously. It is enforced by a **cross-grant**
+    aggregate over every in-flight request, so unlike the per-ticket limit it
+    is best-effort under a simultaneous burst: concurrent admissions can
+    overshoot it by at most the number of racers. Size it as a load-shedding
+    backstop with headroom, not as an exact valve.
     """
 
     @model_validator(mode="after")

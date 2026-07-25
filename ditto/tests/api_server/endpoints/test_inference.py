@@ -609,3 +609,104 @@ def test_pre_v7_model_selection_semantics_are_unchanged() -> None:
     with pytest.raises(HTTPException) as excinfo:
         _locked_grant_model(grant, requested="anthropic/claude", config=_FakeConfig())
     assert excinfo.value.status_code == 403
+
+
+def test_embedding_vectors_pass_through_without_per_element_validation() -> None:
+    """Vector contents are forwarded as parsed; the envelope is still checked.
+
+    Per-element float validation cost 42us per 768-dim vector on the shared
+    event loop, and the trusted broker re-validates every element for NaN/Inf
+    before any harness sees it (inference_broker.go:1144-1151). Dropping the
+    duplicate check must not weaken anything that is O(vectors) rather than
+    O(floats): arity, ordering, vector length, model identity, and usage all
+    still fail closed below.
+    """
+    model = "perplexity/pplx-embed-v1-0.6b"
+
+    # A payload that the old per-element validator would have rejected and the
+    # passthrough forwards verbatim. This is the behavior change, stated
+    # explicitly so a future reader sees it was chosen, not overlooked.
+    exotic = [float("nan"), float("inf"), -float("inf")] + [0.5] * 765
+    public, prompt_tokens = _public_embedding_response(
+        {
+            "object": "list",
+            "model": model,
+            "data": [{"object": "embedding", "index": 0, "embedding": exotic}],
+            "usage": {"prompt_tokens": 3, "total_tokens": 3},
+        },
+        model=model,
+        dimensions=768,
+        input_count=1,
+    )
+    assert prompt_tokens == 3
+    assert public["data"][0]["embedding"] is exotic
+
+    # Everything cheap stays enforced.
+    vector = [0.0] * 768
+    for broken in (
+        # wrong arity vs the request
+        {
+            "model": model,
+            "data": [{"object": "embedding", "index": 0, "embedding": vector}],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1},
+        },
+        # out-of-order / misaligned index
+        {
+            "model": model,
+            "data": [
+                {"object": "embedding", "index": 1, "embedding": vector},
+                {"object": "embedding", "index": 0, "embedding": vector},
+            ],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1},
+        },
+        # truncated vector: length is still validated, only elements are not
+        {
+            "model": model,
+            "data": [
+                {"object": "embedding", "index": 0, "embedding": [0.0] * 512},
+                {"object": "embedding", "index": 1, "embedding": vector},
+            ],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1},
+        },
+        # a vector that is not a list at all
+        {
+            "model": model,
+            "data": [
+                {"object": "embedding", "index": 0, "embedding": "not-a-vector"},
+                {"object": "embedding", "index": 1, "embedding": vector},
+            ],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1},
+        },
+        # missing usage: metering depends on it, so it must still fail closed
+        {
+            "model": model,
+            "data": [
+                {"object": "embedding", "index": 0, "embedding": vector},
+                {"object": "embedding", "index": 1, "embedding": vector},
+            ],
+        },
+    ):
+        with pytest.raises(HTTPException, match="invalid provider response"):
+            _public_embedding_response(
+                broken, model=model, dimensions=768, input_count=2
+            )
+
+
+def test_embedding_model_mismatch_still_refuses_rather_than_substituting() -> None:
+    """#428's request-side policy is unchanged by the response passthrough.
+
+    Chat substitutes the ticket model; embeddings refuse, because silently
+    rewriting the model would change the vector space under a caller that is
+    validating dimensions. The two paths differ on purpose, and the response
+    passthrough must not disturb that: the guarantee lives on the request side.
+    """
+    model = "perplexity/pplx-embed-v1-0.6b"
+    payload = {
+        "model": "embeddinggemma",
+        "input": ["one"],
+        "dimensions": 768,
+        "encoding_format": "float",
+    }
+    with pytest.raises(HTTPException) as refused:
+        _validated_embedding_payload(payload, model=model, dimensions=768)
+    assert refused.value.status_code == 400

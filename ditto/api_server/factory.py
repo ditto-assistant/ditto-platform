@@ -56,7 +56,7 @@ from ditto.api_server.endpoints import (
     upload_router,
     validator_router,
 )
-from ditto.api_server.errors import ApiServerLifespanError
+from ditto.api_server.errors import ApiServerConfigError, ApiServerLifespanError
 from ditto.api_server.inference_concurrency_settings import (
     InferenceConcurrencySettingsResolver,
 )
@@ -87,6 +87,38 @@ _DASHBOARD_IMAGE = (
     Path(__file__).resolve().parents[2] / "dashboard" / "assets" / "paperditto-512.png"
 )
 _WANDB_META_RE = re.compile(r'(<meta name="ditto:wandb-url" content=")[^"]*(")')
+
+
+PLATFORM_ROLE = "platform"
+RELAY_ROLE = "relay"
+
+
+def _process_role() -> str:
+    """Which subset of the API this process serves (``DITTO_ROLE``).
+
+    The inference proxy and validator heartbeat ingest share one event loop in
+    a single fork-mode uvicorn process. Proxy load therefore delays heartbeat
+    ingest, which lets ``seen_at``/``benchmark_capacity`` go stale, which makes
+    the platform force-expire live validator leases and destroy healthy
+    in-flight benchmark runs. The proxy can kill the runs it is serving.
+
+    ``relay`` mounts only ``/health``, ``/metrics``, and the inference plane, so
+    it can be deployed as a separate process on its own host. That severs the
+    shared loop -- which is the actual causal mechanism -- while keeping one
+    codebase, one set of queries, one schema, and one migration history. There
+    is no second implementation to keep byte-identical, because there is no
+    second implementation.
+
+    Unknown values fail boot rather than defaulting. Silently falling back to
+    ``platform`` would mean a typo in the relay's environment quietly serves the
+    full admin and upload surface from a host provisioned to be a proxy.
+    """
+    role = os.environ.get("DITTO_ROLE", PLATFORM_ROLE).strip().lower() or PLATFORM_ROLE
+    if role not in {PLATFORM_ROLE, RELAY_ROLE}:
+        raise ApiServerConfigError(
+            f"DITTO_ROLE must be {PLATFORM_ROLE!r} or {RELAY_ROLE!r}, got {role!r}"
+        )
+    return role
 
 
 def _efficiency_settings_ttl_seconds() -> float:
@@ -264,6 +296,14 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
 
     app.include_router(health_router)
     app.include_router(metrics_router)
+    if _process_role() == RELAY_ROLE:
+        # The inference plane only. Nothing below this point is mounted, so a
+        # relay host cannot serve uploads, scoring, the validator API, or any
+        # admin surface even if it is reachable and holds valid credentials.
+        # /health and /metrics stay so the load balancer and Prometheus scrape
+        # the same paths on both roles.
+        app.include_router(inference_router, prefix="/api/v1")
+        return app
     app.include_router(upload_router, prefix="/api/v1")
     app.include_router(retrieval_router, prefix="/api/v1")
     app.include_router(validator_router, prefix="/api/v1")

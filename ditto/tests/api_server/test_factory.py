@@ -8,7 +8,7 @@ import pytest
 from fastapi import FastAPI
 
 from ditto.api_server import create_api_server
-from ditto.api_server.errors import ApiServerLifespanError
+from ditto.api_server.errors import ApiServerConfigError, ApiServerLifespanError
 from ditto.api_server.middleware import (
     AuthPassThroughMiddleware,
     RequestIDMiddleware,
@@ -95,3 +95,79 @@ class TestLifespanFailureCleanup:
                     pass
 
         engine.dispose.assert_awaited_once()
+
+
+class TestProcessRole:
+    """``DITTO_ROLE=relay`` serves the inference plane and nothing else.
+
+    The relay exists to get the inference hot path off the event loop that
+    ingests validator heartbeats, because proxy load delaying that ingest is
+    what lets the platform force-expire live leases and destroy in-flight runs.
+    It is the same codebase deployed twice, so these tests pin the only thing
+    that actually differs between the two roles: the mounted surface.
+    """
+
+    @staticmethod
+    def _paths(app: FastAPI) -> set[str]:
+        return {getattr(route, "path", "") for route in app.routes}
+
+    def test_relay_serves_inference_health_and_metrics_only(self, monkeypatch):
+        monkeypatch.setenv("DITTO_ROLE", "relay")
+        paths = self._paths(create_api_server(make_api_server_config()))
+        assert "/api/v1/inference/chat/completions" in paths
+        assert "/api/v1/inference/embeddings" in paths
+        assert "/api/v1/inference/exchange" in paths
+        assert "/health" in paths
+        assert "/metrics" in paths
+
+    def test_relay_does_not_mount_the_platform_surface(self, monkeypatch):
+        """A relay host must not serve uploads, scoring, validator, or admin.
+
+        This is the containment property: even if the relay is reachable and
+        holds valid credentials, there is no route on it to drive the rest of
+        the platform.
+        """
+        monkeypatch.setenv("DITTO_ROLE", "relay")
+        paths = self._paths(create_api_server(make_api_server_config()))
+        forbidden = [
+            path
+            for path in paths
+            if path.startswith("/api/v1/") and not path.startswith("/api/v1/inference/")
+        ]
+        assert forbidden == []
+
+    def test_platform_role_is_the_default_and_is_unchanged(self, monkeypatch):
+        monkeypatch.delenv("DITTO_ROLE", raising=False)
+        default = self._paths(create_api_server(make_api_server_config()))
+        monkeypatch.setenv("DITTO_ROLE", "platform")
+        explicit = self._paths(create_api_server(make_api_server_config()))
+        assert default == explicit
+        assert "/api/v1/upload/agent" in default
+        assert "/api/v1/inference/chat/completions" in default
+
+    def test_relay_is_a_strict_subset_of_the_platform_surface(self, monkeypatch):
+        """The relay must never expose a route the platform does not.
+
+        Same code, same routers -- if this ever fails, the two roles have
+        diverged into two implementations, which is exactly what this design
+        exists to prevent.
+        """
+        monkeypatch.setenv("DITTO_ROLE", "platform")
+        platform = self._paths(create_api_server(make_api_server_config()))
+        monkeypatch.setenv("DITTO_ROLE", "relay")
+        relay = self._paths(create_api_server(make_api_server_config()))
+        assert relay <= platform
+
+    @pytest.mark.parametrize("value", ["proxy", "RELAY ", "", "platfrom", "true"])
+    def test_unknown_role_fails_boot_instead_of_defaulting(self, monkeypatch, value):
+        """A typo must not silently serve the full admin surface from a relay.
+
+        Only the empty string and exact casings of the two known roles are
+        tolerated; everything else is a configuration error at boot.
+        """
+        monkeypatch.setenv("DITTO_ROLE", value)
+        if value.strip().lower() in {"", "relay", "platform"}:
+            create_api_server(make_api_server_config())
+            return
+        with pytest.raises(ApiServerConfigError):
+            create_api_server(make_api_server_config())

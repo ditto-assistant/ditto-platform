@@ -650,6 +650,22 @@ def _public_embedding_response(
         or prompt_tokens < 0
     ):
         raise HTTPException(status_code=502, detail="invalid provider response")
+    # The vector payload is forwarded as parsed, without inspecting elements.
+    #
+    # Envelope shape, ordering, arity, and length are still checked below --
+    # those are O(vectors) and catch a truncated or misaligned provider
+    # response. What is deliberately NOT done is per-element float validation.
+    # At 768 dimensions that cost 42us per vector (measured), and a v7 run
+    # issues ~671 embedding calls of up to 256 inputs each: 0.2s of blocking
+    # CPU per run at small batches and 7.2s at the maximum, all of it on the
+    # single event loop that also ingests validator heartbeats. It was roughly
+    # a 50% surcharge on top of the unavoidable json.loads of the same body.
+    #
+    # It also bought nothing. This proxy is not the consumer of these vectors;
+    # the trusted broker is, and it independently re-validates every element
+    # for NaN/Inf plus each vector's length and index before any harness sees
+    # them (dittobench-api cmd/dittobench-api/inference_broker.go:1144-1151).
+    # This was the second copy of a check the actual consumer performs anyway.
     public_data: list[dict[str, Any]] = []
     for expected_index, item in enumerate(data):
         vector = item.get("embedding") if isinstance(item, dict) else None
@@ -658,12 +674,6 @@ def _public_embedding_response(
             or item.get("index") != expected_index
             or not isinstance(vector, list)
             or len(vector) != dimensions
-            or any(
-                not isinstance(value, (int, float))
-                or isinstance(value, bool)
-                or not math.isfinite(float(value))
-                for value in vector
-            )
         ):
             raise HTTPException(status_code=502, detail="invalid provider response")
         public_data.append(
@@ -1057,10 +1067,10 @@ async def proxy_embeddings(
 
     session_maker = request.app.state.session_maker
     # Resolve the operator's concurrency board BEFORE opening the admission
-    # transaction. That transaction holds a global advisory lock and two
-    # FOR UPDATE row locks, so a settings SELECT inside it would lengthen the
-    # most contended critical section in the service. The resolver is TTL-cached
-    # and reads on its own session, so the common case costs nothing.
+    # transaction. That transaction holds two FOR UPDATE row locks (the grant
+    # and its ticket), so a settings SELECT inside it would lengthen the most
+    # contended critical section in the service. The resolver is TTL-cached and
+    # reads on its own session, so the common case costs nothing.
     admission_config = await _resolve_admission_config(request, config)
     now = datetime.now(UTC)
     async with session_maker() as session, session.begin():
