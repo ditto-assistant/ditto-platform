@@ -57,6 +57,7 @@ from ditto.db.queries.benchmark_rollout import (
     active_bench_version,
     append_rollout_member,
     bind_inference_activation_requirements,
+    capable_validator_counts,
     create_rollout_snapshot,
     heartbeat_supports_version,
     historical_rescore_cohort,
@@ -2032,6 +2033,34 @@ async def test_capability_gate_is_parameterised_per_bench_version() -> None:
     assert not heartbeat_supports_version(stale, now=now, version=4)
     legacy_v7 = _heartbeat("legacy-v7", now, versions=[2, 7], protocol_version=10)
     assert not heartbeat_supports_version(legacy_v7, now=now, version=7)
+
+
+async def test_capable_validator_counts_agree_with_the_per_version_state() -> None:
+    """The batched count is the same answer, from one heartbeat read.
+
+    Target discovery needs this number for every shipped contract. It used to
+    get it by running the full ``rollout_state`` derivation once per contract,
+    so the two must stay identical or the cheap path is a different guarantee.
+    """
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC).replace(microsecond=0)
+    versions = [2, 3, 4, 5, 6]
+    async with maker() as session, session.begin():
+        session.add(_heartbeat("v4-only", now, versions=[2, 4]))
+        session.add(_heartbeat("v3-only", now, versions=[2, 3]))
+        session.add(_heartbeat("also-v4", now, versions=[2, 4]))
+        await session.flush()
+
+        batched = await capable_validator_counts(session, versions=versions, now=now)
+
+        assert batched == {2: 3, 3: 1, 4: 2, 5: 0, 6: 0}
+        for version in versions:
+            state = await rollout_state(session, now=now, capability_version=version)
+            assert batched[version] == state["canary_capable_validator_count"]
+    await engine.dispose()
 
 
 async def test_second_rollout_while_one_is_open_raises_conflict_not_integrity() -> None:

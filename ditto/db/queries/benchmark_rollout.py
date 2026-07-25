@@ -247,15 +247,24 @@ async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]
     if source_version is None:
         source_version = await active_bench_version(session)
     target_version = rollout.desired_version if rollout is not None else None
-    agents = list(
-        await session.scalars(select(Agent).where(Agent.status == AgentStatus.SCORED))
-    )
-    if not agents:
-        return []
-    scores = list(
-        await session.scalars(
-            select(Score).where(
-                Score.agent_id.in_([agent.agent_id for agent in agents]),
+    # Column-scoped on purpose. Hydrating ORM ``Score`` entities pulls the
+    # per-case ``details`` breakdown -- kilobytes per row, for every scored
+    # agent -- and this ranking reads five scalars. Fetching whole rows made an
+    # operator's read of the rollout status the most expensive query in the API.
+    rows = (
+        await session.execute(
+            select(
+                Agent.agent_id,
+                Agent.miner_hotkey,
+                Agent.created_at,
+                Score.bench_version,
+                Score.composite,
+                Score.validator_hotkey,
+                Score.n,
+            )
+            .join(Score, Score.agent_id == Agent.agent_id)
+            .where(
+                Agent.status == AgentStatus.SCORED,
                 Score.bench_version.in_(
                     (source_version, target_version)
                     if target_version is not None
@@ -263,16 +272,19 @@ async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]
                 ),
             )
         )
-    )
-    by_agent: dict[UUID, dict[int, list[Score]]] = {}
-    for score in scores:
-        by_agent.setdefault(score.agent_id, {}).setdefault(
-            score.bench_version, []
-        ).append(score)
+    ).all()
+    if not rows:
+        return []
+    identities: dict[UUID, tuple[str, datetime]] = {}
+    by_agent: dict[UUID, dict[int, list[tuple[float, str, int]]]] = {}
+    for row in rows:
+        identities[row.agent_id] = (row.miner_hotkey, row.created_at)
+        by_agent.setdefault(row.agent_id, {}).setdefault(row.bench_version, []).append(
+            (row.composite, row.validator_hotkey, row.n)
+        )
 
-    candidates: list[tuple[Agent, float]] = []
-    for agent in agents:
-        versions = by_agent.get(agent.agent_id, {})
+    candidates: list[tuple[UUID, float]] = []
+    for agent_id, versions in by_agent.items():
         selected = (
             versions.get(target_version, []) if target_version is not None else []
         )
@@ -280,36 +292,35 @@ async def rolling_top_five(session: AsyncSession) -> list[RolloutSnapshotMember]
             selected = versions.get(source_version, [])
         if not selected:
             continue
-        middle = sorted(
-            selected, key=lambda row: (row.composite, row.validator_hotkey)
-        )[(len(selected) - 1) // 2]
-        if middle.n < 100 or middle.composite <= 0:
+        composite, _hotkey, cases = sorted(selected, key=lambda row: (row[0], row[1]))[
+            (len(selected) - 1) // 2
+        ]
+        if cases < 100 or composite <= 0:
             continue
-        candidates.append((agent, float(middle.composite)))
+        candidates.append((agent_id, float(composite)))
 
     from ditto.db.queries.payments import get_miner_coldkeys_for_agents
 
     coldkeys = await get_miner_coldkeys_for_agents(
-        session, agent_ids={agent.agent_id for agent, _ in candidates}
+        session, agent_ids={agent_id for agent_id, _ in candidates}
     )
     # Keep one best generation per payment-time coldkey before taking the
     # network-wide top five. Legacy rows without payment provenance remain
     # isolated by hotkey.
-    candidates.sort(key=lambda item: (-item[1], item[0].created_at, item[0].agent_id))
+    candidates.sort(key=lambda item: (-item[1], identities[item[0]][1], item[0]))
     unique: list[RolloutSnapshotMember] = []
     seen_owners: set[str] = set()
-    for agent, composite in candidates:
+    for agent_id, composite in candidates:
+        miner_hotkey = identities[agent_id][0]
         owner = (
-            f"coldkey:{coldkeys[agent.agent_id]}"
-            if agent.agent_id in coldkeys
-            else f"hotkey:{agent.miner_hotkey}"
+            f"coldkey:{coldkeys[agent_id]}"
+            if agent_id in coldkeys
+            else f"hotkey:{miner_hotkey}"
         )
         if owner in seen_owners:
             continue
         seen_owners.add(owner)
-        unique.append(
-            RolloutSnapshotMember(agent.agent_id, agent.miner_hotkey, composite)
-        )
+        unique.append(RolloutSnapshotMember(agent_id, miner_hotkey, composite))
         if len(unique) == PRIORITY_COHORT_SIZE:
             break
     return unique
@@ -1037,6 +1048,31 @@ def heartbeat_supports_version(
         and component.source_revision == scorer.source_revision
         and (component.version is None or component.version == scorer.software_version)
     )
+
+
+async def capable_validator_counts(
+    session: AsyncSession,
+    *,
+    versions: Sequence[int],
+    now: datetime | None = None,
+) -> dict[int, int]:
+    """Count fresh, identity-matched scorers for many versions in one read.
+
+    :func:`rollout_state` answers this for a single version, but it derives the
+    whole cohort and quorum picture on the way. Target discovery needs the count
+    for every shipped contract, and paying the cohort derivation once per
+    contract is what made the operator's read of the rollout status scale with
+    the number of shipped benchmarks rather than staying flat.
+    """
+    now = now or datetime.now(UTC)
+    heartbeats = list(await session.scalars(select(ValidatorHeartbeat)))
+    return {
+        version: sum(
+            heartbeat_supports_version(heartbeat, now=now, version=version)
+            for heartbeat in heartbeats
+        )
+        for version in versions
+    }
 
 
 async def rollout_cohort_complete(

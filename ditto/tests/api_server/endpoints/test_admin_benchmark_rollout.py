@@ -1,5 +1,6 @@
 """HTTP contract tests for the guarded benchmark rollout control plane."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -9,7 +10,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -19,6 +20,7 @@ from sqlalchemy.ext.asyncio import (
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import get_session
+from ditto.api_server.endpoints import admin_benchmark_rollout
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     MINIMUM_ROLLOUT_START_VALIDATORS,
 )
@@ -56,6 +58,31 @@ async def rollout_maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     yield async_sessionmaker(engine, expire_on_commit=False)
+    await engine.dispose()
+
+
+@pytest.fixture
+async def instrumented_maker() -> AsyncIterator[
+    tuple[async_sessionmaker[AsyncSession], list[str]]
+]:
+    """A session maker that records every statement the handler actually runs."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    statements: list[str] = []
+
+    @event.listens_for(engine.sync_engine, "before_cursor_execute")
+    def _record(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    yield async_sessionmaker(engine, expire_on_commit=False), statements
     await engine.dispose()
 
 
@@ -248,6 +275,121 @@ async def test_control_discovery_is_authenticated_read_only_and_dynamic(
     assert all(
         contract["capable_validator_count"] == 0 for contract in body["contracts"]
     )
+
+
+async def test_control_reads_the_cohort_once_and_never_writes(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    instrumented_maker: tuple[async_sessionmaker[AsyncSession], list[str]],
+) -> None:
+    """One page load is one cohort read, whatever the console is showing.
+
+    The operator console loads this on every view. It used to derive the whole
+    cohort/quorum picture once per *shipped contract* just to read one integer
+    out of each, so shipping a benchmark made the operator's status page slower
+    -- and with the per-case ``details`` breakdown hydrated for every scored
+    agent on each pass, slow enough to blow through the console's own timeout.
+    """
+    maker, statements = instrumented_maker
+    _install(app, maker)
+    now = datetime.now(UTC).replace(microsecond=0)
+    members = await _seed_start_ready(maker, now)
+    async with maker() as session, session.begin():
+        await create_rollout_snapshot(
+            session,
+            members=members,
+            datasets={
+                member.agent_id: DatasetPin(
+                    seed=index, sha256="c" * 64, run_size="full"
+                )
+                for index, member in enumerate(members, start=1)
+            },
+            now=now,
+            from_version=2,
+            desired_version=_TARGET,
+        )
+    generator = _StubGenerator()
+    app.state.dataset_generator = generator
+    statements.clear()
+
+    response = await client.get("/api/v1/admin/benchmark-rollout", headers=_HEADERS)
+
+    assert response.status_code == 200, response.text
+    # Flat in the number of shipped contracts. Six contracts once cost 106
+    # statements here; the count must not track ``benchmark_contracts()``.
+    assert len(statements) <= 30, "\n".join(statements)
+    # And the ranking read must not drag the per-case breakdown along with it:
+    # that column is kilobytes per score row, for every scored agent.
+    assert all("details" not in statement for statement in statements), statements
+    # A read is a read: no rollout is opened, advanced, or activated, and the
+    # generate-service is never dialled from the status path.
+    assert not [
+        statement
+        for statement in statements
+        if statement.lstrip()[:6].upper() in ("INSERT", "UPDATE", "DELETE")
+    ]
+    assert generator.calls == []
+    assert await _rollout_count(maker) == 1
+
+
+async def test_control_degrades_the_slow_section_instead_of_hanging(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    rollout_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lagging qualification lookup costs that section, not the whole page."""
+    _install(app, rollout_maker)
+
+    async def _slow(*_args: object, **_kwargs: object) -> dict[str, object]:
+        await asyncio.sleep(60)
+        raise AssertionError("the budget should have expired first")
+
+    monkeypatch.setattr(admin_benchmark_rollout, "ROLLOUT_STATUS_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(admin_benchmark_rollout, "authority_selection_state", _slow)
+
+    response = await client.get("/api/v1/admin/benchmark-rollout", headers=_HEADERS)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # The durable rollout status -- the part the operator came for -- survives.
+    assert body["active_version"] == 2
+    assert body["status"] == "inactive"
+    assert [contract["version"] for contract in body["contracts"]] == [2, 3, 4, 5, 6, 7]
+    # Fail closed on what could not be proven: no candidate is offered for
+    # activation, and the omission is named rather than mistaken for "none".
+    assert body["active_contract_candidates"] == []
+    assert body["degraded_sections"] == ["active_contract_candidates"]
+
+
+async def test_control_names_the_database_when_the_core_read_overruns(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    rollout_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the core state there is nothing useful to return -- so say why.
+
+    The operator chased a missing endpoint and a bad admin token for an hour
+    because a slow read reached them as a bare client-side abort. A 503 that
+    names the database is the whole point of bounding this server-side.
+    """
+    _install(app, rollout_maker)
+
+    async def _slow(*_args: object, **_kwargs: object) -> dict[str, object]:
+        await asyncio.sleep(60)
+        raise AssertionError("the budget should have expired first")
+
+    monkeypatch.setattr(admin_benchmark_rollout, "ROLLOUT_STATUS_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(admin_benchmark_rollout, "rollout_state", _slow)
+
+    response = await client.get("/api/v1/admin/benchmark-rollout", headers=_HEADERS)
+
+    assert response.status_code == 503, response.text
+    message = response.json()["message"]
+    assert "read budget" in message
+    assert "database" in message
+    assert "token" in message
 
 
 async def test_start_requires_full_guard_payload_and_exact_confirmation(
