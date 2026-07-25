@@ -15,7 +15,11 @@ from ditto.db.queries.agents import SubmissionCooldownError, get_submission_retr
 DEFAULT_SUBMISSION_COOLDOWN_SECONDS = 3600
 MIN_SUBMISSION_COOLDOWN_SECONDS = 60
 MAX_SUBMISSION_COOLDOWN_SECONDS = 86400
-UPLOAD_ADMISSION_TTL = timedelta(minutes=30)
+# A miner may need several long HTTP attempts after payment when the platform or
+# its chain/storage dependencies are degraded. Keep the pre-payment reservation
+# valid for a full-day recovery window so those attempts cannot lose the
+# slot to a competing submission from the same coldkey.
+UPLOAD_ADMISSION_TTL = timedelta(hours=24)
 
 
 @dataclass(frozen=True)
