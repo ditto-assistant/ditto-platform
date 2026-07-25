@@ -2393,6 +2393,7 @@ class TestPublicActivity:
             "score_count",
             "provisional_composite",
             "validator_queue_rank",
+            "previous_generation",
             "quorum",
             "retry_state",
             "retry_after",
@@ -2545,6 +2546,55 @@ class TestPublicActivity:
         assert by_id[fresh_id]["validator_queue_rank"] == 1
         assert by_id[stranded_id]["validator_queue_rank"] == 2
         assert by_id[stranded_id]["status"] == "waiting_validator"
+        # The rank number alone cannot say *why* the row is last, so the era is
+        # reported too. Both rows are "waiting_validator" and both carry an
+        # integer rank; only this distinguishes a stranded row from a queued one.
+        assert by_id[stranded_id]["previous_generation"] is True
+        assert by_id[fresh_id]["previous_generation"] is False
+
+    async def test_flags_a_previous_generation_row_that_holds_rank_one(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Being first in a stalled line is not the same as being next.
+
+        Sorting stranded rows last fixes the common case, but it cannot fix this
+        one: once the current era has nothing waiting, the top of the queue is a
+        previous-generation row and its rank is 1. The dashboard badges rank 1 as
+        "Up next", which a miner reads as "about to be scored" -- while the lanes
+        that serve this row issue only into an empty current-era queue and may
+        stay shut indefinitely. The flag is what lets the client tell the truth,
+        so it must survive precisely the arrangement that makes rank misleading.
+        """
+        rollout_started = datetime(2026, 7, 18, 14, 30, tzinfo=UTC)
+        stranded_id = await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.EVALUATING,
+            name="stranded-alone",
+            created_at=rollout_started - timedelta(days=3),
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=1,
+                    desired_version=2,
+                    status="collecting",
+                    cohort_size=5,
+                    created_at=rollout_started,
+                )
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/activity")
+        by_id = {entry["agent_id"]: entry for entry in response.json()["entries"]}
+
+        assert by_id[stranded_id]["validator_queue_rank"] == 1
+        assert by_id[stranded_id]["previous_generation"] is True
 
     async def test_exposes_queue_priority_with_provisional_composites(
         self,

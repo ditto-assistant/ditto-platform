@@ -1615,6 +1615,21 @@ class PublicActivityEntry(BaseModel):
             ),
         ),
     ]
+    previous_generation: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "Whether this waiting submission predates the active benchmark "
+                "era and is therefore reachable only by the previous-generation "
+                "lanes (carryover and retired-era source backfill). Those lanes "
+                "are strictly last and issue only into an empty current-era "
+                "queue, so such a row is not advancing while any current-era "
+                "submission still needs a validator -- however low its rank "
+                "number happens to look."
+            ),
+        ),
+    ] = False
     quorum: Annotated[
         int,
         Field(ge=1, description="Independent validator scores required to finalize."),

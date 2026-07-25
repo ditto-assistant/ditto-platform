@@ -3144,6 +3144,17 @@ def _public_activity_response(
                 score_count=row.score_count,
                 provisional_composite=row.provisional_composite,
                 validator_queue_rank=validator_queue_ranks.get(row.agent.agent_id),
+                # Scoped to the waiting lanes for the same reason as
+                # ``retry_state``: on a finalized row "predates the era" is inert
+                # history, while on a waiting row it is the reason the row is not
+                # moving. The rank number alone cannot carry that -- a stranded
+                # row and a fresh one both render as an integer -- so a client
+                # that wants to label the queue honestly has to be told.
+                previous_generation=(
+                    row.agent.agent_id in prev_generation
+                    if row_status in ("waiting_validator", "below_score_floor")
+                    else False
+                ),
                 quorum=SCORING_QUORUM,
                 retry_state=(
                     retry_by_agent[row.agent.agent_id].state
