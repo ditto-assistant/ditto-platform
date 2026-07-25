@@ -3584,19 +3584,31 @@
     }
 
     // Reference baseline per benchmark version: the stock (unmodified)
-    // starter-kit harness on the locked model. Source of every number:
-    // dittobench-api docs/BASELINES.md. Keyed by version rather than held as a
-    // single constant so an older board view still shows ITS baseline instead of
-    // a bare dash, and so a version we have not measured yet says so explicitly
-    // rather than looking like a rendering failure.
+    // starter-kit harness on the locked model. Keyed by version rather than held
+    // as a single constant so an older board view still shows ITS baseline
+    // instead of a bare dash, and so a version we have not measured yet says so
+    // explicitly rather than looking like a rendering failure.
     //
-    // Add a version here only from a published run. A baseline is measured, not
-    // estimated, and an invented number here would be indistinguishable on the
-    // page from a real one.
+    // Add a version here only from a published run, and name the document that
+    // published it in "source". A baseline is measured, not estimated, and an
+    // invented number here would be indistinguishable on the page from a real
+    // one. Two documents publish these runs and neither is a superset of the
+    // other: the kit's own BASELINES.md is authoritative for the released
+    // contracts a miner actually targets, while the validator's docs/BASELINES.md
+    // additionally carries the calibration runs (v3, v4) that shipped alongside
+    // scorer work. The tooltip cites whichever one a given row came from, so the
+    // page never points a reader at a document that does not contain the number.
     var REFERENCE_BASELINES = {
-      2: { composite: 0.492, method: "24 seeds at run_size=full", run: "Run 1" },
-      3: { composite: 0.445, method: "25 seeds at run_size=full", run: "Run 3 (transform audit)" },
-      4: { composite: 0.429, method: "one full run, seed 20260719", run: "Run 5" }
+      2: { composite: 0.492, method: "24 seeds at run_size=full", run: "Run 1",
+           source: "dittobench-api docs/BASELINES.md" },
+      3: { composite: 0.445, method: "25 seeds at run_size=full", run: "Run 3 (transform audit)",
+           source: "dittobench-api docs/BASELINES.md" },
+      4: { composite: 0.429, method: "one full run, seed 20260719", run: "Run 5",
+           source: "dittobench-api docs/BASELINES.md" },
+      5: { composite: 0.263, method: "10 seeds at run_size=full", run: "2026-07-21, datagen v0.10.0",
+           source: "dittobench-starter-kit BASELINES.md" },
+      6: { composite: 0.242, method: "6 seeds at run_size=full", run: "2026-07-21, datagen v0.11.0",
+           source: "dittobench-starter-kit BASELINES.md" }
     };
 
     // Off-network comparison records. Every point is one retained practice run
@@ -4275,7 +4287,7 @@
           baseline
             ? "Reference baseline: the stock (unmodified) starter-kit harness on the locked model, " +
               baseline.method + ", measured on bench_version " + currentBench + " (" + baseline.run +
-              "). Source: dittobench-api docs/BASELINES.md. This is the score a submission must beat " +
+              "). Source: " + baseline.source + ". This is the score a submission must beat " +
               "to be worth submitting; it is not the score that wins, which is the champion's."
             : "No reference baseline has been measured on bench_version " + (currentBench || "?") +
               " yet. A baseline is a real run of the stock starter-kit harness on the locked model, so it " +
