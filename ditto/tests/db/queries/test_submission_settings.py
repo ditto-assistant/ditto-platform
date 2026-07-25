@@ -27,6 +27,32 @@ async def session() -> AsyncIterator[AsyncSession]:
     await engine.dispose()
 
 
+async def test_admission_remains_valid_during_extended_paid_upload_recovery(
+    session: AsyncSession,
+) -> None:
+    now = datetime(2026, 7, 24, 20, 0, tzinfo=UTC)
+    settings = EffectiveSubmissionSettings(revision=1, cooldown_seconds=3600)
+    async with session.begin():
+        admission = await reserve_upload_admission(
+            session,
+            miner_coldkey="coldkey",
+            miner_hotkey="hotkey",
+            sha256="a" * 64,
+            settings=settings,
+            now=now,
+        )
+    async with session.begin():
+        await consume_or_enforce_upload_admission(
+            session,
+            miner_coldkey="coldkey",
+            miner_hotkey="hotkey",
+            sha256="a" * 64,
+            admission_token=admission.token,
+            settings=settings,
+            now=now + timedelta(hours=23, minutes=59),
+        )
+
+
 async def test_reservation_is_idempotent_and_blocks_competing_series(
     session: AsyncSession,
 ) -> None:
