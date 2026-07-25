@@ -22,12 +22,10 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_models.agent_status import AgentStatus
@@ -65,7 +63,6 @@ from ditto.db.models import (
     AgentKingship,
     ArtifactReleaseSettingsRevision,
     AthReview,
-    Base,
     BenchmarkDataset,
     BenchmarkRollout,
     EvaluationPayment,
@@ -337,29 +334,6 @@ def test_dataset_command_is_withheld_when_the_generator_pin_is_unknown() -> None
         )
         is None
     )
-
-
-@pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield eng
-    finally:
-        await eng.dispose()
-
-
-@pytest.fixture
-def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 def _install_db(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
@@ -2502,9 +2476,7 @@ class TestPublicActivity:
         assert entry["version"] == 4
         assert entry["miner_hotkey"] == _MINER_A
         assert entry["status"] == "under_review"
-        assert datetime.fromisoformat(entry["review_opened_at"]) == opened_at.replace(
-            tzinfo=None
-        )
+        assert datetime.fromisoformat(entry["review_opened_at"]) == opened_at
         assert entry["review_reason"] == "Submission requires ATH similarity review"
         assert entry["score_count"] == 3
         assert entry["provisional_composite"] == pytest.approx(0.7)
@@ -2998,7 +2970,7 @@ class TestPublicActivity:
                         policy_version=SCREENING_POLICY_VERSION,
                         manifest_digest="ab" * 32,
                         finding_digest=private_finding.canonical_digest(),
-                        reason_code="suspicious_source",
+                        reason_code="suspicious-source",
                         evidence=[
                             {
                                 "module_id": "agentic-source-review",
@@ -3063,7 +3035,7 @@ class TestPublicActivity:
                         screener_hotkey=_MINER_B,
                         policy_version=SCREENING_POLICY_VERSION,
                         manifest_digest="ab" * 32,
-                        reason_code="suspicious_source",
+                        reason_code="suspicious-source",
                         status="resolved",
                         resolved_at=now,
                         resolved_by="admin@example.com",
@@ -3082,9 +3054,7 @@ class TestPublicActivity:
         attempt = response.json()["screening_attempts"][0]
         assert attempt["status"] == "quarantined"
         assert attempt["quarantine_resolution"] == "release"
-        assert datetime.fromisoformat(attempt["quarantine_resolved_at"]) == now.replace(
-            tzinfo=None
-        )
+        assert datetime.fromisoformat(attempt["quarantine_resolved_at"]) == now
         assert attempt["quarantine_resolution_reason"] == (
             "Manual review found no prohibited behavior"
         )
@@ -3149,7 +3119,7 @@ class TestPublicActivity:
                         policy_version=SCREENING_POLICY_VERSION,
                         manifest_digest="ab" * 32,
                         finding_digest=finding.canonical_digest(),
-                        reason_code="suspicious_source",
+                        reason_code="suspicious-source",
                         evidence=[
                             {
                                 "module_id": "agentic-source-review",
@@ -4851,9 +4821,15 @@ class TestPublicArtifactRelease:
             first_crowned_at=now - timedelta(hours=6, minutes=1),
         )
         async with session_maker() as session, session.begin():
+            # The migration chain seeds the operative default, so a new
+            # revision must chain onto the current head -- parent_revision is
+            # UNIQUE and the table is never empty in production.
+            head = await session.scalar(
+                select(func.max(ArtifactReleaseSettingsRevision.revision))
+            )
             session.add(
                 ArtifactReleaseSettingsRevision(
-                    parent_revision=0,
+                    parent_revision=head or 0,
                     embargo_hours=6,
                     reason="Complete the staged privacy rollout",
                     actor="operator@example.com",

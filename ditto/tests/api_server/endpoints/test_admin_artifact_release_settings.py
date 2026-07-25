@@ -9,25 +9,14 @@ from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_server.dependencies import get_session
-from ditto.db.models import Base
 
 pytestmark = pytest.mark.asyncio
 
 _ADMIN_TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_ADMIN_TOKEN}"}
-
-
-@pytest.fixture
-async def settings_maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False)
-    await engine.dispose()
 
 
 def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
@@ -53,26 +42,28 @@ def _payload(hours: int, expected: int = 0) -> dict[str, object]:
 async def test_defaults_to_48_then_shortens_with_audited_revisions(
     app: FastAPI,
     client: httpx.AsyncClient,
-    settings_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    _install(app, settings_maker)
+    _install(app, session_maker)
     initial = await client.get(
         "/api/v1/admin/artifact-release-settings", headers=_HEADERS
     )
     assert initial.status_code == 200
-    assert initial.json()["current"] == {
-        "revision": 0,
-        "parent_revision": 0,
-        "embargo_hours": 48,
-        "reason": "Built-in privacy-first default",
-        "actor": "platform",
-        "created_at": None,
-    }
+    # The 48-hour default is served from the migration-seeded audit chain, not
+    # from the built-in fallback: the first artifact-release migration seeds a
+    # row and the table is append-only, so `revision 0 / actor "platform"` is
+    # a state production is never in.
+    baseline = initial.json()
+    assert baseline["current"]["embargo_hours"] == 48
+    assert baseline["current"]["actor"] == "migration"
+    assert baseline["current"]["created_at"] is not None
+    head = baseline["current"]["revision"]
+    seeded_hours = [row["embargo_hours"] for row in baseline["history"]]
 
     twelve = await client.post(
         "/api/v1/admin/artifact-release-settings",
         headers=_HEADERS,
-        json=_payload(12),
+        json=_payload(12, expected=head),
     )
     assert twelve.status_code == 200, twelve.text
     revision = twelve.json()["revision"]
@@ -87,20 +78,28 @@ async def test_defaults_to_48_then_shortens_with_audited_revisions(
         "/api/v1/admin/artifact-release-settings", headers=_HEADERS
     )
     assert current.json()["current"]["embargo_hours"] == 6
-    assert [row["embargo_hours"] for row in current.json()["history"]] == [6, 12]
+    assert [row["embargo_hours"] for row in current.json()["history"]] == [
+        6,
+        12,
+        *seeded_hours,
+    ]
 
 
 async def test_lengthens_shortens_and_rejects_stale_or_wrong_confirmation(
     app: FastAPI,
     client: httpx.AsyncClient,
-    settings_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    _install(app, settings_maker)
+    _install(app, session_maker)
+    head = (
+        await client.get("/api/v1/admin/artifact-release-settings", headers=_HEADERS)
+    ).json()["current"]["revision"]
     first = await client.post(
         "/api/v1/admin/artifact-release-settings",
         headers=_HEADERS,
-        json=_payload(12),
+        json=_payload(12, expected=head),
     )
+    assert first.status_code == 200, first.text
     revision = first.json()["revision"]
 
     # Lengthening is now allowed, up to the 48-hour ceiling.

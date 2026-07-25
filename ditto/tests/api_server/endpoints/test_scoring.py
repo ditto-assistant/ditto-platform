@@ -1,6 +1,6 @@
 """Unit tests for :mod:`ditto.api_server.endpoints.scoring`.
 
-Exercises ``GET /scoring/scores`` against in-memory SQLite with the chain
+Exercises ``GET /scoring/scores`` against a real Postgres with the chain
 permit-check mocked. The ledger read + ordering is covered at the query level in
 ``tests/db/queries/test_scores.py``; here we assert the endpoint's auth gate and
 wire shape.
@@ -17,13 +17,10 @@ import bittensor
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 import ditto.api_server.endpoints.scoring as scoring_mod
@@ -31,7 +28,7 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.dependencies import get_chain_client, get_session
 from ditto.api_server.middleware.error_envelope import ERROR_CODE_VALIDATOR_AUTH
 from ditto.chain.models import NeuronInfo
-from ditto.db.models import Agent, Base, ValidatorHeartbeat
+from ditto.db.models import Agent, ValidatorHeartbeat
 from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
@@ -82,29 +79,6 @@ def _ledger_headers(
         "X-Validator-Ledger-Requested-At": requested_at.isoformat(),
         "X-Validator-Ledger-Signature": signing_keypair.sign(signed).hex(),
     }
-
-
-@pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield eng
-    finally:
-        await eng.dispose()
-
-
-@pytest.fixture
-def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 def _install_db(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:

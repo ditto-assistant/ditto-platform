@@ -7,36 +7,16 @@ from decimal import Decimal
 from uuid import uuid4
 
 import httpx
-import pytest
 from fastapi import FastAPI
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.dependencies import get_session
-from ditto.db.models import Agent, Base, EvaluationPayment
+from ditto.db.models import Agent, EvaluationPayment
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "X-Admin-Actor": "operator"}
 _NOW = datetime.now(UTC)
-
-
-@pytest.fixture
-async def fee_engine() -> AsyncIterator[AsyncEngine]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield engine
-    await engine.dispose()
-
-
-@pytest.fixture
-def fee_maker(fee_engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(fee_engine, expire_on_commit=False)
 
 
 def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
@@ -89,18 +69,18 @@ async def _seed_payment(
 async def test_summary_uses_payment_ledger_and_discloses_unpriced_rows(
     app: FastAPI,
     client: httpx.AsyncClient,
-    fee_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    _install(app, fee_maker)
+    _install(app, session_maker)
     await _seed_payment(
-        fee_maker,
+        session_maker,
         amount_rao=20_000_000,
         tao_usd_rate=Decimal("250"),
         age=timedelta(days=1),
         coldkey="5ColdkeyA",
     )
     await _seed_payment(
-        fee_maker,
+        session_maker,
         amount_rao=30_000_000,
         tao_usd_rate=None,
         age=timedelta(days=2),

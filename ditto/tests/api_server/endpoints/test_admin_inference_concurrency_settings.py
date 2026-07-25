@@ -9,14 +9,12 @@ from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.inference_concurrency_settings import (
     InferenceConcurrencySettingsResolver,
 )
-from ditto.db.models import Base
 
 pytestmark = pytest.mark.asyncio
 
@@ -27,12 +25,15 @@ _CONFIRMATION = "APPLY INFERENCE CONCURRENCY SETTINGS"
 
 
 @pytest.fixture
-async def settings_maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False)
-    await engine.dispose()
+def settings_maker(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> async_sessionmaker[AsyncSession]:
+    """Alias onto the root real-Postgres fixture in ``ditto/tests/conftest.py``.
+
+    Aliasing rather than renaming keeps every test signature in this file
+    untouched, so the diff cannot change what is asserted.
+    """
+    return session_maker
 
 
 def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:

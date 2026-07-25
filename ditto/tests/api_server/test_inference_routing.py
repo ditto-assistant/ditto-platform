@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ditto.api_server.inference_routing import (
     AGGREGATE_PROVIDER,
@@ -13,7 +13,6 @@ from ditto.api_server.inference_routing import (
     select_route,
 )
 from ditto.db.models import (
-    Base,
     InferenceProviderRoute,
     InferenceRoutingPolicy,
 )
@@ -119,11 +118,10 @@ def test_route_ranking_will_not_trade_tool_quality_for_raw_speed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_aggregate_selection_uses_only_reviewed_logical_route() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_aggregate_selection_uses_only_reviewed_logical_route(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    maker = session_maker
     now = datetime.now(UTC)
     model = "openai/gpt-oss-20b"
     profile = aggregate_profile_revision(model)
@@ -179,15 +177,13 @@ async def test_aggregate_selection_uses_only_reviewed_logical_route() -> None:
         assert selected is not None
         assert selected.provider == AGGREGATE_PROVIDER
         assert selected.selected_ticket_count == 1
-    await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_aggregate_discovery_tracks_active_model_endpoints() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+async def test_aggregate_discovery_tracks_active_model_endpoints(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    maker = session_maker
     model = "openai/gpt-oss-20b"
     profile = aggregate_profile_revision(model)
     endpoint_statuses = [1, 0, 1]
@@ -238,5 +234,3 @@ async def test_aggregate_discovery_tracks_active_model_endpoints() -> None:
                 )
                 assert route is not None
                 assert route.status == expected
-
-    await engine.dispose()

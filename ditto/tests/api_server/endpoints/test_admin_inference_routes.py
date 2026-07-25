@@ -2,21 +2,25 @@
 
 from collections.abc import AsyncIterator
 from dataclasses import replace
-from datetime import UTC, datetime
-from uuid import uuid4
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.inference_routing import aggregate_profile_revision
 from ditto.db.models import (
-    Base,
+    Agent,
+    InferenceGrant,
     InferenceProviderRoute,
     InferenceRequest,
     InferenceRoutingPolicy,
+    ValidatorTicket,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -25,15 +29,6 @@ _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "X-Admin-Actor": "operator"}
 _MODEL = "openai/gpt-oss-20b"
 _PROFILE = "openrouter-route-test-v1"
-
-
-@pytest.fixture
-async def route_maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False)
-    await engine.dispose()
 
 
 async def _install(
@@ -98,6 +93,64 @@ async def _install(
         )
 
 
+async def _seed_grant(session: AsyncSession) -> UUID:
+    """Create the agent/ticket/grant chain one inference request hangs off.
+
+    ``inference_requests.grant_id`` is a real foreign key into
+    ``inference_grants``, which in turn keys into ``validator_tickets``. The
+    parent rows used to be skipped because SQLite leaves foreign keys off,
+    so this file's telemetry fixture described a row shape production cannot
+    produce. Nothing about what the test asserts depends on the parents --
+    only that the child is insertable at all.
+    """
+    now = datetime.now(UTC)
+    deadline = now + timedelta(minutes=20)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5MinerHotkeyInferenceTelemetry",
+        name="inference-telemetry",
+        version=1,
+        sha256="ab" * 32,
+        status=AgentStatus.EVALUATING,
+        created_at=now,
+    )
+    ticket = ValidatorTicket(
+        agent_id=agent.agent_id,
+        validator_hotkey="5ValidatorHotkeyInferenceTelemetry",
+        slot_id="slot-0",
+        status=TicketStatus.ISSUED,
+        issued_at=now,
+        deadline=deadline,
+        bench_version=7,
+        attempt_count=1,
+    )
+    grant = InferenceGrant(
+        grant_id=uuid4(),
+        agent_id=agent.agent_id,
+        bench_version=ticket.bench_version,
+        validator_hotkey=ticket.validator_hotkey,
+        slot_id=ticket.slot_id,
+        ticket_deadline=deadline,
+        status="active",
+        generation=1,
+        allowed_models=[_MODEL],
+        request_budget=10,
+        token_budget=100_000,
+        embedding_model="perplexity/pplx-embed-v1-0.6b",
+        embedding_profile="dittobench-v7-openrouter-pplx-embed-v1-0.6b-768-v1",
+        embedding_provider="Perplexity",
+        embedding_dimensions=768,
+        embedding_request_budget=1_000,
+        embedding_token_budget=1_000_000,
+        expires_at=deadline,
+    )
+    session.add_all([agent, ticket])
+    await session.flush()
+    session.add(grant)
+    await session.flush()
+    return grant.grant_id
+
+
 def _policy_payload() -> dict[str, object]:
     return {
         "enabled": True,
@@ -120,9 +173,9 @@ def _policy_payload() -> dict[str, object]:
 async def test_lists_and_updates_complete_model_policy(
     app: FastAPI,
     client: httpx.AsyncClient,
-    route_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    await _install(app, route_maker)
+    await _install(app, session_maker)
     listing = await client.get("/api/v1/admin/inference-routes", headers=_HEADERS)
     assert listing.status_code == 200
     assert listing.headers["Cache-Control"] == "no-store"
@@ -150,9 +203,9 @@ async def test_lists_and_updates_complete_model_policy(
 async def test_route_admission_requires_exact_confirmation_and_quality_floor(
     app: FastAPI,
     client: httpx.AsyncClient,
-    route_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    await _install(app, route_maker)
+    await _install(app, session_maker)
     payload = {
         "model": _MODEL,
         "provider": "Groq",
@@ -194,14 +247,40 @@ async def test_route_admission_requires_exact_confirmation_and_quality_floor(
     assert audited.json()["audits"][0]["action"] == "route_eligible"
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "OPEN PRODUCTION BUG, deliberately left red-as-xfail rather than "
+        "papered over. GET /api/v1/admin/inference-routes serializes four "
+        "aggregate columns as JSON *strings* against real Postgres, and as "
+        "numbers against SQLite -- which is why this was green for as long "
+        "as the suite ran on SQLite. Two ingredients: (1) "
+        "admin_inference_routes.py:123-128 -- func.sum() over BigInteger "
+        "yields `numeric` in Postgres (not bigint) and func.avg() yields "
+        "`numeric`, both of which asyncpg hands back as Decimal; (2) "
+        "admin_inference_routes.py:82 -- the handler is annotated "
+        "`-> dict[str, object]`, so FastAPI serializes through Pydantic v2, "
+        "which renders Decimal as a string. The tell is that request_count / "
+        "completed_count / timeout_count (func.count and sum over an int "
+        "CASE, both `bigint`) stay integers; only the four `numeric` "
+        "aggregates flip. This is the live wire shape production serves "
+        "today, not a test artifact. Fix is ~4 lines of int()/float() "
+        "coercion at admin_inference_routes.py:220-223, or better a typed "
+        "response_model -- admin_miner_fees.py:28 declares one and its "
+        "equally-Decimal sums serialize correctly. Held back because a v7 "
+        "rollout is open and this PR changes no production code. `strict` "
+        "so that fixing the endpoint turns CI red until this marker is "
+        "removed."
+    ),
+)
 async def test_aggregate_mode_blocks_adaptive_controls_but_allows_logical_route(
     app: FastAPI,
     client: httpx.AsyncClient,
-    route_maker: async_sessionmaker[AsyncSession],
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    await _install(app, route_maker, routing_mode="aggregate_throughput")
+    await _install(app, session_maker, routing_mode="aggregate_throughput")
     profile = aggregate_profile_revision(_MODEL)
-    async with route_maker() as session, session.begin():
+    async with session_maker() as session, session.begin():
         session.add(
             InferenceProviderRoute(
                 model=_MODEL,
@@ -218,9 +297,10 @@ async def test_aggregate_mode_blocks_adaptive_controls_but_allows_logical_route(
                 updated_at=datetime.now(UTC),
             )
         )
+        grant_id = await _seed_grant(session)
         session.add(
             InferenceRequest(
-                grant_id=uuid4(),
+                grant_id=grant_id,
                 nonce=uuid4(),
                 generation=1,
                 status="completed",

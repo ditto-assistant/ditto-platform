@@ -25,19 +25,17 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_server import EfficiencyBonusConfig, create_api_server
 from ditto.api_server.dependencies import get_chain_client, get_session
 from ditto.api_server.efficiency_settings import EfficiencyBonusSettingsResolver
 from ditto.chain.models import NeuronInfo
-from ditto.db.models import Base, EfficiencyBonus, EfficiencyCohortSnapshot
+from ditto.db.models import EfficiencyBonus, EfficiencyCohortSnapshot
 from ditto.tests.api_server.conftest import make_api_server_config
 from ditto.tests.api_server.endpoints.test_public_efficiency import (
     _KEYPAIR,
@@ -51,29 +49,6 @@ from ditto.tests.api_server.endpoints.test_public_efficiency import (
 _ADMIN_TOKEN = "test-admin-token-at-least-32-characters"
 _ADMIN_HEADERS = {"Authorization": f"Bearer {_ADMIN_TOKEN}"}
 _SETTINGS_URL = "/api/v1/admin/efficiency-bonus-settings"
-
-
-@pytest.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_connection: object, _: object) -> None:
-        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield eng
-    finally:
-        await eng.dispose()
-
-
-@pytest.fixture
-def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 def _make_hotswap_app(

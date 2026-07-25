@@ -242,6 +242,18 @@ class TestUploadAgentIntegration:
             assert await storage.object_exists(key=f"{agent_id}/agent.tar.gz")
 
     async def test_replay_rejected(self):
+        """A payment proof is non-transferable: spending it on a
+        *different* upload is rejected 402/3207.
+
+        A byte-identical re-submit is deliberately NOT a replay --
+        ``fix: make paid uploads safely retryable`` (31f46fa, 2026-07-20)
+        added the exact-retry recovery at ``upload.py:399-424`` so a
+        proxy that eats the 200 cannot cost a miner their payment. This
+        test asserted the pre-31f46fa contract and had been failing ever
+        since; nobody saw it because pytest addopts carried
+        ``-m "not integration"``. The retry half is covered by
+        ``test_exact_retry_recovers_the_original_upload`` below.
+        """
         kp = bittensor.Keypair.create_from_uri("//Alice")
         block_hash = _new_block_hash(2)
         async with _running_app(block_hash=block_hash) as app:
@@ -255,14 +267,58 @@ class TestUploadAgentIntegration:
                 )
                 assert first.status_code == 200, first.text
 
-                # Replay the exact same form.
-                data2, files2 = _build_form(keypair=kp, block_hash=block_hash)
+                # Same proof, different agent name -> not an exact retry,
+                # so the proof is being spent a second time.
+                data2, files2 = _build_form(
+                    keypair=kp, block_hash=block_hash, name="beta-agent"
+                )
                 second = await client.post(
                     "/api/v1/upload/agent", data=data2, files=files2
                 )
 
             assert second.status_code == 402
             assert second.json()["error_code"] == ERROR_CODE_PAYMENT_REPLAYED
+
+    async def test_exact_retry_recovers_the_original_upload(self):
+        """The other half of 31f46fa: replaying the *identical* form
+        returns the original agent_id rather than 402, and writes no
+        second row."""
+        from sqlalchemy import func, select
+
+        from ditto.db.models import Agent
+
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        block_hash = _new_block_hash(4)
+        async with _running_app(block_hash=block_hash) as app:
+            data, files = _build_form(keypair=kp, block_hash=block_hash)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as client:
+                first = await client.post(
+                    "/api/v1/upload/agent", data=data, files=files
+                )
+                assert first.status_code == 200, first.text
+
+                data2, files2 = _build_form(keypair=kp, block_hash=block_hash)
+                retry = await client.post(
+                    "/api/v1/upload/agent", data=data2, files=files2
+                )
+
+            assert retry.status_code == 200, retry.text
+            assert retry.json()["agent_id"] == first.json()["agent_id"]
+            assert retry.json()["version"] == first.json()["version"]
+
+            session_maker = app.state.session_maker
+            async with session_maker() as session:
+                count = (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(Agent)
+                        .where(Agent.miner_hotkey == kp.ss58_address)
+                    )
+                ).scalar_one()
+            assert count == 1
 
     async def test_pk_constraint_name_matches_dispatch_constant(self):
         """The queries-layer dispatch hard-codes
@@ -308,7 +364,12 @@ class TestUploadAgentIntegration:
                 ok = await client.post("/api/v1/upload/agent", data=data, files=files)
                 assert ok.status_code == 200, ok.text
 
-                data2, files2 = _build_form(keypair=kp, block_hash=block_hash)
+                # A different name spends the proof a second time (an
+                # identical form would be an exact retry, recovered 200
+                # by 31f46fa -- see test_replay_rejected).
+                data2, files2 = _build_form(
+                    keypair=kp, block_hash=block_hash, name="beta-agent"
+                )
                 replay = await client.post(
                     "/api/v1/upload/agent", data=data2, files=files2
                 )

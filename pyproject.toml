@@ -41,7 +41,6 @@ dev = [
     "pytest-cov>=5",
     "pytest-xdist>=3.8",
     "pre-commit>=3.7",
-    "aiosqlite>=0.20",
     "httpx>=0.27",
 ]
 
@@ -81,17 +80,33 @@ check_untyped_defs = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["ditto/tests"]
 markers = [
     "slow: long-running tests excluded by default",
-    "integration: integration tests requiring real infra",
+    "integration: multi-session/concurrency tests against a real Postgres",
     "localnet: tests against a local Bittensor network",
     "e2e: end-to-end tests through the full stack",
+    "needs_chain: requires a reachable Pylon backed by a live subtensor",
 ]
+# `integration` and `e2e` are NOT deselected. They were, and the consequence
+# was that `test_reservations_on_one_grant_serialize_and_respect_the_budget`
+# -- the only signal that the ditto-platform#438 accounting bug has returned
+# -- never ran in CI. `localnet` stays out because it needs a chain, and
+# `slow` stays out because it is a wall-clock tier, not a fidelity tier.
+#
+# `needs_chain` is a *capability* gate, not a fidelity one, and it is
+# deliberately tiny -- exactly two tests, both of which assert on data only a
+# live subtensor can produce (cached recent-neuron sets). Everything a
+# container can provide is provisioned in CI instead of excluded: the suite
+# gets a real Postgres and a real MinIO, so the other 10 previously-excluded
+# integration tests now run there. Resist widening this marker; the whole
+# point of this change is that "the test needs a real dependency" stopped
+# being a reason not to run it.
 addopts = [
     "-n",
     "auto",
     "--dist=worksteal",
     "-m",
-    "not slow and not integration and not localnet and not e2e",
+    "not slow and not localnet and not needs_chain",
 ]

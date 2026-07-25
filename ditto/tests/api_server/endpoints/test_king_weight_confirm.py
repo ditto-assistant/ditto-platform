@@ -7,7 +7,6 @@ set on the miner. Uses a real ORM + SQLite engine and a stub chain client.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -18,7 +17,6 @@ import pytest
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from ditto.api_server.endpoints.validator import (
@@ -26,7 +24,7 @@ from ditto.api_server.endpoints.validator import (
     _confirm_king_onchain_weights,
 )
 from ditto.chain.models import ChainWeight, ChainWeightsSnapshot, ChainWeightVector
-from ditto.db.models import Agent, AgentStatus, Base
+from ditto.db.models import Agent, AgentStatus
 from ditto.db.queries.king_reign import get_king_reveal, record_first_crowned
 
 pytestmark = pytest.mark.asyncio
@@ -36,12 +34,11 @@ _NOW = datetime(2026, 7, 22, tzinfo=UTC)
 
 
 @pytest.fixture
-async def maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False)
-    await engine.dispose()
+def maker(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> async_sessionmaker[AsyncSession]:
+    """Local alias for the root Postgres ``session_maker``."""
+    return session_maker
 
 
 def _app_state(**overrides: object) -> SimpleNamespace:

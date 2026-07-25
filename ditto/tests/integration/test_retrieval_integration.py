@@ -168,9 +168,23 @@ class TestRetrievalIntegration:
             assert response.headers["cache-control"] == "no-store"
 
             body = response.json()
-            assert set(body.keys()) == {"agent_id", "status"}
+            # ``screening_reason`` / ``screening_reason_code`` were added
+            # to this response by 2982230 (2026-07-14) and this assertion
+            # was never updated -- the test has been red since, unseen,
+            # because pytest addopts carried ``-m "not integration"``.
+            # Pinning the full key set is the point of the assertion, so
+            # it stays exact; a freshly uploaded agent has been screened
+            # for nothing, so both new fields must be null.
+            assert set(body.keys()) == {
+                "agent_id",
+                "status",
+                "screening_reason",
+                "screening_reason_code",
+            }
             assert body["agent_id"] == str(seeded.agent_id)
             assert body["status"] == AgentStatus.UPLOADED.value
+            assert body["screening_reason"] is None
+            assert body["screening_reason_code"] is None
 
     async def test_agent_status_404(self) -> None:
         config = parse_api_server_config_from_env(commit_hash="integration-test")

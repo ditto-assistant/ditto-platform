@@ -1,54 +1,153 @@
-"""Suite-wide test configuration.
+"""Root fixtures: every database test runs against a real Postgres.
 
-Registers explicit ``sqlite3`` date/datetime adapters so the test suite
-does not depend on the implicit ones CPython deprecated in 3.12.
+The suite used to run on ``sqlite+aiosqlite:///:memory:``. That is not a
+weaker test of the same code, it is a test of *different* code: SQLAlchemy
+emits no ``FOR UPDATE`` on SQLite, ``pg_advisory_xact_lock`` has no SQLite
+counterpart so fifteen call sites take a no-op branch, and SQLite has no
+concurrent writers at all. ditto-platform#438 is the proof -- the identity
+map served pre-lock attribute values and three concurrent reservations
+recorded ``request_count=1``, silently overspending miner grants. No SQLite
+test could have failed on that, and none did.
 
-Production runs on Postgres via asyncpg; SQLite is a test/dev-only
-backend (in-memory ``sqlite+aiosqlite`` engines), so this registration
-belongs here rather than in ``ditto.db``.
+Fixture names are deliberately unchanged (``engine`` / ``session_maker`` /
+``session``), so a test file migrates by *deleting* its local SQLite
+fixtures rather than by being rewritten.
+
+Isolation model
+---------------
+* one **database per xdist worker**, cloned from a once-migrated template;
+* the database is reset to its pristine post-migration state **before**
+  each test.
+
+Per-worker databases are not a performance tweak, they are the fix for the
+``DeadlockDetectedError`` the integration suite hits under ``-n auto``.
+Sharing one database means worker A's ``TRUNCATE ... CASCADE``
+(``ACCESS EXCLUSIVE`` on ``agents`` and everything referencing it) queues
+behind worker B's ``FOR UPDATE`` row locks while B's next ``TRUNCATE``
+queues behind A's -- a lock-order inversion guaranteed by the topology, not
+an unlucky interleaving. When the unit of database ownership equals the unit
+of parallelism there is nothing left to invert.
+
+``POSTGRES_*`` is exported to point at the worker's own database, so the
+integration files that call ``create_db_engine()`` inline -- with no fixture
+at all -- become worker-isolated without being edited.
 """
 
 from __future__ import annotations
 
-import datetime as _dt
-import sqlite3
+import os
+from collections.abc import AsyncIterator, Iterator
+from typing import TYPE_CHECKING
+
+import pytest
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from ditto.tests import pgharness
+
+if TYPE_CHECKING:
+    from ditto.tests.pgharness import Dsn, WorkerDatabase
 
 
-def _adapt_date_iso(val: _dt.date) -> str:
-    """Adapt :class:`datetime.date` to an ISO-8601 date string."""
-    return val.isoformat()
+def _worker_id() -> str:
+    """Identity of this xdist worker (``gw0``…), or ``main`` when serial."""
+    return os.environ.get("PYTEST_XDIST_WORKER", "main")
 
 
-def _adapt_datetime_iso(val: _dt.datetime) -> str:
-    """Adapt :class:`datetime.datetime` to an ISO-8601 timestamp string.
+def _run_id() -> str:
+    """Identity of this *pytest invocation*.
 
-    The separator is a space, not the ``"T"`` used by the bare
-    ``isoformat()`` recipe in the sqlite3 docs. Two reasons, both
-    load-bearing:
-
-    * It reproduces CPython's deprecated default adapter byte for byte
-      (``val.isoformat(" ")``), so stored text is unchanged by this fix.
-    * SQLAlchemy's own SQLite ``DATETIME`` storage format is space
-      separated. A ``"T"`` here would make timestamps written through
-      raw ``text()`` binds sort and compare differently from those
-      written through mapped columns, since SQLite compares them as
-      text.
-
-    ``isoformat`` keeps the UTC offset suffix on aware datetimes, so
-    timezone information survives into the stored value exactly as it
-    did before.
+    Without it, two concurrent runs on one machine -- a developer's suite and
+    an agent's -- would both claim ``ditto_test_gw0`` and silently truncate
+    each other's rows.
     """
-    return val.isoformat(" ")
+    uid = os.environ.get("PYTEST_XDIST_TESTRUNUID")
+    if uid:
+        return uid[:8]
+    return f"p{os.getppid()}"
 
 
-# Registration is process-global and idempotent. pytest-xdist runs each
-# worker in its own process, and every worker imports this module.
-sqlite3.register_adapter(_dt.date, _adapt_date_iso)
-sqlite3.register_adapter(_dt.datetime, _adapt_datetime_iso)
+@pytest.fixture(scope="session")
+def postgres_admin_dsn() -> Dsn:
+    """Admin connection target, provisioning the ambient container if needed.
 
-# No matching converter is registered on purpose. Converters only run
-# when the connection is opened with ``detect_types``, and SQLAlchemy
-# never enables it (its docs actively discourage it) -- the read path is
-# handled by the dialect's own result processors instead. A converter
-# here would be unreachable code that misleads readers about how rows
-# are decoded.
+    A provisioning failure is a **skip** on a laptop and a **hard error**
+    under ``DITTO_REQUIRE_POSTGRES=1``. CI must set that variable: a database
+    suite that turns green because the database was unreachable is precisely
+    the failure mode this migration exists to delete.
+    """
+    try:
+        return pgharness.resolve_admin_dsn()
+    except Exception as exc:
+        if pgharness._require():
+            raise
+        pytest.skip(f"real Postgres unavailable: {exc}")
+
+
+@pytest.fixture(scope="session")
+def worker_database(postgres_admin_dsn: Dsn) -> Iterator[WorkerDatabase]:
+    """This worker's private, migrated database.
+
+    Built by cloning a template that the real Alembic chain migrated once --
+    not by ``Base.metadata.create_all``. ``create_all`` builds the schema the
+    models *claim*; only Alembic builds the schema production has, so this is
+    also the first test coverage the migration chain has ever had.
+    """
+    name = f"{pgharness.DB_PREFIX}{_run_id()}_{_worker_id()}"
+    database = pgharness.provision_worker_database(postgres_admin_dsn, name)
+    previous = {key: os.environ.get(key) for key in database.dsn.env}
+    os.environ.update(database.dsn.env)
+    try:
+        yield database
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        pgharness.drop_worker_database(postgres_admin_dsn, name)
+
+
+@pytest.fixture
+async def engine(worker_database: WorkerDatabase) -> AsyncIterator[AsyncEngine]:
+    """Per-test engine over this worker's database, reset before the test.
+
+    Function-scoped on purpose. An ``AsyncEngine``'s pool is bound to the
+    event loop that used it, and pytest-asyncio gives each test its own loop,
+    so a session-scoped engine would hand the second test a pool full of
+    connections belonging to a closed loop. Engine construction does no I/O;
+    the real cost is the reset plus a connect, and both are milliseconds.
+
+    Commits are **real commits**. There is no outer-transaction/rollback
+    trick here, and there must not be one: you cannot observe two
+    concurrently-committing transactions from inside a single transaction, so
+    a rollback-isolated fixture would quietly re-hide exactly the class of bug
+    (#438) that motivated this migration. If the suite ever needs a faster
+    tier, it belongs alongside this fixture, not in place of it.
+    """
+    eng = create_async_engine(worker_database.dsn.sqlalchemy)
+    try:
+        async with eng.begin() as conn:
+            await pgharness.reset_database(conn, worker_database.reset_sql)
+        yield eng
+    finally:
+        await eng.dispose()
+
+
+@pytest.fixture
+def session_maker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    """Session factory bound to this test's engine."""
+    return async_sessionmaker(engine, expire_on_commit=False)
+
+
+@pytest.fixture
+async def session(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[AsyncSession]:
+    """One :class:`AsyncSession` scoped to a single test function."""
+    async with session_maker() as sess:
+        yield sess
