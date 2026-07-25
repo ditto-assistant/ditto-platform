@@ -3124,7 +3124,7 @@ class TestPublicActivity:
                                 "score": composite,
                                 "correct": False,
                                 "latency_ms": 500,
-                                "notes": ["answer did not match"],
+                                "notes": ["no deterministic value match"],
                                 "expected": "private answer key",
                                 "called": ["private tool trace"],
                                 "case_id": f"private-{index}",
@@ -3167,7 +3167,7 @@ class TestPublicActivity:
             assert case["kind"] == "memory"
             assert case["correct"] is False
             assert case["latency_ms"] == 500
-            assert case["notes"] == ["answer did not match"]
+            assert case["notes"] == ["no deterministic value match"]
         for leaked in (
             '"expected"',
             '"called"',
@@ -3570,6 +3570,127 @@ class TestPublicActivity:
 
         for response in responses:
             assert_redacted(response.json())
+
+    async def test_per_case_notes_are_a_closed_vocabulary_not_scorer_free_text(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The Go scorers interpolate DATASET content into several per-case notes:
+        # the memory grader embeds the distractor value it matched, and the
+        # trajectory scorer embeds required/forbidden argument names. Those notes
+        # must not reach an unauthenticated, CDN-cached response — least of all
+        # `provisional_scores`, which is served BEFORE the /agent/{id}/dataset
+        # reveal gate that holds answer keys until a run is finalized.
+        distractor = "DISTRACTOR_CANARY_DO_NOT_PUBLISH"
+        arg_key = "ARGKEY_CANARY_DO_NOT_PUBLISH"
+        forbidden_arg = "FORBIDDENARG_CANARY_DO_NOT_PUBLISH"
+        misrouted_tool = "TOOLNAME_CANARY_DO_NOT_PUBLISH"
+        future_note = "EXPECTED_ANSWER_CANARY_DO_NOT_PUBLISH"
+        rogue_kind = "canary_leak"
+        sentinels = (
+            distractor,
+            arg_key,
+            forbidden_arg,
+            misrouted_tool,
+            future_note,
+            rogue_kind,
+        )
+        planted_notes = [
+            # Mechanical notes that must SURVIVE, verbatim.
+            "deterministic value match",
+            "1 extra/unexpected tool call(s)",
+            "capped: observable case not executed via tool_endpoint "
+            "(self-report untrusted)",
+            "judged correct=false grounded=true",
+            # Value-bearing notes: the verdict survives, the value must not.
+            f'surfaced a wrong same-attribute value "{distractor}" (scored 0)',
+            f"wrong value for arg {arg_key}",
+            f"forbidden arg present: {forbidden_arg}",
+            f"misrouted a memory request to a non-memory tool: {misrouted_tool}",
+            # A note a future scorer might add, and a rogue AnswerKind smuggled
+            # through an otherwise-known template: both dropped by default.
+            f"expected answer was {future_note}",
+            f"deterministic {rogue_kind} match",
+        ]
+        details = {
+            "bench_version": 2,
+            "per_case": [
+                {
+                    "kind": "memory",
+                    "category": "temporal_reasoning",
+                    "score": 0.5,
+                    "correct": False,
+                    "latency_ms": 500,
+                    "notes": planted_notes,
+                }
+            ],
+        }
+
+        # Finalized (k=3) — reaches /leaderboard and /agent/{id}/scores.
+        finalized_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.4, 0.5, 0.6],
+            details=details,
+        )
+        # Provisional (accepted, pre-quorum) — reaches /pipeline provisional_scores.
+        provisional_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_B,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        async with session_maker() as session, session.begin():
+            await upsert_score(
+                session,
+                agent_id=provisional_id,
+                validator_hotkey=_VALIDATOR_C,
+                run_id="provisional-notes",
+                seed=42,
+                composite=0.5,
+                tool_mean=0.5,
+                memory_mean=0.5,
+                median_ms=500,
+                n=114,
+                generated_at=datetime.now(UTC),
+                signature="ab" * 64,
+                details=details,
+            )
+        _install_db(app, session_maker)
+
+        responses = [
+            await client.get("/api/v1/public/leaderboard"),
+            await client.get("/api/v1/public/activity"),
+            await client.get(f"/api/v1/public/agent/{provisional_id}/pipeline"),
+            await client.get(f"/api/v1/public/agent/{finalized_id}/scores"),
+        ]
+        assert all(response.status_code == 200 for response in responses)
+        # No planted dataset value appears anywhere, on any endpoint.
+        for response in responses:
+            for sentinel in sentinels:
+                assert sentinel not in response.text
+
+        published = (
+            await client.get(f"/api/v1/public/agent/{provisional_id}/pipeline")
+        ).json()["provisional_scores"][0]["case_results"][0]["notes"]
+        assert published == [
+            "deterministic value match",
+            "1 extra/unexpected tool call(s)",
+            "capped: observable case not executed via tool_endpoint "
+            "(self-report untrusted)",
+            "judged correct=false grounded=true",
+            # The verdicts are kept; the values they were rendered around are gone.
+            "surfaced a wrong same-attribute value (scored 0)",
+            "wrong value for a required arg",
+            "forbidden arg present",
+            "misrouted a memory request to a non-memory tool",
+        ]
+        # The finalized projection publishes exactly the same closed vocabulary.
+        assert responses[3].json()["scores"][0]["case_results"][0]["notes"] == published
 
     async def test_live_work_marks_only_its_own_bench_version_attempt(
         self,
