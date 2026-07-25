@@ -52,16 +52,29 @@
 # to be backward-compatible with the previous revision either way, and the
 # rollback relies on exactly that property rather than introducing it.
 #
-# TWO-HOST DEPLOYS (the DITTO_ROLE=relay plan in #438) are NOT handled here.
-# This script assumes it is the only thing deploying, and each host would
-# migrate the same shared database independently. Before a relay host is real,
-# two things need deciding: which host owns `alembic upgrade` (running it from
-# two hosts concurrently is two uncoordinated DDL transactions on one database),
-# and what happens when one host lands the new revision and the other rolls
-# back -- with the rules above that leaves the pair straddling two revisions,
-# which is worse than either host being stale. Neither is solvable inside a
-# per-host script; it needs a deploy that migrates once and then rolls the
-# hosts, and the workflow is the place for it.
+# THE RELAY (DITTO_ROLE=relay, #438) IS A SECOND PROCESS ON THIS HOST, NOT A
+# SECOND HOST -- which is what makes it safe for this script to own.
+#
+# An earlier version of this note said two-host deploys were unsolvable here,
+# and it was right: two hosts pulling independently would migrate one shared
+# database from two uncoordinated DDL transactions, and a rollback on one host
+# but not the other would leave the pair straddling two revisions. That needs a
+# deploy that migrates once and then rolls both, which no per-host script can
+# arrange.
+#
+# Running the relay as a second pm2 app on this host dissolves that problem
+# instead of solving it. There is ONE checkout, so `git reset --hard` below
+# fixes one revision for both processes and there is no second pull to race.
+# There is ONE run of `alembic upgrade head`, ordered before the pm2 stage, so
+# migrations are exactly-once by sequence rather than by locking. And the
+# verify stage holds EVERY app in app_health_url_for to the same bar -- HTTP
+# 200 plus the commit this deploy checked out -- so a process that failed to
+# restart fails the deploy rather than drifting silently behind its sibling.
+#
+# Drift between the two roles is therefore structurally impossible here, and
+# the pair can only ever be as stale as each other. Splitting the relay onto
+# its own host would reintroduce every problem in the paragraph above; do not
+# do it without moving the deploy into the workflow first.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -112,6 +125,40 @@ resolve_health_url() {
     port="$(sed -n 's|^API_PORT=||p' .env 2>/dev/null | tail -n 1)"
   fi
   printf 'http://127.0.0.1:%s/health' "${port:-8000}"
+}
+
+# The local /health URL for a given pm2 service app, or empty if it has none.
+#
+# Every app listed here is held to the full bar below: it must answer HTTP 200
+# AND report the commit this deploy checked out. Without this mapping the
+# verify loop only checked `ditto-api` by name and waved every other service
+# app through on pm2 status alone -- which is exactly the defect #425 closed
+# ("pm2 `online` is NOT proof of life"; pm2 reports online for a process that
+# never bound its port) and would have left the relay outside the #441 commit
+# assertion. Add a case here whenever a new HTTP service app joins
+# scripts/ecosystem.config.js.
+app_health_url_for() {
+  case "$1" in
+    ditto-api) resolve_health_url ;;
+    # Relay ports are derived from the app index so this stays correct when a
+    # relay is added to RELAY_PORTS in scripts/ecosystem.config.js. The base
+    # must match RELAY_PORTS[0] there. $DITTO_RELAY_PORT_BASE exists so the
+    # test harness can point the relays at an ephemeral listener.
+    ditto-api-relay-*)
+      # ditto-api-relay-N takes the Nth port from the list, which must mirror
+      # RELAY_PORTS in scripts/ecosystem.config.js. $DITTO_RELAY_PORTS lets the
+      # test harness point every relay at one ephemeral listener; an unknown
+      # index yields an empty URL, which degrades to a pm2-status-only check
+      # rather than probing the wrong port.
+      local idx="${1##*-}" port
+      case "$idx" in '' | *[!0-9]*) printf ''; return ;; esac
+      port="$(printf '%s' "${DITTO_RELAY_PORTS:-8010 8011}" |
+        tr ' ,' '\n\n' | sed -n "${idx}p")"
+      [ -n "$port" ] || { printf ''; return; }
+      printf 'http://127.0.0.1:%s/health' "$port"
+      ;;
+    *) printf '' ;;
+  esac
 }
 
 # Ask the running process which commit it was started from. `/health` reports
@@ -484,7 +531,8 @@ DITTO_HEALTH_TIMEOUT="${DITTO_HEALTH_TIMEOUT:-120}"
 # Root `/health` is the purpose-built liveness probe (cheap DB + chain reachability
 # check); it is also what deploy.yml polls through Caddy. `/api/v1/public/health`
 # is a different thing -- an aggregate subnet rollup -- and is not a liveness probe.
-health_url="$(resolve_health_url)"
+# The per-app URL comes from app_health_url_for: with more than one HTTP app on
+# the host there is no longer a single health URL for the whole deploy.
 health_snapshot="$(mktemp "${TMPDIR:-/tmp}/ditto-health.XXXXXX")"
 
 # Print one app's live state as "status<TAB>pid<TAB>restarts<TAB>exec_path".
@@ -539,26 +587,27 @@ deadline=$((SECONDS + DITTO_HEALTH_TIMEOUT))
 for app in $service_apps; do
   http_code=""
   served_commit=""
+  app_health_url="$(app_health_url_for "$app")"
   while :; do
     IFS=$'\t' read -r status pid restarts _exec_path <<<"$(pm2_app_state "$app")"
     # `errored` is terminal for a service: pm2 exhausted max_restarts.
     [ "$status" = "errored" ] && fail_deploy "$app" "is in pm2 state 'errored'"
 
     if [ "$status" = "online" ]; then
-      if [ "$app" != "ditto-api" ]; then
+      if [ -z "$app_health_url" ]; then
         echo "    $app: online (pid $pid, $restarts restarts)"
         break
       fi
-      # Ground truth for the API: does the port actually answer, and is the
+      # Ground truth for an HTTP app: does the port actually answer, and is the
       # answer coming from THIS revision?
-      http_code="$(curl -s -o "$health_snapshot" -m 5 -w '%{http_code}' "$health_url" 2>/dev/null || true)"
+      http_code="$(curl -s -o "$health_snapshot" -m 5 -w '%{http_code}' "$app_health_url" 2>/dev/null || true)"
       if [ "$http_code" = "200" ]; then
         served_commit="$(json_string_field commit < "$health_snapshot" || true)"
         # An empty or "unknown" commit means the process cannot report one (a
         # checkout without git history). Do not invent a mismatch from a
         # missing fact -- that would fail every deploy on such a host.
         if [ -z "$served_commit" ] || [ "$served_commit" = "unknown" ]; then
-          echo "    $app: online and serving 200 at $health_url (pid $pid, $restarts restarts)"
+          echo "    $app: online and serving 200 at $app_health_url (pid $pid, $restarts restarts)"
           echo "    WARNING: $app does not report a commit; cannot confirm it is running $deploy_target" >&2
           break
         fi
@@ -566,7 +615,7 @@ for app in $service_apps; do
         # a mismatch keeps polling until the deadline rather than failing on
         # the first sample.
         if [ "$served_commit" = "$deploy_target" ]; then
-          echo "    $app: online and serving 200 at $health_url on commit $served_commit (pid $pid, $restarts restarts)"
+          echo "    $app: online and serving 200 at $app_health_url on commit $served_commit (pid $pid, $restarts restarts)"
           break
         fi
       fi
@@ -580,7 +629,7 @@ for app in $service_apps; do
           "is serving commit $served_commit but this deploy checked out $deploy_target -- the process never restarted into this build"
       fi
       if [ "$status" = "online" ] && [ -n "$http_code" ] && [ "$http_code" != "000" ]; then
-        fail_deploy "$app" "is serving but $health_url returned HTTP $http_code (dependency down?)"
+        fail_deploy "$app" "is serving but $app_health_url returned HTTP $http_code (dependency down?)"
       fi
       fail_deploy "$app" "did not come up within ${DITTO_HEALTH_TIMEOUT}s (pm2 status '$status')"
     fi

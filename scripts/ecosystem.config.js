@@ -40,6 +40,79 @@ const root = path.resolve(__dirname, "..");
 // have selected, minus the intervening shim process.
 const venvPython = path.join(root, ".venv", "bin", "python");
 
+// --- Inference relay pool -------------------------------------------------
+//
+// Ports must stay in sync with app_health_url_for() in scripts/update.sh and
+// with platform_inference_relay_ports in the infra platform_app role, which
+// renders the Caddy upstreams.
+const RELAY_PORTS = [8010, 8011];
+
+// TWO relays, not one, from the start. Measured on prod (e2-standard-4):
+// `ditto-api` sits at 84% of ONE core serving 10.8 req/s, and inference is
+// 71.7% of requests / 81.7% of in-flight request-time. A single relay would
+// therefore inherit ~60-69% of one core AT TODAY'S LOAD -- not headroom, and
+// it only gets worse as validator slot concurrency ramps. Two relays land at
+// ~30-34% each. The marginal cost is one pm2 entry and one port; the cost of
+// getting it wrong is rediscovering the single-event-loop ceiling in
+// production, which is the whole thing this change exists to stop.
+//
+// POSTGRES_POOL_MAX_SIZE=12 is what makes two relays fit under the CURRENT
+// max_connections=100 on ditto-pg-platform without a Postgres restart:
+//   platform 30 + dev 30 + 2x12 = 84, +3 superuser-reserved = 87 of 100.
+// Observed live usage is 16 total, and the DB duty cycle of an inference
+// request is small (~15 short ORM statements inside a ~300 ms p50 request that
+// is mostly awaiting OpenRouter), so 12 is ample. Raise it to 20 only after
+// max_connections goes up -- that is a postmaster setting and needs a full
+// database RESTART, so it is a separate, quieter change.
+const relayApp = (port, index) => ({
+  // A SECOND (and third) process of the SAME codebase running with
+  // DITTO_ROLE=relay, which mounts only /health, /metrics and
+  // /api/v1/inference/* (see factory.py _process_role). Caddy load-balances
+  // /api/v1/inference/* across them, so the proxy hot path stops sharing an
+  // event loop with validator heartbeat ingest -- which is what lets the
+  // platform force-expire live leases and destroy healthy in-flight runs.
+  //
+  // !! NEVER set exec_mode: "cluster" on this or any app here. pm2's cluster
+  // !! mode is Node's `cluster` module: God.js does
+  // !! cluster.setupMaster({exec: ProcessContainer.js}) and ClusterMode.js
+  // !! `God.nodeApp` calls cluster.fork(), so every worker is a NODE process.
+  // !! pm2 only auto-selects cluster mode for a node/bun interpreter
+  // !! (Common.js determineExecMode), but an EXPLICIT exec_mode is passed
+  // !! straight through with NO interpreter check -- so pm2 would accept it
+  // !! and then try to require() the venv python binary as JavaScript,
+  // !! crash-looping the app. Verified against pm2 7.0.3 on the prod host.
+  name: `ditto-api-relay-${index + 1}`,
+  cwd: root,
+  script: venvPython,
+  // --port beats $API_PORT (the argparse default in __main__.py). `args` IS
+  // reconciled by `pm2 reload`, unlike script/interpreter/exec_mode/cwd.
+  args: `-m ditto.api_server --port ${port}`,
+  interpreter: "none",
+  instances: 1,
+  exec_mode: "fork",
+  env: {
+    // The only per-process differences. /opt/ditto-platform/.env is SHARED by
+    // every process here, so the role cannot come from there.
+    DITTO_ROLE: "relay",
+    API_PORT: String(port),
+    POSTGRES_POOL_MIN_SIZE: "5",
+    POSTGRES_POOL_MAX_SIZE: "12",
+    // Dashboard validator-name enrichment is in-memory only and a relay serves
+    // no dashboard, so skip its refresher and its Taostats calls.
+    DITTO_TAOSTATS_VALIDATOR_NAMES_URL: "",
+  },
+  autorestart: true,
+  max_restarts: 10,
+  min_uptime: "10s",
+  restart_delay: 2000,
+  kill_timeout: 35000,
+  max_memory_restart: "3072M",
+  out_file: path.join(root, "logs", `ditto-api-relay-${index + 1}.out.log`),
+  error_file: path.join(root, "logs", `ditto-api-relay-${index + 1}.err.log`),
+  merge_logs: true,
+  time: true,
+});
+
 module.exports = {
   apps: [
     {
@@ -55,10 +128,26 @@ module.exports = {
       // has no second instance to shift traffic onto, so `pm2 reload` degrades
       // to a hard stop/start -- roughly 6s of refused connections, measured.
       // It is NOT zero-downtime here despite what pm2's docs say about reload
-      // in general. Real zero-downtime would require `exec_mode: "cluster"`,
-      // which changes production restart behavior (and how uvicorn binds the
-      // port) enough that it is a separate operator decision, deliberately not
-      // made in the same change as the memory-guard fix.
+      // in general.
+      //
+      // `exec_mode: "cluster"` IS NOT THE FIX, and an earlier version of this
+      // comment was wrong to suggest it. pm2 cluster mode is Node's `cluster`
+      // module -- God.js does cluster.setupMaster({exec: ProcessContainer.js})
+      // and ClusterMode.js `God.nodeApp` calls cluster.fork(), so every worker
+      // is a NODE process that require()s the app as a JS module. It cannot
+      // fork a Python interpreter. Worse, pm2 only INFERS cluster mode from a
+      // node/bun interpreter (Common.js determineExecMode); an explicit
+      // exec_mode is passed through with no interpreter check, so setting it
+      // here would be accepted and then crash-loop the app rather than fall
+      // back to fork. Verified against pm2 7.0.3 on the prod host.
+      //
+      // The real zero-downtime path is horizontal: N processes behind Caddy,
+      // reloaded one at a time. That works for the relay role (see relayApp
+      // above) because a relay runs no singleton background work. It does NOT
+      // work for this role: two `ditto-api` processes would double-run the
+      // provider-route discovery loop, which upserts routing rows with no
+      // ON CONFLICT and no row lock. Making this role horizontally scalable
+      // needs leader election first.
       instances: 1,
       exec_mode: "fork",
 
@@ -85,6 +174,7 @@ module.exports = {
       merge_logs: true,
       time: true, // prefix every log line with a timestamp
     },
+    ...RELAY_PORTS.map(relayApp),
     {
       // DB-aware retention: keeps evaluating/current-best images, clears old
       // non-champions back to source-build fallback, then deletes their objects.

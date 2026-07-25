@@ -211,7 +211,23 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 client=inference_client,
             )
             stack.push_async_callback(provider_routes.aclose)
-            await provider_routes.start()
+            # Exactly ONE process may run discovery. The refresh loop upserts
+            # InferenceRoutingPolicy and InferenceProviderRoute rows by hand --
+            # `session.get` then `session.add` -- with no ON CONFLICT, no row
+            # lock and no savepoint, all inside a single transaction per model.
+            # Two copies racing it collide on the primary key, and because the
+            # insert shares that transaction the whole model's refresh cycle is
+            # discarded; the loop's handler logs only the exception type, so it
+            # degrades silently. The unlocked read-modify-write on `status` can
+            # also flap a route between discovered and offline, which feeds
+            # selection's status filter.
+            #
+            # The relay does not need it: route selection reads Postgres per
+            # request under `FOR UPDATE`, so there is no in-memory route cache
+            # to keep warm. This makes the platform role the designated primary
+            # for the one piece of background work that requires a singleton.
+            if _process_role() == PLATFORM_ROLE:
+                await provider_routes.start()
             app.state.inference_provider_routes = provider_routes
 
             validator_names = app.state.validator_names

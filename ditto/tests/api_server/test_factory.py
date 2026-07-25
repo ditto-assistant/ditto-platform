@@ -97,6 +97,88 @@ class TestLifespanFailureCleanup:
         engine.dispose.assert_awaited_once()
 
 
+class TestRouteDiscoveryIsSingleton:
+    """Only the platform role may run the provider-route discovery loop.
+
+    ``ProviderRouteRefresher.refresh`` upserts ``InferenceRoutingPolicy`` and
+    ``InferenceProviderRoute`` rows by hand -- ``session.get`` then
+    ``session.add`` -- with no ON CONFLICT, no row lock and no savepoint, all
+    inside one transaction per model. Two processes running it against the one
+    shared database collide on the primary key, and because the insert shares
+    that transaction the whole model's refresh cycle is discarded; the loop's
+    handler logs only the exception type, so it degrades silently.
+
+    The relay does not need it: route selection reads Postgres per request
+    under ``FOR UPDATE``, so there is no in-memory route cache to keep warm.
+    """
+
+    @staticmethod
+    async def _refresher_for_role(role: str | None, monkeypatch) -> MagicMock:
+        if role is None:
+            monkeypatch.delenv("DITTO_ROLE", raising=False)
+        else:
+            monkeypatch.setenv("DITTO_ROLE", role)
+
+        refresher = MagicMock()
+        refresher.start = AsyncMock()
+        refresher.aclose = AsyncMock()
+        engine = MagicMock()
+        engine.dispose = AsyncMock()
+        chain_ctx = MagicMock()
+        chain_ctx.__aenter__ = AsyncMock(return_value=MagicMock())
+        chain_ctx.__aexit__ = AsyncMock(return_value=False)
+        storage_ctx = MagicMock()
+        storage_ctx.__aenter__ = AsyncMock(return_value=MagicMock())
+        storage_ctx.__aexit__ = AsyncMock(return_value=False)
+        closeable = MagicMock()
+        closeable.aclose = AsyncMock()
+
+        with (
+            patch("ditto.api_server.factory.create_db_engine", return_value=engine),
+            patch(
+                "ditto.api_server.factory.create_session_maker",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "ditto.api_server.factory.create_chain_client", return_value=chain_ctx
+            ),
+            patch(
+                "ditto.api_server.factory.create_price_oracle", return_value=closeable
+            ),
+            patch("ditto.api_server.factory.create_payment_verifier"),
+            patch(
+                "ditto.api_server.factory.create_storage_client",
+                return_value=storage_ctx,
+            ),
+            patch("ditto.api_server.factory.create_embedder", return_value=closeable),
+            patch("ditto.api_server.factory.create_generator", return_value=closeable),
+            patch(
+                "ditto.api_server.factory.ProviderRouteRefresher",
+                return_value=refresher,
+            ),
+        ):
+            app = create_api_server(make_api_server_config())
+            app.state.validator_names.start = AsyncMock()
+            app.state.validator_names.aclose = AsyncMock()
+            async with app.router.lifespan_context(app):
+                pass
+        return refresher
+
+    async def test_relay_does_not_start_route_discovery(self, monkeypatch):
+        refresher = await self._refresher_for_role("relay", monkeypatch)
+        refresher.start.assert_not_awaited()
+        # Still constructed and still registered for cleanup, so shutdown is
+        # symmetric with the platform role.
+        refresher.aclose.assert_awaited_once()
+
+    @pytest.mark.parametrize("role", [None, "platform"])
+    async def test_platform_role_still_starts_route_discovery(
+        self, monkeypatch, role: str | None
+    ):
+        refresher = await self._refresher_for_role(role, monkeypatch)
+        refresher.start.assert_awaited_once()
+
+
 class TestProcessRole:
     """``DITTO_ROLE=relay`` serves the inference plane and nothing else.
 
