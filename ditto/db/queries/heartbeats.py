@@ -237,6 +237,7 @@ async def upsert_validator_heartbeat(
     stack: dict | None = None,
     stack_health: dict | None = None,
     benchmark_capacity: dict | None = None,
+    claimed_slots: list[dict] | None = None,
 ) -> tuple[ValidatorHeartbeat, bool]:
     """Persist only a strictly newer heartbeat; return ``(row, accepted)``."""
     row = await session.scalar(
@@ -264,6 +265,7 @@ async def upsert_validator_heartbeat(
             "stack": stack,
             "stack_health": stack_health,
             "benchmark_capacity": benchmark_capacity,
+            "claimed_slots": claimed_slots,
             "reported_at": reported_at,
             "seen_at": seen_at,
             "signature": signature,
@@ -373,6 +375,10 @@ async def upsert_validator_heartbeat(
         # private monotonic floor across idle/polling/downgrade heartbeats. The
         # public view follows this flag and therefore clears immediately.
         row.benchmark_progress_reported = False
+    # Straight off the verified signature: no reconciliation, no monotonicity.
+    # This is the validator's own statement about which slots it is busy on, and
+    # it is only ever read to REFUSE a revocation.
+    row.claimed_slots = claimed_slots
     row.reported_at = reported_at
     row.seen_at = seen_at
     row.signature = signature

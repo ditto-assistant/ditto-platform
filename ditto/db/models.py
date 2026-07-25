@@ -1455,6 +1455,17 @@ class ValidatorHeartbeat(Base):
     benchmark_capacity: Mapped[dict | None] = mapped_column(
         _JSON_VARIANT, nullable=True
     )
+    # The slots the validator's SIGNED capacity claimed as busy, recorded before
+    # the ticket-confirmation filter in ``_validated_heartbeat_work`` narrows
+    # ``benchmark_capacity`` to work the ledger could confirm. A slot can be
+    # genuinely occupied and still fail confirmation (a re-issued lease moves the
+    # deadline the validator cached, so the exact-deadline lookup misses), and
+    # ``benchmark_capacity`` alone cannot tell "this slot is free" apart from
+    # "this slot's progress did not confirm". Only ever used to REFUSE a
+    # revocation, never to grant work or accept a score, so an over-broad claim
+    # costs the validator its own throughput and nothing else.
+    # Shape: ``[{"slot_id": "slot-0", "agent_id": "<uuid>"}, ...]``.
+    claimed_slots: Mapped[list | None] = mapped_column(_JSON_VARIANT, nullable=True)
     reported_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )

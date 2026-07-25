@@ -2438,10 +2438,15 @@ def _validator_heartbeats_response(
             }
             synchronized_works = []
             for slot in capacity.active:
+                # Identity only. Every slot in the stored capacity was already
+                # confirmed against a live ticket under a row lock at ingest, so
+                # re-testing the deadline here — against a separately fetched
+                # assignments snapshot — adds no safety and one failure mode:
+                # a lease re-issued in place moves the deadline the validator
+                # cached, and a single microsecond of drift blanked the slot to
+                # "Benchmark progress not reported" while the run was healthy.
                 item = by_identity.get((slot.slot_id, slot.agent_id))
-                if item is None or slot.progress.ticket_deadline != _aware(
-                    item.ticket.deadline
-                ):
+                if item is None:
                     continue
                 synchronized_works.append(
                     ActiveValidatorWork(
