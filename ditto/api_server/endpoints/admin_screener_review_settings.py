@@ -17,7 +17,6 @@ from ditto.api_models.screener import ScreenerReviewSettingsStatus
 from ditto.api_models.screener_review_settings import (
     AdminScreenerReviewSettingsRequest,
     AdminScreenerReviewSettingsResponse,
-    AdminShadowReviewObservation,
     AppliedScreenerReviewSettings,
     ScreenerReviewSettings,
 )
@@ -26,6 +25,7 @@ from ditto.api_models.screener_review_settings import (
 )
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
+from ditto.api_server.shadow_review import shadow_review_observation
 from ditto.db.models import (
     ScreenerHeartbeat,
     ScreenerReviewSettingsRevision,
@@ -151,30 +151,7 @@ async def get_settings(
         history=[_revision(row) for row in rows[:200]],
         known_instances=instances,
         applied_instances=sorted(applied, key=lambda item: item.instance_id),
-        shadow_observations=[
-            AdminShadowReviewObservation.model_validate(
-                {
-                    "attempt_id": row.attempt_id,
-                    "agent_id": row.agent_id,
-                    "settings_revision": row.settings_revision,
-                    "settings_scope": row.settings_scope,
-                    "settings_checksum": row.settings_checksum,
-                    "disposition": row.disposition,
-                    "risk_level": row.risk_level,
-                    "categories": list(row.categories),
-                    "finding_digest": row.finding_digest,
-                    "resolution_basis": row.resolution_basis,
-                    "clearance_path": row.clearance_path,
-                    "critic_disposition": row.critic_disposition,
-                    "adjudicator_disposition": row.adjudicator_disposition,
-                    "response_models": list(row.response_models),
-                    "response_providers": list(row.response_providers),
-                    "usage": dict(row.usage),
-                    "created_at": row.created_at,
-                }
-            )
-            for row in shadow_rows
-        ],
+        shadow_observations=[shadow_review_observation(row) for row in shadow_rows],
     )
 
 
