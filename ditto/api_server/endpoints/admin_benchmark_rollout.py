@@ -23,9 +23,6 @@ from ditto.api_server.benchmark_rollout import (
     qualification_candidate,
     refresh_rolling_qualification,
 )
-from ditto.api_server.benchmark_rollout_settings import (
-    resolve_benchmark_rollout_settings,
-)
 from ditto.api_server.datapipeline import DataPipelineError, DatasetGenerator
 from ditto.api_server.dependencies import get_dataset_generator, get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
@@ -34,6 +31,9 @@ from ditto.api_server.inference_routing import (
     AGGREGATE_PROVIDER,
     aggregate_profile_revision,
     benchmark_model,
+)
+from ditto.api_server.queue_policy_settings import (
+    resolve_queue_policy_settings,
 )
 from ditto.db.models import (
     InferenceProviderRoute,
@@ -529,9 +529,9 @@ async def start_rollout(
     # Read the operator policy exactly once, here, and freeze it onto the
     # rollout below. Everything downstream (backfill, blockers, telemetry) reads
     # the frozen value, so a later revision cannot resize this rollout.
-    rescore_cohort_target = (
-        await resolve_benchmark_rollout_settings(session)
-    ).rescore_cohort_size
+    queue_policy = await resolve_queue_policy_settings(session)
+    rescore_cohort_target = queue_policy.rescore_cohort_size
+    priority_cohort_target = queue_policy.priority_cohort_size
     members = await historical_rescore_cohort(
         session, source_version=from_version, limit=rescore_cohort_target
     )
@@ -584,6 +584,7 @@ async def start_rollout(
             from_version=from_version,
             desired_version=target,
             rescore_cohort_target=rescore_cohort_target,
+            priority_cohort_target=priority_cohort_target,
             audit_context={
                 "origin": "admin",
                 "actor": payload.actor,
@@ -595,6 +596,7 @@ async def start_rollout(
                 # so the size this rollout was built to is recoverable even if
                 # the row is later inspected without its policy history.
                 "rescore_cohort_target": rescore_cohort_target,
+                "priority_cohort_target": priority_cohort_target,
             },
         )
     except RolloutConflictError as exc:

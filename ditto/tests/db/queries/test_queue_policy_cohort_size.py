@@ -23,21 +23,21 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import set_committed_value
 
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.benchmark_rollout_settings import (
+from ditto.api_models.queue_policy_settings import (
     DEFAULT_RESCORE_COHORT_SIZE as WIRE_DEFAULT,
 )
-from ditto.api_models.benchmark_rollout_settings import (
-    MAX_RESCORE_COHORT_SIZE as WIRE_MAX,
+from ditto.api_models.queue_policy_settings import (
+    MAX_COHORT_SIZE as WIRE_MAX,
 )
-from ditto.api_models.benchmark_rollout_settings import (
-    MIN_RESCORE_COHORT_SIZE as WIRE_MIN,
+from ditto.api_models.queue_policy_settings import (
+    MIN_COHORT_SIZE as WIRE_MIN,
 )
-from ditto.api_models.benchmark_rollout_settings import (
-    BenchmarkRolloutSettings,
+from ditto.api_models.queue_policy_settings import (
+    QueuePolicySettings,
 )
 from ditto.api_server.benchmark_rollout import _rollout_rescore_cohort
-from ditto.api_server.benchmark_rollout_settings import (
-    resolve_benchmark_rollout_settings,
+from ditto.api_server.queue_policy_settings import (
+    resolve_queue_policy_settings,
 )
 from ditto.db.models import (
     Agent,
@@ -55,8 +55,8 @@ from ditto.db.queries.benchmark_rollout import (
     create_rollout_snapshot,
     historical_rescore_cohort,
 )
-from ditto.db.queries.benchmark_rollout_settings import (
-    insert_benchmark_rollout_settings_revision,
+from ditto.db.queries.queue_policy_settings import (
+    insert_queue_policy_settings_revision,
 )
 
 # asyncio_mode = "auto" (pyproject) handles the async tests; a module-level
@@ -129,16 +129,16 @@ class TestBounds:
         assert WIRE_DEFAULT == DEFAULT_RESCORE_COHORT_SIZE
 
     def test_settings_default_is_the_historical_ten(self) -> None:
-        assert BenchmarkRolloutSettings().rescore_cohort_size == 10
+        assert QueuePolicySettings().rescore_cohort_size == 10
 
     @pytest.mark.parametrize("size", [4, 0, -1, 26, 100])
     def test_settings_reject_out_of_range(self, size: int) -> None:
         with pytest.raises(ValueError):
-            BenchmarkRolloutSettings(rescore_cohort_size=size)
+            QueuePolicySettings(rescore_cohort_size=size)
 
     @pytest.mark.parametrize("size", [5, 10, 25])
     def test_settings_accept_in_range(self, size: int) -> None:
-        assert BenchmarkRolloutSettings(rescore_cohort_size=size)
+        assert QueuePolicySettings(rescore_cohort_size=size)
 
     @pytest.mark.parametrize("limit", [4, 26])
     async def test_historical_cohort_rejects_out_of_range_limit(
@@ -312,7 +312,7 @@ class TestMidRolloutChangeIsIgnored:
 
             # The operator widens the policy to the ceiling mid-rollout.
             async with session.begin():
-                await insert_benchmark_rollout_settings_revision(
+                await insert_queue_policy_settings_revision(
                     session,
                     parent_revision=0,
                     scope="*",
@@ -322,7 +322,7 @@ class TestMidRolloutChangeIsIgnored:
                     actor="peyton@omniaura.ai",
                 )
                 assert (
-                    await resolve_benchmark_rollout_settings(session)
+                    await resolve_queue_policy_settings(session)
                 ).rescore_cohort_size == 25
 
             async with session.begin():

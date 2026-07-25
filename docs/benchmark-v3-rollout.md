@@ -60,14 +60,14 @@ constant. It defaults to the historical **ten** and an operator may set it
 anywhere in `[5, 25]` from backroom as the subnet scales, with no redeploy:
 
 ```text
-GET  /api/v1/admin/benchmark-rollout-settings
-POST /api/v1/admin/benchmark-rollout-settings
+GET  /api/v1/admin/queue-policy-settings
+POST /api/v1/admin/queue-policy-settings
 ```
 
 The POST is an append-only revision carrying the complete policy, an
 `expected_revision` compare-and-swap, an actor + reason, and the exact typed
 confirmation `APPLY BENCHMARK ROLLOUT SETTINGS`. The table
-(`benchmark_rollout_settings_revisions`) is never updated or deleted, so every
+(`queue_policy_settings_revisions`) is never updated or deleted, so every
 change is recoverable history. Unlike rollout *activation*, this control **is**
 exposed over MCP — it is policy for a future transition, not an action on a live
 one.
@@ -90,7 +90,7 @@ Three properties make the semantics unsurprising:
   value applies to the next transition. Membership being append-only would make
   growing an in-flight cohort safe, but not predictable — it would silently move
   the completion bar that gates the authority switch under validators already
-  scoring the cohort. `GET /admin/benchmark-rollout-settings` reports the open
+  scoring the cohort. `GET /admin/queue-policy-settings` reports the open
   rollout's frozen target beside the configured one so the difference is visible
   rather than inferred.
 * **Historical rollouts stay explainable.** The frozen target is on the rollout

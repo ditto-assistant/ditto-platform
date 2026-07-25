@@ -72,8 +72,8 @@ from ditto.db.queries.benchmark_rollout import (
     select_active_bench_version,
     supersede_open_rollout,
 )
-from ditto.db.queries.benchmark_rollout_settings import (
-    insert_benchmark_rollout_settings_revision,
+from ditto.db.queries.queue_policy_settings import (
+    insert_queue_policy_settings_revision,
 )
 from ditto.db.queries.scores import count_ranked_quorum_agents, list_eligible_ledger
 from ditto.db.queries.screening import claim_screening_attempts
@@ -105,6 +105,7 @@ async def test_admin_status_read_does_not_start_rollout() -> None:
             "rescore_cohort_target": None,
             "max_rescore_cohort_size": 25,
             "priority_cohort_size": 5,
+            "priority_cohort_target": None,
             "priority_complete": False,
             "members": [],
         }
@@ -2802,7 +2803,7 @@ async def _start_for_cohort_size(configured: int | None) -> dict:
     async with maker() as session, session.begin():
         await _seed_eligible_v2_era(session, now, count=12)
         if configured is not None:
-            await insert_benchmark_rollout_settings_revision(
+            await insert_queue_policy_settings_revision(
                 session,
                 parent_revision=0,
                 scope="*",

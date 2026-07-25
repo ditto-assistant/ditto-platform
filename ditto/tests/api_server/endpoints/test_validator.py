@@ -40,6 +40,7 @@ from ditto.api_models.benchmark_progress import (
     BenchmarkProgress,
     benchmark_progress_signing_token,
 )
+from ditto.api_models.queue_policy_settings import QueuePolicySettings
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.stack_health import (
     ValidatorStackHealth,
@@ -3121,6 +3122,7 @@ class TestRequestJob:
                 validator_hotkey=validator_hotkey,
                 bench_version=3,
                 rollout_started_at=started_at,
+                settings=QueuePolicySettings(),
             )
             for completed in range(1, 4):
                 agent_id = uuid4()
@@ -3153,6 +3155,7 @@ class TestRequestJob:
                     validator_hotkey=validator_hotkey,
                     bench_version=3,
                     rollout_started_at=started_at,
+                    settings=QueuePolicySettings(),
                 )
                 assert due is (completed != 2)
 

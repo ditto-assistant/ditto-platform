@@ -78,6 +78,7 @@ from ditto.api_models.benchmark_capacity import (
 from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.benchmark_progress import benchmark_progress_signing_token
 from ditto.api_models.inference import InferenceGrantOffer
+from ditto.api_models.queue_policy_settings import QueuePolicySettings
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.stack_health import (
     ValidatorStackHealth,
@@ -124,6 +125,12 @@ from ditto.api_server.koth import (
     top5_round_is_due,
 )
 from ditto.api_server.onchain_seed import derive_validator_seed
+from ditto.api_server.queue_policy_settings import (
+    DEFAULT_SETTINGS as QUEUE_POLICY_DEFAULTS,
+)
+from ditto.api_server.queue_policy_settings import (
+    QueuePolicySettingsResolver,
+)
 from ditto.api_server.scoring_gate import evaluate_duplicate_signals
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
@@ -317,11 +324,22 @@ def _transform_audit_verdict(
 
 router = APIRouter(prefix="/validator", tags=["validator"])
 
-# Three fresh-submission jobs for every one rollout-tail job. The counter is
-# per validator, so every validator rotates through both lanes and new agents
-# can still reach the three-validator scoring quorum.
-_FRESH_SUBMISSION_SLOTS = frozenset((0, 1, 3))
-_LANE_CYCLE_SIZE = 4
+
+def _queue_policy_resolver(request: Request) -> QueuePolicySettingsResolver | None:
+    """The queue-policy cache, when the app has one bound.
+
+    ``None`` means the app was built without one (some tests construct routers
+    directly), in which case callers use the shipped defaults -- the same values
+    that were hard-coded before this became operator policy.
+    """
+    return getattr(request.app.state, "queue_policy_settings", None)
+
+
+async def _resolve_queue_policy(request: Request) -> QueuePolicySettings:
+    resolver = _queue_policy_resolver(request)
+    if resolver is None:
+        return QUEUE_POLICY_DEFAULTS
+    return await resolver.resolve(getattr(request.app.state, "session_maker", None))
 
 
 async def _fresh_submission_lane_due(
@@ -330,7 +348,22 @@ async def _fresh_submission_lane_due(
     validator_hotkey: str,
     bench_version: int,
     rollout_started_at: datetime,
+    settings: QueuePolicySettings,
 ) -> bool:
+    """Whether this validator's next rollout-era job serves a fresh submission.
+
+    The lane split defaults to three fresh-submission jobs for every one
+    rollout-tail job. The counter is per validator, so every validator rotates
+    through both lanes and new agents can still reach the three-validator
+    scoring quorum.
+
+    The split is operator policy
+    (``ditto.api_models.queue_policy_settings.QueuePolicySettings``), but the
+    modulus is deliberately immutable while a rollout is open: this count is
+    measured from ``rollout_started_at``, so changing the cycle length would
+    reassign every validator's position in it discontinuously. The admin
+    endpoint refuses such a write rather than letting it land here.
+    """
     completed_since_rollout = await session.scalar(
         select(func.count())
         .select_from(ValidatorTicket)
@@ -341,9 +374,7 @@ async def _fresh_submission_lane_due(
             ValidatorTicket.created_at >= rollout_started_at,
         )
     )
-    return int(completed_since_rollout or 0) % _LANE_CYCLE_SIZE in (
-        _FRESH_SUBMISSION_SLOTS
-    )
+    return settings.fresh_submission_lane_due(int(completed_since_rollout or 0))
 
 
 async def _issue_source_backfill_ticket(
@@ -1261,6 +1292,11 @@ async def request_job(
         chain, netuid, payload.validator_hotkey, network=network
     )
 
+    # Resolved before the transaction opens: the resolver may open its own
+    # session to refill a cold cache, and doing that inside this transaction
+    # would nest sessions on the hot path.
+    queue_policy = await _resolve_queue_policy(request)
+
     job: JobResponse | None = None
     async with session.begin():
         await _assert_validator_compatible(
@@ -1364,6 +1400,7 @@ async def request_job(
                     validator_hotkey=payload.validator_hotkey,
                     bench_version=rollout.desired_version,
                     rollout_started_at=rollout.created_at,
+                    settings=queue_policy,
                 )
             )
             ticket = (

@@ -33,13 +33,13 @@ from ditto.api_server.embedding import create_embedder
 from ditto.api_server.endpoints import (
     admin_artifact_release_settings_router,
     admin_benchmark_rollout_router,
-    admin_benchmark_rollout_settings_router,
     admin_continual_retest_settings_router,
     admin_copy_review_router,
     admin_efficiency_bonus_settings_router,
     admin_inference_routes_router,
     admin_miner_fees_router,
     admin_quarantine_router,
+    admin_queue_policy_settings_router,
     admin_scoring_readiness_router,
     admin_screener_review_settings_router,
     admin_submission_settings_router,
@@ -66,6 +66,7 @@ from ditto.api_server.middleware import (
 from ditto.api_server.middleware.public_cache import compute_etag, if_none_match
 from ditto.api_server.payment_verifier import create_payment_verifier
 from ditto.api_server.pricing import create_price_oracle
+from ditto.api_server.queue_policy_settings import QueuePolicySettingsResolver
 from ditto.api_server.storage import create_storage_client
 from ditto.api_server.validator_names import create_validator_names
 from ditto.chain import create_chain_client
@@ -222,6 +223,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
         ttl_seconds=_efficiency_settings_ttl_seconds(),
     )
     app.state.continual_retest_settings = ContinualRetestSettingsResolver()
+    app.state.queue_policy_settings = QueuePolicySettingsResolver()
     # The object exists even when lifespan is skipped in unit tests. Its
     # snapshot path is synchronous and disabled by default; production lifespan
     # starts the optional background refresher without blocking API startup.
@@ -260,7 +262,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(public_router, prefix="/api/v1")
     app.include_router(admin_artifact_release_settings_router, prefix="/api/v1")
     app.include_router(admin_benchmark_rollout_router, prefix="/api/v1")
-    app.include_router(admin_benchmark_rollout_settings_router, prefix="/api/v1")
+    app.include_router(admin_queue_policy_settings_router, prefix="/api/v1")
     app.include_router(admin_efficiency_bonus_settings_router, prefix="/api/v1")
     app.include_router(admin_inference_routes_router, prefix="/api/v1")
     app.include_router(admin_quarantine_router, prefix="/api/v1")
