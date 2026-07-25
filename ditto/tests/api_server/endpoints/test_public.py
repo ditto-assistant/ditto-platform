@@ -2706,16 +2706,11 @@ class TestPublicActivity:
         assert [work["bench_version"] for work in activity["active_benchmarks"]] == [3]
 
         operations = (await client.get("/api/v1/public/operations")).json()
-        operations_entry = next(
-            entry
-            for entry in operations["activity"]["entries"]
-            if entry["agent_id"] == str(agent_id)
-        )
         assert operations["active_bench_version"] == 4
-        assert operations_entry["status"] == "not_queued"
-        assert operations_entry["score_count"] == 1
-        assert operations_entry["provisional_composite"] == pytest.approx(0.391897)
-        assert operations_entry["validator_queue_rank"] is None
+        assert not any(
+            entry["agent_id"] == str(agent_id)
+            for entry in operations["activity"]["entries"]
+        )
         assert operations["activity"]["status_counts"]["not_queued"] == 1
 
         pipeline = (
@@ -2820,9 +2815,14 @@ class TestPublicActivity:
             datetime.fromisoformat(by_id[str(cooling_id)]["retry_after"])
             == cooldown_until
         )
-        # Rejected (not EVALUATING): no retry_state, despite exhausted tickets.
-        assert by_id[str(rejected_id)]["retry_state"] is None
-        assert by_id[str(rejected_id)]["retry_after"] is None
+        # Rejected history is intentionally omitted from the live board snapshot;
+        # the complete Activity feed still exposes it without a retry label.
+        assert str(rejected_id) not in by_id
+        rejected = (
+            await client.get("/api/v1/public/activity", params={"q": str(rejected_id)})
+        ).json()["entries"][0]
+        assert rejected["retry_state"] is None
+        assert rejected["retry_after"] is None
 
     async def test_progress_is_multi_validator_allowlisted_and_recursively_redacted(
         self,

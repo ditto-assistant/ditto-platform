@@ -1505,6 +1505,35 @@ class TestHeartbeat:
         assert rollout_snapshot["desired_bench_version"] == 3
         assert rollout_snapshot["benchmark_rollout_status"] == "collecting"
 
+    async def test_operations_snapshot_keeps_live_work_and_bounds_history(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        active_id = await _seed_agent(
+            session_maker, status=AgentStatus.SCREENING, name="active-agent"
+        )
+        for index in range(51):
+            await _seed_agent(
+                session_maker,
+                status=AgentStatus.SCORED,
+                name=f"scored-agent-{index}",
+                created_at=datetime(2026, 7, 24, 12, index, tzinfo=UTC),
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/operations")
+
+        assert response.status_code == 200
+        activity = response.json()["activity"]
+        assert activity["total"] == 52
+        assert activity["count"] == 51
+        assert activity["status_counts"]["screening"] == 1
+        assert activity["status_counts"]["scored"] == 51
+        assert sum(entry["status"] == "scored" for entry in activity["entries"]) == 50
+        assert any(entry["agent_id"] == str(active_id) for entry in activity["entries"])
+
     async def test_operations_snapshot_surfaces_different_reported_agent(
         self,
         app: FastAPI,

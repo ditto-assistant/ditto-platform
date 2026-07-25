@@ -2421,6 +2421,7 @@ def _public_activity_response(
     ath_review_opened_at: dict[UUID, datetime] | None = None,
     ath_review_composite: dict[UUID, float] | None = None,
     ath_only: bool = False,
+    terminal_history_limit: int | None = None,
 ) -> PublicActivityResponse:
     """Project activity from the same validated work set used by fleet health."""
     active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
@@ -2540,14 +2541,34 @@ def _public_activity_response(
         ]
 
     total = len(projected)
-    page_rows = projected[(page - 1) * limit : page * limit]
+    if terminal_history_limit is None:
+        page_rows = projected[(page - 1) * limit : page * limit]
+        page_size = limit
+    else:
+        # The operations board needs every actionable submission, but not the
+        # complete historical ledger on every eight-second poll. Keep all live
+        # work and only the newest finalized rows; the paginated activity API
+        # remains the authoritative route for full history and search.
+        board_statuses = {
+            "waiting_screening",
+            "screening",
+            "waiting_validator",
+            "below_score_floor",
+            "evaluating",
+        }
+        actionable = [item for item in projected if item[1] in board_statuses]
+        terminal = [item for item in projected if item[1] in {"scored", "live"}][
+            :terminal_history_limit
+        ]
+        page_rows = actionable + terminal
+        page_size = max(1, len(page_rows))
     return PublicActivityResponse(
         generated_at=now,
         count=len(page_rows),
         total=total,
         status_counts=status_counts,
         page=page,
-        page_size=limit,
+        page_size=page_size,
         total_pages=max(1, math.ceil(total / limit)),
         entries=[
             PublicActivityEntry(
@@ -2809,6 +2830,7 @@ async def operations(
             session, agents=[row.agent for row in activity_rows], now=now
         ),
         duplicate_metadata=await _duplicate_submission_metadata(session, activity_rows),
+        terminal_history_limit=50,
     )
     validator_snapshot = _validator_heartbeats_response(
         rows=heartbeat_rows,
