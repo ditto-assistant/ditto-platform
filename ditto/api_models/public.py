@@ -341,7 +341,23 @@ class PublicLeaderboardEntry(BaseModel):
     (``expected`` / ``called``).
     """
 
-    rank: Annotated[int, Field(ge=1, description="1-based rank by composite.")]
+    rank: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "1-based rank by ``official_composite`` -- NOT by ``composite``. "
+                "Sorting this board by ``composite`` reproduces ``rank`` only "
+                "while every entry is still on the canonical median "
+                "(``aggregate_method == 'canonical_median'``); once any agent "
+                "has completed continual cohort waves the two orderings differ, "
+                "and ``official_composite`` is the one that ranks the board and "
+                "drives the weight fold. Ties break on ``first_seen`` then "
+                "``agent_id``. Provisional (pre-quorum) rows are ranked among "
+                "themselves and always trail the finalized board."
+            ),
+        ),
+    ]
     finalized: Annotated[
         bool,
         Field(
@@ -514,11 +530,15 @@ class PublicLeaderboardEntry(BaseModel):
             ge=0.0,
             le=1.1,
             description=(
-                "composite * (1 + efficiency_bonus): the platform-side ranking "
-                "score with the frozen bonus applied. The validator's composite "
-                "is never modified; this is a separate, derived field so the UI "
-                "can show provenance (base, bonus, effective) distinctly. Null "
-                "whenever efficiency_bonus is null."
+                "composite * (1 + efficiency_bonus): the token-efficiency view "
+                "of the score, with the frozen bonus applied. The validator's "
+                "composite is never modified; this is a separate, derived field "
+                "so the UI can show provenance (base, bonus, effective) "
+                "distinctly. Null whenever efficiency_bonus is null.\n\n"
+                "Name collision warning: this is NOT the value the board ranks "
+                "by, and it is unrelated to ``koth.effective_composite()``, "
+                "which is the continual-mean estimator surfaced here as "
+                "``official_composite``. ``rank`` never reads this field."
             ),
         ),
     ] = None
@@ -808,7 +828,15 @@ class PublicEmissionRecipient(BaseModel):
         int,
         Field(
             ge=1,
-            description="This entry's independent rank by finalized composite.",
+            description=(
+                "This entry's independent rank by the finalized canonical "
+                "median ``composite`` -- deliberately a different ordering from "
+                "the board's ``rank``, which uses ``official_composite``. A "
+                "champion carrying ``raw_rank: 4`` is not an inconsistency: it "
+                "means three agents beat it on the single-quorum median while it "
+                "leads on the continual mean that actually folds into emissions. "
+                "Do not read this as a leaderboard position."
+            ),
         ),
     ]
     share_of_miner_pool: Annotated[
