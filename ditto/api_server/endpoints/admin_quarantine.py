@@ -127,6 +127,10 @@ from ditto.db.queries.benchmark_rollout import (
     maybe_activate_rollout,
     open_rollout,
 )
+from ditto.db.queries.payments import (
+    get_miner_coldkey_for_agent,
+    get_miner_coldkeys_for_agents,
+)
 from ditto.db.queries.tickets import RETRY_COOLDOWN
 
 logger = logging.getLogger(__name__)
@@ -196,6 +200,7 @@ def _item(
     row: ScreeningQuarantine,
     agent: Agent,
     history: list[ScreeningQuarantineResolution] | None = None,
+    miner_coldkey: str | None = None,
 ) -> AdminQuarantineItem:
     evidence, finding, finding_verified = _review_payloads(row, agent)
     return AdminQuarantineItem(
@@ -203,6 +208,7 @@ def _item(
         agent_id=row.agent_id,
         attempt_id=row.attempt_id,
         miner_hotkey=agent.miner_hotkey,
+        miner_coldkey=miner_coldkey,
         agent_name=agent.name,
         agent_version=agent.version,
         artifact_sha256=agent.sha256,
@@ -604,8 +610,16 @@ async def list_quarantines(
     history = await _resolution_history(
         session, [quarantine.quarantine_id for quarantine, _agent in rows]
     )
+    coldkeys = await get_miner_coldkeys_for_agents(
+        session, agent_ids={agent.agent_id for _quarantine, agent in rows}
+    )
     items = [
-        _item(quarantine, agent, history[quarantine.quarantine_id])
+        _item(
+            quarantine,
+            agent,
+            history[quarantine.quarantine_id],
+            coldkeys.get(agent.agent_id),
+        )
         for quarantine, agent in rows
     ]
     return AdminQuarantineList(items=items, count=total)
@@ -941,7 +955,8 @@ async def get_quarantine(
         raise HTTPException(status_code=404, detail="quarantine not found")
     quarantine, agent = result
     history = await _resolution_history(session, [quarantine.quarantine_id])
-    return _item(quarantine, agent, history[quarantine.quarantine_id])
+    coldkey = await get_miner_coldkey_for_agent(session, agent_id=agent.agent_id)
+    return _item(quarantine, agent, history[quarantine.quarantine_id], coldkey)
 
 
 async def _build_quarantine_context(
@@ -1077,6 +1092,22 @@ async def _build_quarantine_context(
             EvaluationPayment.agent_id == agent.agent_id
         )
     )
+    # Every coldkey that ever funded THIS hotkey. Usually one; several is
+    # ordinary miner behaviour, and the reviewer needs to see it rather than
+    # infer it from a single submission's payment row.
+    miner_coldkeys = sorted(
+        {
+            coldkey
+            for coldkey in (
+                await session.scalars(
+                    select(EvaluationPayment.miner_coldkey)
+                    .where(EvaluationPayment.miner_hotkey == agent.miner_hotkey)
+                    .distinct()
+                )
+            ).all()
+            if coldkey is not None
+        }
+    )
     duplicate_payment = aliased(EvaluationPayment)
     same_owner_filter = Agent.miner_hotkey == agent.miner_hotkey
     if candidate_coldkey is not None:
@@ -1140,6 +1171,7 @@ async def _build_quarantine_context(
             agent_name=other.name,
             agent_status=other.status,
             submitted_at=other.created_at,
+            miner_coldkey=other_coldkey,
             match=(
                 "identical_artifact"
                 if other.sha256 == agent.sha256
@@ -1156,10 +1188,11 @@ async def _build_quarantine_context(
     ]
 
     return AdminQuarantineContext(
-        quarantine=_item(quarantine, agent),
+        quarantine=_item(quarantine, agent, None, candidate_coldkey),
         agent=AdminQuarantineAgentContext(
             agent_id=agent.agent_id,
             miner_hotkey=agent.miner_hotkey,
+            miner_coldkey=candidate_coldkey,
             agent_name=agent.name,
             artifact_sha256=agent.sha256,
             agent_status=agent.status,
@@ -1185,6 +1218,7 @@ async def _build_quarantine_context(
         ],
         miner=AdminMinerContext(
             miner_hotkey=agent.miner_hotkey,
+            miner_coldkeys=miner_coldkeys,
             total_submissions=total_submissions,
             quarantine_count=quarantine_count,
             released_count=resolution_counts.get("release", 0),
@@ -1292,8 +1326,9 @@ async def resolve_quarantine(
         )
 
     history = await _resolution_history(session, [quarantine.quarantine_id])
+    coldkey = await get_miner_coldkey_for_agent(session, agent_id=agent.agent_id)
     return AdminQuarantineResolveResponse(
-        quarantine=_item(quarantine, agent, history[quarantine.quarantine_id]),
+        quarantine=_item(quarantine, agent, history[quarantine.quarantine_id], coldkey),
         agent_status=agent.status,
     )
 
@@ -1488,11 +1523,14 @@ async def _screening_attempts_by_agent(
 
 
 def _screening_submission(
-    agent: Agent, attempts: list[AdminScreeningAttempt]
+    agent: Agent,
+    attempts: list[AdminScreeningAttempt],
+    miner_coldkey: str | None = None,
 ) -> AdminScreeningSubmission:
     return AdminScreeningSubmission(
         agent_id=agent.agent_id,
         miner_hotkey=agent.miner_hotkey,
+        miner_coldkey=miner_coldkey,
         agent_name=agent.name,
         agent_version=agent.version,
         artifact_sha256=agent.sha256,
@@ -1529,10 +1567,17 @@ async def list_screening_submissions(
     attempts_by_agent = await _screening_attempts_by_agent(
         session, [agent.agent_id for agent in agents]
     )
+    coldkeys = await get_miner_coldkeys_for_agents(
+        session, agent_ids={agent.agent_id for agent in agents}
+    )
     return AdminScreeningSubmissionList(
         count=total,
         items=[
-            _screening_submission(agent, attempts_by_agent[agent.agent_id])
+            _screening_submission(
+                agent,
+                attempts_by_agent[agent.agent_id],
+                coldkeys.get(agent.agent_id),
+            )
             for agent in agents
         ],
     )
@@ -1549,7 +1594,8 @@ async def get_screening_submission(
     if agent is None:
         raise HTTPException(status_code=404, detail="screening submission not found")
     attempts_by_agent = await _screening_attempts_by_agent(session, [agent_id])
-    return _screening_submission(agent, attempts_by_agent[agent_id])
+    coldkey = await get_miner_coldkey_for_agent(session, agent_id=agent_id)
+    return _screening_submission(agent, attempts_by_agent[agent_id], coldkey)
 
 
 @router.post(

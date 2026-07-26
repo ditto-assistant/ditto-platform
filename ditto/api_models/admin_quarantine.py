@@ -27,6 +27,15 @@ class AdminQuarantineItem(BaseModel):
     agent_id: UUID
     attempt_id: UUID
     miner_hotkey: str
+    miner_coldkey: str | None = None
+    """Coldkey that paid for this evaluation, from ``evaluation_payments``.
+
+    Null for legacy/test agents with no payment row: unknown, not absent.
+    Payment-time provenance, not on-chain metagraph ownership, and miners
+    routinely pay from several coldkeys — a match is one signal of common
+    control, a mismatch is not evidence of different operators. Use
+    ``GET /admin/miner-owners/{key}`` for the full linked footprint.
+    """
     agent_name: str
     agent_version: int | None = None
     artifact_sha256: str
@@ -121,6 +130,15 @@ class AdminScreeningAttempt(BaseModel):
 class AdminScreeningSubmission(BaseModel):
     agent_id: UUID
     miner_hotkey: str
+    miner_coldkey: str | None = None
+    """Coldkey that paid for this evaluation, from ``evaluation_payments``.
+
+    Null for legacy/test agents with no payment row: unknown, not absent.
+    Payment-time provenance, not on-chain metagraph ownership, and miners
+    routinely pay from several coldkeys — a match is one signal of common
+    control, a mismatch is not evidence of different operators. Use
+    ``GET /admin/miner-owners/{key}`` for the full linked footprint.
+    """
     agent_name: str
     agent_version: int | None = None
     artifact_sha256: str
@@ -274,6 +292,15 @@ class AdminQuarantineAgentContext(BaseModel):
 
     agent_id: UUID
     miner_hotkey: str
+    miner_coldkey: str | None = None
+    """Coldkey that paid for this evaluation, from ``evaluation_payments``.
+
+    Null for legacy/test agents with no payment row: unknown, not absent.
+    Payment-time provenance, not on-chain metagraph ownership, and miners
+    routinely pay from several coldkeys — a match is one signal of common
+    control, a mismatch is not evidence of different operators. Use
+    ``GET /admin/miner-owners/{key}`` for the full linked footprint.
+    """
     agent_name: str
     artifact_sha256: str
     agent_status: str
@@ -301,6 +328,15 @@ class AdminMinerContext(BaseModel):
     """The submitting miner's track record across all submissions."""
 
     miner_hotkey: str
+    miner_coldkeys: list[str] = Field(default_factory=list)
+    """Every payment-time coldkey ever recorded for this hotkey.
+
+    Usually one; more than one means the hotkey's uploads were funded from
+    several coldkeys, which is ordinary miner behaviour and not by itself
+    suspicious. The counts below are keyed on the hotkey alone, so an operator
+    running several hotkeys shows a fragmented record here — resolve the whole
+    footprint with ``GET /admin/miner-owners/{key}``.
+    """
     total_submissions: int
     quarantine_count: int
     released_count: int
@@ -314,11 +350,23 @@ class AdminArtifactDuplicate(BaseModel):
 
     agent_id: UUID
     miner_hotkey: str
+    miner_coldkey: str | None = None
+    """Coldkey that paid for this evaluation, from ``evaluation_payments``.
+
+    Null for legacy/test agents with no payment row: unknown, not absent.
+    Payment-time provenance, not on-chain metagraph ownership, and miners
+    routinely pay from several coldkeys — a match is one signal of common
+    control, a mismatch is not evidence of different operators. Use
+    ``GET /admin/miner-owners/{key}`` for the full linked footprint.
+    """
     agent_name: str
     agent_status: str
     submitted_at: datetime
     match: Literal["identical_artifact", "identical_normalized_source"]
     same_owner: bool = False
+    """True when this duplicate shares the reviewed submission's hotkey, or its
+    payment coldkey. False covers both "provably someone else" and "no payment
+    record to compare", so it is a positive signal only when true."""
 
 
 class AdminDuplicateSummary(BaseModel):

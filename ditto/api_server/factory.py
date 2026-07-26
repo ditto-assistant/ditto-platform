@@ -40,6 +40,7 @@ from ditto.api_server.endpoints import (
     admin_inference_routes_router,
     admin_lease_revocations_router,
     admin_miner_fees_router,
+    admin_owner_router,
     admin_quarantine_router,
     admin_queue_policy_settings_router,
     admin_retirement_router,
@@ -336,6 +337,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(admin_efficiency_bonus_settings_router, prefix="/api/v1")
     app.include_router(admin_inference_routes_router, prefix="/api/v1")
     app.include_router(admin_lease_revocations_router, prefix="/api/v1")
+    app.include_router(admin_owner_router, prefix="/api/v1")
     app.include_router(admin_quarantine_router, prefix="/api/v1")
     app.include_router(admin_validation_retry_router, prefix="/api/v1")
     app.include_router(admin_retirement_router, prefix="/api/v1")
