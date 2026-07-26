@@ -1503,6 +1503,8 @@ def _public_entry(
     completed_wave_count: int = 0,
     initial_quorum_composites: tuple[float, ...] = (),
     completed_wave_composites: tuple[float, ...] = (),
+    confirmation_seed_depth: int = 0,
+    confirmation_seed_composites: tuple[float, ...] = (),
     continual_aggregate_active: bool = False,
     efficiency_bonus: float | None = None,
     efficiency_snapshot_id: UUID | None = None,
@@ -1554,6 +1556,8 @@ def _public_entry(
         completed_wave_count=completed_wave_count,
         initial_quorum_composites=list(initial_quorum_composites),
         completed_wave_composites=list(completed_wave_composites),
+        confirmation_seed_depth=confirmation_seed_depth,
+        confirmation_seed_composites=list(confirmation_seed_composites),
         raw_composite=(
             float(details["raw_composite"])
             if isinstance(details.get("raw_composite"), (int, float))
@@ -2169,6 +2173,21 @@ async def leaderboard(
                     value
                     for _seed, value in sorted(
                         completed_by_seed.get(row.agent_id, {}).items()
+                    )
+                ),
+                # The raw, unfiltered append-only trail, alongside the
+                # fold-eligible subset above. ``_completed_wave_data`` keeps
+                # only seeds shared by *every current* emission-set member, so a
+                # new entrant with no retests yet empties that intersection and
+                # ``completed_wave_*`` collapses to zero board-wide even though
+                # nothing was deleted. Surfacing the raw depth separately is
+                # what makes that distinction visible instead of looking like
+                # data loss; the fold still consumes only the completed subset.
+                confirmation_seed_depth=confirmation_depth.get(row.agent_id, 0),
+                confirmation_seed_composites=tuple(
+                    value
+                    for _seed, value in sorted(
+                        confirmation_by_seed.get(row.agent_id, {}).items()
                     )
                 ),
                 continual_aggregate_active=continual_mean_active,
