@@ -67,7 +67,7 @@ from ditto.db.queries.benchmark_admission import (
     validator_queue_admission_predicate,
 )
 from ditto.db.queries.scores import SCORING_QUORUM
-from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION
+from ditto.db.queries.tickets import retry_budget_spent
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -190,12 +190,7 @@ async def desired_era_work_outstanding(
                     ValidatorTicket.status == TicketStatus.EXPIRED,
                     or_(
                         ValidatorTicket.retry_after > now,
-                        ValidatorTicket.attempt_count
-                        >= (
-                            MAX_ATTEMPTS_PER_VERSION
-                            + ValidatorTicket.manual_retry_grants
-                            + ValidatorTicket.infra_retry_grants
-                        ),
+                        retry_budget_spent(),
                     ),
                 ),
             ),

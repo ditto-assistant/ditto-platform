@@ -86,6 +86,168 @@ async def _seed_heartbeat(
     await session.flush()
 
 
+# Exactly the shape of the live v7 fleet the owner-pin defect was found on:
+# three version-capable validators against a quorum of three, so a single
+# retry-exhausted validator already puts a submission out of reach.
+_CAPABLE_FLEET = ("5CapableA", "5CapableB", "5CapableC")
+_OWNER_COLDKEY = "5SharedOwnerColdkey"
+_OWNER_ROLLOUT_STARTED = _NOW - timedelta(hours=6)
+
+
+async def _seed_capable_heartbeat(
+    session: AsyncSession, *, validator_hotkey: str, bench_version: int = 3
+) -> None:
+    """A fresh signed heartbeat that advertises ``bench_version``.
+
+    Only a validator the platform can see as capable counts toward the quorum
+    ceiling, so reachability tests must publish a real capability payload
+    rather than the bare slot snapshot :func:`_seed_heartbeat` stores.
+    """
+    revision = "a" * 40
+    session.add(
+        ValidatorHeartbeat(
+            validator_hotkey=validator_hotkey,
+            software_version="1.3.0",
+            protocol_version=12,
+            code_digest="d" * 64,
+            state="polling",
+            first_seen_at=_NOW,
+            reported_at=_NOW,
+            seen_at=_NOW,
+            signature="ab" * 64,
+            capabilities={
+                "screened_images": True,
+                "require_screened_image": False,
+                "source_build_fallback": True,
+                "full_stack_managed": False,
+                "stack_updater": False,
+                "sandbox_egress_restricted": True,
+                "ticket_inference": False,
+                "signed_score_quorum": False,
+                "executor_isolation": "privileged_dind",
+                "scorer_benchmarks": {
+                    "status": "fresh_verified",
+                    "supported_bench_versions": [2, bench_version],
+                    "observed_at": int(_NOW.timestamp()),
+                    "software_version": "1.3.0",
+                    "source_revision": revision,
+                },
+            },
+            stack={
+                "mode": "source",
+                "compose_schema": 1,
+                "release_descriptor_digest": None,
+                "components": {
+                    name: {
+                        "source_revision": (
+                            revision if name == "dittobench_api" else "b" * 40
+                        ),
+                        "version": "1.3.0" if name == "dittobench_api" else "1.2.0",
+                        "provenance": "committed_pin",
+                    }
+                    for name in (
+                        "ditto_subnet",
+                        "dittobench_api",
+                        "sandbox_docker",
+                        "model_relay",
+                        "pylon",
+                        "ollama",
+                    )
+                },
+            },
+        )
+    )
+    await session.flush()
+
+
+def _owner_ticket(
+    agent_id: UUID,
+    validator_hotkey: str,
+    *,
+    status: TicketStatus,
+    attempt_count: int = MAX_ATTEMPTS_PER_VERSION,
+    retry_after: datetime | None = None,
+    deadline: datetime | None = None,
+    started_after: timedelta = timedelta(minutes=10),
+) -> ValidatorTicket:
+    """One validator's history on an owner generation.
+
+    Defaults to a spent retry budget, the only state that permanently costs a
+    submission a quorum slot. ``started_after`` sets ``issued_at``, which is
+    what the pin orders generations by.
+    """
+    return ValidatorTicket(
+        agent_id=agent_id,
+        validator_hotkey=validator_hotkey,
+        bench_version=3,
+        status=status,
+        issued_at=_OWNER_ROLLOUT_STARTED + started_after,
+        deadline=deadline or (_NOW - timedelta(hours=1)),
+        retry_after=retry_after,
+        attempt_count=attempt_count,
+    )
+
+
+async def _seed_owner_generations(
+    session: AsyncSession, *, older: str, newer: str
+) -> tuple[UUID, UUID]:
+    """Two admitted same-owner generations on an activated v3 era.
+
+    Linked by a shared payment coldkey rather than a shared hotkey, matching
+    the live case where one miner submitted from two hotkeys.
+    """
+    older_id = await _seed_evaluating(
+        session,
+        created_at=_OWNER_ROLLOUT_STARTED + timedelta(minutes=5),
+        name=older,
+        screened=True,
+    )
+    newer_id = await _seed_evaluating(
+        session,
+        created_at=_OWNER_ROLLOUT_STARTED + timedelta(hours=4),
+        name=newer,
+        screened=True,
+    )
+    async with session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=2,
+                desired_version=3,
+                status="activated",
+                cohort_size=5,
+                created_at=_OWNER_ROLLOUT_STARTED,
+                activated_at=_OWNER_ROLLOUT_STARTED,
+            )
+        )
+        for index, agent_id in enumerate((older_id, newer_id)):
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            session.add_all(
+                [
+                    BenchmarkDataset(
+                        agent_id=agent_id,
+                        bench_version=3,
+                        seed=321 + index,
+                        sha256=f"{index + 7:02x}" * 32,
+                        run_size="full",
+                    ),
+                    EvaluationPayment(
+                        block_hash=f"0xowner-reach-{index}",
+                        extrinsic_index=index,
+                        agent_id=agent_id,
+                        miner_hotkey=agent.miner_hotkey,
+                        miner_coldkey=_OWNER_COLDKEY,
+                        amount_rao=1,
+                        tao_usd_rate=Decimal("1"),
+                        dest_address="5Destination",
+                        timestamp=_OWNER_ROLLOUT_STARTED,
+                    ),
+                ]
+            )
+    return older_id, newer_id
+
+
 def _active_slot(
     agent_id: UUID,
     *,
@@ -815,6 +977,162 @@ class TestIssueTicket:
 
         assert ticket is not None
         assert ticket.agent_id == fresh
+
+    async def test_unreachable_pinned_generation_falls_through_to_sibling(
+        self, session: AsyncSession
+    ) -> None:
+        """The pin asks "can this still finish?", not "did it start first?".
+
+        The live incident: an owner's oldest generation had burned every
+        capable validator's retry budget, so it could never collect
+        ``SCORING_QUORUM`` scores -- yet its first-started progress kept it
+        pinned, and the owner's healthy newer submission was never leased while
+        fleet slots sat idle.
+        """
+        dead, healthy = await _seed_owner_generations(
+            session, older="dead-generation", newer="healthy-generation"
+        )
+        async with session.begin():
+            for hotkey in _CAPABLE_FLEET:
+                await _seed_capable_heartbeat(session, validator_hotkey=hotkey)
+            # One score banked, then both remaining capable validators spent
+            # their whole budget on it. Ceiling is 1 of a required 3.
+            session.add(
+                _owner_ticket(dead, _CAPABLE_FLEET[0], status=TicketStatus.SCORED)
+            )
+            for hotkey in _CAPABLE_FLEET[1:]:
+                session.add(_owner_ticket(dead, hotkey, status=TicketStatus.EXPIRED))
+            # The sibling started progress later, so it loses the pin on
+            # ``min(issued_at)`` and can only win it by being the reachable
+            # one. Ceiling is 3 of a required 3.
+            session.add(
+                _owner_ticket(
+                    healthy,
+                    _CAPABLE_FLEET[0],
+                    status=TicketStatus.SCORED,
+                    started_after=timedelta(hours=3),
+                )
+            )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey=_CAPABLE_FLEET[1],
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=3,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == healthy
+
+    async def test_reachable_pinned_generation_still_pins_sibling(
+        self, session: AsyncSession
+    ) -> None:
+        """No regression on quorum completion: only *provably* dead rows fall through.
+
+        A recorded score, a live lease and a retry cooldown all still lead to a
+        score, so none of them may cost a generation its pin. This is why the
+        term counts spent retry budgets rather than reusing
+        ``desired_era_work_outstanding``'s "could a validator take this right
+        now" -- that question answers "no" here, and unpinning mid-quorum is
+        exactly the diversion pinning exists to prevent.
+        """
+        pinned, sibling = await _seed_owner_generations(
+            session, older="pinned-generation", newer="younger-sibling"
+        )
+        async with session.begin():
+            for hotkey in _CAPABLE_FLEET:
+                await _seed_capable_heartbeat(session, validator_hotkey=hotkey)
+            session.add(
+                _owner_ticket(pinned, _CAPABLE_FLEET[0], status=TicketStatus.SCORED)
+            )
+            # Cooling down, not exhausted: this validator comes back, so the
+            # ceiling is still 3 of a required 3 and the pin must survive.
+            session.add(
+                _owner_ticket(
+                    pinned,
+                    _CAPABLE_FLEET[2],
+                    status=TicketStatus.EXPIRED,
+                    attempt_count=1,
+                    retry_after=_NOW + timedelta(hours=1),
+                )
+            )
+            # Reachable and pin-selectable, so it takes the owner's slot the
+            # moment the older generation is wrongly judged dead.
+            session.add(
+                _owner_ticket(
+                    sibling,
+                    _CAPABLE_FLEET[0],
+                    status=TicketStatus.SCORED,
+                    started_after=timedelta(hours=3),
+                )
+            )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey=_CAPABLE_FLEET[1],
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=3,
+            )
+
+        assert ticket is not None
+        assert ticket.agent_id == pinned
+        assert ticket.agent_id != sibling
+
+    async def test_live_lease_still_bounds_owner_even_when_unreachable(
+        self, session: AsyncSession
+    ) -> None:
+        """One live lease per owner outranks the new fall-through.
+
+        With nine concurrent fleet slots, the live-sibling rail is the only
+        thing stopping one owner monopolising the fleet, so a generation losing
+        its pin must never let a sibling start while a lease is still out on
+        it. Here the older generation is genuinely unreachable *and* still
+        holds a live lease: the sibling stays shut out until that lease
+        resolves.
+        """
+        leased, sibling = await _seed_owner_generations(
+            session, older="leased-generation", newer="waiting-sibling"
+        )
+        async with session.begin():
+            for hotkey in _CAPABLE_FLEET:
+                await _seed_capable_heartbeat(session, validator_hotkey=hotkey)
+            session.add(
+                _owner_ticket(leased, _CAPABLE_FLEET[0], status=TicketStatus.SCORED)
+            )
+            session.add(
+                _owner_ticket(leased, _CAPABLE_FLEET[1], status=TicketStatus.EXPIRED)
+            )
+            # Ceiling is 2 of a required 3, so the pin is gone -- but this
+            # lease is still live and the owner's slot is still occupied.
+            session.add(
+                _owner_ticket(
+                    leased,
+                    _CAPABLE_FLEET[2],
+                    status=TicketStatus.ISSUED,
+                    deadline=_NOW + timedelta(minutes=20),
+                )
+            )
+
+        async with session.begin():
+            ticket = await issue_ticket(
+                session,
+                validator_hotkey=_CAPABLE_FLEET[1],
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=3,
+            )
+
+        assert ticket is None
+        async with session.begin():
+            assert (
+                await session.scalar(
+                    select(func.count()).where(ValidatorTicket.agent_id == sibling)
+                )
+            ) == 0
 
     async def test_below_top_ten_owner_history_does_not_pin_fresh_sibling(
         self, session: AsyncSession

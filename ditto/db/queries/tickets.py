@@ -45,6 +45,7 @@ from ditto.db.queries.queue_order import (
     owner_live_lease_agent_ids,
     queue_candidate_predicate,
     queue_order_terms,
+    quorum_capable_validator_hotkeys,
     resolve_fifo_start_at,
     resolve_owner_linkage,
     selected_owner_agent_id,
@@ -55,6 +56,7 @@ from ditto.db.queries.scores import (
 )
 
 if TYPE_CHECKING:
+    from sqlalchemy import ColumnElement
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -119,6 +121,22 @@ def ticket_attempt_cap(ticket: ValidatorTicket) -> int:
         MAX_ATTEMPTS_PER_VERSION
         + ticket.manual_retry_grants
         + ticket.infra_retry_grants
+    )
+
+
+def retry_budget_spent() -> ColumnElement[bool]:
+    """SQL twin of :func:`ticket_attempt_cap`, as a ``ValidatorTicket`` predicate.
+
+    True when this lease has burned every attempt it will ever get, so no
+    amount of waiting brings the validator back to this agent. The Python and
+    SQL forms must describe the same budget, so both live here and every
+    surface -- issuance, the completion-first head check, the desired-era
+    backlog gate, owner reachability -- spells the sum exactly once.
+    """
+    return ValidatorTicket.attempt_count >= (
+        MAX_ATTEMPTS_PER_VERSION
+        + ValidatorTicket.manual_retry_grants
+        + ValidatorTicket.infra_retry_grants
     )
 
 
@@ -389,17 +407,7 @@ async def issue_ticket(
             ValidatorTicket.status.in_(_LIVE_TICKET_STATUSES)
             | (
                 (ValidatorTicket.status == TicketStatus.EXPIRED)
-                & (
-                    (ValidatorTicket.retry_after > now)
-                    | (
-                        ValidatorTicket.attempt_count
-                        >= (
-                            MAX_ATTEMPTS_PER_VERSION
-                            + ValidatorTicket.manual_retry_grants
-                            + ValidatorTicket.infra_retry_grants
-                        )
-                    )
-                )
+                & ((ValidatorTicket.retry_after > now) | retry_budget_spent())
             )
         ),
     )
@@ -421,6 +429,13 @@ async def issue_ticket(
     # separate statement after the lock is acquired, so under Postgres READ
     # COMMITTED it sees any ticket committed by the previous lock holder.
     # SKIP LOCKED lets unrelated agents continue allocating concurrently.
+
+    # The fleet that could still score this version, read once per issuance.
+    # Only used to decide whether a *pinned* owner generation is provably
+    # finished; the preview reads the same fleet for the same predicate.
+    capable_hotkeys = await quorum_capable_validator_hotkeys(
+        session, bench_version=bench_version, now=now
+    )
     skipped: list[UUID] = []
     while True:
         # The validator-independent half of the filter is shared with the queue
@@ -502,6 +517,7 @@ async def issue_ticket(
             now=now,
             provisional_contender_floor=provisional_contender_floor,
             rollout=activated_rollout,
+            capable_validator_hotkeys=capable_hotkeys,
         )
         if owner_selected_agent_id is not None and owner_selected_agent_id != agent_id:
             skipped.append(agent_id)
@@ -535,14 +551,7 @@ async def issue_ticket(
                             (ValidatorTicket.status == TicketStatus.EXPIRED)
                             & (
                                 (ValidatorTicket.retry_after > now)
-                                | (
-                                    ValidatorTicket.attempt_count
-                                    >= (
-                                        MAX_ATTEMPTS_PER_VERSION
-                                        + ValidatorTicket.manual_retry_grants
-                                        + ValidatorTicket.infra_retry_grants
-                                    )
-                                )
+                                | retry_budget_spent()
                             )
                         )
                     ),
