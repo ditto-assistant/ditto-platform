@@ -33,6 +33,45 @@ class ContinualRetestSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     aggregate_mode: Literal["disabled", "fleet_ready", "enabled"] = "fleet_ready"
+
+    wave_membership: Literal["strict", "participants", "per_agent"] = "strict"
+    """Whose retests have to land before a seed counts toward the aggregate.
+
+    **This changes what validators weight.** ``official_composite`` is the
+    continual mean of the three quorum scores plus one score per fold-eligible
+    seed, so widening this widens the estimator, re-orders the tail, and moves
+    emission shares. It ships ``strict`` -- byte-identical to today -- and every
+    other value is an operator decision with an audit trail.
+
+    ``strict`` intersects over every *current* emission-set member. That is
+    today's behaviour and it has a defect: a newly finalized agent entering the
+    top five with no retests of its own empties the intersection, so every other
+    agent's accumulated depth stops counting and ``official_composite`` falls
+    back to the three-score quorum median board-wide. The rows are append-only
+    and were never deleted, but the fold stops reading them. Every top-five
+    membership change discards accumulated retest signal.
+
+    ``participants`` takes the same intersection over members that hold at least
+    one confirmation row. An agent at depth zero has never been issued a lease
+    for any of these seeds, so it is not protecting one; excluding it can only
+    preserve evidence, never fabricate any. Shared-seed comparability is fully
+    intact -- every agent receiving a continual mean still shares one intersected
+    seed set. **This is the recommended setting**: it fixes the incident without
+    weakening the property the intersection exists to protect.
+
+    ``per_agent`` drops the intersection: each agent aggregates over its own
+    completed seeds. Most responsive, least comparable -- two agents' means are
+    then taken over different seed sets and the difference between them carries
+    a seed-composition term that common random numbers exist to cancel. Unbiased
+    under exchangeable draws, but noisier, and at a ``KOTH_MARGIN`` of 0.007 the
+    added noise is the same size as the decision it feeds.
+
+    See :func:`ditto.db.queries.confirmation_scores.fold_eligible_seeds_by_agent`
+    for the full argument. The paired dethrone test is unaffected by all three:
+    ``koth._paired_statistic`` computes its own pairwise intersection between
+    challenger and champion.
+    """
+
     idle_retests_enabled: bool = False
     rollout_standdown: Literal["off", "capable_validators", "all"] = (
         "capable_validators"

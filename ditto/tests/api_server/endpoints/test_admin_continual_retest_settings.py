@@ -87,6 +87,10 @@ async def test_defaults_are_safe_and_revision_is_audited(
         "retest_eligibility_mode": "fixed",
         "retest_eligibility_z": 1.64,
         "retest_cohort_max_size": 25,
+        # Ships on today's behaviour. This one feeds the weight fold, so the
+        # default has to be the strict intersection until an operator decides
+        # otherwise with an audit trail.
+        "wave_membership": "strict",
     }
     assert initial.json()["effective"]["open_rollout_desired_version"] is None
     assert initial.json()["effective"]["rollout_standdown_active"] is False
@@ -303,6 +307,52 @@ async def test_stored_revisions_predating_the_tie_band_still_load() -> None:
     resolved = settings_from_row(_Row())  # type: ignore[arg-type]
     assert resolved.retest_cohort_size == 25
     assert resolved.retest_eligibility_mode == "fixed"
+
+
+async def test_wave_membership_is_operator_controlled(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    settings_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The mode that moves the weight fold is one audited revision away."""
+    _install(app, settings_maker)
+
+    for mode in ("strict", "per_agent", "participants"):
+        payload = _payload(expected_revision=0)
+        payload["settings"]["wave_membership"] = mode  # type: ignore[index]
+        applied = await client.post(_URL, headers=_HEADERS, json=payload)
+        assert applied.status_code in (200, 409), applied.text
+        if applied.status_code == 200:
+            assert applied.json()["settings"]["wave_membership"] == mode
+            break
+
+    rejected = _payload(expected_revision=1)
+    rejected["settings"]["wave_membership"] = "everyone"  # type: ignore[index]
+    assert (await client.post(_URL, headers=_HEADERS, json=rejected)).status_code == 422
+
+
+async def test_stored_revisions_predating_wave_membership_still_load() -> None:
+    """An existing revision acquires the shipped default, not its old fold.
+
+    The board is append-only and v7 is live. ``participants`` is a deliberate,
+    authorized change to the fold, so a revision written before the field
+    existed resolves to it exactly as a fresh board does -- the field is absent
+    from the stored JSON, so there is no stored intent to preserve.
+    """
+    from ditto.api_server.continual_retest_settings import settings_from_row
+
+    class _Row:
+        revision = 5
+        settings = {
+            "aggregate_mode": "enabled",
+            "idle_retests_enabled": True,
+            "rollout_standdown": "all",
+            "retest_cohort_size": 25,
+        }
+
+    resolved = settings_from_row(_Row())  # type: ignore[arg-type]
+    assert resolved.retest_cohort_size == 25
+    assert resolved.wave_membership == "participants"
 
 
 async def test_stored_revisions_predating_the_cohort_dial_still_load() -> None:

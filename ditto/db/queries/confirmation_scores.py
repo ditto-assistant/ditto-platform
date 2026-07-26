@@ -18,7 +18,7 @@ from __future__ import annotations
 import statistics
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -61,6 +61,9 @@ class ConfirmationHistoryRow:
     signature: str | None
 
 
+WaveMembership = Literal["strict", "participants", "per_agent"]
+
+
 def completed_confirmation_wave_seeds(
     *,
     member_ids: Iterable[UUID],
@@ -73,6 +76,10 @@ def completed_confirmation_wave_seeds(
     not enter the KOTH fold until every current top-five member has one result
     for the same seed.  Otherwise the first report can change the champion and
     invalidate the still-running leases for the rest of the wave.
+
+    This is the ``strict`` half of :func:`fold_eligible_seeds_by_agent`; see
+    there for why "every current member" is not the same predicate as "every
+    member the wave was actually issued to".
     """
     members = tuple(dict.fromkeys(member_ids))
     if not members:
@@ -84,6 +91,87 @@ def completed_confirmation_wave_seeds(
         if not common:
             return frozenset()
     return frozenset(common or ())
+
+
+def fold_eligible_seeds_by_agent(
+    *,
+    member_ids: Iterable[UUID],
+    seeds_by_agent: Mapping[UUID, Iterable[int]],
+    mode: WaveMembership = "strict",
+) -> dict[UUID, frozenset[int]]:
+    """Per agent, which confirmation seeds may enter the fold's aggregate.
+
+    Three policies, widening in order. All three are pure functions of the same
+    two inputs; the mode is an operator setting because the choice changes what
+    ``effective_composite`` averages and therefore what validators weight.
+
+    ``strict`` -- the shipped behaviour. One global intersection over EVERY
+        current emission-set member, handed to every agent.
+
+        The invariant it buys is real: ``effective_composite`` averages the three
+        quorum scores together with one score per wave, and it is handed a bare
+        tuple of composites with the seed identity already discarded. Comparing
+        two such means is only sound when the two agents were measured on the
+        SAME seeds, because seed difficulty is the dominant variance term --
+        that is the whole reason the lane uses common random numbers.
+
+        Its defect is that "every current member" is evaluated against the live
+        emission set rather than against the membership the wave was issued to.
+        A newly finalized agent entering the top five with no retests of its own
+        empties the intersection, and every other agent's accumulated depth
+        silently stops counting. This is not display-only: ``official_composite``
+        falls back from the continual mean to the three-score quorum median, so
+        the aggregate feeding validator weights reverts too. Every top-five
+        membership change currently discards the fold's accumulated evidence.
+
+    ``participants`` -- the same intersection, taken over members that hold at
+        least one confirmation row. An agent that has never reported a single
+        seed is not "still running" any wave, so it cannot be protecting a lease;
+        including it can only erase evidence, never validate any. Equal sample
+        composition is fully preserved among every agent that receives a
+        continual mean, because they still share one intersected seed set. A
+        member at depth zero simply keeps its quorum median until it starts
+        reporting, exactly as every agent outside the emission set already does.
+
+        This is a strictly smaller change than it looks: the board ALREADY mixes
+        the two estimators. ``official_composite`` is computed for every
+        finalized row and sorted into one list, so an agent with completed waves
+        is already ranked directly against an agent on its quorum median at the
+        rank-five boundary. ``participants`` does not introduce that mixing; it
+        stops a membership change from flipping every agent onto the noisier
+        estimator at once.
+
+    ``per_agent`` -- each agent aggregates over its own completed seeds, with no
+        intersection at all. This is the most responsive and the least
+        comparable: two agents' means are then taken over different seed sets, so
+        the difference between them carries a seed-composition term that the
+        shared-seed design exists to cancel. Under exchangeable CRN draws it
+        stays unbiased, but it adds variance, and variance is what the whole lane
+        was built to suppress -- at a ``KOTH_MARGIN`` of 0.007 the noise is the
+        same size as the decision. Offered because it is what "retests should
+        count for an agent even when others lack waves" literally asks for, and
+        gated because it changes what validators weight.
+
+    Note that the paired dethrone test is untouched by all three.
+    ``koth._paired_statistic`` computes its OWN pairwise seed intersection
+    between challenger and champion, so the crown comparison stays paired
+    whatever this returns.
+    """
+    members = tuple(dict.fromkeys(member_ids))
+    own = {agent_id: frozenset(seeds) for agent_id, seeds in seeds_by_agent.items()}
+    if mode == "per_agent":
+        return own
+    if mode == "participants":
+        members = tuple(member_id for member_id in members if own.get(member_id))
+    shared = completed_confirmation_wave_seeds(
+        member_ids=members, seeds_by_agent=seeds_by_agent
+    )
+    # Intersected with what the agent actually holds, so the result is that
+    # agent's fold-eligible seeds rather than a filter to be applied later. For
+    # every member this is the shared set unchanged (the intersection could not
+    # contain a seed the member is missing); it only narrows for a non-member
+    # that happens to carry rows, which the widened retest cohort makes routine.
+    return {agent_id: seeds & shared for agent_id, seeds in own.items()}
 
 
 async def append_confirmation_scores(

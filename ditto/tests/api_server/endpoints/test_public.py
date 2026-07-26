@@ -1266,6 +1266,127 @@ class TestPublicLeaderboard:
         assert entries[entrant_id]["confirmation_seed_depth"] == 0
         assert entries[entrant_id]["confirmation_seed_composites"] == []
 
+    async def test_participants_membership_keeps_the_fold_on_the_continual_mean(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The other half of the 03:56Z incident: the WEIGHT side, not display.
+
+        #485 made the audit trail survive a membership change. It deliberately
+        left ``official_composite`` alone, so an entrant with no retests still
+        knocks every agent off the continual mean and back onto the three-score
+        quorum median -- and that aggregate is what validators weight.
+
+        With ``wave_membership="participants"`` the zero-depth entrant no longer
+        empties the intersection, so the agents that actually ran the waves keep
+        their accumulated estimator. The entrant itself still gets the canonical
+        median, exactly like every agent outside the emission set.
+        """
+        from ditto.db.models import ContinualRetestSettingsRevision
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        champion_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.90, 0.90, 0.90],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        tail_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.80, 0.80, 0.80],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_C,
+                    software_version="0.28.0",
+                    protocol_version=14,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                    capabilities=_scorer_capabilities(
+                        now, versions=[DEFAULT_BENCH_VERSION]
+                    ),
+                )
+            )
+            s.add(
+                ContinualRetestSettingsRevision(
+                    parent_revision=0,
+                    scope="*",
+                    settings={
+                        "aggregate_mode": "fleet_ready",
+                        "idle_retests_enabled": False,
+                        "wave_membership": "participants",
+                    },
+                    checksum="c" * 64,
+                    reason="keep retest evidence across a membership change",
+                    actor="operator@example.com",
+                )
+            )
+            # 0.60 on every wave seed, well below the 0.90 quorum median, so the
+            # continual mean is unmistakably distinguishable from the fallback:
+            # mean(0.90, 0.90, 0.90, 0.60, 0.60, 0.60) = 0.75.
+            await append_confirmation_scores(
+                s,
+                rows=[
+                    ConfirmationSeedScore(
+                        UUID(agent_id),
+                        "5V1",
+                        seed,
+                        0.60,
+                        f"r{agent_id}-{seed}",
+                        None,
+                    )
+                    for agent_id in (champion_id, tail_id)
+                    for seed in (100, 200, 300)
+                ],
+                bench_version=DEFAULT_BENCH_VERSION,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+
+        entrant_id = await _seed_k3(
+            session_maker,
+            miner="5Cq" + "z" * 45,
+            composites=[0.95, 0.95, 0.95],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 3, tzinfo=UTC),
+        )
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+        entries = {entry["agent_id"]: entry for entry in body["entries"]}
+
+        # The evidence survives the entrant, on the FOLD side this time.
+        assert entries[champion_id]["completed_wave_count"] == 3
+        assert entries[champion_id]["aggregate_method"] == "continual_mean"
+        assert entries[champion_id]["official_composite"] == pytest.approx(0.75)
+        assert entries[tail_id]["completed_wave_count"] == 3
+        # Equal sample composition: both agents averaged the same three seeds.
+        assert entries[champion_id]["completed_wave_composites"] == pytest.approx(
+            entries[tail_id]["completed_wave_composites"]
+        )
+        # The entrant has run nothing, so it stays on the canonical median --
+        # the same estimator every agent outside the emission set already uses.
+        assert entries[entrant_id]["completed_wave_count"] == 0
+        assert entries[entrant_id]["aggregate_method"] == "canonical_median"
+        assert entries[entrant_id]["official_composite"] == pytest.approx(0.95)
+        # And the raw audit trail from #485 is still there underneath.
+        assert entries[champion_id]["confirmation_seed_depth"] == 3
+
     async def test_marks_deregistered_scores_retained_but_emission_ineligible(
         self,
         app: FastAPI,
