@@ -83,6 +83,7 @@ Revises: f3b8c2d17a49
 Create Date: 2026-07-26
 """
 
+import contextlib
 import random
 import time
 from collections.abc import Sequence
@@ -160,7 +161,11 @@ def _with_retry(bind: Connection, statements: Sequence[str], what: str) -> None:
             bind.exec_driver_sql("COMMIT")
             return
         except exc.DBAPIError as error:
-            bind.exec_driver_sql("ROLLBACK")
+            # Best-effort: a ROLLBACK that itself fails must not replace the
+            # error that actually explains the failure. A deploy log that names
+            # the wrong cause is worse than one that names none.
+            with contextlib.suppress(exc.DBAPIError):
+                bind.exec_driver_sql("ROLLBACK")
             if not _retryable(error) or attempt == MAX_ATTEMPTS:
                 raise
             delay = _backoff(attempt)
