@@ -18,13 +18,17 @@ from __future__ import annotations
 import statistics
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
+from ditto.api_models.continual_retest_settings import (
+    DEFAULT_WAVE_MEMBERSHIP,
+    WaveMembership,
+)
 from ditto.db.models import ConfirmationScore
 
 if TYPE_CHECKING:
@@ -61,9 +65,6 @@ class ConfirmationHistoryRow:
     signature: str | None
 
 
-WaveMembership = Literal["strict", "participants", "per_agent"]
-
-
 def completed_confirmation_wave_seeds(
     *,
     member_ids: Iterable[UUID],
@@ -97,7 +98,7 @@ def fold_eligible_seeds_by_agent(
     *,
     member_ids: Iterable[UUID],
     seeds_by_agent: Mapping[UUID, Iterable[int]],
-    mode: WaveMembership = "strict",
+    mode: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
 ) -> dict[UUID, frozenset[int]]:
     """Per agent, which confirmation seeds may enter the fold's aggregate.
 
@@ -105,8 +106,9 @@ def fold_eligible_seeds_by_agent(
     two inputs; the mode is an operator setting because the choice changes what
     ``effective_composite`` averages and therefore what validators weight.
 
-    ``strict`` -- the shipped behaviour. One global intersection over EVERY
-        current emission-set member, handed to every agent.
+    ``strict`` -- the historical behaviour, and now the ROLLBACK PATH rather
+        than the default. One global intersection over EVERY current
+        emission-set member, handed to every agent.
 
         The invariant it buys is real: ``effective_composite`` averages the three
         quorum scores together with one score per wave, and it is handed a bare
@@ -124,7 +126,8 @@ def fold_eligible_seeds_by_agent(
         the aggregate feeding validator weights reverts too. Every top-five
         membership change currently discards the fold's accumulated evidence.
 
-    ``participants`` -- the same intersection, taken over members that hold at
+    ``participants`` -- **the shipped default.** The same intersection, taken
+        over members that hold at
         least one confirmation row. An agent that has never reported a single
         seed is not "still running" any wave, so it cannot be protecting a lease;
         including it can only erase evidence, never validate any. Equal sample

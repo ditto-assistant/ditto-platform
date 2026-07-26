@@ -87,10 +87,11 @@ async def test_defaults_are_safe_and_revision_is_audited(
         "retest_eligibility_mode": "fixed",
         "retest_eligibility_z": 1.64,
         "retest_cohort_max_size": 25,
-        # Ships on today's behaviour. This one feeds the weight fold, so the
-        # default has to be the strict intersection until an operator decides
-        # otherwise with an audit trail.
-        "wave_membership": "strict",
+        # NOT a no-op on merge: this one feeds the weight fold, and it ships
+        # deliberately widened. "strict" is what emptied the intersection at
+        # 03:56Z and reverted every agent to its quorum median; it stays
+        # reachable as the one-revision rollback.
+        "wave_membership": "participants",
     }
     assert initial.json()["effective"]["open_rollout_desired_version"] is None
     assert initial.json()["effective"]["rollout_standdown_active"] is False

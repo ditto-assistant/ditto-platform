@@ -1175,7 +1175,15 @@ class TestPublicLeaderboard:
         for the rest of the wave must not be invalidated -- but the accepted
         rows are append-only and were never deleted, so the raw depth has to
         survive the reset or the UI reads as though the data is gone.
+
+        This test now pins ``wave_membership="strict"`` EXPLICITLY. It used to
+        rely on that being the shipped default; the default is ``participants``
+        as of the fold change, so the revision below is what keeps #485's
+        original coverage meaningful. It doubles as the regression test for the
+        rollback path: if an operator returns the board to ``strict``, this is
+        the behaviour they get back, display half included.
         """
+        from ditto.db.models import ContinualRetestSettingsRevision
         from ditto.db.queries.confirmation_scores import (
             ConfirmationSeedScore,
             append_confirmation_scores,
@@ -1212,6 +1220,20 @@ class TestPublicLeaderboard:
                     ),
                 )
             )
+            s.add(
+                ContinualRetestSettingsRevision(
+                    parent_revision=0,
+                    scope="*",
+                    settings={
+                        "aggregate_mode": "fleet_ready",
+                        "idle_retests_enabled": False,
+                        "wave_membership": "strict",
+                    },
+                    checksum="e" * 64,
+                    reason="pin the pre-change fold for this regression",
+                    actor="operator@example.com",
+                )
+            )
             await append_confirmation_scores(
                 s,
                 rows=[
@@ -1230,6 +1252,9 @@ class TestPublicLeaderboard:
                 created_at=datetime.now(UTC),
             )
         _install_db(app, session_maker)
+        # The strict pin above is only honoured if the settings cache re-reads.
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
 
         before = (await client.get("/api/v1/public/leaderboard")).json()
         assert before["continual_aggregate_active"] is True
@@ -1386,6 +1411,111 @@ class TestPublicLeaderboard:
         assert entries[entrant_id]["official_composite"] == pytest.approx(0.95)
         # And the raw audit trail from #485 is still there underneath.
         assert entries[champion_id]["confirmation_seed_depth"] == 3
+
+    async def test_the_shipped_default_survives_a_membership_change(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Pins ``participants`` as the DEFAULT, not merely as an option.
+
+        The companion test above proves the mode works when an operator selects
+        it. This one writes a revision that never mentions ``wave_membership``
+        at all, so the fold runs on whatever ships. It is deliberately the
+        03:56Z scenario: if the default were ever moved back to ``strict``, the
+        zero-depth entrant would empty the intersection and this goes red with
+        ``completed_wave_count == 0`` and a ``canonical_median`` fallback --
+        which is precisely the regression that reverted every agent's
+        ``official_composite`` while v7 was driving validator weights.
+        """
+        from ditto.db.models import ContinualRetestSettingsRevision
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        champion_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.90, 0.90, 0.90],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        tail_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.80, 0.80, 0.80],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_C,
+                    software_version="0.28.0",
+                    protocol_version=14,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                    capabilities=_scorer_capabilities(
+                        now, versions=[DEFAULT_BENCH_VERSION]
+                    ),
+                )
+            )
+            s.add(
+                ContinualRetestSettingsRevision(
+                    parent_revision=0,
+                    scope="*",
+                    # No ``wave_membership`` key: this is the whole point.
+                    settings={
+                        "aggregate_mode": "fleet_ready",
+                        "idle_retests_enabled": False,
+                    },
+                    checksum="d" * 64,
+                    reason="defaults only",
+                    actor="operator@example.com",
+                )
+            )
+            await append_confirmation_scores(
+                s,
+                rows=[
+                    ConfirmationSeedScore(
+                        UUID(agent_id),
+                        "5V1",
+                        seed,
+                        0.60,
+                        f"r{agent_id}-{seed}",
+                        None,
+                    )
+                    for agent_id in (champion_id, tail_id)
+                    for seed in (100, 200, 300)
+                ],
+                bench_version=DEFAULT_BENCH_VERSION,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+
+        await _seed_k3(
+            session_maker,
+            miner="5Cq" + "z" * 45,
+            composites=[0.95, 0.95, 0.95],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 3, tzinfo=UTC),
+        )
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+        entries = {entry["agent_id"]: entry for entry in body["entries"]}
+
+        assert entries[champion_id]["completed_wave_count"] == 3
+        assert entries[champion_id]["aggregate_method"] == "continual_mean"
+        assert entries[champion_id]["official_composite"] == pytest.approx(0.75)
+        assert entries[tail_id]["aggregate_method"] == "continual_mean"
 
     async def test_marks_deregistered_scores_retained_but_emission_ineligible(
         self,

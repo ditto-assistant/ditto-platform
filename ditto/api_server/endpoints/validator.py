@@ -184,6 +184,7 @@ from ditto.db.queries.benchmark_rollout import (
     rollout_cohort_complete,
 )
 from ditto.db.queries.confirmation_scores import (
+    DEFAULT_WAVE_MEMBERSHIP,
     ConfirmationSeedScore,
     WaveMembership,
     append_confirmation_scores,
@@ -2323,7 +2324,7 @@ async def _current_koth_entries(
     *,
     canonical_version: int,
     completed_waves_only: bool = True,
-    wave_membership: WaveMembership = "strict",
+    wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
 ) -> list[KothEntry]:
     """Build the active-version KOTH fold from canonical or completed evidence.
 
@@ -2438,7 +2439,7 @@ async def _current_emission_set(
     *,
     canonical_version: int,
     completed_waves_only: bool = True,
-    wave_membership: WaveMembership = "strict",
+    wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
 ) -> tuple[KothEntry, ...]:
     entries = await _current_koth_entries(
         session,

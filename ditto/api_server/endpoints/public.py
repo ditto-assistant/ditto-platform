@@ -209,6 +209,7 @@ from ditto.db.queries.benchmark_rollout import (
     rollout_state,
 )
 from ditto.db.queries.confirmation_scores import (
+    DEFAULT_WAVE_MEMBERSHIP,
     WaveMembership,
     confirmation_composites_by_seed,
     confirmation_depths,
@@ -1612,7 +1613,7 @@ def _completed_wave_data(
     stderrs: dict[UUID, float | None],
     confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
     confirmation_depth: dict[UUID, int] | None = None,
-    wave_membership: WaveMembership = "strict",
+    wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
 ) -> tuple[list[LedgerRow], dict[UUID, dict[int, float]], dict[UUID, int]]:
     """Return canonical candidates plus only fully completed cohort-wave data."""
     by_seed = confirmation_by_seed or {}
@@ -1680,7 +1681,7 @@ def _public_koth_emissions(
     confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
     confirmation_depth: dict[UUID, int] | None = None,
     include_continual_scores: bool = True,
-    wave_membership: WaveMembership = "strict",
+    wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
     quorum_values = quorum_by_agent or {}
