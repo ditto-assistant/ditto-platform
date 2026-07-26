@@ -8,6 +8,7 @@ restart -- that is what makes this setting a kill switch rather than a release.
 
 from __future__ import annotations
 
+import socket
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import Any
@@ -16,6 +17,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -36,6 +38,18 @@ from ditto.tests.pgharness import Dsn
 _ADMIN_TOKEN = "test-admin-token-at-least-32-characters"
 _ADMIN_HEADERS = {"Authorization": f"Bearer {_ADMIN_TOKEN}"}
 _URL = "/api/v1/admin/validator-slot-settings"
+
+
+def _closed_port() -> int:
+    """A localhost port with nothing listening, so a connect is *refused*.
+
+    Bind-then-close rather than a hardcoded number: a hardcoded port that
+    something happens to be listening on would turn a refused connection into
+    a hang or a protocol error, and quietly stop testing the outage shape.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 @pytest.fixture
@@ -408,22 +422,58 @@ class TestResolverFailClosed:
         Keeps the original shape -- a reachable database in which the table
         does not exist -- but on real Postgres: the harness's admin database
         is migrated by nobody, so the read raises
-        ``ProgrammingError(UndefinedTableError)`` into the resolver's
-        ``except SQLAlchemyError`` arm.
+        ``ProgrammingError(UndefinedTableError)``.
 
-        A *refused connection* is deliberately not used here even though it
-        looks like the more realistic outage. asyncpg raises
-        ``ConnectionRefusedError`` -- a bare ``OSError`` that SQLAlchemy does
-        not wrap -- so it sails straight past ``except SQLAlchemyError`` and
-        out of ``resolve()``. That is worth someone's attention on its own
-        (see the PR description); it is not this test's subject, and pinning
-        it here would silently convert a fail-closed test into a fail-open one.
+        The *unreachable* database is the sibling case below; it is the shape
+        that used to escape the guard.
         """
         engine = create_async_engine(postgres_admin_dsn.sqlalchemy)
         maker = async_sessionmaker(engine)
         resolver = ValidatorSlotSettingsResolver(ttl_seconds=0)
         try:
             assert await resolver.resolve(maker) == DEFAULT_SETTINGS
+        finally:
+            await engine.dispose()
+
+    async def test_refused_connection_holds_the_default_cap(
+        self, postgres_admin_dsn: Dsn
+    ) -> None:
+        """Postgres being *down* is the outage the guard most has to survive.
+
+        asyncpg raises a bare ``OSError`` that SQLAlchemy does not wrap -- so
+        this escaped the resolver's original ``except SQLAlchemyError`` arm
+        entirely and propagated out of ``resolve()``, 500ing the ticket-issue
+        path instead of holding the cap that #433 promises. Pinned here
+        because it is the exact shape a type-enumerated guard gets wrong.
+
+        The precondition asserts ``OSError`` and *not*-``SQLAlchemyError``,
+        which is the whole load-bearing claim, rather than the narrower
+        ``ConnectionRefusedError``. Which ``OSError`` subclass surfaces
+        depends on the host's IP stack: against an IPv4-only host asyncio
+        raises ``ConnectionRefusedError``, but against a dual-stack
+        ``localhost`` it fans out to ``::1`` and ``127.0.0.1``, gets two
+        refusals with different messages, and combines them into a plain
+        ``OSError("Multiple exceptions: ...")``. Pinning the subclass made
+        this test pass on a developer's IPv4 DSN and fail on CI's dual-stack
+        one -- and it also understates the bug, since even an
+        ``except ConnectionRefusedError`` guard would have missed that shape.
+        """
+        dead = replace(postgres_admin_dsn, port=_closed_port())
+        engine = create_async_engine(dead.sqlalchemy)
+        maker = async_sessionmaker(engine)
+        resolver = ValidatorSlotSettingsResolver(ttl_seconds=0)
+        try:
+            with pytest.raises(OSError) as refused:
+                async with maker() as session:
+                    await session.execute(select(ValidatorSlotSettingsRevision))
+            # The point of the fix: SQLAlchemy never wrapped this, so an
+            # `except SQLAlchemyError` arm could not have seen it.
+            assert not isinstance(refused.value, SQLAlchemyError)
+            assert await resolver.resolve(maker) == DEFAULT_SETTINGS
+            assert DEFAULT_SETTINGS.max_concurrent_slots == 2
+            # An outage is never cached: the next issue re-reads rather than
+            # pinning the default for a full TTL after Postgres returns.
+            assert resolver._cache is None
         finally:
             await engine.dispose()
 
