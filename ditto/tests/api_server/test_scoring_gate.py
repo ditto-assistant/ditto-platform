@@ -918,3 +918,177 @@ class TestPromptShadowSignal:
         )
         assert decision.held is True
         assert "prompt" not in (decision.reason or "")
+
+
+class TestAttestedOwnerLink:
+    """The owner-link exemption.
+
+    Models the real case: a miner's submissions stalled during an evaluation
+    outage, they moved to a new coldkey/hotkey and resubmitted, and their newer
+    work now copy-flags against their own earlier submission because the
+    same-owner exemption keys on coldkey equality and they rotated.
+    """
+
+    def test_linked_hotkey_is_not_a_copy_source(self) -> None:
+        """The Jupiter case: near-duplicate of one's own pre-rotation work."""
+        shingles = {f"s{i:03d}" for i in range(40)}
+        incumbent = _entry(
+            composite=0.80,
+            miner="5OldHotkey",
+            coldkey="5OldColdkey",
+            sha256="aa" * 32,
+            size_bytes=500000,
+            content_fingerprint=_sk(shingles),
+        )
+        kwargs = {
+            "agent_id": uuid4(),
+            "miner_hotkey": "5NewHotkey",
+            "miner_coldkey": "5NewColdkey",  # rotated: coldkey equality cannot help
+            "sha256": "bb" * 32,
+            "composite": 0.805,
+            "size_bytes": 500100,
+            "content_fingerprint": _sk(shingles),
+            "eligible": [incumbent],
+        }
+
+        # Without the attestation this is held -- today's behaviour.
+        assert evaluate_duplicate_signals(**kwargs).held is True
+
+        # With it, the miner is not a copier of their own earlier work.
+        decision = evaluate_duplicate_signals(
+            **kwargs, linked_owner_hotkeys=frozenset({"5OldHotkey"})
+        )
+        assert decision.held is False
+
+    def test_unlinked_hotkey_is_not_exempted(self) -> None:
+        """An unrelated hotkey in the set exempts nothing."""
+        shingles = {f"s{i:03d}" for i in range(40)}
+        incumbent = _entry(
+            composite=0.80,
+            miner="5OldHotkey",
+            size_bytes=500000,
+            content_fingerprint=_sk(shingles),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5NewHotkey",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=500100,
+            content_fingerprint=_sk(shingles),
+            eligible=[incumbent],
+            linked_owner_hotkeys=frozenset({"5SomeoneElse"}),
+        )
+        assert decision.held is True
+        assert decision.duplicate_of == incumbent.agent_id
+
+    def test_attestation_does_not_exempt_byte_identical_resubmission(self) -> None:
+        """Scope guard: rule 1 is not covered.
+
+        Byte-identical resubmission under a new key is the shape of
+        emission-slot farming, so it still reaches an operator even with a
+        valid owner link. Unchanged by how strong the proof behind the link is
+        -- a better answer to "who" does not make an identical re-upload more
+        meritorious. Deliberately narrower than the same-coldkey exemption.
+        """
+        incumbent = _entry(
+            composite=0.70, miner="5OldHotkey", sha256="cc" * 32, size_bytes=500000
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5NewHotkey",
+            sha256="cc" * 32,
+            composite=0.70,
+            size_bytes=500000,
+            eligible=[incumbent],
+            linked_owner_hotkeys=frozenset({"5OldHotkey"}),
+        )
+        assert decision.held is True
+        assert "sha256" in (decision.reason or "")
+
+    def test_attestation_does_not_exempt_repack(self) -> None:
+        """Scope guard: rule 1b is not covered either."""
+        incumbent = _entry(
+            composite=0.60,
+            miner="5OldHotkey",
+            sha256="cc" * 32,
+            normalized_source_hash="ns" * 32,
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5NewHotkey",
+            sha256="dd" * 32,
+            composite=0.60,
+            size_bytes=incumbent.size_bytes,
+            normalized_source_hash="ns" * 32,
+            eligible=[incumbent],
+            linked_owner_hotkeys=frozenset({"5OldHotkey"}),
+        )
+        assert decision.held is True
+        assert "repack" in (decision.reason or "")
+
+    def test_attestation_does_not_shield_a_third_partys_work(self) -> None:
+        """A link exempts only its counterparty.
+
+        A miner with a genuine owner link still gets screened against every
+        other miner, so a link cannot be used as blanket cover.
+        """
+        shingles = {f"s{i:03d}" for i in range(40)}
+        own_prior = _entry(
+            composite=0.50,
+            miner="5OldHotkey",
+            size_bytes=100000,
+            content_fingerprint=_sk({f"z{i:03d}" for i in range(40)}),
+        )
+        stranger = _entry(
+            composite=0.80,
+            miner="5Stranger",
+            size_bytes=500000,
+            content_fingerprint=_sk(shingles),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5NewHotkey",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=500100,
+            content_fingerprint=_sk(shingles),
+            eligible=[own_prior, stranger],
+            linked_owner_hotkeys=frozenset({"5OldHotkey"}),
+        )
+        assert decision.held is True
+        assert decision.duplicate_of == stranger.agent_id
+
+    def test_size_fallback_also_respects_the_exemption(self) -> None:
+        """Rule 3, the legacy no-fingerprint path, is exempted too."""
+        incumbent = _entry(
+            composite=0.80, miner="5OldHotkey", sha256="aa" * 32, size_bytes=500000
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5NewHotkey",
+            sha256="bb" * 32,
+            composite=0.805,
+            size_bytes=500100,
+            eligible=[incumbent],
+            linked_owner_hotkeys=frozenset({"5OldHotkey"}),
+        )
+        assert decision.held is False
+
+    def test_empty_set_is_todays_behaviour(self) -> None:
+        """The default must change nothing for the 99% who never rotated."""
+        incumbent = _entry(composite=0.80, sha256="aa" * 32, size_bytes=500000)
+        kwargs = {
+            "agent_id": uuid4(),
+            "miner_hotkey": "5Copier",
+            "sha256": "bb" * 32,
+            "composite": 0.805,
+            "size_bytes": 500100,
+            "eligible": [incumbent],
+        }
+        assert (
+            evaluate_duplicate_signals(**kwargs).held
+            is evaluate_duplicate_signals(
+                **kwargs, linked_owner_hotkeys=frozenset()
+            ).held
+        )
