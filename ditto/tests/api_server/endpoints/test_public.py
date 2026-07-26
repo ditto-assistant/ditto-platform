@@ -1412,6 +1412,125 @@ class TestPublicLeaderboard:
         # And the raw audit trail from #485 is still there underneath.
         assert entries[champion_id]["confirmation_seed_depth"] == 3
 
+    async def test_rank_follows_official_composite_not_composite(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Pin the invariant a consumer actually needs: sorting the board by the
+        field ``rank`` is derived from must reproduce ``rank``.
+
+        Nothing caught this before. The board is ranked by ``official_composite``
+        (the continual mean), but ``composite`` is the field that *looks* like
+        the score, and on 2026-07-26 the production board had a champion whose
+        ``composite`` was only 4th best. An operator reading ``composite`` as
+        "the score" concluded the wrong agent was winning and nearly moved 65%
+        of miner emissions on it.
+
+        So this deliberately builds a board where the two orderings INVERT, and
+        asserts three things: ``rank`` tracks ``official_composite``, it does
+        *not* track ``composite``, and ``raw_rank`` on the emission recipients
+        tracks ``composite`` (which is what that field has always meant).
+        """
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        # Leads on the single-quorum median (0.90) ...
+        median_leader_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.90, 0.90, 0.90],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        # ... but trails once the completed waves land.
+        mean_leader_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.80, 0.80, 0.80],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        wave_scores = {median_leader_id: 0.60, mean_leader_id: 0.95}
+        async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_C,
+                    software_version="0.28.0",
+                    protocol_version=14,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                    capabilities=_scorer_capabilities(
+                        now, versions=[DEFAULT_BENCH_VERSION]
+                    ),
+                )
+            )
+            await append_confirmation_scores(
+                s,
+                rows=[
+                    ConfirmationSeedScore(
+                        UUID(agent_id),
+                        "5V1",
+                        seed,
+                        value,
+                        f"r{agent_id}-{seed}",
+                        None,
+                    )
+                    for agent_id, value in wave_scores.items()
+                    for seed in (100, 200, 300)
+                ],
+                bench_version=DEFAULT_BENCH_VERSION,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+        assert body["continual_aggregate_active"] is True
+        entries = body["entries"]
+        by_id = {entry["agent_id"]: entry for entry in entries}
+
+        # mean(0.90, 0.90, 0.90, 0.60, 0.60, 0.60) = 0.75
+        assert by_id[median_leader_id]["composite"] == pytest.approx(0.90)
+        assert by_id[median_leader_id]["official_composite"] == pytest.approx(0.75)
+        # mean(0.80, 0.80, 0.80, 0.95, 0.95, 0.95) = 0.875
+        assert by_id[mean_leader_id]["composite"] == pytest.approx(0.80)
+        assert by_id[mean_leader_id]["official_composite"] == pytest.approx(0.875)
+        assert by_id[mean_leader_id]["aggregate_method"] == "continual_mean"
+
+        # The two orderings genuinely disagree, or this test proves nothing.
+        assert [
+            e["agent_id"] for e in sorted(entries, key=lambda e: -e["composite"])
+        ] != [
+            e["agent_id"]
+            for e in sorted(entries, key=lambda e: -e["official_composite"])
+        ]
+
+        # THE INVARIANT: sorting by official_composite reproduces rank exactly.
+        assert [e["rank"] for e in entries] == sorted(e["rank"] for e in entries)
+        assert [
+            e["agent_id"]
+            for e in sorted(
+                entries, key=lambda e: (-e["official_composite"], e["rank"])
+            )
+        ] == [e["agent_id"] for e in sorted(entries, key=lambda e: e["rank"])]
+        assert by_id[mean_leader_id]["rank"] == 1
+        assert by_id[median_leader_id]["rank"] == 2
+
+        # And raw_rank is the OTHER ordering on purpose: by canonical median.
+        # The champion here carries raw_rank 2 while holding board rank 1 --
+        # the exact shape that read as a bug in production.
+        recipients = {r["agent_id"]: r for r in body["emissions"]["recipients"]}
+        assert recipients[mean_leader_id]["role"] == "champion"
+        assert recipients[mean_leader_id]["raw_rank"] == 2
+        assert recipients[median_leader_id]["raw_rank"] == 1
+
     async def test_the_shipped_default_survives_a_membership_change(
         self,
         app: FastAPI,
