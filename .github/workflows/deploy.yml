@@ -94,6 +94,47 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
+      - name: Register deploy SSH key with OS Login
+        # Every run starts on a fresh runner with no ~/.ssh/google_compute_engine,
+        # so `gcloud compute ssh` would otherwise mint a throwaway keypair AND
+        # open the tunnel in one breath ("You do not have an SSH key for gcloud.
+        # SSH keygen will be executed"). Registering a key with OS Login is
+        # eventually consistent, and run 30179674679 lost that race: the key was
+        # minted and the VM refused it 3.5s later with `Permission denied
+        # (publickey)`, on the runner side of the tunnel, before any command
+        # reached the host. The identical pipeline passed 7 minutes later.
+        #
+        # Minting the key here and registering it as its own step splits that
+        # race into two observable halves: propagation gets the length of this
+        # step plus the tunnel setup to settle, and if it still hasn't, the
+        # retry in the deploy step covers the remainder.
+        #
+        # `--ttl` is the other half of the point. An OS Login profile caps at 32
+        # keys, and a deploy-per-push that registers a permanent key each time
+        # walks into that ceiling and then fails every deploy until someone
+        # prunes by hand. Expiring keys plus the always()-cleanup step below
+        # keep the profile at ~one key.
+        #
+        # Best-effort on purpose: if the SA somehow lacks the self-scoped
+        # oslogin.sshPublicKeys.create, warn and let `gcloud compute ssh` fall
+        # back to its own import path rather than red a deploy over a
+        # pre-warming optimization.
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ ! -f ~/.ssh/google_compute_engine ]; then
+            ssh-keygen -t rsa -b 2048 -N '' -q \
+              -C "gha-deploy-${{ github.run_id }}-${{ github.run_attempt }}" \
+              -f ~/.ssh/google_compute_engine
+          fi
+          if gcloud compute os-login ssh-keys add \
+               --key-file ~/.ssh/google_compute_engine.pub \
+               --ttl 45m >/dev/null; then
+            echo "registered this run's deploy key with OS Login (ttl 45m)"
+          else
+            echo "::warning::could not pre-register the deploy key with OS Login; falling back to gcloud's own key import (the deploy step retries on propagation lag)"
+          fi
+
       - name: Deploy (IAP SSH -> scripts/update.sh)
         id: deploy
         # `sudo -iu deploy bash -lc` runs a LOGIN shell as deploy so uv/pm2/docker
@@ -118,14 +159,60 @@ jobs:
         # `bash -e`, WITHOUT pipefail, so a failing gcloud on the left of the
         # `tee` pipe below would otherwise be masked by tee's exit 0 -- the same
         # class of "failure reported as success" this deploy path already had.
+        #
+        # THE RETRY IS NARROW ON PURPOSE (run 30179674679).
+        #
+        # Re-running this command is only safe while nothing on the host has
+        # been touched, and exactly one failure has that property: the runner's
+        # own ssh being refused by OS Login before the tunnel carries a command.
+        # So the loop does not retry "gcloud failed" -- it retries one signature,
+        # and treats everything else as terminal on the first try. A blanket
+        # `retry 3x on non-zero` would re-enter update.sh after a half-finished
+        # deploy, which is precisely the failure mode update.sh's rollback logic
+        # exists to make legible.
+        #
+        # The signature is anchored to `@compute.<numeric-id>:` rather than the
+        # bare `Permission denied (publickey)` because that string is NOT unique
+        # to the runner. The remote command's first act is `git fetch origin`,
+        # and a broken VM-side deploy key makes GitHub print the identical
+        # sentence as `git@github.com: Permission denied (publickey).` -- a real,
+        # non-transient failure that must red on attempt one. The `@compute.`
+        # host is gcloud's IAP pseudo-host, so that form of the line can only
+        # come from the runner's ssh, before the host was reached -- which is
+        # what makes "nothing was half-applied" a checked fact here rather than
+        # an assumption about update.sh being idempotent.
         run: |
           set -euo pipefail
-          gcloud compute ssh "${{ steps.target.outputs.vm }}" \
-            --zone "$GCP_ZONE" \
-            --tunnel-through-iap \
-            --quiet \
-            --command "sudo -iu deploy bash -lc 'cd /opt/ditto-platform && git fetch --prune origin && git checkout -fB ${{ steps.target.outputs.branch }} origin/${{ steps.target.outputs.branch }} && git reset --hard origin/${{ steps.target.outputs.branch }} && DITTO_DEPLOY_BRANCH=${{ steps.target.outputs.branch }} DITTO_UPLOAD_PAYMENT_ADDRESS=${{ secrets.DITTO_UPLOAD_PAYMENT_ADDRESS }} DITTO_DASHBOARD_WANDB_URL=${{ vars.DITTO_DASHBOARD_WANDB_URL }} ./scripts/update.sh'" \
-            2>&1 | tee /tmp/deploy.log
+
+          attempt=1
+          max_attempts=3
+          while :; do
+            rc=0
+            gcloud compute ssh "${{ steps.target.outputs.vm }}" \
+              --zone "$GCP_ZONE" \
+              --tunnel-through-iap \
+              --quiet \
+              --command "sudo -iu deploy bash -lc 'cd /opt/ditto-platform && git fetch --prune origin && git checkout -fB ${{ steps.target.outputs.branch }} origin/${{ steps.target.outputs.branch }} && git reset --hard origin/${{ steps.target.outputs.branch }} && DITTO_DEPLOY_BRANCH=${{ steps.target.outputs.branch }} DITTO_UPLOAD_PAYMENT_ADDRESS=${{ secrets.DITTO_UPLOAD_PAYMENT_ADDRESS }} DITTO_DASHBOARD_WANDB_URL=${{ vars.DITTO_DASHBOARD_WANDB_URL }} ./scripts/update.sh'" \
+              2>&1 | tee /tmp/deploy.log || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              break
+            fi
+
+            if ! grep -Eq '@compute\.[0-9]+: Permission denied \(publickey\)' /tmp/deploy.log; then
+              echo "deploy failed (rc=$rc) for a reason other than SSH key propagation; not retrying" >&2
+              exit "$rc"
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "SSH key was still not accepted after $max_attempts attempts; giving up" >&2
+              echo "check the deploy SA's OS Login profile -- a full 32-key profile fails this way too:" >&2
+              echo "  gcloud compute os-login describe-profile --format='value(sshPublicKeys)'" >&2
+              exit "$rc"
+            fi
+            echo "::warning::attempt $attempt/$max_attempts: OS Login has not accepted this run's SSH key yet (nothing ran on the host); retrying in 15s"
+            attempt=$((attempt + 1))
+            sleep 15
+          done
+
           # update.sh's last line on success. Not github.sha: the host resets to
           # origin/<branch>, which may already carry a newer push, and asserting
           # against this job's SHA would red a deploy that is actually correct.
@@ -176,3 +263,30 @@ jobs:
           echo "expected commit $EXPECTED_COMMIT; last response:" >&2
           cat /tmp/health.json >&2 || true
           exit 1
+
+      - name: Deregister deploy SSH key
+        # The runner is thrown away; the OS Login profile is not. Without this,
+        # one key per push accretes on the deploy SA until it hits the 32-key
+        # cap, at which point EVERY deploy fails with the same `Permission
+        # denied (publickey)` the retry above is meant to absorb -- a permanent
+        # failure wearing a transient one's clothes. The `--ttl` on registration
+        # already bounds that; removing the key makes the steady state exactly
+        # zero rather than "however many ran in the last 45 minutes".
+        #
+        # always(), because a key left behind by a FAILED deploy is the one most
+        # likely to be forgotten. Never fails the job: this runs after the gates
+        # that decide whether the deploy was good, and a leaked throwaway key is
+        # not a reason to red a healthy release.
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if [ ! -f ~/.ssh/google_compute_engine.pub ]; then
+            echo "no runner key to deregister"; exit 0
+          fi
+          if gcloud compute os-login ssh-keys remove \
+               --key-file ~/.ssh/google_compute_engine.pub >/dev/null 2>&1; then
+            echo "deregistered this run's deploy key"
+          else
+            echo "::warning::could not deregister this run's deploy key; it expires on its own TTL"
+          fi
