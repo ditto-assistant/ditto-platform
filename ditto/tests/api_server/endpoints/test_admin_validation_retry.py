@@ -83,9 +83,9 @@ async def _seed(
     # ``agents_hotkey_name_version_key`` makes (miner_hotkey, name, version)
     # unique, and several tests here seed two or three agents. The name used to
     # be the constant "valid-agent", which only worked because that constraint
-    # is declared ``.ddl_if(dialect="postgresql")`` in ditto/db/models.py and so
-    # was never created under SQLite's ``create_all``. No assertion in this file
-    # reads the name this helper generates.
+    # used to carry ``.ddl_if(dialect="postgresql")`` in ditto/db/models.py and
+    # so was never created under SQLite's ``create_all``. No assertion in this
+    # file reads the name this helper generates.
     async with maker() as session, session.begin():
         session.add(
             Agent(

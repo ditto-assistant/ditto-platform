@@ -273,12 +273,19 @@ class Agent(Base):
         UniqueConstraint(
             "agent_id", "miner_hotkey", name="agents_agent_id_miner_hotkey_key"
         ),
+        # Unconditional, exactly as 2026_07_15_add_agent_versions.py creates
+        # it. This used to carry `.ddl_if(dialect="postgresql")`, which was
+        # only ever an accommodation for the SQLite test tier: the gate made
+        # `create_all` skip it, so tests could seed several simultaneous
+        # agents sharing one `(hotkey, name, version)` identity -- rows
+        # production has always forbidden. #446 deleted that tier; nothing
+        # builds this schema on SQLite any more, so the gate is dead.
         UniqueConstraint(
             "miner_hotkey",
             "name",
             "version",
             name="agents_hotkey_name_version_key",
-        ).ddl_if(dialect="postgresql"),
+        ),
         CheckConstraint(
             "version IS NULL OR version > 0", name="agents_version_positive_check"
         ),
@@ -445,7 +452,13 @@ class ScreeningAttempt(Base):
             name="screening_attempts_finished_check",
         ),
         CheckConstraint(
-            "reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 64",
+            # Verbatim from 2026_07_15_add_exact_duplicate_precheck.py, which
+            # creates this constraint *name* with this predicate. `models.py`
+            # used to declare the same name as `length(reason_code) BETWEEN 1
+            # AND 64` -- strictly weaker, so tests accepted reason codes
+            # production rejects (`suspicious_source` with an underscore was
+            # one, and #446 had to hyphenate three fixtures).
+            "reason_code IS NULL OR reason_code ~ '^[a-z0-9][a-z0-9-]{0,63}$'",
             name="screening_attempts_reason_code_check",
         ),
         CheckConstraint(
@@ -608,6 +621,23 @@ class ScreeningQuarantine(Base):
         UniqueConstraint("attempt_id", name="screening_quarantines_attempt_id_key"),
         CheckConstraint(
             "policy_version > 0", name="screening_quarantines_policy_check"
+        ),
+        # The three digest/reason-code formats below are declared inline on the
+        # columns by 2026_07_14_add_screening_quarantines.py, so Postgres named
+        # them itself and `models.py` never carried them. Production has always
+        # enforced all three; declaring them here is what lets a test see the
+        # schema production actually has.
+        CheckConstraint(
+            "manifest_digest ~ '^[0-9a-f]{64}$'",
+            name="screening_quarantines_manifest_digest_check",
+        ),
+        CheckConstraint(
+            "finding_digest IS NULL OR finding_digest ~ '^[0-9a-f]{64}$'",
+            name="screening_quarantines_finding_digest_check",
+        ),
+        CheckConstraint(
+            "reason_code ~ '^[a-z0-9][a-z0-9-]{0,63}$'",
+            name="screening_quarantines_reason_code_check",
         ),
         CheckConstraint(
             "status IN ('active', 'resolved')",
@@ -2020,6 +2050,13 @@ class ValidatorTicket(Base):
         CheckConstraint(
             "manual_retry_grants >= 0",
             name="validator_tickets_manual_retry_grants_nonnegative",
+        ),
+        # Created by 2026_07_23_add_validator_ticket_datasets.py; production
+        # has enforced it since. NULL is a ticket issued before per-ticket
+        # dataset seeding, not a seed of zero.
+        CheckConstraint(
+            "seed IS NULL OR seed >= 0",
+            name="validator_tickets_seed_nonnegative",
         ),
         CheckConstraint(
             "infra_retry_grants >= 0",
