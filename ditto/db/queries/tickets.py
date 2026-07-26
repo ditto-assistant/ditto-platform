@@ -726,45 +726,84 @@ async def issue_confirmation_ticket(
     bench_version: int,
     seed: int | None = None,
     dataset_sha256: str | None = None,
+    slot_id: str = "slot-0",
 ) -> ValidatorTicket | None:
     """Reissue this validator's existing quorum slot for top-five maintenance.
 
     The caller has already proven that ``agent_id`` is the one bounded KOTH
-    confirmation target.  Reusing the existing composite-key row keeps score
-    submission on the dedicated append-only endpoint. A validator with unrelated
-    live work receives no confirmation
-    ticket, so this maintenance run cannot interrupt queue scoring.
+    confirmation target, and that ``slot_id`` is a healthy slot this validator
+    is not already using -- the retest lane occupies one execution slot exactly
+    like a canonical lease, and the operator slot cap is charged for it at the
+    call site. Reusing the existing composite-key row keeps score submission on
+    the dedicated append-only endpoint.
+
+    This used to refuse a confirmation whenever the validator held **any** live
+    lease, fleet-wide, "so this maintenance run cannot interrupt queue
+    scoring". That was correct while a validator ran one benchmark at a time.
+    Since #433 a validator holds up to ``max_concurrent_slots`` leases, and the
+    fleet-wide test meant the lane could only ever fire on a completely idle
+    validator -- so the continual retests an operator had explicitly enabled to
+    consume *idle* capacity were the one thing that could never claim it. It is
+    the same stale single-slot assumption ``issue_ticket`` already corrected in
+    its ``same_validator_blocking_status`` branch. The rail that actually
+    matters is per-slot, and it is enforced below: one live lease per
+    ``(validator, slot)``, which is also the durable unique partial index.
     """
     if session.get_bind().dialect.name == "postgresql":
         await session.execute(
             select(
-                func.pg_advisory_xact_lock(func.hashtextextended(validator_hotkey, 0))
+                func.pg_advisory_xact_lock(
+                    func.hashtextextended(f"{validator_hotkey}:{slot_id}", 0)
+                )
             )
         )
     await expire_overdue_tickets(session, now=now)
-    existing_live = await session.scalar(
+    # Resume this exact retest wherever it already lives. Looked up before the
+    # slot rail so a lease that drifted slots (or predates slot-aware issuance)
+    # is handed back rather than being refused as an occupant of its own slot.
+    existing_retest = await session.scalar(
         select(ValidatorTicket)
         .where(
+            ValidatorTicket.agent_id == agent_id,
             ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.bench_version == bench_version,
             ValidatorTicket.status == TicketStatus.ISSUED,
             ValidatorTicket.deadline > now,
         )
         .limit(1)
         .with_for_update()
     )
-    if existing_live is not None:
+    if existing_retest is not None:
         return (
-            existing_live
-            if existing_live.agent_id == agent_id
-            and existing_live.bench_version == bench_version
-            and existing_live.purpose == TicketPurpose.CONTINUAL_RETEST
-            and existing_live.purpose_revision > 0
-            and (seed is None or existing_live.seed == seed)
+            existing_retest
+            if existing_retest.purpose == TicketPurpose.CONTINUAL_RETEST
+            and existing_retest.purpose_revision > 0
+            and (seed is None or existing_retest.seed == seed)
             and (
-                dataset_sha256 is None or existing_live.dataset_sha256 == dataset_sha256
+                dataset_sha256 is None
+                or existing_retest.dataset_sha256 == dataset_sha256
             )
             else None
         )
+    # One live lease per execution slot, whatever lane issued it. A canonical
+    # benchmark on this slot owns it until its deadline; a retest must take a
+    # different slot or wait. This is the rail the fleet-wide check was reaching
+    # for, and it is the one the unique partial index enforces durably --
+    # without it, stamping a slot on a confirmation ticket would start raising
+    # integrity errors the moment the lane was unblocked.
+    slot_occupied = await session.scalar(
+        select(ValidatorTicket)
+        .where(
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.slot_id == slot_id,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    if slot_occupied is not None:
+        return None
 
     agent = await session.scalar(
         select(Agent).where(Agent.agent_id == agent_id).with_for_update()
@@ -802,6 +841,7 @@ async def issue_confirmation_ticket(
         ticket = ValidatorTicket(
             agent_id=agent_id,
             validator_hotkey=validator_hotkey,
+            slot_id=slot_id,
             status=TicketStatus.ISSUED,
             purpose=TicketPurpose.CONTINUAL_RETEST,
             purpose_revision=1,
@@ -821,6 +861,12 @@ async def issue_confirmation_ticket(
         ticket.purpose = TicketPurpose.CONTINUAL_RETEST
         ticket.purpose_revision += 1
         ticket.legacy_completion_allowed = False
+        # The reused row carries whichever slot last leased this (agent,
+        # version, validator) pair. Restamp it: the validator binds its
+        # execution slot to the ticket's ``slot_id`` (ditto-subnet #270), so a
+        # stale value sends every progress report to a slot with no matching
+        # lease and the run is discarded at ingest.
+        ticket.slot_id = slot_id
         ticket.issued_at = now
         ticket.deadline = now + ttl
         ticket.bench_version = bench_version
