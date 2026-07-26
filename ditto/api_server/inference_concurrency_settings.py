@@ -71,19 +71,21 @@ def apply_settings(
 
     Returns a new frozen config so the admission query keeps its existing
     signature and every field this board does not own -- the chat concurrency and
-    rate limits, the token budgets, the upstream URLs, the routing weights -- is
-    carried through untouched by construction rather than by remembering to copy
-    it.
+    rate limits, the embedding token budget, the upstream URLs, the routing
+    weights -- is carried through untouched by construction rather than by
+    remembering to copy it.
 
-    ``request_budget`` is overlaid here too, but note where it is *consumed*: the
-    grant-minting path (``ensure_inference_grant``) stamps it onto the new
-    grant's row. The admission path compares against ``grant.request_budget``,
-    the stamped column, and so is unaffected by this overlay -- which is what
-    keeps a live lease's allowance immutable.
+    ``request_budget`` and ``token_budget`` are overlaid here too, but note where
+    they are *consumed*: the grant-minting path (``ensure_inference_grant``)
+    stamps both onto the new grant's row. The admission path compares against
+    ``grant.request_budget`` and ``grant.token_budget``, the stamped columns, and
+    so is unaffected by this overlay -- which is what keeps a live lease's
+    allowances immutable.
     """
     return dataclasses.replace(
         config,
         request_budget=settings.chat_request_budget,
+        token_budget=settings.chat_token_budget,
         embedding_per_ticket_concurrency=settings.embedding_per_ticket_concurrency,
         embedding_per_validator_concurrency=(
             settings.embedding_per_validator_concurrency

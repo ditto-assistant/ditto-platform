@@ -77,16 +77,19 @@ class TestApplySettings:
         into ``apply_settings`` by mistake, fails here instead of silently
         retuning something unrelated.
 
-        ``request_budget`` joined the owned set deliberately. Note what did
-        *not*: the chat concurrency and rate limits, and both token budgets. The
-        token budget in particular is the other half of what bounds a grant's
-        spend, and it stays boot-time on purpose.
+        ``request_budget`` and ``token_budget`` are both owned deliberately.
+        Note what is *not*: the chat concurrency and rate limits, and the
+        embedding token budget. The chat token budget moved onto the board
+        because leaving it boot-time is what made #473 inert -- the operator
+        raised the request budget from backroom and the number that was actually
+        binding could only be changed by a redeploy.
         """
         config = _config()
         overlaid = apply_settings(
             config,
             InferenceConcurrencySettings(
                 chat_request_budget=4096,
+                chat_token_budget=12_000_000,
                 embedding_per_ticket_concurrency=12,
                 embedding_per_validator_concurrency=48,
                 embedding_global_concurrency=96,
@@ -99,13 +102,14 @@ class TestApplySettings:
         }
         assert changed == {
             "request_budget",
+            "token_budget",
             "embedding_per_ticket_concurrency",
             "embedding_per_validator_concurrency",
             "embedding_global_concurrency",
         }
         assert overlaid.request_budget == 4096
+        assert overlaid.token_budget == 12_000_000
         assert overlaid.per_ticket_concurrency == config.per_ticket_concurrency
-        assert overlaid.token_budget == config.token_budget
         assert overlaid.embedding_token_budget == config.embedding_token_budget
 
 

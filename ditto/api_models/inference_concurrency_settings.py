@@ -1,14 +1,15 @@
 """Operator-tunable admission policy for the hosted v7 inference lanes.
 
 This board governs the **hosted** embedding route
-(``perplexity/pplx-embed-v1-0.6b`` through the platform proxy) plus one chat
-number: the per-grant chat request budget.
+(``perplexity/pplx-embed-v1-0.6b`` through the platform proxy) plus the two
+per-grant chat allowances: the request budget and the token budget.
 
 * The chat lane's **concurrency and rate** limits keep their boot-time config.
   They were never sized against a local resource, they are already 8/24/72, and
   they are not what is throttling a v7 run.
-* The chat lane's **request budget** is here because it is a per-lease resource
-  allowance, not a rate. See ``chat_request_budget`` for why it moved.
+* The chat lane's **request and token budgets** are here because they are
+  per-lease resource allowances, not rates. See ``chat_request_budget`` and
+  ``chat_token_budget`` for why each moved.
 * The **local Ollama** lane (bench_version 2-6, one container per validator
   host) is not reachable from here at all. dittobench-api #93 made v7 bypass it
   (``inference_broker.go``: ``if benchVersion < 7 { acquire b.embeddingSlots }``),
@@ -75,13 +76,51 @@ MAX_EMBEDDING_GLOBAL_CONCURRENCY = 128
 DEFAULT_CHAT_REQUEST_BUDGET = 8192
 
 # The ceiling is 2x the default, not unbounded. The request budget is not the
-# only thing bounding a grant's spend -- ``token_budget`` (4,000,000 per grant,
-# boot-time and unchanged) is the other, and at 8192 requests it is the one that
-# binds first for any strategy averaging over ~488 tokens a call. Keeping a
-# finite request ceiling matters anyway: it is the bound that survives a
-# pathological loop of tiny requests, which the token budget would absorb
-# slowly and the concurrency board would not catch at all.
+# only thing bounding a grant's spend -- ``chat_token_budget`` is the other, and
+# the two are now deliberately sized so that neither is vestigial (see below).
+# Keeping a finite request ceiling matters regardless: it is the bound that
+# survives a pathological loop of tiny requests, which the token budget would
+# absorb slowly and the concurrency board would not catch at all.
 MAX_CHAT_REQUEST_BUDGET = 16384
+
+# The chat *token* budget, which is what actually ended the runs #473 set out to
+# save. #473 raised the request budget to 8192 and the same agents kept failing,
+# because the request count was never the binding allowance:
+#
+#   * 1009 consecutive chat declines on one lease, every one of them the
+#     unnamed 4100 -- never 4102 ("spent its request budget"), never 4101
+#     ("revoked") -- with 1h21m still on the lease
+#   * 1009 chat declines and *zero* embedding declines on the same grant, and
+#     the token budget is the only per-lane quantity in the system (chat 4M vs
+#     ``embedding_token_budget`` 1B)
+#
+# Sizing, and why this number is larger than it first looks. The old 4,000,000
+# was never four million *real* tokens. Admission reserves ``max_tokens +
+# len(body)`` and byte length is roughly 4x the token count of the same JSON, so
+# a 4M allowance permitted only ~1M tokens an agent could actually spend. The
+# reservation is honest as of the companion change, so this number is now a
+# true token count and the two effects multiply.
+#
+# Against observed usage:
+#
+#   * a v7 run's chat traffic measures ~2,300 tokens per call (the calibration
+#     fleet's own accounting: 92% prompt, 8% completion)
+#   * the heaviest observed strategies (Jupiter, KOTH_v7_1) spend ~1090 calls,
+#     so ~2.7-3.8M real tokens for a complete run
+#
+# 25,000,000 is therefore ~7x the heaviest run observed -- deliberately the same
+# safety factor #473 chose on the request axis (8192 vs ~1090). The two
+# allowances cross over at ~3,050 tokens a call: below that the request budget
+# binds first, above it the token budget does. That crossover sits right at the
+# observed median, which is the point -- at the old pairing (4M / 8192) the
+# crossover was 488 tokens a call, so the token budget bound *everything* and
+# the request budget was decoration.
+DEFAULT_CHAT_TOKEN_BUDGET = 25_000_000
+
+# 2x the default, matching the request budget's idiom. This is also the bound
+# ``check_config`` enforces at boot -- imported there rather than repeated, so a
+# revision this board accepts can never be a value the next restart rejects.
+MAX_CHAT_TOKEN_BUDGET = 50_000_000
 
 
 class InferenceConcurrencySettings(BaseModel):
@@ -92,14 +131,15 @@ class InferenceConcurrencySettings(BaseModel):
     validator enforces the same hierarchy from below, so under normal operation
     the platform numbers are headroom rather than the operative valve.
 
-    ``chat_request_budget`` stands apart from the three. It is not a rate and it
-    is not enforced fleet-wide at admission -- it is *stamped onto each grant when
-    the grant is minted* and thereafter read from the grant's own row. That is
-    deliberate, and it is what makes this field safe to sit on a live board: a
-    revision changes what the **next** lease is issued, never what a running
-    lease is already spending against. An operator cannot exhaust a run in
-    flight by lowering this number, which is exactly the hazard that forced the
-    embedding limits to grow a capacity-decline path.
+    ``chat_request_budget`` and ``chat_token_budget`` stand apart from the
+    three. Neither is a rate and neither is enforced fleet-wide at admission --
+    each is *stamped onto a grant when the grant is minted* and thereafter read
+    from the grant's own row. That is deliberate, and it is what makes both
+    fields safe to sit on a live board: a revision changes what the **next**
+    lease is issued, never what a running lease is already spending against. An
+    operator cannot exhaust a run in flight by lowering either number, which is
+    exactly the hazard that forced the embedding limits to grow a
+    capacity-decline path.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -112,6 +152,21 @@ class InferenceConcurrencySettings(BaseModel):
     Raising this is the lever for "let a heavier strategy finish"; lowering it is
     the lever for "stop paying for a runaway". Neither takes effect on a lease
     that has already been minted -- see the class docstring.
+    """
+
+    chat_token_budget: Annotated[int, Field(ge=1, le=MAX_CHAT_TOKEN_BUDGET)] = (
+        DEFAULT_CHAT_TOKEN_BUDGET
+    )
+    """Chat tokens (prompt + completion) one scoring ticket's grant may spend.
+
+    The other half of "let a heavier strategy finish", and empirically the half
+    that was actually binding: raising ``chat_request_budget`` alone left the
+    heaviest agents failing in exactly the same place, because they were running
+    out of tokens rather than out of calls.
+
+    This is the number to move when a legitimate strategy stuffs large contexts.
+    Note that it is a *cap*, not a spend: an agent is charged what it consumes,
+    so raising the ceiling changes only which runs are permitted to finish.
     """
 
     embedding_per_ticket_concurrency: Annotated[
