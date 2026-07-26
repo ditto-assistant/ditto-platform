@@ -62,6 +62,7 @@ from ditto.chain.models import (
 from ditto.db.models import (
     Agent,
     AgentKingship,
+    ArtifactFetchAudit,
     ArtifactReleaseSettingsRevision,
     AthReview,
     BenchmarkDataset,
@@ -5588,6 +5589,86 @@ class TestPublicArtifactRelease:
             f"ditto-agent-{first_id}.tar.gz",
             f"ditto-agent-{second_id}.tar.gz",
         }
+
+    async def test_public_release_download_is_audited(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The one route that serves source to anyone still records the serve.
+
+        There is no requester identity to record here -- that is the point of a
+        public release -- so the row carries the peer address and the fact that
+        the bytes went out at all. Audited only after the release gate passes,
+        so an unauthenticated caller cannot drive row inserts by knocking.
+        """
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        await _set_score_created_times(
+            session_maker,
+            agent_id=agent_id,
+            created_at=[
+                now - timedelta(hours=51),
+                now - timedelta(hours=50),
+                now - timedelta(hours=49),
+            ],
+        )
+        await _crown(
+            session_maker,
+            agent_id=agent_id,
+            first_crowned_at=now - timedelta(hours=49),
+        )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+        storage.presigned_get_url.return_value = "https://objects.example/source"
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+
+        assert response.status_code == 200
+        async with session_maker() as s:
+            rows = (await s.scalars(select(ArtifactFetchAudit))).all()
+        assert len(rows) == 1
+        assert str(rows[0].agent_id) == str(agent_id)
+        assert rows[0].endpoint == "public.agent_artifact"
+        assert rows[0].requester_kind == "public"
+        # No identity exists on this route; the CHECK constraint requires the
+        # column to be NULL rather than a misleading placeholder.
+        assert rows[0].requester_id is None
+
+    async def test_embargoed_request_writes_no_audit_row(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A refused fetch served no bytes, so it is not an artifact fetch."""
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6]
+        )
+        await _set_score_created_times(
+            session_maker,
+            agent_id=agent_id,
+            created_at=[now, now, now],
+        )
+        await _crown(session_maker, agent_id=agent_id, first_crowned_at=now)
+        _install_db(app, session_maker)
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+
+        assert response.status_code == 425
+        async with session_maker() as s:
+            assert (
+                await s.scalar(select(func.count()).select_from(ArtifactFetchAudit))
+            ) == 0
 
     async def test_fourth_score_does_not_restart_the_quorum_embargo(
         self,

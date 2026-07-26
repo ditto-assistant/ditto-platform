@@ -68,6 +68,7 @@ from ditto.api_models.screener_review_settings import (
     ScreenerReviewSettings,
 )
 from ditto.api_models.system_health import system_metrics_signing_token
+from ditto.api_server.artifact_audit import client_ip, request_detail
 from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
@@ -100,6 +101,10 @@ from ditto.db.models import (
     ScreeningQuarantine,
 )
 from ditto.db.queries.agents import get_agent_by_id
+from ditto.db.queries.artifact_fetch_audit import (
+    ENDPOINT_SCREENER_ARTIFACT,
+    record_artifact_fetch,
+)
 from ditto.db.queries.benchmark_rollout import arrival_bench_version
 from ditto.db.queries.heartbeats import (
     prune_stale_screener_heartbeats,
@@ -688,17 +693,24 @@ async def claim(
 )
 async def agent_artifact(
     agent_id: UUID,
+    request: Request,
     response: Response,
     screener_hotkey: ScreenerDep,
     session: SessionDep,
     storage: StorageDep,
     attempt_id: Annotated[UUID | None, Query()] = None,
+    instance_id: Annotated[str | None, Query(pattern=_INSTANCE_ID_PATTERN)] = None,
 ) -> ArtifactResponse:
     """Return a short-lived pre-signed download URL for the agent's tarball.
 
     Download is bound to an active screening lease for this screener. Callers
     should pass the claim ``attempt_id``; without it the platform still requires
     a unique running attempt for ``(screener_hotkey, agent_id)``.
+
+    ``instance_id`` is optional and records *which* worker in the shared-hotkey
+    fleet took the source, for the artifact audit trail. It is accepted here so
+    the platform is ready for it; a screener that does not send it is still
+    served normally and simply audits without per-instance attribution.
     """
     response.headers["Cache-Control"] = "no-store"
     now = datetime.now(UTC)
@@ -743,6 +755,21 @@ async def agent_artifact(
         screener_hotkey,
         agent_id,
         attempt.attempt_id,
+    )
+    # SCREENER_HOTKEY is one shared string across an autoscaled fleet, so the
+    # attempt lease is the sharpest attribution available until callers start
+    # sending instance_id.
+    await record_artifact_fetch(
+        session,
+        agent_id=agent_id,
+        endpoint=ENDPOINT_SCREENER_ARTIFACT,
+        requester_kind="screener",
+        requester_id=screener_hotkey,
+        requester_instance_id=instance_id,
+        lease_id=attempt.attempt_id,
+        artifact_sha256=agent.sha256,
+        source_ip=client_ip(request),
+        detail=request_detail(request),
     )
     return ArtifactResponse(
         agent_id=agent_id,

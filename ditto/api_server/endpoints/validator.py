@@ -107,6 +107,7 @@ from ditto.api_models.validator_slot_settings import (
     ValidatorSlotSettings,
 )
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
+from ditto.api_server.artifact_audit import client_ip, request_detail
 from ditto.api_server.benchmark_rollout import (
     refresh_rolling_qualification,
 )
@@ -164,6 +165,10 @@ from ditto.db.models import (
     ValidatorTicket,
 )
 from ditto.db.queries.agents import get_agent_by_id
+from ditto.db.queries.artifact_fetch_audit import (
+    ENDPOINT_VALIDATOR_ARTIFACT,
+    record_artifact_fetch,
+)
 from ditto.db.queries.audit import (
     EVENT_AUDIT,
     EVENT_FINALIZED,
@@ -3871,6 +3876,27 @@ async def agent_artifact(
         x_validator_hotkey,
         agent_id,
         ticket.bench_version,
+    )
+    # Durable counterpart to the log line above. The ticket is keyed by
+    # (agent_id, validator_hotkey), so those two columns plus bench_version
+    # identify the lease that authorized this fetch.
+    await record_artifact_fetch(
+        session,
+        agent_id=agent_id,
+        endpoint=ENDPOINT_VALIDATOR_ARTIFACT,
+        requester_kind="validator",
+        requester_id=x_validator_hotkey,
+        bench_version=ticket.bench_version,
+        artifact_sha256=agent.sha256,
+        source_ip=client_ip(request),
+        detail=request_detail(
+            request,
+            served_screened_image=image_url is not None,
+            # The ticket row is UPSERTed on reissue, so attempt_count is the
+            # only thing tying this fetch to which lease attempt it served.
+            attempt_count=ticket.attempt_count,
+            slot_id=ticket.slot_id,
+        ),
     )
     return ArtifactResponse(
         agent_id=agent_id,

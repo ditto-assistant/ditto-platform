@@ -83,6 +83,7 @@ from ditto.api_server.middleware.error_envelope import (
 from ditto.chain.models import NeuronInfo
 from ditto.db.models import (
     Agent,
+    ArtifactFetchAudit,
     AthReview,
     BenchmarkDataset,
     BenchmarkRollout,
@@ -95,6 +96,10 @@ from ditto.db.models import (
     ValidatorHeartbeat,
     ValidatorLeaseAudit,
     ValidatorTicket,
+)
+from ditto.db.queries.artifact_fetch_audit import (
+    AUDIT_WRITE_FAILED,
+    record_artifact_fetch,
 )
 from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
@@ -2911,6 +2916,144 @@ class TestHeartbeat:
         )
         assert response.status_code == 401
         assert response.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
+
+
+class TestArtifactFetchAudit:
+    """Every served artifact must leave a durable, attributable row."""
+
+    async def test_fetch_writes_an_audit_row(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, bench_version=3)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
+        )
+
+        assert response.status_code == 200
+        async with session_maker() as s:
+            rows = (await s.scalars(select(ArtifactFetchAudit))).all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.agent_id == agent_id
+        assert row.endpoint == "validator.agent_artifact"
+        assert row.requester_kind == "validator"
+        # The whole point: the fetch is attributable to a specific hotkey.
+        assert row.requester_id == _KEYPAIR.ss58_address
+        assert row.artifact_sha256 == _SHA256
+        assert row.bench_version == 3
+        assert row.fetched_at is not None
+
+    async def test_each_fetch_appends_its_own_row(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Per-fetch history survives a ticket UPSERT.
+
+        ``validator_tickets`` is keyed by (agent_id, bench_version, hotkey) and
+        is overwritten on reissue, so a claim/fail/reclaim loop collapses into a
+        single row. The audit trail is what preserves that each hand-off of the
+        source actually happened, which is the record the leak investigation
+        did not have.
+        """
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, bench_version=3)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        _install_storage(app)
+
+        for _ in range(3):
+            # A fresh nonce each time: the same lease, fetched repeatedly.
+            response = await client.get(
+                f"/api/v1/validator/agent/{agent_id}/artifact",
+                headers=_artifact_headers(agent_id),
+            )
+            assert response.status_code == 200
+
+        async with session_maker() as s:
+            rows = (await s.scalars(select(ArtifactFetchAudit))).all()
+        assert len(rows) == 3
+        assert {r.seq for r in rows} == {r.seq for r in rows}
+
+    async def test_audit_failure_does_not_deny_the_artifact(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A logging fault must never become a scoring outage.
+
+        The validator has already proved hotkey possession, passed the chain
+        permit check and burned its nonce by this point. Refusing the artifact
+        because a bookkeeping INSERT failed would take the fleet down over a
+        full disk. Fail open, and make the gap loud instead of silent.
+        """
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, bench_version=3)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        _install_storage(app)
+
+        def _explode(**_kwargs: object) -> ArtifactFetchAudit:
+            raise RuntimeError("audit table is on fire")
+
+        # Break the row write itself, not the helper that wraps it, so this
+        # exercises the real fail-open path rather than a stubbed one.
+        monkeypatch.setattr(
+            "ditto.db.queries.artifact_fetch_audit.ArtifactFetchAudit",
+            _explode,
+        )
+
+        caplog.set_level(logging.ERROR)
+        response = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
+        )
+
+        # The artifact is still served, in full.
+        assert response.status_code == 200
+        body = response.json()
+        assert body["download_url"].startswith("https://")
+        assert body["sha256"] == _SHA256
+        # ...and the gap is loud, not silent: this is the string alerting keys on.
+        assert AUDIT_WRITE_FAILED in caplog.text
+        async with session_maker() as s:
+            assert (
+                await s.scalar(select(func.count()).select_from(ArtifactFetchAudit))
+            ) == 0
+
+    async def test_audit_write_failure_is_swallowed_and_logged(
+        self,
+        session_maker: async_sessionmaker[AsyncSession],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The helper itself never raises, and never fails silently."""
+        caplog.set_level(logging.ERROR)
+        async with session_maker() as s:
+            wrote = await record_artifact_fetch(
+                s,
+                agent_id=uuid4(),
+                endpoint="validator.agent_artifact",
+                requester_kind="validator",
+                # Violates the requester_id presence CHECK for a non-public
+                # kind, so the INSERT fails inside the database.
+                requester_id=None,
+            )
+
+        assert wrote is False
+        assert AUDIT_WRITE_FAILED in caplog.text
 
 
 class TestArtifact:
