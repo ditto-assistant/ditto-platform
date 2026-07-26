@@ -66,7 +66,7 @@ POST /api/v1/admin/queue-policy-settings
 
 The POST is an append-only revision carrying the complete policy, an
 `expected_revision` compare-and-swap, an actor + reason, and the exact typed
-confirmation `APPLY BENCHMARK ROLLOUT SETTINGS`. The table
+confirmation `APPLY QUEUE POLICY SETTINGS` (a mismatch is a 409). The table
 (`queue_policy_settings_revisions`) is never updated or deleted, so every
 change is recoverable history. Unlike rollout *activation*, this control **is**
 exposed over MCP — it is policy for a future transition, not an action on a live

@@ -15,15 +15,21 @@ SN118 publishes publicly and how. Implementation tracked per section below.
    researchers who want full per-epoch telemetry.
 3. **Public read API = yes.** Add a rate-limited, no-auth read endpoint so the
    dashboard (and anyone) can read the leaderboard without a validator hotkey.
-4. **Submitted source becomes public after finalization.** Every cleared
-   submission becomes downloadable after the configured embargo (48 hours by
-   default, operator-tunable anywhere from 6 hours to 720 hours / 30 days) from
-   its third accepted validator score. The clock is derived from immutable
-   score insertion timestamps, so the policy applies retroactively without a
-   backfill. Scores from different
-   benchmark versions never combine into a quorum. Quarantined, held, and
-   rejected submissions remain private unless an operator clears them; a clear
-   uses the original quorum time rather than restarting the embargo.
+4. **The king's source becomes public after on-chain confirmation.** Source
+   release is **king-only** and gated on on-chain weights: a submission's source
+   becomes downloadable only once it has (1) held the KOTH crown and (2) had
+   validators' revealed on-chain weights set on it after commit-reveal. The
+   configured embargo (48 hours by default, operator-tunable anywhere from 6
+   hours to 720 hours / 30 days) is measured from that on-chain confirmation —
+   **not** from the third accepted validator score. A submission that never
+   reigned is never released, however it scored. One that held the crown but is
+   not yet chain-confirmed is withheld with no unlock time until commit-reveal
+   confirms validators backed it. A three-validator score quorum on a single
+   benchmark version remains a precondition — scores from different benchmark
+   versions never combine into a quorum — but it starts no clock, and neither
+   an operator clear nor a later re-score moves the embargo, which is anchored
+   to the on-chain confirmation alone. Quarantined, held, and rejected
+   submissions stay private regardless of rank.
 
 ## Anti-gaming posture (the load-bearing rule)
 
@@ -81,12 +87,21 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
 - `GET /api/v1/public/leaderboard` → `{ generated_at, count,
   active_bench_version, desired_bench_version, selection_mode, entries: [
   { rank, agent_id, agent_name, miner_hotkey, registered, emission_eligible,
-    composite, tool_mean, memory_mean, first_seen, n,
+    composite, official_composite, effective_composite, efficiency_bonus,
+    aggregate_method, finalized, score_count, tool_mean, memory_mean,
+    first_seen, n,
     median_ms, bench_version, dataset_sha256, models, per_category,
     integrity, tokens } ], emissions: { champion_agent_id, recipients,
     raw_leader_decision, margin, dethrone_z, champion_share, rank_shares,
     tail_size } }`.
-  Entries are best-per-payment-coldkey and ranked by raw finalized composite.
+  Entries are best-per-payment-coldkey and ranked by **`official_composite`,
+  not `composite`**. Sorting the board yourself by `composite` reproduces `rank`
+  only while every entry is still on the canonical median
+  (`aggregate_method == 'canonical_median'`); once any agent has completed
+  continual cohort waves the two orderings diverge, and `official_composite` is
+  the one that ranks the board and drives the weight fold. Ties break on
+  `first_seen`, then `agent_id`. Provisional (pre-quorum) rows are ranked among
+  themselves and always trail the finalized board.
   Different names and hotkeys under one coldkey compete for one position; the
   best eligible generation wins and its hotkey remains the weight destination.
   During a
@@ -115,7 +130,9 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   preserves the immutable submission and score while excluding that hotkey from
   active weights and emissions; `null` means the chain snapshot was unavailable.
   Each entry also carries `artifact_release`, the submission-specific source
-  state described below; source visibility is independent of KOTH rank.
+  state described below. Source visibility depends **entirely** on KOTH rank:
+  only an agent that has worn the crown and been confirmed on-chain is ever
+  released.
   The optional chain lookup has a short deadline and a bounded in-process
   snapshot cache, so Pylon latency or failure cannot fail the public
   leaderboard. A failed refresh keeps serving the last successful mapping and
@@ -134,7 +151,8 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   miner can confirm progress before a score exists. Screening failures expose a
   stable failure category; anti-copy holds expose the matched agent and signal
   summary. Internal review and ban states are collapsed to `under_review` /
-  `rejected`. `artifact_release` exposes only the derived quorum/embargo state;
+  `rejected`. `artifact_release` exposes only the derived king/on-chain/embargo
+  release state;
   signed download URLs, source hashes, payments, and raw screener/build logs are
   never included in this listing.
   Each waiting entry also carries `validator_queue_rank` and
@@ -242,12 +260,16 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   still omits `per_case`.
 - `GET /api/v1/public/agent/{agent_id}/artifact` → `{ agent_id, bench_version,
   sha256, finalized_at, download_url, expires_at }`.
-  Returns a five-minute private-bucket URL only when one benchmark version has
-  three independently inserted score rows, the configured embargo has elapsed since the
-  third row, and the agent is currently in a cleared finalized state (`scored`
-  or legacy `live`). Before the deadline it fails with 425; unknown,
-  held-for-review, quarantined, and rejected agents fail closed with 404. The
-  response is `private, no-store`. A fourth score, re-score, benchmark rollover,
+  Returns a five-minute private-bucket URL only when the agent **has held the
+  KOTH crown**, its on-chain weights have been confirmed after commit-reveal,
+  the configured embargo has elapsed since that confirmation, one benchmark
+  version has three independently inserted score rows, and the agent is
+  currently in a cleared finalized state (`scored` or legacy `live`). Before the
+  deadline it fails with 425. An agent that has **never been king fails closed
+  with 404** — `"only the king's source is released"` — as do unknown,
+  held-for-review, quarantined, and rejected agents; an ever-king agent still
+  awaiting on-chain confirmation is withheld with no unlock time. The response
+  is `private, no-store`. A fourth score, re-score, benchmark rollover,
   leaderboard change, or deregistration never resets the original clock.
 - `GET /api/v1/public/agent/{agent_id}/dataset` → `{ agent_id, miner_hotkey,
   seed, run_size, dataset_sha256, bench_version, dataset_seed_block(+hash),
