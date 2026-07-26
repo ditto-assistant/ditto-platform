@@ -86,6 +86,19 @@ async def _seed_heartbeat(
     await session.flush()
 
 
+def _mark_lease_reported(ticket: ValidatorTicket, *, at: datetime) -> None:
+    """Say that this lease was observed running at least once.
+
+    The liveness gate will not revoke a lease that has never reported: a slot
+    that never announced itself is silent because it is still starting up, not
+    because it is idle. So a test about reclaiming an *idle* lease has to first
+    establish that the run began -- otherwise it is exercising the never-reported
+    refusal instead of the case it was written for. Call inside the transaction
+    that owns *ticket*.
+    """
+    ticket.first_reported_at = at
+
+
 # Exactly the shape of the live v7 fleet the owner-pin defect was found on:
 # three version-capable validators against a quorum of three, so a single
 # retry-exhausted validator already puts a submission out of reach.
@@ -1589,6 +1602,7 @@ class TestIssueTicket:
                     status=TicketStatus.ISSUED,
                     issued_at=_NOW - timedelta(minutes=1),
                     deadline=_AFTER_REPORTING_GRACE + _TTL,
+                    first_reported_at=_NOW,
                 )
             )
             # The validator is heartbeating right now and advertising no work on
@@ -1667,7 +1681,7 @@ class TestIssueTicket:
         assert ticket is not None
         assert ticket.agent_id == image_id
 
-    async def test_screened_only_releases_unstarted_incompatible_lease(
+    async def test_screened_only_releases_idle_incompatible_lease(
         self, session: AsyncSession
     ) -> None:
         source_id = await _seed_evaluating(session)
@@ -1678,6 +1692,11 @@ class TestIssueTicket:
                 now=_NOW,
                 ttl=timedelta(hours=2),
             )
+            assert issued is not None
+            # The lease started and was seen running; what makes it releasable
+            # is that the validator now reports the slot empty, not that time
+            # passed.
+            _mark_lease_reported(issued, at=_NOW + timedelta(minutes=1))
             await _seed_heartbeat(
                 session,
                 validator_hotkey="5Transition",
@@ -1860,6 +1879,9 @@ class TestIssueTicket:
                 ttl=timedelta(hours=2),
             )
             assert issued is not None
+            # It was running before the restart, so its silence afterwards is
+            # real evidence rather than a run that never announced itself.
+            _mark_lease_reported(issued, at=_NOW + timedelta(minutes=1))
             await _seed_heartbeat(
                 session,
                 validator_hotkey="5Restarted",
@@ -2301,6 +2323,7 @@ class TestIssueTicket:
             )
             assert legacy is not None
             assert legacy.agent_id == legacy_agent
+            _mark_lease_reported(legacy, at=_NOW + timedelta(minutes=1))
             await _seed_heartbeat(
                 session,
                 validator_hotkey="5V1",

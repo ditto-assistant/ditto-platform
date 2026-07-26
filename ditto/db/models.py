@@ -2030,6 +2030,27 @@ class ValidatorTicket(Base):
     )
     """Earliest time this validator may retry an expired ticket."""
 
+    first_reported_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    """When heartbeat ingest first confirmed this lease against a live slot.
+
+    NULL means this lease has never once been observed running, which is a
+    different claim from "it is not running now" and must never be read as the
+    latter. A validator can hold a lease for many minutes before its first
+    progress report -- pulling the screened image, rendering the dataset, or
+    seeding, which alone is allowed 15 minutes for v7 against a 5-minute
+    reporting grace -- and during that window the slot is simply absent from
+    ``capacity.active``, indistinguishable from an idle one.
+
+    So this is the evidence :func:`~ditto.db.queries.lease_liveness.lease_liveness`
+    needs to separate "has been quiet since it started" from "has gone quiet",
+    and it is only ever used to REFUSE a revocation. Set once and never moved:
+    the question it answers is whether this lease has *ever* testified, not when
+    it last did. Reset to NULL on reissue, since a new lease has its own silence
+    to account for.
+    """
+
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     """Latest signed public-safe failure class reported for this ticket."""
 

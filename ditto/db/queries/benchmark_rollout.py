@@ -1499,6 +1499,7 @@ async def issue_rollout_ticket(
         ticket.deadline = now + ttl
         ticket.attempt_count += 1
         ticket.retry_after = None
+        ticket.first_reported_at = None
     await session.flush()
     return ticket
 

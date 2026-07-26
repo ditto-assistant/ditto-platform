@@ -1263,6 +1263,7 @@ async def replace_validator_score_after_infrastructure_failure(
         ticket.deadline = deadline
         ticket.attempt_count += 1
         ticket.retry_after = None
+        ticket.first_reported_at = None
         await append_audit_entry(
             session,
             agent_id=agent_id,

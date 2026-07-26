@@ -1237,6 +1237,79 @@ class TestHeartbeat:
         ]
         assert public["active_benchmark"] == public["active_benchmarks"][0]
 
+    async def test_confirmed_slot_stamps_the_lease_as_reported_once(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Ingest is what tells the liveness gate this lease ever ran.
+
+        Until a slot confirms, the lease is unrevocable: its silence means "has
+        not announced itself yet". The stamp is what converts later silence into
+        evidence, so it has to be written exactly when the ledger first agrees
+        the slot is live -- and it must not move afterwards, since the question
+        is whether the lease ever testified, not when it last did.
+        """
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, slot_id="slot-0")
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+            )
+            assert ticket is not None
+            assert ticket.first_reported_at is None
+
+        async def _beat(completed: int) -> None:
+            progress = _progress("running_benchmark", completed=completed, total=10)
+            response = await client.post(
+                "/api/v1/validator/heartbeat",
+                headers=_AUTH_HEADER,
+                json=_heartbeat_payload(
+                    protocol_version=10,
+                    state="running_benchmark",
+                    active_agent_id=agent_id,
+                    benchmark_progress=progress,
+                    capabilities=_V9_CAPABILITIES,
+                    stack=_V7_STACK,
+                    stack_health=_V9_STACK_HEALTH,
+                    benchmark_capacity={
+                        "configured_slots": 1,
+                        "healthy_slots": ["slot-0"],
+                        "admission": "accepting",
+                        "active": [
+                            {
+                                "slot_id": "slot-0",
+                                "agent_id": str(agent_id),
+                                "bench_version": 2,
+                                "progress": progress,
+                            }
+                        ],
+                    },
+                ),
+            )
+            assert response.status_code == 200, response.text
+
+        await _beat(3)
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+            )
+            assert ticket is not None
+            assert ticket.first_reported_at is not None
+            stamped = ticket.first_reported_at
+
+        await _beat(7)
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+            )
+            assert ticket is not None
+            assert ticket.first_reported_at == stamped
+
     async def test_capacity_validation_failure_still_advances_liveness(
         self,
         app: FastAPI,
@@ -4003,12 +4076,14 @@ class TestRequestJob:
                     bench_version=2,
                     validator_hotkey=_VALIDATOR_HOTKEY,
                     status=TicketStatus.ISSUED,
-                    # Old enough that a heartbeat reporting no work is evidence
-                    # of idleness rather than a run still starting up.
+                    # Reported once already, so a heartbeat now reporting no
+                    # work is evidence of idleness rather than a run still
+                    # starting up and not yet advertising its slot.
                     issued_at=now - timedelta(minutes=10),
                     deadline=now + timedelta(minutes=90),
                     attempt_count=1,
                     manual_retry_grants=0,
+                    first_reported_at=now - timedelta(minutes=9),
                 )
             )
         _install_db(app, session_maker)

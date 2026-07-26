@@ -24,6 +24,20 @@ no log line explaining it.
 So this module inverts the burden of proof. A lease is revocable only on
 **positive, fresh evidence of idleness that postdates the lease**:
 
+0. The lease has been observed running at least once
+   (``ValidatorTicket.first_reported_at`` is set). A lease that has *never*
+   reported has produced no evidence in either direction, so no amount of
+   elapsed time turns its silence into proof. This is the rule the grace window
+   below was standing in for and could not enforce: the validator omits a leased
+   slot from ``capacity.active`` entirely until its first progress report
+   (``ditto-subnet`` ``worker.py``, ``slot.progress is None`` -> ``continue``),
+   and every other safeguard here is derived from that one list -- including the
+   ``claimed_slots`` fallback, which is projected from it. So a slot that was
+   still rendering its dataset or seeding looked exactly like an idle one, and
+   once the grace expired the lease was destroyed. Seeding alone is allowed 15
+   minutes for v7 against a 5-minute grace, which is why every observed death
+   landed just past the window rather than inside it.
+
 1. The heartbeat row exists and its ``seen_at`` is within
    :data:`IDLE_EVIDENCE_MAX_AGE`. Missing, unreadable, or older than that is
    *unknown*, and unknown reads as running.
@@ -93,6 +107,7 @@ LEASE_REPORTING_GRACE = timedelta(minutes=5)
 
 # Reason codes. Everything except IDLE_* means "assume running, do not revoke".
 REASON_RUNNING_REPORTED = "running_benchmark_reported"
+REASON_NEVER_REPORTED = "lease_never_reported"
 REASON_HEARTBEAT_MISSING = "heartbeat_missing"
 REASON_HEARTBEAT_STALE = "heartbeat_stale"
 REASON_EVIDENCE_PREDATES_LEASE = "evidence_predates_lease"
@@ -180,6 +195,31 @@ async def lease_liveness(
     if running_benchmark_reported:
         # The caller already holds a signed report that this slot is running.
         return _assume_running(REASON_RUNNING_REPORTED)
+
+    if ticket.first_reported_at is None:
+        # This lease has never once been observed running, so there is no
+        # evidence about it in either direction and the grace window is beside
+        # the point. Absence from ``capacity.active`` is what a slot looks like
+        # while it pulls its image, renders its dataset, or seeds -- the v7 seed
+        # alone may take 15 minutes against a 5-minute grace -- and it is also
+        # what a slot looks like when the validator omits it, which today it
+        # does for every leased slot until the first progress report arrives.
+        # Under that omission all three of the platform's other safeguards
+        # (slot_running_benchmark, the active-slot check, and the claimed_slots
+        # fallback, which is projected from the same list) read false together,
+        # leaving the grace timer as the only protection a healthy run had.
+        #
+        # A never-reported lease is therefore not revocable at all. The cost is
+        # bounded and already paid for elsewhere: the deadline still expires the
+        # lease via ``expire_overdue_tickets``, so a validator that died during
+        # seeding gives its slot back on the deadline exactly as a crashed one
+        # always has.
+        return _assume_running(
+            REASON_NEVER_REPORTED,
+            lease_age_seconds=round(
+                (now - _as_utc(ticket.issued_at)).total_seconds(), 3
+            ),
+        )
 
     heartbeat = await session.get(ValidatorHeartbeat, validator_hotkey)
     if heartbeat is None:
