@@ -11,6 +11,7 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.queue_policy_settings import PrevGenCarryoverSettings
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.endpoints import validator as validator_endpoint
@@ -121,6 +122,14 @@ async def test_concurrent_source_backfill_respects_atomic_fleet_cap(
                 heartbeat=heartbeat,
                 validator_hotkey=validator_hotkey,
                 now=now,
+                # The rollout above has activated, so v6 is retired and the lane
+                # is off unless an operator asks for it. Asking for it is what
+                # this fixture needs, and it proves the knob re-enables the lane
+                # against a real Postgres rather than a mock.
+                active_version=7,
+                carryover_settings=PrevGenCarryoverSettings(
+                    allow_retired_era_backfill=True
+                ),
                 artifact_mode="screened_only",
                 validator_running_benchmark=False,
                 slot_id="slot-0",
