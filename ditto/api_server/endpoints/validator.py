@@ -480,6 +480,64 @@ def _slot_cap_declines(
     return len({held for held in held_slots if held != slot_id}) >= allowed_slots
 
 
+async def _idle_retest_slot(
+    session: AsyncSession,
+    *,
+    heartbeat: ValidatorHeartbeat | None,
+    slot_settings: ValidatorSlotSettings,
+    validator_hotkey: str,
+    now: datetime,
+) -> str | None:
+    """Pick a slot a continual retest may occupy, or None when there is none.
+
+    The continual lane consumes an execution slot just like a canonical lease,
+    so it is bound by the same two limits: the validator must be offering the
+    slot (``healthy_slots`` minus whatever it reports as already running), and
+    the operator's ``max_concurrent_slots`` ceiling on how many leases one
+    validator holds at once. Before this the lane asked neither -- every
+    confirmation ticket took the ``slot-0`` column default and none of them
+    counted against the cap, so an operator lowering the cap did not bound
+    retests and a retest could not be told apart from an idle slot.
+
+    Slots holding a live lease are excluded on top of the heartbeat's own
+    ``active`` list: the heartbeat is a self-report that freezes when ingest
+    fails, while the ticket table is what the platform actually leased. Taking
+    the union keeps a stale capacity blob from double-booking a slot, which the
+    unique partial index would otherwise reject outright.
+
+    A validator advertising no parseable capacity is treated as the single
+    ``slot-0`` machine this lane has always assumed, not as having no capacity
+    at all. Absence of evidence is not evidence of a busy slot, and declining
+    would silently switch the lane off for anyone whose heartbeat predates -- or
+    momentarily loses -- the capacity blob. The per-slot rail in
+    ``issue_confirmation_ticket`` still refuses the claim if that one slot turns
+    out to be leased.
+
+    Returns the lowest free healthy slot for determinism -- the caller's
+    fairness ordering is over cohort members, not slots, so there is nothing to
+    gain by spreading and a stable choice is easier to reason about.
+    """
+    if heartbeat is None:
+        return None
+    try:
+        capacity = BenchmarkCapacity.model_validate(heartbeat.benchmark_capacity)
+    except ValidationError:
+        capacity = None
+    held = await _held_lease_slots(session, validator_hotkey=validator_hotkey, now=now)
+    allowed = allowed_slot_count(
+        slot_settings,
+        advertised_slots=(capacity.configured_slots if capacity is not None else 1),
+        disk_percent=_heartbeat_disk_percent(heartbeat),
+    )
+    if len(held) >= allowed:
+        return None
+    offered = capacity.free_healthy_slots if capacity is not None else ("slot-0",)
+    free = [slot for slot in offered if slot not in held]
+    if not free:
+        return None
+    return min(free, key=_slot_ordinal)
+
+
 def _heartbeat_disk_percent(heartbeat: ValidatorHeartbeat | None) -> int | None:
     """Read the last reported host disk usage, or None when it is unknown.
 
@@ -2532,21 +2590,32 @@ async def _top5_member_is_least_covered(
     if requested_member_id not in member_ids:
         return False
 
-    existing_live = await session.scalar(
+    # One continual retest per validator at a time: a validator already running
+    # a wave member re-asks for that same member (a poll or a restart) and gets
+    # it back, and is not handed a second one.
+    #
+    # Scoped to CONTINUAL_RETEST leases. Matching any live lease meant a
+    # canonical benchmark on an unrelated slot answered the question "which
+    # cohort member is least covered" with "none of them", so a validator
+    # scoring ordinary queue work could never start a retest -- the fleet-wide
+    # veto that ``issue_confirmation_ticket`` used to apply again one layer
+    # down. Coverage is a property of the cohort, not of the validator's
+    # canonical workload; the slot rails belong downstream.
+    existing_retest = await session.scalar(
         select(ValidatorTicket)
         .where(
             ValidatorTicket.validator_hotkey == validator_hotkey,
             ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.purpose == TicketPurpose.CONTINUAL_RETEST,
             ValidatorTicket.deadline > now,
         )
         .limit(1)
     )
-    if existing_live is not None:
+    if existing_retest is not None:
         return (
-            existing_live.agent_id == requested_member_id
-            and existing_live.bench_version == canonical_version
-            and existing_live.purpose == TicketPurpose.CONTINUAL_RETEST
-            and existing_live.seed == wave_seed
+            existing_retest.agent_id == requested_member_id
+            and existing_retest.bench_version == canonical_version
+            and existing_retest.seed == wave_seed
         )
 
     history = await confirmation_composites_by_seed(
@@ -2895,6 +2964,25 @@ async def request_top5_confirmation_job(
                 status_code=409,
                 detail="another cohort member has less confirmation coverage",
             )
+        # Place this retest on a real execution slot. The lane occupies one
+        # slot exactly like a canonical lease, so it answers the same two
+        # questions the canonical lane already answers: which slots is this
+        # validator offering (healthy, not already running), and how many
+        # leases has the operator allowed it to hold at once. Neither was asked
+        # before: the ticket took the ``slot-0`` column default and the lane was
+        # invisible to the operator cap.
+        retest_slot = await _idle_retest_slot(
+            session,
+            heartbeat=heartbeat,
+            slot_settings=await _validator_slot_settings(request),
+            validator_hotkey=payload.validator_hotkey,
+            now=now,
+        )
+        if retest_slot is None:
+            raise HTTPException(
+                status_code=409,
+                detail="validator has no idle slot for a continual retest",
+            )
         ticket = await issue_confirmation_ticket(
             session,
             agent_id=payload.member_agent_id,
@@ -2908,6 +2996,7 @@ async def request_top5_confirmation_job(
                 if confirmation_datasets
                 else None
             ),
+            slot_id=retest_slot,
         )
         if ticket is None:
             raise HTTPException(

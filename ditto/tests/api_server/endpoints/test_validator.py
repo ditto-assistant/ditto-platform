@@ -6618,6 +6618,172 @@ class TestTop5ConfirmationLane:
         assert response.status_code == 200, response.text
         assert response.json()["agent_id"] == str(member)
 
+    async def _arm_idle_retest_lane(
+        self,
+        app: FastAPI,
+        session_maker: async_sessionmaker[AsyncSession],
+        champion: UUID,
+        *,
+        capacity: dict[str, object] | None,
+    ) -> None:
+        """Open every retest gate and publish ``capacity`` for the validator."""
+        async with session_maker() as session, session.begin():
+            champion_row = await session.get(Agent, champion)
+            assert champion_row is not None
+            champion_row.dataset_seed_block = 1
+            session.add(
+                ContinualRetestSettingsRevision(
+                    parent_revision=0,
+                    scope="*",
+                    settings={
+                        "aggregate_mode": "fleet_ready",
+                        "idle_retests_enabled": True,
+                    },
+                    checksum="b" * 64,
+                    reason="idle retests claim spare slots",
+                    actor="operator@example.com",
+                )
+            )
+            heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert heartbeat is not None
+            heartbeat.benchmark_capacity = capacity
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+        _install_chain_with_block(app, block_number=361)
+        app.state.config = replace(app.state.config, top5_backoff_base=2)
+
+    async def test_retest_claims_an_idle_slot_beside_a_canonical_lease(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A busy sibling slot must not veto the whole validator.
+
+        The lane refused a confirmation whenever the validator held any live
+        lease anywhere, which is the pre-#433 one-benchmark-per-validator
+        assumption. With multi-slot validators that made continual retests --
+        enabled precisely to consume *idle* capacity -- the one kind of work
+        that could never claim it.
+        """
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        busy_agent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="canonical-occupant",
+            miner_hotkey="5CanonicalOccupant",
+            sha256="ab" * 32,
+        )
+        await _seed_ticket(session_maker, busy_agent, slot_id="slot-0")
+        await self._arm_idle_retest_lane(
+            app,
+            session_maker,
+            champion,
+            capacity={
+                "configured_slots": 4,
+                "healthy_slots": ["slot-0", "slot-1", "slot-2", "slot-3"],
+                "admission": "accepting",
+                "active": [],
+            },
+        )
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(member)
+        async with session_maker() as session:
+            ticket = await session.get(ValidatorTicket, (member, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
+            # The lowest free slot, NOT the ``slot-0`` column default: the
+            # validator binds its execution slot to the ticket, so a wrong id
+            # sends every progress report to a slot with no matching lease.
+            assert ticket.slot_id == "slot-1"
+
+    async def test_operator_slot_cap_bounds_the_retest_lane(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Retests are leases, so the operator cap has to count them too.
+
+        The validator advertises four healthy slots but the default policy
+        allows two concurrent leases, and both are already spent on canonical
+        work. Ramping the fleet stays an operator decision.
+        """
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        for index, slot in enumerate(("slot-0", "slot-1")):
+            busy_agent = await _seed_agent(
+                session_maker,
+                status=AgentStatus.EVALUATING,
+                name=f"canonical-occupant-{index}",
+                miner_hotkey=f"5CanonicalOccupant{index}",
+                sha256=f"{index + 12:02d}" * 32,
+            )
+            await _seed_ticket(session_maker, busy_agent, slot_id=slot)
+        await self._arm_idle_retest_lane(
+            app,
+            session_maker,
+            champion,
+            capacity={
+                "configured_slots": 4,
+                "healthy_slots": ["slot-0", "slot-1", "slot-2", "slot-3"],
+                "admission": "accepting",
+                "active": [],
+            },
+        )
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 409
+        assert "no idle slot" in response.json()["message"]
+
+    async def test_single_slot_validator_still_serializes_against_its_lease(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """No advertised capacity falls back to the one-slot machine.
+
+        Absence of a capacity blob is not evidence of free capacity, and it is
+        not evidence of a busy validator either: the lane keeps its historical
+        single-``slot-0`` behaviour, which here means the canonical lease on
+        that slot still blocks the retest.
+        """
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, member = agent_ids[0], agent_ids[1]
+        busy_agent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="canonical-occupant",
+            miner_hotkey="5CanonicalOccupant",
+            sha256="cd" * 32,
+        )
+        await _seed_ticket(session_maker, busy_agent, slot_id="slot-0")
+        await self._arm_idle_retest_lane(app, session_maker, champion, capacity=None)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, member),
+        )
+
+        assert response.status_code == 409
+        assert "no idle slot" in response.json()["message"]
+
     async def test_allows_out_of_cadence_claim_while_canonical_tail_drains(
         self,
         app: FastAPI,
