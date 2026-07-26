@@ -233,6 +233,7 @@ from ditto.db.queries.retirement import retired_agent_ids
 from ditto.db.queries.retry_state import (
     AgentRetryState,
     classify_agent_retry_states,
+    resolve_bench_version,
 )
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
@@ -3675,6 +3676,32 @@ async def agent_pipeline(
     canonical_scores = [
         score for score in accepted_scores if score.bench_version == canonical_version
     ]
+    # The era this submission's progress is *reported* against, which is not
+    # always the active one. Counting a closed-generation row against the active
+    # version told a miner who got 2 of 3 in v6 that they had "0 of 3", reading
+    # as if their accepted work had vanished.
+    #
+    # Any accepted score in the active version settles it: that submission is
+    # current-generation work and its progress is the active era's, even when it
+    # also holds a ticket for a version being rolled out ahead of the active one.
+    # Only a submission with no foothold in the active era falls back, and then
+    # to the same resolution the validator-retry surfaces use -- which correctly
+    # keeps a carried-over row on the new era (its live ticket outranks its old
+    # scores), so a submission cannot be in one era there and another here.
+    era_version = (
+        canonical_version
+        if canonical_scores
+        else resolve_bench_version(
+            all_tickets=tickets,
+            all_scores=accepted_scores,
+            canonical_version=canonical_version,
+        )
+    )
+    era_scores = (
+        canonical_scores
+        if era_version == canonical_version
+        else [score for score in accepted_scores if score.bench_version == era_version]
+    )
     confirmation_scores = list(
         await session.scalars(
             select(ConfirmationScore)
@@ -3738,6 +3765,11 @@ async def agent_pipeline(
                 and cast(datetime, _aware(ticket.deadline)) > now
                 for ticket in tickets
             ),
+            # Deliberately the ACTIVE-era count, not ``era_scores``. The only
+            # label this feeds is ``below_score_floor``, which compares a score
+            # against the active version's continuation floor -- a previous
+            # generation's composites are not on that scale, so admitting them
+            # here would decide a live-queue question with incomparable numbers.
             score_count=len(canonical_scores),
             highest_composite=(
                 max(score.composite for score in canonical_scores)
@@ -3749,7 +3781,8 @@ async def agent_pipeline(
             retired=agent_retired,
         ),
         active_bench_version=canonical_version,
-        score_count=len(canonical_scores),
+        score_bench_version=era_version,
+        score_count=len(era_scores),
         quorum=SCORING_QUORUM,
         score_floor=score_continuation_floor or 0.0,
         provisional_scores=[
@@ -3826,9 +3859,14 @@ async def agent_pipeline(
             )
             for score in confirmation_scores
         ],
+        # Same era as ``score_count`` above, or the page contradicts itself: a
+        # finalized v6 row would read "3 of 3" with no final score to show for
+        # it. The median is over one era's scores either way, so this stays the
+        # median that submission was actually finalized at -- it is not a second
+        # aggregate, and nothing here feeds weights or the leaderboard.
         final_composite=(
-            statistics.median(score.composite for score in canonical_scores)
-            if len(canonical_scores) >= SCORING_QUORUM
+            statistics.median(score.composite for score in era_scores)
+            if len(era_scores) >= SCORING_QUORUM
             and agent.status in (AgentStatus.SCORED, AgentStatus.LIVE)
             else None
         ),

@@ -188,6 +188,13 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   bind a positive revision. A database-side guard converts old-writer reissues
   to unclassified, while revision-zero leases without the transition allowance
   cannot be scored.
+  `score_count` and `final_composite` are counted against `score_bench_version`
+  — the benchmark era the submission belongs to, which is `active_bench_version`
+  for current-generation work and an older version for a submission whose
+  generation has closed. Consumers must read the two version fields together: a
+  count scoped to the active era alone answered 0 for every previous-generation
+  row, which is indistinguishable from a submission no validator ever took up.
+  Scores from different eras are never mixed into one count.
   `final_composite` remains null until three independent scores reach quorum and
   the submission is in a finalized public state; the leaderboard and emission
   eligibility rules are unchanged. On-chain provenance is claimed only when the

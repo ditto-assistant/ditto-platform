@@ -273,16 +273,18 @@ async def test_retired_row_stays_reachable_by_direct_url(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["status"] == "retired"
-    # ``score_count`` on this page is scoped to the ACTIVE benchmark, so a
-    # closed-generation submission reads 0 here even though its own era's
-    # scores are intact. That is pre-existing behaviour for every
-    # previous-generation row, not something retirement introduces, and it is
-    # pinned rather than asserted-away so a later fix has to update this line
-    # deliberately. The v6 scores are still in the ledger; see
-    # ``test_retired_row_leaves_the_waiting_queue_but_stays_visible`` for the
-    # activity feed, which reports the era-correct count.
-    assert body["score_count"] == 0
+    # Retiring a submission closes it out; it does not erase what it earned.
+    # ``score_count`` is reported against the era the submission belongs to, so
+    # the two v6 scores still read as 2 of 3 -- this page used to scope the
+    # count to the ACTIVE benchmark and answer 0, which read to the miner as
+    # though their accepted work had vanished along with their queue slot.
+    # ``score_bench_version`` is what makes the number unambiguous: the count is
+    # v6's, and the benchmark that is live now is a different one.
+    assert body["score_count"] == 2
+    assert body["score_bench_version"] == _CLOSED_VERSION
     assert body["active_bench_version"] == _ACTIVE_VERSION
+    # Below its own era's quorum, so there is no finalized composite to show.
+    assert body["final_composite"] is None
 
 
 async def test_retired_row_is_dropped_from_the_operations_board(
