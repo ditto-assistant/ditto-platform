@@ -1611,7 +1611,29 @@ class PublicActivityEntry(BaseModel):
             ge=1,
             description=(
                 "Current global validator-assignment priority for a waiting "
-                "submission. Validator-specific eligibility may skip a row."
+                "submission, produced by the same ordering the allocator issues "
+                "tickets with. It is an ordering, not a prediction of the next "
+                "assignment: each validator additionally applies its own retry "
+                "cooldowns, one-score-per-validator rule, and artifact mode, "
+                "any of which can skip a row. Read validator_queue_gate before "
+                "reading rank 1 as imminent."
+            ),
+        ),
+    ]
+    validator_queue_gate: Annotated[
+        Literal["previous_generation", "owner_serialized", "not_leasable"] | None,
+        Field(
+            default=None,
+            description=(
+                "Why this submission cannot be leased on the next poll despite "
+                "its rank, or null when nothing holds it. 'previous_generation' "
+                "is retired-era work the fleet serves only once the current era "
+                "drains; 'owner_serialized' means another submission from the "
+                "same paid owner holds the owner's single validator slot -- "
+                "rotating hotkeys does not buy a second one; 'not_leasable' "
+                "means the allocator's candidate filter excludes it (no "
+                "versioned dataset, no eligible screened image, withdrawn, or "
+                "not admitted to this era)."
             ),
         ),
     ]

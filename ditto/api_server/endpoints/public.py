@@ -199,6 +199,7 @@ from ditto.db.queries.artifact_release_settings import (
 )
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.benchmark_admission import (
+    activated_rollout_for_version,
     admitted_agent_ids,
     agent_is_admitted,
 )
@@ -223,6 +224,11 @@ from ditto.db.queries.heartbeats import (
     live_validator_fleet_supports_protocol,
 )
 from ditto.db.queries.king_reign import KingReveal, get_king_reveal
+from ditto.db.queries.queue_order import (
+    QueueGate,
+    QueuePreviewEntry,
+    preview_queue_order,
+)
 from ditto.db.queries.retry_state import (
     AgentRetryState,
     classify_agent_retry_states,
@@ -249,7 +255,6 @@ from ditto.db.queries.screening import (
     list_screening_attempts,
 )
 from ditto.db.queries.tickets import (
-    PROVISIONAL_CONTENDER_LANE_SIZE,
     get_score_continuation_floor,
     get_score_priority_floors,
 )
@@ -2938,46 +2943,97 @@ def _public_activity_status(
     return status.value
 
 
-def _public_activity_response(
+def _waiting_validator_agent_ids(
+    rows: list[Any],
+    *,
+    statuses: dict[UUID, str],
+) -> list[UUID]:
+    """Submissions the fleet still owes a score, in the order they were listed.
+
+    The population the queue preview ranks. ``below_score_floor`` belongs to it:
+    the allocator still serves those rows, just last.
+    """
+    return [
+        row.agent.agent_id
+        for row in rows
+        if statuses.get(row.agent.agent_id)
+        in ("waiting_validator", "below_score_floor")
+    ]
+
+
+async def queue_preview_for_rows(
+    session: AsyncSession,
     *,
     rows: list[Any],
-    active_work: list[ActiveValidatorWork],
+    statuses: dict[UUID, str],
+    bench_version: int,
     now: datetime,
-    page: int,
-    limit: int,
-    requested_statuses: set[str],
-    query: str | None,
     score_continuation_floor: float | None,
     provisional_contender_floor: float | None,
+) -> dict[UUID, QueuePreviewEntry]:
+    """Rank the waiting population with the allocator's own ordering.
+
+    Every endpoint that publishes ``validator_queue_rank`` goes through here,
+    so a fix landed for one of them cannot miss the other -- which is exactly
+    how the operations board kept ranking a stranded previous-generation
+    backlog at the head of the queue after ``/activity`` had been corrected.
+    """
+    waiting = _waiting_validator_agent_ids(rows, statuses=statuses)
+    if not waiting:
+        return {}
+    return await preview_queue_order(
+        session,
+        bench_version=bench_version,
+        now=now,
+        agent_ids=waiting,
+        score_continuation_floor=score_continuation_floor,
+        provisional_contender_floor=provisional_contender_floor,
+        rollout=await activated_rollout_for_version(
+            session, bench_version=bench_version
+        ),
+        previous_generation_agent_ids=await prev_generation_agent_ids(
+            session, bench_version=bench_version, agent_ids=waiting
+        ),
+    )
+
+
+def _queue_rank(preview: dict[UUID, QueuePreviewEntry], agent_id: UUID) -> int | None:
+    """This submission's place in the fleet-wide queue, if it is waiting on one."""
+    entry = preview.get(agent_id)
+    return None if entry is None else entry.rank
+
+
+def _queue_gate(
+    preview: dict[UUID, QueuePreviewEntry], agent_id: UUID
+) -> QueueGate | None:
+    """What holds this submission behind its rank, if anything does."""
+    entry = preview.get(agent_id)
+    return None if entry is None else entry.gate
+
+
+def _public_activity_statuses(
+    rows: list[Any],
+    *,
+    active_work: list[ActiveValidatorWork],
     active_assignment_agent_ids: set[UUID],
-    artifact_releases: dict[UUID, PublicArtifactRelease],
+    score_continuation_floor: float | None,
     active_bench_version: int | None = None,
     benchmark_admitted_agent_ids: set[UUID] | None = None,
-    retry_states: dict[UUID, AgentRetryState] | None = None,
-    duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
-    ath_review_opened_at: dict[UUID, datetime] | None = None,
-    ath_review_composite: dict[UUID, float] | None = None,
-    prev_generation_agent_ids: set[UUID] | None = None,
-    ath_only: bool = False,
-    terminal_history_limit: int | None = None,
-) -> PublicActivityResponse:
-    """Project activity from the same validated work set used by fleet health."""
-    active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
-    for work in active_work:
-        active_by_agent.setdefault(work.agent.agent_id, []).append(
-            _public_benchmark_progress(work, now)
-        )
+) -> dict[UUID, str]:
+    """Public lifecycle label per submission, keyed by agent id.
+
+    Split out so an endpoint can resolve the waiting population -- and rank it
+    against the database -- before projecting the response.
+    """
     active_agent_ids = {
         work.agent.agent_id
         for work in active_work
         if active_bench_version is None
         or work.ticket.bench_version == active_bench_version
     }
-    retry_by_agent = retry_states or {}
     admitted = benchmark_admitted_agent_ids
-
-    def public_status(row: Any) -> str:
-        return _public_activity_status(
+    return {
+        row.agent.agent_id: _public_activity_status(
             row.agent.status,
             screening_policy_version=row.agent.screening_policy_version,
             has_active_attempt=row.screening_attempt is not None,
@@ -2988,91 +3044,54 @@ def _public_activity_response(
             score_continuation_floor=score_continuation_floor,
             benchmark_admitted=(admitted is None or row.agent.agent_id in admitted),
         )
+        for row in rows
+    }
 
-    projected = [(row, public_status(row)) for row in rows]
+
+def _public_activity_response(
+    *,
+    rows: list[Any],
+    active_work: list[ActiveValidatorWork],
+    now: datetime,
+    page: int,
+    limit: int,
+    requested_statuses: set[str],
+    query: str | None,
+    score_continuation_floor: float | None,
+    active_assignment_agent_ids: set[UUID],
+    artifact_releases: dict[UUID, PublicArtifactRelease],
+    queue_preview: dict[UUID, QueuePreviewEntry],
+    active_bench_version: int | None = None,
+    benchmark_admitted_agent_ids: set[UUID] | None = None,
+    retry_states: dict[UUID, AgentRetryState] | None = None,
+    duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
+    ath_review_opened_at: dict[UUID, datetime] | None = None,
+    ath_review_composite: dict[UUID, float] | None = None,
+    ath_only: bool = False,
+    terminal_history_limit: int | None = None,
+) -> PublicActivityResponse:
+    """Project activity from the same validated work set used by fleet health."""
+    active_by_agent: dict[UUID, list[PublicBenchmarkProgress]] = {}
+    for work in active_work:
+        active_by_agent.setdefault(work.agent.agent_id, []).append(
+            _public_benchmark_progress(work, now)
+        )
+    retry_by_agent = retry_states or {}
+    statuses = _public_activity_statuses(
+        rows,
+        active_work=active_work,
+        active_assignment_agent_ids=active_assignment_agent_ids,
+        score_continuation_floor=score_continuation_floor,
+        active_bench_version=active_bench_version,
+        benchmark_admitted_agent_ids=benchmark_admitted_agent_ids,
+    )
+    projected = [(row, statuses[row.agent.agent_id]) for row in rows]
     if ath_only:
         projected = [
             (row, row_status)
             for row, row_status in projected
             if row.agent.status == AgentStatus.ATH_PENDING_REVIEW
         ]
-    # Mirror the validator ticket queue's global ordering. The ticket query adds
-    # validator-specific retry and eligibility checks that can still skip a row.
-    waiting_candidates = [
-        (row, row_status)
-        for row, row_status in projected
-        if row_status in ("waiting_validator", "below_score_floor")
-    ]
-    provisional_candidates = sorted(
-        (
-            row
-            for row, row_status in waiting_candidates
-            if row_status != "below_score_floor"
-            if 1 <= row.score_count < SCORING_QUORUM
-            and row.provisional_composite is not None
-            and (
-                provisional_contender_floor is None
-                or (
-                    row.first_composite is not None
-                    and row.first_composite >= provisional_contender_floor
-                )
-            )
-        ),
-        key=lambda row: (
-            -(row.provisional_composite or 0.0),
-            row.agent.created_at,
-            str(row.agent.agent_id),
-        ),
-    )
-    # Group by the payment-time owner, not the hotkey: the allocator partitions
-    # its contender lane on ``emission_owner_key`` (ditto/db/queries/tickets.py),
-    # so one coldkey funding several hotkeys holds ONE contender slot. Keying on
-    # the hotkey here handed that owner a slot per hotkey, pushing every miner
-    # below it a rank too deep and evicting a genuine contender from the lane.
-    best_provisional_by_owner: dict[str, Any] = {}
-    for row in provisional_candidates:
-        best_provisional_by_owner.setdefault(
-            emission_owner(
-                miner_hotkey=row.agent.miner_hotkey,
-                miner_coldkey=row.miner_coldkey,
-            ),
-            row,
-        )
-    provisional_contender_ids = {
-        row.agent.agent_id
-        for row in list(best_provisional_by_owner.values())[
-            :PROVISIONAL_CONTENDER_LANE_SIZE
-        ]
-    }
-    # Previous-generation submissions sort behind every current-era row, ahead
-    # of nothing but the score floor. They are served by the carryover and
-    # source-backfill lanes, which issue only into an empty current-era queue,
-    # so ranking them by arrival date alone put a stranded backlog at the head
-    # of a queue it is in fact strictly last in. Miners read this list as the
-    # order the fleet will work in, and it was telling them the opposite of the
-    # truth: the oldest stranded rows held ranks 2 through 13 while every fresh
-    # submission sat below them.
-    prev_generation = prev_generation_agent_ids or set()
-    waiting_rows = sorted(
-        waiting_candidates,
-        key=lambda candidate: (
-            1 if candidate[0].agent.agent_id in prev_generation else 0,
-            1 if candidate[1] == "below_score_floor" else 0,
-            0 if candidate[0].agent.agent_id in provisional_contender_ids else 1,
-            -(
-                candidate[0].provisional_composite or 0.0
-                if candidate[0].agent.agent_id in provisional_contender_ids
-                else 0.0
-            ),
-            candidate[0].score_count,
-            -(candidate[0].provisional_composite or 0.0),
-            candidate[0].agent.created_at,
-            str(candidate[0].agent.agent_id),
-        ),
-    )
-    validator_queue_ranks = {
-        row.agent.agent_id: rank for rank, (row, _) in enumerate(waiting_rows, start=1)
-    }
     normalized_query = query.strip().casefold() if query else ""
     if normalized_query:
         projected = [
@@ -3158,17 +3177,20 @@ def _public_activity_response(
                 ),
                 score_count=row.score_count,
                 provisional_composite=row.provisional_composite,
-                validator_queue_rank=validator_queue_ranks.get(row.agent.agent_id),
-                # Scoped to the waiting lanes for the same reason as
-                # ``retry_state``: on a finalized row "predates the era" is inert
-                # history, while on a waiting row it is the reason the row is not
-                # moving. The rank number alone cannot carry that -- a stranded
-                # row and a fresh one both render as an integer -- so a client
-                # that wants to label the queue honestly has to be told.
+                validator_queue_rank=_queue_rank(queue_preview, row.agent.agent_id),
+                validator_queue_gate=_queue_gate(queue_preview, row.agent.agent_id),
+                # #458's flag, now read off the shared preview rather than
+                # recomputed here: it is exactly the ``previous_generation``
+                # case of ``validator_queue_gate``. Kept as its own boolean
+                # because clients already consume it, and derived from the one
+                # gate so the two can never disagree about the same row. Both
+                # are scoped to the waiting lanes for the same reason as
+                # ``retry_state``: on a finalized row "predates the era" is
+                # inert history, while on a waiting row it is the reason the
+                # row is not moving.
                 previous_generation=(
-                    row.agent.agent_id in prev_generation
-                    if row_status in ("waiting_validator", "below_score_floor")
-                    else False
+                    _queue_gate(queue_preview, row.agent.agent_id)
+                    == "previous_generation"
                 ),
                 quorum=SCORING_QUORUM,
                 retry_state=(
@@ -3307,6 +3329,9 @@ async def activity(
     if review == "ath":
         ath_opened_at, ath_composite = await _ath_review_public_snapshot(session, rows)
     assignments = await list_active_validator_assignments(session, now=now)
+    active_work = await list_active_validator_work(
+        session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
+    )
     (
         score_continuation_floor,
         provisional_contender_floor,
@@ -3316,24 +3341,39 @@ async def activity(
         statuses={row.agent.agent_id: row.agent.status for row in rows},
         now=now,
     )
+    active_assignment_agent_ids = {
+        assignment.agent.agent_id
+        for assignment in assignments
+        if assignment.ticket.bench_version == active_version
+    }
+    queue_preview = await queue_preview_for_rows(
+        session,
+        rows=rows,
+        statuses=_public_activity_statuses(
+            rows,
+            active_work=active_work,
+            active_assignment_agent_ids=active_assignment_agent_ids,
+            score_continuation_floor=score_continuation_floor,
+            active_bench_version=active_version,
+            benchmark_admitted_agent_ids=admitted,
+        ),
+        bench_version=active_version,
+        now=now,
+        score_continuation_floor=score_continuation_floor,
+        provisional_contender_floor=provisional_contender_floor,
+    )
     return _public_activity_response(
         rows=rows,
-        active_work=await list_active_validator_work(
-            session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
-        ),
+        active_work=active_work,
         now=now,
         page=page,
         limit=limit,
         requested_statuses=requested_statuses,
         query=q,
         score_continuation_floor=score_continuation_floor,
-        provisional_contender_floor=provisional_contender_floor,
-        active_assignment_agent_ids={
-            assignment.agent.agent_id
-            for assignment in assignments
-            if assignment.ticket.bench_version == active_version
-        },
+        active_assignment_agent_ids=active_assignment_agent_ids,
         artifact_releases=artifact_releases,
+        queue_preview=queue_preview,
         active_bench_version=active_version,
         benchmark_admitted_agent_ids=admitted,
         retry_states=await classify_agent_retry_states(
@@ -3342,11 +3382,6 @@ async def activity(
         duplicate_metadata=await _duplicate_submission_metadata(session, rows),
         ath_review_opened_at=ath_opened_at,
         ath_review_composite=ath_composite,
-        prev_generation_agent_ids=await prev_generation_agent_ids(
-            session,
-            bench_version=active_version,
-            agent_ids=[row.agent.agent_id for row in rows],
-        ),
         ath_only=review == "ath",
     )
 
@@ -3383,6 +3418,11 @@ async def operations(
         statuses={row.agent.agent_id: row.agent.status for row in activity_rows},
         now=now,
     )
+    active_assignment_agent_ids = {
+        assignment.agent.agent_id
+        for assignment in assignments
+        if assignment.ticket.bench_version == active_version
+    }
     activity_snapshot = _public_activity_response(
         rows=activity_rows,
         active_work=active_work,
@@ -3392,13 +3432,28 @@ async def operations(
         requested_statuses=set(),
         query=None,
         score_continuation_floor=score_continuation_floor,
-        provisional_contender_floor=provisional_contender_floor,
-        active_assignment_agent_ids={
-            assignment.agent.agent_id
-            for assignment in assignments
-            if assignment.ticket.bench_version == active_version
-        },
+        active_assignment_agent_ids=active_assignment_agent_ids,
         artifact_releases=artifact_releases,
+        # The board renders the "up next" badge off this ranking, so it must go
+        # through the same shared preview ``/activity`` does. It did not, and a
+        # stranded previous-generation backlog kept holding the head of the
+        # miner-facing queue after that was fixed on the other endpoint.
+        queue_preview=await queue_preview_for_rows(
+            session,
+            rows=activity_rows,
+            statuses=_public_activity_statuses(
+                activity_rows,
+                active_work=active_work,
+                active_assignment_agent_ids=active_assignment_agent_ids,
+                score_continuation_floor=score_continuation_floor,
+                active_bench_version=active_version,
+                benchmark_admitted_agent_ids=admitted,
+            ),
+            bench_version=active_version,
+            now=now,
+            score_continuation_floor=score_continuation_floor,
+            provisional_contender_floor=provisional_contender_floor,
+        ),
         active_bench_version=active_version,
         benchmark_admitted_agent_ids=admitted,
         retry_states=await classify_agent_retry_states(

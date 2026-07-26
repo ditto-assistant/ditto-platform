@@ -590,17 +590,17 @@
       color: var(--accent); background: color-mix(in oklab, var(--accent) 10%, transparent);
       font: 700 8.5px/1.5 var(--mono); letter-spacing: .02em;
     }
+    /* A waiting row nothing can lease yet, whatever its rank. Muted on
+       purpose: it is the one badge here that means "this is not moving", so it
+       must explain rather than compete with the live queue. */
+    .pipeline-gate-badge {
+      flex: 0 0 auto; padding: 1px 5px; border-radius: 5px;
+      color: var(--text-dim); background: var(--bg-elev-2);
+      font: 750 8.5px/1.5 var(--mono); letter-spacing: .01em; white-space: nowrap;
+    }
     .pipeline-qualification-badge {
       flex: 0 0 auto; padding: 1px 5px; border-radius: 5px;
       color: var(--accent-2); background: color-mix(in oklab, var(--accent-2) 12%, transparent);
-      font: 750 8.5px/1.5 var(--mono); letter-spacing: .01em; white-space: nowrap;
-    }
-    /* A previous-generation row is waiting on the whole current era to drain,
-       not on its turn. Muted on purpose: it is the one badge here that means
-       "this is not moving", so it must not compete with the live queue. */
-    .pipeline-prevgen-badge {
-      flex: 0 0 auto; padding: 1px 5px; border-radius: 5px;
-      color: var(--text-dim); background: var(--bg-elev-2);
       font: 750 8.5px/1.5 var(--mono); letter-spacing: .01em; white-space: nowrap;
     }
     /* Retry-state chip: flags a waiting submission that is stuck (exhausted →
@@ -7104,6 +7104,31 @@
       return "";
     }
 
+    // Why a waiting submission cannot be leased on the next poll, from the
+    // API's validator_queue_gate. Null when nothing holds it, which is the
+    // only state that may ever be badged "Up next".
+    var QUEUE_GATES = {
+      previous_generation: {
+        label: "Prev gen",
+        title: "Submitted before the current benchmark version. Previous-generation work is served only after every current-era submission has a validator, so this is not advancing yet.",
+        aria: "previous benchmark generation, waiting for the current era to finish"
+      },
+      owner_serialized: {
+        label: "Owner busy",
+        title: "Another submission from the same owner is already using their one validator slot. A miner advances one generation at a time, and rotating hotkeys does not add a second slot.",
+        aria: "waiting on another submission from the same owner"
+      },
+      not_leasable: {
+        label: "Not queued",
+        title: "Not currently eligible for validator assignment: withdrawn from the queue, not admitted to this benchmark era, or missing its dataset or screened image.",
+        aria: "not currently eligible for validator assignment"
+      }
+    };
+
+    function queueGateLabel(entry) {
+      return QUEUE_GATES[entry.validator_queue_gate] || null;
+    }
+
     function pipelineRescoreState(entry) {
       if (entry.status === "evaluating") return null;
       var targetVersion = Math.max.apply(null, (entry.active_benchmarks || [])
@@ -7183,14 +7208,17 @@
         }
         var visible = indexed.map(function (item) {
           var entry = item.entry;
-          // A previous-generation row is reachable only by the carryover and
-          // retired-era backfill lanes, which issue nothing while any current-era
-          // submission still needs a validator. Rank 1 among those rows is first
-          // in a line that is not moving, so "Up next" -- which a miner reads as
-          // "you are about to be scored" -- must never appear on one. Two miners
-          // reported exactly that reading on one evening.
-          var isPrevGen = entry.previous_generation === true;
-          var isUpNext = column.status === "waiting_validator" && !isPrevGen && Number(entry.validator_queue_rank) === 1;
+          // Rank 1 is not the same as "next". A row in a gated lane holds the
+          // top of a line that is not moving: a previous-generation backlog the
+          // fleet serves only once the current era drains (#458 caught this
+          // one), or a submission parked behind another generation from the
+          // same owner. "Up next" -- which a miner reads as "you are about to
+          // be scored" -- must never appear on any of them, so the gate is
+          // authoritative and rank only orders within it.
+          var queueGate = queueGateLabel(entry);
+          var isUpNext = column.status === "waiting_validator"
+            && Number(entry.validator_queue_rank) === 1
+            && !queueGate;
           var rescore = column.status === "evaluating" ? pipelineRescoreState(entry) : null;
           var meta = column.status === "waiting_validator" || column.status === "evaluating" || entry.status === "below_score_floor"
             ? (rescore
@@ -7211,10 +7239,10 @@
             ? "Provisional " + fx(Number(entry.provisional_composite))
             : "";
           var accessibleName = agentLabel(entry.name, entry.version);
-          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(accessibleName) + ' details' + (isUpNext ? ', up next for validator assignment' : '') + (isPrevGen ? ', previous benchmark generation, waiting for the current era to finish' : '') + (rescore && rescore.isQualification ? ', inherited benchmark cohort qualification in progress' : '') + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
+          return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(accessibleName) + ' details' + (isUpNext ? ', up next for validator assignment' : '') + (queueGate ? ', ' + esc(queueGate.aria) : '') + (rescore && rescore.isQualification ? ', inherited benchmark cohort qualification in progress' : '') + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
             '<span class="pipeline-item-heading"><span class="pipeline-item-name">' + esc(agentName(entry.name)) + '</span>' +
               (isUpNext ? '<span class="pipeline-next-badge" title="Highest current priority; validator eligibility can vary">Up next</span>' : '') +
-              (isPrevGen ? '<span class="pipeline-prevgen-badge" title="Submitted before the current benchmark version. Previous-generation work is served only after every current-era submission has a validator, so this is not advancing yet.">Prev gen</span>' : '') +
+              (queueGate ? '<span class="pipeline-gate-badge" title="' + esc(queueGate.title) + '">' + esc(queueGate.label) + '</span>' : '') +
               (rescore && rescore.isQualification ? '<span class="pipeline-qualification-badge" title="Existing score remains authoritative while this inherited cohort agent qualifies on the next benchmark">Cohort → v' + esc(rescore.targetVersion) + '</span>' : '') + '</span>' +
             agentVersionBadge(entry.version) +
             '<span class="pipeline-item-meta"><span>' + esc(String(entry.agent_id || "").slice(0, 8)) + '</span><span>' + esc(meta) + '</span></span>' +
