@@ -12,6 +12,7 @@ only behind the default-off fold flag.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -92,6 +93,9 @@ _ENABLED = EfficiencyBonusConfig(
     min_cohort=3,
     epoch_hours=24,
 )
+# Same tuning, switch off. This is the shape an operator actually has when they
+# want to LOOK at the boost: the knobs are set, the feature is not turned on.
+_DISABLED = replace(_ENABLED, enabled=False)
 
 
 async def _activate_bench_version(
@@ -418,19 +422,73 @@ class TestLeaderboardBonusExposure:
             assert (await s.scalars(select(EfficiencyCohortSnapshot))).all() == []
             assert (await s.scalars(select(EfficiencyBonus))).all() == []
 
-    async def test_disabled_flag_writes_and_exposes_nothing(
+    async def test_disabled_flag_previews_without_writing_or_applying(
         self, session_maker: async_sessionmaker[AsyncSession]
     ) -> None:
+        """Switched off must mean "visible but not applied", not "invisible".
+
+        The block used to disappear entirely when the bonus was off, so the only
+        way to see the boost was to enable it -- and enabling WRITES: `enabled`
+        gates ensure_efficiency_state, which freezes a snapshot and inserts a
+        bonus row per agent. That is how rows got frozen at 04:43Z part-way
+        through the token-budget transition.
+
+        So the disabled board previews instead: the same arithmetic, computed at
+        read time, persisted nowhere, applied to nothing.
+        """
         agents = await _seed_v7_board(session_maker)
-        app = _make_app(session_maker, efficiency=EfficiencyBonusConfig())
+        app = _make_app(session_maker, efficiency=_DISABLED)
         async with _client(app) as client:
             payload = (await client.get("/api/v1/public/leaderboard")).json()
 
-        assert payload["efficiency"] is None
-        assert _entry(payload, agents["lean"])["efficiency_bonus"] is None
+        efficiency = payload["efficiency"]
+        assert efficiency is not None
+        assert efficiency["preview"] is True
+        # A preview is never active and has no snapshot to resolve, because it
+        # froze nothing.
+        assert efficiency["active"] is False
+        assert efficiency["snapshot_id"] is None
+        assert efficiency["reference_p25_tokens"] is not None
+
+        lean = _entry(payload, agents["lean"])
+        # The "would be" number is real arithmetic on a separate field...
+        assert lean["efficiency_bonus_preview"] is not None
+        assert lean["efficiency_bonus_preview"] > 0.0
+        # ...and the applied fields stay null, so no consumer can mistake an
+        # unapplied preview for an awarded bonus.
+        assert lean["efficiency_bonus"] is None
+        assert lean["effective_composite"] is None
+        assert lean["efficiency_snapshot_id"] is None
+
+        # The whole point: nothing was persisted.
         async with session_maker() as s:
             assert (await s.scalars(select(EfficiencyCohortSnapshot))).all() == []
             assert (await s.scalars(select(EfficiencyBonus))).all() == []
+
+    async def test_a_preview_never_reaches_the_validator_ledger(
+        self, session_maker: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """fold_effective = enabled AND fold_enabled, and a preview is neither.
+
+        The preview exists to be looked at. If it could reach the ledger it
+        would be a scoring change wearing an observability costume.
+        """
+        from ditto.api_server.efficiency import preview_efficiency_board
+
+        await _seed_v7_board(session_maker)
+        config = _DISABLED
+        assert config.enabled is False
+        assert config.fold_enabled is False
+
+        async with session_maker() as s:
+            view = await preview_efficiency_board(s, config, bench_version=7, now=_T0)
+
+        assert view is not None
+        assert view.preview is True
+        # `bonuses` is what every fold-facing reader consumes; a preview leaves
+        # it empty and puts its numbers in a field no fold path reads.
+        assert view.bonuses == {}
+        assert view.preview_bonuses
 
     async def test_snapshot_endpoint_404_for_unknown_id(
         self, session_maker: async_sessionmaker[AsyncSession]
@@ -492,15 +550,33 @@ class TestEpochFreezing:
             assert new.reference_p25_tokens == 50_000.0
 
             bonuses = {
-                row.agent_id: row
+                (row.agent_id, row.epoch_index): row
                 for row in (await s.scalars(select(EfficiencyBonus))).all()
             }
-        # Epoch-1 agents stay frozen against snapshot 1; only the newcomer is
-        # assigned in epoch 2, against snapshot 2.
+        # Every agent's epoch-1 row is still there, still pointing at snapshot 1,
+        # still holding the value it was published with. Recomputation is
+        # additive; it never rewrites history.
         for agent_id in agents.values():
-            assert bonuses[agent_id].snapshot_id == first_id
-        assert bonuses[newcomer].snapshot_id == new.snapshot_id
-        assert bonuses[newcomer].bonus == 0.05
+            frozen = bonuses[(agent_id, first_epoch)]
+            assert frozen.snapshot_id == first_id
+
+        # ...and epoch 2 recomputed against snapshot 2. This is the fix: before
+        # epoch_index joined the key, `_materialize_epoch` skipped any agent
+        # already present, so an agent measured in epoch 1 kept that bonus for
+        # the life of the bench version no matter how its efficiency changed.
+        # Only the two agents still clearing the ratcheted 0.7 quality floor are
+        # in the epoch-2 cohort; the 0.6 agent dropped out of it.
+        recomputed = [
+            agent_id
+            for agent_id in agents.values()
+            if (agent_id, new.epoch_index) in bonuses
+        ]
+        assert recomputed, "epoch 2 must reassign, not inherit epoch 1"
+        for agent_id in recomputed:
+            assert bonuses[(agent_id, new.epoch_index)].snapshot_id == new.snapshot_id
+
+        assert bonuses[(newcomer, new.epoch_index)].snapshot_id == new.snapshot_id
+        assert bonuses[(newcomer, new.epoch_index)].bonus == 0.05
 
     async def test_quality_floors_ratchet_from_previous_active_cohort(
         self, session_maker: async_sessionmaker[AsyncSession]

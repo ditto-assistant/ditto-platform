@@ -160,10 +160,13 @@ class TestRuntimeFlip:
         agents = await _seed_v7_board(session_maker)
         app = _make_hotswap_app(session_maker)
         async with _client(app) as client:
-            # No revision yet: default-off, byte-identical to the disabled path.
+            # No revision yet: default-off. The board previews rather than
+            # hiding the block, but nothing is applied and nothing is written.
             before = (await client.get("/api/v1/public/leaderboard")).json()
-            assert before["efficiency"] is None
+            assert before["efficiency"]["preview"] is True
+            assert before["efficiency"]["active"] is False
             assert _entry(before, agents["lean"])["efficiency_bonus"] is None
+            assert _entry(before, agents["lean"])["effective_composite"] is None
             async with session_maker() as s:
                 assert (await s.scalars(select(EfficiencyCohortSnapshot))).all() == []
                 assert (await s.scalars(select(EfficiencyBonus))).all() == []
@@ -190,11 +193,21 @@ class TestRuntimeFlip:
         async with _client(app) as client:
             await _apply(client, expected=0, enabled=True)
             (await client.get("/api/v1/public/leaderboard")).json()
-            # Roll back: disable. A new epoch would not snapshot; the board
-            # stops exposing the status object.
+            # Roll back: disable. A new epoch would not snapshot, and the board
+            # drops back to an unapplied preview -- visible, but not awarded.
             await _apply(client, expected=1, enabled=False)
             rolled = (await client.get("/api/v1/public/leaderboard")).json()
-            assert rolled["efficiency"] is None
+            assert rolled["efficiency"]["preview"] is True
+            assert rolled["efficiency"]["active"] is False
+            for entry in rolled["entries"]:
+                assert entry["efficiency_bonus"] is None
+                assert entry["effective_composite"] is None
+            # Exactly the one snapshot the enabled read froze; the disabled read
+            # added nothing.
+            async with session_maker() as s:
+                assert (
+                    len((await s.scalars(select(EfficiencyCohortSnapshot))).all()) == 1
+                )
 
 
 class TestReproducibility:

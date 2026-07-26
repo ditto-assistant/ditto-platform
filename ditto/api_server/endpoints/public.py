@@ -150,6 +150,7 @@ from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.efficiency import (
     EfficiencyBoardView,
     ensure_efficiency_state,
+    preview_efficiency_board,
     read_efficiency_board,
 )
 from ditto.api_server.efficiency import (
@@ -1508,6 +1509,7 @@ def _public_entry(
     continual_aggregate_active: bool = False,
     efficiency_bonus: float | None = None,
     efficiency_snapshot_id: UUID | None = None,
+    efficiency_bonus_preview: float | None = None,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -1571,6 +1573,9 @@ def _public_entry(
             else None
         ),
         efficiency_snapshot_id=efficiency_snapshot_id,
+        # Deliberately NOT folded into effective_composite above: a preview is
+        # arithmetic about a hypothetical, not a component of any score.
+        efficiency_bonus_preview=efficiency_bonus_preview,
         # Use the exact uncertainty value sent to validators: a stashed re-score
         # SE when present, otherwise the k=3 quorum SEM. This keeps the displayed
         # band and the KOTH projection aligned with the real fold.
@@ -1979,17 +1984,29 @@ async def leaderboard(
         continual_settings, fleet_protocol_ready=fleet_protocol_ready
     )
     efficiency_view: EfficiencyBoardView | None = None
-    if efficiency_config.enabled and finalized_rows:
+    if finalized_rows:
         board_version = max(row.bench_version for row in finalized_rows)
         try:
-            efficiency_view = await read_efficiency_board(
-                session,
-                efficiency_config,
-                bench_version=board_version,
-                agent_ids=finalized_ids,
-                bench_versions=selected_versions,
-                now=datetime.now(UTC),
-            )
+            if efficiency_config.enabled:
+                efficiency_view = await read_efficiency_board(
+                    session,
+                    efficiency_config,
+                    bench_version=board_version,
+                    agent_ids=finalized_ids,
+                    bench_versions=selected_versions,
+                    now=datetime.now(UTC),
+                )
+            else:
+                # Switched off, so show what the boost WOULD be rather than
+                # hiding the block entirely. This computes and persists nothing;
+                # it deliberately does not go via ensure_efficiency_state, whose
+                # `enabled` gate is a gate on WRITES.
+                efficiency_view = await preview_efficiency_board(
+                    session,
+                    efficiency_config,
+                    bench_version=board_version,
+                    now=datetime.now(UTC),
+                )
         except SQLAlchemyError:
             logger.warning(
                 "efficiency bonus read failed; serving board without it",
@@ -2154,6 +2171,11 @@ async def leaderboard(
                 efficiency_snapshot_id=(
                     bonus_row.snapshot_id if bonus_row is not None else None
                 ),
+                efficiency_bonus_preview=(
+                    (efficiency_view.preview_bonuses or {}).get(row.agent_id)
+                    if efficiency_view is not None and efficiency_view.preview
+                    else None
+                ),
                 registered=(
                     row.miner_hotkey in registered_uids
                     if registered_uids is not None
@@ -2257,8 +2279,46 @@ async def leaderboard(
 def _efficiency_status(
     view: EfficiencyBoardView | None,
 ) -> PublicEfficiencyStatus | None:
-    """The board-level bonus status from the governing frozen snapshot."""
-    if view is None or view.snapshot is None:
+    """The board-level bonus status, whether or not the bonus is switched on.
+
+    The block used to vanish entirely when the bonus was disabled, so an
+    operator could not see the boost without turning it on -- and turning it on
+    WRITES. A preview renders the same shape with ``active=False,
+    preview=True``, so the dashboard can show "would be +X%" beside an explicit
+    not-applied badge.
+    """
+    if view is None:
+        return None
+    if view.preview:
+        reference = view.preview_reference
+        if reference is None:
+            return None
+        deep_frontier = (
+            reference.deep_frontier_ratio * reference.reference_p25_tokens
+            if reference.deep_frontier_ratio is not None
+            and reference.reference_p25_tokens is not None
+            else None
+        )
+        return PublicEfficiencyStatus(
+            # Never active: a preview is not applied to any composite and never
+            # reaches the fold. ``preview`` is what tells the UI the numbers are
+            # real arithmetic rather than a placeholder.
+            active=False,
+            preview=True,
+            bench_version=reference.bench_version,
+            run_size=reference.run_size,
+            epoch_index=reference.epoch_index,
+            snapshot_id=None,
+            cohort_size=len(reference.members),
+            n_min=reference.n_min,
+            bonus_cap=reference.bonus_cap,
+            curve_version=reference.curve_version,
+            deep_bonus_cap=reference.deep_bonus_cap,
+            deep_frontier_tokens=deep_frontier,
+            reference_p25_tokens=reference.reference_p25_tokens,
+            reference_median_tokens=reference.reference_median_tokens,
+        )
+    if view.snapshot is None:
         return None
     snapshot = view.snapshot
     deep_frontier_tokens = (
@@ -2269,6 +2329,7 @@ def _efficiency_status(
     )
     return PublicEfficiencyStatus(
         active=snapshot.active,
+        preview=False,
         bench_version=snapshot.bench_version,
         run_size=snapshot.run_size,
         epoch_index=snapshot.epoch_index,

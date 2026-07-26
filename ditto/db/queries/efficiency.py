@@ -125,16 +125,32 @@ async def get_bonus_rows(
     agent_ids: Sequence[UUID],
     *,
     bench_versions: Mapping[UUID, int],
+    epoch_index: int | None = None,
 ) -> dict[UUID, EfficiencyBonus]:
-    """The frozen bonus row per requested agent at its authoritative version."""
+    """The frozen bonus row per requested agent at its authoritative version.
+
+    ``epoch_index`` names WHICH epoch's row to read, explicitly rather than by
+    accident of query ordering. Every consumer that feeds a score -- the
+    validator ledger fold and the public board -- passes the CURRENT epoch, so
+    an agent's bonus reflects its current efficiency rather than whatever epoch
+    it was first measured in.
+
+    ``None`` means "the newest row at or below any epoch", which is only for
+    provenance/history readers that genuinely want the last thing assigned. It
+    must not be used on a scoring path: a board that silently reads a stale
+    epoch is exactly the freeze this key was widened to fix.
+    """
     if not agent_ids:
         return {}
-    result = await session.scalars(
-        select(EfficiencyBonus).where(
-            EfficiencyBonus.agent_id.in_(agent_ids),
-            EfficiencyBonus.bench_version.in_(set(bench_versions.values())),
-        )
+    statement = select(EfficiencyBonus).where(
+        EfficiencyBonus.agent_id.in_(agent_ids),
+        EfficiencyBonus.bench_version.in_(set(bench_versions.values())),
     )
+    if epoch_index is not None:
+        statement = statement.where(EfficiencyBonus.epoch_index == epoch_index)
+    result = await session.scalars(statement.order_by(EfficiencyBonus.epoch_index))
+    # Ascending epoch, so the last write per agent is the newest row. With an
+    # explicit epoch there is at most one row per agent and the order is inert.
     return {
         row.agent_id: row
         for row in result
@@ -147,19 +163,25 @@ async def insert_bonus(
     *,
     agent_id: UUID,
     bench_version: int,
+    epoch_index: int,
     snapshot_id: UUID,
     token_total: float | None,
     bonus: float,
 ) -> EfficiencyBonus:
     """Persist one immutable bonus assignment (caller-managed transaction).
 
-    Flushes immediately so a duplicate ``(agent_id, bench_version)`` insert
-    surfaces as ``IntegrityError`` to the caller's retry path — the earlier
-    frozen row always wins; this function never overwrites.
+    Flushes immediately so a duplicate ``(agent_id, bench_version, epoch_index)``
+    insert surfaces as ``IntegrityError`` to the caller's retry path — the
+    earlier frozen row always wins; this function never overwrites.
+
+    Immutability is now per EPOCH rather than per bench version. A later epoch
+    inserts a new row beside this one; this row is never touched, so a published
+    snapshot's numbers stay reproducible forever.
     """
     row = EfficiencyBonus(
         agent_id=agent_id,
         bench_version=bench_version,
+        epoch_index=epoch_index,
         snapshot_id=snapshot_id,
         token_total=token_total,
         bonus=bonus,

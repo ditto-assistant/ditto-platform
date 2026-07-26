@@ -534,6 +534,22 @@ class PublicLeaderboardEntry(BaseModel):
             ),
         ),
     ] = None
+    efficiency_bonus_preview: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=0.1,
+            description=(
+                "What the bonus WOULD be if the feature were switched on, "
+                "computed at read time and persisted nowhere. Populated only "
+                "while efficiency.preview is true, and deliberately kept "
+                "separate from efficiency_bonus so that no consumer can mistake "
+                "an unapplied preview for an awarded bonus. It is never folded "
+                "into effective_composite and never reaches validator weights."
+            ),
+        ),
+    ] = None
     composite_stderr: Annotated[
         float | None,
         Field(
@@ -877,15 +893,36 @@ class PublicKothEmissions(BaseModel):
 class PublicEfficiencyStatus(BaseModel):
     """Where the relative token-efficiency bonus stands for a displayed board.
 
-    Only present for bench_version >= 7 boards while the bonus feature is
-    enabled. ``active=false`` means the frozen cohort has not reached the
-    ``n_min`` activation gate (after lineage dedupe) — every bonus is zero and
-    entries carry null efficiency fields until a later epoch activates.
+    Present for any bench_version >= 7 board. ``active=false`` means no bonus is
+    being applied — either the frozen cohort has not reached the ``n_min``
+    activation gate (after lineage dedupe), or the feature is switched off and
+    this is a ``preview``.
+
+    Read ``active`` and ``preview`` together:
+
+    * ``active=true,  preview=false`` — live. Bonuses are frozen rows and
+      ``effective_composite`` on each entry carries them.
+    * ``active=false, preview=false`` — enabled but below the activation gate.
+      Every bonus is zero and entries carry null efficiency fields.
+    * ``active=false, preview=true``  — switched off. The numbers here are
+      computed at read time from live state, persisted nowhere, applied to
+      nothing, and never seen by the weight fold. Render them as "would be",
+      never as an agent's score.
     """
 
     active: Annotated[
         bool,
         Field(description="Whether the governing frozen cohort awards bonuses."),
+    ]
+    preview: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "True when this block was computed at read time and nothing "
+                "was persisted or applied. Always accompanied by active=false."
+            ),
+        ),
     ]
     bench_version: Annotated[int, Field(ge=7)]
     run_size: Annotated[
@@ -896,12 +933,14 @@ class PublicEfficiencyStatus(BaseModel):
         Field(description="Efficiency epoch ordinal of the governing snapshot."),
     ]
     snapshot_id: Annotated[
-        UUID,
+        UUID | None,
         Field(
+            default=None,
             description=(
                 "Frozen cohort snapshot id; resolvable at "
-                "/public/efficiency/snapshots/{snapshot_id}."
-            )
+                "/public/efficiency/snapshots/{snapshot_id}. Null on a preview, "
+                "which freezes nothing and therefore has nothing to resolve."
+            ),
         ),
     ]
     cohort_size: Annotated[

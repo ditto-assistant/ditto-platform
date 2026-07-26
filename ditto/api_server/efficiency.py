@@ -470,6 +470,18 @@ class EfficiencyBoardView:
 
     snapshot: EfficiencyCohortSnapshot | None
     bonuses: dict[UUID, EfficiencyBonus]
+    preview: bool = False
+    """True when nothing here is persisted or applied.
+
+    A preview is computed at read time from live state and thrown away. Its
+    numbers answer "what WOULD the bonus be", never "what IS an agent's score".
+    Callers must render it as inactive and must never fold it into a composite.
+    """
+    preview_reference: CohortReference | None = None
+    """The in-memory cohort a preview was computed against; ``None`` when this
+    is a real read of frozen rows."""
+    preview_bonuses: dict[UUID, float] | None = None
+    """Per-agent bonus fractions a preview computed, keyed by agent."""
 
 
 def _candidates_from_rows(
@@ -629,7 +641,14 @@ async def _materialize_epoch(
         return
 
     reference = reference_from_snapshot(snapshot)
-    existing = await get_bonus_rows(session, agent_ids, bench_versions=versions)
+    # Scoped to THIS epoch. Without the epoch predicate an agent assigned a
+    # bonus in any earlier epoch was skipped forever, which froze its bonus for
+    # the life of the bench version -- the defect this key widening fixes. Rows
+    # from earlier epochs are still present and still immutable; they simply no
+    # longer suppress the current epoch's recomputation.
+    existing = await get_bonus_rows(
+        session, agent_ids, bench_versions=versions, epoch_index=epoch
+    )
     for candidate in candidates:
         if candidate.agent_id in existing:
             continue
@@ -643,6 +662,7 @@ async def _materialize_epoch(
             session,
             agent_id=candidate.agent_id,
             bench_version=bench_version,
+            epoch_index=epoch,
             snapshot_id=snapshot.snapshot_id,
             token_total=candidate.token_total,
             bonus=bonus,
@@ -715,5 +735,114 @@ async def read_efficiency_board(
         max_epoch_index=epoch_index_for(now, config.epoch_hours),
         active_only=False,
     )
-    bonuses = await get_bonus_rows(session, agent_ids, bench_versions=bench_versions)
+    bonuses = await get_bonus_rows(
+        session,
+        agent_ids,
+        bench_versions=bench_versions,
+        epoch_index=epoch_index_for(now, config.epoch_hours),
+    )
     return EfficiencyBoardView(snapshot=snapshot, bonuses=bonuses)
+
+
+async def preview_efficiency_board(
+    session: AsyncSession,
+    config: EfficiencyBonusConfig,
+    *,
+    bench_version: int,
+    now: datetime,
+) -> EfficiencyBoardView | None:
+    """Compute what the bonus WOULD be, persisting nothing.
+
+    "I need to see the token boost whether or not it's active." Today the whole
+    ``efficiency`` block disappears from the leaderboard when the bonus is off,
+    so the feature is all-or-nothing: invisible, or live and moving composites.
+
+    The obvious workaround -- ``enabled=True, fold_enabled=False`` -- is NOT
+    read-only and must not be recommended. ``enabled`` is what gates
+    :func:`ensure_efficiency_state`, which **writes**: it freezes a cohort
+    snapshot and then inserts a bonus row per agent. Turning it on to look at
+    the numbers is what froze rows at 04:43Z part-way through the token-budget
+    transition.
+
+    So this recomputes instead. Every input is already available -- finalized
+    ranked rows and audited ``token_usage`` from the quorum's score details --
+    and the entire bonus calculation
+    (:func:`build_cohort_snapshot` -> :func:`bonus_for_submission`) is pure. The
+    only thing dropped is the two ``INSERT``s. That makes genuine shadow
+    observation possible AND removes the freeze hazard, which is strictly better
+    than the enabled-without-fold path it replaces.
+
+    One deliberate inexactness: the derived quality/memory floors normally come
+    from the *previous active epoch's* frozen members, and when the bonus has
+    never run there is no such snapshot. The preview then falls back to the
+    static configured floors, exactly as a cold start would. It is a preview of
+    what enabling would produce, not a promise of byte-identical numbers.
+
+    Returns ``None`` when the bonus could not apply to this board at all, so an
+    impossible preview is never dressed up as a zero one.
+    """
+    from ditto.db.queries.efficiency import latest_snapshot
+    from ditto.db.queries.scores import quorum_score_rows
+
+    if bench_version < MIN_BONUS_BENCH_VERSION:
+        return None
+    rows = [
+        row
+        for row in await _finalized_ranked_rows(session)
+        if row.bench_version == bench_version
+    ]
+    if not rows:
+        return None
+    agent_ids = [row.agent_id for row in rows]
+    versions = dict.fromkeys(agent_ids, bench_version)
+    score_rows = await quorum_score_rows(session, agent_ids, bench_versions=versions)
+    candidates = _candidates_from_rows(
+        rows,
+        {
+            agent_id: audited_token_total(
+                [score.details for score in score_rows.get(agent_id, [])]
+            )
+            for agent_id in agent_ids
+        },
+    )
+    epoch = epoch_index_for(now, config.epoch_hours)
+    previous = await latest_snapshot(
+        session,
+        bench_version=bench_version,
+        run_size=BONUS_RUN_SIZE,
+        max_epoch_index=epoch - 1,
+        active_only=True,
+    )
+    quality_floor, memory_floor = floors_from_previous(
+        previous.members if previous is not None else None,
+        quality_floor=config.quality_floor,
+        memory_floor=config.memory_floor,
+    )
+    reference = build_cohort_snapshot(
+        candidates,
+        bench_version=bench_version,
+        run_size=BONUS_RUN_SIZE,
+        epoch_index=epoch,
+        cohort_limit=config.cohort_size,
+        n_min=config.min_cohort,
+        bonus_cap=config.cap,
+        quality_floor=quality_floor,
+        memory_floor=memory_floor,
+        deep_bonus_cap=config.deep_cap,
+        deep_frontier_ratio=config.deep_frontier_ratio,
+    )
+    return EfficiencyBoardView(
+        snapshot=None,
+        bonuses={},
+        preview=True,
+        preview_reference=reference,
+        preview_bonuses={
+            candidate.agent_id: bonus_for_submission(
+                candidate.composite,
+                candidate.memory_mean,
+                candidate.token_total,
+                reference,
+            )
+            for candidate in candidates
+        },
+    )
