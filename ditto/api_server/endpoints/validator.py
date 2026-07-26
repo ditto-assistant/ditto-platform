@@ -216,6 +216,7 @@ from ditto.db.queries.scores import (
 )
 from ditto.db.queries.tickets import (
     MAX_INFRA_RETRY_GRANTS,
+    OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     RETRY_COOLDOWN,
     get_live_slot_ticket,
     get_open_ticket,
@@ -584,6 +585,7 @@ async def _issue_source_backfill_ticket(
     # backfill budget rather than widening it.
     slot_settings: ValidatorSlotSettings = SLOT_SETTINGS_DEFAULT,
     carryover_settings: PrevGenCarryoverSettings = PREV_GEN_CARRYOVER_DEFAULTS,
+    owner_concurrent_submission_limit: int = OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     resume_only: bool = False,
 ) -> ValidatorTicket | None:
     """Use otherwise-idle capacity after the desired era has nothing to give.
@@ -645,6 +647,7 @@ async def _issue_source_backfill_ticket(
             artifact_mode=artifact_mode,
             validator_running_benchmark=validator_running_benchmark,
             slot_id=slot_id,
+            owner_concurrent_submission_limit=owner_concurrent_submission_limit,
         )
     if resume_only:
         return None
@@ -746,6 +749,7 @@ async def _issue_source_backfill_ticket(
         artifact_mode=artifact_mode,
         validator_running_benchmark=validator_running_benchmark,
         slot_id=slot_id,
+        owner_concurrent_submission_limit=owner_concurrent_submission_limit,
     )
 
 
@@ -760,6 +764,7 @@ async def _issue_prev_gen_carryover_ticket(
     target_inference_ready: bool,
     validator_running_benchmark: bool,
     slot_id: str,
+    owner_concurrent_submission_limit: int = OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
 ) -> ValidatorTicket | None:
     """Lease an adopted previous-generation submission in the new era.
 
@@ -813,6 +818,7 @@ async def _issue_prev_gen_carryover_ticket(
         validator_running_benchmark=validator_running_benchmark,
         slot_id=slot_id,
         only_agent_ids=adopted,
+        owner_concurrent_submission_limit=owner_concurrent_submission_limit,
     )
 
 
@@ -1874,6 +1880,9 @@ async def request_job(
                     fifo_start_at=rollout.created_at,
                     completion_first=True,
                     slot_id=slot_id,
+                    owner_concurrent_submission_limit=(
+                        queue_policy.owner_concurrent_submission_limit
+                    ),
                 )
                 if fresh_lane_due
                 else None
@@ -1905,6 +1914,9 @@ async def request_job(
                     fifo_start_at=rollout.created_at,
                     completion_first=True,
                     slot_id=slot_id,
+                    owner_concurrent_submission_limit=(
+                        queue_policy.owner_concurrent_submission_limit
+                    ),
                 )
             if ticket is None and not fresh_lane_due:
                 ticket = await _issue_prev_gen_carryover_ticket(
@@ -1917,6 +1929,9 @@ async def request_job(
                     target_inference_ready=target_inference_ready,
                     validator_running_benchmark=slot_running_benchmark,
                     slot_id=slot_id,
+                    owner_concurrent_submission_limit=(
+                        queue_policy.owner_concurrent_submission_limit
+                    ),
                 )
         else:
             ticket = await activate_next_score_retest(
@@ -2034,6 +2049,9 @@ async def request_job(
                         artifact_mode=artifact_mode,
                         validator_running_benchmark=slot_running_benchmark,
                         slot_id=slot_id,
+                        owner_concurrent_submission_limit=(
+                            queue_policy.owner_concurrent_submission_limit
+                        ),
                     )
                 )
             if ticket is None and source_backfill_rollout is not None:
@@ -2060,6 +2078,9 @@ async def request_job(
                     slot_id=slot_id,
                     slot_settings=slot_settings,
                     carryover_settings=queue_policy.prev_gen_carryover,
+                    owner_concurrent_submission_limit=(
+                        queue_policy.owner_concurrent_submission_limit
+                    ),
                 )
             if ticket is None and rollout is not None:
                 return Response(status_code=204)

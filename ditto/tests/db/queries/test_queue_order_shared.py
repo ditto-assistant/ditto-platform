@@ -35,7 +35,9 @@ from ditto.db.models import (
 )
 from ditto.db.queries.benchmark_admission import activated_rollout_for_version
 from ditto.db.queries.queue_order import (
+    OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     QueuePreviewEntry,
+    owner_capacity_gate,
     preview_artifact_mode,
     preview_queue_order,
     resolve_owner_linkage,
@@ -219,6 +221,18 @@ class TestPreviewMatchesAllocator:
         turned on: several hotkeys funded by one coldkey, submissions at every
         score count from zero to quorum-minus-one, live leases, and owners with
         multiple generations.
+
+        The preview answers for the allocator's *ordinary* pass, so the property
+        has two halves and the second one is where the owner relaxation lives:
+
+        * While the preview has any leasable row, that row is what the allocator
+          leases. This is the original property, unweakened -- the last-resort
+          pass must never reorder the queue or serve one owner ahead of another.
+        * When the preview has none, the allocator may still fill an otherwise
+          idle slot from its last-resort pass, and what it picks must be a row
+          the preview gated ``owner_serialized``. Never a ``not_leasable`` row
+          and never a ``previous_generation`` one: relaxing the owner ceiling is
+          the only rule the second pass is allowed to relax.
         """
         rng = random.Random(seed)
         coldkeys = [f"5Coldkey{index}" for index in range(3)]
@@ -248,10 +262,17 @@ class TestPreviewMatchesAllocator:
         leasable = [agent_id for agent_id in ranked if entries[agent_id].gate is None]
         picked = await _allocator_pick(session)
 
-        assert picked == (leasable[0] if leasable else None), (
-            "the queue preview and the ticket allocator disagree about which "
-            "submission is next; they are supposed to share one ordering"
-        )
+        if leasable:
+            assert picked == leasable[0], (
+                "the queue preview and the ticket allocator disagree about which "
+                "submission is next; they are supposed to share one ordering"
+            )
+        elif picked is not None:
+            assert entries[picked].gate == "owner_serialized", (
+                "the allocator's last-resort pass leased a row the preview did "
+                "not gate on owner capacity; it may only relax the owner "
+                f"ceiling, but this row was gated {entries[picked].gate!r}"
+            )
 
     @pytest.mark.integration
     async def test_owner_serialization_is_visible_rather_than_silent(
@@ -503,3 +524,118 @@ class TestOwnerLinkage:
             assert batch[agent_id] == await resolve_owner_linkage(
                 session, agent_id=agent_id
             )
+
+
+class TestOwnerCapacityGate:
+    """The one predicate the preview and the allocator both ask.
+
+    Exercised directly because its inputs -- a pin, a live-lease set, a ceiling
+    and which pass is running -- are cheap to state exactly here and expensive
+    to arrange as fixtures, and because every one of these cases is a rule
+    somebody could plausibly "simplify" away.
+    """
+
+    def _ids(self, count: int) -> list[UUID]:
+        return [UUID(int=index + 1) for index in range(count)]
+
+    async def test_a_lone_submission_is_never_gated(self) -> None:
+        (agent,) = self._ids(1)
+        assert (
+            owner_capacity_gate(
+                agent_id=agent, selected_agent_id=None, live_lease_agent_ids=()
+            )
+            is None
+        )
+
+    async def test_ordinary_pass_serializes_on_a_live_sibling(self) -> None:
+        agent, sibling = self._ids(2)
+        assert (
+            owner_capacity_gate(
+                agent_id=agent,
+                selected_agent_id=None,
+                live_lease_agent_ids=(sibling,),
+            )
+            == "owner_serialized"
+        )
+
+    async def test_ordinary_pass_serializes_on_the_pin_with_no_lease_at_all(
+        self,
+    ) -> None:
+        """The pin holds the owner's slot across the gaps between leases."""
+        agent, pinned = self._ids(2)
+        assert (
+            owner_capacity_gate(
+                agent_id=agent, selected_agent_id=pinned, live_lease_agent_ids=()
+            )
+            == "owner_serialized"
+        )
+
+    async def test_last_resort_admits_a_second_submission(self) -> None:
+        agent, sibling = self._ids(2)
+        assert (
+            owner_capacity_gate(
+                agent_id=agent,
+                selected_agent_id=sibling,
+                live_lease_agent_ids=(sibling,),
+                last_resort=True,
+            )
+            is None
+        )
+
+    async def test_last_resort_still_stops_at_the_ceiling(self) -> None:
+        agent, first, second = self._ids(3)
+        assert (
+            owner_capacity_gate(
+                agent_id=agent,
+                selected_agent_id=first,
+                live_lease_agent_ids=(first, second),
+                last_resort=True,
+            )
+            == "owner_serialized"
+        )
+
+    async def test_a_ceiling_of_one_is_the_old_rule_exactly(self) -> None:
+        """The knob's identity value: last resort becomes a no-op."""
+        agent, sibling = self._ids(2)
+        assert (
+            owner_capacity_gate(
+                agent_id=agent,
+                selected_agent_id=sibling,
+                live_lease_agent_ids=(sibling,),
+                concurrent_submission_limit=1,
+                last_resort=True,
+            )
+            == "owner_serialized"
+        )
+
+    async def test_the_pinned_generation_is_exempt_from_the_ceiling(self) -> None:
+        """Otherwise a relaxed sibling locks out the row the pin protects."""
+        pinned, sibling = self._ids(2)
+        assert (
+            owner_capacity_gate(
+                agent_id=pinned,
+                selected_agent_id=pinned,
+                live_lease_agent_ids=(sibling, pinned),
+            )
+            is None
+        )
+
+    async def test_joining_a_submission_that_already_holds_a_lease_is_free(
+        self,
+    ) -> None:
+        """Quorum, not the owner ceiling, bounds slots on ONE submission.
+
+        The owner already occupies two submissions; adding a third validator to
+        one of them does not make it three, so the ceiling must not refuse it.
+        """
+        agent, sibling = self._ids(2)
+        assert (
+            owner_capacity_gate(
+                agent_id=agent,
+                selected_agent_id=sibling,
+                live_lease_agent_ids=(agent, sibling),
+                concurrent_submission_limit=OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
+                last_resort=True,
+            )
+            is None
+        )

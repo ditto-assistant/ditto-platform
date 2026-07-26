@@ -108,6 +108,33 @@ EMISSION_CONTENDER_COUNT = 5
 # miners.
 PROVISIONAL_CONTENDER_LANE_SIZE = 10
 
+# ---------------------------------------------------------------------------
+# Owner capacity
+# ---------------------------------------------------------------------------
+# How many of one owner's submissions may hold live leases at the same time
+# once the allocator has fallen through to its last-resort pass. ``1`` is the
+# rule as it stood before this ceiling existed -- strict serialization, an
+# owner advances exactly one generation at a time -- and setting the operator
+# knob back to ``1`` restores it byte for byte.
+#
+# ``2`` ships as the default because a knob whose default is the old behaviour
+# fixes nothing: the whole point is that idle fleet slots were being held shut
+# in front of a queue that had work for them. Two is the smallest value that is
+# not "off".
+#
+# It bounds submissions, not leases, because that is the unit both owner rails
+# already speak in: the pin selects a generation, and
+# :func:`owner_live_lease_agent_ids` returns distinct submissions. One
+# submission can occupy at most ``SCORING_QUORUM`` slots, so the arithmetic
+# ceiling on an owner is ``limit * SCORING_QUORUM`` -- and only ever when no
+# other owner has a single eligible submission anywhere in the fleet.
+OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT = 2
+MIN_OWNER_CONCURRENT_SUBMISSION_LIMIT = 1
+# A ceiling on the ceiling. Above this an owner could hold every slot of a
+# small fleet for a full lease even under the last-resort predicate, which is
+# the monopoly the rail exists to prevent.
+MAX_OWNER_CONCURRENT_SUBMISSION_LIMIT = 3
+
 
 def preview_artifact_mode(bench_version: int) -> ArtifactMode:
     """The artifact mode a global preview may honestly assume.
@@ -878,11 +905,17 @@ QueueGate = Literal["previous_generation", "owner_serialized", "not_leasable"]
     Served only by the carryover and source-backfill lanes, which the operator
     policy holds strictly behind every desired-era submission.
 ``owner_serialized``
-    Another generation from the same paid owner occupies the owner's one slot.
+    Another generation from the same paid owner is using the owner's ordinary
+    capacity. Not a permanent refusal: a validator that finds nothing else
+    eligible anywhere in the fleet may still lease such a row, bounded by
+    :func:`owner_capacity_gate`'s ceiling. Whether that happens depends on the
+    polling validator's own eligibility set, which a global preview cannot
+    represent -- so the preview reports the ordinary answer.
 ``not_leasable``
     The allocator's validator-independent candidate filter excludes it: no
     versioned dataset, no eligible screened image, withdrawn from the queue, or
-    not admitted to this era.
+    not admitted to this era -- or every one of its quorum slots is already
+    occupied, so the scores it is waiting on are already in flight.
 
 ``None`` means the row is genuinely leasable right now, subject only to the
 per-validator checks a global preview cannot represent.
@@ -898,6 +931,77 @@ _GATE_RANK: dict[QueueGate | None, int] = {
     "not_leasable": 2,
     "previous_generation": 3,
 }
+
+
+def owner_capacity_gate(
+    *,
+    agent_id: UUID,
+    selected_agent_id: UUID | None,
+    live_lease_agent_ids: Collection[UUID],
+    concurrent_submission_limit: int = OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
+    last_resort: bool = False,
+) -> QueueGate | None:
+    """Whether one owner's capacity rules hold this submission back.
+
+    The single expression of both owner rails, called by ``issue_ticket`` for
+    the row it is about to lease and by :func:`preview_queue_order` for the
+    badge it is about to show. They diverged three times before #463 put the
+    ordering in one place; this puts the *reason* in one place too, so relaxing
+    the rule cannot relax it for only one of them.
+
+    Two rails, one question
+    =======================
+
+    ``live_lease_agent_ids`` is the serialization rail: an owner's submissions
+    holding live leases right now. ``selected_agent_id`` is the pinning rail
+    (#467): the one generation the owner is committed to finishing, held across
+    the gaps between its leases so a validator that already scored it cannot
+    open a sibling and divert the rest of the fleet mid-quorum.
+
+    They are independent and both still apply. What changes here is only *when*
+    a second submission from an owner who already holds a lease may be leased.
+
+    Last resort, not idle detection
+    ===============================
+
+    ``last_resort=True`` means the caller has already walked its entire
+    candidate set and found nothing else it may lease -- not that a slot happens
+    to be free this instant. The distinction is the whole design: momentary
+    leasability is not an empty queue, which is exactly how
+    ``desired_era_work_outstanding`` came to report "drained" with 84 rows
+    waiting. The allocator therefore never asks "is there idle capacity"; it
+    asks its own candidate query until it comes back empty, and only then
+    re-offers the rows it skipped here. A caller that gets that wrong in the
+    conservative direction gets today's strict serialization, never starvation.
+
+    The pinned generation is never gated
+    ====================================
+
+    ``selected_agent_id == agent_id`` returns ``None`` before either ceiling is
+    consulted. Without relaxation that branch is unreachable -- the owner can
+    only have one submission leased, and if it is the pinned one there are no
+    siblings to trip over. With relaxation it is load-bearing: a relaxed
+    sibling lease would otherwise make ``live_lease_agent_ids`` non-empty and
+    lock out the very generation the pin exists to finish, re-creating the
+    mid-quorum diversion through the back door.
+    """
+    leased = set(live_lease_agent_ids)
+    if selected_agent_id == agent_id:
+        return None
+    siblings_leased = leased - {agent_id}
+    # The ordinary pass is the ceiling of one this rail has always enforced.
+    # The last-resort pass raises it to the operator's, and only then.
+    limit = max(1, concurrent_submission_limit) if last_resort else 1
+    # Leasing this row leaves the owner occupying its leased siblings plus this
+    # submission. When the row already holds a lease from another validator the
+    # count is unchanged, and this arithmetic says so without a special case.
+    if len(siblings_leased) + 1 > limit:
+        return "owner_serialized"
+    if not last_resort and selected_agent_id is not None:
+        # An owner mid-generation does not open the next one on the ordinary
+        # pass, whether or not a lease is live at this instant.
+        return "owner_serialized"
+    return None
 
 
 @dataclass(frozen=True)
@@ -959,10 +1063,44 @@ async def preview_queue_order(
             )
         )
     )
+    # A submission whose quorum slots are all occupied cannot be leased by
+    # anybody, which is a fleet-wide fact and therefore the preview's to report.
+    # The allocator counts the same slots but only *after* locking the candidate
+    # row -- that recount is how concurrent replicas avoid over-issuing a fourth
+    # slot, so it must stay where it is rather than move into the shared
+    # candidate predicate. This is the one place a second spelling is right:
+    # here a stale read costs a badge, there it would cost the lock.
+    #
+    # An overdue ``issued`` ticket is counted as free because the allocator
+    # sweeps it to ``expired`` before it counts; the preview cannot write, so it
+    # reads through the same way ``owner_live_lease_agent_ids`` does.
+    #
+    # A backstop rather than a common path: the public caller only ranks rows it
+    # has already classified as waiting, and a row with a lease in flight is
+    # classified ``evaluating`` instead, so it never arrives here. What does
+    # arrive is the row whose slots are all spent without a lease to show for
+    # it, and calling that one "up next" is the divergence this closes.
+    occupied_quorum_slots = (
+        select(func.count())
+        .where(
+            ValidatorTicket.agent_id == Agent.agent_id,
+            ValidatorTicket.bench_version == bench_version,
+            or_(
+                ValidatorTicket.status == TicketStatus.SCORED,
+                and_(
+                    ValidatorTicket.status == TicketStatus.ISSUED,
+                    ValidatorTicket.deadline > now,
+                ),
+            ),
+        )
+        .correlate(Agent)
+        .scalar_subquery()
+    )
     leasable = set(
         await session.scalars(
             select(Agent.agent_id).where(
                 Agent.agent_id.in_(requested),
+                occupied_quorum_slots < SCORING_QUORUM,
                 *queue_candidate_predicate(
                     bench_version=bench_version,
                     artifact_mode=artifact_mode,
@@ -1008,14 +1146,19 @@ async def preview_queue_order(
             leased_by_owner[owner_key] = await owner_live_lease_agent_ids(
                 session, linkage=owner, now=now
             )
-        selected = selected_by_owner[owner_key]
-        if selected is not None and selected != agent_id:
-            gates[agent_id] = "owner_serialized"
-            continue
-        if leased_by_owner[owner_key] - {agent_id}:
-            gates[agent_id] = "owner_serialized"
-            continue
-        gates[agent_id] = None
+        # The allocator's own predicate, asked for the ordinary pass. A global
+        # preview cannot honestly answer the last-resort one: whether some
+        # validator finds nothing else eligible depends on that validator's
+        # retry cooldowns, prior tickets and artifact mode, which is precisely
+        # the per-validator half the module docstring explains no fleet-wide
+        # list can carry. The gate's documentation says so rather than the
+        # preview guessing.
+        gates[agent_id] = owner_capacity_gate(
+            agent_id=agent_id,
+            selected_agent_id=selected_by_owner[owner_key],
+            live_lease_agent_ids=leased_by_owner[owner_key],
+            last_resort=False,
+        )
     ranked = sorted(
         enumerate(ordered),
         key=lambda item: (_GATE_RANK[gates[item[1]]], item[0]),

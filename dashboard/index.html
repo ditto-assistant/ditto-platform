@@ -7121,9 +7121,9 @@
         aria: "previous benchmark generation, waiting for the current era to finish"
       },
       owner_serialized: {
-        label: "Owner busy",
-        title: "Another submission from the same owner is already using their one validator slot. A miner advances one generation at a time, and rotating hotkeys does not add a second slot.",
-        aria: "waiting on another submission from the same owner"
+        label: "Owner queued",
+        title: "Another submission from the same owner is using their validator slot, so this one does not get a turn while anybody else is waiting. It is not stuck: a validator that finds no other owner's work eligible may still lease it rather than idle, up to the per-owner limit on the queue policy board. Rotating hotkeys does not add a slot.",
+        aria: "queued behind another submission from the same owner"
       },
       not_leasable: {
         label: "Not queued",

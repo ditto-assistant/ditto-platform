@@ -55,6 +55,7 @@ def _settings(**overrides: object) -> dict[str, object]:
         "priority_cohort_size": 5,
         "lane_cycle_size": 4,
         "fresh_submission_slots": [0, 1, 3],
+        "owner_concurrent_submission_limit": 2,
         "prev_gen_carryover": {
             "enabled": False,
             "max_agents": 10,

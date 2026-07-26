@@ -1629,11 +1629,15 @@ class PublicActivityEntry(BaseModel):
                 "its rank, or null when nothing holds it. 'previous_generation' "
                 "is retired-era work the fleet serves only once the current era "
                 "drains; 'owner_serialized' means another submission from the "
-                "same paid owner holds the owner's single validator slot -- "
-                "rotating hotkeys does not buy a second one; 'not_leasable' "
-                "means the allocator's candidate filter excludes it (no "
-                "versioned dataset, no eligible screened image, withdrawn, or "
-                "not admitted to this era)."
+                "same paid owner is using the owner's validator slot, so this "
+                "one waits while any other owner has eligible work -- rotating "
+                "hotkeys does not buy a second slot, though a validator that "
+                "finds nothing else eligible anywhere may still lease it rather "
+                "than idle, up to the operator's per-owner limit; "
+                "'not_leasable' means the allocator's candidate filter excludes "
+                "it (no versioned dataset, no eligible screened image, "
+                "withdrawn, not admitted to this era, or every quorum slot "
+                "already occupied)."
             ),
         ),
     ]

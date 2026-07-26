@@ -15,8 +15,11 @@ import pytest
 from ditto.api_models.queue_policy_settings import (
     DEFAULT_FRESH_SUBMISSION_SLOTS,
     DEFAULT_LANE_CYCLE_SIZE,
+    DEFAULT_OWNER_CONCURRENT_SUBMISSIONS,
     MAX_COHORT_SIZE,
+    MAX_OWNER_CONCURRENT_SUBMISSIONS,
     MIN_COHORT_SIZE,
+    MIN_OWNER_CONCURRENT_SUBMISSIONS,
     PrevGenCarryoverSettings,
     QueuePolicySettings,
     rollout_locked_change,
@@ -25,6 +28,11 @@ from ditto.db.queries.benchmark_rollout import (
     DEFAULT_RESCORE_COHORT_SIZE,
     MAX_PERSISTED_RESCORE_COHORT_SIZE,
     PRIORITY_COHORT_SIZE,
+)
+from ditto.db.queries.queue_order import (
+    MAX_OWNER_CONCURRENT_SUBMISSION_LIMIT,
+    MIN_OWNER_CONCURRENT_SUBMISSION_LIMIT,
+    OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
 )
 
 
@@ -35,6 +43,31 @@ class TestQueuePolicyBoundsMatchQueueConstants:
     def test_queue_policy_bounds_match_queue_constants(self) -> None:
         assert MIN_COHORT_SIZE == PRIORITY_COHORT_SIZE
         assert MAX_COHORT_SIZE == MAX_PERSISTED_RESCORE_COHORT_SIZE
+        assert MIN_OWNER_CONCURRENT_SUBMISSIONS == (
+            MIN_OWNER_CONCURRENT_SUBMISSION_LIMIT
+        )
+        assert MAX_OWNER_CONCURRENT_SUBMISSIONS == (
+            MAX_OWNER_CONCURRENT_SUBMISSION_LIMIT
+        )
+        assert DEFAULT_OWNER_CONCURRENT_SUBMISSIONS == (
+            OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT
+        )
+
+    def test_owner_ceiling_ships_relaxed_but_conservative(self) -> None:
+        """The relaxation is ON by default; only its size is tunable.
+
+        A knob defaulting to the old behaviour would leave the idle slots idle,
+        which is the whole defect. ``1`` is the identity value an operator can
+        return to without a deploy, so it must remain *reachable* but must not
+        be the default.
+        """
+        assert QueuePolicySettings().owner_concurrent_submission_limit == 2
+        assert MIN_OWNER_CONCURRENT_SUBMISSIONS == 1
+
+    @pytest.mark.parametrize("limit", [0, -1, MAX_OWNER_CONCURRENT_SUBMISSIONS + 1])
+    def test_owner_ceiling_rejects_out_of_range(self, limit: int) -> None:
+        with pytest.raises(ValueError):
+            QueuePolicySettings(owner_concurrent_submission_limit=limit)
 
     def test_defaults_reproduce_the_previously_hard_coded_queue(self) -> None:
         """If any of these drift, merging the board retunes the live queue."""

@@ -159,11 +159,20 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   order", not "scored next". `validator_queue_gate` is the honest half the
   preview *can* answer: `previous_generation` (retired-era work the fleet
   serves only once the current era drains), `owner_serialized` (another
-  submission from the same paid owner holds that owner's single validator slot
-  — rotating hotkeys does not buy a second one), or `not_leasable` (excluded by
-  the allocator's candidate filter). A non-null gate means no validator can
-  take the row on its next poll regardless of rank, and consumers must not
+  submission from the same paid owner is using that owner's validator slot, so
+  this row waits while any other owner has eligible work — rotating hotkeys does
+  not buy a second slot), or `not_leasable` (excluded by the allocator's
+  candidate filter, or every quorum slot already occupied). A non-null gate
+  means the row is not next in line regardless of rank, and consumers must not
   present it as imminent.
+
+  `owner_serialized` is the one gate that is not an absolute refusal. A
+  validator that walks its entire candidate set and finds nothing else eligible
+  may lease such a row rather than idle its slot, bounded by the operator's
+  per-owner concurrent-submission limit. Whether that happens depends on the
+  polling validator's own cooldowns and prior tickets, which is exactly the
+  per-validator half no global preview can model — so the preview reports the
+  ordinary answer and this note is the caveat.
 - `GET /api/v1/public/agent/{agent_id}/pipeline` → versioned screening history,
   validator assignment progress, and `provisional_scores` as soon as the
   platform accepts them. Each score exposes only `composite`, the post-commit

@@ -40,8 +40,11 @@ from ditto.db.queries.benchmark_admission import (
 from ditto.db.queries.lease_liveness import maybe_force_expire_lease
 from ditto.db.queries.queue_order import (
     EMISSION_CONTENDER_COUNT,
+    MIN_OWNER_CONCURRENT_SUBMISSION_LIMIT,
+    OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     PROVISIONAL_CONTENDER_LANE_SIZE,
     eligible_screened_image_predicate,
+    owner_capacity_gate,
     owner_live_lease_agent_ids,
     queue_candidate_predicate,
     queue_order_terms,
@@ -56,7 +59,7 @@ from ditto.db.queries.scores import (
 )
 
 if TYPE_CHECKING:
-    from sqlalchemy import ColumnElement
+    from sqlalchemy import ColumnElement, Select
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -259,6 +262,7 @@ async def issue_ticket(
     completion_first: bool = False,
     slot_id: str = "slot-0",
     only_agent_ids: Collection[UUID] | None = None,
+    owner_concurrent_submission_limit: int = OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
@@ -286,6 +290,18 @@ async def issue_ticket(
     serialization, attempt caps) still applies unchanged, so a named agent that
     is not genuinely leasable still yields ``None``. Default ``None`` leaves
     every existing caller's behaviour untouched.
+
+    ``owner_concurrent_submission_limit`` caps how many of one owner's
+    submissions may hold live leases at once, and applies **only** after the
+    ordinary selection above has come back empty. While any other owner has
+    work this validator can take, the owner rails are unchanged: one live
+    submission per owner fleet-wide, pinned to one generation. Only once this
+    validator has walked its whole candidate set without finding anything does
+    the loop re-offer the rows it refused on that ceiling alone -- so a second
+    submission from one owner can consume a slot that would otherwise sit idle,
+    but can never be served ahead of another owner. ``1`` disables the second
+    pass entirely and restores strict serialization; see
+    :func:`~ditto.db.queries.queue_order.owner_capacity_gate`.
     """
     # No row exists to lock before a validator's first claim. Serialize that
     # gap explicitly on Postgres; the unique partial index remains the durable
@@ -436,13 +452,30 @@ async def issue_ticket(
     capable_hotkeys = await quorum_capable_validator_hotkeys(
         session, bench_version=bench_version, now=now
     )
+    # Both owner reads are properties of the owner, not of the row, and nothing
+    # below writes until a winner is chosen, so they are stable for the whole
+    # selection and are answered once per distinct owner rather than once per
+    # candidate. That also makes the second pass free.
+    owner_facts: dict[tuple[str, ...], tuple[UUID | None, set[UUID]]] = {}
     skipped: list[UUID] = []
-    while True:
-        # The validator-independent half of the filter is shared with the queue
-        # preview, so "would the allocator even look at this row" has one
-        # answer. The per-validator half (``already_mine``) and this loop's
-        # ``skipped`` set stay here: neither has a fleet-wide truth value.
-        candidate = select(Agent.agent_id).where(
+    # Rows this validator was refused purely by the owner ceiling, in the queue
+    # order they were refused in. These -- and only these -- are what the
+    # last-resort pass reconsiders; a row skipped because the submission is
+    # already at quorum, or because this validator cannot contribute to it, is
+    # not leasable at any ceiling and must never reappear here.
+    owner_capacity_skips: list[UUID] = []
+    last_resort = False
+    reconsidered: set[UUID] | None = None
+
+    def eligible_candidates() -> Select[tuple[UUID]]:
+        """This validator's remaining candidate set, unordered and unlocked.
+
+        The validator-independent half of the filter is shared with the queue
+        preview, so "would the allocator even look at this row" has one answer.
+        The per-validator half (``already_mine``) and this loop's ``skipped``
+        set stay here: neither has a fleet-wide truth value.
+        """
+        statement = select(Agent.agent_id).where(
             *queue_candidate_predicate(
                 bench_version=bench_version,
                 artifact_mode=artifact_mode,
@@ -453,11 +486,17 @@ async def issue_ticket(
             )
         )
         if not completion_first:
-            candidate = candidate.where(Agent.agent_id.not_in(already_mine))
+            statement = statement.where(Agent.agent_id.not_in(already_mine))
         if only_agent_ids is not None:
-            candidate = candidate.where(Agent.agent_id.in_(set(only_agent_ids)))
+            statement = statement.where(Agent.agent_id.in_(set(only_agent_ids)))
         if skipped:
-            candidate = candidate.where(Agent.agent_id.not_in(skipped))
+            statement = statement.where(Agent.agent_id.not_in(skipped))
+        return statement
+
+    while True:
+        candidate = eligible_candidates()
+        if reconsidered is not None:
+            candidate = candidate.where(Agent.agent_id.in_(reconsidered))
         candidate = (
             # The ordinary queue first advances the bounded set of strongest
             # scored provisional contenders, one best submission per miner. A
@@ -472,7 +511,50 @@ async def issue_ticket(
         )
         agent_id = (await session.execute(candidate)).scalar_one_or_none()
         if agent_id is None:
-            return None
+            if (
+                last_resort
+                or not owner_capacity_skips
+                or owner_concurrent_submission_limit
+                <= MIN_OWNER_CONCURRENT_SUBMISSION_LIMIT
+            ):
+                return None
+            # Nothing else in the fleet is leasable by this validator. The loop
+            # above did not sample capacity or guess at idleness -- it walked
+            # the entire candidate set in queue order and every row that was
+            # not refused by the owner ceiling was refused for a reason no
+            # ceiling can lift. So the last-resort predicate is not a second
+            # query that could disagree with the first; it is the first query
+            # coming back empty, which is the only form of "no other owner has
+            # eligible work" that cannot be wrong in the optimistic direction.
+            #
+            # This matters because the obvious implementation -- "is a slot
+            # idle right now?" -- is the failure mode
+            # ``desired_era_work_outstanding`` already shipped: it truthfully
+            # reported drained while 84 rows waited, because a row that is one
+            # tick from leasable is not an empty queue. Serving an owner's
+            # second submission on that signal would put them ahead of another
+            # owner. Serving it only here structurally cannot.
+            #
+            # With one exception, which is the same mistake wearing a different
+            # hat: the selection above runs ``SKIP LOCKED``, so a row another
+            # replica is mid-allocation on silently vanishes from it. An empty
+            # result can therefore mean "the queue is empty" or "the only rows
+            # left are momentarily locked", and relaxing on the second would
+            # hand an owner a slot because of a lock. Re-ask without the lock
+            # before committing to the fall-through; if anything eligible is
+            # merely unavailable this instant, yield the poll and let the
+            # validator come back. Conservative in the safe direction: the cost
+            # is one skipped poll, and the alternative is a fairness bug that
+            # only appears under concurrency.
+            if await session.scalar(eligible_candidates().limit(1)) is not None:
+                return None
+            last_resort = True
+            reconsidered = set(owner_capacity_skips)
+            # Rows skipped for other reasons are absent from ``reconsidered``
+            # anyway; clearing lets the ceiling be re-asked on the rows that
+            # are, in the same queue order.
+            skipped = []
+            continue
 
         # One paid owner may have many generations, but only one generation may
         # occupy validator capacity at a time. Serialize by the immutable
@@ -497,30 +579,45 @@ async def issue_ticket(
                         )
                     )
                 )
-        if await owner_live_lease_agent_ids(session, linkage=linkage, now=now) - {
-            agent_id
-        }:
+        # Both owner rails, in one expression the queue preview calls too, so
+        # relaxing the rule cannot relax it for only one of them.
+        #
+        # ``selected_owner_agent_id`` keeps one current-era generation selected
+        # across the gaps between its leases. Otherwise a validator that
+        # already scored the selected row can open a sibling after the last
+        # lease becomes SCORED, and that new lease diverts every eligible
+        # validator away from finishing the first generation. Historical
+        # overlaps converge deterministically on the generation whose
+        # accepted/live progress began first. Expired-only attempts do not pin
+        # an owner, so failed work can still drain.
+        owner_key = linkage.advisory_lock_keys
+        if owner_key not in owner_facts:
+            owner_facts[owner_key] = (
+                await selected_owner_agent_id(
+                    session,
+                    linkage=linkage,
+                    bench_version=bench_version,
+                    now=now,
+                    provisional_contender_floor=provisional_contender_floor,
+                    rollout=activated_rollout,
+                    capable_validator_hotkeys=capable_hotkeys,
+                ),
+                await owner_live_lease_agent_ids(session, linkage=linkage, now=now),
+            )
+        owner_selected_agent_id, owner_live_leases = owner_facts[owner_key]
+        if (
+            owner_capacity_gate(
+                agent_id=agent_id,
+                selected_agent_id=owner_selected_agent_id,
+                live_lease_agent_ids=owner_live_leases,
+                concurrent_submission_limit=owner_concurrent_submission_limit,
+                last_resort=last_resort,
+            )
+            is not None
+        ):
             skipped.append(agent_id)
-            continue
-
-        # Keep one current-era generation selected across the gaps between its
-        # leases. Otherwise a validator that already scored the selected row
-        # can open a sibling after the last lease becomes SCORED, and that new
-        # lease diverts every eligible validator away from finishing the first
-        # generation. Historical overlaps converge deterministically on the
-        # generation whose accepted/live progress began first. Expired-only
-        # attempts do not pin an owner, so failed work can still drain.
-        owner_selected_agent_id = await selected_owner_agent_id(
-            session,
-            linkage=linkage,
-            bench_version=bench_version,
-            now=now,
-            provisional_contender_floor=provisional_contender_floor,
-            rollout=activated_rollout,
-            capable_validator_hotkeys=capable_hotkeys,
-        )
-        if owner_selected_agent_id is not None and owner_selected_agent_id != agent_id:
-            skipped.append(agent_id)
+            if not last_resort:
+                owner_capacity_skips.append(agent_id)
             continue
         occupied = await session.scalar(
             select(func.count()).where(
