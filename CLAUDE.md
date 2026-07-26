@@ -50,6 +50,18 @@ async-substrate-interface). Wire shapes are `ditto/api_models` (Pydantic).
 - **Migrations own the schema.** `ditto/db/models.py` describes it in Python but
   Alembic under `alembic/versions/` is the source of truth — keep them in sync and
   add a migration for any schema change.
+- **Adding a column to a hot table? Use `safe_add_column`.** `op.add_column`
+  holds an `AccessExclusiveLock` until the migration commits, so a plain
+  add-then-backfill stalls every writer for the length of the backfill — that is
+  how #481 deadlocked the deploy twice. `ditto/db/migration_lock.py` gives you
+  `safe_add_column` / `safe_drop_column`, which add metadata-only, backfill in
+  committed batches, and pin the constraint in one short window. Hot tables today
+  are `inference_requests`, `inference_grants` and `validator_tickets`. Take
+  table locks in the application's order — validator_tickets → inference_grants
+  → inference_requests — and never touch two hot tables in one transaction.
+  `alembic/env.py` applies a `lock_timeout` and a bounded retry underneath, but
+  that is a backstop: it does not rescue a badly-shaped migration under sustained
+  load, and it assumes your migration is re-runnable.
 
 ## Commands
 
