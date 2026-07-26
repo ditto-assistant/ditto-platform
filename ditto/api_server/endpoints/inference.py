@@ -110,15 +110,17 @@ class InferenceDeclinedError(Exception):
 
     Raised instead of ``HTTPException`` so the reason reaches the client as a
     stable numeric code instead of being flattened into a status the broker then
-    has to guess from. ``decline`` is ``None`` for the fail-closed remainder.
+    has to guess from. Every refusal carries a decline now, including the
+    deliberately-unexplained one (``InferenceDecline.UNATTRIBUTED``) -- there is
+    no longer a ``None`` case meaning "we did not say".
 
     The status, the error code, and the ``Retry-After`` hint are all derived in
     ``middleware/error_envelope.py`` -- the numeric registry lives there, and
     importing it back into an endpoint would close an import cycle.
     """
 
-    def __init__(self, decline: InferenceDecline | None, *, lane: str) -> None:
-        super().__init__(f"{lane} inference declined: {decline or 'unavailable'}")
+    def __init__(self, decline: InferenceDecline, *, lane: str) -> None:
+        super().__init__(f"{lane} inference declined: {decline}")
         self.decline = decline
         self.lane = lane
 
@@ -909,12 +911,11 @@ async def proxy_chat_completions(
             now=now,
             config=config,
         )
-        # The chat lane now distinguishes its refusals like the embedding lane
-        # does. The old code asserted a capacity decline could never appear here
-        # -- true while chat could only ever be refused by a boot-time limit, and
-        # exactly the assumption that made a full chat rail indistinguishable
-        # from a dead lease.
-        if reserved is None or isinstance(reserved, InferenceDecline):
+        # Every refusal now arrives as a named decline; there is no longer a
+        # bare ``None`` meaning "refused, no comment". The one that used to hide
+        # here was a spent token budget, which reached the broker as 4100 and
+        # was retried until the run died with hours left on the lease.
+        if isinstance(reserved, InferenceDecline):
             raise InferenceDeclinedError(reserved, lane="inference")
 
     upstream_payload = _locked_upstream_payload(
@@ -1166,8 +1167,8 @@ async def proxy_embeddings(
         # dittobench-api #103 -- the lease is fine and the lane is momentarily
         # full, and 503 is already in the broker's retryable-transient class, so
         # a fleet that has not learned about backpressure still backs off and
-        # survives. What is new is that the other refusals now carry a code too.
-        if reserved is None or isinstance(reserved, InferenceDecline):
+        # survives. Every other refusal now carries its own code as well.
+        if isinstance(reserved, InferenceDecline):
             raise InferenceDeclinedError(reserved, lane="embedding")
 
     upstream_payload = {

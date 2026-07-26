@@ -52,6 +52,7 @@ def _settings(**overrides: object) -> dict[str, object]:
     """A COMPLETE policy body; the board stores the whole object."""
     settings: dict[str, object] = {
         "chat_request_budget": 8192,
+        "chat_token_budget": 25_000_000,
         "embedding_per_ticket_concurrency": 12,
         "embedding_per_validator_concurrency": 48,
         "embedding_global_concurrency": 96,
@@ -117,6 +118,7 @@ class TestRead:
         # than the 1024 that was exhausting legitimate agents.
         assert body["effective"]["settings"] == {
             "chat_request_budget": 8192,
+            "chat_token_budget": 25_000_000,
             "embedding_per_ticket_concurrency": 12,
             "embedding_per_validator_concurrency": 48,
             "embedding_global_concurrency": 96,

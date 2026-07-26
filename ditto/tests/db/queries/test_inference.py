@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.inference_concurrency_settings import (
+    DEFAULT_CHAT_TOKEN_BUDGET,
     InferenceConcurrencySettings,
 )
 from ditto.api_models.ticket_status import TicketStatus
@@ -69,7 +70,20 @@ def _config() -> InferenceProxyConfig:
     )
 
 
-async def _live_grant(session: AsyncSession):
+async def _live_grant(
+    session: AsyncSession,
+    config: InferenceProxyConfig | None = None,
+    validator_hotkey: str = "validator",
+):
+    """Mint and activate one live grant.
+
+    ``config`` is threaded through because the budgets that bind admission are
+    the ones *stamped onto the grant row* at mint time, not the ones in the
+    config handed to ``begin_inference_request``. A test that raises a budget
+    only on the admission call is testing nothing -- see
+    ``test_the_operator_budget_is_stamped_onto_the_new_grant``.
+    """
+    config = config if config is not None else _config()
     now = datetime.now(UTC)
     agent = Agent(
         agent_id=uuid4(),
@@ -81,7 +95,7 @@ async def _live_grant(session: AsyncSession):
     )
     ticket = ValidatorTicket(
         agent_id=agent.agent_id,
-        validator_hotkey="validator",
+        validator_hotkey=validator_hotkey,
         slot_id="slot-0",
         status=TicketStatus.ISSUED,
         issued_at=now,
@@ -91,7 +105,7 @@ async def _live_grant(session: AsyncSession):
     )
     session.add_all([agent, ticket])
     await session.flush()
-    grant = await ensure_inference_grant(session, ticket=ticket, config=_config())
+    grant = await ensure_inference_grant(session, ticket=ticket, config=config)
     assert grant is not None
     assert (
         await activate_inference_grant(
@@ -100,17 +114,17 @@ async def _live_grant(session: AsyncSession):
             validator_hotkey="wrong-validator",
             broker_public_key="broker-key",
             now=now,
-            config=_config(),
+            config=config,
         )
         is None
     )
     activated = await activate_inference_grant(
         session,
         grant_id=grant.grant_id,
-        validator_hotkey="validator",
+        validator_hotkey=validator_hotkey,
         broker_public_key="broker-key",
         now=now,
-        config=_config(),
+        config=config,
     )
     assert activated is not None
     return ticket, activated[0], activated[1], now
@@ -256,7 +270,7 @@ async def test_grant_rejects_wrong_bearer_model_budget_and_replay(
                 now=now,
                 config=_config(),
             )
-            is None
+            is InferenceDecline.UNATTRIBUTED
         )
         assert (
             await begin_inference_request(
@@ -269,7 +283,7 @@ async def test_grant_rejects_wrong_bearer_model_budget_and_replay(
                 now=now,
                 config=_config(),
             )
-            is None
+            is InferenceDecline.MODEL_NOT_PERMITTED
         )
         assert (
             await begin_inference_request(
@@ -282,8 +296,12 @@ async def test_grant_rejects_wrong_bearer_model_budget_and_replay(
                 now=now,
                 config=_config(),
             )
-            is None
+            is InferenceDecline.RESERVATION_TOO_LARGE
         )
+        # ...and asking for more than the whole allowance did NOT spend it. The
+        # accepted request below is the assertion that matters: a lease must
+        # survive one oversized call.
+        assert grant.status == "active"
         nonce = uuid4()
         accepted = await begin_inference_request(
             session,
@@ -319,7 +337,7 @@ async def test_grant_rejects_wrong_bearer_model_budget_and_replay(
                 now=now,
                 config=_config(),
             )
-            is None
+            is InferenceDecline.NONCE_REPLAYED
         )
 
 
@@ -837,7 +855,7 @@ async def test_a_bad_bearer_learns_nothing_about_the_grant(
                 now=now,
                 config=config,
             )
-            is None
+            is InferenceDecline.UNATTRIBUTED
         )
 
 
@@ -875,8 +893,230 @@ async def test_the_operator_budget_is_stamped_onto_the_new_grant(
     session.add_all([agent, ticket])
     await session.flush()
     board = apply_settings(
-        _config(), InferenceConcurrencySettings(chat_request_budget=7)
+        _config(),
+        InferenceConcurrencySettings(chat_request_budget=7, chat_token_budget=7_000),
     )
     grant = await ensure_inference_grant(session, ticket=ticket, config=board)
     assert grant is not None
     assert grant.request_budget == 7
+    # Both allowances travel the same way. The token budget is the one that was
+    # boot-time-only until now, which is why raising the request budget from
+    # backroom did not save the runs it was meant to save.
+    assert grant.token_budget == 7_000
+
+
+def _token_budget_config(token_budget: int) -> InferenceProxyConfig:
+    """A config where the *token* budget is the only limit that can bind.
+
+    Rails wide, request budget effectively unbounded, so that reaching a refusal
+    proves something about the token allowance and nothing else.
+    """
+    return replace(
+        _config(),
+        request_budget=1_000_000,
+        token_budget=token_budget,
+        per_ticket_concurrency=8,
+        per_validator_concurrency=64,
+        global_concurrency=64,
+        per_ticket_requests_per_minute=1_000_000,
+        per_validator_requests_per_minute=1_000_000,
+        global_requests_per_minute=1_000_000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_spent_token_budget_is_named_terminal_and_persistent(
+    session: AsyncSession,
+) -> None:
+    """The defect that made #473 inert, in miniature.
+
+    A grant whose token allowance is gone used to answer a bare ``None``, which
+    the envelope renders as 4100 and the broker classifies as transient. It then
+    retried at ~2.5/sec for two minutes and the run died as
+    ``model_relay_unavailable`` -- 1009 declines on one lease, every one of them
+    4100, with 1h21m still on the clock.
+
+    Note the arithmetic that hid this from the exhaustion check in
+    ``finish_inference_request``: that one fires on ``spent >= token_budget``,
+    but a run stalls one *request* short of the line and never books the last
+    call, so ``spent`` freezes below the budget forever. Nothing set the status,
+    so nothing named the refusal, on any call for the rest of the run.
+    """
+    config = _token_budget_config(1_000)
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_grant(session, config)
+        for _ in range(4):
+            accepted = await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=(nonce := uuid4()),
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=250,
+                now=now,
+                config=config,
+            )
+            assert isinstance(accepted, tuple)
+            await finish_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=nonce,
+                generation=grant.generation,
+                status="completed",
+                prompt_tokens=200,
+                completion_tokens=25,
+                cost_microusd=1,
+                usage_available=True,
+                now=now,
+            )
+        # 900 booked against a 1,000 budget: a 250-token call no longer fits.
+        assert grant.prompt_tokens + grant.completion_tokens == 900
+        assert grant.status == "active"
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=250,
+                now=now,
+                config=config,
+            )
+            is InferenceDecline.TOKEN_BUDGET_EXHAUSTED
+        )
+        # Terminal, and recorded as terminal -- matching request-count
+        # exhaustion, so the broker must not retry it.
+        assert grant.status == "exhausted"
+        # And it stays named -- as the *token* wall, not the request wall -- for
+        # the whole tail of the run, which is the window in which a harness can
+        # still wind down and submit what it has.
+        for _ in range(3):
+            assert (
+                await begin_inference_request(
+                    session,
+                    grant_id=grant.grant_id,
+                    nonce=uuid4(),
+                    bearer=bearer,
+                    model="qwen/qwen3-32b",
+                    token_reservation=250,
+                    now=now,
+                    config=config,
+                )
+                is InferenceDecline.TOKEN_BUDGET_EXHAUSTED
+            )
+
+
+@pytest.mark.asyncio
+async def test_in_flight_reservations_alone_are_backpressure_not_exhaustion(
+    session: AsyncSession,
+) -> None:
+    """Nothing spent, so nothing is over -- the reservations will settle.
+
+    The old code answered this identically to a genuinely spent allowance (both
+    were a bare ``None``), which meant a grant with plenty of headroom could be
+    reported as dead purely because several calls happened to be in flight. It
+    has to degrade to backpressure or a healthy run is thrown away.
+    """
+    config = _token_budget_config(1_000)
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_grant(session, config)
+        for _ in range(3):
+            assert isinstance(
+                await begin_inference_request(
+                    session,
+                    grant_id=grant.grant_id,
+                    nonce=uuid4(),
+                    bearer=bearer,
+                    model="qwen/qwen3-32b",
+                    token_reservation=300,
+                    now=now,
+                    config=config,
+                ),
+                tuple,
+            )
+        # 900 reserved, 0 spent. A fourth call crosses only because of the three
+        # in flight.
+        assert grant.prompt_tokens + grant.completion_tokens == 0
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=300,
+                now=now,
+                config=config,
+            )
+            is InferenceDecline.AT_CAPACITY
+        )
+        # Emphatically still alive: backpressure must not spend the lease.
+        assert grant.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_a_jupiter_profile_run_completes_at_the_shipped_budget(
+    session: AsyncSession,
+) -> None:
+    """The whole point of the change, measured against the real numbers.
+
+    Jupiter and KOTH_v7_1 issue ~1090 chat calls at ~10k tokens each -- ~10.9M
+    for a complete run. Against the old 4,000,000 that run is refused from call
+    ~400 onward, which is 36% of the way in: the remaining ~690 calls were the
+    1009 declines observed on a live lease.
+
+    Scaled down by 1000x so the test is a few hundred rows rather than a
+    million, but the ratio that matters -- run demand vs. allowance -- is
+    preserved exactly.
+    """
+    per_call_prompt, per_call_completion = 9_400, 600
+    calls = 1_090
+    demand = calls * (per_call_prompt + per_call_completion)
+    assert demand == 10_900_000
+
+    async def _drive(token_budget: int) -> tuple[int, object]:
+        config = _token_budget_config(token_budget)
+        _ticket, grant, bearer, now = await _live_grant(
+            session, config, validator_hotkey=f"validator-{token_budget}"
+        )
+        completed = 0
+        for _ in range(calls):
+            got = await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=(nonce := uuid4()),
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=per_call_prompt + per_call_completion,
+                now=now,
+                config=config,
+            )
+            if isinstance(got, InferenceDecline):
+                return completed, got
+            await finish_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=nonce,
+                generation=grant.generation,
+                status="completed",
+                prompt_tokens=per_call_prompt,
+                completion_tokens=per_call_completion,
+                cost_microusd=1,
+                usage_available=True,
+                now=now,
+            )
+            completed += 1
+        return completed, None
+
+    async with session.begin():
+        # The old allowance: cut off well before the run ends...
+        completed, decline = await _drive(4_000_000)
+        assert completed == 400
+        assert decline is InferenceDecline.TOKEN_BUDGET_EXHAUSTED
+
+    async with session.begin():
+        # ...and the shipped one: the run finishes.
+        completed, decline = await _drive(DEFAULT_CHAT_TOKEN_BUDGET)
+        assert completed == calls
+        assert decline is None

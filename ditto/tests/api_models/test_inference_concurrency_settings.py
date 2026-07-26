@@ -125,6 +125,7 @@ class TestWriteContract:
     def test_complete_policy_is_accepted(self) -> None:
         request = self._request(
             chat_request_budget=8192,
+            chat_token_budget=25_000_000,
             embedding_per_ticket_concurrency=16,
             embedding_per_validator_concurrency=64,
             embedding_global_concurrency=128,
@@ -142,6 +143,23 @@ class TestWriteContract:
         """
         with pytest.raises(ValidationError, match="chat_request_budget"):
             self._request(
+                chat_token_budget=25_000_000,
+                embedding_per_ticket_concurrency=16,
+                embedding_per_validator_concurrency=64,
+                embedding_global_concurrency=128,
+            )
+
+    def test_a_write_omitting_only_the_token_budget_is_refused(self) -> None:
+        """Same guard, same reason, for the field that actually bound v7.
+
+        Worth its own case rather than folding into the one above: the token
+        budget is the newest field, so it is the one a remembered payload is
+        most likely to be missing, and silently resetting it to the default is
+        precisely how a deliberate operator raise would evaporate.
+        """
+        with pytest.raises(ValidationError, match="chat_token_budget"):
+            self._request(
+                chat_request_budget=8192,
                 embedding_per_ticket_concurrency=16,
                 embedding_per_validator_concurrency=64,
                 embedding_global_concurrency=128,
