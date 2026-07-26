@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
+from ditto.api_server.endpoints.inference import InferenceDeclinedError
 from ditto.api_server.endpoints.retrieval import (
     AgentNotFoundError,
     HotkeyAgentNotFoundError,
@@ -45,6 +46,7 @@ from ditto.api_server.pricing import (
     PricingError,
 )
 from ditto.db.queries.agents import SubmissionCooldownError
+from ditto.db.queries.inference import InferenceDecline
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,30 @@ ERROR_CODE_PAYMENT_REPLAYED = 3207
 # driving the evaluate -> score loop; distinct from the agent-side 1xxx codes.
 ERROR_CODE_VALIDATOR_AUTH = 4000
 ERROR_CODE_AGENT_NOT_EVALUATABLE = 4001
+
+# Inference-proxy declines (41xx, inside the validator range because the caller
+# is the validator's broker). These exist because the HTTP status alone cannot
+# carry this distinction: 429 has meant three different things on this path, and
+# a broker that can only see the status has no way to tell "your lease is dead"
+# from "come back in a second". The status stays a coarse hint -- retryable or
+# not -- and *these codes are the authoritative signal*.
+#
+# Contract, in the order a broker should check it:
+#   4101 GRANT_REVOKED     -> 429. Fatal. Do not retry; the run is over.
+#   4102 BUDGET_EXHAUSTED  -> 429. Terminal but healthy: the lease is alive and
+#                             the allowance is spent. Do not retry, but the run
+#                             can still wind down and submit what it has.
+#   4103 AT_CAPACITY       -> 503 + Retry-After. Nothing is wrong. Back off and
+#                             retry; this must never end a run.
+#   4100 unspecified       -> 429. The fail-closed remainder. Treat as fatal.
+#
+# Old brokers ignore the body entirely and see only the status, which is why
+# 4103 had to move off 429 and onto 503 -- see the module docstring in
+# `endpoints/inference.py` for why that specific status is the safe one.
+ERROR_CODE_INFERENCE_DECLINED = 4100
+ERROR_CODE_INFERENCE_GRANT_REVOKED = 4101
+ERROR_CODE_INFERENCE_BUDGET_EXHAUSTED = 4102
+ERROR_CODE_INFERENCE_AT_CAPACITY = 4103
 
 # Screener-side error codes (5xxx range). Surfaced to the screener worker
 # driving the uploaded -> evaluating promotion gate.
@@ -151,6 +177,42 @@ def register_exception_handlers(app: FastAPI) -> None:
             ERROR_CODE_SUBMISSION_COOLDOWN,
             f"owner coldkey may submit again at {exc.retry_at.isoformat()}",
             headers={"Retry-After": str(retry_after)},
+        )
+
+    @app.exception_handler(InferenceDeclinedError)
+    async def _inference_declined_handler(
+        _request: Request, exc: InferenceDeclinedError
+    ) -> JSONResponse:
+        """Map an admission decline to its status, code, and retry hint.
+
+        The whole mapping lives here so there is exactly one place that decides
+        what a refusal looks like on the wire. See the "How a refusal is
+        signalled" section of ``endpoints/inference.py`` for why the retryable
+        case is the only one that moved off ``429``.
+        """
+        if exc.decline is InferenceDecline.AT_CAPACITY:
+            return _envelope_response(
+                503,
+                ERROR_CODE_INFERENCE_AT_CAPACITY,
+                f"{exc.lane} lane is at capacity",
+                headers={"Retry-After": "1"},
+            )
+        if exc.decline is InferenceDecline.GRANT_REVOKED:
+            return _envelope_response(
+                429,
+                ERROR_CODE_INFERENCE_GRANT_REVOKED,
+                f"{exc.lane} grant was revoked",
+            )
+        if exc.decline is InferenceDecline.BUDGET_EXHAUSTED:
+            return _envelope_response(
+                429,
+                ERROR_CODE_INFERENCE_BUDGET_EXHAUSTED,
+                f"{exc.lane} grant has spent its request budget",
+            )
+        return _envelope_response(
+            429,
+            ERROR_CODE_INFERENCE_DECLINED,
+            f"{exc.lane} grant unavailable",
         )
 
     @app.exception_handler(OracleUnreachableError)

@@ -69,18 +69,24 @@ class TestDecoding:
 
 
 class TestApplySettings:
-    async def test_only_the_embedding_limits_move(self) -> None:
-        """The overlay must not be able to disturb the chat lane or the budgets.
+    async def test_only_the_board_owned_fields_move(self) -> None:
+        """The overlay must not disturb anything this board does not own.
 
-        Written as a whole-object diff rather than three equality assertions so
-        that a future field added to the settings model, and wired into
-        ``apply_settings`` by mistake, fails here instead of silently retuning
-        something unrelated.
+        Written as a whole-object diff rather than a handful of equality
+        assertions so that a future field added to the settings model, and wired
+        into ``apply_settings`` by mistake, fails here instead of silently
+        retuning something unrelated.
+
+        ``request_budget`` joined the owned set deliberately. Note what did
+        *not*: the chat concurrency and rate limits, and both token budgets. The
+        token budget in particular is the other half of what bounds a grant's
+        spend, and it stays boot-time on purpose.
         """
         config = _config()
         overlaid = apply_settings(
             config,
             InferenceConcurrencySettings(
+                chat_request_budget=4096,
                 embedding_per_ticket_concurrency=12,
                 embedding_per_validator_concurrency=48,
                 embedding_global_concurrency=96,
@@ -92,11 +98,14 @@ class TestApplySettings:
             if getattr(config, field) != getattr(overlaid, field)
         }
         assert changed == {
+            "request_budget",
             "embedding_per_ticket_concurrency",
             "embedding_per_validator_concurrency",
             "embedding_global_concurrency",
         }
+        assert overlaid.request_budget == 4096
         assert overlaid.per_ticket_concurrency == config.per_ticket_concurrency
+        assert overlaid.token_budget == config.token_budget
         assert overlaid.embedding_token_budget == config.embedding_token_budget
 
 

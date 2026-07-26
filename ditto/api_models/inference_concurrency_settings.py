@@ -1,11 +1,14 @@
-"""Operator-tunable concurrency for the hosted v7 embedding lane.
+"""Operator-tunable admission policy for the hosted v7 inference lanes.
 
-Scope is deliberately narrow: this board governs the **hosted** embedding route
-(``perplexity/pplx-embed-v1-0.6b`` through the platform proxy) and nothing else.
+This board governs the **hosted** embedding route
+(``perplexity/pplx-embed-v1-0.6b`` through the platform proxy) plus one chat
+number: the per-grant chat request budget.
 
-* The **chat** lane keeps its boot-time config. It was never sized against a
-  local resource, its limits are already 8/24/72, and it is not what is
-  throttling a v7 run.
+* The chat lane's **concurrency and rate** limits keep their boot-time config.
+  They were never sized against a local resource, they are already 8/24/72, and
+  they are not what is throttling a v7 run.
+* The chat lane's **request budget** is here because it is a per-lease resource
+  allowance, not a rate. See ``chat_request_budget`` for why it moved.
 * The **local Ollama** lane (bench_version 2-6, one container per validator
   host) is not reachable from here at all. dittobench-api #93 made v7 bypass it
   (``inference_broker.go``: ``if benchVersion < 7 { acquire b.embeddingSlots }``),
@@ -55,17 +58,61 @@ MAX_EMBEDDING_PER_TICKET_CONCURRENCY = 128
 MAX_EMBEDDING_PER_VALIDATOR_CONCURRENCY = 128
 MAX_EMBEDDING_GLOBAL_CONCURRENCY = 128
 
+# The chat request budget, sized against the observed distribution rather than
+# against the round number it replaces (1024, which was never justified against
+# a real run).
+#
+#   * a typical v7 agent spends ~1.25 chat requests per check, ~355 per run
+#   * Jupiter and KOTH_v7_1 spend ~3.85 per check, ~1090 per run
+#   * a run is 279-283 checks depending on the dataset
+#
+# 1024 sat *below* the heaviest observed strategy, so those agents exhausted
+# around check 266 and had every remaining call refused -- a resource limit
+# behaving as a run failure. 8192 is ~23x the median run, ~7.5x the heaviest
+# run observed, and ~29 requests per check at 283 checks. It is a real raise
+# (8x) rather than a nudge, which is the point: a ceiling that a legitimate
+# strategy can reach by being thorough is a ceiling in the wrong place.
+DEFAULT_CHAT_REQUEST_BUDGET = 8192
+
+# The ceiling is 2x the default, not unbounded. The request budget is not the
+# only thing bounding a grant's spend -- ``token_budget`` (4,000,000 per grant,
+# boot-time and unchanged) is the other, and at 8192 requests it is the one that
+# binds first for any strategy averaging over ~488 tokens a call. Keeping a
+# finite request ceiling matters anyway: it is the bound that survives a
+# pathological loop of tiny requests, which the token budget would absorb
+# slowly and the concurrency board would not catch at all.
+MAX_CHAT_REQUEST_BUDGET = 16384
+
 
 class InferenceConcurrencySettings(BaseModel):
-    """The whole hosted-embedding concurrency policy, stored as one object.
+    """The whole hosted-inference admission policy, stored as one object.
 
-    The three limits are a strict hierarchy: one ticket may not exceed its
-    validator's allowance, and no validator may exceed the fleet's. The
+    The three embedding limits are a strict hierarchy: one ticket may not exceed
+    its validator's allowance, and no validator may exceed the fleet's. The
     validator enforces the same hierarchy from below, so under normal operation
     the platform numbers are headroom rather than the operative valve.
+
+    ``chat_request_budget`` stands apart from the three. It is not a rate and it
+    is not enforced fleet-wide at admission -- it is *stamped onto each grant when
+    the grant is minted* and thereafter read from the grant's own row. That is
+    deliberate, and it is what makes this field safe to sit on a live board: a
+    revision changes what the **next** lease is issued, never what a running
+    lease is already spending against. An operator cannot exhaust a run in
+    flight by lowering this number, which is exactly the hazard that forced the
+    embedding limits to grow a capacity-decline path.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    chat_request_budget: Annotated[int, Field(ge=1, le=MAX_CHAT_REQUEST_BUDGET)] = (
+        DEFAULT_CHAT_REQUEST_BUDGET
+    )
+    """Chat completions one scoring ticket's grant may spend, in total.
+
+    Raising this is the lever for "let a heavier strategy finish"; lowering it is
+    the lever for "stop paying for a runaway". Neither takes effect on a lease
+    that has already been minted -- see the class docstring.
+    """
 
     embedding_per_ticket_concurrency: Annotated[
         int, Field(ge=1, le=MAX_EMBEDDING_PER_TICKET_CONCURRENCY)

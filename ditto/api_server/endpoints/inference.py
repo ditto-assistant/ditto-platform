@@ -4,6 +4,41 @@ Only a validator-authenticated exchange can bind a grant to a trusted local
 broker key. Every inference call then requires the opaque grant secret plus an
 Ed25519 proof over the exact request body. Request bodies and provider payloads
 are intentionally never logged.
+
+How a refusal is signalled, and why it looks like this
+------------------------------------------------------
+
+``429`` used to mean three unrelated things here: the lease was revoked, the
+lease's budget was spent, or the lane was simply full. The broker
+(``dittobench-api``) classifies purely on status, so all three read as "lease
+gone, discard the run". That cost real runs -- ``banblackycat`` died to 17
+capacity declines against a perfectly healthy lease.
+
+The fix is not "more status codes". Status codes are a two-bit channel and this
+is application semantics, so the authoritative signal is the numeric
+``error_code`` already present in every error body (see
+``middleware/error_envelope.py``, 41xx). The status is kept as a coarse,
+*honest* hint:
+
+* retryable  -> ``503`` + ``Retry-After``
+* terminal   -> ``429``
+
+Choosing ``503`` for the retryable case is the entire backward-compatibility
+story, and it is forced rather than chosen. A broker pinned to an old build
+sees only the status, so:
+
+* ``503`` already falls in its transient class -- it backs off, retries, and on
+  final failure reports the same ``502`` to the harness it always did. Strictly
+  better than today, where the same event ends the run instantly.
+* ``409``/``403`` would be *worse* than today. The old broker forwards an
+  unrecognised 4xx to the harness verbatim, changing the gateway contract
+  mid-benchmark -- the one thing its own comments say must never happen.
+
+So revocation and exhaustion keep ``429`` (which old brokers already treat
+correctly, as fatal) and only the retryable case moves. New brokers read
+``error_code`` and can finally tell revocation from exhaustion; old brokers see
+no regression on any path. The embedding lane has answered this way since
+dittobench-api #103 and the fleet already understands it.
 """
 
 from __future__ import annotations
@@ -38,7 +73,7 @@ from ditto.api_server.endpoints.validator import (
     _verify_signature,
 )
 from ditto.api_server.inference_concurrency_settings import (
-    InferenceConcurrencySettingsResolver,
+    resolved_proxy_config,
 )
 from ditto.api_server.inference_routing import (
     benchmark_reasoning,
@@ -68,6 +103,24 @@ _PPLX_EMBED_CONTRACT_MODEL = "perplexity/pplx-embed-v1-0.6b"
 _PPLX_EMBED_RESPONSE_MODEL = "pplx-embed-v1-0.6b"
 _PROVIDER_MAX_ATTEMPTS = 3
 _PROVIDER_RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+class InferenceDeclinedError(Exception):
+    """An admission refusal, carrying the machine-readable reason.
+
+    Raised instead of ``HTTPException`` so the reason reaches the client as a
+    stable numeric code instead of being flattened into a status the broker then
+    has to guess from. ``decline`` is ``None`` for the fail-closed remainder.
+
+    The status, the error code, and the ``Retry-After`` hint are all derived in
+    ``middleware/error_envelope.py`` -- the numeric registry lives there, and
+    importing it back into an endpoint would close an import cycle.
+    """
+
+    def __init__(self, decline: InferenceDecline | None, *, lane: str) -> None:
+        super().__init__(f"{lane} inference declined: {decline or 'unavailable'}")
+        self.decline = decline
+        self.lane = lane
 
 
 @dataclass(frozen=True)
@@ -567,22 +620,14 @@ def _locked_upstream_payload(
 async def _resolve_admission_config(
     request: Request, config: InferenceProxyConfig
 ) -> InferenceProxyConfig:
-    """``config`` with the operator's live hosted-embedding limits overlaid.
+    """``config`` with the operator's live admission policy overlaid.
 
-    With no resolver bound (unit tests, or a deployment predating the board) the
-    boot-time config is returned untouched, so ``DITTO_INFERENCE_*`` env
-    overrides keep their meaning as the seed. The board's shipped defaults are
-    the same numbers ``config.py`` seeds, so an empty settings table and an
-    absent resolver produce identical admission behaviour.
+    Note that the overlaid ``request_budget`` is inert on this path: admission
+    compares against ``grant.request_budget``, the value stamped on the grant
+    row when the lease was minted. That is deliberate -- see
+    ``api_models/inference_concurrency_settings.py``.
     """
-    resolver: InferenceConcurrencySettingsResolver | None = getattr(
-        request.app.state, "inference_concurrency_settings", None
-    )
-    if resolver is None:
-        return config
-    return await resolver.resolve_config(
-        config, getattr(request.app.state, "session_maker", None)
-    )
+    return await resolved_proxy_config(request.app.state, config)
 
 
 def _provider_rejection_is_route_observable(status_code: int) -> bool:
@@ -864,13 +909,13 @@ async def proxy_chat_completions(
             now=now,
             config=config,
         )
-        if reserved is None:
-            raise HTTPException(status_code=429, detail="inference grant unavailable")
-        # The chat lane never returns a capacity decline: its limits are
-        # boot-time constants that cannot move under a live ticket, so there is
-        # nothing new for it to distinguish. Asserted rather than handled so the
-        # day someone makes chat tunable, this line is the thing that fails.
-        assert not isinstance(reserved, InferenceDecline)
+        # The chat lane now distinguishes its refusals like the embedding lane
+        # does. The old code asserted a capacity decline could never appear here
+        # -- true while chat could only ever be refused by a boot-time limit, and
+        # exactly the assumption that made a full chat rail indistinguishable
+        # from a dead lease.
+        if reserved is None or isinstance(reserved, InferenceDecline):
+            raise InferenceDeclinedError(reserved, lane="inference")
 
     upstream_payload = _locked_upstream_payload(
         payload, model=model, max_tokens=max_tokens
@@ -1117,22 +1162,13 @@ async def proxy_embeddings(
             config=admission_config,
             request_kind="embedding",
         )
-        if reserved is InferenceDecline.AT_CAPACITY:
-            # The lease is fine; the lane is momentarily full. Answering 429
-            # here would be read as a revoked lease by the broker and discard a
-            # healthy run (dittobench-api #103), which is precisely what would
-            # happen the first time an operator lowered the concurrency board.
-            # 503 is also already in the broker's retryable-transient class, so
-            # a fleet that has not yet learned about capacity backpressure still
-            # backs off and survives instead of failing closed.
-            raise HTTPException(
-                status_code=503,
-                detail="embedding lane is at capacity",
-                headers={"Retry-After": "1"},
-            )
-        if reserved is None:
-            raise HTTPException(status_code=429, detail="embedding grant unavailable")
-        assert not isinstance(reserved, InferenceDecline)
+        # AT_CAPACITY still answers 503 + Retry-After exactly as it has since
+        # dittobench-api #103 -- the lease is fine and the lane is momentarily
+        # full, and 503 is already in the broker's retryable-transient class, so
+        # a fleet that has not learned about backpressure still backs off and
+        # survives. What is new is that the other refusals now carry a code too.
+        if reserved is None or isinstance(reserved, InferenceDecline):
+            raise InferenceDeclinedError(reserved, lane="embedding")
 
     upstream_payload = {
         "model": config.embedding_model,
