@@ -21,6 +21,7 @@ from ditto.db.models import (
     ValidatorTicket,
 )
 from ditto.db.queries.inference import (
+    USAGE_ACCOUNTING_VERSION,
     InferenceDecline,
     activate_inference_grant,
     begin_inference_request,
@@ -1120,3 +1121,161 @@ async def test_a_jupiter_profile_run_completes_at_the_shipped_budget(
         completed, decline = await _drive(DEFAULT_CHAT_TOKEN_BUDGET)
         assert completed == calls
         assert decline is None
+
+
+@pytest.mark.asyncio
+async def test_a_reclaimed_request_is_charged_the_estimate_not_the_byte_count(
+    session: AsyncSession,
+) -> None:
+    """The over-charge was booked, not merely reserved.
+
+    Every path that reclaims a request which never returned trusted usage --
+    timeout, transport failure, revocation, the stale sweep -- charges
+    ``reserved_tokens`` as ``prompt_tokens``. While that figure was
+    ``max_tokens + len(body)``, a call whose body was 8KB was permanently
+    booked ~8,000 tokens against the grant when it really cost ~2,000.
+
+    This asserts the charge follows the reservation, so an honest reservation is
+    an honest charge. The endpoint-level halves -- that the reservation is now
+    ~1/4 of the byte count, and that the ceiling stayed a true bound -- live in
+    ``test_inference.py``.
+    """
+    config = _token_budget_config(1_000_000)
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_grant(session, config)
+        nonce = uuid4()
+        # What the old code would have reserved for an 8KB body vs. what the
+        # estimate reserves for the same call.
+        byte_bound, estimate = 8_192, 2_048
+        assert isinstance(
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=nonce,
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=estimate,
+                max_chargeable_tokens=byte_bound,
+                now=now,
+                config=config,
+            ),
+            tuple,
+        )
+        # The provider never answered, so the reservation is what gets booked.
+        await finish_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=nonce,
+            generation=grant.generation,
+            status="failed",
+            prompt_tokens=0,
+            completion_tokens=0,
+            cost_microusd=0,
+            usage_available=False,
+            now=now,
+        )
+        assert grant.prompt_tokens == estimate
+        assert grant.prompt_tokens != byte_bound
+
+
+@pytest.mark.asyncio
+async def test_real_usage_above_the_estimate_is_still_deliverable(
+    session: AsyncSession,
+) -> None:
+    """The half of this change that would break v7 if it were got wrong.
+
+    ``finish_inference_request`` marks a request non-deliverable when reported
+    usage exceeds its bound, and the endpoint turns that into a 409. Once the
+    reservation is an estimate, ordinary token-dense prompts land above it --
+    so clamping there would 409 a large share of perfectly good calls.
+
+    The clamp therefore reads ``max_chargeable_tokens``, which is still the
+    byte-derived true bound. Usage between the estimate and the ceiling is
+    booked exactly as reported.
+    """
+    config = _token_budget_config(1_000_000)
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_grant(session, config)
+        nonce = uuid4()
+        estimate, ceiling = 2_048, 8_192
+        assert isinstance(
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=nonce,
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=estimate,
+                max_chargeable_tokens=ceiling,
+                now=now,
+                config=config,
+            ),
+            tuple,
+        )
+        # 2,600 real tokens: over the estimate, well under the ceiling.
+        assert await finish_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=nonce,
+            generation=grant.generation,
+            status="completed",
+            prompt_tokens=2_400,
+            completion_tokens=200,
+            cost_microusd=7,
+            usage_available=True,
+            now=now,
+        )
+        assert grant.prompt_tokens == 2_400
+        assert grant.completion_tokens == 200
+
+    async with session.begin():
+        # ...and a provider claiming more than the byte ceiling is still clamped.
+        _ticket, grant, bearer, now = await _live_grant(
+            session, config, validator_hotkey="validator-liar"
+        )
+        nonce = uuid4()
+        assert isinstance(
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=nonce,
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=2_048,
+                max_chargeable_tokens=8_192,
+                now=now,
+                config=config,
+            ),
+            tuple,
+        )
+        assert not await finish_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=nonce,
+            generation=grant.generation,
+            status="completed",
+            prompt_tokens=9_000_000,
+            completion_tokens=0,
+            cost_microusd=1,
+            usage_available=True,
+            now=now,
+        )
+        assert grant.prompt_tokens == 8_192
+
+
+@pytest.mark.asyncio
+async def test_new_grants_record_which_meter_booked_them(
+    session: AsyncSession,
+) -> None:
+    """A token total is only comparable within the contract that produced it.
+
+    Without this marker, someone comparing a pre-fix run against a post-fix run
+    concludes the agent got dramatically more efficient when only the meter
+    changed. There is no backfill and there cannot be one: the over-charge
+    happened at reservation time, so what those calls really consumed was never
+    recorded.
+    """
+    async with session.begin():
+        _ticket, grant, _bearer, _now = await _live_grant(session)
+        assert grant.usage_accounting_version == USAGE_ACCOUNTING_VERSION
+        assert USAGE_ACCOUNTING_VERSION == 2

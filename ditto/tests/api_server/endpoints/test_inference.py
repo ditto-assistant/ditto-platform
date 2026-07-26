@@ -12,9 +12,11 @@ from fastapi import HTTPException
 from ditto.api_models.inference import InferenceExchangeRequest, InferenceGrantOffer
 from ditto.api_server.endpoints.inference import (
     _bounded_provider_cost,
+    _estimated_tokens,
     _exchange_message,
     _locked_grant_model,
     _locked_upstream_payload,
+    _max_chargeable_tokens,
     _output_token_limit,
     _post_provider_with_retry,
     _provider_preferences,
@@ -710,3 +712,49 @@ def test_embedding_model_mismatch_still_refuses_rather_than_substituting() -> No
     with pytest.raises(HTTPException) as refused:
         _validated_embedding_payload(payload, model=model, dimensions=768)
     assert refused.value.status_code == 400
+
+
+def test_the_reservation_is_a_token_estimate_not_a_byte_count() -> None:
+    """The over-reservation, measured on a body the size v7 actually sends.
+
+    ``max_tokens + len(body)`` treated byte length as a token count. It is a
+    true upper bound, but roughly 4x the truth for this lane's JSON, and it was
+    not merely held: every reclamation path books it as ``prompt_tokens``.
+    """
+    body = (
+        b'{"model":"openai/gpt-oss-20b","messages":[' + b'{"role":"user"}' * 600 + b"]"
+    )
+    assert 8_000 < len(body) < 10_000
+
+    # The prompt half is where the over-estimate lived, and it is 4x to within
+    # the rounding of one ceiling division.
+    assert abs(len(body) / _estimated_tokens(body) - 4) < 0.01
+
+    # On the whole reservation the effect is ~3x rather than 4x, because the
+    # permitted output (``max_tokens``) was never the inflated part.
+    old_reservation = 1024 + len(body)
+    new_reservation = 1024 + _estimated_tokens(body)
+    assert 3.0 < old_reservation / new_reservation < 3.2
+
+    # And a v7-sized body lands in the right neighbourhood of the ~2,300 tokens
+    # per chat call the calibration fleet actually measures.
+    assert 1_500 < _estimated_tokens(body) < 3_000
+
+
+def test_the_charge_ceiling_stays_a_true_bound() -> None:
+    """The estimate may be wrong; the ceiling may not.
+
+    ``max_chargeable_tokens`` is what bounds untrusted provider accounting, so
+    it has to stay tokenizer-independent -- a token cannot consume less than one
+    byte of the UTF-8 body. Keeping it above the estimate is what stops the
+    clamp from marking ordinary token-dense calls non-deliverable.
+    """
+    for body in (b"x", b"{}", b"a" * 4096, "ü".encode() * 2048):
+        ceiling = _max_chargeable_tokens(body, output_tokens=1024)
+        assert ceiling >= len(body)
+        # Never below the reservation, so the clamp can only ever be looser
+        # than the estimate -- which is what keeps a legitimate call deliverable.
+        assert ceiling >= 1024 + _estimated_tokens(body)
+    # Never zero, so the `reserved_tokens > 0` check constraint always holds.
+    assert _max_chargeable_tokens(b"") >= 1
+    assert _estimated_tokens(b"") == 1
