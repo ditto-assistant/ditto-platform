@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import statistics
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
@@ -7531,3 +7532,131 @@ class TestReissuedLeaseKeepsSlotProgress:
                 {"slot_id": "slot-0", "agent_id": str(agent)},
                 {"slot_id": "slot-1", "agent_id": str(stray)},
             ]
+
+
+class TestUnmatchableWorkClaimIsLoud:
+    """A validator reporting work no lease matches must not fail silently.
+
+    A continual-retest run reported its progress against the wrong slot: the
+    lane executed under the default ``slot-0`` while the lease was issued on
+    ``slot-1``. Every slot then failed confirmation and was dropped, so the
+    stored capacity was empty and the fleet view rendered a healthy, scoring
+    validator exactly like an idle one -- ``reported_agent_id: null``,
+    ``active_benchmarks: []``. The per-slot drop lines are INFO, so nothing in
+    the logs distinguished it either.
+
+    Both heartbeats below stay ACCEPTED on purpose. Rejecting either would stop
+    refreshing ``seen_at``, and a frozen ``seen_at`` is what force-expires
+    leases.
+    """
+
+    async def test_retest_reported_on_the_wrong_slot_warns_and_is_accepted(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        agent = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, name="retest-a"
+        )
+        # The lease the platform actually issued: a retest on slot-1.
+        await _seed_ticket(
+            session_maker,
+            agent,
+            slot_id="slot-1",
+            bench_version=7,
+            purpose=TicketPurpose.CONTINUAL_RETEST,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        progress = _progress("running_benchmark", completed=41, total=283)
+        capacity = {
+            "configured_slots": 2,
+            "healthy_slots": ["slot-0", "slot-1"],
+            "admission": "accepting",
+            "active": [
+                {
+                    # ...but the validator reports it against slot-0.
+                    "slot_id": "slot-0",
+                    "agent_id": str(agent),
+                    "bench_version": 7,
+                    "progress": progress,
+                }
+            ],
+        }
+        with caplog.at_level(logging.WARNING):
+            response = await client.post(
+                "/api/v1/validator/heartbeat",
+                headers=_AUTH_HEADER,
+                json=_heartbeat_payload(
+                    protocol_version=10,
+                    state="running_benchmark",
+                    active_agent_id=agent,
+                    benchmark_progress=progress,
+                    capabilities=_V9_CAPABILITIES,
+                    stack=_V7_STACK,
+                    stack_health=_V9_STACK_HEALTH,
+                    benchmark_capacity=capacity,
+                ),
+            )
+
+        # Accepted, so seen_at keeps moving and the lease is not force-expired.
+        assert response.status_code == 200, response.text
+        assert response.json()["accepted"] is True
+        async with session_maker() as s:
+            row = await s.get(ValidatorHeartbeat, _KEYPAIR.ss58_address)
+            assert row is not None
+            assert row.benchmark_capacity is not None
+            # The unmatchable slot is still dropped -- that behaviour is load
+            # bearing for the revoker -- but now it is announced.
+            assert row.benchmark_capacity["active"] == []
+            assert row.claimed_slots == [{"slot_id": "slot-0", "agent_id": str(agent)}]
+        assert any(
+            "no claimed slot matches a live lease" in record.message
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        ), "the wrong-slot heartbeat produced no warning"
+
+    async def test_running_benchmark_with_no_active_slot_warns_and_is_accepted(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # The wire model constrains ``state`` only when ``active`` is non-empty,
+        # so this contradiction validates cleanly. The lease gate ignores
+        # ``state`` under v10+ and reads the empty capacity as idle.
+        _install_db(app, session_maker)
+        _install_chain(app)
+        capacity = {
+            "configured_slots": 2,
+            "healthy_slots": ["slot-0", "slot-1"],
+            "admission": "accepting",
+            "active": [],
+        }
+        # A distinct validator, so this never races the sibling test's row for
+        # the same wall-clock second (a same-second repeat stores nothing).
+        with caplog.at_level(logging.WARNING):
+            response = await client.post(
+                "/api/v1/validator/heartbeat",
+                headers={"X-Validator-Hotkey": _KEYPAIRS[1].ss58_address},
+                json=_heartbeat_payload(
+                    keypair=_KEYPAIRS[1],
+                    protocol_version=10,
+                    state="running_benchmark",
+                    capabilities=_V9_CAPABILITIES,
+                    stack=_V7_STACK,
+                    stack_health=_V9_STACK_HEALTH,
+                    benchmark_capacity=capacity,
+                ),
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["accepted"] is True
+        assert any(
+            "self-contradictory" in record.message
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        ), "the contradictory heartbeat produced no warning"

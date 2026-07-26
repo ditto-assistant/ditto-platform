@@ -1438,6 +1438,22 @@ async def _validated_heartbeat_work(
                     slot.slot_id,
                 )
         valid_active.sort(key=lambda slot: slot.slot_id)
+        # Every slot the validator claimed was dropped, yet it says it is running
+        # a benchmark. The per-slot lines above are INFO and one-per-slot, so this
+        # pattern -- a healthy validator whose work is entirely unmatchable --
+        # produced no aggregate signal at all, and the fleet view then renders it
+        # identically to a genuinely idle validator. That is what made a retest
+        # reporting against the wrong slot indistinguishable from a wedged one.
+        # Warn, never reject: a 422 here would skip the handler entirely and
+        # freeze ``seen_at``, which is the input to lease force-expiry.
+        if claimed and not valid_active and request_body.state == "running_benchmark":
+            logger.warning(
+                "validator heartbeat claims running_benchmark but no claimed "
+                "slot matches a live lease; the fleet view will read this "
+                "validator as idle validator=%s claimed=%s",
+                validator_hotkey,
+                claimed,
+            )
         stored_benchmark_capacity = stored_benchmark_capacity.model_copy(
             update={"active": valid_active}
         )
@@ -1549,6 +1565,30 @@ async def heartbeat(
         and request_body.state != "running_benchmark"
     ):
         raise ValidatorAuthError("active agent requires running_benchmark state")
+    # Self-contradictory but deliberately ACCEPTED: under v10+ the wire model
+    # constrains ``state`` only when ``active`` is non-empty, so a validator can
+    # sign "running_benchmark" while declaring no occupied slot. The lease gate
+    # ignores ``state`` under v10+ and reads the empty capacity as positive
+    # evidence of idleness, so this payload can get a live run's slot revoked.
+    #
+    # This is intentionally a warning and not a ``ValidatorAuthError``. Rejecting
+    # it -- here or in the wire model -- would stop refreshing ``seen_at`` for
+    # every validator still emitting the shape, and a frozen ``seen_at`` is the
+    # input to lease force-expiry. Tighten only once fleet logs show this line
+    # has gone quiet; see the PR body for the ordering.
+    if (
+        request_body.protocol_version >= 10
+        and request_body.state == "running_benchmark"
+        and request_body.benchmark_capacity is not None
+        and not request_body.benchmark_capacity.active
+    ):
+        logger.warning(
+            "validator heartbeat is self-contradictory: state=running_benchmark "
+            "with an empty v%d capacity; the lease gate will read this as idle "
+            "validator=%s",
+            request_body.protocol_version,
+            validator_hotkey,
+        )
     payload = _heartbeat_signing_message(
         validator_hotkey=validator_hotkey,
         software_version=request_body.software_version,
