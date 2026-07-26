@@ -48,16 +48,19 @@ def _payload(
     idle_retests_enabled: bool = False,
     rollout_standdown: str = "capable_validators",
     retest_cohort_size: int = 5,
+    **band: object,
 ) -> dict[str, object]:
+    settings: dict[str, object] = {
+        "aggregate_mode": aggregate_mode,
+        "idle_retests_enabled": idle_retests_enabled,
+        "rollout_standdown": rollout_standdown,
+        "retest_cohort_size": retest_cohort_size,
+    }
+    settings.update(band)
     return {
         "expected_revision": expected_revision,
         "scope": "*",
-        "settings": {
-            "aggregate_mode": aggregate_mode,
-            "idle_retests_enabled": idle_retests_enabled,
-            "rollout_standdown": rollout_standdown,
-            "retest_cohort_size": retest_cohort_size,
-        },
+        "settings": settings,
         "reason": "operator-approved continual retest policy change",
         "actor": "operator@example.com",
         "confirmation": "APPLY CONTINUAL RETEST SETTINGS",
@@ -78,13 +81,22 @@ async def test_defaults_are_safe_and_revision_is_audited(
         "idle_retests_enabled": False,
         "rollout_standdown": "capable_validators",
         "retest_cohort_size": 5,
+        # The tie band ships INERT: "fixed" is the historical rank cutoff, so
+        # merging the band changes no validator's cohort until an operator
+        # switches the mode. z and the ceiling are pre-set for that moment.
+        "retest_eligibility_mode": "fixed",
+        "retest_eligibility_z": 1.64,
+        "retest_cohort_max_size": 25,
     }
     assert initial.json()["effective"]["open_rollout_desired_version"] is None
     assert initial.json()["effective"]["rollout_standdown_active"] is False
     # The page renders the dial's bounds from the platform, never its own copy.
     assert initial.json()["effective"]["emission_set_size"] == 5
     assert initial.json()["effective"]["max_retest_cohort_size"] == 25
+    assert initial.json()["effective"]["max_retest_eligibility_z"] == 3.0
     assert initial.json()["effective"]["eligible_agent_count"] == 0
+    # Nothing on the board, so the cohort the rule resolves to is empty.
+    assert initial.json()["effective"]["resolved_cohort_size"] == 0
 
     updated = await client.post(
         _URL,
@@ -218,6 +230,79 @@ async def test_retest_cohort_size_is_operator_controlled_and_bounded(
             json=_payload(expected_revision=2, retest_cohort_size=rejected),
         )
         assert response.status_code == 422, response.text
+
+
+async def test_the_tie_band_is_operator_controlled_and_bounded(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    settings_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The band is one audited revision away, with both rails enforced."""
+    _install(app, settings_maker)
+
+    applied = await client.post(
+        _URL,
+        headers=_HEADERS,
+        json=_payload(
+            retest_cohort_size=10,
+            retest_eligibility_mode="statistical",
+            retest_eligibility_z=1.64,
+            retest_cohort_max_size=25,
+        ),
+    )
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["settings"]["retest_eligibility_mode"] == "statistical"
+    assert applied.json()["settings"]["retest_eligibility_z"] == 1.64
+
+    # z is bounded: past three the band stops meaning "tied".
+    over_z = await client.post(
+        _URL,
+        headers=_HEADERS,
+        json=_payload(expected_revision=1, retest_eligibility_z=3.5),
+    )
+    assert over_z.status_code == 422, over_z.text
+
+    # The ceiling is bounded by the same cap as the cohort itself.
+    over_ceiling = await client.post(
+        _URL,
+        headers=_HEADERS,
+        json=_payload(expected_revision=1, retest_cohort_max_size=26),
+    )
+    assert over_ceiling.status_code == 422, over_ceiling.text
+
+    # A ceiling below the requested cohort would cut into the fixed rank.
+    incoherent = await client.post(
+        _URL,
+        headers=_HEADERS,
+        json=_payload(
+            expected_revision=1,
+            retest_cohort_size=20,
+            retest_cohort_max_size=10,
+        ),
+    )
+    assert incoherent.status_code == 422, incoherent.text
+
+
+async def test_stored_revisions_predating_the_tie_band_still_load() -> None:
+    """A revision written before the band exists resolves to the fixed cutoff.
+
+    The board is append-only, so every revision Peyton has already written must
+    keep meaning exactly what it meant when he wrote it.
+    """
+    from ditto.api_server.continual_retest_settings import settings_from_row
+
+    class _Row:
+        revision = 4
+        settings = {
+            "aggregate_mode": "enabled",
+            "idle_retests_enabled": True,
+            "rollout_standdown": "all",
+            "retest_cohort_size": 25,
+        }
+
+    resolved = settings_from_row(_Row())  # type: ignore[arg-type]
+    assert resolved.retest_cohort_size == 25
+    assert resolved.retest_eligibility_mode == "fixed"
 
 
 async def test_stored_revisions_predating_the_cohort_dial_still_load() -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # The KOTH emission set is five (champion + four-entry participation tail) and is
 # frozen consensus shared with ``ditto-subnet``'s weight fold. It is the floor of
@@ -17,6 +17,14 @@ EMISSION_SET_SIZE = 5
 # Every extra member is real validator work on every wave seed, so the cap keeps
 # an accidental "retest everyone" from consuming the fleet.
 MAX_RETEST_COHORT_SIZE = 25
+# Ceiling on the tie-tolerance band, in standard errors. The fold's own dethrone
+# test uses ``KOTH_DETHRONE_Z = 1.64`` (one-sided 95%), which is the natural
+# default: an agent that could statistically dethrone the cutoff is exactly an
+# agent whose ranking against the cutoff is unsettled. Three is a hard stop --
+# beyond it the band stops meaning "tied" and starts meaning "nearby", and the
+# only thing still bounding the cohort would be the size ceiling.
+MAX_RETEST_ELIGIBILITY_Z = 3.0
+DEFAULT_RETEST_ELIGIBILITY_Z = 1.64
 
 
 class ContinualRetestSettings(BaseModel):
@@ -43,7 +51,83 @@ class ContinualRetestSettings(BaseModel):
     wave completes -- completion stays keyed to the emission set, so the extended
     members cannot stall the crown. They ride each wave seed with whatever
     capacity is left once every emission-set member is claimed.
+
+    This is a **rank** cutoff, which is why :attr:`retest_eligibility_mode`
+    exists: a rank cannot express "these two hold the same score".
     """
+
+    retest_eligibility_mode: Literal["fixed", "statistical"] = "fixed"
+    """How the bottom edge of the retest cohort is drawn.
+
+    ``fixed`` (the default, and the shipped behaviour) cuts at exactly
+    :attr:`retest_cohort_size` by rank. Its defect is that a rank cutoff has no
+    way to express a tie: rank *n* is retested continually and rank *n + 1* is
+    not, even when the two hold an identical composite and the only thing
+    separating them is the fold's ``first_seen`` tiebreak.
+
+    ``statistical`` keeps that same cutoff and then admits anyone below it who is
+    **not distinguishable from the agent at the cutoff** at the current sample
+    size -- specifically, whose composite is within
+    ``retest_eligibility_z * sqrt(se_candidate^2 + se_cutoff^2)`` of it. Three
+    properties motivate this over the alternatives:
+
+    * It answers the actual complaint. An exact tie has a gap of zero and is
+      admitted at *any* ``z``, including zero.
+    * It is the fold's own arithmetic. ``KOTH_DETHRONE_Z`` already decides
+      whether a challenger's lead over the champion is real; the same test
+      decides here whether the cutoff's lead over a candidate is real. An agent
+      that could dethrone the cutoff is one whose ranking is unsettled, which is
+      precisely the agent worth spending evidence on.
+    * It self-tightens. ``composite_stderr`` shrinks as retests accumulate, so
+      the band narrows on its own as the field resolves. A fixed percentile or a
+      fixed score delta does the opposite: it stays exactly as wide when the
+      measurements get good, and has to be retuned by hand every time the score
+      distribution shifts -- which it does on every benchmark version roll.
+
+    The two rejected options: a **top n%** band (the original sketch) is simple
+    but still splits a tie when two agents straddle the percentile boundary,
+    which is the one thing this is meant to prevent. A fixed **score-gap** delta
+    does solve ties, but its units are composite points, so it is not
+    scale-free and it ignores how precisely each agent has actually been
+    measured.
+
+    Both floor and ceiling still bind: the cohort is never smaller than
+    :data:`EMISSION_SET_SIZE` and never larger than
+    :attr:`retest_cohort_max_size`.
+    """
+
+    retest_eligibility_z: Annotated[
+        float, Field(ge=0.0, le=MAX_RETEST_ELIGIBILITY_Z)
+    ] = DEFAULT_RETEST_ELIGIBILITY_Z
+    """Width of the tie-tolerance band in standard errors. Ignored when
+    :attr:`retest_eligibility_mode` is ``fixed``.
+
+    ``0.0`` is a meaningful setting rather than a disabled one: it admits exact
+    ties and nothing else, which is the narrowest honest reading of "do not split
+    a tie at the boundary".
+    """
+
+    retest_cohort_max_size: Annotated[
+        int, Field(ge=EMISSION_SET_SIZE, le=MAX_RETEST_COHORT_SIZE)
+    ] = MAX_RETEST_COHORT_SIZE
+    """Hard ceiling on the cohort once the tie band has been applied.
+
+    An unbounded band could sweep a tightly-packed leaderboard into the retest
+    lane and consume the fleet, so the band is always clamped. This is a
+    **ceiling, not a target**: with ``fixed`` mode, or with a field that has no
+    ties near the cutoff, the cohort stays at
+    :attr:`retest_cohort_size` and this never binds.
+    """
+
+    @model_validator(mode="after")
+    def _check_cohort_bounds(self) -> ContinualRetestSettings:
+        if self.retest_cohort_max_size < self.retest_cohort_size:
+            raise ValueError(
+                f"retest_cohort_max_size ({self.retest_cohort_max_size}) cannot be "
+                f"below retest_cohort_size ({self.retest_cohort_size}): the ceiling "
+                "would cut into the cohort the fixed rank already admitted"
+            )
+        return self
 
 
 class ContinualRetestSettingsRevision(BaseModel):
@@ -74,6 +158,16 @@ class EffectiveContinualRetestSettings(BaseModel):
     rollout_standdown_active: bool = False
     emission_set_size: int = EMISSION_SET_SIZE
     max_retest_cohort_size: int = MAX_RETEST_COHORT_SIZE
+    max_retest_eligibility_z: float = MAX_RETEST_ELIGIBILITY_Z
+    resolved_cohort_size: int | None = None
+    """How many agents the tie band actually admitted on the current board.
+
+    ``retest_cohort_size`` is what the operator asked for; this is what the
+    ranking produced once ties at the cutoff were absorbed. They differ only in
+    ``statistical`` mode, and the difference is the whole point of the mode, so
+    it has to be visible without reading validator logs. ``None`` when it could
+    not be computed.
+    """
     eligible_agent_count: int | None = None
     """Ranked agents the active generation could supply to the cohort right now.
 
