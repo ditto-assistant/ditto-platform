@@ -434,6 +434,11 @@ async def scores(
         generated_at=generated_at,
         stale=False,
         age_seconds=0,
+        # Advisory: how wide the operator currently wants the shared-seed round
+        # planned. Read from the same short-TTL policy the lease path enforces,
+        # so a Backroom change reaches every validator on its next ledger poll
+        # rather than on a redeploy.
+        continual_retest_cohort_size=continual_settings.retest_cohort_size,
     )
 
 

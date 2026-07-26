@@ -7,12 +7,17 @@ from uuid import UUID
 
 import pytest
 
+from ditto.api_models.continual_retest_settings import (
+    EMISSION_SET_SIZE,
+    MAX_RETEST_COHORT_SIZE,
+)
 from ditto.api_server.koth import (
     BLOCKS_PER_TEMPO,
     KothEntry,
     effective_composite,
     emission_set,
     project_koth,
+    retest_cohort,
     tempo_index,
     top5_round_is_due,
 )
@@ -248,6 +253,71 @@ def test_emission_set_admits_a_new_top_five_entrant() -> None:
 def test_emission_set_empty_pool_is_empty() -> None:
     assert emission_set(None) == ()
     assert emission_set(project_koth([])) == ()
+
+
+def _ranked_pool(count: int) -> list[KothEntry]:
+    return [
+        _entry(rank, 0.90 - rank / 100, minutes=rank) for rank in range(1, count + 1)
+    ]
+
+
+def test_retest_cohort_of_five_is_exactly_the_emission_set() -> None:
+    """The dial's floor must be byte-identical to the historical lane."""
+    pool = _ranked_pool(12)
+    projection = project_koth(pool)
+
+    assert retest_cohort(pool, projection, size=EMISSION_SET_SIZE) == emission_set(
+        projection
+    )
+
+
+def test_retest_cohort_extends_down_the_ranking_in_fold_order() -> None:
+    pool = _ranked_pool(30)
+    projection = project_koth(pool)
+
+    top10 = retest_cohort(pool, projection, size=10)
+    assert [member.agent_id for member in top10] == [UUID(int=i) for i in range(1, 11)]
+    # The champion stays the anchor at every width; only the depth changes.
+    assert top10[0].agent_id == emission_set(projection)[0].agent_id
+    assert [member.agent_id for member in top10[:5]] == [
+        member.agent_id for member in emission_set(projection)
+    ]
+
+    top25 = retest_cohort(pool, projection, size=MAX_RETEST_COHORT_SIZE)
+    assert len(top25) == 25
+    assert [member.agent_id for member in top25[:10]] == [
+        member.agent_id for member in top10
+    ]
+
+
+def test_retest_cohort_is_capped_by_the_field_not_the_dial() -> None:
+    """Asking for 25 in a field of three yields three, not an error."""
+    pool = _ranked_pool(3)
+    projection = project_koth(pool)
+
+    cohort = retest_cohort(pool, projection, size=25)
+
+    assert len(cohort) == 3
+    assert retest_cohort([], None, size=25) == ()
+
+
+def test_retest_cohort_ranks_on_the_same_effective_composite_as_the_fold() -> None:
+    """Completed waves move cohort membership exactly as they move the tail."""
+    champion = _entry(1, 0.90, minutes=0)
+    # Raw composite would rank 3 above 2; the wave evidence reverses that, and
+    # the cohort must follow the estimator the crown itself is decided on.
+    # mean(0.70, 0.70, 0.70, 0.95) = 0.7625, above agent 3's raw 0.75.
+    second = _entry(2, 0.70, minutes=1, quorum=(0.70, 0.70, 0.70), waves=(0.95,))
+    third = _entry(3, 0.75, minutes=2)
+    pool = [champion, second, third]
+
+    cohort = retest_cohort(pool, project_koth(pool), size=3)
+
+    assert [member.agent_id for member in cohort] == [
+        UUID(int=1),
+        UUID(int=2),
+        UUID(int=3),
+    ]
 
 
 def _due_reign_tempos(

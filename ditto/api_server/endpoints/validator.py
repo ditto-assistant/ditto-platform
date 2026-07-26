@@ -130,6 +130,7 @@ from ditto.api_server.koth import (
     KothEntry,
     emission_set,
     project_koth,
+    retest_cohort,
     top5_round_is_due,
 )
 from ditto.api_server.onchain_seed import derive_validator_seed
@@ -2315,6 +2316,30 @@ async def _current_emission_set(
     return emission_set(project_koth(entries))
 
 
+async def _current_retest_cohort(
+    session: AsyncSession,
+    *,
+    canonical_version: int,
+    cohort_size: int,
+) -> tuple[tuple[KothEntry, ...], tuple[KothEntry, ...]]:
+    """Return ``(emission_set, retest_cohort)`` from one ledger read.
+
+    Both are returned because the lane needs them for different jobs and must
+    not disagree about the champion: the emission set decides when a wave is
+    complete (and therefore which seed is open), the cohort decides who may be
+    leased against that seed.
+    """
+    entries = await _current_koth_entries(
+        session,
+        canonical_version=canonical_version,
+    )
+    projection = project_koth(entries)
+    return (
+        emission_set(projection),
+        retest_cohort(entries, projection, size=cohort_size),
+    )
+
+
 async def _confirm_king_onchain_weights(
     app_state: Any,
     chain: ChainClient,
@@ -2383,10 +2408,17 @@ async def _top5_confirmation_seed_plan(
     *,
     champion_agent_id: UUID,
     member_agent_id: UUID,
-    cohort_member_ids: tuple[UUID, ...],
+    wave_member_ids: tuple[UUID, ...],
     canonical_version: int,
 ) -> tuple[int, ...]:
-    """Return at most one seed: the cohort's current incomplete wave."""
+    """Return at most one seed: the current incomplete wave.
+
+    Which seed is open is decided by the emission set alone, never by the wider
+    retest cohort. An extended member that never gets leased (or fails) must not
+    be able to hold the wave open, because the open wave is what gates the KOTH
+    fold: keying completion to the top five keeps the crown moving at exactly
+    the cadence it did before the cohort could be widened.
+    """
     full = champion_anchored_seeds(
         champion_agent_id,
         version=canonical_version,
@@ -2394,11 +2426,11 @@ async def _top5_confirmation_seed_plan(
     )
     history = await confirmation_composites_by_seed(
         session,
-        agent_ids=cohort_member_ids,
+        agent_ids=tuple(dict.fromkeys((*wave_member_ids, member_agent_id))),
         bench_version=canonical_version,
     )
     completed = completed_confirmation_wave_seeds(
-        member_ids=cohort_member_ids,
+        member_ids=wave_member_ids,
         seeds_by_agent={
             agent_id: values.keys() for agent_id, values in history.items()
         },
@@ -2413,13 +2445,22 @@ async def _top5_member_is_least_covered(
     session: AsyncSession,
     *,
     members: tuple[KothEntry, ...],
+    emission_member_ids: frozenset[UUID],
     requested_member_id: UUID,
     wave_seed: int,
     validator_hotkey: str,
     canonical_version: int,
     now: datetime,
 ) -> bool:
-    """Admit one unclaimed member in the current one-seed cohort wave."""
+    """Admit one unclaimed member in the current one-seed cohort wave.
+
+    ``members`` is the whole retest cohort; ``emission_member_ids`` is the top
+    five inside it. While any emission-set member still needs this seed, only
+    emission-set members are admitted: the wave completes on the top five, so
+    spending a slot on rank 12 first would delay every crown decision behind it.
+    Extended members take the seed once the five are claimed or already scored,
+    which is precisely the spare capacity the wider cohort is meant to use.
+    """
     member_ids = [member.agent_id for member in members]
     if requested_member_id not in member_ids:
         return False
@@ -2483,7 +2524,17 @@ async def _top5_member_is_least_covered(
             or_(ValidatorTicket.seed == wave_seed, ValidatorTicket.seed.is_(None)),
         )
     )
-    return requested_member_id not in set(active_rows.scalars())
+    claimed = set(active_rows.scalars())
+    if requested_member_id in claimed:
+        return False
+    waiting_emission_members = [
+        member_id
+        for member_id in eligible
+        if member_id in emission_member_ids and member_id not in claimed
+    ]
+    return (
+        not waiting_emission_members or requested_member_id in waiting_emission_members
+    )
 
 
 async def _canonical_tail_is_draining(
@@ -2674,10 +2725,12 @@ async def request_top5_confirmation_job(
                     status_code=428,
                     detail="fresh benchmark v7 inference capability is required",
                 )
-        members = await _current_emission_set(
+        emission_members, members = await _current_retest_cohort(
             session,
             canonical_version=canonical_version,
+            cohort_size=continual_settings.retest_cohort_size,
         )
+        emission_member_ids = frozenset(member.agent_id for member in emission_members)
         if not members or members[0].agent_id != payload.champion_agent_id:
             raise HTTPException(
                 status_code=409,
@@ -2686,7 +2739,10 @@ async def request_top5_confirmation_job(
         if payload.member_agent_id not in {member.agent_id for member in members}:
             raise HTTPException(
                 status_code=409,
-                detail="the requested agent is not in the current emission set",
+                detail=(
+                    "the requested agent is not in the current retest cohort "
+                    f"(top {continual_settings.retest_cohort_size})"
+                ),
             )
         champion = await get_agent_by_id(session, agent_id=payload.champion_agent_id)
         assert champion is not None
@@ -2728,7 +2784,7 @@ async def request_top5_confirmation_job(
             session,
             champion_agent_id=payload.champion_agent_id,
             member_agent_id=payload.member_agent_id,
-            cohort_member_ids=tuple(member.agent_id for member in members),
+            wave_member_ids=tuple(member.agent_id for member in emission_members),
             canonical_version=canonical_version,
         )
         if not seeds:
@@ -2756,6 +2812,7 @@ async def request_top5_confirmation_job(
         if not await _top5_member_is_least_covered(
             session,
             members=members,
+            emission_member_ids=emission_member_ids,
             requested_member_id=payload.member_agent_id,
             wave_seed=wave_seed,
             validator_hotkey=payload.validator_hotkey,
@@ -2764,7 +2821,7 @@ async def request_top5_confirmation_job(
         ):
             raise HTTPException(
                 status_code=409,
-                detail="another top-five member has less confirmation coverage",
+                detail="another cohort member has less confirmation coverage",
             )
         ticket = await issue_confirmation_ticket(
             session,

@@ -47,6 +47,7 @@ def _payload(
     aggregate_mode: str = "fleet_ready",
     idle_retests_enabled: bool = False,
     rollout_standdown: str = "capable_validators",
+    retest_cohort_size: int = 5,
 ) -> dict[str, object]:
     return {
         "expected_revision": expected_revision,
@@ -55,6 +56,7 @@ def _payload(
             "aggregate_mode": aggregate_mode,
             "idle_retests_enabled": idle_retests_enabled,
             "rollout_standdown": rollout_standdown,
+            "retest_cohort_size": retest_cohort_size,
         },
         "reason": "operator-approved continual retest policy change",
         "actor": "operator@example.com",
@@ -75,9 +77,14 @@ async def test_defaults_are_safe_and_revision_is_audited(
         "aggregate_mode": "fleet_ready",
         "idle_retests_enabled": False,
         "rollout_standdown": "capable_validators",
+        "retest_cohort_size": 5,
     }
     assert initial.json()["effective"]["open_rollout_desired_version"] is None
     assert initial.json()["effective"]["rollout_standdown_active"] is False
+    # The page renders the dial's bounds from the platform, never its own copy.
+    assert initial.json()["effective"]["emission_set_size"] == 5
+    assert initial.json()["effective"]["max_retest_cohort_size"] == 25
+    assert initial.json()["effective"]["eligible_agent_count"] == 0
 
     updated = await client.post(
         _URL,
@@ -175,6 +182,59 @@ async def test_open_rollout_surfaces_the_standdown_state(
     forced = await client.get(_URL, headers=_HEADERS)
     assert forced.json()["effective"]["open_rollout_desired_version"] == 7
     assert forced.json()["effective"]["rollout_standdown_active"] is False
+
+
+async def test_retest_cohort_size_is_operator_controlled_and_bounded(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    settings_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Top-10 and top-25 are one audited revision; outside the band is refused."""
+    _install(app, settings_maker)
+
+    widened = await client.post(
+        _URL, headers=_HEADERS, json=_payload(retest_cohort_size=10)
+    )
+    assert widened.status_code == 200, widened.text
+    assert widened.json()["settings"]["retest_cohort_size"] == 10
+
+    effective = (await client.get(_URL, headers=_HEADERS)).json()["effective"]
+    assert effective["settings"]["retest_cohort_size"] == 10
+
+    top25 = await client.post(
+        _URL,
+        headers=_HEADERS,
+        json=_payload(expected_revision=1, retest_cohort_size=25),
+    )
+    assert top25.status_code == 200, top25.text
+    assert top25.json()["settings"]["retest_cohort_size"] == 25
+
+    # Below the emission set the lane could not do its consensus job at all;
+    # above the cap it would spend the whole fleet on rescores.
+    for rejected in (4, 26):
+        response = await client.post(
+            _URL,
+            headers=_HEADERS,
+            json=_payload(expected_revision=2, retest_cohort_size=rejected),
+        )
+        assert response.status_code == 422, response.text
+
+
+async def test_stored_revisions_predating_the_cohort_dial_still_load() -> None:
+    """A revision written before this field exists resolves to the top five."""
+    from ditto.api_server.continual_retest_settings import settings_from_row
+
+    class _Row:
+        revision = 3
+        settings = {
+            "aggregate_mode": "enabled",
+            "idle_retests_enabled": True,
+            "rollout_standdown": "all",
+        }
+
+    resolved = settings_from_row(_Row())  # type: ignore[arg-type]
+    assert resolved.aggregate_mode == "enabled"
+    assert resolved.retest_cohort_size == 5
 
 
 async def test_rollout_standdown_modes_are_explicit() -> None:

@@ -1233,11 +1233,29 @@ class LedgerResponse(BaseModel):
             description="Age of the snapshot in seconds (0 on a fresh read).",
         ),
     ] = 0
+    continual_retest_cohort_size: Annotated[
+        int,
+        Field(
+            default=5,
+            ge=5,
+            description=(
+                "How many ranked agents the operator currently has the continual "
+                "retest lane covering: 5 (the emission set) up to 25. Advisory "
+                "planning input for the validator's shared-seed round — the "
+                "platform still enforces membership when it issues the lease, so "
+                "a validator that ignores this field simply keeps planning the "
+                "top five and loses nothing but the extra coverage. Emissions, "
+                "the weight fold, and wave completion are always the top five, "
+                "whatever this says."
+            ),
+        ),
+    ] = 5
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "generated_at": "2026-06-08T12:00:00Z",
+                "continual_retest_cohort_size": 5,
                 "stale": False,
                 "age_seconds": 0,
                 "entries": [
