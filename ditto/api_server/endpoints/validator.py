@@ -78,6 +78,7 @@ from ditto.api_models.benchmark_capacity import (
 )
 from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.benchmark_progress import benchmark_progress_signing_token
+from ditto.api_models.continual_retest_settings import ContinualRetestSettings
 from ditto.api_models.inference import InferenceGrantOffer
 from ditto.api_models.queue_policy_settings import (
     PrevGenCarryoverSettings,
@@ -2445,7 +2446,7 @@ async def _current_retest_cohort(
     session: AsyncSession,
     *,
     canonical_version: int,
-    cohort_size: int,
+    settings: ContinualRetestSettings,
 ) -> tuple[tuple[KothEntry, ...], tuple[KothEntry, ...]]:
     """Return ``(emission_set, retest_cohort)`` from one ledger read.
 
@@ -2453,15 +2454,26 @@ async def _current_retest_cohort(
     not disagree about the champion: the emission set decides when a wave is
     complete (and therefore which seed is open), the cohort decides who may be
     leased against that seed.
+
+    Only the *cohort* half is widened by the tie band. The emission set is frozen
+    consensus shared with the subnet's weight fold and is never five-plus-ties;
+    an extended member is extra evidence, never an extra emission recipient.
     """
     entries = await _current_koth_entries(
         session,
         canonical_version=canonical_version,
     )
     projection = project_koth(entries)
+    statistical = settings.retest_eligibility_mode == "statistical"
     return (
         emission_set(projection),
-        retest_cohort(entries, projection, size=cohort_size),
+        retest_cohort(
+            entries,
+            projection,
+            size=settings.retest_cohort_size,
+            max_size=settings.retest_cohort_max_size if statistical else None,
+            tolerance_z=settings.retest_eligibility_z if statistical else 0.0,
+        ),
     )
 
 
@@ -2869,7 +2881,7 @@ async def request_top5_confirmation_job(
         emission_members, members = await _current_retest_cohort(
             session,
             canonical_version=canonical_version,
-            cohort_size=continual_settings.retest_cohort_size,
+            settings=continual_settings,
         )
         emission_member_ids = frozenset(member.agent_id for member in emission_members)
         if not members or members[0].agent_id != payload.champion_agent_id:
@@ -2881,8 +2893,12 @@ async def request_top5_confirmation_job(
             raise HTTPException(
                 status_code=409,
                 detail=(
+                    # The RESOLVED size, not the configured one. Under the tie
+                    # band those differ, and a validator told "top 5" while the
+                    # cohort is actually 7 cannot tell a stale claim from a
+                    # misconfigured board.
                     "the requested agent is not in the current retest cohort "
-                    f"(top {continual_settings.retest_cohort_size})"
+                    f"(top {len(members)})"
                 ),
             )
         champion = await get_agent_by_id(session, agent_id=payload.champion_agent_id)

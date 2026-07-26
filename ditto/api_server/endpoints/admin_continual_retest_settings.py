@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.continual_retest_settings import (
@@ -38,6 +39,7 @@ from ditto.db.queries.continual_retest_settings import (
 from ditto.db.queries.heartbeats import live_validator_fleet_supports_protocol
 from ditto.db.queries.scores import list_eligible_ledger
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/continual-retest-settings", tags=["admin"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 AdminDep = Annotated[None, Depends(require_admin)]
@@ -101,6 +103,35 @@ async def _eligible_agent_count(session: AsyncSession) -> int:
     return sum(1 for row in rows if row.eligible and row.composite > 0.0)
 
 
+async def _resolved_cohort_size(
+    session: AsyncSession, settings: ContinualRetestSettings
+) -> int | None:
+    """How many agents the cohort rule admits on the board as it stands now.
+
+    ``retest_cohort_size`` is the operator's *request*; under
+    ``retest_eligibility_mode="statistical"`` the tie band can admit more. An
+    operator tuning ``retest_eligibility_z`` needs to see what the number they
+    typed actually produced, otherwise the dial is calibrated by reading
+    validator 409s.
+
+    Imported inside the function: ``endpoints.validator`` imports this package's
+    resolver, so a module-level import would close a cycle. This mirrors how
+    ``_current_koth_entries`` already reaches into ``endpoints.scoring``.
+    """
+    from ditto.api_server.endpoints.validator import _current_retest_cohort
+
+    try:
+        _emission, cohort = await _current_retest_cohort(
+            session,
+            canonical_version=await active_bench_version(session),
+            settings=settings,
+        )
+    except SQLAlchemyError:
+        logger.warning("could not resolve the retest cohort size", exc_info=True)
+        return None
+    return len(cohort)
+
+
 @router.get("", response_model=AdminContinualRetestSettingsResponse)
 async def get_settings(
     request: Request, _admin: AdminDep, session: SessionDep
@@ -139,6 +170,7 @@ async def get_settings(
             max_age_seconds=resolver.ttl_seconds,
             open_rollout_desired_version=desired_version,
             rollout_standdown_active=standdown_active,
+            resolved_cohort_size=await _resolved_cohort_size(session, settings),
             eligible_agent_count=await _eligible_agent_count(session),
         ),
     )

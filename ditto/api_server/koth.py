@@ -120,11 +120,40 @@ def emission_set(projection: KothProjection | None) -> tuple[KothEntry, ...]:
     return tuple(members)
 
 
+def indistinguishable_from(
+    candidate: KothEntry, cutoff: KothEntry, *, tolerance_z: float
+) -> bool:
+    """Whether ``candidate`` is statistically tied with the ``cutoff`` agent.
+
+    The tolerance is the same unpaired two-sample band the dethrone decision
+    uses (:func:`_dethrone_decision`'s ``unpaired`` branch):
+    ``z * sqrt(se_candidate^2 + se_cutoff^2)``. Reusing it is the point --- an
+    agent that could statistically dethrone the cutoff is exactly an agent whose
+    ranking against the cutoff is not yet settled, and therefore exactly the
+    agent more evidence should be spent on.
+
+    A missing or invalid stderr contributes zero rather than disqualifying the
+    comparison, so the degenerate case (no stderr anywhere, ``tolerance_z`` of
+    zero) still admits an **exact** tie. That is the case that motivated this:
+    rank 11 holding the identical composite to rank 10 is not a ranking, it is a
+    coin flip, and a fixed cutoff resolves it by arbitrary tiebreak.
+    """
+    gap = effective_composite(cutoff) - effective_composite(candidate)
+    if gap <= 0.0:
+        return True
+    candidate_stderr = _stderr(candidate) or 0.0
+    cutoff_stderr = _stderr(cutoff) or 0.0
+    tolerance = tolerance_z * math.sqrt(candidate_stderr**2 + cutoff_stderr**2)
+    return gap <= tolerance
+
+
 def retest_cohort(
     entries: Sequence[KothEntry],
     projection: KothProjection | None,
     *,
     size: int,
+    max_size: int | None = None,
+    tolerance_z: float = 0.0,
 ) -> tuple[KothEntry, ...]:
     """Return the continual-retest cohort: the top ``size`` ranked agents.
 
@@ -142,6 +171,25 @@ def retest_cohort(
 
     ``entries`` must be the same pool ``projection`` was built from; the
     champion comes from the projection's dethrone chain, never from rank order.
+
+    Tie-tolerant extension
+    ======================
+
+    ``size`` alone is a **rank** cutoff, and a rank cutoff has no way to express
+    "these two are the same score". It will admit rank ``size`` and refuse rank
+    ``size + 1`` even when the two hold an identical composite and the only thing
+    separating them is :func:`project_koth`'s ``first_seen`` tiebreak. That is
+    both unfair and statistically empty.
+
+    ``max_size`` opens a tie-tolerant band below the cutoff: after the fixed
+    ``size`` members are taken, any further-ranked agent that is not
+    distinguishable from the **last included member** (see
+    :func:`indistinguishable_from`) also joins, up to ``max_size`` total. The
+    band is anchored on the cutoff agent and not walked transitively, so it
+    cannot chain down the whole leaderboard one indistinguishable step at a time.
+
+    ``max_size is None`` (or ``<= size``) disables the band entirely and returns
+    byte-identically to the fixed-rank behaviour, which is what ships.
     """
     if projection is None:
         return ()
@@ -158,15 +206,29 @@ def retest_cohort(
             entry.agent_id,
         ),
     )
+    base_size = max(1, size)
+    ceiling = base_size if max_size is None else max(base_size, max_size)
     seen = {champion.agent_id}
     members = [champion]
+    # The cutoff is the last member the FIXED rank would have admitted. It is
+    # captured before the band opens so that every extension is measured against
+    # the same reference; measuring against the running last member would let the
+    # cohort creep down the board one indistinguishable pair at a time.
+    cutoff: KothEntry | None = None
     for entry in ranked:
-        if len(members) >= max(1, size):
-            break
         if entry.agent_id in seen:
             continue
+        if len(members) >= ceiling:
+            break
+        if len(members) >= base_size and (
+            cutoff is None
+            or not indistinguishable_from(entry, cutoff, tolerance_z=tolerance_z)
+        ):
+            break
         seen.add(entry.agent_id)
         members.append(entry)
+        if len(members) == base_size:
+            cutoff = entry
     return tuple(members)
 
 

@@ -301,6 +301,154 @@ def test_retest_cohort_is_capped_by_the_field_not_the_dial() -> None:
     assert retest_cohort([], None, size=25) == ()
 
 
+class TestTieTolerantEligibility:
+    """The band exists so a rank cutoff cannot split an identical score."""
+
+    def test_the_band_is_off_unless_a_ceiling_is_given(self) -> None:
+        """What ships must be byte-identical to the fixed rank cutoff."""
+        pool = _ranked_pool(30)
+        projection = project_koth(pool)
+
+        fixed = retest_cohort(pool, projection, size=10)
+
+        assert retest_cohort(pool, projection, size=10, tolerance_z=1.64) == fixed
+        assert retest_cohort(pool, projection, size=10, max_size=None) == fixed
+        # A ceiling at or below the size is not a band either.
+        assert retest_cohort(pool, projection, size=10, max_size=10) == fixed
+
+    def test_an_exact_tie_at_the_boundary_is_never_split(self) -> None:
+        """Peyton's case: number 11 holds the same score as number 10.
+
+        No stderr anywhere and a tolerance of zero -- the narrowest possible
+        band. An exact tie still has to come in, because the only thing that
+        separated the two was ``first_seen``.
+        """
+        pool = [_entry(rank, 0.90 - rank / 100, minutes=rank) for rank in range(1, 10)]
+        tenth = _entry(10, 0.50, minutes=10)
+        eleventh = _entry(11, 0.50, minutes=11)
+        twelfth = _entry(12, 0.40, minutes=12)
+        pool += [tenth, eleventh, twelfth]
+        projection = project_koth(pool)
+
+        assert len(retest_cohort(pool, projection, size=10)) == 10
+        cohort = retest_cohort(pool, projection, size=10, max_size=25, tolerance_z=0.0)
+
+        ids = [member.agent_id for member in cohort]
+        assert ids[:10] == [UUID(int=i) for i in range(1, 11)]
+        assert UUID(int=11) in ids
+        # 12 is genuinely behind, so the band stops there rather than running on.
+        assert UUID(int=12) not in ids
+
+    def test_the_band_admits_what_the_dethrone_test_would_call_undecided(
+        self,
+    ) -> None:
+        """Same z, same arithmetic as the fold's own unpaired comparison."""
+        pool = [
+            _entry(rank, 0.90 - rank / 100, minutes=rank, stderr=0.01)
+            for rank in range(1, 6)
+        ]
+        # Cutoff sits at 0.85. sqrt(0.01^2 + 0.01^2) * 1.64 ~= 0.0232, so 0.84 is
+        # inside the band and 0.80 is well outside it.
+        near = _entry(6, 0.84, minutes=6, stderr=0.01)
+        far = _entry(7, 0.80, minutes=7, stderr=0.01)
+        pool += [near, far]
+        projection = project_koth(pool)
+
+        cohort = retest_cohort(pool, projection, size=5, max_size=25, tolerance_z=1.64)
+
+        ids = [member.agent_id for member in cohort]
+        assert UUID(int=6) in ids
+        assert UUID(int=7) not in ids
+
+    def test_a_tighter_measurement_narrows_the_band_on_its_own(self) -> None:
+        """The self-adjusting property: more evidence, a smaller cohort.
+
+        This is why the band is stated in standard errors rather than composite
+        points. Nothing is retuned; the same z admits fewer agents once the
+        measurements get good.
+        """
+        base = [
+            _entry(rank, 0.90 - rank / 100, minutes=rank, stderr=0.01)
+            for rank in range(1, 6)
+        ]
+        candidate_composite = 0.84
+
+        noisy = [*base, _entry(6, candidate_composite, minutes=6, stderr=0.01)]
+        precise_base = [
+            _entry(rank, 0.90 - rank / 100, minutes=rank, stderr=0.001)
+            for rank in range(1, 6)
+        ]
+        precise = [
+            *precise_base,
+            _entry(6, candidate_composite, minutes=6, stderr=0.001),
+        ]
+
+        wide = retest_cohort(
+            noisy, project_koth(noisy), size=5, max_size=25, tolerance_z=1.64
+        )
+        narrow = retest_cohort(
+            precise, project_koth(precise), size=5, max_size=25, tolerance_z=1.64
+        )
+
+        assert len(wide) == 6
+        assert len(narrow) == 5
+
+    def test_the_ceiling_bounds_a_pathologically_flat_field(self) -> None:
+        """An unbounded band would sweep the whole leaderboard into retests."""
+        pool = [_entry(rank, 0.80, minutes=rank) for rank in range(1, 41)]
+        projection = project_koth(pool)
+
+        cohort = retest_cohort(
+            pool,
+            projection,
+            size=EMISSION_SET_SIZE,
+            max_size=MAX_RETEST_COHORT_SIZE,
+            tolerance_z=3.0,
+        )
+
+        assert len(cohort) == MAX_RETEST_COHORT_SIZE
+
+    def test_the_band_does_not_chain_down_the_leaderboard(self) -> None:
+        """Every extension is measured against the cutoff, not its predecessor.
+
+        A transitive walk would let a smooth gradient admit everyone: each agent
+        indistinguishable from the one above it, all the way down.
+        """
+        pool = [_entry(rank, 0.90 - rank / 100, minutes=rank) for rank in range(1, 5)]
+        # A staircase of exact 0.01 steps below the cutoff. Each step is tied
+        # with its neighbour under a 0.01-wide band but not with the cutoff.
+        pool += [
+            _entry(5, 0.50, minutes=5, stderr=0.0),
+            _entry(6, 0.49, minutes=6, stderr=0.0),
+            _entry(7, 0.48, minutes=7, stderr=0.0),
+            _entry(8, 0.47, minutes=8, stderr=0.0),
+        ]
+        projection = project_koth(pool)
+
+        cohort = retest_cohort(pool, projection, size=5, max_size=25, tolerance_z=0.0)
+
+        # Only the fixed five: 6 is 0.01 behind the cutoff with zero tolerance.
+        assert len(cohort) == 5
+
+    def test_the_floor_still_holds_under_the_band(self) -> None:
+        """The band only ever adds; it can never cut below the emission set."""
+        pool = _ranked_pool(12)
+        projection = project_koth(pool)
+
+        cohort = retest_cohort(
+            pool,
+            projection,
+            size=EMISSION_SET_SIZE,
+            max_size=MAX_RETEST_COHORT_SIZE,
+            tolerance_z=1.64,
+        )
+
+        assert len(cohort) >= EMISSION_SET_SIZE
+        assert [member.agent_id for member in cohort[:EMISSION_SET_SIZE]] == [
+            member.agent_id for member in emission_set(projection)
+        ]
+
+
 def test_retest_cohort_ranks_on_the_same_effective_composite_as_the_fold() -> None:
     """Completed waves move cohort membership exactly as they move the tail."""
     champion = _entry(1, 0.90, minutes=0)

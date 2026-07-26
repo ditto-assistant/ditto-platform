@@ -6151,18 +6151,20 @@ async def _seed_confirmation_wave(
 
 
 async def _set_retest_cohort_size(
-    maker: async_sessionmaker[AsyncSession], size: int
+    maker: async_sessionmaker[AsyncSession], size: int, **band: object
 ) -> None:
+    settings: dict[str, object] = {
+        "aggregate_mode": "fleet_ready",
+        "idle_retests_enabled": False,
+        "retest_cohort_size": size,
+    }
+    settings.update(band)
     async with maker() as session, session.begin():
         session.add(
             ContinualRetestSettingsRevision(
                 parent_revision=0,
                 scope="*",
-                settings={
-                    "aggregate_mode": "fleet_ready",
-                    "idle_retests_enabled": False,
-                    "retest_cohort_size": size,
-                },
+                settings=settings,
                 checksum="b" * 64,
                 reason="retest deeper than the emission set",
                 actor="operator@example.com",
@@ -7179,6 +7181,136 @@ class TestTop5ConfirmationLane:
             )
         assert ticket is not None
         assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
+
+    async def test_a_tie_at_the_cutoff_is_refused_under_a_fixed_rank(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The defect, stated as a test: identical scores, opposite outcomes.
+
+        Rank five and rank six hold the same composite. The fixed rank keeps one
+        and refuses the other purely on the ``first_seen`` tiebreak.
+        """
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            composites=[0.90, 0.89, 0.88, 0.87, 0.86, 0.86, 0.80],
+        )
+        champion, sixth = agent_ids[0], agent_ids[5]
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=0)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, sixth),
+        )
+
+        assert response.status_code == 409
+        assert "retest cohort (top 5)" in response.json()["message"]
+
+    async def test_the_statistical_band_admits_the_tied_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Same pool, one operator revision, and the tie is no longer split."""
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            composites=[0.90, 0.89, 0.88, 0.87, 0.86, 0.86, 0.80],
+        )
+        champion, sixth = agent_ids[0], agent_ids[5]
+        wave_seed = champion_anchored_seeds(champion, version=2, max_seeds=16)[0]
+        # Clear the emission set off the open seed so the spare slot is genuinely
+        # available to the extended member rather than contended.
+        await _seed_confirmation_wave(session_maker, agent_ids[1:5], seed=wave_seed)
+        await _set_retest_cohort_size(
+            session_maker,
+            5,
+            retest_eligibility_mode="statistical",
+            retest_eligibility_z=1.64,
+            retest_cohort_max_size=25,
+        )
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+        _install_chain_with_block(app, block_number=1)
+
+        champion_claim = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[0]),
+            json=_top5_job_payload(champion, champion, keypair=_KEYPAIRS[0]),
+        )
+        assert champion_claim.status_code == 200, champion_claim.text
+
+        tied = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[1]),
+            json=_top5_job_payload(champion, sixth, keypair=_KEYPAIRS[1]),
+        )
+
+        assert tied.status_code == 200, tied.text
+        async with session_maker() as session:
+            ticket = await session.get(
+                ValidatorTicket, (sixth, 2, _KEYPAIRS[1].ss58_address)
+            )
+        assert ticket is not None
+        assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
+
+    async def test_the_band_does_not_widen_the_emission_set(
+        self,
+        app: FastAPI,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Extra evidence, never an extra emission recipient.
+
+        The band is allowed to widen who gets *retested*. It must not widen the
+        five agents the weight fold pays, which is frozen consensus shared with
+        the subnet.
+        """
+        # A tight stderr keeps the band narrow enough that ONLY the exact tie is
+        # absorbed: 1.64 * sqrt(0.001^2 + 0.001^2) is about 0.0023, so rank seven
+        # at 0.80 is six hundredths clear of the cutoff and stays out.
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            composites=[0.90, 0.89, 0.88, 0.87, 0.86, 0.86, 0.80],
+            composite_stderr=0.001,
+        )
+        await _set_retest_cohort_size(
+            session_maker,
+            5,
+            retest_eligibility_mode="statistical",
+            retest_eligibility_z=1.64,
+            retest_cohort_max_size=25,
+        )
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+
+        from ditto.api_server.continual_retest_settings import settings_from_row
+        from ditto.api_server.endpoints.validator import _current_retest_cohort
+        from ditto.db.queries.continual_retest_settings import (
+            latest_continual_retest_settings_revision,
+        )
+
+        async with session_maker() as session:
+            settings = settings_from_row(
+                await latest_continual_retest_settings_revision(session)
+            )
+            emission, cohort = await _current_retest_cohort(
+                session, canonical_version=2, settings=settings
+            )
+
+        assert len(emission) == 5
+        assert len(cohort) == 6
+        assert agent_ids[5] in {member.agent_id for member in cohort}
+        assert agent_ids[5] not in {member.agent_id for member in emission}
+        # Rank seven is genuinely behind, so the band stops rather than running on.
+        assert agent_ids[6] not in {member.agent_id for member in cohort}
 
     async def test_emission_set_is_served_before_the_extended_cohort(
         self,
