@@ -124,8 +124,25 @@ class TestWriteContract:
 
     def test_complete_policy_is_accepted(self) -> None:
         request = self._request(
+            chat_request_budget=8192,
             embedding_per_ticket_concurrency=16,
             embedding_per_validator_concurrency=64,
             embedding_global_concurrency=128,
         )
         assert request.settings.embedding_per_ticket_concurrency == 16
+        assert request.settings.chat_request_budget == 8192
+
+    def test_a_write_omitting_only_the_chat_budget_is_refused(self) -> None:
+        """The whole-object guard has to cover the newest field too.
+
+        This is the concrete footgun: an operator adjusting the embedding lane
+        from a remembered payload would otherwise silently reset the chat
+        request budget to its default, and `expected_revision` cannot catch it
+        because they do hold the current revision.
+        """
+        with pytest.raises(ValidationError, match="chat_request_budget"):
+            self._request(
+                embedding_per_ticket_concurrency=16,
+                embedding_per_validator_concurrency=64,
+                embedding_global_concurrency=128,
+            )

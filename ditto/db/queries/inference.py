@@ -271,36 +271,46 @@ async def revoke_ticket_inference(
 
 
 class InferenceDecline(StrEnum):
-    """Why an admission was refused, when the reason is *not* fail-closed.
+    """Why an admission was refused, when the reason is worth naming.
 
     Historically :func:`begin_inference_request` returned ``None`` for every
-    refusal and the endpoint mapped all of them to ``429``. That conflates two
-    opposite situations, and dittobench-api #103 documents the damage: on the
-    ticket path a ``429`` means the validator's lease is gone, so the broker
-    correctly discards the whole run.
+    refusal and the endpoint mapped all of them to ``429``. That collapsed three
+    unrelated events into one status code, and dittobench-api #103 documents the
+    damage: on the ticket path the broker reads *any* ``429`` as "the lease is
+    gone" and discards the whole run.
 
-    A refusal caused by a *concurrency or rate limit* is the opposite — the
-    lease is perfectly healthy and the caller should simply come back. That
-    distinction only started to matter when the hosted embedding limits became
-    operator-tunable: a backroom revision can now lower a limit underneath a
-    live run, and without this signal that emergency brake would destroy every
-    run it touched instead of slowing them down.
+    The three events, now each with a name:
 
-    Scoped to the embedding lane on purpose. The chat limits are still boot-time
-    constants that cannot move under a running ticket, so a chat capacity
-    refusal is not a new hazard and its behaviour is left exactly as it was.
+    * :attr:`GRANT_REVOKED` — the lease really is dead (the ticket expired, was
+      reassigned, or the deadline moved). Fatal, and correctly so.
+    * :attr:`BUDGET_EXHAUSTED` — the lease is alive but its request allowance is
+      spent. Also terminal for chat, but for a completely different reason, and
+      a harness that can tell the difference can wind down and submit the work
+      it already has instead of dying mid-check.
+    * :attr:`AT_CAPACITY` — nothing is wrong at all; the lane was momentarily
+      full. The caller should back off and come back.
+
+    Conflating the third with the first is what killed ``banblackycat``: 17
+    capacity declines, read as 17 dead leases. It is also why the status code is
+    no longer the discriminator. The endpoint answers ``AT_CAPACITY`` with
+    ``503 + Retry-After`` and the two terminal declines with ``429``, but the
+    *authoritative* signal is the numeric ``error_code`` in the error body
+    (``ditto/api_server/middleware/error_envelope.py``). A status code carries
+    about two bits; application semantics need more, and every attempt to
+    encode them in the status has cost a run.
     """
 
+    GRANT_REVOKED = "grant_revoked"
+    BUDGET_EXHAUSTED = "budget_exhausted"
     AT_CAPACITY = "at_capacity"
 
 
-def _capacity_decline(request_kind: str) -> InferenceDecline | None:
-    """The refusal a full-but-healthy lane returns.
-
-    ``None`` for chat, preserving its existing ``429``, because chat limits
-    cannot be changed without a restart and so cannot surprise a live run.
-    """
-    return InferenceDecline.AT_CAPACITY if request_kind == "embedding" else None
+# Both lanes return AT_CAPACITY now. Chat used to be excluded on the grounds
+# that its limits are boot-time constants which cannot move under a live ticket
+# -- true, and still true, but it was never the whole argument. A chat lane can
+# hit its rate or concurrency ceiling under perfectly ordinary load with nothing
+# whatsoever wrong with the lease, and answering that with the same ``429`` that
+# means "your lease is dead" is how a healthy run gets thrown away.
 
 
 async def begin_inference_request(
@@ -317,12 +327,18 @@ async def begin_inference_request(
 ) -> tuple[InferenceGrant, InferenceRequest] | InferenceDecline | None:
     """Atomically consume one nonce and reserve bounded proxy capacity.
 
-    Returns the reservation on success. ``None`` is the fail-closed class -- a
-    revoked or expired lease, a spent budget, a replayed nonce, a bad proof --
-    and the caller answers it with ``429`` exactly as before.
-    :class:`InferenceDecline` is returned only when the embedding lane refused
-    on a concurrency or rate limit and the lease is still healthy, so the caller
-    can answer with retryable backpressure instead.
+    Returns the reservation on success, an :class:`InferenceDecline` when the
+    refusal has a name worth telling the caller, and ``None`` for the remaining
+    fail-closed class.
+
+    ``None`` now means strictly "refused, and saying why would either help an
+    attacker or mean nothing to the caller": a bad bearer, a grant that is not
+    this caller's, a model the grant does not permit, a replayed nonce, an
+    expired clock, a grant minted but never exchanged, or a token budget spent.
+    Everything an honest broker can act on differently -- the lease is dead, the
+    allowance is spent, the lane is full -- is a named decline. The caller maps
+    all three to a status code *and* a stable numeric error code; see
+    :class:`InferenceDecline`.
 
     Locking model: the grant row taken ``FOR UPDATE`` below is the only
     serialization point, and every invariant that spends a budget is scoped to
@@ -364,8 +380,8 @@ async def begin_inference_request(
     operational load-shedding backstops with headroom. The per-ticket rails
     directly above them stay exact, and those are the ones a miner can target.
     Best-effort does not change what a refusal *means*: a cross-grant rail that
-    does trip still answers through :func:`_capacity_decline`, so the embedding
-    lane reports a healthy-but-full lane rather than a dead lease.
+    does trip still answers :attr:`InferenceDecline.AT_CAPACITY`, so the caller
+    reports a healthy-but-full lane rather than a dead lease.
     """
     if request_kind not in {"chat", "embedding"}:
         return None
@@ -385,7 +401,6 @@ async def begin_inference_request(
     )
     if (
         grant is None
-        or grant.status != "active"
         or grant.bearer_digest is None
         or not secrets.compare_digest(grant.bearer_digest, bearer_digest(bearer))
         or _aware(grant.expires_at) <= now
@@ -395,6 +410,24 @@ async def begin_inference_request(
             else grant.bench_version < 7 or model != grant.embedding_model
         )
     ):
+        return None
+    # Status is checked *after* the bearer comparison, never before. The reason
+    # a grant is unusable is information about someone else's lease, so it is
+    # only ever disclosed to a caller that has already proved it holds this
+    # grant's bearer. Ordering, not an extra check, is what enforces that.
+    #
+    # This gate is also what makes the terminal declines *persistent*. The first
+    # refusal below sets the status; every subsequent call in the run lands
+    # here, and without this branch the whole tail of the run would decay back
+    # to an unnamed refusal -- which is precisely the window in which a harness
+    # needs to know whether to retry, wind down, or give up.
+    if grant.status != "active":
+        if grant.status == "exhausted":
+            return InferenceDecline.BUDGET_EXHAUSTED
+        if grant.status == "revoked":
+            return InferenceDecline.GRANT_REVOKED
+        # "pending" -- minted but never exchanged. Not a named decline: there is
+        # no live lease here to have an opinion about.
         return None
     stale_cutoff = now - timedelta(seconds=config.timeout_seconds * 2)
     stale_requests = list(
@@ -442,15 +475,24 @@ async def begin_inference_request(
         or _aware(ticket.deadline) <= now
     ):
         grant.status = "revoked"
-        return None
+        return InferenceDecline.GRANT_REVOKED
     if request_kind == "chat" and grant.request_count >= grant.request_budget:
+        # Still terminal: the allowance is spent and no amount of waiting brings
+        # it back, so the broker must not retry. What changes is that the caller
+        # can now say *which* terminal this is. "Your lease died" and "you spent
+        # your budget" call for opposite reactions from a harness -- discard
+        # versus wind down and submit -- and until now they were the same byte.
         grant.status = "exhausted"
-        return None
+        return InferenceDecline.BUDGET_EXHAUSTED
     if (
         request_kind == "embedding"
         and grant.embedding_request_count >= grant.embedding_request_budget
     ):
-        return None
+        # Deliberately not a status change. The embedding allowance is 100,000
+        # against ~671 used per run, so reaching it means something pathological
+        # rather than a strategy being thorough, and killing the grant outright
+        # would also take the chat lane down with it.
+        return InferenceDecline.BUDGET_EXHAUSTED
     active_reserved = await session.scalar(
         select(func.coalesce(func.sum(InferenceRequest.reserved_tokens), 0)).where(
             InferenceRequest.grant_id == grant.grant_id,
@@ -480,7 +522,7 @@ async def begin_inference_request(
         # Healthy lease, lane momentarily full. This is the limit an operator
         # tunes from backroom, so it is also the one most likely to move under a
         # live run -- it must degrade to backpressure, never to a lost run.
-        return _capacity_decline(request_kind)
+        return InferenceDecline.AT_CAPACITY
 
     # Fast replay path avoids an ORM identity collision in the common case;
     # the composite primary key and nested transaction remain authoritative
@@ -560,7 +602,7 @@ async def begin_inference_request(
         or int(validator_recent or 0) >= per_validator_rpm
         or int(global_recent or 0) >= global_rpm
     ):
-        return _capacity_decline(request_kind)
+        return InferenceDecline.AT_CAPACITY
 
     request = InferenceRequest(
         grant_id=grant.grant_id,

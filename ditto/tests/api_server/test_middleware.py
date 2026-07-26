@@ -10,8 +10,13 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 
+from ditto.api_server.endpoints.inference import InferenceDeclinedError
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_HTTP_EXCEPTION,
+    ERROR_CODE_INFERENCE_AT_CAPACITY,
+    ERROR_CODE_INFERENCE_BUDGET_EXHAUSTED,
+    ERROR_CODE_INFERENCE_DECLINED,
+    ERROR_CODE_INFERENCE_GRANT_REVOKED,
     ERROR_CODE_PAYMENT_AMOUNT_MISMATCH,
     ERROR_CODE_PAYMENT_CALL_TYPE_MISMATCH,
     ERROR_CODE_PAYMENT_DESTINATION_MISMATCH,
@@ -38,6 +43,7 @@ from ditto.api_server.payment_verifier import (
     PaymentSignerMismatch,
     PaymentVerifierError,
 )
+from ditto.db.queries.inference import InferenceDecline
 from ditto.tests.api_server.conftest import (
     override_get_chain_client,
     override_get_session,
@@ -314,3 +320,108 @@ class TestAuthPassThrough:
         response = await client.get("/health")
         # Stub is transparent: real auth would 401 here.
         assert response.status_code == 200
+
+
+class TestInferenceDeclineEnvelope:
+    """The wire contract a broker classifies on.
+
+    This is the whole point of the 429 split, so it is asserted at the level a
+    broker actually observes: status, ``Retry-After``, and the numeric code in
+    the body. Asserting it on the enum instead would pass while the thing that
+    reaches the fleet was wrong.
+    """
+
+    @pytest.mark.parametrize(
+        ("decline", "expected_status", "expected_code"),
+        [
+            (
+                InferenceDecline.AT_CAPACITY,
+                503,
+                ERROR_CODE_INFERENCE_AT_CAPACITY,
+            ),
+            (
+                InferenceDecline.GRANT_REVOKED,
+                429,
+                ERROR_CODE_INFERENCE_GRANT_REVOKED,
+            ),
+            (
+                InferenceDecline.BUDGET_EXHAUSTED,
+                429,
+                ERROR_CODE_INFERENCE_BUDGET_EXHAUSTED,
+            ),
+            (None, 429, ERROR_CODE_INFERENCE_DECLINED),
+        ],
+    )
+    async def test_each_decline_has_its_own_status_and_code(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        decline: InferenceDecline | None,
+        expected_status: int,
+        expected_code: int,
+    ):
+        @app.get("/_test/inference_decline")
+        async def _raise() -> dict[str, Any]:
+            raise InferenceDeclinedError(decline, lane="inference")
+
+        response = await client.get("/_test/inference_decline")
+        assert response.status_code == expected_status
+        assert response.json()["error_code"] == expected_code
+
+    async def test_only_the_retryable_decline_carries_retry_after(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ):
+        """``Retry-After`` is the half of the signal old brokers can read.
+
+        A build that predates the error codes classifies on status alone, and
+        the embedding lane taught it that ``503`` + ``Retry-After`` means "back
+        off and come back". Putting the header on a terminal decline would
+        invite exactly the retry loop against a dead grant that this design
+        exists to prevent.
+        """
+
+        @app.get("/_test/decline_capacity")
+        async def _capacity() -> dict[str, Any]:
+            raise InferenceDeclinedError(InferenceDecline.AT_CAPACITY, lane="embedding")
+
+        @app.get("/_test/decline_revoked")
+        async def _revoked() -> dict[str, Any]:
+            raise InferenceDeclinedError(
+                InferenceDecline.GRANT_REVOKED, lane="embedding"
+            )
+
+        capacity = await client.get("/_test/decline_capacity")
+        assert capacity.status_code == 503
+        assert capacity.headers["Retry-After"] == "1"
+
+        revoked = await client.get("/_test/decline_revoked")
+        assert revoked.status_code == 429
+        assert "Retry-After" not in revoked.headers
+
+    async def test_the_two_terminal_declines_share_a_status_but_not_a_code(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ):
+        """Revocation and exhaustion stay on 429 *deliberately*.
+
+        An old broker already treats 429 as fatal, which is correct for both,
+        so neither may move to a status it would mishandle. What they must not
+        share is the code -- that is the only thing letting a new broker
+        discard a dead run but wind down a merely-spent one.
+        """
+
+        @app.get("/_test/decline_exhausted")
+        async def _exhausted() -> dict[str, Any]:
+            raise InferenceDeclinedError(
+                InferenceDecline.BUDGET_EXHAUSTED, lane="inference"
+            )
+
+        @app.get("/_test/decline_dead")
+        async def _dead() -> dict[str, Any]:
+            raise InferenceDeclinedError(
+                InferenceDecline.GRANT_REVOKED, lane="inference"
+            )
+
+        exhausted = await client.get("/_test/decline_exhausted")
+        dead = await client.get("/_test/decline_dead")
+        assert exhausted.status_code == dead.status_code == 429
+        assert exhausted.json()["error_code"] != dead.json()["error_code"]

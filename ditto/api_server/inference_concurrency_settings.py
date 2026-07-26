@@ -1,4 +1,4 @@
-"""Resolver for the operator-controlled hosted-embedding concurrency policy.
+"""Resolver for the operator-controlled hosted-inference admission policy.
 
 Short-TTL cached, matching ``ditto.api_server.queue_policy_settings`` and
 ``ditto.api_server.efficiency_settings``. The admission path
@@ -25,7 +25,7 @@ import dataclasses
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -70,12 +70,20 @@ def apply_settings(
     """Overlay the resolved embedding limits onto a boot-time proxy config.
 
     Returns a new frozen config so the admission query keeps its existing
-    signature and every non-embedding field -- the chat limits, the budgets, the
-    upstream URLs, the routing weights -- is carried through untouched by
-    construction rather than by remembering to copy it.
+    signature and every field this board does not own -- the chat concurrency and
+    rate limits, the token budgets, the upstream URLs, the routing weights -- is
+    carried through untouched by construction rather than by remembering to copy
+    it.
+
+    ``request_budget`` is overlaid here too, but note where it is *consumed*: the
+    grant-minting path (``ensure_inference_grant``) stamps it onto the new
+    grant's row. The admission path compares against ``grant.request_budget``,
+    the stamped column, and so is unaffected by this overlay -- which is what
+    keeps a live lease's allowance immutable.
     """
     return dataclasses.replace(
         config,
+        request_budget=settings.chat_request_budget,
         embedding_per_ticket_concurrency=settings.embedding_per_ticket_concurrency,
         embedding_per_validator_concurrency=(
             settings.embedding_per_validator_concurrency
@@ -141,3 +149,27 @@ class InferenceConcurrencySettingsResolver:
     ) -> InferenceProxyConfig:
         """The admission-path convenience: resolved limits overlaid on config."""
         return apply_settings(config, await self.resolve(session_maker))
+
+
+async def resolved_proxy_config(
+    state: Any, config: InferenceProxyConfig
+) -> InferenceProxyConfig:
+    """``config`` with the operator's live policy overlaid, given an app state.
+
+    With no resolver bound (unit tests, or a deployment predating the board) the
+    boot-time config is returned untouched, so ``DITTO_INFERENCE_*`` env
+    overrides keep their meaning as the seed. The board's shipped defaults are
+    the same numbers ``config.py`` seeds, so an empty settings table and an
+    absent resolver produce identical behaviour.
+
+    **Call this before opening the caller's transaction, never inside it.** The
+    resolver reads on its own session; doing that while the caller holds a grant
+    or ticket row lock would borrow a second pool connection for the duration of
+    the most contended transaction in the service.
+    """
+    resolver: InferenceConcurrencySettingsResolver | None = getattr(
+        state, "inference_concurrency_settings", None
+    )
+    if resolver is None:
+        return config
+    return await resolver.resolve_config(config, getattr(state, "session_maker", None))

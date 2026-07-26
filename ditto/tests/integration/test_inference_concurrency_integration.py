@@ -162,7 +162,9 @@ async def test_reservations_on_different_grants_are_not_serialized() -> None:
                 # Still inside the transaction, holding this grant's row lock.
                 async with asyncio.timeout(_BARRIER_TIMEOUT):
                     await barrier.wait()
-                return reserved is not None
+                # `is not None` would now also be true for an InferenceDecline,
+                # which is a refusal. Only a tuple is an actual reservation.
+                return isinstance(reserved, tuple)
 
         outcomes = await asyncio.gather(reserve(*first), reserve(*second))
         assert outcomes == [True, True]
@@ -200,7 +202,9 @@ async def test_reservations_on_one_grant_serialize_and_respect_the_budget() -> N
                     now=datetime.now(UTC),
                     config=config,
                 )
-                return reserved is not None
+                # `is not None` would now also be true for an InferenceDecline,
+                # which is a refusal. Only a tuple is an actual reservation.
+                return isinstance(reserved, tuple)
 
         outcomes = await asyncio.gather(*(reserve() for _ in range(8)))
         assert sum(outcomes) == 3, "over- or under-reserved against a 300 token budget"
@@ -244,7 +248,9 @@ async def test_revocation_and_reservation_on_one_grant_are_mutually_exclusive() 
                     now=datetime.now(UTC),
                     config=config,
                 )
-                return reserved is not None
+                # `is not None` would now also be true for an InferenceDecline,
+                # which is a refusal. Only a tuple is an actual reservation.
+                return isinstance(reserved, tuple)
 
         async def revoke() -> None:
             async with maker() as session, session.begin():
