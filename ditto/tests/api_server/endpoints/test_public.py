@@ -4544,6 +4544,10 @@ class TestPublicActivity:
         assert response.status_code == 200
         body = response.json()
         assert body["active_bench_version"] == 2
+        # A ticket for a version being rolled out *ahead* of the active one does
+        # not move the reported era. This submission is current-generation work
+        # that finished at v2; its v3 run is visible below, not in the headline.
+        assert body["score_bench_version"] == 2
         assert body["score_count"] == 3
         assert body["final_composite"] == pytest.approx(0.58)
         assert [score["bench_version"] for score in body["provisional_scores"]].count(
@@ -4553,6 +4557,87 @@ class TestPublicActivity:
             3
         ) == 1
         assert body["validation_attempts"][0]["bench_version"] == 3
+
+    async def test_pipeline_counts_a_previous_generation_below_quorum_in_its_own_era(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """2 of 3 in a closed generation must not read as 0 of 3.
+
+        The count used to be scoped to the active benchmark unconditionally, so
+        every previous-generation detail page answered 0 -- indistinguishable
+        from a submission no validator ever picked up, and to the miner who
+        earned those scores it read as if the work had been thrown away.
+        """
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.44, 0.61],
+            status=AgentStatus.EVALUATING,
+            details={"bench_version": 2},
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=datetime.now(UTC) - timedelta(days=1),
+                    activated_at=datetime.now(UTC) - timedelta(days=1),
+                )
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")).json()
+
+        assert body["active_bench_version"] == 3
+        assert body["score_bench_version"] == 2
+        assert body["score_count"] == 2
+        assert body["final_composite"] is None
+
+    async def test_pipeline_keeps_a_previous_generations_finalized_median(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The count and the median name the same era, or the page contradicts.
+
+        Reporting "3 of 3" beside a null final composite would be a new lie in
+        place of the old one, so both are answered for the era the submission
+        was actually finalized in.
+        """
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.41, 0.58, 0.73],
+            status=AgentStatus.SCORED,
+            details={"bench_version": 2},
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=3,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=datetime.now(UTC) - timedelta(days=1),
+                    activated_at=datetime.now(UTC) - timedelta(days=1),
+                )
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")).json()
+
+        assert body["active_bench_version"] == 3
+        assert body["score_bench_version"] == 2
+        assert body["score_count"] == 3
+        assert body["final_composite"] == pytest.approx(0.58)
 
     @pytest.mark.parametrize(
         "status",

@@ -1964,8 +1964,32 @@ class PublicSubmissionPipeline(BaseModel):
     generated_at: datetime
     agent_id: UUID
     status: str
-    active_bench_version: Annotated[int, Field(ge=1)]
-    score_count: Annotated[int, Field(ge=0)]
+    active_bench_version: Annotated[
+        int, Field(ge=1, description="Benchmark version currently being scored.")
+    ]
+    score_bench_version: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Benchmark version ``score_count`` and ``final_composite`` are "
+                "counted against: the era this submission belongs to. Equal to "
+                "``active_bench_version`` for current-generation submissions, "
+                "and older for one whose generation has closed."
+            ),
+        ),
+    ]
+    score_count: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Accepted independent scores in ``score_bench_version``, not in "
+                "the active version. Scores from different eras are not "
+                "comparable, so this never mixes them."
+            ),
+        ),
+    ]
     quorum: Annotated[int, Field(ge=1)]
     score_floor: Annotated[
         float,
@@ -1987,8 +2011,8 @@ class PublicSubmissionPipeline(BaseModel):
             ge=0.0,
             le=1.0,
             description=(
-                "Canonical median once quorum is reached; null while scores are "
-                "still provisional."
+                "Canonical median over the ``score_bench_version`` scores once "
+                "quorum is reached; null while scores are still provisional."
             ),
         ),
     ]
