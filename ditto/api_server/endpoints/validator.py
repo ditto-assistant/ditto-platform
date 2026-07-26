@@ -124,6 +124,7 @@ from ditto.api_server.dependencies import (
 )
 from ditto.api_server.endpoints.retrieval import AgentNotFoundError
 from ditto.api_server.fingerprint import reference_corpus_provenance
+from ditto.api_server.inference_concurrency_settings import resolved_proxy_config
 from ditto.api_server.inference_routing import record_ticket_route_quality
 from ditto.api_server.koth import (
     TOP5_MAX_CONFIRMATION_SEEDS,
@@ -1715,6 +1716,11 @@ async def request_job(
     # request transaction opens: reading it on `session` here would autobegin and
     # break the `session.begin()` below.
     slot_settings = await _validator_slot_settings(request)
+    # Same reason, same rule: the chat request budget stamped onto a new grant
+    # comes from the operator board, and that resolver reads on its own session.
+    inference_config = await resolved_proxy_config(
+        request.app.state, request.app.state.config.inference_proxy
+    )
 
     job: JobResponse | None = None
     async with session.begin():
@@ -2108,7 +2114,7 @@ async def request_job(
                 await ensure_inference_grant(
                     session,
                     ticket=ticket,
-                    config=request.app.state.config.inference_proxy,
+                    config=inference_config,
                     supported_profiles=(
                         tuple(
                             route.profile_revision
@@ -2638,6 +2644,11 @@ async def request_top5_confirmation_job(
     continual_settings = await continual_resolver.resolve(
         getattr(request.app.state, "session_maker", None)
     )
+    # Resolved before the transaction opens: the resolver reads on its own
+    # session, and this one supplies the request budget stamped onto new grants.
+    inference_config = await resolved_proxy_config(
+        request.app.state, config.inference_proxy
+    )
 
     async with session.begin():
         await _assert_validator_compatible(
@@ -2853,7 +2864,7 @@ async def request_top5_confirmation_job(
         inference_grant = await ensure_inference_grant(
             session,
             ticket=ticket,
-            config=config.inference_proxy,
+            config=inference_config,
             supported_profiles=(
                 tuple(
                     route.profile_revision for route in v7_calibration.supported_routes

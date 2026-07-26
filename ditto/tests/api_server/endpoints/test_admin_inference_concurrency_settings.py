@@ -51,6 +51,7 @@ def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
 def _settings(**overrides: object) -> dict[str, object]:
     """A COMPLETE policy body; the board stores the whole object."""
     settings: dict[str, object] = {
+        "chat_request_budget": 8192,
         "embedding_per_ticket_concurrency": 12,
         "embedding_per_validator_concurrency": 48,
         "embedding_global_concurrency": 96,
@@ -111,8 +112,11 @@ class TestRead:
         assert body["effective"]["source"] == "default"
         assert body["effective"]["revision"] == 0
         # The claim under test: with no revision written, the fleet is already
-        # running the raised limits rather than the vestigial 1/8/32.
+        # running the raised limits rather than the vestigial 1/8/32 -- and,
+        # since this board grew a chat field, the raised request budget rather
+        # than the 1024 that was exhausting legitimate agents.
         assert body["effective"]["settings"] == {
+            "chat_request_budget": 8192,
             "embedding_per_ticket_concurrency": 12,
             "embedding_per_validator_concurrency": 48,
             "embedding_global_concurrency": 96,

@@ -6,6 +6,10 @@ from dataclasses import replace
 
 import pytest
 
+from ditto.api_models.inference_concurrency_settings import (
+    DEFAULT_CHAT_REQUEST_BUDGET,
+    MAX_CHAT_REQUEST_BUDGET,
+)
 from ditto.api_server.config import check_config, parse_api_server_config_from_env
 from ditto.api_server.errors import ApiServerConfigError
 from ditto.api_server.validator_names import ValidatorNamesConfig
@@ -400,3 +404,41 @@ class TestEfficiencyBonusConfig:
         )
         with pytest.raises(ApiServerConfigError, match=message):
             check_config(config)
+
+
+class TestInferenceRequestBudgetBound:
+    """The boot check and the operator board must agree on the ceiling.
+
+    They are now the same constant by import rather than two copies of a
+    literal. The failure this prevents is specific and nasty: a board write
+    inside its own limit but above the boot check's would be accepted, served
+    for as long as the process lived, and then refuse to boot on the next
+    restart -- turning a settings change into a delayed outage.
+    """
+
+    def test_the_shipped_default_is_within_the_bound(self):
+        config = make_api_server_config()
+        assert config.inference_proxy.request_budget <= MAX_CHAT_REQUEST_BUDGET
+        check_config(config)
+
+    def test_the_boot_check_rejects_exactly_what_the_board_rejects(self):
+        config = make_api_server_config()
+        over = replace(
+            config.inference_proxy, request_budget=MAX_CHAT_REQUEST_BUDGET + 1
+        )
+        with pytest.raises(ApiServerConfigError, match="safety bound"):
+            check_config(replace(config, inference_proxy=over))
+
+        at_bound = replace(
+            config.inference_proxy, request_budget=MAX_CHAT_REQUEST_BUDGET
+        )
+        check_config(replace(config, inference_proxy=at_bound))
+
+    def test_the_default_is_an_actual_raise_over_the_number_it_replaced(self):
+        """1024 was the ceiling a legitimate heavy strategy hit at check ~266.
+
+        Pinned so that a future edit trimming the default back toward the old
+        value has to argue with this test rather than quietly reintroduce the
+        exhaustion.
+        """
+        assert DEFAULT_CHAT_REQUEST_BUDGET >= 5 * 1024

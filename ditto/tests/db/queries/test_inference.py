@@ -5,8 +5,12 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ditto.api_models.inference_concurrency_settings import (
+    InferenceConcurrencySettings,
+)
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.config import InferenceProxyConfig
+from ditto.api_server.inference_concurrency_settings import apply_settings
 from ditto.db.models import (
     Agent,
     AgentStatus,
@@ -327,6 +331,9 @@ async def test_canceled_or_expired_ticket_revokes_capability(
         ticket, grant, bearer, now = await _live_grant(session)
         await revoke_ticket_inference(session, ticket=ticket, now=now)
         ticket.status = TicketStatus.EXPIRED
+        # Named, not anonymous: a dead lease is the one refusal a broker must
+        # never retry, so it is the one that most needs to be tellable apart
+        # from a lane that is merely full.
         assert (
             await begin_inference_request(
                 session,
@@ -338,7 +345,7 @@ async def test_canceled_or_expired_ticket_revokes_capability(
                 now=now,
                 config=_config(),
             )
-            is None
+            is InferenceDecline.GRANT_REVOKED
         )
 
 
@@ -438,6 +445,9 @@ async def test_ticket_request_rate_is_bounded_after_requests_finish(
             usage_available=True,
             now=now,
         )
+        # A per-minute rate ceiling on a perfectly healthy lease. This is the
+        # exact event that used to be indistinguishable from a revoked grant,
+        # and the reason `banblackycat` died with its lease still live.
         assert (
             await begin_inference_request(
                 session,
@@ -449,7 +459,7 @@ async def test_ticket_request_rate_is_bounded_after_requests_finish(
                 now=now,
                 config=config,
             )
-            is None
+            is InferenceDecline.AT_CAPACITY
         )
 
 
@@ -578,7 +588,13 @@ async def test_full_embedding_lane_is_backpressure_not_a_lost_lease(
 async def test_revoked_lease_still_fails_closed_on_the_embedding_lane(
     session: AsyncSession,
 ) -> None:
-    """The fail-closed class is untouched: a dead ticket still returns ``None``."""
+    """A dead ticket is still fatal on the embedding lane -- and now says so.
+
+    The refusal moved from an anonymous ``None`` to a named ``GRANT_REVOKED``.
+    What did *not* move is which class it belongs to: this is still terminal,
+    still answered with ``429``, and still must never be retried. Naming a
+    refusal is not the same as softening it.
+    """
     config = replace(_config(), embedding_per_ticket_concurrency=8)
     async with session.begin():
         ticket, grant, bearer, now = await _live_v7_embedding_grant(session, config)
@@ -595,7 +611,7 @@ async def test_revoked_lease_still_fails_closed_on_the_embedding_lane(
             config=config,
             request_kind="embedding",
         )
-        assert declined is None
+        assert declined is InferenceDecline.GRANT_REVOKED
 
 
 @pytest.mark.asyncio
@@ -647,12 +663,18 @@ async def test_raised_per_ticket_limit_actually_admits_concurrent_embeddings(
 
 
 @pytest.mark.asyncio
-async def test_chat_capacity_refusal_is_unchanged(session: AsyncSession) -> None:
-    """Chat keeps its historical ``None``/429.
+async def test_chat_capacity_refusal_is_retryable_not_fatal(
+    session: AsyncSession,
+) -> None:
+    """Chat capacity is backpressure, and now says so.
 
-    Its limits are boot-time constants that cannot move under a live ticket, so
-    a chat capacity refusal is not a new hazard and its wire behaviour is left
-    exactly as the v7 rollout is currently observing it.
+    This test previously asserted the opposite -- that chat kept its historical
+    anonymous ``None`` -> 429 -- on the reasoning that chat limits are boot-time
+    constants and so cannot surprise a live run. The premise was true and the
+    conclusion still wrong: a chat rail can fill under ordinary load with
+    nothing wrong with the lease, and answering that with the code that means
+    "your lease is dead" is what ended `banblackycat` while its ticket was
+    still live.
     """
     config = replace(_config(), per_ticket_concurrency=1)
     async with session.begin():
@@ -681,5 +703,180 @@ async def test_chat_capacity_refusal_is_unchanged(session: AsyncSession) -> None
                 now=now,
                 config=config,
             )
+            is InferenceDecline.AT_CAPACITY
+        )
+
+
+# A grant minted by `_live_grant` carries `_config().request_budget`, i.e. two
+# chat requests. Admission reads that stamped column and not the config handed
+# to it, so this is the number the budget tests below exhaust.
+_LIVE_GRANT_REQUEST_BUDGET = 2
+
+
+def _budget_only_config() -> InferenceProxyConfig:
+    """A config where the *request budget* is the only limit that can bind.
+
+    ``_config`` deliberately pins every rail to 1-2 so the capacity tests can
+    trip them cheaply. That makes it useless for asserting anything about the
+    budget, which is checked before them -- the lane would answer AT_CAPACITY
+    on the second call and never reach the budget at all.
+
+    Note what raising ``request_budget`` here would *not* do: nothing. The value
+    that binds was copied onto the grant row at mint time.
+    """
+    return replace(
+        _config(),
+        request_budget=999,
+        token_budget=10_000,
+        per_ticket_concurrency=64,
+        per_validator_concurrency=64,
+        global_concurrency=64,
+        per_ticket_requests_per_minute=1000,
+        per_validator_requests_per_minute=1000,
+        global_requests_per_minute=1000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_spent_budget_is_named_and_stays_named(session: AsyncSession) -> None:
+    """Exhaustion is terminal, distinguishable, and *persistent*.
+
+    Persistence is the half that is easy to miss. The refusal that trips the
+    budget sets ``status = "exhausted"``, so every later call in the run takes
+    the early status gate instead. If that gate did not also name the reason,
+    the signal would exist for exactly one request and the entire tail of the
+    run -- the part where a harness still has time to wind down and submit --
+    would see an anonymous refusal again.
+    """
+    config = _budget_only_config()
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_grant(session)
+        for _ in range(_LIVE_GRANT_REQUEST_BUDGET):
+            assert isinstance(
+                await begin_inference_request(
+                    session,
+                    grant_id=grant.grant_id,
+                    nonce=uuid4(),
+                    bearer=bearer,
+                    model="qwen/qwen3-32b",
+                    token_reservation=10,
+                    now=now,
+                    config=config,
+                ),
+                tuple,
+            )
+        for _ in range(3):
+            assert (
+                await begin_inference_request(
+                    session,
+                    grant_id=grant.grant_id,
+                    nonce=uuid4(),
+                    bearer=bearer,
+                    model="qwen/qwen3-32b",
+                    token_reservation=10,
+                    now=now,
+                    config=config,
+                )
+                is InferenceDecline.BUDGET_EXHAUSTED
+            )
+        assert grant.status == "exhausted"
+
+
+@pytest.mark.asyncio
+async def test_a_bad_bearer_learns_nothing_about_the_grant(
+    session: AsyncSession,
+) -> None:
+    """Why the reason is named *after* the bearer comparison, never before.
+
+    The status of a grant is information about somebody else's lease. A caller
+    that cannot prove it holds this grant's bearer gets the anonymous refusal
+    and learns nothing -- not that the grant exists, not that it was revoked,
+    not that it ran out of budget. Ordering is what enforces that, so this test
+    exists to fail if the status gate is ever hoisted above the digest check.
+    """
+    config = _budget_only_config()
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_grant(session)
+        for _ in range(_LIVE_GRANT_REQUEST_BUDGET):
+            assert isinstance(
+                await begin_inference_request(
+                    session,
+                    grant_id=grant.grant_id,
+                    nonce=uuid4(),
+                    bearer=bearer,
+                    model="qwen/qwen3-32b",
+                    token_reservation=10,
+                    now=now,
+                    config=config,
+                ),
+                tuple,
+            )
+        # The holder is told the budget is spent...
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model="qwen/qwen3-32b",
+                token_reservation=10,
+                now=now,
+                config=config,
+            )
+            is InferenceDecline.BUDGET_EXHAUSTED
+        )
+        # ...and an impostor is told nothing at all.
+        assert (
+            await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer="not-the-bearer",
+                model="qwen/qwen3-32b",
+                token_reservation=10,
+                now=now,
+                config=config,
+            )
             is None
         )
+
+
+@pytest.mark.asyncio
+async def test_the_operator_budget_is_stamped_onto_the_new_grant(
+    session: AsyncSession,
+) -> None:
+    """The board reaches a lease through the mint, not through admission.
+
+    This is the whole mechanism behind ``chat_request_budget`` being safe to
+    change under a live subnet: the number is copied onto the grant row once,
+    when the lease is created, and admission thereafter reads the row. A
+    revision therefore governs the next lease and can never retroactively
+    exhaust one already running.
+    """
+    now = datetime.now(UTC)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="miner",
+        name="budget-stamp",
+        sha256="cd" * 32,
+        status=AgentStatus.EVALUATING,
+        created_at=now,
+    )
+    ticket = ValidatorTicket(
+        agent_id=agent.agent_id,
+        validator_hotkey="validator",
+        slot_id="slot-0",
+        status=TicketStatus.ISSUED,
+        issued_at=now,
+        deadline=now + timedelta(minutes=20),
+        bench_version=5,
+        attempt_count=1,
+    )
+    session.add_all([agent, ticket])
+    await session.flush()
+    board = apply_settings(
+        _config(), InferenceConcurrencySettings(chat_request_budget=7)
+    )
+    grant = await ensure_inference_grant(session, ticket=ticket, config=board)
+    assert grant is not None
+    assert grant.request_budget == 7
