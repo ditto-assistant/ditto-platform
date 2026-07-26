@@ -519,7 +519,7 @@ class TestIssueTicket:
                 )
                 assert ticket is not None
                 claimed.append(ticket.agent_id)
-            blocked = await issue_ticket(
+            last_resort = await issue_ticket(
                 session,
                 validator_hotkey="5OwnerValidator-blocked",
                 now=_NOW,
@@ -527,7 +527,15 @@ class TestIssueTicket:
             )
 
         assert claimed == [first] * SCORING_QUORUM
-        assert blocked is None
+        # Every quorum slot on ``first`` is taken and this world contains no
+        # other owner, so a fourth validator's only alternative to the owner's
+        # second generation is an idle slot. The ordinary pass still refused it
+        # -- that is what the three claims above prove -- and it is leased here
+        # only because the pass came back empty. See
+        # ``test_second_generation_waits_while_another_owner_has_work`` for the
+        # same fixture with a competitor in it.
+        assert last_resort is not None
+        assert last_resort.agent_id == second
 
         async with session.begin():
             first_agent = await session.get(Agent, first)
@@ -549,6 +557,221 @@ class TestIssueTicket:
 
         assert next_ticket is not None
         assert next_ticket.agent_id == second
+
+    async def _seed_owner_pair_and_rival(
+        self, session: AsyncSession, *, coldkey: str = "5RelaxColdkey"
+    ) -> tuple[UUID, UUID, UUID]:
+        """One owner with two generations, plus an unrelated owner's submission.
+
+        The rival is a legacy (unpaid) row, so it falls back to its own hotkey
+        and is a genuinely separate owner from the shared-coldkey pair.
+        """
+        first = await _seed_evaluating(session, created_at=_NOW, name="relax-first")
+        second = await _seed_evaluating(
+            session, created_at=_NOW + timedelta(minutes=1), name="relax-second"
+        )
+        rival = await _seed_evaluating(
+            session, created_at=_NOW + timedelta(minutes=2), name="relax-rival"
+        )
+        async with session.begin():
+            for index, agent_id in enumerate((first, second)):
+                agent = await session.get(Agent, agent_id)
+                assert agent is not None
+                session.add(
+                    EvaluationPayment(
+                        block_hash=f"0xrelax-{index}",
+                        extrinsic_index=index,
+                        agent_id=agent_id,
+                        miner_hotkey=agent.miner_hotkey,
+                        miner_coldkey=coldkey,
+                        amount_rao=1,
+                        tao_usd_rate=Decimal("1"),
+                        dest_address="5Destination",
+                        timestamp=_NOW,
+                    )
+                )
+        return first, second, rival
+
+    async def test_second_generation_waits_while_another_owner_has_work(
+        self, session: AsyncSession
+    ) -> None:
+        """The load-bearing negative: last resort is last, not merely idle-aware.
+
+        ``first`` holds every quorum slot, so the owner's ``second`` is the only
+        thing that could use a further slot -- except that an unrelated owner is
+        also waiting. The relaxation must not fire, because "a slot is idle" is
+        not the predicate; "no other owner has eligible work" is.
+        """
+        first, second, rival = await self._seed_owner_pair_and_rival(session)
+        async with session.begin():
+            for index in range(SCORING_QUORUM):
+                session.add(
+                    ValidatorTicket(
+                        agent_id=first,
+                        validator_hotkey=f"5Holder-{index}",
+                        status=TicketStatus.ISSUED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                        bench_version=2,
+                        attempt_count=1,
+                    )
+                )
+
+        async with session.begin():
+            served = await issue_ticket(
+                session, validator_hotkey="5Spare", now=_NOW, ttl=_TTL
+            )
+
+        assert served is not None
+        assert served.agent_id == rival, (
+            "an owner's second submission was served while another owner still "
+            "had eligible work; the relaxation must be last-resort only"
+        )
+        async with session.begin():
+            assert (
+                await session.scalar(
+                    select(func.count()).where(ValidatorTicket.agent_id == second)
+                )
+            ) == 0
+
+    async def test_owner_ceiling_bounds_the_last_resort_pass(
+        self, session: AsyncSession
+    ) -> None:
+        """Even with the fleet otherwise idle, one owner does not take every slot.
+
+        Three generations, one owner, nothing else in the world. The ceiling of
+        two lets the second generation start and refuses the third, so headroom
+        survives for a submission that becomes eligible a moment later.
+
+        The unit is *submissions*, not leases: once ``second`` is open, further
+        spare validators may join it -- that is how it reaches quorum and how
+        the owner stops holding two slots -- but no poll may ever open
+        ``third``. Draining the whole fleet at it is what proves the bound.
+        """
+        first, second, rival = await self._seed_owner_pair_and_rival(session)
+        third = await _seed_evaluating(
+            session, created_at=_NOW + timedelta(minutes=3), name="relax-third"
+        )
+        async with session.begin():
+            agent = await session.get(Agent, third)
+            assert agent is not None
+            session.add(
+                EvaluationPayment(
+                    block_hash="0xrelax-3",
+                    extrinsic_index=3,
+                    agent_id=third,
+                    miner_hotkey=agent.miner_hotkey,
+                    miner_coldkey="5RelaxColdkey",
+                    amount_rao=1,
+                    tao_usd_rate=Decimal("1"),
+                    dest_address="5Destination",
+                    timestamp=_NOW,
+                )
+            )
+            # Retire the rival so this owner is genuinely the only work left.
+            rival_agent = await session.get(Agent, rival)
+            assert rival_agent is not None
+            rival_agent.status = AgentStatus.SCORED
+            for index in range(SCORING_QUORUM):
+                session.add(
+                    ValidatorTicket(
+                        agent_id=first,
+                        validator_hotkey=f"5Holder-{index}",
+                        status=TicketStatus.ISSUED,
+                        issued_at=_NOW,
+                        deadline=_NOW + _TTL,
+                        bench_version=2,
+                        attempt_count=1,
+                    )
+                )
+
+        async with session.begin():
+            opened_second = await issue_ticket(
+                session, validator_hotkey="5Spare-a", now=_NOW, ttl=_TTL
+            )
+        assert opened_second is not None
+        assert opened_second.agent_id == second
+
+        # Drain the rest of the fleet at it. Every one of these polls has the
+        # same choice the one above had, and none of them may take ``third``.
+        for index in range(SCORING_QUORUM + 2):
+            async with session.begin():
+                spare = await issue_ticket(
+                    session,
+                    validator_hotkey=f"5Spare-drain-{index}",
+                    now=_NOW,
+                    ttl=_TTL,
+                )
+            assert spare is None or spare.agent_id in {first, second}, (
+                "the per-owner ceiling did not hold: a third concurrent "
+                "submission from one owner was leased even though the limit is "
+                "two"
+            )
+
+        async with session.begin():
+            assert (
+                await session.scalar(
+                    select(func.count()).where(ValidatorTicket.agent_id == third)
+                )
+            ) == 0
+            live_submissions = (
+                await session.scalars(
+                    select(ValidatorTicket.agent_id)
+                    .where(
+                        ValidatorTicket.status == TicketStatus.ISSUED,
+                        ValidatorTicket.deadline > _NOW,
+                    )
+                    .distinct()
+                )
+            ).all()
+        assert set(live_submissions) == {first, second}
+
+    async def test_last_resort_never_gives_one_validator_two_slots_on_one_agent(
+        self, session: AsyncSession
+    ) -> None:
+        """Quorum is untouched: the score PK still bounds a validator to one slot.
+
+        The relaxation is across an owner's *different* submissions. A validator
+        that already holds a lease on the owner's first generation may take the
+        second, but it must never come back for a second slot on either -- the
+        ticket and score primary keys are (agent, version, validator).
+        """
+        first, second, rival = await self._seed_owner_pair_and_rival(session)
+        async with session.begin():
+            rival_agent = await session.get(Agent, rival)
+            assert rival_agent is not None
+            rival_agent.status = AgentStatus.SCORED
+
+        async with session.begin():
+            mine = await issue_ticket(
+                session, validator_hotkey="5Solo", now=_NOW, ttl=_TTL, slot_id="slot-0"
+            )
+        assert mine is not None
+        assert mine.agent_id == first
+
+        async with session.begin():
+            sibling = await issue_ticket(
+                session, validator_hotkey="5Solo", now=_NOW, ttl=_TTL, slot_id="slot-1"
+            )
+        assert sibling is not None
+        assert sibling.agent_id == second
+
+        async with session.begin():
+            again = await issue_ticket(
+                session, validator_hotkey="5Solo", now=_NOW, ttl=_TTL, slot_id="slot-2"
+            )
+
+        assert again is None
+        async with session.begin():
+            for agent_id in (first, second):
+                assert (
+                    await session.scalar(
+                        select(func.count()).where(
+                            ValidatorTicket.agent_id == agent_id,
+                            ValidatorTicket.validator_hotkey == "5Solo",
+                        )
+                    )
+                ) == 1
 
     async def test_same_coldkey_legacy_partial_scores_do_not_deadlock(
         self, session: AsyncSession
@@ -622,7 +845,13 @@ class TestIssueTicket:
                 ttl=_TTL,
             )
 
-        assert ineligible_recovery is None
+        # ``5Prior-0`` already scored ``first`` and can never contribute to it
+        # again -- the score PK is (agent, version, validator). With no other
+        # owner in this world its slot would otherwise idle, so the last-resort
+        # pass hands it the owner's second generation instead. It still did not
+        # get a second slot on ``first``, which is the deadlock this guards.
+        assert ineligible_recovery is not None
+        assert ineligible_recovery.agent_id == second
         assert eligible_recovery is not None
         assert eligible_recovery.agent_id == first
 
@@ -671,11 +900,26 @@ class TestIssueTicket:
     async def test_live_sibling_blocks_across_status_and_benchmark_version(
         self, session: AsyncSession
     ) -> None:
+        """A live sibling is found across era and status, and costs the owner
+        its turn while any other owner has work.
+
+        The linkage under test is the awkward one: the sibling holding the lease
+        is in ``SCREENING`` and its ticket is for a different benchmark version,
+        so neither the candidate filter nor the version-scoped queries would
+        surface it. A rival owner is present so that "candidate was not leased"
+        means the rail refused it, rather than merely that the fixture had
+        nothing else to offer.
+        """
         live = await _seed_evaluating(session, created_at=_NOW, name="live-owner")
         candidate = await _seed_evaluating(
             session,
             created_at=_NOW + timedelta(minutes=1),
             name="candidate-owner",
+        )
+        rival = await _seed_evaluating(
+            session,
+            created_at=_NOW + timedelta(minutes=2),
+            name="rival-owner",
         )
         async with session.begin():
             for index, agent_id in enumerate((live, candidate)):
@@ -710,7 +954,7 @@ class TestIssueTicket:
             )
 
         async with session.begin():
-            blocked = await issue_ticket(
+            served = await issue_ticket(
                 session,
                 validator_hotkey="5CurrentEra",
                 now=_NOW,
@@ -718,7 +962,11 @@ class TestIssueTicket:
                 bench_version=2,
             )
 
-        assert blocked is None
+        # ``candidate`` outranks ``rival`` on FIFO, so the allocator reached it
+        # first and passed over it: the owner's cross-era, cross-status live
+        # lease still costs them their turn while anyone else is waiting.
+        assert served is not None
+        assert served.agent_id == rival
         assert await session.get(ValidatorTicket, (candidate, 2, "5CurrentEra")) is None
 
     async def test_fresh_lane_excludes_pre_rollout_backlog(
@@ -1089,10 +1337,16 @@ class TestIssueTicket:
 
         With nine concurrent fleet slots, the live-sibling rail is the only
         thing stopping one owner monopolising the fleet, so a generation losing
-        its pin must never let a sibling start while a lease is still out on
-        it. Here the older generation is genuinely unreachable *and* still
-        holds a live lease: the sibling stays shut out until that lease
-        resolves.
+        its pin must never let a sibling start on the ordinary pass while a
+        lease is still out on it. Here the older generation is genuinely
+        unreachable *and* still holds a live lease.
+
+        Pinned to the ceiling rather than to an outcome, because the two answers
+        are the whole point of the relaxation: at ``1`` the rail is absolute and
+        the sibling stays shut out, exactly as before. At the shipped ceiling
+        the sibling is leased only after the allocator has proven it has nothing
+        else to do -- this fixture contains no other owner -- and one live lease
+        per owner still governs every poll that does.
         """
         leased, sibling = await _seed_owner_generations(
             session, older="leased-generation", newer="waiting-sibling"
@@ -1118,6 +1372,94 @@ class TestIssueTicket:
             )
 
         async with session.begin():
+            strict = await issue_ticket(
+                session,
+                validator_hotkey=_CAPABLE_FLEET[1],
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=3,
+                owner_concurrent_submission_limit=1,
+            )
+
+        assert strict is None
+        async with session.begin():
+            assert (
+                await session.scalar(
+                    select(func.count()).where(ValidatorTicket.agent_id == sibling)
+                )
+            ) == 0
+
+        async with session.begin():
+            relaxed = await issue_ticket(
+                session,
+                validator_hotkey=_CAPABLE_FLEET[1],
+                now=_NOW,
+                ttl=_TTL,
+                bench_version=3,
+            )
+
+        assert relaxed is not None
+        assert relaxed.agent_id == sibling
+
+    async def test_pinned_generation_outranks_its_own_relaxed_sibling(
+        self, session: AsyncSession
+    ) -> None:
+        """The relaxation must not resurrect mid-quorum diversion through the back door.
+
+        Once a sibling may hold a lease, the owner's live-lease set is no longer
+        a single row -- and the naive rail would then gate the *pinned*
+        generation behind the sibling it just let start. That is precisely the
+        diversion #467's pin exists to prevent, arriving from the other side:
+        the fleet would abandon a 1-of-3 generation to finish a newer one.
+
+        So the pinned generation is exempt from the ceiling. A capable validator
+        that can still score it gets it, sibling lease or not.
+
+        A rival owner is in the fixture on purpose: without one the allocator
+        reaches ``pinned`` again on its own last-resort pass and the bug is
+        invisible. With one, losing the exemption means the fleet walks past a
+        1-of-3 generation to serve somebody else -- which is the starvation.
+        """
+        pinned, sibling = await _seed_owner_generations(
+            session, older="pinned-progress", newer="relaxed-sibling"
+        )
+        rival = await _seed_evaluating(
+            session,
+            created_at=_OWNER_ROLLOUT_STARTED + timedelta(hours=5),
+            name="rival-generation",
+            screened=True,
+        )
+        async with session.begin():
+            session.add(
+                BenchmarkDataset(
+                    agent_id=rival,
+                    bench_version=3,
+                    seed=999,
+                    sha256="99" * 32,
+                    run_size="full",
+                )
+            )
+        async with session.begin():
+            for hotkey in _CAPABLE_FLEET:
+                await _seed_capable_heartbeat(session, validator_hotkey=hotkey)
+            # One accepted score: progress started, and with two capable
+            # validators left the generation is still reachable, so it pins.
+            session.add(
+                _owner_ticket(pinned, _CAPABLE_FLEET[0], status=TicketStatus.SCORED)
+            )
+            # The sibling holds the lease the last-resort pass would have given
+            # it, which is what makes the owner's live-lease set non-trivial.
+            session.add(
+                _owner_ticket(
+                    sibling,
+                    _CAPABLE_FLEET[2],
+                    status=TicketStatus.ISSUED,
+                    deadline=_NOW + timedelta(minutes=20),
+                    started_after=timedelta(hours=3),
+                )
+            )
+
+        async with session.begin():
             ticket = await issue_ticket(
                 session,
                 validator_hotkey=_CAPABLE_FLEET[1],
@@ -1126,13 +1468,13 @@ class TestIssueTicket:
                 bench_version=3,
             )
 
-        assert ticket is None
-        async with session.begin():
-            assert (
-                await session.scalar(
-                    select(func.count()).where(ValidatorTicket.agent_id == sibling)
-                )
-            ) == 0
+        assert ticket is not None
+        assert ticket.agent_id == pinned, (
+            "a relaxed sibling lease locked out the generation the owner is "
+            "pinned to; the fleet walked past it to serve "
+            f"{'the rival owner' if ticket.agent_id == rival else 'other work'} "
+            "and would abandon it mid-quorum"
+        )
 
     async def test_below_top_ten_owner_history_does_not_pin_fresh_sibling(
         self, session: AsyncSession

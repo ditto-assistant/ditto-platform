@@ -101,6 +101,18 @@ DEFAULT_FRESH_SUBMISSION_SLOTS = (0, 1, 3)
 MAX_PREV_GEN_CARRYOVER_AGENTS = 50
 DEFAULT_PREV_GEN_CARRYOVER_AGENTS = 10
 
+# ---------------------------------------------------------------------------
+# Owner capacity bounds
+# ---------------------------------------------------------------------------
+# Mirror ``ditto.db.queries.queue_order``'s ceiling constants, which live beside
+# the predicate they parameterize. Spelled again here for the same reason the
+# cohort bounds are: that module imports this package, so importing back would
+# be a cycle. ``test_queue_policy_bounds_match_queue_constants`` asserts they
+# agree, so drifting them apart fails CI.
+MIN_OWNER_CONCURRENT_SUBMISSIONS = 1
+MAX_OWNER_CONCURRENT_SUBMISSIONS = 3
+DEFAULT_OWNER_CONCURRENT_SUBMISSIONS = 2
+
 # Fields the queue refuses to change while a benchmark rollout is open, because
 # they move the modulus of a counter that is measured from rollout start.
 ROLLOUT_LOCKED_FIELDS = ("lane_cycle_size", "fresh_submission_slots")
@@ -347,6 +359,33 @@ class QueuePolicySettings(BaseModel):
     # where the allocator groups by payment-time coldkey). Making the size
     # operator-tunable before that divergence is fixed would let one setting
     # produce two different lanes. It is tracked separately.
+
+    owner_concurrent_submission_limit: Annotated[
+        int,
+        Field(ge=MIN_OWNER_CONCURRENT_SUBMISSIONS, le=MAX_OWNER_CONCURRENT_SUBMISSIONS),
+    ] = DEFAULT_OWNER_CONCURRENT_SUBMISSIONS
+    """How many of one owner's submissions may hold live leases at once.
+
+    Applies **only** to the allocator's last-resort pass. The ordinary pass is
+    untouched at any value: one live submission per owner fleet-wide, pinned to
+    one generation, ordered by the queue the whole fleet shares. This number
+    decides what happens after a validator has walked its entire candidate set
+    and found nothing it may lease -- the moment when the alternative is not
+    "serve someone else" but "serve nobody and idle the slot".
+
+    ``1`` disables the second pass and restores strict serialization exactly.
+    It ships at ``2`` rather than ``1`` deliberately: a knob whose default is
+    the old behaviour changes nothing, and the board's own history is that
+    empty defaults are how a fix ships and never takes effect. Two is the
+    smallest value that is not "off".
+
+    The unit is submissions, not leases, because that is what both owner rails
+    already speak in. One submission can occupy at most ``SCORING_QUORUM``
+    slots, so the arithmetic worst case for an owner is ``limit * 3`` -- and
+    only while no other owner has a single eligible submission anywhere. The
+    ceiling of 3 exists so that even that worst case cannot be raised past the
+    point where one owner could hold a small fleet for a full lease.
+    """
 
     prev_gen_carryover: PrevGenCarryoverSettings = PrevGenCarryoverSettings()
     """Adoption policy for stranded previous-generation submissions."""

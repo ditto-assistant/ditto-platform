@@ -3257,6 +3257,9 @@ class TestRequestJob:
             artifact_mode="screened_only",
             validator_running_benchmark=False,
             slot_id="slot-1",
+            # The retired-era lane answers to the same operator ceiling as the
+            # desired-era one; a backfill slot is still fleet capacity.
+            owner_concurrent_submission_limit=2,
         )
 
     async def test_activated_v7_retires_v6_until_an_operator_asks_for_it(
