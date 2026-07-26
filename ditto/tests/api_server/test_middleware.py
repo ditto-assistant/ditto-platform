@@ -16,7 +16,13 @@ from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_INFERENCE_AT_CAPACITY,
     ERROR_CODE_INFERENCE_BUDGET_EXHAUSTED,
     ERROR_CODE_INFERENCE_DECLINED,
+    ERROR_CODE_INFERENCE_GRANT_NOT_EXCHANGED,
     ERROR_CODE_INFERENCE_GRANT_REVOKED,
+    ERROR_CODE_INFERENCE_LEASE_EXPIRED,
+    ERROR_CODE_INFERENCE_MODEL_NOT_PERMITTED,
+    ERROR_CODE_INFERENCE_NONCE_REPLAYED,
+    ERROR_CODE_INFERENCE_RESERVATION_TOO_LARGE,
+    ERROR_CODE_INFERENCE_TOKEN_BUDGET_EXHAUSTED,
     ERROR_CODE_PAYMENT_AMOUNT_MISMATCH,
     ERROR_CODE_PAYMENT_CALL_TYPE_MISMATCH,
     ERROR_CODE_PAYMENT_DESTINATION_MISMATCH,
@@ -349,14 +355,44 @@ class TestInferenceDeclineEnvelope:
                 429,
                 ERROR_CODE_INFERENCE_BUDGET_EXHAUSTED,
             ),
-            (None, 429, ERROR_CODE_INFERENCE_DECLINED),
+            (
+                InferenceDecline.TOKEN_BUDGET_EXHAUSTED,
+                429,
+                ERROR_CODE_INFERENCE_TOKEN_BUDGET_EXHAUSTED,
+            ),
+            (
+                InferenceDecline.LEASE_EXPIRED,
+                429,
+                ERROR_CODE_INFERENCE_LEASE_EXPIRED,
+            ),
+            (
+                InferenceDecline.NONCE_REPLAYED,
+                429,
+                ERROR_CODE_INFERENCE_NONCE_REPLAYED,
+            ),
+            (
+                InferenceDecline.MODEL_NOT_PERMITTED,
+                429,
+                ERROR_CODE_INFERENCE_MODEL_NOT_PERMITTED,
+            ),
+            (
+                InferenceDecline.GRANT_NOT_EXCHANGED,
+                429,
+                ERROR_CODE_INFERENCE_GRANT_NOT_EXCHANGED,
+            ),
+            (
+                InferenceDecline.RESERVATION_TOO_LARGE,
+                429,
+                ERROR_CODE_INFERENCE_RESERVATION_TOO_LARGE,
+            ),
+            (InferenceDecline.UNATTRIBUTED, 429, ERROR_CODE_INFERENCE_DECLINED),
         ],
     )
     async def test_each_decline_has_its_own_status_and_code(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
-        decline: InferenceDecline | None,
+        decline: InferenceDecline,
         expected_status: int,
         expected_code: int,
     ):
@@ -367,6 +403,35 @@ class TestInferenceDeclineEnvelope:
         response = await client.get("/_test/inference_decline")
         assert response.status_code == expected_status
         assert response.json()["error_code"] == expected_code
+
+    async def test_no_decline_falls_through_to_the_anonymous_code(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ):
+        """Every member is mapped, and only the deliberate one answers 4100.
+
+        This is the regression guard for the shape of bug that cost 1009
+        requests on a live lease: a decline exists in the enum, nothing maps it,
+        and it silently degrades to the anonymous refusal that the broker reads
+        as transient. Walking the enum here means adding a member without
+        deciding its code fails the suite rather than a run.
+        """
+        for member in InferenceDecline:
+
+            @app.get(f"/_test/sweep/{member.value}")
+            async def _raise(member: InferenceDecline = member) -> dict[str, Any]:
+                raise InferenceDeclinedError(member, lane="inference")
+
+            response = await client.get(f"/_test/sweep/{member.value}")
+            code = response.json()["error_code"]
+            if member is InferenceDecline.UNATTRIBUTED:
+                assert code == ERROR_CODE_INFERENCE_DECLINED
+                # ...and it says that the silence is a choice.
+                assert "deliberately not disclosed" in response.json()["message"]
+            else:
+                assert code != ERROR_CODE_INFERENCE_DECLINED, (
+                    f"{member} falls through to the anonymous 4100"
+                )
+            assert response.status_code in {429, 503}
 
     async def test_only_the_retryable_decline_carries_retry_after(
         self, app: FastAPI, client: httpx.AsyncClient

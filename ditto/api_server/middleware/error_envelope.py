@@ -89,24 +89,95 @@ ERROR_CODE_AGENT_NOT_EVALUATABLE = 4001
 # Contract, in the order a broker should check it:
 #   4101 GRANT_REVOKED     -> 429. Fatal. Do not retry; the run is over.
 #   4102 BUDGET_EXHAUSTED  -> 429. Terminal but healthy: the lease is alive and
-#                             the allowance is spent. Do not retry, but the run
-#                             can still wind down and submit what it has.
+#                             the request-count allowance is spent. Do not
+#                             retry, but the run can still wind down and submit
+#                             what it has.
 #   4103 AT_CAPACITY       -> 503 + Retry-After. Nothing is wrong. Back off and
 #                             retry; this must never end a run.
-#   4100 unspecified       -> 429. The fail-closed remainder. Treat as fatal.
+#   4104 TOKEN_BUDGET_EXHAUSTED -> 429. As 4102, but the *token* allowance. Split
+#                             out because the two are tuned by different
+#                             operator dials, and because this is the one that
+#                             actually ends heavy v7 runs.
+#   4105 LEASE_EXPIRED     -> 429. The grant's own clock ran out.
+#   4106 NONCE_REPLAYED    -> 429. This (grant, nonce) already exists. Retrying
+#                             it can never succeed; mint a fresh nonce.
+#   4107 MODEL_NOT_PERMITTED -> 429. The grant does not pin this model.
+#   4108 GRANT_NOT_EXCHANGED -> 429. Minted but never exchanged for a bearer.
+#   4109 RESERVATION_TOO_LARGE -> 429. The request alone exceeds the whole token
+#                             allowance; it would not fit in a fresh grant
+#                             either. Distinct from 4104 because nothing has
+#                             been spent and the lease is still good.
+#   4100 unattributed      -> 429. The deliberate remainder: an unknown grant id
+#                             or a failed bearer comparison, which are held
+#                             indistinguishable on purpose so an unauthenticated
+#                             caller learns nothing about someone else's lease.
+#                             Treat as fatal.
 #
-# Old brokers ignore the body entirely and see only the status, which is why
-# 4103 had to move off 429 and onto 503 -- see the module docstring in
-# `endpoints/inference.py` for why that specific status is the safe one.
+# 4104-4108 are additive. Old brokers ignore the body entirely and see only the
+# status, and every one of these is a 429 -- the status old brokers already
+# treat as fatal -- so adding them changes nothing a pinned build can observe.
+# That asymmetry is the whole reason the retryable case (4103) had to move off
+# 429 and onto 503 while these could stay: adding codes is backward-compatible,
+# changing statuses is not. See the module docstring in
+# `endpoints/inference.py` for why 503 specifically is the safe retryable status.
 ERROR_CODE_INFERENCE_DECLINED = 4100
 ERROR_CODE_INFERENCE_GRANT_REVOKED = 4101
 ERROR_CODE_INFERENCE_BUDGET_EXHAUSTED = 4102
 ERROR_CODE_INFERENCE_AT_CAPACITY = 4103
+ERROR_CODE_INFERENCE_TOKEN_BUDGET_EXHAUSTED = 4104
+ERROR_CODE_INFERENCE_LEASE_EXPIRED = 4105
+ERROR_CODE_INFERENCE_NONCE_REPLAYED = 4106
+ERROR_CODE_INFERENCE_MODEL_NOT_PERMITTED = 4107
+ERROR_CODE_INFERENCE_GRANT_NOT_EXCHANGED = 4108
+ERROR_CODE_INFERENCE_RESERVATION_TOO_LARGE = 4109
 
 # Screener-side error codes (5xxx range). Surfaced to the screener worker
 # driving the uploaded -> evaluating promotion gate.
 ERROR_CODE_SCREENER_AUTH = 5000
 ERROR_CODE_AGENT_NOT_SCREENABLE = 5001
+
+
+# Every terminal decline, in one table rather than a ladder of ifs. A ladder
+# invites the failure this whole area keeps having: a new decline is added to
+# the enum, nobody adds a branch, and it silently falls through to the anonymous
+# 4100 -- which is exactly how a spent token budget spent months looking like an
+# unexplained refusal. ``test_every_decline_has_a_distinct_code`` walks the enum
+# against this table so a member with no entry fails the suite instead of
+# failing a run.
+_TERMINAL_DECLINE_RESPONSES: dict[InferenceDecline, tuple[int, str]] = {
+    InferenceDecline.GRANT_REVOKED: (
+        ERROR_CODE_INFERENCE_GRANT_REVOKED,
+        "grant was revoked",
+    ),
+    InferenceDecline.BUDGET_EXHAUSTED: (
+        ERROR_CODE_INFERENCE_BUDGET_EXHAUSTED,
+        "grant has spent its request budget",
+    ),
+    InferenceDecline.TOKEN_BUDGET_EXHAUSTED: (
+        ERROR_CODE_INFERENCE_TOKEN_BUDGET_EXHAUSTED,
+        "grant has spent its token budget",
+    ),
+    InferenceDecline.LEASE_EXPIRED: (
+        ERROR_CODE_INFERENCE_LEASE_EXPIRED,
+        "grant has expired",
+    ),
+    InferenceDecline.NONCE_REPLAYED: (
+        ERROR_CODE_INFERENCE_NONCE_REPLAYED,
+        "request nonce was already used",
+    ),
+    InferenceDecline.MODEL_NOT_PERMITTED: (
+        ERROR_CODE_INFERENCE_MODEL_NOT_PERMITTED,
+        "grant does not permit this model",
+    ),
+    InferenceDecline.GRANT_NOT_EXCHANGED: (
+        ERROR_CODE_INFERENCE_GRANT_NOT_EXCHANGED,
+        "grant has not been exchanged for a bearer",
+    ),
+    InferenceDecline.RESERVATION_TOO_LARGE: (
+        ERROR_CODE_INFERENCE_RESERVATION_TOO_LARGE,
+        "request exceeds the grant's entire token budget",
+    ),
+}
 
 
 def _envelope(error_code: int, message: str) -> dict[str, Any]:
@@ -197,22 +268,19 @@ def register_exception_handlers(app: FastAPI) -> None:
                 f"{exc.lane} lane is at capacity",
                 headers={"Retry-After": "1"},
             )
-        if exc.decline is InferenceDecline.GRANT_REVOKED:
-            return _envelope_response(
-                429,
-                ERROR_CODE_INFERENCE_GRANT_REVOKED,
-                f"{exc.lane} grant was revoked",
-            )
-        if exc.decline is InferenceDecline.BUDGET_EXHAUSTED:
-            return _envelope_response(
-                429,
-                ERROR_CODE_INFERENCE_BUDGET_EXHAUSTED,
-                f"{exc.lane} grant has spent its request budget",
-            )
+        terminal = _TERMINAL_DECLINE_RESPONSES.get(exc.decline)
+        if terminal is not None:
+            error_code, message = terminal
+            return _envelope_response(429, error_code, f"{exc.lane} {message}")
+        # The deliberate remainder. The message says so rather than implying the
+        # platform merely failed to have an opinion: an unnamed refusal that
+        # reads like an oversight invites exactly the "retry until it works"
+        # behaviour that turned a spent token budget into a dead run.
         return _envelope_response(
             429,
             ERROR_CODE_INFERENCE_DECLINED,
-            f"{exc.lane} grant unavailable",
+            f"{exc.lane} grant unavailable, and the reason is deliberately not "
+            "disclosed to an unauthenticated caller",
         )
 
     @app.exception_handler(OracleUnreachableError)

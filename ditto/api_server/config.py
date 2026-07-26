@@ -8,7 +8,10 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlparse
 
 from ditto.api_models.inference_concurrency_settings import (
+    DEFAULT_CHAT_REQUEST_BUDGET,
+    DEFAULT_CHAT_TOKEN_BUDGET,
     MAX_CHAT_REQUEST_BUDGET,
+    MAX_CHAT_TOKEN_BUDGET,
 )
 from ditto.api_server.datapipeline import (
     DataPipelineConfig,
@@ -249,8 +252,8 @@ class ApiServerConfig:
             allowed_models=("qwen/qwen3-32b", "openai/gpt-oss-20b"),
             provider="nebius",
             routing_mode="aggregate_throughput",
-            request_budget=8192,
-            token_budget=4_000_000,
+            request_budget=DEFAULT_CHAT_REQUEST_BUDGET,
+            token_budget=DEFAULT_CHAT_TOKEN_BUDGET,
             embedding_upstream_url="https://openrouter.ai/api/v1/embeddings",
             embedding_model="perplexity/pplx-embed-v1-0.6b",
             embedding_profile="dittobench-v7-openrouter-pplx-embed-v1-0.6b-768-v1",
@@ -418,9 +421,15 @@ def parse_api_server_config_from_env(commit_hash: str) -> ApiServerConfig:
                 "DITTO_INFERENCE_ROUTING_MODE", "aggregate_throughput"
             ).strip(),
             request_budget=int(
-                os.environ.get("DITTO_INFERENCE_REQUEST_BUDGET", "8192")
+                os.environ.get(
+                    "DITTO_INFERENCE_REQUEST_BUDGET", str(DEFAULT_CHAT_REQUEST_BUDGET)
+                )
             ),
-            token_budget=int(os.environ.get("DITTO_INFERENCE_TOKEN_BUDGET", "4000000")),
+            token_budget=int(
+                os.environ.get(
+                    "DITTO_INFERENCE_TOKEN_BUDGET", str(DEFAULT_CHAT_TOKEN_BUDGET)
+                )
+            ),
             embedding_upstream_url=os.environ.get(
                 "DITTO_EMBEDDING_UPSTREAM_URL",
                 "https://openrouter.ai/api/v1/embeddings",
@@ -861,7 +870,7 @@ def check_config(config: ApiServerConfig) -> None:
     # check would have rejected is a board that bricks the next restart.
     if (
         inference.request_budget > MAX_CHAT_REQUEST_BUDGET
-        or inference.token_budget > 10_000_000
+        or inference.token_budget > MAX_CHAT_TOKEN_BUDGET
         or inference.request_body_bytes > 1 << 20
         or inference.response_body_bytes > 8 << 20
         or inference.max_output_tokens > 32_768

@@ -271,29 +271,62 @@ async def revoke_ticket_inference(
 
 
 class InferenceDecline(StrEnum):
-    """Why an admission was refused, when the reason is worth naming.
+    """Why an admission was refused. Every refusal has one; none is silent.
 
     Historically :func:`begin_inference_request` returned ``None`` for every
-    refusal and the endpoint mapped all of them to ``429``. That collapsed three
+    refusal and the endpoint mapped all of them to ``429``. That collapsed
     unrelated events into one status code, and dittobench-api #103 documents the
     damage: on the ticket path the broker reads *any* ``429`` as "the lease is
     gone" and discards the whole run.
 
-    The three events, now each with a name:
+    #473 named three of them. The rest stayed behind a bare ``None`` -> ``4100``,
+    and one of those was the defect that made #473 inert: a spent **token**
+    budget answered ``4100``, which the broker classifies as transient and
+    retries at ~2.5/sec for two minutes until the run dies as
+    ``model_relay_unavailable``. 1009 declines on one lease, every one of them
+    ``4100``, with 1h21m still on the clock. A refusal nobody can name is a
+    refusal nobody can act on, so this enum now covers the whole surface.
+
+    Terminal, and the caller must not retry:
 
     * :attr:`GRANT_REVOKED` — the lease really is dead (the ticket expired, was
       reassigned, or the deadline moved). Fatal, and correctly so.
-    * :attr:`BUDGET_EXHAUSTED` — the lease is alive but its request allowance is
-      spent. Also terminal for chat, but for a completely different reason, and
-      a harness that can tell the difference can wind down and submit the work
-      it already has instead of dying mid-check.
-    * :attr:`AT_CAPACITY` — nothing is wrong at all; the lane was momentarily
-      full. The caller should back off and come back.
+    * :attr:`LEASE_EXPIRED` — the grant's own ``expires_at`` has passed. Same
+      practical advice as revocation, different cause, and worth separating
+      because one is the platform acting and the other is just the clock.
+    * :attr:`BUDGET_EXHAUSTED` — the **request-count** allowance is spent.
+    * :attr:`TOKEN_BUDGET_EXHAUSTED` — the **token** allowance is spent. Split
+      from the above deliberately: they are tuned by different operator dials
+      and a harness that hits the token wall at call 400 is behaving very
+      differently from one that hits the request wall at call 8192.
+    * :attr:`MODEL_NOT_PERMITTED` — the grant does not pin this model.
+    * :attr:`NONCE_REPLAYED` — this (grant, nonce) already exists. Repeating it
+      can never succeed; the caller must mint a fresh nonce.
+    * :attr:`GRANT_NOT_EXCHANGED` — minted but never exchanged for a bearer, so
+      there is no live lease here yet. The broker must exchange first.
+    * :attr:`RESERVATION_TOO_LARGE` — the request alone is bigger than the whole
+      token allowance. Distinct from exhaustion on purpose: nothing has been
+      spent, and a lease must not be declared dead because one call was
+      oversized.
 
-    Conflating the third with the first is what killed ``banblackycat``: 17
+    Retryable, and the caller should back off and return:
+
+    * :attr:`AT_CAPACITY` — nothing is wrong at all; the lane was momentarily
+      full, or the grant's in-flight reservations momentarily cover the
+      remaining token headroom. Both clear on their own.
+
+    And the one honest remainder:
+
+    * :attr:`UNATTRIBUTED` — refused, and naming the reason would tell an
+      unauthenticated caller about somebody else's lease. This is a *deliberate*
+      refusal to explain, not an accident, which is why it is a named member
+      rather than a ``None`` return: the reader of a ``4100`` should be able to
+      tell "we decided not to say" from "nobody ever wired this up".
+
+    Conflating a full lane with a dead lease is what killed ``banblackycat``: 17
     capacity declines, read as 17 dead leases. It is also why the status code is
-    no longer the discriminator. The endpoint answers ``AT_CAPACITY`` with
-    ``503 + Retry-After`` and the two terminal declines with ``429``, but the
+    not the discriminator. The endpoint answers the retryable decline with
+    ``503 + Retry-After`` and every terminal one with ``429``, but the
     *authoritative* signal is the numeric ``error_code`` in the error body
     (``ditto/api_server/middleware/error_envelope.py``). A status code carries
     about two bits; application semantics need more, and every attempt to
@@ -303,6 +336,13 @@ class InferenceDecline(StrEnum):
     GRANT_REVOKED = "grant_revoked"
     BUDGET_EXHAUSTED = "budget_exhausted"
     AT_CAPACITY = "at_capacity"
+    TOKEN_BUDGET_EXHAUSTED = "token_budget_exhausted"
+    LEASE_EXPIRED = "lease_expired"
+    MODEL_NOT_PERMITTED = "model_not_permitted"
+    NONCE_REPLAYED = "nonce_replayed"
+    GRANT_NOT_EXCHANGED = "grant_not_exchanged"
+    RESERVATION_TOO_LARGE = "reservation_too_large"
+    UNATTRIBUTED = "unattributed"
 
 
 # Both lanes return AT_CAPACITY now. Chat used to be excluded on the grounds
@@ -324,21 +364,28 @@ async def begin_inference_request(
     now: datetime,
     config: InferenceProxyConfig,
     request_kind: str = "chat",
-) -> tuple[InferenceGrant, InferenceRequest] | InferenceDecline | None:
+) -> tuple[InferenceGrant, InferenceRequest] | InferenceDecline:
     """Atomically consume one nonce and reserve bounded proxy capacity.
 
-    Returns the reservation on success, an :class:`InferenceDecline` when the
-    refusal has a name worth telling the caller, and ``None`` for the remaining
-    fail-closed class.
+    Returns the reservation on success and an :class:`InferenceDecline` on every
+    refusal. There is no unnamed refusal left: this function used to return a
+    bare ``None`` for "a bad bearer, a grant that is not this caller's, a model
+    the grant does not permit, a replayed nonce, an expired clock, a grant
+    minted but never exchanged, or a token budget spent" -- seven unrelated
+    conditions behind one anonymous ``4100``, of which a spent token budget was
+    the one that quietly ended runs.
 
-    ``None`` now means strictly "refused, and saying why would either help an
-    attacker or mean nothing to the caller": a bad bearer, a grant that is not
-    this caller's, a model the grant does not permit, a replayed nonce, an
-    expired clock, a grant minted but never exchanged, or a token budget spent.
-    Everything an honest broker can act on differently -- the lease is dead, the
-    allowance is spent, the lane is full -- is a named decline. The caller maps
-    all three to a status code *and* a stable numeric error code; see
-    :class:`InferenceDecline`.
+    The reasons an authenticated caller can act on are now each named. The two
+    that stay anonymous -- an unknown grant id and a failed bearer comparison --
+    return :attr:`InferenceDecline.UNATTRIBUTED`, which is still ``4100`` on the
+    wire but is now a *decision* recorded in the type rather than a gap. The
+    caller maps every member to a status code and a stable numeric error code;
+    see :class:`InferenceDecline`.
+
+    Ordering is the security property, not an extra check. Every named decline
+    below sits *after* the bearer comparison, because the reason a grant is
+    unusable is information about somebody else's lease and is disclosed only to
+    a caller that has already proved it holds this grant's bearer.
 
     Locking model: the grant row taken ``FOR UPDATE`` below is the only
     serialization point, and every invariant that spends a budget is scoped to
@@ -384,10 +431,10 @@ async def begin_inference_request(
     reports a healthy-but-full lane rather than a dead lease.
     """
     if request_kind not in {"chat", "embedding"}:
-        return None
+        return InferenceDecline.UNATTRIBUTED
     snapshot = await session.get(InferenceGrant, grant_id)
     if snapshot is None:
-        return None
+        return InferenceDecline.UNATTRIBUTED
     ticket = await session.get(
         ValidatorTicket,
         (snapshot.agent_id, snapshot.bench_version, snapshot.validator_hotkey),
@@ -399,36 +446,55 @@ async def begin_inference_request(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
+    # THE authentication gate. Everything below it may name a reason; nothing
+    # above it may. Keep the bearer comparison fused with the existence checks
+    # so an unknown grant and a wrong bearer are indistinguishable, and keep
+    # every *other* condition below it -- the model check in particular used to
+    # be fused in here, which meant a caller holding the right bearer could not
+    # be told the one thing it could actually fix.
     if (
         grant is None
         or grant.bearer_digest is None
         or not secrets.compare_digest(grant.bearer_digest, bearer_digest(bearer))
-        or _aware(grant.expires_at) <= now
-        or (
-            model not in grant.allowed_models
-            if request_kind == "chat"
-            else grant.bench_version < 7 or model != grant.embedding_model
-        )
     ):
-        return None
-    # Status is checked *after* the bearer comparison, never before. The reason
-    # a grant is unusable is information about someone else's lease, so it is
-    # only ever disclosed to a caller that has already proved it holds this
-    # grant's bearer. Ordering, not an extra check, is what enforces that.
-    #
-    # This gate is also what makes the terminal declines *persistent*. The first
+        return InferenceDecline.UNATTRIBUTED
+    if _aware(grant.expires_at) <= now:
+        return InferenceDecline.LEASE_EXPIRED
+    if (
+        model not in grant.allowed_models
+        if request_kind == "chat"
+        else grant.bench_version < 7 or model != grant.embedding_model
+    ):
+        return InferenceDecline.MODEL_NOT_PERMITTED
+    # This gate is what makes the terminal declines *persistent*. The first
     # refusal below sets the status; every subsequent call in the run lands
     # here, and without this branch the whole tail of the run would decay back
     # to an unnamed refusal -- which is precisely the window in which a harness
     # needs to know whether to retry, wind down, or give up.
+    #
+    # ``exhausted`` is one status covering two different spent allowances, and
+    # the tail of a run must not be told the wrong one. Rather than remembering
+    # which wall was hit, ask the same question the wall asked: would a request
+    # of *this* size still fit in the token allowance? That re-derivation is two
+    # already-loaded columns and it stays correct in the case a stored reason
+    # would get wrong -- exhaustion recorded a request short of the budget, so
+    # ``spent`` sits just below ``token_budget`` rather than at it.
     if grant.status != "active":
         if grant.status == "exhausted":
+            if (
+                request_kind == "chat"
+                and grant.prompt_tokens + grant.completion_tokens + token_reservation
+                > grant.token_budget
+            ):
+                return InferenceDecline.TOKEN_BUDGET_EXHAUSTED
             return InferenceDecline.BUDGET_EXHAUSTED
         if grant.status == "revoked":
             return InferenceDecline.GRANT_REVOKED
-        # "pending" -- minted but never exchanged. Not a named decline: there is
-        # no live lease here to have an opinion about.
-        return None
+        # "pending" -- minted but never exchanged. Unreachable in practice,
+        # since a pending grant has no bearer digest and fails the gate above,
+        # but named rather than silent: an anonymous refusal is now something
+        # this function has to choose, not something it falls into.
+        return InferenceDecline.GRANT_NOT_EXCHANGED
     stale_cutoff = now - timedelta(seconds=config.timeout_seconds * 2)
     stale_requests = list(
         (
@@ -493,6 +559,9 @@ async def begin_inference_request(
         # rather than a strategy being thorough, and killing the grant outright
         # would also take the chat lane down with it.
         return InferenceDecline.BUDGET_EXHAUSTED
+    if token_reservation < 1:
+        # A caller-shape error, not an allowance problem. Nothing to attribute.
+        return InferenceDecline.UNATTRIBUTED
     active_reserved = await session.scalar(
         select(func.coalesce(func.sum(InferenceRequest.reserved_tokens), 0)).where(
             InferenceRequest.grant_id == grant.grant_id,
@@ -500,14 +569,49 @@ async def begin_inference_request(
             InferenceRequest.request_kind == request_kind,
         )
     )
-    if token_reservation < 1 or (
+    spent = (
         grant.prompt_tokens + grant.completion_tokens
         if request_kind == "chat"
         else grant.embedding_tokens
-    ) + int(active_reserved or 0) + token_reservation > (
+    )
+    token_budget = (
         grant.token_budget if request_kind == "chat" else grant.embedding_token_budget
-    ):
-        return None
+    )
+    if spent + int(active_reserved or 0) + token_reservation > token_budget:
+        # Three very different events used to share this one anonymous exit, and
+        # telling them apart is exactly what a broker needs.
+        if token_reservation > token_budget:
+            # The request is larger than the entire allowance, so it would not
+            # have fit in a brand-new grant either. That is a caller-shape
+            # problem, and emphatically not a reason to declare a lease spent
+            # when it has consumed nothing.
+            return InferenceDecline.RESERVATION_TOO_LARGE
+        if spent + token_reservation > token_budget:
+            # The allowance has less room left than one request needs. No amount
+            # of waiting brings it back, so say so and stop. This is the branch
+            # that answered a bare ``None`` -- and therefore 4100, which the
+            # broker reads as transient and retries at ~2.5/sec for two minutes
+            # until the run dies as ``model_relay_unavailable``. It is the whole
+            # reason the heaviest v7 agents failed with hours left on the lease.
+            #
+            # Note that ``spent`` never actually reaches ``token_budget`` on
+            # this path, which is why the exhaustion check in
+            # ``finish_inference_request`` (``>= token_budget``) did not cover
+            # it: the run stalls a request short of the line and stays there.
+            if request_kind == "chat":
+                # Terminal, and recorded as terminal, exactly as request-count
+                # exhaustion is: a spent allowance does not come back, so the
+                # status gate above answers every later call in the run without
+                # re-deriving it. Deliberately not done for embeddings, whose
+                # 1B allowance means reaching it is pathological rather than
+                # thorough -- and killing the grant would take chat down too.
+                grant.status = "exhausted"
+            return InferenceDecline.TOKEN_BUDGET_EXHAUSTED
+        # Only the *in-flight* reservations push the total over. Nothing is
+        # spent yet and they settle within the provider timeout, so this is
+        # backpressure, not exhaustion -- answering it terminally would throw
+        # away a run that still had room.
+        return InferenceDecline.AT_CAPACITY
     active_requests = (
         grant.active_requests
         if request_kind == "chat"
@@ -528,7 +632,7 @@ async def begin_inference_request(
     # the composite primary key and nested transaction remain authoritative
     # for concurrent attempts on different platform workers.
     if await session.get(InferenceRequest, (grant.grant_id, nonce)) is not None:
-        return None
+        return InferenceDecline.NONCE_REPLAYED
 
     active_column = (
         InferenceGrant.active_requests
@@ -620,7 +724,7 @@ async def begin_inference_request(
             await session.flush()
     except IntegrityError:
         # The composite primary key is the distributed replay guard.
-        return None
+        return InferenceDecline.NONCE_REPLAYED
     if request_kind == "chat":
         grant.request_count += 1
         grant.active_requests += 1
