@@ -23,6 +23,9 @@ from ditto.api_server.endpoints.admin_inference_concurrency_settings import (
 from ditto.api_server.endpoints.admin_inference_routes import (
     router as admin_inference_routes_router,
 )
+from ditto.api_server.endpoints.admin_lease_revocations import (
+    router as admin_lease_revocations_router,
+)
 from ditto.api_server.endpoints.admin_miner_fees import (
     router as admin_miner_fees_router,
 )
@@ -69,6 +72,7 @@ __all__ = [
     "admin_queue_policy_settings_router",
     "admin_efficiency_bonus_settings_router",
     "admin_inference_routes_router",
+    "admin_lease_revocations_router",
     "admin_copy_review_router",
     "admin_continual_retest_settings_router",
     "admin_miner_fees_router",
