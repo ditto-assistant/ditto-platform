@@ -1718,7 +1718,7 @@ class ArtifactReleaseSettingsRevision(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "embargo_hours BETWEEN 6 AND 48",
+            "embargo_hours BETWEEN 6 AND 720",
             name="artifact_release_settings_embargo_hours_check",
         ),
         CheckConstraint(

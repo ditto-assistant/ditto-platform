@@ -77,7 +77,8 @@ async def create_settings_revision(
 ) -> RevisionModel:
     """Set the global embargo with CAS and an append-only audit record.
 
-    The window may be shortened or lengthened (up to the 48-hour ceiling).
+    The window may be shortened or lengthened anywhere in the 6-to-720-hour
+    range; 48 hours remains the community-agreed default, not a cap.
     Shortening still releases source earlier and cannot be reversed, so the
     console surfaces that warning; the server only enforces the CAS revision
     and the exact confirmation phrase.

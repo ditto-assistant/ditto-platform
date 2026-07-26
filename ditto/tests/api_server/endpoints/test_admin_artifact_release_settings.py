@@ -102,7 +102,7 @@ async def test_lengthens_shortens_and_rejects_stale_or_wrong_confirmation(
     assert first.status_code == 200, first.text
     revision = first.json()["revision"]
 
-    # Lengthening is now allowed, up to the 48-hour ceiling.
+    # Lengthening is now allowed, up to the 720-hour ceiling.
     increase = await client.post(
         "/api/v1/admin/artifact-release-settings",
         headers=_HEADERS,
@@ -111,21 +111,39 @@ async def test_lengthens_shortens_and_rejects_stale_or_wrong_confirmation(
     assert increase.status_code == 200, increase.text
     revision = increase.json()["revision"]
 
+    # 48 is the default, not a limit: a window past it is an ordinary write.
+    beyond_default = await client.post(
+        "/api/v1/admin/artifact-release-settings",
+        headers=_HEADERS,
+        json=_payload(168, expected=revision),
+    )
+    assert beyond_default.status_code == 200, beyond_default.text
+    assert beyond_default.json()["embargo_hours"] == 168
+
     ceiling = await client.post(
         "/api/v1/admin/artifact-release-settings",
         headers=_HEADERS,
-        json=_payload(48, expected=revision),
+        json=_payload(720, expected=beyond_default.json()["revision"]),
     )
     assert ceiling.status_code == 200, ceiling.text
-    assert ceiling.json()["embargo_hours"] == 48
+    assert ceiling.json()["embargo_hours"] == 720
 
     # One hour past the ceiling is rejected by the request contract.
     over = await client.post(
         "/api/v1/admin/artifact-release-settings",
         headers=_HEADERS,
-        json=_payload(49, expected=ceiling.json()["revision"]),
+        json=_payload(721, expected=ceiling.json()["revision"]),
     )
     assert over.status_code == 422
+
+    # And one hour below the floor, so widening the ceiling did not quietly
+    # loosen the other end of the range.
+    under = await client.post(
+        "/api/v1/admin/artifact-release-settings",
+        headers=_HEADERS,
+        json=_payload(5, expected=ceiling.json()["revision"]),
+    )
+    assert under.status_code == 422
 
     stale = await client.post(
         "/api/v1/admin/artifact-release-settings",
