@@ -253,6 +253,7 @@ class TestBonuses:
                 session,
                 agent_id=agent.agent_id,
                 bench_version=7,
+                epoch_index=1,
                 snapshot_id=snapshot.snapshot_id,
                 token_total=90.0,
                 bonus=0.05,
@@ -277,22 +278,80 @@ class TestBonuses:
                 session,
                 agent_id=agent_id,
                 bench_version=7,
+                epoch_index=1,
                 snapshot_id=snapshot_id,
                 token_total=90.0,
                 bonus=0.05,
             )
+        # Same epoch -> still rejected. Immutability within an epoch is exactly
+        # what keeps a published effective score from drifting.
         with pytest.raises(SAIntegrityError):
             async with session.begin():
                 await insert_bonus(
                     session,
                     agent_id=agent_id,
                     bench_version=7,
+                    epoch_index=1,
                     snapshot_id=snapshot_id,
                     token_total=90.0,
                     bonus=0.01,
                 )
         rows = await get_bonus_rows(session, [agent_id], bench_versions={agent_id: 7})
         assert rows[agent_id].bonus == 0.05
+
+    async def test_a_later_epoch_recomputes_beside_the_frozen_row(
+        self, session: AsyncSession
+    ):
+        """The freeze fix: a new epoch adds a row, it never mutates the old one.
+
+        Before ``epoch_index`` joined the key, an agent's bonus was insert-once
+        per bench version FOREVER -- so an agent that became more efficient could
+        never earn a better one, and an agent measured mid-transition kept that
+        measurement for the life of the contract.
+        """
+        agent = await _seed_agent(session)
+        async with session.begin():
+            first = await insert_snapshot(session, _reference(epoch_index=1))
+            await insert_bonus(
+                session,
+                agent_id=agent.agent_id,
+                bench_version=7,
+                epoch_index=1,
+                snapshot_id=first.snapshot_id,
+                token_total=90.0,
+                bonus=0.02,
+            )
+        async with session.begin():
+            second = await insert_snapshot(session, _reference(epoch_index=2))
+            await insert_bonus(
+                session,
+                agent_id=agent.agent_id,
+                bench_version=7,
+                epoch_index=2,
+                snapshot_id=second.snapshot_id,
+                token_total=40.0,
+                bonus=0.09,
+            )
+
+        # The scoring path names its epoch, so it reads the current one.
+        current = await get_bonus_rows(
+            session,
+            [agent.agent_id],
+            bench_versions={agent.agent_id: 7},
+            epoch_index=2,
+        )
+        assert current[agent.agent_id].bonus == 0.09
+
+        # And the earlier epoch is untouched, so its published snapshot still
+        # reproduces exactly. Nothing had to be deleted for the agent to move on.
+        historical = await get_bonus_rows(
+            session,
+            [agent.agent_id],
+            bench_versions={agent.agent_id: 7},
+            epoch_index=1,
+        )
+        assert historical[agent.agent_id].bonus == 0.02
+        assert historical[agent.agent_id].snapshot_id == first.snapshot_id
 
     async def test_version_scoped_read(self, session: AsyncSession):
         agent = await _seed_agent(session)
@@ -302,6 +361,7 @@ class TestBonuses:
                 session,
                 agent_id=agent.agent_id,
                 bench_version=7,
+                epoch_index=1,
                 snapshot_id=snapshot.snapshot_id,
                 token_total=90.0,
                 bonus=0.02,

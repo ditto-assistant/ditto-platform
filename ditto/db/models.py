@@ -1173,12 +1173,29 @@ class EfficiencyCohortSnapshot(Base):
 class EfficiencyBonus(Base):
     """One agent's frozen relative token-efficiency bonus (bench_version >= 7).
 
-    Insert-once per ``(agent_id, bench_version)``: assigned against the frozen
-    cohort snapshot of the epoch the submission finalized in (strictly-upside
-    zero rows included, so "no bonus" is as frozen as "5%") and **never
-    updated**, so a published effective score can never drift when later
-    submissions arrive. ``effective_composite = composite * (1 + bonus)`` is
-    derived at read time; the validator's composite is never modified.
+    Insert-once per ``(agent_id, bench_version, epoch_index)``: assigned against
+    the frozen cohort snapshot of that epoch (strictly-upside zero rows included,
+    so "no bonus" is as frozen as "5%") and **never updated**, so a published
+    effective score can never drift. ``effective_composite = composite *
+    (1 + bonus)`` is derived at read time; the validator's composite is never
+    modified.
+
+    The key carries ``epoch_index`` because the bonus is *relative*: it is a
+    position against a cohort's token distribution, and that distribution moves.
+    Without the epoch in the key the row was insert-once per bench version
+    FOREVER, so an agent that became more efficient could never earn a better
+    bonus, and an agent measured mid-transition kept that measurement for the
+    life of the contract. That happened at 04:43Z on 2026-07-26, part-way
+    through the 4M -> 25M token-budget change.
+
+    ``bench_version`` stays in the key and stays load-bearing: a bonus earned
+    under one benchmark contract is meaningless under another (different
+    dataset, different difficulty, different token profile). Epoch scoping is
+    strictly *inside* version scoping, not a replacement for it.
+
+    Recomputation is additive, never destructive. A new epoch writes a NEW row;
+    prior epochs' rows are untouched, so ``/public/efficiency/snapshots/{id}``
+    stays immutable and the audit trail is complete.
     """
 
     __tablename__ = "efficiency_bonuses"
@@ -1188,6 +1205,17 @@ class EfficiencyBonus(Base):
 
     bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
     """Benchmark contract of the bonused board. PK part 2."""
+
+    epoch_index: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    """The epoch this bonus was computed in. PK part 3.
+
+    Mirrors ``EfficiencyCohortSnapshot.epoch_index``, which has always carried
+    it -- the asymmetry between the two tables was the defect. Backfilled from
+    the referenced snapshot, so historical rows keep the epoch they were really
+    assigned in rather than collapsing to zero.
+    """
 
     snapshot_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
     """The frozen cohort snapshot this bonus was computed against (the
@@ -1210,7 +1238,10 @@ class EfficiencyBonus(Base):
 
     __table_args__ = (
         PrimaryKeyConstraint(
-            "agent_id", "bench_version", name="efficiency_bonuses_pkey"
+            "agent_id",
+            "bench_version",
+            "epoch_index",
+            name="efficiency_bonuses_pkey",
         ),
         ForeignKeyConstraint(
             ["agent_id"],
@@ -1229,7 +1260,14 @@ class EfficiencyBonus(Base):
         CheckConstraint(
             "bench_version >= 7", name="efficiency_bonuses_bench_version_check"
         ),
+        CheckConstraint(
+            "epoch_index >= 0", name="efficiency_bonuses_epoch_index_check"
+        ),
         Index("efficiency_bonuses_snapshot_idx", "snapshot_id"),
+        # The fold and the board both ask "this agent, this version, this
+        # epoch", which the PK already serves. This one serves the other
+        # direction: sweep one epoch's whole board.
+        Index("efficiency_bonuses_epoch_idx", "bench_version", "epoch_index"),
     )
 
 
