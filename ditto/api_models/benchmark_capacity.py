@@ -23,7 +23,21 @@ class ActiveBenchmarkSlot(BaseModel):
     slot_id: Annotated[str, Field(pattern=_SLOT_PATTERN)]
     agent_id: UUID
     bench_version: Annotated[int, Field(ge=1)]
-    progress: BenchmarkProgress
+    progress: BenchmarkProgress | None = None
+    """``None`` from heartbeat protocol 16: leased, but not yet reporting.
+
+    Through protocol 15 a validator omitted a slot from ``active`` entirely until
+    its first progress report, so a slot still pulling its image, rendering its
+    dataset, or seeding was indistinguishable from a free one -- and the lease
+    liveness gate had to treat every absence as unknown because of it. A v16
+    reporter announces the slot from the moment it is claimed and leaves this
+    null until there is something to say.
+
+    Optional rather than a new required shape so the platform can accept both
+    generations. A stricter model would 422 during FastAPI parsing, before the
+    handler runs, which would freeze ``seen_at`` -- the input to force-expiry --
+    and cause exactly the revocation this exists to prevent.
+    """
     healthy: bool = True
 
 

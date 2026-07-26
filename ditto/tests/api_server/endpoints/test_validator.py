@@ -1310,6 +1310,71 @@ class TestHeartbeat:
             assert ticket is not None
             assert ticket.first_reported_at == stamped
 
+    async def test_v16_claimed_slot_without_progress_is_accepted(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Protocol 16 announces a leased slot before it has anything to report.
+
+        The platform has to accept this *before* any validator sends it. A
+        stricter model would 422 during FastAPI parsing, before the handler runs,
+        which freezes ``seen_at`` -- the input to force-expiry -- and causes the
+        very revocation the change exists to prevent. So this is the deploy
+        ordering encoded as a test: tolerate first, emit second.
+        """
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, slot_id="slot-0")
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=16,
+                state="running_benchmark",
+                # The v10 mirror rule still applies and needs no relaxing: the
+                # legacy scalars mirror the primary slot, so `active_agent_id`
+                # names it and `benchmark_progress` is null for the same reason
+                # the slot's own progress is.
+                active_agent_id=agent_id,
+                capabilities=_quorum_capabilities(),
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity={
+                    "configured_slots": 1,
+                    "healthy_slots": ["slot-0"],
+                    "admission": "accepting",
+                    "active": [
+                        {
+                            "slot_id": "slot-0",
+                            "agent_id": str(agent_id),
+                            "bench_version": 2,
+                            "progress": None,
+                        }
+                    ],
+                },
+            ),
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["accepted"] is True
+
+        # The slot is now visible as occupied, which is the whole point: the
+        # liveness gate sees it in `capacity.active` and refuses to revoke,
+        # without needing the never-reported fallback at all.
+        async with session_maker() as session:
+            stored = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert stored is not None
+            assert stored.claimed_slots == [
+                {"slot_id": "slot-0", "agent_id": str(agent_id)}
+            ]
+            assert stored.benchmark_capacity is not None
+            active = stored.benchmark_capacity["active"]
+            assert [slot["slot_id"] for slot in active] == ["slot-0"]
+            assert active[0]["progress"] is None
+
     async def test_capacity_validation_failure_still_advances_liveness(
         self,
         app: FastAPI,
