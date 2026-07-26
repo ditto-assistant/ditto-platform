@@ -16,8 +16,10 @@ from ditto.api_models.queue_policy_settings import (
     DEFAULT_FRESH_SUBMISSION_SLOTS,
     DEFAULT_LANE_CYCLE_SIZE,
     DEFAULT_OWNER_CONCURRENT_SUBMISSIONS,
+    DEFAULT_PREV_GEN_CARRYOVER_AGENTS,
     MAX_COHORT_SIZE,
     MAX_OWNER_CONCURRENT_SUBMISSIONS,
+    MAX_PREV_GEN_CARRYOVER_AGENTS,
     MIN_COHORT_SIZE,
     MIN_OWNER_CONCURRENT_SUBMISSIONS,
     PrevGenCarryoverSettings,
@@ -92,6 +94,37 @@ class TestQueuePolicyBoundsMatchQueueConstants:
         assert carryover.include_exhausted is False
         assert carryover.dedupe_scope == "coldkey"
         assert carryover.require_cohort_complete is True
+
+    def test_the_top_twenty_five_qualify_to_enter_the_new_era(self) -> None:
+        """Carryover depth matches the cohort depth it exists to populate.
+
+        Adopting fewer than the retest lane will later re-benchmark hands the
+        new era a leaderboard too short for its own cohort, so these two move
+        together. ``MAX_COHORT_SIZE`` is the shared ceiling.
+        """
+        assert PrevGenCarryoverSettings().max_agents == 25
+        assert DEFAULT_PREV_GEN_CARRYOVER_AGENTS == MAX_COHORT_SIZE
+        # The size dial moved; every gate that decides *whether* anyone is
+        # adopted is untouched, so this remains a no-op on a live fleet.
+        assert PrevGenCarryoverSettings().enabled is False
+
+    def test_the_carryover_ceiling_still_admits_the_new_default(self) -> None:
+        """The board's own bound never became the thing blocking the default.
+
+        This is the #473 failure mode in miniature: a default that a validator
+        would reject is a delayed boot failure rather than a rejected write.
+        ``max_agents`` has no env-var twin and no CHECK constraint, so this
+        field-level bound is the only one there is.
+        """
+        assert DEFAULT_PREV_GEN_CARRYOVER_AGENTS <= MAX_PREV_GEN_CARRYOVER_AGENTS
+        assert (
+            PrevGenCarryoverSettings(
+                max_agents=MAX_PREV_GEN_CARRYOVER_AGENTS
+            ).max_agents
+            == MAX_PREV_GEN_CARRYOVER_AGENTS
+        )
+        with pytest.raises(ValueError):
+            PrevGenCarryoverSettings(max_agents=MAX_PREV_GEN_CARRYOVER_AGENTS + 1)
 
     def test_a_retired_era_is_not_backfilled_by_default(self) -> None:
         """The one default here that is NOT the pre-existing behaviour.

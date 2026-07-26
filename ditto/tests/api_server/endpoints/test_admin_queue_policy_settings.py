@@ -136,9 +136,13 @@ class TestDefaultAndRoundTrip:
         assert body["default"]["priority_cohort_size"] == 5
         assert body["default"]["lane_cycle_size"] == 4
         assert body["default"]["fresh_submission_slots"] == [0, 1, 3]
+        # ``max_agents`` is the one carryover default that is deliberately NOT
+        # the historical value: the top 25 of the closing generation qualify to
+        # enter the new era, matching max_cohort_size above. It is inert while
+        # ``enabled`` is False, which is why widening it is not a queue retune.
         assert body["default"]["prev_gen_carryover"] == {
             "enabled": False,
-            "max_agents": 10,
+            "max_agents": 25,
             "min_score_count": 2,
             "include_exhausted": False,
             "dedupe_scope": "coldkey",

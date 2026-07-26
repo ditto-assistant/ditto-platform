@@ -99,7 +99,18 @@ DEFAULT_FRESH_SUBMISSION_SLOTS = (0, 1, 3)
 # Previous-generation carryover bounds
 # ---------------------------------------------------------------------------
 MAX_PREV_GEN_CARRYOVER_AGENTS = 50
-DEFAULT_PREV_GEN_CARRYOVER_AGENTS = 10
+# The top 25 of the closing generation are the ones the new era offers to adopt,
+# matching :data:`MAX_COHORT_SIZE` / the continual board's ``retest_cohort_size``.
+# All three answer the same question -- "how deep does the leaderboard stay
+# interesting?" -- and an operator who widens one and not the others gets a
+# carryover set narrower than the cohort it is meant to feed.
+#
+# This is a *shipped default*, not a bound, and it is inert on its own: the whole
+# carryover path is gated behind ``enabled``, which still ships ``False``. Raising
+# it changes what would be adopted **if** an operator turned carryover on; it
+# admits nobody by itself. See :attr:`PrevGenCarryoverSettings.enabled` for the
+# other gates that also have to move before a single submission is carried over.
+DEFAULT_PREV_GEN_CARRYOVER_AGENTS = 25
 
 # ---------------------------------------------------------------------------
 # Owner capacity bounds
@@ -173,6 +184,12 @@ class PrevGenCarryoverSettings(BaseModel):
     bounding the total is the honest control. Ordering is by demonstrated
     progress first (see :attr:`min_score_count`) and then FIFO, so a cap keeps
     the submissions that are closest to finalizing.
+
+    Defaults to ``25`` -- "the top 25 of the closing generation qualify to enter
+    the new era" -- which is the same depth as ``MAX_COHORT_SIZE`` and the
+    continual board's ``retest_cohort_size``. Carryover exists to hand the new
+    era a populated leaderboard, so adopting fewer than the retest lane will
+    later re-benchmark just leaves that lane short of candidates.
     """
 
     min_score_count: Annotated[int, Field(ge=0, le=2)] = 2
