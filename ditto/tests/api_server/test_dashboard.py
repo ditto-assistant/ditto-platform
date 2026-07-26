@@ -471,9 +471,9 @@ class TestDashboard:
         assert 'subject: "OpenClaw 2026.7.1"' in body
         assert 'profile: "Native memory-core FTS · 20-result recall"' in body
         assert 'runId: "34178537-0529-48d8-8421-8b7c566db2d4"' in body
-        assert 'memoryMean: 0.13636363636363635' in body
+        assert "memoryMean: 0.13636363636363635" in body
         assert 'runId: "dd651606-bcfd-4ed8-83ae-926a0a19ee6b"' in body
-        assert 'memoryMean: 0.22601010101010102' in body
+        assert "memoryMean: 0.22601010101010102" in body
         assert 'model: "openai/gpt-oss-20b"' in body
         assert 'route: "OpenRouter · aggregate throughput"' in body
         assert "point.measuredAt || evidence.measuredAt" in body
