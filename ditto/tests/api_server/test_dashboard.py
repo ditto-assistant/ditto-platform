@@ -876,6 +876,117 @@ class TestDashboard:
         ]
         assert "currentBench = data.desired_bench_version" not in body
 
+    async def test_validator_progress_keeps_superseded_failures_as_history(
+        self,
+    ) -> None:
+        """A retried lease must render its real outcome, not its old failure.
+
+        ``validator_tickets`` is one mutable row per (agent, version, validator):
+        a reissue resets ``issued_at`` and bumps ``attempt_count`` while
+        ``failure_reason``/``failed_at`` are preserved as an audit trail. The
+        drawer used to let that preserved failure win outright, so a submission
+        whose three validators each failed once and then scored rendered as three
+        "Scoring run failed · deferred" rows stamped with the superseded failure
+        times -- with three accepted scores sitting above them, unexplained.
+        """
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        helpers = []
+        for name in ("attemptLabel", "validatorFailureLabel", "validatorRetryInfo"):
+            match = re.search(r"(function " + name + r"\(.*?\n    \})", body, re.DOTALL)
+            assert match is not None, name
+            helpers.append(match.group(1))
+        render = re.search(
+            r"(function renderValidationAttempt\(a\) \{.*?\n      \})"
+            r"\n      var validation",
+            body,
+            re.DOTALL,
+        )
+        assert render is not None
+        cases = [
+            # The production shape: scored, carrying a failure from the lease
+            # that preceded the reissue (failed_at < issued_at).
+            {
+                "validator_hotkey": "5CqJAjSj",
+                "status": "scored",
+                "purpose": "canonical_quorum",
+                "issued_at": "2026-07-25T21:26:27Z",
+                "deadline": "2026-07-25T23:26:27Z",
+                "bench_version": 7,
+                "actively_running": False,
+                "failure_reason": "scoring_error",
+                "failed_at": "2026-07-25T20:54:41Z",
+                "attempt_count": 2,
+            },
+            # Still live and failing now: the failure IS the current state.
+            {
+                "validator_hotkey": "5CFtzzb4",
+                "status": "expired",
+                "purpose": "canonical_quorum",
+                "issued_at": "2026-07-25T20:00:00Z",
+                "deadline": "2026-07-25T22:00:00Z",
+                "bench_version": 7,
+                "actively_running": False,
+                "failure_reason": "infrastructure",
+                "failed_at": "2026-07-25T21:00:00Z",
+                "attempt_count": 1,
+            },
+            # A clean first-attempt score keeps its plain wording.
+            {
+                "validator_hotkey": "5HmP9732",
+                "status": "scored",
+                "purpose": "canonical_quorum",
+                "issued_at": "2026-07-25T20:56:19Z",
+                "deadline": "2026-07-25T22:56:19Z",
+                "bench_version": 7,
+                "actively_running": False,
+                "failure_reason": None,
+                "failed_at": None,
+                "attempt_count": 1,
+            },
+        ]
+        script = (
+            'var VALIDATOR_RETRY_EXPLANATION = "";\n'
+            "function esc(s) { return String(s == null ? '' : s); }\n"
+            "function shortKey(k) { return String(k); }\n"
+            "function relTime(t) { return 'AT:' + String(t); }\n"
+            "function entityAnchor(kind, key, text) { return esc(text); }\n"
+            "function renderBenchmarkProgress(p, f) { return ''; }\n"
+            + "\n".join(helpers)
+            + "\n"
+            + render.group(1)
+            + "\nconsole.log(JSON.stringify("
+            + json.dumps(cases)
+            + ".map(renderValidationAttempt)));"
+        )
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        retried, failing, clean = json.loads(result.stdout)
+
+        # The retried lease reports what actually happened, dated by the lease it
+        # describes -- with the old failure demoted to a trailing note.
+        assert "Score submitted" in retried
+        assert "deferred" not in retried
+        assert "submitted a score on attempt 2" in retried
+        assert "an earlier attempt reported scoring run failed" in retried
+        assert "AT:2026-07-25T21:26:27Z" in retried
+        assert "2026-07-25T20:54:41Z" not in retried
+
+        # An unsuperseded failure is untouched: still the headline, still dated
+        # by the failure itself.
+        assert "Validator infrastructure failure · deferred" in failing
+        assert "reported validator infrastructure failure" in failing
+        assert "an earlier attempt" not in failing
+        assert "AT:2026-07-25T21:00:00Z" in failing
+
+        assert "Score submitted" in clean
+        assert "on attempt" not in clean
+        assert "deferred" not in clean
+
     async def test_includes_accessible_benchmark_progress(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text

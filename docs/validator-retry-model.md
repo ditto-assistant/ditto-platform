@@ -58,6 +58,29 @@ attempt_count  >=  MAX_ATTEMPTS_PER_VERSION + manual_retry_grants + infra_retry_
 - **Explicit fail** (`fail_job`): the validator reports terminal failure →
   ticket `expired`, `retry_after = now` (immediate reissue, no 6h wait).
 
+### A recorded failure can describe a superseded lease
+
+A ticket row is a *lease slot*, not an append-only attempt log. Reissue rewrites
+it in place — `status` back to `issued`, `issued_at = now`, `attempt_count += 1`
+— but **`failure_reason` and `failed_at` are deliberately left alone** so the
+last failure stays auditable. A ticket that failed, was re-leased, and then
+scored therefore reads `status = scored` *and* `failure_reason = scoring_error`
+at the same time.
+
+So never read `failure_reason` as the current state of the row. It is history
+whenever either holds:
+
+- `status = scored` — `fail_job` only accepts an `issued` lease
+  (`get_open_ticket`), so a scored row's failure necessarily predates its last
+  reissue.
+- `failed_at < issued_at` — the failure belongs to a lease that has since been
+  replaced.
+
+`attempt_count > 1` is the corroborating signal that earlier attempts exist.
+`PublicValidationAttempt` publishes all four fields for exactly this reason:
+treating the kept failure as current made every retried-then-scored quorum input
+render as a failure in the public submission drawer.
+
 ## When is a submission "stuck"?
 
 A below-quorum submission is one of these retry states (surfaced per agent and

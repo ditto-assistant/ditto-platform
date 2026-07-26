@@ -4379,6 +4379,65 @@ class TestPublicActivity:
         assert body["validation_attempts"][0]["purpose"] == "canonical_quorum"
         assert body["validation_attempts"][0]["failure_reason"] == "sandbox_oom"
         assert body["validation_attempts"][0]["failed_at"] is not None
+        assert body["validation_attempts"][0]["attempt_count"] == 1
+
+    async def test_pipeline_dates_a_retried_lease_after_its_kept_failure(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A scored lease keeps its old failure, so publish what supersedes it.
+
+        ``failure_reason``/``failed_at`` survive a reissue by design (retry
+        accounting and audit), so a ticket that failed, was re-leased, and then
+        scored still carries them. Consumers can only tell that the failure is
+        history from ``issued_at`` moving past ``failed_at`` and from
+        ``attempt_count`` -- both must be on the wire.
+        """
+        agent_id = UUID(
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.84],
+                status=AgentStatus.EVALUATING,
+                details={"bench_version": 2},
+            )
+        )
+        now = datetime.now(UTC)
+        failed_at = now - timedelta(hours=15)
+        reissued_at = now - timedelta(minutes=40)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=_MINER_B,
+                    status=TicketStatus.SCORED,
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
+                    issued_at=reissued_at,
+                    deadline=now + timedelta(hours=1),
+                    failure_reason="scoring_error",
+                    failed_at=failed_at,
+                    attempt_count=2,
+                )
+            )
+        _install_db(app, session_maker)
+
+        body = (await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")).json()
+        attempt = next(
+            row
+            for row in body["validation_attempts"]
+            if row["validator_hotkey"] == _MINER_B
+        )
+
+        assert attempt["status"] == "scored"
+        assert attempt["attempt_count"] == 2
+        # The kept failure stays readable, but strictly behind the lease that
+        # replaced it -- that ordering is what marks it as history.
+        assert attempt["failure_reason"] == "scoring_error"
+        assert datetime.fromisoformat(attempt["failed_at"]) < datetime.fromisoformat(
+            attempt["issued_at"]
+        )
 
     async def test_pipeline_separates_canonical_quorum_from_continual_retests(
         self,
