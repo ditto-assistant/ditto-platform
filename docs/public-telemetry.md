@@ -16,10 +16,11 @@ SN118 publishes publicly and how. Implementation tracked per section below.
 3. **Public read API = yes.** Add a rate-limited, no-auth read endpoint so the
    dashboard (and anyone) can read the leaderboard without a validator hotkey.
 4. **Submitted source becomes public after finalization.** Every cleared
-   submission becomes downloadable after the configured embargo (24 hours by
-   default, operator-shortenable to 6 hours) from its third accepted validator
-   score. The clock is derived from immutable score insertion timestamps, so the
-   policy applies retroactively without a backfill. Scores from different
+   submission becomes downloadable after the configured embargo (48 hours by
+   default, operator-tunable anywhere from 6 hours to 720 hours / 30 days) from
+   its third accepted validator score. The clock is derived from immutable
+   score insertion timestamps, so the policy applies retroactively without a
+   backfill. Scores from different
    benchmark versions never combine into a quorum. Quarantined, held, and
    rejected submissions remain private unless an operator clears them; a clear
    uses the original quorum time rather than restarting the embargo.

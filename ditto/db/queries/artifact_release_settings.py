@@ -7,7 +7,11 @@ from ditto.db.models import ArtifactReleaseSettingsRevision
 
 DEFAULT_ARTIFACT_RELEASE_EMBARGO_HOURS = 48
 MIN_ARTIFACT_RELEASE_EMBARGO_HOURS = 6
-MAX_ARTIFACT_RELEASE_EMBARGO_HOURS = 48
+# The ceiling is a range bound, not a recommendation: 48 hours stays the
+# community-agreed operative default, and the extra headroom exists so an
+# operator can hold the king's source private for a bounded stretch (a
+# disclosure window, an unresolved dispute) without a code change.
+MAX_ARTIFACT_RELEASE_EMBARGO_HOURS = 720
 
 
 async def latest_artifact_release_settings(
