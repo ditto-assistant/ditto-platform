@@ -252,8 +252,22 @@
     .board { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
 
     /* The board's filter row reuses the submissions pills (.activity-filter)
-       and its band treatment, centered so it brackets the table with the pager. */
-    .board-tabs { justify-content: center; padding: 12px 14px; border-bottom: 1px solid var(--border); background: color-mix(in oklab, var(--bg-elev-2) 38%, var(--bg-elev)); }
+       and its band treatment, centered so it brackets the table with the pager.
+       The toolbar carries the band so the tabs stay a clean pill group and the
+       text filter can sit beside them on the same rule. */
+    .board-toolbar { display: flex; align-items: center; justify-content: center; gap: 14px; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--border); background: color-mix(in oklab, var(--bg-elev-2) 38%, var(--bg-elev)); }
+    .board-tabs { justify-content: center; }
+    /* Narrowing the board in place is a different job from the shell's global
+       search, which jumps to one record; this keeps the whole table honest to
+       the filter, so the pager and counts describe the narrowed set. */
+    .board-search { flex: 0 1 300px; min-width: 200px; }
+    .board-search .search-field { min-height: 32px; }
+    .board-search .search-input { height: 30px; }
+    .board-search.has-query .search-clear { display: grid; place-items: center; }
+    @media (max-width: 640px) {
+      .board-toolbar { align-items: stretch; flex-direction: column; }
+      .board-search { flex: 1 1 auto; }
+    }
     .leaderboard-version-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
     .leaderboard-version-switch .context { color: var(--text-dim); font-size: 12px; }
     .leaderboard-version-switch .activity-filter-list { flex: 0 0 auto; }
@@ -2400,10 +2414,20 @@
     </div>
     <div class="leaderboard-notice" id="leaderboard-notice" role="status" aria-live="polite"></div>
     <div class="board" tabindex="0" role="region" aria-label="Leaderboard table, horizontally scrollable on small screens">
-      <div class="board-tabs activity-filter-list" role="group" aria-label="Leaderboard view">
-        <button class="activity-filter" type="button" data-board-tab="all" aria-pressed="false">All <span class="activity-filter-count" data-board-count="all">–</span></button>
-        <button class="activity-filter" type="button" data-board-tab="scored" aria-pressed="true">Scored <span class="activity-filter-count" data-board-count="scored">–</span></button>
-        <button class="activity-filter" type="button" data-board-tab="provisional" aria-pressed="false">Provisional <span class="activity-filter-count" data-board-count="provisional">–</span></button>
+      <div class="board-toolbar">
+        <div class="board-tabs activity-filter-list" role="group" aria-label="Leaderboard view">
+          <button class="activity-filter" type="button" data-board-tab="all" aria-pressed="false">All <span class="activity-filter-count" data-board-count="all">–</span></button>
+          <button class="activity-filter" type="button" data-board-tab="scored" aria-pressed="true">Scored <span class="activity-filter-count" data-board-count="scored">–</span></button>
+          <button class="activity-filter" type="button" data-board-tab="provisional" aria-pressed="false">Provisional <span class="activity-filter-count" data-board-count="provisional">–</span></button>
+        </div>
+        <div class="board-search" id="board-search">
+          <label class="visually-hidden" for="board-filter">Filter the leaderboard</label>
+          <div class="search-field">
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+            <input class="search-input" id="board-filter" type="search" autocomplete="off" placeholder="Filter by agent, UID, or hotkey" />
+            <button class="search-clear" id="board-filter-clear" type="button" aria-label="Clear the leaderboard filter" title="Clear filter">×</button>
+          </div>
+        </div>
       </div>
       <table id="board" tabindex="-1" aria-label="Subnet 118 leaderboard: best score per miner">
         <thead>
@@ -3543,7 +3567,7 @@
     // rank-movement snapshot are computed over the whole field); this only
     // controls what is DISPLAYED. Scored is the default tab because a
     // provisional run is pre-quorum feedback, not a standing.
-    var boardView = { tab: "scored", sort: "rank", dir: 1, page: 1, pageSize: 25 };
+    var boardView = { tab: "scored", sort: "rank", dir: 1, page: 1, pageSize: 25, query: "" };
     var leaderboardVersionView = "current";
     // Chain unreachable for the whole snapshot (set by render(), read by
     // renderBoardRows()): suppresses the identical per-row "registration
@@ -4645,9 +4669,19 @@
     // The visible slice: current tab, current sort, current page. Split out of
     // render() so a tab/sort/page change re-renders the table without refetching
     // or recomputing ranks.
+    // Matching agent name, UID, and hotkey covers how people actually look a
+    // miner up: by what they called it, by the number on the board, or by
+    // pasting a key from the chain.
+    function boardMatches(entry, needle) {
+      if (!needle) return true;
+      return [entry.agent_name, entry.miner_hotkey, entry.miner_uid == null ? "" : "uid " + entry.miner_uid, entry.miner_uid]
+        .some(function (field) { return String(field == null ? "" : field).toLowerCase().indexOf(needle) >= 0; });
+    }
+
     function renderBoardRows() {
       var tb = document.getElementById("rows");
-      var all = lastEntries || [];
+      var needle = boardView.query.trim().toLowerCase();
+      var all = (lastEntries || []).filter(function (e) { return boardMatches(e, needle); });
       var scored = all.filter(isFinalized);
       var provisional = all.filter(function (e) { return !isFinalized(e); });
       var counts = { all: all.length, scored: scored.length, provisional: provisional.length };
@@ -4690,8 +4724,10 @@
       if (next) next.disabled = boardView.page >= pageCount;
 
       if (!pageRows.length) {
-        if (sectionChanged("leaderboard", { empty: true, tab: boardView.tab, page: boardView.page })) {
-          tb.innerHTML = '<tr><td colspan="9" class="empty"><div class="empty-msg">' + (boardView.tab === "provisional"
+        if (sectionChanged("leaderboard", { empty: true, tab: boardView.tab, page: boardView.page, query: needle })) {
+          tb.innerHTML = '<tr><td colspan="9" class="empty"><div class="empty-msg">' + (needle
+            ? "No miner matches that filter."
+            : boardView.tab === "provisional"
             ? "No provisional runs right now. Pre-quorum scores appear here as validators report them."
             : "No miners have been scored yet. As soon as a submission clears scoring it appears here.") + '</div></td></tr>';
         }
@@ -4703,6 +4739,7 @@
         rows: pageRows,
         block: lastChainWeights ? lastChainWeights.block : null,
         tab: boardView.tab, sort: boardView.sort, dir: boardView.dir, page: boardView.page,
+        query: needle,
       })) {
         return;
       }
@@ -4807,6 +4844,43 @@
       if (next) next.addEventListener("click", function () {
         // "next" is disabled at the last page, so this never overshoots.
         navigateBoardPage(boardView.page + 1);
+      });
+    })();
+
+    (function () {
+      var input = document.getElementById("board-filter");
+      var wrap = document.getElementById("board-search");
+      var clear = document.getElementById("board-filter-clear");
+      if (!input) return;
+      var debounce = 0;
+      function apply() {
+        var next = input.value;
+        if (next === boardView.query) return;
+        boardView.query = next;
+        // A narrowed list almost never has the page you were on.
+        boardView.page = 1;
+        writeBoardPage(false);
+        if (wrap) wrap.classList.toggle("has-query", !!next);
+        forceRender();
+        renderBoardRows();
+      }
+      input.addEventListener("input", function () {
+        clearTimeout(debounce);
+        debounce = setTimeout(apply, 120);
+      });
+      // Escape clears rather than just blurring; the filter is the only thing
+      // standing between the reader and the full board.
+      input.addEventListener("keydown", function (event) {
+        if (event.key === "Escape" && input.value) {
+          event.stopPropagation();
+          input.value = "";
+          apply();
+        }
+      });
+      if (clear) clear.addEventListener("click", function () {
+        input.value = "";
+        apply();
+        input.focus();
       });
     })();
 
