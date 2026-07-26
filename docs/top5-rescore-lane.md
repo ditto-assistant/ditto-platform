@@ -74,6 +74,41 @@ The champion establishes a three-seed baseline, then extends one seed per round 
 to a fixed cap. A behind tail entrant scores up to two missing seeds per claimed
 round until it catches up; it never exceeds the champion's depth.
 
+### Catch-up
+
+Issuance distinguishes two kinds of pending work for a member.
+
+*Growth* is the next seed the wave has not finished, paced one per round. The wave
+is a synchronisation point: nobody may run ahead of the seed the rest of the
+emission set is still working, so this pacing is what keeps the crown moving at a
+fixed cadence.
+
+*Catch-up* is the member's backlog — seeds every **other** emission member already
+holds and this one does not. That is settled evidence, so there is no wave left to
+tear and no ordering to preserve, and the whole backlog is offered at once. The
+platform hands one backlog seed per validator per claim (the ticket is pinned to a
+single seed), so K idle validators converge K seeds in the time one used to take
+one. Convergence after a membership change is therefore ~1 round rather than one
+round per anchored seed.
+
+This matters because a completed wave is not stored state: it is recomputed at read
+time by intersecting the *current* emission set's seed sets. A member promoted into
+the top five arrives at depth zero and gates that intersection for everyone.
+ditto-platform#489 stopped the promotion from discarding accumulated evidence on the
+read side (`wave_membership = participants`); catch-up is the write side, shortening
+the window in which anything is degraded at all.
+
+Two bounds hold it in place. A behind member is privileged over *extended-cohort*
+top-up work only — never over another emission member — so a member that cannot be
+leased can never stall the lane. And "behind" is a fact about append-only stored
+evidence, not a promotion event: the privilege exists exactly while a backlog does,
+and an agent oscillating in and out of the top five keeps what it earned, so it
+cannot re-acquire a backlog by re-entering.
+
+Catch-up is scoped to emission-set members. The extended retest cohort is
+spare-capacity work whose depth gates nothing, and it keeps one-seed-per-round
+pacing.
+
 ## UI
 
 The public leaderboard shows confirmation depth for top-five agents. This is
