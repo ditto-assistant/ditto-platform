@@ -1407,8 +1407,15 @@ async def submit_result(
         target = AgentStatus.QUARANTINED
         public_reason = "Submission held for anti-cheat review"
     elif payload.outcome == ScreenResultOutcome.RETRYABLE_INFRA:
+        # Retryable means exactly that: the attempt is re-queued and normally
+        # succeeds on the next pass. Saying "Screening infrastructure error"
+        # and nothing else told the miner the subnet was broken and left them
+        # with no reason to expect it to resolve itself — which it then did,
+        # a minute later, making the subnet look flaky rather than merely
+        # interrupted. Same status and same retry as before; only the sentence
+        # is honest now, and it matches the INCONCLUSIVE wording above.
         target = AgentStatus.SCREENING_FAILED
-        public_reason = "Screening infrastructure error"
+        public_reason = "Screening was interrupted; retry scheduled"
     elif payload.outcome == ScreenResultOutcome.DETERMINISTIC_REJECT:
         target = AgentStatus.REJECTED
         public_reason = _public_screening_reason(payload.detail, payload.reason_code)

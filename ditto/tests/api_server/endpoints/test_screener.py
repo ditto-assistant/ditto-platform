@@ -4861,6 +4861,49 @@ class TestQuarantineReviewContext:
             "agentic-source-review-tripwire"
         ]
 
+    async def test_retryable_infra_tells_the_miner_a_retry_is_scheduled(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A retried attempt must not read as a hard subnet failure.
+
+        A retryable outcome is re-queued and normally passes on the next
+        attempt. Reporting it as a bare "Screening infrastructure error" made
+        a self-healing interruption look like the subnet was broken.
+        """
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        claimed = await client.post(_CLAIM_URL)
+        attempt_id = UUID(claimed.json()["items"][0]["attempt_id"])
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                attempt_id=attempt_id,
+                outcome="retryable_infra",
+                reason_code="source-review-model-response-invalid",
+            ),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == AgentStatus.SCREENING_FAILED
+        async with session_maker() as session:
+            refreshed = await session.get(Agent, agent_id)
+            assert refreshed is not None
+            # The status and the retry are unchanged; only the sentence is.
+            assert refreshed.status == AgentStatus.SCREENING_FAILED
+            assert refreshed.screening_reason == (
+                "Screening was interrupted; retry scheduled"
+            )
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            assert attempt is not None
+            assert attempt.reason_code == "source-review-model-response-invalid"
+
     async def test_inconclusive_finishes_attempt_and_preserves_lease_backoff(
         self,
         app: FastAPI,
