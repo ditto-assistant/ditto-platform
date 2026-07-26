@@ -484,39 +484,73 @@ class TestDashboard:
         # The kicker above the title was dropped.
         assert "Reference only · no emissions" not in body
 
-    async def test_overview_pairs_the_chart_with_a_filterable_board_rail(
+    async def test_overview_shows_the_full_board_without_a_disclosure(
         self,
     ) -> None:
+        """The leaderboard is the page, not a sidebar rail beside it.
+
+        ditto-platform#383 split the overview and moved the nine-column table,
+        the version pills, and the rollout and emissions strips into a collapsed
+        <details>, which hid the run's model, bench version, tool and memory
+        subscores, latency, first-seen, emissions role, and the whole v7 rollout
+        readout behind a click. Everything that reports a standing stays in the
+        first paint.
+        """
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
 
-        overview_start = body.index(
-            '<section class="page active" data-page="overview">'
-        )
-        split_start = body.index('<div class="overview-split">')
-        rail_start = body.index('<aside class="board-rail"')
-        full_start = body.index('<details class="board-full">')
-        # Chart and rail share the split; the wide table follows it, collapsed.
-        assert overview_start < split_start < rail_start < full_start
-        assert '<div class="board" tabindex="0"' in body
-        assert body.index('<div class="board" tabindex="0"') > full_start
+        # No split, no rail, no disclosure around the board.
+        assert '<div class="overview-split">' not in body
+        assert '<aside class="board-rail"' not in body
+        assert '<details class="board-full">' not in body
 
-        # The rail carries its own filter, and the filter drives both views.
+        # The strips that report emissions and the live rollout are unwrapped.
+        board = body.index('<div class="board" tabindex="0"')
+        for marker in (
+            '<div class="emissions-strip" id="emissions-strip"',
+            '<div class="rollout-strip" id="rollout-strip"',
+            'id="leaderboard-version-pills"',
+            'id="leaderboard-notice"',
+        ):
+            assert marker in body
+            assert body.index(marker) < board
+
+        # The columns the rail dropped are still column headers.
+        for sort_key in (
+            "rank",
+            "name",
+            "bench",
+            "composite",
+            "tool",
+            "memory",
+            "latency",
+            "first_seen",
+        ):
+            assert f'data-sort="{sort_key}"' in body
+        assert 'id="emissions-col-tip"' in body
+
+    async def test_leaderboard_carries_a_filter_over_name_uid_and_hotkey(
+        self,
+    ) -> None:
+        """The one capability worth keeping from #383's rail.
+
+        Filtering narrows the table in place, which the shell's global search
+        does not do: that jumps to a single record.
+        """
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+
         assert 'id="board-filter"' in body
+        assert 'id="board-filter-clear"' in body
         assert "function boardMatches(entry, needle)" in body
         assert "boardView.query.trim().toLowerCase()" in body
-        assert "renderBoardRail(pageRows, rows, pageCount, needle)" in body
+        # The filter drives the same rows the tabs, pager, and counts describe.
+        assert "return boardMatches(e, needle);" in body
         # A narrowed list rarely contains the page you were on.
         assert "boardView.page = 1;" in body
-
-        # Rail rows resolve against lastEntries, the array openModal indexes.
-        assert 'data-rail-i="' in body
-        assert 'openModal(+hit.getAttribute("data-rail-i"))' in body
-        assert "lastEntries.indexOf(e)" in body
-
-        # The champion is a card, and only when the list is unfiltered page one.
-        assert 'class="rail-leader"' in body
-        assert "var champion = !needle && boardView.page === 1" in body
+        assert "No miner matches that filter." in body
+        # It lives on the board's own toolbar, not in a sidebar.
+        assert '<div class="board-toolbar">' in body
 
     async def test_memory_timeline_plots_the_field_and_crowns_the_champion(
         self,
