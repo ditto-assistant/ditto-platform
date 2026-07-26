@@ -30,6 +30,15 @@ def bearer_digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+USAGE_ACCOUNTING_VERSION = 2
+"""The metering contract new grants are booked under.
+
+Bumped when what gets *recorded* as a grant's token usage changes, so that a
+total is never silently compared across two different meters. See
+``InferenceGrant.usage_accounting_version``.
+"""
+
+
 async def ensure_inference_grant(
     session: AsyncSession,
     *,
@@ -128,6 +137,7 @@ async def ensure_inference_grant(
                     embedding_cost_microusd=0,
                     embedding_active_requests=0,
                     request_count=0,
+                    usage_accounting_version=USAGE_ACCOUNTING_VERSION,
                     prompt_tokens=0,
                     completion_tokens=0,
                     cost_microusd=0,
@@ -361,6 +371,7 @@ async def begin_inference_request(
     bearer: str,
     model: str,
     token_reservation: int,
+    max_chargeable_tokens: int | None = None,
     now: datetime,
     config: InferenceProxyConfig,
     request_kind: str = "chat",
@@ -716,6 +727,11 @@ async def begin_inference_request(
         request_kind=request_kind,
         model=model,
         reserved_tokens=token_reservation,
+        max_chargeable_tokens=(
+            token_reservation
+            if max_chargeable_tokens is None
+            else max(token_reservation, max_chargeable_tokens)
+        ),
         started_at=now,
     )
     try:
@@ -804,10 +820,16 @@ async def finish_inference_request(
         # charged to its reservation, including timeout and transport failure.
         prompt_tokens = request.reserved_tokens
         completion_tokens = 0
-    elif prompt_tokens + completion_tokens > request.reserved_tokens:
-        # Untrusted provider accounting cannot exceed the atomically reserved
-        # budget or overflow the grant's integer counters.
-        prompt_tokens = request.reserved_tokens
+    elif prompt_tokens + completion_tokens > request.max_chargeable_tokens:
+        # Untrusted provider accounting cannot exceed the byte-derived ceiling
+        # or overflow the grant's integer counters.
+        #
+        # Clamped against ``max_chargeable_tokens``, NOT ``reserved_tokens``.
+        # The reservation is an estimate now, and a legitimate token-dense
+        # prompt routinely lands a little above it; clamping there would mark
+        # ordinary successful calls non-deliverable and 409 them back to the
+        # harness. The ceiling is the number that is still a true bound.
+        prompt_tokens = request.max_chargeable_tokens
         completion_tokens = 0
         deliverable = False
     request.status = (
@@ -890,6 +912,7 @@ async def ticket_inference_revoked_mid_lease(
 
 
 __all__ = [
+    "USAGE_ACCOUNTING_VERSION",
     "activate_inference_grant",
     "bearer_digest",
     "InferenceDecline",

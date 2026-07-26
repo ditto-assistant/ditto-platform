@@ -2152,6 +2152,29 @@ class InferenceGrant(Base):
     active_requests: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
+    usage_accounting_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, server_default=text("1")
+    )
+    """Which metering contract booked this grant's token counters.
+
+    A token total is only comparable within the contract that produced it --
+    the same axis as ``bench_version`` for scores, and for the same reason.
+
+    ``1`` -- reservations were ``max_tokens + len(body)``, byte length used as a
+    token count, roughly 4x the truth. Any request that did not return trusted
+    provider usage (timeout, transport failure, revocation, or a stale sweep)
+    was charged that inflated figure as ``prompt_tokens``.
+
+    ``2`` -- reservations are a real token estimate, so a reclaimed request is
+    charged approximately what it cost.
+
+    Successful calls booked the provider's own numbers under both versions, so
+    the two differ only on the unsettled tail. The marker exists anyway: without
+    it, someone comparing a v1 run against a v2 run later concludes an agent got
+    dramatically more efficient when only the meter changed. There is no
+    backfill and there cannot be one -- the over-charge happened at reservation
+    time, so what those calls really consumed was never recorded.
+    """
     expires_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )
@@ -2391,6 +2414,24 @@ class InferenceRequest(Base):
     request_kind: Mapped[str] = mapped_column(Text, nullable=False, default="chat")
     model: Mapped[str] = mapped_column(Text, nullable=False)
     reserved_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    """Estimated tokens held against the grant's allowance while in flight.
+
+    An *estimate*, not a bound, since ``usage_accounting_version = 2``. It is
+    also what every reclamation path charges when a request never returns
+    trusted usage, which is why it being ~4x too large mattered: the figure was
+    not merely reserved, it was booked.
+    """
+    max_chargeable_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    """Hard ceiling on what untrusted provider accounting may claim.
+
+    Byte-derived and therefore tokenizer-independent: a token cannot consume
+    less than one byte of the UTF-8 request body. Split from ``reserved_tokens``
+    when that became an estimate -- clamping real usage to an estimate would
+    mark ordinary token-dense requests non-deliverable. Rows written before the
+    split carry the old reservation here, which *was* this same bound.
+    """
     prompt_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     completion_tokens: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0

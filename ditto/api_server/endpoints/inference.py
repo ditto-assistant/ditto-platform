@@ -104,6 +104,51 @@ _PPLX_EMBED_RESPONSE_MODEL = "pplx-embed-v1-0.6b"
 _PROVIDER_MAX_ATTEMPTS = 3
 _PROVIDER_RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
+# Bytes per token, for turning a request body into a token estimate.
+#
+# The reservation used to be ``max_tokens + len(body)`` -- byte length used
+# directly as a token count. That is a genuine upper bound (a token cannot
+# consume less than one byte of UTF-8) but it is roughly 4x the truth for the
+# JSON this lane actually carries, and it is not merely reserved: every path
+# that reclaims an unsettled request *charges* it as ``prompt_tokens``, so a
+# timeout or a stale sweep books ~4x what the call really cost.
+#
+# 4 is measured against this lane's own traffic rather than picked: the
+# calibration fleet's chat prompts run ~2,300 tokens against bodies in the
+# 8-10KB range under the o200k-family tokenizer that ``openai/gpt-oss-20b``
+# uses. English prose sits near 4, JSON escaping and code push it slightly
+# under, so this stays a mild over-estimate in the ordinary case.
+#
+# Being approximately right is safe here, and the reason is worth stating: the
+# estimate governs *admission* only. The real allowance is enforced against
+# real settled usage, both by ``begin_inference_request`` (which compares the
+# provider-reported spend) and by ``finish_inference_request`` (``spent >=
+# token_budget`` -> exhausted). An estimate that runs low can overshoot the
+# budget by at most one call per concurrent slot, never systematically.
+_ESTIMATED_BYTES_PER_TOKEN = 4
+
+
+def _estimated_tokens(body: bytes) -> int:
+    """A realistic token estimate for a request body, floored at 1."""
+    return max(1, -(-len(body) // _ESTIMATED_BYTES_PER_TOKEN))
+
+
+def _max_chargeable_tokens(body: bytes, *, output_tokens: int = 0) -> int:
+    """The tokenizer-independent hard ceiling on what this call may be charged.
+
+    This is the old reservation figure, and it keeps that job: bounding
+    *untrusted provider accounting*. A token cannot consume less than one byte
+    of the UTF-8 body, so no honest ``usage`` block can exceed it.
+
+    It is deliberately a second number rather than a reuse of the reservation.
+    Once the reservation is an estimate, a legitimate request can exceed it by a
+    little -- and ``finish_inference_request`` marks anything over its bound
+    non-deliverable, which would turn ordinary token-dense prompts into 409s.
+    Two numbers, two jobs: the estimate decides what the budget holds, the
+    ceiling decides what a provider is allowed to claim.
+    """
+    return output_tokens + max(1, len(body))
+
 
 class InferenceDeclinedError(Exception):
     """An admission refusal, carrying the machine-readable reason.
@@ -903,11 +948,15 @@ async def proxy_chat_completions(
             nonce=x_ditto_nonce,
             bearer=authorization.removeprefix("Bearer "),
             model=model,
-            # A tokenizer-independent upper bound: a token cannot consume less
-            # than one byte of the UTF-8 request body. Reserve the full body
-            # plus the permitted output before the provider call so concurrent
-            # requests cannot collectively cross the ticket budget.
-            token_reservation=max_tokens + max(1, len(body)),
+            # Reserve a realistic estimate of what this call will cost, plus the
+            # output the caller is permitted, so concurrent requests cannot
+            # collectively cross the ticket budget. The byte-length ceiling
+            # travels alongside it for the provider-accounting bound; see
+            # ``_estimated_tokens`` for why these are two numbers.
+            token_reservation=max_tokens + _estimated_tokens(body),
+            max_chargeable_tokens=_max_chargeable_tokens(
+                body, output_tokens=max_tokens
+            ),
             now=now,
             config=config,
         )
@@ -1158,7 +1207,8 @@ async def proxy_embeddings(
             nonce=x_ditto_nonce,
             bearer=authorization.removeprefix("Bearer "),
             model=config.embedding_model,
-            token_reservation=max(1, len(body)),
+            token_reservation=_estimated_tokens(body),
+            max_chargeable_tokens=_max_chargeable_tokens(body),
             now=now,
             config=admission_config,
             request_kind="embedding",
