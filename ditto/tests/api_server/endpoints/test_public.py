@@ -1159,6 +1159,113 @@ class TestPublicLeaderboard:
         assert entries[tail_id]["composite"] == pytest.approx(0.80)
         assert entries[tail_id]["official_composite"] == pytest.approx(0.85)
 
+    async def test_new_entrant_resets_waves_but_keeps_confirmation_depth(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A fresh emission-set member must not look like retest data loss.
+
+        Regression for the 2026-07-26 incident: three completed waves vanished
+        from the public board the moment a newly finalized agent entered the
+        top five. ``completed_confirmation_wave_seeds`` intersects over the
+        *current* members, so an entrant with no retests empties it board-wide.
+        Zeroing the fold-eligible count is correct -- the still-running leases
+        for the rest of the wave must not be invalidated -- but the accepted
+        rows are append-only and were never deleted, so the raw depth has to
+        survive the reset or the UI reads as though the data is gone.
+        """
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        champion_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.90, 0.90, 0.90],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        tail_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.80, 0.80, 0.80],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_C,
+                    software_version="0.28.0",
+                    protocol_version=14,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                    capabilities=_scorer_capabilities(
+                        now, versions=[DEFAULT_BENCH_VERSION]
+                    ),
+                )
+            )
+            await append_confirmation_scores(
+                s,
+                rows=[
+                    ConfirmationSeedScore(
+                        UUID(agent_id),
+                        "5V1",
+                        seed,
+                        0.90,
+                        f"r{agent_id}-{seed}",
+                        None,
+                    )
+                    for agent_id in (champion_id, tail_id)
+                    for seed in (100, 200, 300)
+                ],
+                bench_version=DEFAULT_BENCH_VERSION,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+
+        before = (await client.get("/api/v1/public/leaderboard")).json()
+        assert before["continual_aggregate_active"] is True
+        settled = {entry["agent_id"]: entry for entry in before["entries"]}
+        assert settled[champion_id]["completed_wave_count"] == 3
+        assert settled[champion_id]["confirmation_seed_depth"] == 3
+        assert settled[champion_id]["confirmation_seed_composites"] == pytest.approx(
+            [0.90, 0.90, 0.90]
+        )
+
+        # A brand-new finalized agent joins the emission set with zero retests.
+        entrant_id = await _seed_k3(
+            session_maker,
+            miner="5Cq" + "z" * 45,
+            composites=[0.95, 0.95, 0.95],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 3, tzinfo=UTC),
+        )
+
+        after = (await client.get("/api/v1/public/leaderboard")).json()
+        entries = {entry["agent_id"]: entry for entry in after["entries"]}
+        # The fold-eligible view collapses board-wide: that part is by design.
+        assert entries[entrant_id]["completed_wave_count"] == 0
+        assert entries[champion_id]["completed_wave_count"] == 0
+        assert entries[champion_id]["completed_wave_composites"] == []
+        assert entries[champion_id]["aggregate_method"] == "canonical_median"
+        assert entries[champion_id]["official_composite"] == pytest.approx(0.90)
+        # ...but the append-only audit trail must still be visible.
+        assert entries[champion_id]["confirmation_seed_depth"] == 3
+        assert entries[champion_id]["confirmation_seed_composites"] == pytest.approx(
+            [0.90, 0.90, 0.90]
+        )
+        assert entries[tail_id]["confirmation_seed_depth"] == 3
+        assert entries[entrant_id]["confirmation_seed_depth"] == 0
+        assert entries[entrant_id]["confirmation_seed_composites"] == []
+
     async def test_marks_deregistered_scores_retained_but_emission_ineligible(
         self,
         app: FastAPI,

@@ -458,6 +458,30 @@ class PublicLeaderboardEntry(BaseModel):
     completed_wave_composites: list[Annotated[float, Field(ge=0.0, le=1.0)]] = Field(
         default_factory=list
     )
+    confirmation_seed_depth: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Raw count of distinct seeds this submission has accepted "
+                "continual-retest evidence for, independent of whether the "
+                "cohort wave those seeds belong to is complete. A wave only "
+                "completes once every current emission-set member has a result "
+                "for the same seed, so a new entrant with no retests yet drops "
+                "``completed_wave_count`` to zero for the whole board while "
+                "this count -- the append-only audit trail -- keeps growing."
+            ),
+        ),
+    ] = 0
+    confirmation_seed_composites: list[Annotated[float, Field(ge=0.0, le=1.0)]] = Field(
+        default_factory=list,
+        description=(
+            "Per-seed median confirmation composites behind "
+            "``confirmation_seed_depth``, ordered by seed. Audit-only: these "
+            "never enter ``official_composite`` unless their seed also appears "
+            "in ``completed_wave_composites``."
+        ),
+    )
     raw_composite: Annotated[
         float | None,
         Field(

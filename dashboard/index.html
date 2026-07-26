@@ -5159,7 +5159,22 @@
     }
 
     function continualScoreChip(e) {
-      if (!e || e.aggregate_method !== "continual_mean") return "";
+      if (!e) return "";
+      // A wave completes only when every *current* emission-set member shares a
+      // seed, so one new entrant with no retests yet resets completed_wave_count
+      // to zero board-wide. The accepted retests are still on file, so show the
+      // pending state rather than letting the chip vanish and read as data loss.
+      if (e.aggregate_method !== "continual_mean") {
+        var pending = Number(e.confirmation_seed_depth) || 0;
+        if (!pending) return "";
+        var pendingTitle = "Recorded " + pending + " continual-retest " +
+          (pending === 1 ? "seed" : "seeds") + " for this agent, but no cohort wave " +
+          "is complete: a wave counts only once every current emission-set member " +
+          "has a result for the same seed, and that resets whenever the set changes. " +
+          "The initial three-score median stays authoritative meanwhile.";
+        return '<span class="rollout-chip tip" tabindex="0" data-tooltip="' + esc(pendingTitle) + '">' +
+          esc(pending + (pending === 1 ? " retest seed" : " retest seeds") + " · wave pending") + '</span>';
+      }
       var waves = Number(e.completed_wave_count) || 0;
       var samples = Number(e.aggregate_sample_count) || (3 + waves);
       var title = "Current leaderboard score: arithmetic mean of the original three validator scores plus " +
@@ -6869,7 +6884,20 @@
         return Number(attempt.bench_version) === activeVersion;
       });
       var counts = retestAttemptCounts(currentAttempts);
-      if (!completedWaves.length && !counts.running && !counts.assigned && !counts.expired) return "";
+      // Accepted-but-not-yet-foldable retests still belong on the page: the rows
+      // are append-only and were never deleted, they are merely waiting on a
+      // cohort-wide shared seed. Keep the section when any exist.
+      var pendingSeeds = boardEntry && Array.isArray(boardEntry.confirmation_seed_composites)
+        ? boardEntry.confirmation_seed_composites.map(Number).filter(Number.isFinite)
+        : [];
+      var pendingDepth = Math.max(
+        Number(boardEntry && boardEntry.confirmation_seed_depth) || 0,
+        pendingSeeds.length
+      );
+      if (
+        !completedWaves.length && !pendingDepth &&
+        !counts.running && !counts.assigned && !counts.expired
+      ) return "";
       var state = [];
       if (counts.running) state.push(counts.running + " running");
       if (counts.assigned) state.push(counts.assigned + " assigned");
@@ -6882,6 +6910,14 @@
             '</span>Completed cohort wave ' + esc(index + 1) + ' · consensus aggregate</span></div>' +
         '</div>';
       }).join("");
+      var pendingRows = completedWaves.length ? "" : pendingSeeds.map(function (score, index) {
+        return '<div class="accepted-score">' +
+          '<div><span class="accepted-score-value">' + fx(score) + '</span>' +
+            '<span class="accepted-score-label"><span class="bench-version-badge">' +
+              esc(benchmarkVersionLabel(benchmarkVersionKey(activeVersion))) +
+            '</span>Retest seed ' + esc(index + 1) + ' · recorded, wave not complete</span></div>' +
+        '</div>';
+      }).join("");
       var aggregate = boardEntry && boardEntry.aggregate_method === "continual_mean"
         ? '<p class="accepted-score-final">Current leaderboard score: ' + fx(boardEntry.official_composite) +
           ' · arithmetic mean of the initial three scores plus ' + esc(boardEntry.completed_wave_count) +
@@ -6891,6 +6927,10 @@
         ? '<p class="accepted-score-note">' + esc(completedWaves.length) + ' full cohort ' +
           (completedWaves.length === 1 ? 'wave is' : 'waves are') +
           ' recorded. The initial three-score median remains authoritative until the compatible continual-mean rollout activates.</p>'
+        : pendingDepth
+        ? '<p class="accepted-score-note">' + esc(pendingDepth) + ' retest ' +
+          (pendingDepth === 1 ? 'seed is' : 'seeds are') +
+          ' recorded for this agent, but no cohort wave is complete: a wave counts only once every current emission-set member has a result for the same seed, so it resets whenever that set changes. The rows below are the append-only audit trail and were not discarded; the initial three-score median drives its leaderboard position meanwhile.</p>'
         : '<p class="accepted-score-note">No full cohort wave has completed for this agent yet, so the initial three-score median still drives its leaderboard position.</p>';
       return '<section class="pipeline-section" aria-labelledby="pipeline-confirmation-scores">' +
         '<div class="pipeline-section-heading"><h4 id="pipeline-confirmation-scores">Continual top-five retests</h4>' +
@@ -6899,7 +6939,11 @@
         aggregate +
         '<p class="accepted-score-note">The initial quorum remains immutable provenance. The current leaderboard score continually adjusts up or down as full cohort waves complete.</p>' +
         '<p class="accepted-score-note">Only completed cohort-wave aggregates are shown here. Partial, legacy, and superseded raw retest rows remain in the audit ledger but are omitted from the score list.</p>' +
-        (rows ? '<div class="accepted-score-list">' + rows + '</div>' : '<p class="pipeline-detail-state">No completed continual retest wave yet.</p>') +
+        (rows
+          ? '<div class="accepted-score-list">' + rows + '</div>'
+          : pendingRows
+          ? '<div class="accepted-score-list">' + pendingRows + '</div>'
+          : '<p class="pipeline-detail-state">No completed continual retest wave yet.</p>') +
       '</section>';
     }
 
