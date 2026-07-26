@@ -20,6 +20,16 @@ an admitted carryover agent always already has the dataset that
 deliberately *not* true: a bare dataset is not admission evidence, so a routine
 policy rescreen that regenerates one cannot self-admit a historical submission.
 
+**Retirement wins over adoption.** Retiring a stranded submission (see
+:mod:`ditto.db.queries.retirement`) and carrying it over are opposite remedies
+for the same rows, so exactly one of them may apply. Adoption writes a
+carryover row, which is an admission disjunct and therefore makes the submission
+ineligible for retirement; conversely
+:func:`stranded_prev_gen_candidates` filters retired rows out, so turning this
+policy on can never silently resurrect work an operator has already closed out.
+Retirement is the stronger claim because it carries a named actor and a reason;
+undoing one is a deliberate operator act, not a side effect of a policy flag.
+
 **Adoption adds no new gate.** In particular it does not introduce a rescreening
 requirement. ``issue_ticket`` already refuses to lease an agent whose
 ``screening_policy_version`` is below :data:`SCREENING_POLICY_VERSION`, so an
@@ -56,6 +66,7 @@ from ditto.db.models import (
 from ditto.db.queries.audit import benchmark_contract_refresh_event
 from ditto.db.queries.benchmark_admission import validator_queue_admission_predicate
 from ditto.db.queries.benchmark_rollout import DatasetPin, append_rollout_audit
+from ditto.db.queries.retirement import retirement_admission_predicate
 from ditto.db.queries.retry_state import classify_agent_retry_states
 from ditto.db.queries.scores import SCORING_QUORUM, emission_owner_key
 
@@ -214,6 +225,14 @@ async def stranded_prev_gen_candidates(
             # into. Either withdrawal is the miner asking to be left alone.
             validator_queue_admission_predicate(bench_version=rollout.from_version),
             validator_queue_admission_predicate(bench_version=rollout.desired_version),
+            # Retirement is the opposite remedy for these exact rows: an
+            # operator has already declared this submission's generation closed,
+            # with an actor and a reason on the record. Enabling carryover later
+            # must never silently un-retire it, so adoption skips it. Scoped to
+            # ``from_version`` because that is the era a retirement names; a
+            # retirement can only ever be written against an era older than the
+            # active one, so a desired-version row cannot exist.
+            retirement_admission_predicate(bench_version=rollout.from_version),
         )
         .order_by(
             # Demonstrated progress first: a 2-of-3 has proven it can run, a

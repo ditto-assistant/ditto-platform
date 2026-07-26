@@ -627,8 +627,9 @@ class TestDashboard:
         )
         assert 'below_score_floor: ["Low-priority completion", "warn"]' in body
         assert 'not_queued: ["Historical · not queued", ""]' in body
+        assert 'retired: ["Retired · earlier benchmark", ""]' in body
         assert 'under_review: ["Operator review", "warn"]' in body
-        assert '"below_score_floor", "not_queued", "under_review"' in body
+        assert '"below_score_floor", "not_queued", "retired", "under_review"' in body
         assert "var provisionalScores = e.provisional_scores || [];" in body
         assert "if (!provisionalScores.length || !Number.isFinite(scoreFloor))" in body
         assert (

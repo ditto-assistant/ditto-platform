@@ -2833,7 +2833,7 @@
     };
     var ACTIVITY_STATUSES = [
       "waiting_screening", "screening", "waiting_validator", "evaluating",
-      "below_score_floor", "not_queued", "under_review", "rejected", "scored", "live"
+      "below_score_floor", "not_queued", "retired", "under_review", "rejected", "scored", "live"
     ];
     var activityStatuses = [];
     var activityQuery = "";
@@ -6055,6 +6055,7 @@
         evaluating: ["Evaluating", "progress"],
         below_score_floor: ["Low-priority completion", "warn"],
         not_queued: ["Historical · not queued", ""],
+        retired: ["Retired · earlier benchmark", ""],
         scored: ["Scored", "good"],
         live: ["Live", "good"],
         under_review: ["Operator review", "warn"],
@@ -6068,6 +6069,7 @@
       var quorum = Math.max(1, Number(e.quorum) || 3);
       if (e.status === "below_score_floor") return count + " of " + quorum + " · queued last";
       if (e.status === "not_queued") return "Not in active benchmark queue";
+      if (e.status === "retired") return count + " of " + quorum + " · benchmark closed";
       var hasStarted = count > 0 || ["waiting_validator", "evaluating", "scored", "live", "under_review"].indexOf(e.status) >= 0;
       return hasStarted ? count + " of " + quorum : "Not started";
     }
@@ -6141,6 +6143,9 @@
       }
       if (e.status === "not_queued") {
         return "This historical submission is retained for audit history but is not admitted to the active benchmark queue. It cannot consume validator capacity unless an explicit audited recovery admits it.";
+      }
+      if (e.status === "retired") {
+        return "This submission was entered for an earlier benchmark generation. The subnet has since moved to a newer benchmark, and validators only score the current one, so no further scores will arrive for it. Nothing here was rejected and nothing was lost: the submission, its screening record, and the " + count + " score" + (count === 1 ? "" : "s") + " it did receive stay on file and searchable. Submitting against the current benchmark starts fresh with a full quorum.";
       }
       if (e.status === "waiting_screening") return "Queued for a screener to claim under the current policy.";
       if (e.status === "screening") return "A screener is currently checking this submission.";

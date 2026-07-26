@@ -30,6 +30,7 @@ from ditto.db.models import (
     BenchmarkRollout,
     EvaluationPayment,
     Score,
+    SubmissionRetirement,
     ValidatorTicket,
 )
 from ditto.db.queries.benchmark_admission import activated_rollout_for_version
@@ -294,6 +295,57 @@ class TestPreviewMatchesAllocator:
         assert entries[other].gate is None
         assert entries[parked].rank > entries[other].rank
         assert await _allocator_pick(session) != parked
+
+    @pytest.mark.integration
+    async def test_a_retired_submission_is_excluded_from_both(
+        self, session: AsyncSession
+    ) -> None:
+        """Retirement is a real queue exclusion, not just a public label.
+
+        The exclusion lives in ``queue_candidate_predicate`` rather than at
+        ``issue_ticket``'s call site precisely so it cannot hold for one side
+        and not the other: a row the allocator will never lease again must not
+        be ranked by the preview as though it were next.
+        """
+        retired = await _seed_agent(
+            session,
+            name="retired",
+            hotkey="5RetiredHotkey",
+            coldkey="5RetiredColdkey",
+            created_at=_NOW - timedelta(hours=10),
+        )
+        live = await _seed_agent(
+            session,
+            name="live",
+            hotkey="5LiveHotkey",
+            coldkey="5LiveColdkey",
+            created_at=_NOW - timedelta(hours=1),
+        )
+        async with session.begin():
+            session.add(
+                SubmissionRetirement(
+                    retirement_id=uuid4(),
+                    agent_id=retired,
+                    bench_version=_BENCH,
+                    superseded_by_version=_BENCH + 1,
+                    actor="operator",
+                    reason="the generation this was queued against has closed",
+                    expected_snapshot="waiting_validator",
+                    score_count=0,
+                    ticket_snapshot=[],
+                )
+            )
+
+        entries = await _preview_entries(session, agent_ids=[retired, live])
+        # The preview gates rather than drops, so the row still carries a
+        # reason. ``/activity`` never even sends it here -- a retired row is not
+        # in the waiting population -- but the two layers must agree if it does.
+        assert entries[retired].gate == "not_leasable"
+        assert entries[live].gate is None
+        assert entries[retired].rank > entries[live].rank
+        # The older row would otherwise be leased first; retirement is the only
+        # reason the allocator skips it.
+        assert await _allocator_pick(session) == live
 
 
 class TestHistoricalDivergences:

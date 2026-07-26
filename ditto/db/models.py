@@ -2608,6 +2608,92 @@ class ValidatorQueueWithdrawal(Base):
     )
 
 
+class SubmissionRetirement(Base):
+    """One audited close-out of a submission whose benchmark era has ended.
+
+    Retirement is a *generational* fact, not a verdict. It records that the
+    benchmark version this submission was queued against is no longer the
+    active one, so no validator will ever issue it another ticket: the era
+    closed underneath it. The payment, artifact, screening record, accepted
+    scores and ticket history are all preserved, and the row stays visible and
+    searchable on the submissions page.
+
+    Deliberately a sibling of :class:`ValidatorQueueWithdrawal` rather than a
+    reuse of it. The two answer different questions and a reader must be able to
+    tell them apart:
+
+    * a **withdrawal** says the submission burned its slots and can no longer
+      reach quorum on its own; it is scoped to a benchmark version because a
+      later era is a fresh eligibility decision.
+    * a **retirement** says the submission never got the chance, because the
+      subnet moved to a newer benchmark generation. It names the version that
+      closed (``bench_version``) and the version that superseded it
+      (``superseded_by_version``), so the miner-facing copy can say which
+      generation their work belonged to.
+
+    Retirement is also deliberately *not* an :class:`AgentStatus` value. That
+    enum is the screener/platform wire contract shipped by
+    ``ditto-screening-protocol``, and :data:`SCOREABLE_AGENT_STATUSES` feeds the
+    score ledger. Introducing a status would change scoring semantics for a
+    display problem. The agent row keeps ``status = evaluating``; this table is
+    what the queue predicates and the public projection read.
+    """
+
+    __tablename__ = "submission_retirements"
+
+    retirement_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    superseded_by_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    score_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    ticket_snapshot: Mapped[list[dict]] = mapped_column(_JSON_VARIANT, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="RESTRICT",
+            name="submission_retirements_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "bench_version > 0",
+            name="submission_retirements_bench_version_positive",
+        ),
+        CheckConstraint(
+            "superseded_by_version > bench_version",
+            name="submission_retirements_superseded_by_is_newer",
+        ),
+        CheckConstraint(
+            "score_count >= 0",
+            name="submission_retirements_score_count_nonnegative",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="submission_retirements_actor_length",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="submission_retirements_reason_length",
+        ),
+        UniqueConstraint(
+            "agent_id",
+            "bench_version",
+            name="submission_retirements_agent_bench_key",
+        ),
+        Index(
+            "submission_retirements_created_idx",
+            "created_at",
+            "retirement_id",
+        ),
+    )
+
+
 class ValidatorRequestNonce(Base):
     """A recently consumed signed validator request nonce.
 
