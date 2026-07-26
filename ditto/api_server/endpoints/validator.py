@@ -574,6 +574,7 @@ async def _issue_source_backfill_ticket(
     heartbeat: ValidatorHeartbeat | None,
     validator_hotkey: str,
     now: datetime,
+    active_version: int,
     artifact_mode: Literal["legacy", "prefer_screened", "screened_only"],
     validator_running_benchmark: bool,
     slot_id: str,
@@ -591,6 +592,15 @@ async def _issue_source_backfill_ticket(
     desired-era queue. A lease already in flight is never revoked -- the gate
     guards new admission, not resumption, because expiring a running benchmark
     would burn a retry attempt for a submission that did nothing wrong.
+
+    ``active_version`` is the era the fleet is actually scoring. While a rollout
+    is open it equals ``rollout.from_version``, and this lane does what it was
+    written for (#362): keep a source-version validator busy draining the source
+    backlog instead of idling through the transition, producing scores that
+    still count. Once the rollout activates the two diverge, and every ticket
+    this lane issues is for an era nobody will ever score again -- see
+    ``PrevGenCarryoverSettings.allow_retired_era_backfill``, which is why that
+    setting ships OFF.
     """
     if heartbeat is None or not heartbeat_supports_version(
         heartbeat, now=now, version=rollout.from_version
@@ -636,8 +646,23 @@ async def _issue_source_backfill_ticket(
         )
     if resume_only:
         return None
-    # New retired-era admission only. Checked before the fleet lock so a poll
-    # that is going to decline anyway does not serialize behind one that is not.
+    # Everything below is NEW admission. A retired era gets none of it.
+    #
+    # `_prev_gen_lane_open` cannot stand in for this. It asks whether any
+    # desired-era work is leasable *right now*, and "nothing leasable this
+    # instant" is not "the desired era is finished": owner serialization, the
+    # per-(agent, version, validator) rule and quorum-sized capable fleets all
+    # make a deep v7 queue momentarily unleasable, at which point that gate
+    # correctly reports drained and this lane fills the fleet with tickets for a
+    # version that will never be scored again. Priority was the wrong axis --
+    # a retired era does not need to be last, it needs to be never.
+    if (
+        rollout.from_version != active_version
+        and not carryover_settings.allow_retired_era_backfill
+    ):
+        return None
+    # Checked before the fleet lock so a poll that is going to decline anyway
+    # does not serialize behind one that is not.
     if not await _prev_gen_lane_open(
         session, rollout=rollout, now=now, settings=carryover_settings
     ):
@@ -1941,6 +1966,7 @@ async def request_job(
                     heartbeat=heartbeat,
                     validator_hotkey=payload.validator_hotkey,
                     now=now,
+                    active_version=canonical_version,
                     artifact_mode=artifact_mode,
                     validator_running_benchmark=slot_running_benchmark,
                     slot_id=slot_id,
@@ -2010,14 +2036,18 @@ async def request_job(
                 # and ordinary work all had first claim above. Reusing
                 # issue_ticket preserves its bounded 2/3 contender, then 1/3,
                 # then 0/3 ordering and every duplicate/owner/slot guard for
-                # this low-priority second queue. Keep doing so after activation
-                # until the source-era backlog is empty.
+                # this low-priority second queue.
+                #
+                # Only while the source era is still the active one. After
+                # activation the retired era is off by default and an operator
+                # has to ask for it by name; the helper holds that line.
                 ticket = await _issue_source_backfill_ticket(
                     session,
                     rollout=source_backfill_rollout,
                     heartbeat=heartbeat,
                     validator_hotkey=payload.validator_hotkey,
                     now=now,
+                    active_version=canonical_version,
                     artifact_mode=artifact_mode,
                     validator_running_benchmark=slot_running_benchmark,
                     slot_id=slot_id,

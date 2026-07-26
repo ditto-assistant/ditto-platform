@@ -60,6 +60,18 @@ class TestQueuePolicyBoundsMatchQueueConstants:
         assert carryover.dedupe_scope == "coldkey"
         assert carryover.require_cohort_complete is True
 
+    def test_a_retired_era_is_not_backfilled_by_default(self) -> None:
+        """The one default here that is NOT the pre-existing behaviour.
+
+        A knob that ships matching today's behaviour fixes nothing: the fleet
+        keeps spending slots on a benchmark version no quorum will ever accept
+        until somebody remembers to go and turn it off.
+        """
+        assert PrevGenCarryoverSettings().allow_retired_era_backfill is False
+        assert QueuePolicySettings().prev_gen_carryover.allow_retired_era_backfill is (
+            False
+        )
+
 
 class TestLaneDecision:
     """One implementation of the lane rotation, so no projection can drift."""

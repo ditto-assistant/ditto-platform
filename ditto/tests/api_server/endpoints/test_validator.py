@@ -99,6 +99,9 @@ from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
 )
+from ditto.db.queries.queue_policy_settings import (
+    insert_queue_policy_settings_revision,
+)
 from ditto.db.queries.tickets import MAX_INFRA_RETRY_GRANTS
 
 # Real dev keypairs: sign for real so _verify_signature runs end to end. The k=3
@@ -657,6 +660,37 @@ def _install_db(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
             yield s
 
     app.dependency_overrides[get_session] = _session
+
+
+async def _enable_retired_era_backfill(
+    app: FastAPI, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """Re-open the retired-era source-backfill lane the way an operator would.
+
+    Writes a real queue-policy revision and lets the endpoint's own resolver
+    pick it up, rather than patching the resolved policy in. A knob is only a
+    knob if the path from the settings board to the lane is unbroken, and that
+    path is what this exercises.
+    """
+    settings = QueuePolicySettings(
+        prev_gen_carryover=PrevGenCarryoverSettings(allow_retired_era_backfill=True)
+    )
+    payload = settings.model_dump(mode="json")
+    async with maker() as session, session.begin():
+        await insert_queue_policy_settings_revision(
+            session,
+            parent_revision=0,
+            scope="*",
+            settings=payload,
+            checksum=hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            reason="test: reopen the retired-era source backfill",
+            actor="test",
+        )
+    # The resolver reads through app.state, not the request session override.
+    app.state.session_maker = maker
+    app.state.queue_policy_settings.invalidate()
 
 
 def _install_chain(
@@ -2940,12 +2974,16 @@ class TestRequestJob:
     async def test_source_backfill_declines_while_the_new_era_has_work(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Retired-era work is strictly last, fleet-wide -- not per validator.
+        """Previous-generation work is strictly last, fleet-wide.
 
         Reaching this helper only means the polling validator's own new-era
         lanes came back empty, which happens constantly while the queue is deep.
         Leasing a v6 artifact on that evidence takes a slot away from a v7 queue
         the validator simply could not see.
+
+        Scoped to an OPEN rollout (``active_version`` is still the source era),
+        because that is the only shape where the drain gate is the deciding one.
+        Once v7 activates the era gate below refuses first, and always.
         """
         now = datetime.now(UTC)
         rollout = MagicMock(
@@ -2983,6 +3021,7 @@ class TestRequestJob:
             heartbeat=MagicMock(),
             validator_hotkey="validator-a",
             now=now,
+            active_version=6,
             artifact_mode="screened_only",
             validator_running_benchmark=False,
             slot_id="slot-1",
@@ -2993,13 +3032,130 @@ class TestRequestJob:
         issue.assert_not_awaited()
         outstanding.assert_awaited()
 
+    async def test_source_backfill_never_tickets_a_retired_era(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After activation the source era is not last, it is closed.
+
+        Every other gate is deliberately wide open here -- the desired era is
+        drained, the cohort is complete, the heartbeat serves v6 -- so the only
+        thing that can decline is the era itself. This is the shape the fleet
+        was actually in when three of one validator's four slots were running
+        v6 benchmarks whose scores no quorum would ever accept.
+        """
+        now = datetime.now(UTC)
+        rollout = MagicMock(
+            rollout_id=uuid4(), from_version=6, desired_version=7, cohort_size=10
+        )
+        session = AsyncMock()
+        session.get_bind = MagicMock(
+            return_value=MagicMock(dialect=MagicMock(name="sqlite"))
+        )
+        session.scalar = AsyncMock(return_value=None)
+        issue = AsyncMock(return_value=MagicMock())
+        outstanding = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.heartbeat_supports_version",
+            MagicMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.rollout_cohort_complete",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr("ditto.api_server.endpoints.validator.issue_ticket", issue)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.desired_era_work_outstanding",
+            outstanding,
+        )
+
+        blocked = await _issue_source_backfill_ticket(
+            session,
+            rollout=rollout,
+            heartbeat=MagicMock(),
+            validator_hotkey="validator-a",
+            now=now,
+            active_version=7,
+            artifact_mode="screened_only",
+            validator_running_benchmark=False,
+            slot_id="slot-1",
+            carryover_settings=PrevGenCarryoverSettings(enabled=True),
+        )
+
+        assert blocked is None
+        issue.assert_not_awaited()
+        # Refused on the era, before the priority question is even asked.
+        outstanding.assert_not_awaited()
+
+    async def test_operator_can_reopen_the_retired_era_backfill(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same poll issues once the operator asks for the retired era.
+
+        Same fleet, same rollout, one field different. Without this the fix is a
+        hard-coded behaviour change that needs a deploy to undo.
+        """
+        now = datetime.now(UTC)
+        rollout = MagicMock(
+            rollout_id=uuid4(), from_version=6, desired_version=7, cohort_size=10
+        )
+        session = AsyncMock()
+        session.get_bind = MagicMock(
+            return_value=MagicMock(dialect=MagicMock(name="sqlite"))
+        )
+        session.scalar = AsyncMock(return_value=None)
+        session.scalars = AsyncMock(
+            return_value=MagicMock(all=MagicMock(return_value=[]))
+        )
+        issued = MagicMock()
+        issue = AsyncMock(return_value=issued)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.heartbeat_supports_version",
+            MagicMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.rollout_cohort_complete",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr("ditto.api_server.endpoints.validator.issue_ticket", issue)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.desired_era_work_outstanding",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator._desired_era_capable_hotkeys",
+            AsyncMock(return_value={"validator-a"}),
+        )
+
+        ticket = await _issue_source_backfill_ticket(
+            session,
+            rollout=rollout,
+            heartbeat=MagicMock(),
+            validator_hotkey="validator-a",
+            now=now,
+            active_version=7,
+            artifact_mode="screened_only",
+            validator_running_benchmark=False,
+            slot_id="slot-1",
+            carryover_settings=PrevGenCarryoverSettings(
+                enabled=True, allow_retired_era_backfill=True
+            ),
+        )
+
+        assert ticket is issued
+        assert issue.await_args is not None
+        assert issue.await_args.kwargs["bench_version"] == 6
+
     async def test_source_backfill_resumes_a_live_lease_despite_the_gate(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The gate guards new admission, never a benchmark already running.
+        """The gates guard new admission, never a benchmark already running.
 
         Declining to resume would strand the lease until it expired and burn a
-        retry attempt for a submission that did nothing wrong.
+        retry attempt for a submission that did nothing wrong. Run against a
+        RETIRED era (``active_version`` has moved past ``from_version``) with the
+        lane switched off, because that is the state the fleet is in now: the
+        v6 benchmarks already mid-flight when this shipped keep their leases and
+        finish or expire on their own. Stopping new issuance is the whole fix.
         """
         now = datetime.now(UTC)
         rollout = MagicMock(
@@ -3032,6 +3188,7 @@ class TestRequestJob:
             heartbeat=MagicMock(),
             validator_hotkey="validator-a",
             now=now,
+            active_version=7,
             artifact_mode="screened_only",
             validator_running_benchmark=True,
             slot_id="slot-1",
@@ -3070,6 +3227,7 @@ class TestRequestJob:
             heartbeat=heartbeat,
             validator_hotkey="validator-a",
             now=now,
+            active_version=6,
             artifact_mode="screened_only",
             validator_running_benchmark=False,
             slot_id="slot-1",
@@ -3083,6 +3241,7 @@ class TestRequestJob:
             heartbeat=heartbeat,
             validator_hotkey="validator-a",
             now=now,
+            active_version=6,
             artifact_mode="screened_only",
             validator_running_benchmark=False,
             slot_id="slot-1",
@@ -3100,12 +3259,20 @@ class TestRequestJob:
             slot_id="slot-1",
         )
 
-    async def test_activated_v7_capacity_one_backfills_and_reserves_fleet_slot(
+    async def test_activated_v7_retires_v6_until_an_operator_asks_for_it(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
+        """v6 is retired: no new lease for it, knob or no knob asked first.
+
+        The rollout below has ACTIVATED, so no v6 score will ever join a quorum
+        again. Every ticket the source-backfill lane issues here is a validator
+        slot spent on a number nobody will read. Once an operator asks for the
+        lane by name, the rest of its contract -- the fleet reservation, resume,
+        and a v6 quorum that still finalizes into the v6 ledger -- is unchanged.
+        """
         now = datetime.now(UTC)
         cohort = (
             await _seed_top5_emission_set(
@@ -3258,6 +3425,30 @@ class TestRequestJob:
             json=_job_payload(_DAVE, slot_id="slot-0"),
         )
         assert ineligible_source_only.status_code == 204
+
+        # Default policy: the era is retired, so the lane issues nothing --
+        # even though every other gate it has (cohort complete, capable
+        # heartbeat, an empty v7 queue, spare fleet capacity) is wide open.
+        retired = await client.post(
+            "/api/v1/validator/job",
+            headers=_AUTH_HEADER,
+            json=_job_payload(slot_id="slot-0"),
+        )
+        assert retired.status_code == 204
+        async with session_maker() as session:
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(ValidatorTicket)
+                    .where(
+                        ValidatorTicket.bench_version == 6,
+                        ValidatorTicket.status == TicketStatus.ISSUED,
+                    )
+                )
+                == 0
+            )
+
+        await _enable_retired_era_backfill(app, session_maker)
 
         primary = await client.post(
             "/api/v1/validator/job",
