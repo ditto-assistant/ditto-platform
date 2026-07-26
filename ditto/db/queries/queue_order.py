@@ -76,6 +76,7 @@ from ditto.db.models import (
     BenchmarkRollout,
     EvaluationPayment,
     Score,
+    ValidatorHeartbeat,
     ValidatorTicket,
 )
 from ditto.db.queries.benchmark_admission import (
@@ -680,6 +681,28 @@ async def owner_live_lease_agent_ids(
     )
 
 
+async def quorum_capable_validator_hotkeys(
+    session: AsyncSession, *, bench_version: int, now: datetime
+) -> set[str]:
+    """Validators whose fresh signed heartbeat advertises ``bench_version``.
+
+    The fleet that could actually contribute a score at this version, which is
+    the denominator for asking whether a submission can still reach quorum.
+    Same notion of "capable" the previous-generation gate feeds into
+    :func:`~ditto.db.queries.desired_era_backlog.desired_era_work_outstanding`.
+
+    Read once per issuance or preview and passed down, so the owner loop in
+    :func:`preview_queue_order` does not re-read the heartbeat table per owner.
+    """
+    from ditto.db.queries.benchmark_rollout import heartbeat_supports_version
+
+    return {
+        heartbeat.validator_hotkey
+        for heartbeat in (await session.scalars(select(ValidatorHeartbeat))).all()
+        if heartbeat_supports_version(heartbeat, now=now, version=bench_version)
+    }
+
+
 async def selected_owner_agent_id(
     session: AsyncSession,
     *,
@@ -688,6 +711,7 @@ async def selected_owner_agent_id(
     now: datetime,
     provisional_contender_floor: float | None,
     rollout: BenchmarkRollout | None,
+    capable_validator_hotkeys: Collection[str],
 ) -> UUID | None:
     """This owner's pinned generation, or ``None`` when none has started.
 
@@ -697,7 +721,8 @@ async def selected_owner_agent_id(
     every eligible validator away from finishing the first generation.
     Historical overlaps converge deterministically on the generation whose
     accepted/live progress began first. Expired-only attempts do not pin an
-    owner, so failed work can still drain.
+    owner, so failed work can still drain -- and neither does a generation that
+    can no longer reach quorum, see ``owner_quorum_reachable`` below.
     """
     sibling_agent = aliased(Agent)
     sibling_payment = aliased(EvaluationPayment)
@@ -728,6 +753,69 @@ async def selected_owner_agent_id(
         .correlate(sibling_agent)
         .scalar_subquery()
     )
+    # Pinning asks "did this generation start progress?" -- but the slot it
+    # holds is only worth holding if the generation can still *finish*. A
+    # capable validator that has spent its retry budget on a submission is a
+    # quorum slot nobody can ever fill, so once enough of them are gone the
+    # submission is structurally dead: it can never reach SCORING_QUORUM, yet
+    # "it started first" kept it pinned and left the owner's healthy siblings
+    # unleasable while fleet slots sat idle. With three v7-capable validators
+    # and a quorum of three, one exhausted validator is already fatal.
+    #
+    # A live lease, a recorded score, and a retry cooldown all still lead to a
+    # score, so none of them subtract from the ceiling -- only a spent budget
+    # does. That is deliberately narrower than
+    # ``desired_era_work_outstanding``'s ``blocked_validators``, which asks
+    # "could a validator take this agent *right now*"; reusing that here would
+    # unpin a generation that is merely mid-lease or cooling down, which is
+    # exactly the mid-quorum diversion pinning exists to prevent. Both share
+    # one definition of a spent budget in :func:`retry_budget_spent`.
+    #
+    # Imported lazily because :mod:`ditto.db.queries.tickets` imports this
+    # module; the budget constant belongs beside the retry rules it caps.
+    from ditto.db.queries.tickets import retry_budget_spent
+
+    owner_scored_count = (
+        select(func.count(func.distinct(ValidatorTicket.validator_hotkey)))
+        .where(
+            ValidatorTicket.agent_id == sibling_agent.agent_id,
+            ValidatorTicket.bench_version == bench_version,
+            ValidatorTicket.status == TicketStatus.SCORED,
+        )
+        .correlate(sibling_agent)
+        .scalar_subquery()
+    )
+    # Capable validators already counted in ``owner_scored_count`` or gone for
+    # good. Subtracting them from the capable fleet leaves the validators that
+    # have yet to contribute and still can, so the sum below is a true ceiling
+    # with nothing double-counted.
+    owner_spent_capable = (
+        select(func.count(func.distinct(ValidatorTicket.validator_hotkey)))
+        .where(
+            ValidatorTicket.agent_id == sibling_agent.agent_id,
+            ValidatorTicket.bench_version == bench_version,
+            ValidatorTicket.validator_hotkey.in_(set(capable_validator_hotkeys)),
+            or_(
+                ValidatorTicket.status == TicketStatus.SCORED,
+                and_(
+                    ValidatorTicket.status == TicketStatus.EXPIRED,
+                    retry_budget_spent(),
+                ),
+            ),
+        )
+        .correlate(sibling_agent)
+        .scalar_subquery()
+    )
+    capable_count = len(set(capable_validator_hotkeys))
+    # Only provable when the visible capable fleet is itself at least
+    # quorum-sized. Below that the fleet is the constraint, not the submission,
+    # and the term would condemn every generation at once -- so it switches off
+    # and the pin behaves exactly as it did before.
+    owner_quorum_reachable = (
+        (owner_scored_count + (capable_count - owner_spent_capable)) >= SCORING_QUORUM
+        if capable_count >= SCORING_QUORUM
+        else literal(True)
+    )
     return await session.scalar(
         select(sibling_agent.agent_id)
         .outerjoin(
@@ -738,6 +826,7 @@ async def selected_owner_agent_id(
             sibling_agent.status == AgentStatus.EVALUATING,
             linkage.same_owner_predicate(agent=sibling_agent, payment=sibling_payment),
             owner_progress_started_at.is_not(None),
+            owner_quorum_reachable,
             (
                 owner_first_score >= provisional_contender_floor
                 if provisional_contender_floor is not None
@@ -872,6 +961,11 @@ async def preview_queue_order(
     # questions are asked once per distinct owner rather than once per rank.
     selected_by_owner: dict[tuple[str, ...], UUID | None] = {}
     leased_by_owner: dict[tuple[str, ...], set[UUID]] = {}
+    # Read once for the whole preview: the pin's reachability term needs the
+    # capable fleet, and it is the same fleet for every owner in this pass.
+    capable_hotkeys = await quorum_capable_validator_hotkeys(
+        session, bench_version=bench_version, now=now
+    )
     gates: dict[UUID, QueueGate | None] = {}
     for agent_id in ordered:
         if agent_id in previous_generation:
@@ -893,6 +987,7 @@ async def preview_queue_order(
                 now=now,
                 provisional_contender_floor=provisional_contender_floor,
                 rollout=rollout,
+                capable_validator_hotkeys=capable_hotkeys,
             )
             leased_by_owner[owner_key] = await owner_live_lease_agent_ids(
                 session, linkage=owner, now=now
