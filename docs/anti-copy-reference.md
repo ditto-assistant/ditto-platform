@@ -15,6 +15,19 @@ bundles and that manifest together.
   Submission time is authoritative; UUID order breaks equal-time ties.
 - Lexical v2 subtracts the canonical corpus before sketching. The public Jaccard
   and containment thresholds remain `0.75` and `0.95`.
+- Lexical similarity carries no score-proximity precondition. A matching
+  fingerprint holds on its own, in either score direction and at any distance.
+  The former `0.03` composite window assumed between-seed noise of `σ ≤ 0.01`;
+  production measurement on bench_version 7 put two normalized-identical
+  artifacts `0.0768` apart with per-agent standard errors of `0.016`–`0.020`, so
+  the window made detection *less* likely the luckier a copy's re-roll was. The
+  composite delta is still recorded in the hold reason as reviewer context.
+- Score proximity remains on two rules where it is a co-signal rather than a gate
+  on evidence: the inconclusive result for an uncomparable fingerprint pair, and
+  the legacy archive-size fallback. Neither has fingerprint evidence to stand on,
+  so proximity there selects which pairs justify operator attention. A copy that
+  reaches only those paths can still escape on a lucky seed; closing that is
+  tracked with the KOTH-parameter validation work.
 - The lexical residual floor is eight shingles. Measured calibration showed that a
   floor of 16 missed a copied 12-shingle custom block, while eight retained exact
   containment for that copy. Residues below eight remain versioned empty sketches

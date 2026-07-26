@@ -510,9 +510,12 @@ class TestEvaluateAntidup:
         )
         assert decision.held is False
 
-    def test_content_dup_ignored_when_score_far(self) -> None:
-        # Near-identical content but a large score gap: outside score_tol, so the
-        # content rule does not fire (a real improvement, not a copy).
+    def test_content_dup_held_when_score_far(self) -> None:
+        # Regression: a matching lexical fingerprint holds on its own. A large
+        # score gap is NOT evidence of independence — benchmark noise moves
+        # identical code further than any plausible proximity window (see
+        # test_dittotop_v0_incident below), so the gate must not skip the
+        # comparison just because the composites are far apart.
         shared = _sk({f"{i:016x}" for i in range(20)})
         incumbent = _entry(
             composite=0.80,
@@ -529,7 +532,55 @@ class TestEvaluateAntidup:
             content_fingerprint=shared,
             eligible=[incumbent],
         )
-        assert decision.held is False
+        assert decision.held is True
+        assert decision.duplicate_of == incumbent.agent_id
+        assert "content near-duplicate" in (decision.reason or "")
+        # The delta is still reported, as context rather than as a precondition.
+        assert "composite delta 0.1000" in (decision.reason or "")
+
+    def test_dittotop_v0_incident(self) -> None:
+        """The bench_version 7 copy the old 0.03 score window let through.
+
+        Production, 2026-07-25. ``ditto-v7`` (composite 0.914322, uploaded
+        12:26:49Z) and ``dittoTop-v0`` (composite 0.837497, uploaded 13:16:51Z,
+        another miner) were **normalized-identical**: 15 of 15 files matched once
+        comments and whitespace were canonicalized. dittoTop-v0 was never held,
+        because the 0.076825 composite gap fell outside the 0.03 proximity window
+        — while ``cliM@X-v1`` (delta 0.0277) and ``dittoLife-v1`` (delta 0.0199),
+        both *less* similar, were held. Per-agent composite_stderr across these
+        four agents ran 0.016–0.020, so identical code drifts roughly 2.5x wider
+        than the window assumed; detection probability was inversely related to
+        how lucky the copy's re-roll was.
+
+        Fingerprints here are identical (Jaccard 1.0), matching the production
+        evidence for the pairs that *were* held.
+        """
+        shared = _sk({f"{i:016x}" for i in range(40)})
+        ditto_v7 = _entry(
+            composite=0.914322,
+            miner="5Fszh8YAWYdLms139nij2QHaJVMm5EjJ2mjwvjBwDkCekSdo",
+            sha256="aa" * 32,
+            size_bytes=524288,
+            content_fingerprint=shared,
+            first_seen=datetime(2026, 7, 25, 12, 26, 49, tzinfo=UTC),
+        )
+        decision = evaluate_duplicate_signals(
+            agent_id=uuid4(),
+            miner_hotkey="5F7hzMMVJhaBtWg4hHsN5g8MqbCciKr9pqK9TCqvyyGmRLw3",
+            submitted_at=datetime(2026, 7, 25, 13, 16, 51, tzinfo=UTC),
+            sha256="bb" * 32,
+            composite=0.837497,
+            # Repacked, so neither the sha256 nor the archive size matches.
+            size_bytes=524288 + 64 * 1024,
+            content_fingerprint=shared,
+            eligible=[ditto_v7],
+        )
+        assert decision.held is True
+        assert decision.duplicate_of == ditto_v7.agent_id
+        assert "content near-duplicate" in (decision.reason or "")
+        # 0.0768: wider than the retired 0.03 window and than any window a
+        # 0.016-0.020 stderr would justify.
+        assert "composite delta 0.0768" in (decision.reason or "")
 
     def test_same_miner_content_dup_not_held(self) -> None:
         # A miner iterating on their own harness shares content with themselves —

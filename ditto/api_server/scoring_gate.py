@@ -2,12 +2,15 @@
 
 SN118 artifacts are downloadable, so the central threat is copying: download
 the current best harness and resubmit it (verbatim or lightly tweaked) to
-dethrone the original. The KOTH+ATH fold already defeats a *verbatim* copy — it
-ties the incumbent, never clears the fixed composite-point margin, and first-seen
-protects the original. This gate adds cheap signals against a *lightly-tweaked*
-copy that nudges its score just past the incumbent: such a submission scores
-within a hair of the agent it surpasses and matches on the *lexical* fingerprint
-channel — a
+dethrone the original. The KOTH+ATH fold is *supposed* to defeat a verbatim copy
+by tying the incumbent and never clearing the fixed composite-point margin, with
+first-seen protecting the original — but on bench_version 7 a verbatim copy does
+not tie: two normalized-identical artifacts measured 0.0768 apart (see
+``_DEFAULT_SCORE_TOL``), so it can clear the margin in either direction on
+benchmark noise alone. That makes this gate, not the fold, the load-bearing
+defense. This gate adds cheap signals against a *lightly-tweaked*
+copy that nudges its score just past the incumbent: such a submission matches on
+the *lexical* fingerprint channel — a
 reference-aware sketch of the tarball text (:mod:`ditto.api_server.fingerprint`,
 official starter-kit scaffolding subtracted before sketching), which survives
 reindent/reformat/localized-edit and junk-file padding, compared by Jaccard
@@ -39,14 +42,29 @@ if TYPE_CHECKING:
 
     from ditto.db.queries.scores import LedgerRow
 
-# A challenger scoring within this of the incumbent it surpasses is "a hair past"
-# — the anti-copy tolerance must exceed the benchmark's between-seed composite
-# noise so a re-rolled verbatim copy cannot clear it on a lucky seed.
-# DittoBench v2 / bench_version 2 (BENCHMARK-V2 §6.2, B8) targets between-seed
-# σ ≤ 0.01 composite. The 0.03 tolerance remains intentionally broader than
-# the validator's fixed KOTH margin so a near-copy that barely clears the crown gate
-# is still held for review. Bump this tolerance if the hosted 30-seed σ comes in
-# higher (it was 0.02 for v1).
+# Score-proximity tolerance for the two rules that still use one: the
+# *inconclusive* branch of rule 2 and the legacy size fallback (rule 3). It is
+# deliberately NOT used by the lexical near-duplicate match itself — see rule 2.
+#
+# History and why it no longer gates the fingerprint match. This started as
+# "a challenger scoring within this of the incumbent it surpasses is a hair past",
+# sized as ~3σ of between-seed composite noise on the DittoBench v2 target of
+# σ ≤ 0.01 (BENCHMARK-V2 §6.2, B8; it was 0.02 for v1). That noise model is
+# falsified by production. On bench_version 7, two *normalized-identical*
+# artifacts — ditto-v7 (69ad... uploaded 2026-07-25T12:26Z, composite 0.914322)
+# and dittoTop-v0 (uploaded 50 minutes later, composite 0.837497) — scored
+# 0.0768 apart, with per-agent composite_stderr in the 0.016–0.020 band rather
+# than ≤ 0.01. Identical code therefore routinely lands ~2.5x outside this
+# window, so using score proximity as a precondition on fingerprint evidence made
+# detection probability *inversely* proportional to how lucky a copy got: the
+# luckier the re-roll, the further the score drifted, the less likely the copy was
+# ever compared. dittoTop-v0 was never held for exactly this reason.
+#
+# Where it survives, score proximity is a co-signal on weak or absent evidence
+# (archive size, or an uncomparable fingerprint pair), not a gate on strong
+# evidence — see the rule 2 inconclusive branch and rule 3. Widening it there
+# would only add holds whose sole other signal is tarball size, so it stays at
+# the historical value pending the KOTH-parameter validation task.
 _DEFAULT_SCORE_TOL = 0.03
 # A tweaked copy differs from the original by at most a few edited lines, so its
 # gzipped tarball size barely moves. 8 KiB comfortably covers small edits.
@@ -209,27 +227,38 @@ def evaluate_duplicate_signals(
        matches. Like rule 1, held on the hash equality alone — no score proximity,
        because an exact-source match is copy evidence regardless of the score it
        happened to land.
-    2. **Near-duplicate lexical fingerprint** — composites within ``score_tol``
-       *and* the lexical channel (``content_fingerprint``, reference-aware) at
-       least ``jaccard_tol`` Jaccard or ``containment_tol`` contained — survives
-       re-indent / reformat / localized edits / junk-file padding. Structural
-       (``structural_fingerprint``, whole-crate AST from dittobench — measured
-       at/above its thresholds for 12 of the 66 audited holds, concentrated in
-       the smallest-edit submissions) and prompt overlap annotate the hold's
-       audit reason as corroboration; neither triggers until reference-aware.
+    2. **Near-duplicate lexical fingerprint** — the lexical channel
+       (``content_fingerprint``, reference-aware) at least ``jaccard_tol`` Jaccard
+       or ``containment_tol`` contained — survives re-indent / reformat /
+       localized edits / junk-file padding. Like rules 1 and 1b this is held on the
+       fingerprint alone: **no score proximity**. Score similarity is not evidence
+       of copying and score dissimilarity is not evidence of independence — see
+       ``_DEFAULT_SCORE_TOL`` for the production measurement that retired the
+       precondition. Structural (``structural_fingerprint``, whole-crate AST from
+       dittobench — measured at/above its thresholds for 12 of the 66 audited
+       holds, concentrated in the smallest-edit submissions) and prompt overlap
+       annotate the hold's audit reason as corroboration; neither triggers until
+       reference-aware. When the two lexical sketches are *uncomparable* (different
+       algorithm version) the pair is inconclusive rather than matched, and that
+       branch keeps ``score_tol`` — there the tolerance triages pairs with no
+       evidence either way instead of gating evidence that already exists.
 
     3. **Size near-duplicate fallback** — composites within ``score_tol`` and
        tarball sizes within ``size_tol``, but only when neither lexical nor
        structural fingerprints are comparable. A valid negative fingerprint is
        evidence of distinct content and must not be overridden by similar archive
-       size. The fallback remains for legacy or unreadable artifacts.
+       size. The fallback remains for legacy or unreadable artifacts, and keeps
+       score proximity because archive size alone is too weak to hold on.
 
     Rules 2 and 3 check *every earlier* other-miner eligible agent, in either score
     direction, so a genuine unrelated agent scoring in between cannot mask the
-    copy. A genuine improvement (composite more than ``score_tol`` from any other
-    miner's score, with a different size and both fingerprints distinct) is never
-    held. Pure + deterministic: candidates are ordered by upload chronology, so the
-    reported ``duplicate_of`` is the oldest matching submission.
+    copy. A genuine improvement is never held by rule 2 as long as its
+    miner-authored residual is its own: after reference subtraction, clearing
+    ``jaccard_tol`` / ``containment_tol`` means sharing another miner's custom
+    surface, not the shared starter kit. Rule 3 additionally requires a different
+    size or a comparable fingerprint. Pure + deterministic: candidates are ordered
+    by upload chronology, so the reported ``duplicate_of`` is the oldest matching
+    submission.
 
     ``prompt_fingerprint`` participates in **shadow mode only**: when a hold
     fires for another reason, a high prompt overlap with the matched agent is
@@ -281,15 +310,20 @@ def evaluate_duplicate_signals(
                     reason=f"normalized-source (repack) match of agent {e.agent_id}",
                 )
 
-    # 2. Near-dup fingerprint: close in score AND a matching lexical sketch.
+    # 2. Near-dup fingerprint: a matching lexical sketch, on its own.
     #    Checked before the size rule because a fingerprint is the stronger,
     #    size-independent signal. The structural (whole-crate AST) channel
     #    saturates between independent starter-kit derivatives — astfp performs
     #    no reference subtraction — so it corroborates the audit reason instead
     #    of triggering until its sketches are reference-aware.
+    #
+    #    There is deliberately NO score-proximity precondition here. Two
+    #    normalized-identical bench_version 7 artifacts (ditto-v7 / dittoTop-v0)
+    #    scored 0.0768 apart in production, so a 0.03 window skipped the
+    #    comparison precisely when the copy got the luckiest re-roll. See
+    #    ``_DEFAULT_SCORE_TOL``. The composite delta is still reported in the
+    #    audit reason as context for the reviewer.
     for e in earlier_others:
-        if abs(composite - e.composite) > score_tol:
-            continue
         # A refreshed starter-kit corpus changes what is subtracted from the
         # sketch.  During the bounded metadata backfill, old and new corpus IDs
         # coexist.  That pair is incomparable, but incomparability is not copy
@@ -301,6 +335,15 @@ def evaluate_duplicate_signals(
         if _fingerprint_versions_incompatible(
             content_fingerprint, e.content_fingerprint
         ):
+            # Absence of evidence, not evidence: the sketches cannot be compared
+            # at all, so nothing here says "copy". Score proximity stays on this
+            # branch as triage — it decides which uncomparable pairs are worth an
+            # operator's time, rather than gating a fingerprint match that already
+            # stands on its own. Without it, every cross-version pair in the
+            # ledger would open an inconclusive review during an algorithm
+            # rollout.
+            if abs(composite - e.composite) > score_tol:
+                continue
             return ReviewDecision(
                 held=True,
                 duplicate_of=e.agent_id,
