@@ -18,6 +18,7 @@ from ditto.db.queries.confirmation_scores import (
     confirmation_composites_by_seed,
     confirmation_depths,
     confirmation_history_by_agent,
+    fold_eligible_seeds_by_agent,
 )
 
 _NOW = datetime(2026, 7, 21, 12, 0, 0, tzinfo=UTC)
@@ -124,6 +125,102 @@ class TestConfirmationAggregates:
                 third: [100],
             },
         ) == frozenset({100})
+
+    def test_a_zero_depth_entrant_empties_the_strict_intersection(self) -> None:
+        """The 03:56Z incident, as a unit test.
+
+        ``dittoLife-v1`` finalized, displaced ``banblackycat`` from the top five,
+        and brought no confirmation rows with it. Under ``strict`` that single
+        arrival erases eight waves of accumulated evidence for every other agent
+        -- and not only on the display: ``official_composite`` reverts to the
+        three-score quorum median, so validator weights revert with it.
+        """
+        deep, mid, entrant = uuid4(), uuid4(), uuid4()
+        seeds = {deep: [100, 200, 300], mid: [100, 200, 300], entrant: []}
+
+        strict = fold_eligible_seeds_by_agent(
+            member_ids=[deep, mid, entrant], seeds_by_agent=seeds, mode="strict"
+        )
+
+        assert strict[deep] == frozenset()
+        assert strict[mid] == frozenset()
+
+    def test_participants_keeps_the_evidence_the_entrant_never_ran(self) -> None:
+        """The recommended fix, on the same input.
+
+        An agent at depth zero has never been leased any of these seeds, so it is
+        not protecting a running lease. Excluding it preserves every completed
+        wave, and the two agents that DO get a continual mean still share one
+        identical seed set -- comparability is untouched.
+        """
+        deep, mid, entrant = uuid4(), uuid4(), uuid4()
+        seeds = {deep: [100, 200, 300], mid: [100, 200, 300], entrant: []}
+
+        participants = fold_eligible_seeds_by_agent(
+            member_ids=[deep, mid, entrant],
+            seeds_by_agent=seeds,
+            mode="participants",
+        )
+
+        assert participants[deep] == frozenset({100, 200, 300})
+        assert participants[mid] == frozenset({100, 200, 300})
+        # Equal composition among everyone who receives a continual mean.
+        assert participants[deep] == participants[mid]
+        assert participants[entrant] == frozenset()
+
+    def test_participants_still_waits_on_a_member_that_has_started(self) -> None:
+        """Catch-up is preserved: a partial member still narrows the wave.
+
+        This is the half of the strict rule that is genuinely protecting a
+        running lease, and ``participants`` keeps it. Only depth ZERO is treated
+        as "not in the lane yet".
+        """
+        deep, catching_up = uuid4(), uuid4()
+
+        participants = fold_eligible_seeds_by_agent(
+            member_ids=[deep, catching_up],
+            seeds_by_agent={deep: [100, 200, 300], catching_up: [100]},
+            mode="participants",
+        )
+
+        assert participants[deep] == frozenset({100})
+        assert participants[catching_up] == frozenset({100})
+
+    def test_per_agent_gives_every_agent_its_own_depth(self) -> None:
+        """Peyton's literal ask, and the comparability it costs.
+
+        Each agent keeps everything it ran. The means are then taken over
+        different seed sets, which is exactly the seed-composition confound the
+        shared-seed design exists to cancel -- hence the operator gate.
+        """
+        deep, mid, entrant = uuid4(), uuid4(), uuid4()
+
+        per_agent = fold_eligible_seeds_by_agent(
+            member_ids=[deep, mid, entrant],
+            seeds_by_agent={deep: [100, 200, 300], mid: [100], entrant: []},
+            mode="per_agent",
+        )
+
+        assert per_agent[deep] == frozenset({100, 200, 300})
+        assert per_agent[mid] == frozenset({100})
+        assert per_agent[entrant] == frozenset()
+
+    def test_strict_is_the_default_and_matches_the_legacy_helper(self) -> None:
+        """Merging this must not move a single composite."""
+        first, second, third = uuid4(), uuid4(), uuid4()
+        seeds = {first: [100, 200, 300], second: [100, 200], third: [100]}
+
+        by_agent = fold_eligible_seeds_by_agent(
+            member_ids=[first, second, third], seeds_by_agent=seeds
+        )
+        legacy = completed_confirmation_wave_seeds(
+            member_ids=[first, second, third], seeds_by_agent=seeds
+        )
+
+        # Every member resolves to the same set the single shared value held,
+        # so no composite moves when this ships.
+        assert set(by_agent.values()) == {legacy}
+        assert legacy == frozenset({100})
 
     async def test_composites_by_seed_medians_across_validators(
         self, session: AsyncSession

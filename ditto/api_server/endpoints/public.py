@@ -210,9 +210,11 @@ from ditto.db.queries.benchmark_rollout import (
     rollout_state,
 )
 from ditto.db.queries.confirmation_scores import (
-    completed_confirmation_wave_seeds,
+    DEFAULT_WAVE_MEMBERSHIP,
+    WaveMembership,
     confirmation_composites_by_seed,
     confirmation_depths,
+    fold_eligible_seeds_by_agent,
 )
 from ditto.db.queries.desired_era_backlog import prev_generation_agent_ids
 from ditto.db.queries.heartbeats import (
@@ -1616,6 +1618,7 @@ def _completed_wave_data(
     stderrs: dict[UUID, float | None],
     confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
     confirmation_depth: dict[UUID, int] | None = None,
+    wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
 ) -> tuple[list[LedgerRow], dict[UUID, dict[int, float]], dict[UUID, int]]:
     """Return canonical candidates plus only fully completed cohort-wave data."""
     by_seed = confirmation_by_seed or {}
@@ -1645,23 +1648,32 @@ def _completed_wave_data(
         if raw_projection is not None
         else ()
     )
-    completed_wave_seeds = completed_confirmation_wave_seeds(
+    eligible_by_agent = fold_eligible_seeds_by_agent(
         member_ids=[member.agent_id for member in raw_members],
         seeds_by_agent={
             agent_id: values.keys() for agent_id, values in by_seed.items()
         },
+        mode=wave_membership,
     )
     by_seed = {
         agent_id: {
             seed: value
             for seed, value in values.items()
-            if seed in completed_wave_seeds
+            if seed in eligible_by_agent.get(agent_id, frozenset())
         }
         for agent_id, values in by_seed.items()
     }
     depths = dict.fromkeys(depths, 0)
+    # Depth is reported per agent from the seeds that actually entered that
+    # agent's aggregate. Under ``strict`` and ``participants`` every member
+    # shares one set, so this is the intersection size for all of them --
+    # identical to what the old shared counter produced. Under ``per_agent``
+    # the members genuinely differ and a single shared number would be a lie.
     depths.update(
-        {member.agent_id: len(completed_wave_seeds) for member in raw_members}
+        {
+            member.agent_id: len(eligible_by_agent.get(member.agent_id, frozenset()))
+            for member in raw_members
+        }
     )
     return candidates, by_seed, depths
 
@@ -1674,6 +1686,7 @@ def _public_koth_emissions(
     confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
     confirmation_depth: dict[UUID, int] | None = None,
     include_continual_scores: bool = True,
+    wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
     quorum_values = quorum_by_agent or {}
@@ -1682,6 +1695,7 @@ def _public_koth_emissions(
         stderrs=stderrs,
         confirmation_by_seed=confirmation_by_seed,
         confirmation_depth=confirmation_depth,
+        wave_membership=wave_membership,
     )
 
     fold_entries = []
@@ -2031,6 +2045,7 @@ async def leaderboard(
         stderrs=fold_stderrs,
         confirmation_by_seed=confirmation_by_seed,
         confirmation_depth=confirmation_depth,
+        wave_membership=continual_settings.wave_membership,
     )
     official_composites = {
         row.agent_id: effective_composite(
@@ -2270,6 +2285,7 @@ async def leaderboard(
                     confirmation_depth if continual_mean_active else {}
                 ),
                 include_continual_scores=continual_mean_active,
+                wave_membership=continual_settings.wave_membership,
             )
         ),
         efficiency=_efficiency_status(efficiency_view),

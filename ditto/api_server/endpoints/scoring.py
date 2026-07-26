@@ -47,8 +47,8 @@ from ditto.api_server.koth import KothEntry, emission_set, project_koth
 from ditto.db.models import Score
 from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.confirmation_scores import (
-    completed_confirmation_wave_seeds,
     confirmation_history_by_agent,
+    fold_eligible_seeds_by_agent,
 )
 from ditto.db.queries.efficiency import get_bonus_rows
 from ditto.db.queries.heartbeats import live_validator_fleet_supports_protocol
@@ -360,12 +360,16 @@ async def scores(
         ]
     )
     raw_member_ids = [member.agent_id for member in emission_set(raw_projection)]
-    completed_wave_seeds = completed_confirmation_wave_seeds(
+    # Per agent, because ``per_agent`` membership gives each agent a different
+    # eligible set. Under ``strict`` and ``participants`` every entry maps to the
+    # same intersection, so this is the previous single set spelled per row.
+    eligible_seeds = fold_eligible_seeds_by_agent(
         member_ids=raw_member_ids or history.keys(),
         seeds_by_agent={
             agent_id: tuple(row.seed for row in agent_history)
             for agent_id, agent_history in history.items()
         },
+        mode=continual_settings.wave_membership,
     )
     generated_at = datetime.now(UTC)
     entries = [
@@ -400,7 +404,7 @@ async def scores(
                         signature=row.signature,
                     )
                     for row in history[r.agent_id]
-                    if row.seed in completed_wave_seeds
+                    if row.seed in eligible_seeds.get(r.agent_id, frozenset())
                 ]
                 if continual_mean_active and r.agent_id in history
                 else None

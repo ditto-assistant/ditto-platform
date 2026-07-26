@@ -184,10 +184,13 @@ from ditto.db.queries.benchmark_rollout import (
     rollout_cohort_complete,
 )
 from ditto.db.queries.confirmation_scores import (
+    DEFAULT_WAVE_MEMBERSHIP,
     ConfirmationSeedScore,
+    WaveMembership,
     append_confirmation_scores,
     completed_confirmation_wave_seeds,
     confirmation_composites_by_seed,
+    fold_eligible_seeds_by_agent,
 )
 from ditto.db.queries.desired_era_backlog import desired_era_work_outstanding
 from ditto.db.queries.heartbeats import (
@@ -2321,6 +2324,7 @@ async def _current_koth_entries(
     *,
     canonical_version: int,
     completed_waves_only: bool = True,
+    wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
 ) -> list[KothEntry]:
     """Build the active-version KOTH fold from canonical or completed evidence.
 
@@ -2370,11 +2374,12 @@ async def _current_koth_entries(
         for rank, row in enumerate(rows, start=1)
     ]
     raw_members = emission_set(project_koth(raw_entries))
-    completed_seeds = completed_confirmation_wave_seeds(
+    eligible_seeds = fold_eligible_seeds_by_agent(
         member_ids=[member.agent_id for member in raw_members],
         seeds_by_agent={
             agent_id: values.keys() for agent_id, values in history.items()
         },
+        mode=wave_membership,
     )
     entries: list[KothEntry] = []
     for rank, row in enumerate(rows, start=1):
@@ -2384,12 +2389,13 @@ async def _current_koth_entries(
         legacy_composites = _confirmation_composites(details)
         if legacy_seeds is not None and legacy_composites is not None:
             merged.update(zip(legacy_seeds, legacy_composites, strict=False))
+        agent_eligible = eligible_seeds.get(row.agent_id, frozenset())
         if completed_waves_only:
             merged.update(
                 {
                     seed: value
                     for seed, value in history.get(row.agent_id, {}).items()
-                    if seed in completed_seeds
+                    if seed in agent_eligible
                 }
             )
         else:
@@ -2410,7 +2416,7 @@ async def _current_koth_entries(
                 completed_wave_composites=tuple(
                     value
                     for seed, value in sorted(history.get(row.agent_id, {}).items())
-                    if seed in completed_seeds
+                    if seed in agent_eligible
                 )
                 or None,
                 confirmation_composites=(
@@ -2433,11 +2439,13 @@ async def _current_emission_set(
     *,
     canonical_version: int,
     completed_waves_only: bool = True,
+    wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
 ) -> tuple[KothEntry, ...]:
     entries = await _current_koth_entries(
         session,
         canonical_version=canonical_version,
         completed_waves_only=completed_waves_only,
+        wave_membership=wave_membership,
     )
     return emission_set(project_koth(entries))
 
@@ -2458,10 +2466,16 @@ async def _current_retest_cohort(
     Only the *cohort* half is widened by the tie band. The emission set is frozen
     consensus shared with the subnet's weight fold and is never five-plus-ties;
     an extended member is extra evidence, never an extra emission recipient.
+
+    ``settings.wave_membership`` has to match what the public board is using,
+    because the champion it produces is the seed anchor. Two different answers
+    here and on the leaderboard would derive two different seed families, and the
+    validator's confirmation would be rejected as un-anchored.
     """
     entries = await _current_koth_entries(
         session,
         canonical_version=canonical_version,
+        wave_membership=settings.wave_membership,
     )
     projection = project_koth(entries)
     statistical = settings.retest_eligibility_mode == "statistical"
@@ -2566,6 +2580,13 @@ async def _top5_confirmation_seed_plan(
         agent_ids=tuple(dict.fromkeys((*wave_member_ids, member_agent_id))),
         bench_version=canonical_version,
     )
+    # Deliberately the STRICT intersection, and not ``wave_membership``. This
+    # decides which seed to ISSUE next, not which evidence may be folded. A
+    # member at depth zero is exactly the member that still needs leasing, so
+    # excluding it here would declare the wave finished and stop the catch-up
+    # that gives a new entrant its evidence in the first place. The scoring
+    # policy widens what counts; the issuance policy must stay conservative or
+    # the two disagree about whether there is work left to do.
     completed = completed_confirmation_wave_seeds(
         member_ids=wave_member_ids,
         seeds_by_agent={

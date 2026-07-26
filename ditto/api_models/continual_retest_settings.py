@@ -13,6 +13,21 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # exists to keep exactly those five comparable, so a cohort that excluded one of
 # them would stop the lane doing its only consensus-relevant job.
 EMISSION_SET_SIZE = 5
+
+WaveMembership = Literal["strict", "participants", "per_agent"]
+
+DEFAULT_WAVE_MEMBERSHIP: WaveMembership = "participants"
+"""The shipped fold policy -- single source of truth for every default.
+
+Deliberately NOT ``strict``. Kept here, and re-exported through
+``ditto.db.queries.confirmation_scores``, so that the operator policy model and
+every helper taking a ``wave_membership`` argument cannot drift apart. That
+drift would be a live hazard rather than a tidiness concern: the champion those
+helpers derive is the seed anchor, and two answers on two paths derive two
+different seed families.
+
+See :attr:`ContinualRetestSettings.wave_membership` for why ``participants``.
+"""
 # Ceiling on how far past the emission set an operator may extend retesting.
 # Every extra member is real validator work on every wave seed, so the cap keeps
 # an accidental "retest everyone" from consuming the fleet.
@@ -33,6 +48,52 @@ class ContinualRetestSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     aggregate_mode: Literal["disabled", "fleet_ready", "enabled"] = "fleet_ready"
+
+    wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP
+    """Whose retests have to land before a seed counts toward the aggregate.
+
+    **This changes what validators weight, and it is NOT a no-op on merge.**
+    ``official_composite`` is the continual mean of the three quorum scores plus
+    one score per fold-eligible seed, so widening this widens the estimator,
+    re-orders the tail, and moves emission shares.
+
+    It ships ``participants`` -- an authorized, deliberate change to the fold,
+    made because ``strict`` is what caused the 03:56Z incident. ``strict``
+    remains available as the **rollback path**: one audited revision returns the
+    board to the historical behaviour without a redeploy.
+
+    ``strict`` intersects over every *current* emission-set member. That is the
+    pre-merge behaviour and it has a defect: a newly finalized agent entering the
+    top five with no retests of its own empties the intersection, so every other
+    agent's accumulated depth stops counting and ``official_composite`` falls
+    back to the three-score quorum median board-wide. The rows are append-only
+    and were never deleted, but the fold stops reading them. Every top-five
+    membership change discards accumulated retest signal.
+
+    ``participants`` takes the same intersection over members that hold at least
+    one confirmation row. An agent at depth zero has never been issued a lease
+    for any of these seeds, so it is not protecting one; excluding it can only
+    preserve evidence, never fabricate any. Shared-seed comparability is fully
+    intact -- every agent receiving a continual mean still shares one intersected
+    seed set. **This is the shipped default**: it fixes the incident without
+    weakening the property the intersection exists to protect. It also keeps the
+    genuinely protective half of ``strict`` -- a member that has started catching
+    up still narrows the wave, and only depth *zero* is read as "not in the lane
+    yet".
+
+    ``per_agent`` drops the intersection: each agent aggregates over its own
+    completed seeds. Most responsive, least comparable -- two agents' means are
+    then taken over different seed sets and the difference between them carries
+    a seed-composition term that common random numbers exist to cancel. Unbiased
+    under exchangeable draws, but noisier, and at a ``KOTH_MARGIN`` of 0.007 the
+    added noise is the same size as the decision it feeds.
+
+    See :func:`ditto.db.queries.confirmation_scores.fold_eligible_seeds_by_agent`
+    for the full argument. The paired dethrone test is unaffected by all three:
+    ``koth._paired_statistic`` computes its own pairwise intersection between
+    challenger and champion.
+    """
+
     idle_retests_enabled: bool = False
     rollout_standdown: Literal["off", "capable_validators", "all"] = (
         "capable_validators"
