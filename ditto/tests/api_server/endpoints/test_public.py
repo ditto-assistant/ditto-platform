@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
 )
 
+from ditto.api_models import bench_glossary as bench_glossary_data
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.public import PublicBenchmarkProgress, PublicSystemMetrics
 from ditto.api_models.screener import (
@@ -895,13 +896,25 @@ class TestPublicBenchmarkTimeline:
         body = response.json()
         assert body["metric"] == "memory_mean"
         assert body["score_quorum"] == 3
-        assert [release["bench_version"] for release in body["releases"]] == [
-            2,
-            3,
-            4,
-            5,
-            6,
-        ]
+        # The window follows the changelog, so a new contract must land here
+        # without anyone editing a list of versions — this asserts the rule, not
+        # a snapshot of today's versions.
+        expected_versions = sorted(
+            version
+            for version in sorted(
+                (
+                    int(entry["version"])
+                    for entry in bench_glossary_data.version_entries()
+                    if int(entry["version"])
+                    >= public_endpoint._TIMELINE_MIN_BENCH_VERSION
+                ),
+                reverse=True,
+            )[: public_endpoint._TIMELINE_MAX_RELEASES]
+        )
+        assert [
+            release["bench_version"] for release in body["releases"]
+        ] == expected_versions
+        assert len(expected_versions) == public_endpoint._TIMELINE_MAX_RELEASES
         assert body["releases"][0]["released_at"] == "2026-07-07T00:00:00Z"
         assert body["releases"][1]["released_at"] == "2026-07-18T14:30:00Z"
         assert body["releases"][1]["activated_at"] == "2026-07-18T16:00:00Z"
@@ -910,6 +923,44 @@ class TestPublicBenchmarkTimeline:
             second_id,
         ]
         assert [point["memory_mean"] for point in body["points"]] == [0.42, 0.72]
+
+    async def test_a_new_contract_enters_the_window_without_a_code_change(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Shipping a bench_version must put it on the timeline by itself.
+
+        This endpoint used to carry the range as a literal, which is why a live
+        contract could drive validator weights while the public chart still
+        ended a generation earlier. The window now follows the changelog and
+        drops the oldest contract rather than growing without bound.
+        """
+        _install_db(app, session_maker)
+        entries = list(bench_glossary_data.version_entries())
+        newest = int(entries[0]["version"])
+        monkeypatch.setattr(
+            bench_glossary_data,
+            "version_entries",
+            lambda: [
+                {
+                    "version": newest + 1,
+                    "epoch": "2026-08-01",
+                    "title": "A contract nobody edited this endpoint for",
+                },
+                *entries,
+            ],
+        )
+
+        body = (await client.get("/api/v1/public/bench/timeline")).json()
+
+        versions = [release["bench_version"] for release in body["releases"]]
+        assert versions[-1] == newest + 1
+        assert len(versions) == public_endpoint._TIMELINE_MAX_RELEASES
+        assert versions == sorted(versions)
+        assert min(versions) >= public_endpoint._TIMELINE_MIN_BENCH_VERSION
 
 
 class TestPublicLeaderboard:

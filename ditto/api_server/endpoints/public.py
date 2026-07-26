@@ -267,6 +267,15 @@ router = APIRouter(prefix="/public", tags=["public"])
 # short here, so a stale board is never more than a couple of minutes old.
 _CACHE_CONTROL = "public, max-age=30, stale-while-revalidate=120"
 _TIMELINE_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=3600"
+# v1 predates the memory subscore, so it has nothing to plot on this axis.
+_TIMELINE_MIN_BENCH_VERSION = 2
+# The window is bounded for two reasons that both point at the same number. The
+# read below is a per-version scan of the score ledger, so an unbounded range
+# grows more expensive with every contract that ships; and the dashboard renders
+# the contracts as an ordinal colour ramp whose adjacent steps stop being
+# distinguishable past six. Serving the newest six keeps both honest, and a new
+# bench_version enters the window with no code change.
+_TIMELINE_MAX_RELEASES = 6
 # A leaderboard pinned to a *settled* benchmark version is finished work: the
 # rollout has moved past it, so nothing routine writes to it again. It is still
 # not immutable (an ATH review or a score replacement can correct an old row),
@@ -1767,14 +1776,20 @@ async def benchmark_timeline(
     response: Response,
     session: SessionDep,
 ) -> PublicBenchmarkTimelineResponse:
-    """Running best finalized miner memory score across benchmark v2-v6."""
+    """Running best finalized miner memory score across the newest contracts.
+
+    The window follows the bench_version changelog rather than a hardcoded
+    range, so shipping a new contract puts it on the timeline on its own. See
+    :data:`_TIMELINE_MAX_RELEASES` for why it stays bounded.
+    """
 
     response.headers["Cache-Control"] = _TIMELINE_CACHE_CONTROL
+    # ``version_entries`` is newest-first, so the head of the list is the window.
     version_docs = [
         entry
         for entry in bench_glossary_data.version_entries()
-        if 2 <= int(entry["version"]) <= 6
-    ]
+        if int(entry["version"]) >= _TIMELINE_MIN_BENCH_VERSION
+    ][:_TIMELINE_MAX_RELEASES]
     rollout_rows = (
         await session.execute(
             select(

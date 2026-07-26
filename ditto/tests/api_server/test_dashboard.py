@@ -498,6 +498,63 @@ class TestDashboard:
         assert "@keyframes timeline-dot-in { from { opacity: 0;" in body
         assert ".timeline-champion-pulse { display: none; }" in body
 
+    async def test_memory_timeline_names_the_gaps_instead_of_implying_data(
+        self,
+    ) -> None:
+        """A contract can outrun both the reference runs and its own rollout.
+
+        Neither may be papered over. A reference line that simply stops reads as
+        a third-party baseline collapsing to zero, and a band drawn like every
+        settled one implies a rank that can no longer move. Both states are
+        derived from data — the harness records and /public/bench/rollout — so a
+        later contract inherits the treatment without another edit here.
+        """
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+
+        # Which contracts a reference harness covers comes from its own points,
+        # never from a hardcoded version.
+        assert "function harnessUnmeasuredVersions(evidence, shownVersions)" in body
+        assert "unmeasured: harnessUnmeasuredVersions(evidence, shownVersions)" in body
+        # The gap is stated on the plot, in the legend, in the caption, and in
+        # the exact-data table — not left as blank space.
+        assert 'class="timeline-unmeasured"' in body
+        assert '"not yet measured"' in body
+        assert "' <em>· not on ' + esc(versionList(series.unmeasured))" in body
+        assert "not a score of zero" in body
+        assert 'measured: "not yet measured", score: null' in body
+        # The line ends deliberately rather than trailing off.
+        assert 'class="timeline-series-end ' in body
+        # Nothing is ever drawn across a contract with no measurement.
+        assert "harnessMeasuredVersions" in body
+
+        # An unsettled rollout borrows the rollout strip's own status word and
+        # accent rather than inventing a second vocabulary for the same state.
+        assert ".timeline-band.open { fill: color-mix(in oklch, var(--accent-2)" in body
+        assert 'rolloutStatus !== "activated" && rolloutStatus !== "superseded"' in body
+        assert '(era.open ? " collecting" : "")' in body
+        assert "rollout still collecting" in body
+        # Provisional runs stay off the plot but are counted, so a band that can
+        # still change never looks complete.
+        assert "return entry.finalized === false;" in body
+        assert "awaiting quorum" in body
+        assert "a rank here can never move retroactively" in body
+
+    async def test_memory_timeline_window_is_not_pinned_to_a_bench_version(
+        self,
+    ) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+
+        # The bands are whatever the timeline endpoint returns, windowed by
+        # count. No version literal decides what is drawn.
+        assert "var releases = allReleases.slice(-TIMELINE_MAX_ERAS);" in body
+        assert "var TIMELINE_MAX_ERAS = 6;" in body
+        assert "Number(release.bench_version) >= 2" in body
+        for version in range(3, 12):
+            assert f"bench_version === {version}" not in body
+            assert f"version === {version}" not in body
+
     async def test_api_failures_do_not_render_sample_data(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
