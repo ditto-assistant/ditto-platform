@@ -80,6 +80,7 @@ from pydantic import ValidationError
 from ditto.api_models.benchmark_capacity import BenchmarkCapacity
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.db.models import ValidatorHeartbeat, ValidatorLeaseAudit, ValidatorTicket
+from ditto.db.queries.retry_budget import grant_no_fault_retry
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -394,7 +395,21 @@ async def force_expire_lease(
     context: str,
     requested_bench_version: int | None = None,
 ) -> None:
-    """Expire a lease proven idle, leaving a log line and an audit row behind."""
+    """Expire a lease proven idle, leaving a log line and an audit row behind.
+
+    Compensates the miner on the way out. ditto-platform#460 settled the rule --
+    "do not bill a miner for a lease the platform itself revoked" -- but put the
+    grant only in the signed ``fail_job`` handler, which this path cannot reach:
+    the revocation sets ``status = EXPIRED`` and rewrites ``deadline = now``, and
+    ``get_open_ticket`` requires an ``ISSUED`` ticket whose deadline matches
+    exactly and is still in the future, so a late ``fail_job`` for this lease
+    resolves to nothing and the compensation never fires. A validator that was
+    proven idle usually never reports at all, so in practice it never fired.
+
+    The miner was therefore billed an attempt for every lease the platform
+    destroyed -- which is how held agents reached ``attempt_count: 4,
+    retry_budget_exhausted: true`` without four real failures.
+    """
     await record_lease_revocation(
         session,
         ticket=ticket,
@@ -404,9 +419,23 @@ async def force_expire_lease(
         action="force_expired",
         requested_bench_version=requested_bench_version,
     )
+    # Before the status change, so the grant is part of the same transaction the
+    # audit row records. Bounded, so a persistently sick slot cannot mint
+    # attempts forever; the audit row is the per-grant justification.
+    granted = grant_no_fault_retry(ticket)
     ticket.status = TicketStatus.EXPIRED
     ticket.deadline = now
     ticket.retry_after = now
+    if not granted:
+        logger.warning(
+            "platform revoked a lease whose no-fault retry budget is already "
+            "exhausted; this revocation bills the miner agent=%s validator=%s "
+            "slot=%s grants=%s",
+            ticket.agent_id,
+            ticket.validator_hotkey,
+            ticket.slot_id,
+            ticket.infra_retry_grants,
+        )
     await session.flush()
 
 

@@ -209,6 +209,10 @@ from ditto.db.queries.king_reign import (
     record_weight_confirmed,
 )
 from ditto.db.queries.payments import get_miner_coldkey_for_agent
+from ditto.db.queries.retry_budget import (
+    grant_no_fault_retry,
+    infra_retry_backoff,
+)
 from ditto.db.queries.score_retests import activate_next_score_retest
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
@@ -219,12 +223,10 @@ from ditto.db.queries.scores import (
     upsert_score,
 )
 from ditto.db.queries.tickets import (
-    MAX_INFRA_RETRY_GRANTS,
     OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     RETRY_COOLDOWN,
     get_live_slot_ticket,
     get_open_ticket,
-    infra_retry_backoff,
     issue_confirmation_ticket,
     issue_ticket,
     mark_ticket_scored,
@@ -3397,12 +3399,11 @@ async def fail_job(
                 # immediate back-to-back re-leases of the same agent.
                 #
                 # The same compensation covers a platform-revoked lease however
-                # the validator labelled it. MAX_INFRA_RETRY_GRANTS still caps
-                # it, so a persistently broken lease cannot mint attempts
-                # forever, and failure_reason still records what was actually
-                # reported -- this corrects the billing, not the diagnosis.
-                if ticket.infra_retry_grants < MAX_INFRA_RETRY_GRANTS:
-                    ticket.infra_retry_grants += 1
+                # the validator labelled it. The grant is still bounded, so a
+                # persistently broken lease cannot mint attempts forever, and
+                # failure_reason still records what was actually reported --
+                # this corrects the billing, not the diagnosis.
+                grant_no_fault_retry(ticket)
                 ticket.retry_after = now + infra_retry_backoff(
                     ticket.infra_retry_grants
                 )

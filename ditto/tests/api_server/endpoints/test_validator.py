@@ -103,7 +103,7 @@ from ditto.db.queries.confirmation_scores import (
 from ditto.db.queries.queue_policy_settings import (
     insert_queue_policy_settings_revision,
 )
-from ditto.db.queries.tickets import MAX_INFRA_RETRY_GRANTS
+from ditto.db.queries.retry_budget import MAX_INFRA_RETRY_GRANTS
 
 # Real dev keypairs: sign for real so _verify_signature runs end to end. The k=3
 # quorum needs three distinct permitted validators before an agent finalizes.
@@ -6082,7 +6082,7 @@ async def test_idle_qualification_refresh_is_single_flight_and_throttled(
 
 
 def test_infra_retry_backoff_doubles_and_caps() -> None:
-    from ditto.db.queries.tickets import (
+    from ditto.db.queries.retry_budget import (
         INFRA_RETRY_BACKOFF_BASE,
         INFRA_RETRY_BACKOFF_CAP,
         infra_retry_backoff,
