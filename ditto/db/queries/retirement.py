@@ -56,6 +56,7 @@ from ditto.db.models import (
     ValidatorQueueWithdrawal,
     ValidatorTicket,
 )
+from ditto.db.queries.queue_removal import removal_in_force
 from ditto.db.queries.scores import SCORING_QUORUM
 
 if TYPE_CHECKING:
@@ -252,11 +253,17 @@ async def finalized_prev_gen_count(
 async def load_withdrawal_versions(
     session: AsyncSession, *, agent_id: UUID
 ) -> set[int]:
-    """Which benchmark eras this agent has already been withdrawn from."""
+    """Which benchmark eras this agent is currently withdrawn from.
+
+    A reinstated removal is excluded: the submission is back in that era's queue,
+    so retirement — which refuses an already-withdrawn era as redundant — is a
+    live option for it again.
+    """
     return set(
         await session.scalars(
             select(ValidatorQueueWithdrawal.bench_version).where(
-                ValidatorQueueWithdrawal.agent_id == agent_id
+                ValidatorQueueWithdrawal.agent_id == agent_id,
+                removal_in_force(),
             )
         )
     )

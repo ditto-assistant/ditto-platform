@@ -25,6 +25,7 @@ from ditto.db.models import (
     ScoreAuditEntry,
     ValidatorHeartbeat,
     ValidatorLeaseAudit,
+    ValidatorQueueReinstatement,
     ValidatorQueueWithdrawal,
     ValidatorRetryRecovery,
     ValidatorTicket,
@@ -1019,6 +1020,453 @@ async def test_evict_replay_is_idempotent_and_never_double_revokes(
             ).all()
         )
     assert len(audits) == 1
+
+
+_REINSTATE_CONFIRMATION = "REINSTATE TO VALIDATOR QUEUE"
+_REINSTATE_REASON = (
+    "source review found no hang primitives; freeing the fleet was not a verdict"
+)
+
+
+async def _detail(client: httpx.AsyncClient, agent_id: UUID) -> dict:
+    response = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _evict(client: httpx.AsyncClient, agent_id: UUID) -> httpx.Response:
+    body = await _detail(client, agent_id)
+    return await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/evict",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": body["snapshot"],
+            "reason": _EVICT_REASON,
+            "confirmation": _EVICT_CONFIRMATION,
+        },
+    )
+
+
+async def _reinstate(
+    client: httpx.AsyncClient, agent_id: UUID, **overrides: object
+) -> httpx.Response:
+    body = await _detail(client, agent_id)
+    payload: dict[str, object] = {
+        "request_id": str(uuid4()),
+        "expected_snapshot": body["snapshot"],
+        "reason": _REINSTATE_REASON,
+        "confirmation": _REINSTATE_CONFIRMATION,
+    }
+    payload.update(overrides)
+    return await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/reinstate",
+        headers=_HEADERS,
+        json=payload,
+    )
+
+
+async def test_reinstatement_returns_an_evicted_submission_to_the_queue(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The whole point: eviction stops being one-way.
+
+    Before this, an evicted miner's only route back was a fresh submission and a
+    second evaluation fee, which made a capacity lever into a fine and is why the
+    lever went unused. Reinstatement restores exactly the queue effect — the
+    admission predicate, the triage feed, a real re-lease — and preserves the
+    eviction record that justified taking it.
+    """
+    from ditto.db.queries.benchmark_admission import agent_is_admitted
+
+    agent_id = await _seed(retry_maker, ticket_count=0)
+    await _seed_live_lease(retry_maker, agent_id)
+    _install(app, retry_maker)
+
+    evicted = await _evict(client, agent_id)
+    assert evicted.status_code == 200, evicted.text
+    eviction_id = evicted.json()["eviction"]["eviction_id"]
+    async with retry_maker() as session:
+        assert not await agent_is_admitted(
+            session, bench_version=DEFAULT_BENCH_VERSION, agent_id=agent_id
+        )
+
+    body = await _detail(client, agent_id)
+    assert body["reinstatement_allowed"] is True
+    assert body["reinstatement_blocking_reason"] is None
+    assert body["withdrawal"]["reinstated_at"] is None
+    assert body["reinstatement"] is None
+
+    response = await _reinstate(client, agent_id)
+    assert response.status_code == 200, response.text
+    reinstated = response.json()
+    assert reinstated["idempotent"] is False
+    assert reinstated["restored_bench_version"] == DEFAULT_BENCH_VERSION
+    assert reinstated["eviction"]["eviction_id"] == eviction_id
+    assert reinstated["eviction"]["evicted_validator_hotkeys"] == ["validator-0"]
+    assert reinstated["eviction"]["reinstated_at"] is not None
+    assert reinstated["reinstatement"]["withdrawal_id"] == eviction_id
+    assert reinstated["reinstatement"]["actor"] == "operator"
+    assert reinstated["reinstatement"]["reason"] == _REINSTATE_REASON
+
+    # Eligibility is back: the admission predicate, the operator triage feed, and
+    # an actual validator claim all agree.
+    async with retry_maker() as session:
+        assert await agent_is_admitted(
+            session, bench_version=DEFAULT_BENCH_VERSION, agent_id=agent_id
+        )
+    triage = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    assert any(row["agent_id"] == str(agent_id) for row in triage.json()["submissions"])
+    async with retry_maker() as session, session.begin():
+        reissued = await issue_ticket(
+            session,
+            validator_hotkey="validator-0",
+            now=datetime.now(UTC) + timedelta(minutes=5),
+            ttl=timedelta(minutes=90),
+            bench_version=DEFAULT_BENCH_VERSION,
+        )
+    assert reissued is not None and reissued.agent_id == agent_id
+
+    # The eviction record survives, resolved rather than deleted, and the lease
+    # revocation it wrote is still readable through the #498 audit feed.
+    async with retry_maker() as session:
+        record = await session.get(ValidatorQueueWithdrawal, UUID(eviction_id))
+        audits = list(
+            (
+                await session.scalars(
+                    select(ValidatorLeaseAudit).where(
+                        ValidatorLeaseAudit.agent_id == agent_id
+                    )
+                )
+            ).all()
+        )
+    assert record is not None
+    assert record.reinstated_at is not None
+    assert record.evicted_validator_hotkeys == ["validator-0"]
+    assert record.actor == "operator" and record.reason == _EVICT_REASON
+    assert len(audits) == 1 and audits[0].action == "operator_evicted"
+    feed = await client.get(
+        "/api/v1/admin/lease-revocations",
+        headers=_HEADERS,
+        params={"agent_id": str(agent_id), "action": "operator_evicted"},
+    )
+    assert feed.status_code == 200, feed.text
+    assert feed.json()["total"] == 1
+
+    # And the operator surface still shows what happened, now resolved.
+    body = await _detail(client, agent_id)
+    assert body["withdrawal"]["reinstated_at"] is not None
+    assert (
+        body["reinstatement"]["reinstatement_id"]
+        == (reinstated["reinstatement"]["reinstatement_id"])
+    )
+    assert body["reinstatement_allowed"] is False
+    assert body["reinstatement_blocking_reason"] == (
+        "removal has already been reinstated"
+    )
+
+
+async def test_reinstatement_interlocks_reject_a_wrong_phrase_or_stale_snapshot(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Symmetric with the eviction route, including the phrase confusion.
+
+    Three operator actions now write this table and each rejects the others'
+    confirmation phrase, so no operator can reverse an eviction while believing
+    they are taking one, or the other way round.
+    """
+    agent_id = await _seed(retry_maker, ticket_count=0)
+    await _seed_live_lease(retry_maker, agent_id)
+    _install(app, retry_maker)
+    assert (await _evict(client, agent_id)).status_code == 200
+
+    stale = await _reinstate(client, agent_id, expected_snapshot="0" * 64)
+    assert stale.status_code == 409
+    assert "validation state changed" in stale.text
+
+    for phrase in (_EVICT_CONFIRMATION, "REMOVE FROM VALIDATOR QUEUE"):
+        wrong = await _reinstate(client, agent_id, confirmation=phrase)
+        assert wrong.status_code == 422, wrong.text
+
+    for malformed in (
+        {"expected_snapshot": "not-a-snapshot"},
+        {"reason": "short"},
+        {"unexpected_field": "x"},
+    ):
+        response = await _reinstate(client, agent_id, **malformed)
+        assert response.status_code == 422, response.text
+
+    body = await _detail(client, agent_id)
+    payload = {
+        "request_id": str(uuid4()),
+        "expected_snapshot": body["snapshot"],
+        "reason": _REINSTATE_REASON,
+        "confirmation": _REINSTATE_CONFIRMATION,
+    }
+    no_actor = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/reinstate",
+        headers={"Authorization": _HEADERS["Authorization"]},
+        json=payload,
+    )
+    assert no_actor.status_code == 422
+    unauthorized = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/reinstate", json=payload
+    )
+    assert unauthorized.status_code == 401
+
+    # Nothing above may have reversed the eviction.
+    async with retry_maker() as session:
+        removals = list(
+            (
+                await session.scalars(
+                    select(ValidatorQueueWithdrawal).where(
+                        ValidatorQueueWithdrawal.agent_id == agent_id
+                    )
+                )
+            ).all()
+        )
+        reinstatements = list(
+            (
+                await session.scalars(
+                    select(ValidatorQueueReinstatement).where(
+                        ValidatorQueueReinstatement.agent_id == agent_id
+                    )
+                )
+            ).all()
+        )
+    assert len(removals) == 1 and removals[0].reinstated_at is None
+    assert reinstatements == []
+
+
+async def test_reinstatement_replays_idempotently_and_refuses_a_second_reversal(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker, ticket_count=0)
+    await _seed_live_lease(retry_maker, agent_id)
+    _install(app, retry_maker)
+    assert (await _evict(client, agent_id)).status_code == 200
+
+    body = await _detail(client, agent_id)
+    payload = {
+        "request_id": str(uuid4()),
+        "expected_snapshot": body["snapshot"],
+        "reason": _REINSTATE_REASON,
+        "confirmation": _REINSTATE_CONFIRMATION,
+    }
+    first = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/reinstate",
+        headers=_HEADERS,
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+    replay = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/reinstate",
+        headers=_HEADERS,
+        json=payload,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["idempotent"] is True
+    assert replay.json()["reinstatement"] == first.json()["reinstatement"]
+
+    # A fresh request id against an already-reversed removal is a conflict, and
+    # a reused id carrying different evidence is refused outright.
+    again = await _reinstate(client, agent_id)
+    assert again.status_code == 409
+    assert "removal has already been reinstated" in again.text
+    forged = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/reinstate",
+        headers=_HEADERS,
+        json={**payload, "reason": "a different reason entirely, same request id"},
+    )
+    assert forged.status_code == 409
+    assert "request id already used" in forged.text
+
+    async with retry_maker() as session:
+        reinstatements = list(
+            (
+                await session.scalars(
+                    select(ValidatorQueueReinstatement).where(
+                        ValidatorQueueReinstatement.agent_id == agent_id
+                    )
+                )
+            ).all()
+        )
+    assert len(reinstatements) == 1
+
+
+async def test_reinstatement_refuses_a_withdrawal_and_a_closed_benchmark_era(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The two states where putting a submission back would change nothing.
+
+    A withdrawal is only reachable once quorum is already unreachable, so
+    restoring eligibility restores nothing usable; and no validator is ever
+    issued a ticket for a closed era. Both are refused by name rather than
+    accepted as a silent no-op.
+    """
+    withdrawn = await _seed(retry_maker)
+    _install(app, retry_maker)
+    body = await _detail(client, withdrawn)
+    removed = await client.post(
+        f"/api/v1/admin/validation-retries/{withdrawn}/withdraw",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": body["snapshot"],
+            "reason": "Three validator scoring failures exhausted every retry budget",
+            "confirmation": "REMOVE FROM VALIDATOR QUEUE",
+        },
+    )
+    assert removed.status_code == 200, removed.text
+    body = await _detail(client, withdrawn)
+    assert body["reinstatement_allowed"] is False
+    assert body["reinstatement_blocking_reason"] == (
+        "removal was a queue withdrawal, not an operator eviction"
+    )
+    refused = await _reinstate(client, withdrawn)
+    assert refused.status_code == 409
+    assert "not an operator eviction" in refused.text
+
+    # An eviction taken in a superseded era: the queue has moved on, so there is
+    # nothing to come back to.
+    old_era = DEFAULT_BENCH_VERSION - 1
+    stale = await _seed(
+        retry_maker, ticket_count=0, bench_version=old_era, miner_hotkey="5StaleMiner"
+    )
+    await _seed_live_lease(retry_maker, stale, bench_version=old_era)
+    assert (await _evict(client, stale)).status_code == 200
+    body = await _detail(client, stale)
+    assert body["reinstatement_allowed"] is False
+    assert body["reinstatement_blocking_reason"] == (
+        f"benchmark era v{old_era} is no longer active "
+        f"(the queue is now serving v{DEFAULT_BENCH_VERSION})"
+    )
+    closed = await _reinstate(client, stale)
+    assert closed.status_code == 409
+    assert "no longer active" in closed.text
+
+    async with retry_maker() as session:
+        record = await session.scalar(
+            select(ValidatorQueueWithdrawal).where(
+                ValidatorQueueWithdrawal.agent_id == stale
+            )
+        )
+    assert record is not None and record.reinstated_at is None
+
+
+async def test_reinstatement_cannot_launder_the_retry_budget(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The security property of the change, stated as an assertion.
+
+    Eviction refuses to compensate the miner (``compensate=False``) so it cannot
+    raise the attempt cap on the artifact it just evicted. If reinstatement gave
+    that cap back, the pair would be an attempt printer: evict, reinstate,
+    collect, repeat — free leases past ``MAX_AGENT_INFRA_RETRY_GRANTS`` (12 per
+    agent per era, #522) and a reset of ``MAX_OPERATOR_RECOVERIES_PER_AGENT``,
+    rebuilding the amplifier that took ``mnemox-v55`` to nine attempts against a
+    base budget of two. So the cycle is run three times and every counter is
+    asserted unchanged across all of it.
+    """
+    agent_id = await _seed(retry_maker, ticket_count=0)
+    await _seed_live_lease(retry_maker, agent_id)
+    async with retry_maker() as session, session.begin():
+        session.add(
+            ValidatorRetryRecovery(
+                recovery_id=uuid4(),
+                agent_id=agent_id,
+                actor="operator",
+                reason="Prior validator infrastructure recovery",
+                expected_snapshot="a" * 64,
+                score_count=0,
+                bench_version=DEFAULT_BENCH_VERSION,
+                ticket_snapshot=[],
+                granted_validator_hotkeys=["validator-0"],
+                created_at=_T0,
+            )
+        )
+    _install(app, retry_maker)
+
+    async def _budget() -> tuple[int, int, int, int]:
+        async with retry_maker() as session:
+            tickets = list(
+                (
+                    await session.scalars(
+                        select(ValidatorTicket).where(
+                            ValidatorTicket.agent_id == agent_id
+                        )
+                    )
+                ).all()
+            )
+            recoveries = len(
+                list(
+                    (
+                        await session.scalars(
+                            select(ValidatorRetryRecovery).where(
+                                ValidatorRetryRecovery.agent_id == agent_id
+                            )
+                        )
+                    ).all()
+                )
+            )
+        return (
+            max(ticket.attempt_count for ticket in tickets),
+            sum(ticket.infra_retry_grants for ticket in tickets),
+            sum(ticket.manual_retry_grants for ticket in tickets),
+            recoveries,
+        )
+
+    before = await _budget()
+    assert before == (1, 0, 0, 1)
+
+    for _cycle in range(3):
+        assert (await _evict(client, agent_id)).status_code == 200
+        response = await _reinstate(client, agent_id)
+        assert response.status_code == 200, response.text
+        recorded = response.json()["reinstatement"]["retry_budget_snapshot"]
+        # The route records the counts it left alone, so "nothing was granted"
+        # is checkable from the audit row and not only from this test.
+        assert recorded["attempts_used"] == before[0]
+        assert recorded["agent_infra_retry_grants"] == before[1]
+        assert recorded["max_agent_infra_retry_grants"] == 12
+        assert recorded["manual_retry_grants"] == before[2]
+        assert recorded["operator_recoveries"] == before[3]
+        assert recorded["max_operator_recoveries"] == 3
+        assert await _budget() == before
+        # Each cycle needs its own live lease to evict; the reinstated one is
+        # expired, and re-leasing it is the validator's job, not the operator's.
+        await _seed_live_lease(
+            retry_maker, agent_id, validator_hotkey=f"validator-cycle-{_cycle}"
+        )
+
+    # Three evict/reinstate cycles bought exactly nothing: no no-fault grant, no
+    # manual grant, and the operator-recovery count is still spent.
+    assert await _budget() == before
+    async with retry_maker() as session:
+        removals = list(
+            (
+                await session.scalars(
+                    select(ValidatorQueueWithdrawal).where(
+                        ValidatorQueueWithdrawal.agent_id == agent_id
+                    )
+                )
+            ).all()
+        )
+    # Every eviction is preserved; each is resolved by its own reversal.
+    assert len(removals) == 3
+    assert all(row.reinstated_at is not None for row in removals)
 
 
 async def test_triage_tells_a_silent_expiry_apart_from_a_reported_failure(

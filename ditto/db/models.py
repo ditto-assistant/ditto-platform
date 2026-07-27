@@ -2692,6 +2692,10 @@ class ValidatorQueueWithdrawal(Base):
       consuming validator capacity;
     * an **eviction** (a list, possibly empty) additionally revoked whatever live
       leases the submission was still holding, naming them.
+
+    A row is *in force* only while :attr:`reinstated_at` is ``NULL``. Reversing
+    an eviction resolves the row rather than deleting it — see
+    :class:`ValidatorQueueReinstatement`.
     """
 
     __tablename__ = "validator_queue_withdrawals"
@@ -2715,6 +2719,18 @@ class ValidatorQueueWithdrawal(Base):
     indistinguishable from an ordinary cleanup, which is precisely the
     distinction an emissions-relevant action against a paying miner has to be
     able to defend later.
+    """
+    reinstated_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    """When this removal was reversed, or ``NULL`` while it is still in force.
+
+    The resolution pointer, deliberately *on the removal row*. Every queue
+    predicate in the codebase already asks one question of this table — "is this
+    agent removed from this era?" — and answering it after reinstatement has to
+    stay a single indexed read rather than a correlated join against another
+    table. The reinstatement's own actor, reason, and evidence live in
+    :class:`ValidatorQueueReinstatement`; this column carries only the fact.
     """
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -2743,15 +2759,127 @@ class ValidatorQueueWithdrawal(Base):
             "length(trim(reason)) BETWEEN 8 AND 500",
             name="validator_queue_withdrawals_reason_length",
         ),
-        UniqueConstraint(
+        # One removal *in force* per (agent, benchmark era). Partial rather than
+        # a plain unique constraint because reinstatement is reversible in both
+        # directions: an operator who reinstates a submission and then watches it
+        # starve the fleet again must be able to evict it a second time in the
+        # same era, and a total constraint would make the first reinstatement
+        # permanently disarm the lever the whole feature exists to provide.
+        # Resolved rows stay, so the era's full removal history is preserved.
+        Index(
+            "validator_queue_withdrawals_agent_bench_key",
             "agent_id",
             "bench_version",
-            name="validator_queue_withdrawals_agent_bench_key",
+            unique=True,
+            postgresql_where=text("reinstated_at IS NULL"),
         ),
         Index(
             "validator_queue_withdrawals_created_idx",
             "created_at",
             "withdrawal_id",
+        ),
+    )
+
+
+class ValidatorQueueReinstatement(Base):
+    """One audited reversal of an operator eviction, returning it to the queue.
+
+    Eviction was one-way until this existed, so an operator could only free a
+    starved fleet by ending a paying miner's benchmark era, and the miner's only
+    route back was a fresh submission and a second evaluation fee. That made a
+    capacity lever into a punishment, and it was the sole reason the lever went
+    unused against the ``mnemo*`` family, whose source review found self-imposed
+    per-case deadlines, no hang primitives, and a version trajectory of pure
+    latency reduction — costly, but not shown to be malicious.
+
+    Deliberately its **own append-only row** rather than a mutation of
+    :class:`ValidatorQueueWithdrawal`, and rather than deleting that row:
+
+    * an eviction that was later reversed is a fact worth keeping. It named live
+      validator leases it destroyed, and each of those has a
+      ``validator_lease_audit`` row that ``GET /admin/lease-revocations
+      ?action=operator_evicted`` reads; deleting the eviction would orphan them
+      and quietly rewrite what the operator did on 2026-07-27;
+    * the two actions have different actors, different reasons, and different
+      idempotency keys. Overwriting ``actor``/``reason`` in place would destroy
+      the evictor's justification to record the reinstator's.
+
+    The reversal itself is deliberately *inert*: it restores eligibility and
+    nothing else. It does not resurrect leases, reset ``attempt_count``, mint a
+    no-fault grant, or clear the operator-recovery count. See
+    :attr:`retry_budget_snapshot`.
+    """
+
+    __tablename__ = "validator_queue_reinstatements"
+
+    reinstatement_id: Mapped[UUID] = mapped_column(
+        SaUUID(as_uuid=True), primary_key=True
+    )
+    withdrawal_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    score_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    ticket_snapshot: Mapped[list[dict]] = mapped_column(_JSON_VARIANT, nullable=False)
+    retry_budget_snapshot: Mapped[dict] = mapped_column(_JSON_VARIANT, nullable=False)
+    """The attempt budget as it stood when the submission came back.
+
+    Recorded because "unchanged" is the security property of this route and an
+    assertion nobody can check later is not an assertion. A reinstatement grants
+    no attempt and lifts no cap, so a submission returns with exactly the budget
+    it was evicted with; the pair of numbers here (the agent's fleet-wide
+    ``infra_retry_grants`` at this era, bounded by ``MAX_AGENT_INFRA_RETRY_GRANTS``,
+    and its operator-recovery count, bounded by
+    ``MAX_OPERATOR_RECOVERIES_PER_AGENT``) is what lets a reviewer confirm that
+    an evict/reinstate cycle laundered neither bound.
+    """
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["withdrawal_id"],
+            ["validator_queue_withdrawals.withdrawal_id"],
+            ondelete="RESTRICT",
+            name="validator_queue_reinstatements_withdrawal_id_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["agent_id"],
+            ["agents.agent_id"],
+            ondelete="RESTRICT",
+            name="validator_queue_reinstatements_agent_id_fkey",
+        ),
+        CheckConstraint(
+            "bench_version > 0",
+            name="validator_queue_reinstatements_bench_version_positive",
+        ),
+        CheckConstraint(
+            "score_count >= 0",
+            name="validator_queue_reinstatements_score_count_nonnegative",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="validator_queue_reinstatements_actor_length",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="validator_queue_reinstatements_reason_length",
+        ),
+        # One reversal per removal. The removal row is resolved exactly once, so
+        # a second reinstatement of the same eviction is a database-level
+        # impossibility rather than a route-level check that could be bypassed.
+        UniqueConstraint(
+            "withdrawal_id",
+            name="validator_queue_reinstatements_withdrawal_key",
+        ),
+        Index(
+            "validator_queue_reinstatements_agent_idx",
+            "agent_id",
+            "bench_version",
+            "created_at",
         ),
     )
 

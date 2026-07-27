@@ -28,6 +28,7 @@ from ditto.db.models import (
     ValidatorTicket,
 )
 from ditto.db.queries.benchmark_rollout import active_bench_version
+from ditto.db.queries.queue_removal import is_eviction, is_in_force, removal_in_force
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import ticket_attempt_cap
 
@@ -223,6 +224,78 @@ def eviction_gate(
     return True, None
 
 
+def reinstatement_gate(
+    *,
+    agent: Agent,
+    scores: list[Score],
+    removal: ValidatorQueueWithdrawal | None,
+    bench_version: int,
+    active_version: int,
+) -> tuple[bool, str | None]:
+    """Allow an eviction to be undone: back in the queue, with nothing added.
+
+    :func:`eviction_gate` made eviction reachable while a submission was still
+    burning validator slots, which is what made it useful — and one-way, which is
+    what kept it unused. An evicted miner had paid an evaluation fee for a
+    benchmark era that ended by operator decision, and their only route back was
+    a fresh submission and a second fee. That is a punishment, and it should not
+    be the price of a capacity decision taken against a submission nobody has
+    shown to be malicious.
+
+    Reinstatement is therefore the exact inverse of the queue effect and *nothing
+    else*. It clears the removal so ``validator_queue_admission_predicate``
+    admits the agent again; it does not resurrect the revoked leases, reset
+    ``attempt_count``, mint a no-fault grant, or forgive a spent operator
+    recovery. That inertness is the security property: eviction already refuses
+    to compensate (``compensate=False``), so if reinstatement handed back
+    headroom the pair would become an attempt printer — evict, reinstate, collect
+    — which is precisely the amplifier ``MAX_AGENT_INFRA_RETRY_GRANTS`` (12, per
+    agent per era, ditto-platform#522) and ``MAX_OPERATOR_RECOVERIES_PER_AGENT``
+    (3) were introduced to bound. Both counters are keyed on (agent, benchmark
+    version) and this route writes neither, so an evict/reinstate cycle is
+    budget-neutral by construction and no number of cycles changes that.
+
+    The refusals:
+
+    * nothing to reverse, or it was reversed already;
+    * the removal was a **withdrawal**, not an eviction. Withdrawal is only
+      reachable once a submission has exhausted enough tickets that quorum is
+      already unreachable, so putting it back would restore eligibility it
+      cannot use; the honest remedy there is an operator retry grant, which is
+      bounded and audited on its own terms;
+    * **the era moved on.** A removal is scoped to the benchmark version it was
+      taken in, and no validator will ever be issued a ticket for a closed one,
+      so reinstating into it would report success and change nothing. Refused
+      explicitly, naming both versions, rather than left as a silent no-op;
+    * the submission is no longer waiting for scores, already has quorum, or has
+      fallen behind the current screening policy (below it nothing is leasable,
+      so re-admission would again be a no-op).
+    """
+
+    if removal is None:
+        return False, "submission is not removed from this benchmark queue"
+    if not is_in_force(removal):
+        return False, "removal has already been reinstated"
+    if not is_eviction(removal):
+        return (
+            False,
+            "removal was a queue withdrawal, not an operator eviction",
+        )
+    if bench_version != active_version:
+        return (
+            False,
+            f"benchmark era v{bench_version} is no longer active "
+            f"(the queue is now serving v{active_version})",
+        )
+    if agent.status != AgentStatus.EVALUATING:
+        return False, "submission is not waiting for validator scores"
+    if agent.screening_policy_version < SCREENING_POLICY_VERSION:
+        return False, "submission is not on the current screening policy"
+    if len(scores) >= SCORING_QUORUM:
+        return False, "submission already reached scoring quorum"
+    return True, None
+
+
 def classify_retry_state(
     *,
     automatic: bool,
@@ -341,7 +414,12 @@ async def classify_agent_retry_states(
                 select(
                     ValidatorQueueWithdrawal.agent_id,
                     ValidatorQueueWithdrawal.bench_version,
-                ).where(ValidatorQueueWithdrawal.agent_id.in_(id_subq))
+                ).where(
+                    ValidatorQueueWithdrawal.agent_id.in_(id_subq),
+                    # Reinstated removals do not count: the submission is back in
+                    # the queue and belongs in triage again.
+                    removal_in_force(),
+                )
             )
         ).all()
     )
