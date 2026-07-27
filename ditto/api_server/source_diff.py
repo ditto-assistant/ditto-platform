@@ -18,6 +18,7 @@ reformat repack. Pure CPU work — callers run it via ``asyncio.to_thread``.
 from __future__ import annotations
 
 import difflib
+from collections.abc import Callable
 from typing import Any, Literal
 
 from ditto.api_server.fingerprint import _normalized_source
@@ -144,6 +145,46 @@ def build_source_diff_manifest(
         "removed_count": removed_files,
         "truncated": truncated,
     }
+
+
+def build_baseline_diff_manifest(
+    candidate: dict[str, str],
+    baseline: dict[str, str],
+    is_stock: Callable[[str], bool],
+    *,
+    max_files: int = MAX_MANIFEST_FILES,
+) -> dict[str, Any]:
+    """Manifest against the starter kit, with stock-kit files marked.
+
+    Same classification as :func:`build_source_diff_manifest`, plus a
+    ``stock_kit`` flag per file and the aggregate an operator actually wants:
+    how many lines of this submission the miner wrote themselves.
+
+    ``stock_kit`` is broader than ``status == "identical"``. Identical means
+    "matches the baseline tip"; a miner who forked an older commit has kit files
+    that differ from the tip but are still not their work. ``is_stock`` answers
+    that against the whole lineage, so those files stay out of the custom-surface
+    total instead of masquerading as authored code.
+    """
+    manifest = build_source_diff_manifest(candidate, baseline, max_files=max_files)
+    stock_count = 0
+    custom_files = 0
+    custom_added = 0
+    for entry in manifest["files"]:
+        text = candidate.get(str(entry["path"]))
+        stock = entry["status"] == "identical" or (text is not None and is_stock(text))
+        entry["stock_kit"] = stock
+        if stock:
+            stock_count += 1
+        elif entry["status"] != "removed":
+            custom_files += 1
+            custom_added += int(entry["added_lines"])
+    manifest["stock_kit_count"] = stock_count
+    manifest["custom_file_count"] = custom_files
+    # The headline number: lines present in the submission that are neither
+    # baseline code nor kit code at any revision.
+    manifest["custom_added_lines"] = custom_added
+    return manifest
 
 
 def unified_diff_for_file(
