@@ -2367,6 +2367,15 @@
        stay on the Leaderboard page and in row detail. */
     .overview-main .board { overflow-x: hidden; }
     .overview-main #board .cline2 { display: none; }
+    /* The strips were spaced for their old above-table home; give the first
+       one clear separation from the board on the Leaderboard page. */
+    .page[data-page="leaderboard"] #emissions-strip { margin-top: 28px; }
+    /* The page's own title already says "Leaderboard"; the block heading is
+       redundant here (it stays on the overview, where it is the board's only
+       label). Archive state remains signaled by the version pills and the
+       switch's context line. */
+    .page[data-page="leaderboard"] .section-head { display: none; }
+    .page[data-page="leaderboard"] .leaderboard-version-switch { display: none; }
     @media (min-width: 1181px) and (max-width: 1919px) {
       /* The half-width pane can't fit context text + one pill per bench
          version side by side; stack them like the mobile layout does. */
@@ -2429,6 +2438,7 @@
       </div>
       <nav class="nav" id="site-nav" aria-label="Sections">
         <a class="nav-item" href="#/overview" data-page="overview"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg></span><span class="ni-text"><span class="ni-label">Overview</span><span class="ni-desc">Snapshot &amp; leaderboard</span></span></a>
+        <a class="nav-item" href="#/leaderboard" data-page="leaderboard"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M8 21V9"/><path d="M16 21v-5"/><path d="M4 21v-3"/><path d="M20 21v-8"/><path d="M4 3h16"/></svg></span><span class="ni-text"><span class="ni-label">Leaderboard</span><span class="ni-desc">Full ranked table</span></span></a>
         <a class="nav-item" href="#/operations" data-page="operations"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/></svg></span><span class="ni-text"><span class="ni-label">Network ops</span><span class="ni-desc">Pipeline &amp; fleet health</span></span></a>
         <a class="nav-item" href="#/submissions" data-page="submissions"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg></span><span class="ni-text"><span class="ni-label">Submissions</span><span class="ni-desc">Recent uploads</span></span></a>
         <a class="nav-item" href="#/reviews" data-page="reviews"><span class="ni-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3 3.6 7.2v5.6c0 4.7 3.6 7.2 8.4 8.2 4.8-1 8.4-3.5 8.4-8.2V7.2Z"/><path d="M9 12h6M12 9v6"/></svg></span><span class="ni-text"><span class="ni-label">ATH reviews</span><span class="ni-desc">Active public holds</span></span></a>
@@ -2535,6 +2545,10 @@
         <div class="champion-state">Waiting for the emissions projection…</div>
       </div>
     </section>
+    <!-- One leaderboard instance for the whole app: the router re-parents this
+         block between the overview column and the dedicated leaderboard page.
+         Renderers address elements by id, so relocation is invisible to them. -->
+    <div id="leaderboard-block">
     <div class="section-head">
       <h2 id="leaderboard-title">Leaderboard</h2>
       <span class="hint" id="leaderboard-hint">raw score rank · KOTH emissions shown separately · open a row for tool &amp; memory detail</span>
@@ -2546,27 +2560,6 @@
         <button class="activity-filter" type="button" data-leaderboard-version="2" aria-pressed="false">Bench v2</button>
       </div>
     </div>
-    <div class="emissions-strip" id="emissions-strip" role="status" aria-live="polite">
-      <div class="emissions-summary">
-        <div class="emissions-title" id="emissions-title"></div>
-        <details class="emissions-why" id="emissions-why" hidden>
-          <summary>How the crown is decided</summary>
-          <div class="emissions-reason" id="emissions-reason"></div>
-          <div class="emissions-threshold" id="emissions-threshold"></div>
-        </details>
-      </div>
-      <div class="emissions-recipients" id="emissions-recipients"></div>
-      <div class="chain-observation" id="chain-observation">
-        <span class="chain-badge">On chain</span>
-        <span id="chain-observation-copy"></span>
-      </div>
-    </div>
-    <div class="rollout-strip" id="rollout-strip" role="status" aria-live="polite">
-      <div class="rollout-head" id="rollout-head"></div>
-      <div class="rollout-progress" id="rollout-progress"></div>
-      <div class="rollout-note" id="rollout-note"></div>
-    </div>
-    <div class="leaderboard-notice" id="leaderboard-notice" role="status" aria-live="polite"></div>
     <div class="board" tabindex="0" role="region" aria-label="Leaderboard table, horizontally scrollable on small screens">
       <div class="board-toolbar">
         <div class="board-tabs activity-filter-list" role="group" aria-label="Leaderboard view">
@@ -2607,9 +2600,38 @@
         <button class="btn ghost" type="button" id="board-next">Next <span aria-hidden="true">&#8594;</span></button>
       </nav>
     </div>
+    <!-- Post-table context: emissions, rollout, and standing notices sit
+         below the board so the table starts at the top of the Leaderboard
+         page. Hidden entirely on the overview (see .overview-main rules). -->
+    <div class="emissions-strip" id="emissions-strip" role="status" aria-live="polite">
+      <div class="emissions-summary">
+        <div class="emissions-title" id="emissions-title"></div>
+        <details class="emissions-why" id="emissions-why" hidden>
+          <summary>How the crown is decided</summary>
+          <div class="emissions-reason" id="emissions-reason"></div>
+          <div class="emissions-threshold" id="emissions-threshold"></div>
+        </details>
+      </div>
+      <div class="emissions-recipients" id="emissions-recipients"></div>
+      <div class="chain-observation" id="chain-observation">
+        <span class="chain-badge">On chain</span>
+        <span id="chain-observation-copy"></span>
+      </div>
+    </div>
+    <div class="rollout-strip" id="rollout-strip" role="status" aria-live="polite">
+      <div class="rollout-head" id="rollout-head"></div>
+      <div class="rollout-progress" id="rollout-progress"></div>
+      <div class="rollout-note" id="rollout-note"></div>
+    </div>
+    <div class="leaderboard-notice" id="leaderboard-notice" role="status" aria-live="polite"></div>
+    </div>
     </div>
     </div>
 
+    </section>
+
+    <section class="page" data-page="leaderboard">
+      <div id="leaderboard-page-host"></div>
     </section>
 
     <section class="page" data-page="operations">
@@ -3031,6 +3053,7 @@
     // sanitizer runs, because currentPageName() consults it.
     var PAGES = {
       overview:    ["Overview", "Subnet snapshot and the full leaderboard · ranked by composite"],
+      leaderboard: ["Leaderboard", "Every scored miner · all columns · ranked by composite"],
       operations:  ["Network operations", "Live submission pipeline and validator / screener fleet health"],
       submissions: ["Recent submissions", "Screening evidence and validator quorum progress · select a row for history"],
       reviews:     ["ATH reviews", "Public queue of held high-score submissions · scores preserved, emissions paused"],
@@ -9272,6 +9295,23 @@
       }
       var els = document.querySelectorAll(".page");
       for (var i = 0; i < els.length; i++) els[i].classList.toggle("active", els[i].getAttribute("data-page") === page);
+      // Re-parent the single leaderboard instance: compact inside the overview
+      // column, full-width on its own page. Outside .overview-split none of the
+      // split's column-hiding or width rules match, so the same DOM renders
+      // with every column simply by moving.
+      var lbBlock = document.getElementById("leaderboard-block");
+      var lbHost = page === "leaderboard"
+        ? document.getElementById("leaderboard-page-host")
+        : document.querySelector(".overview-main");
+      if (lbBlock && lbHost && lbBlock.parentNode !== lbHost) lbHost.appendChild(lbBlock);
+      // The leaderboard page hides the version switch, so it must never show
+      // an archive silently: entering it always resets to the current rollout.
+      if (page === "leaderboard" && leaderboardVersionView !== "current") {
+        leaderboardVersionView = "current";
+        boardView.page = 1;
+        renderVersionPills();
+        load(true);
+      }
       var items = document.querySelectorAll(".nav-item");
       for (var j = 0; j < items.length; j++) {
         var on = items[j].getAttribute("data-page") === page;
