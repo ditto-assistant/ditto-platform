@@ -47,6 +47,8 @@ def _run(entry: Mapping[str, object], call: str) -> object:
             _extract("validatorSlotIds"),
             _extract("slotOrdinal"),
             _extract("anyBenchmarkStage"),
+            _extract("cappedSlotIds"),
+            _extract("fundedSlotCount"),
             f"const entry = {json.dumps(dict(entry))};",
             f"process.stdout.write(JSON.stringify({call}));",
         ]
@@ -187,6 +189,125 @@ class TestAnyBenchmarkStage:
         assert _run(entry, "anyBenchmarkStage(entry)") is True
 
 
+class TestCappedSlots:
+    """Advertised capacity above the operator cap must not read as idle.
+
+    The fleet ran eight advertised slots under a cap of six, and the table drew
+    eight rows the operator could reasonably read as eight usable slots. Two of
+    them were never going to receive a ticket.
+    """
+
+    def _capped(self, entry: Mapping[str, object]) -> list[str]:
+        result = _run(entry, "cappedSlotIds(entry)")
+        assert isinstance(result, dict)
+        return sorted(result, key=lambda slot: int(slot.rsplit("-", 1)[1]))
+
+    def test_slots_above_the_cap_are_marked(self) -> None:
+        """Eight advertised, cap of six: the top two are capped, not idle."""
+        entry = {
+            "configured_slots": 8,
+            "allowed_slots": 6,
+            "healthy_slots": [f"slot-{index}" for index in range(8)],
+            "admission": "accepting",
+            "active_benchmarks": [],
+            "assigned_benchmarks": [],
+        }
+
+        assert self._capped(entry) == ["slot-6", "slot-7"]
+
+    def test_a_validator_inside_the_cap_has_nothing_capped(self) -> None:
+        entry = {
+            "configured_slots": 4,
+            "allowed_slots": 4,
+            "healthy_slots": [f"slot-{index}" for index in range(4)],
+            "admission": "accepting",
+            "active_benchmarks": [],
+            "assigned_benchmarks": [],
+        }
+
+        assert self._capped(entry) == []
+
+    def test_running_work_is_charged_first_and_never_marked(self) -> None:
+        """Lowering the cap costs new leases only, never one in flight."""
+        entry = {
+            "configured_slots": 4,
+            "allowed_slots": 2,
+            "healthy_slots": [f"slot-{index}" for index in range(4)],
+            "admission": "accepting",
+            "active_benchmarks": [_benchmark("slot-1")],
+            "assigned_benchmarks": [],
+        }
+
+        # slot-1 runs and spends one of the two, slot-0 takes the other.
+        assert self._capped(entry) == ["slot-2", "slot-3"]
+
+    def test_leases_beyond_the_cap_do_not_borrow_from_idle_slots(self) -> None:
+        """A cap dropped under live work caps every idle slot, not a negative."""
+        entry = {
+            "configured_slots": 4,
+            "allowed_slots": 1,
+            "healthy_slots": [f"slot-{index}" for index in range(4)],
+            "admission": "accepting",
+            "active_benchmarks": [_benchmark("slot-0"), _benchmark("slot-1")],
+            "assigned_benchmarks": [],
+        }
+
+        assert self._capped(entry) == ["slot-2", "slot-3"]
+
+    def test_an_unhealthy_slot_keeps_its_own_state(self) -> None:
+        """Unavailable is about the validator; capped is about the operator."""
+        entry = {
+            "configured_slots": 4,
+            "allowed_slots": 2,
+            "healthy_slots": ["slot-0", "slot-2", "slot-3"],
+            "admission": "accepting",
+            "active_benchmarks": [],
+            "assigned_benchmarks": [],
+        }
+
+        # slot-1 is unhealthy, so it is not the cap keeping work off it.
+        assert self._capped(entry) == ["slot-3"]
+
+    def test_a_payload_without_the_field_marks_nothing(self) -> None:
+        """A dashboard served against an older API must not invent a cap."""
+        entry = {
+            "configured_slots": 8,
+            "healthy_slots": [f"slot-{index}" for index in range(8)],
+            "admission": "accepting",
+            "active_benchmarks": [],
+            "assigned_benchmarks": [],
+        }
+
+        assert self._capped(entry) == []
+
+
+class TestFundedSlotCount:
+    """The fleet table's numerator: what can take work, not what is advertised."""
+
+    def test_the_cap_binds_below_healthy_capacity(self) -> None:
+        entry = {
+            "configured_slots": 8,
+            "allowed_slots": 6,
+            "healthy_slots": [f"slot-{index}" for index in range(8)],
+        }
+
+        assert _run(entry, "fundedSlotCount(entry)") == 6
+
+    def test_health_binds_below_the_cap(self) -> None:
+        entry = {
+            "configured_slots": 8,
+            "allowed_slots": 6,
+            "healthy_slots": ["slot-0", "slot-1"],
+        }
+
+        assert _run(entry, "fundedSlotCount(entry)") == 2
+
+    def test_without_the_field_it_falls_back_to_healthy_slots(self) -> None:
+        entry = {"configured_slots": 4, "healthy_slots": ["slot-0", "slot-1"]}
+
+        assert _run(entry, "fundedSlotCount(entry)") == 2
+
+
 class TestDashboardSource:
     def test_slot_ids_are_not_synthesised_from_a_count(self) -> None:
         """The old loop built ids as ``"slot-" + index`` and dropped the rest."""
@@ -201,9 +322,25 @@ class TestDashboardSource:
         assert 'class="fleet-slot"' in body
         assert ".fleet-slot + .fleet-slot" in body
 
+    def test_a_capped_slot_is_rendered_as_its_own_state(self) -> None:
+        """Not "Idle" (claims usable capacity) and not "Unavailable" (a fault)."""
+        body = _DASHBOARD.read_text()
+
+        assert 'class="stage capped"' in body
+        assert ".stage.capped {" in body
+
+    def test_the_fleet_row_reports_funded_capacity(self) -> None:
+        """The numerator is what dispatch funds, not what is advertised."""
+        body = _DASHBOARD.read_text()
+
+        assert 'String(fundedSlotCount(entry)) + " of "' in body
+        assert 'String((entry.healthy_slots || []).length) + "/"' not in body
+
     def test_detail_modal_renders_every_active_slot(self) -> None:
         body = _DASHBOARD.read_text()
-        modal = body[body.index("var assignment = renderValidatorAssignment(entry);") :]
+        modal_start = body.index("function renderValidatorDetail(entry)")
+        modal_end = body.index("function openValidatorEntry(", modal_start)
+        modal = body[modal_start:modal_end]
 
-        assert "activeSlots.slice().sort(" in modal[:2000]
-        assert re.search(r'vstat\("Slots"', modal[:2000]) is not None
+        assert "activeSlots.slice().sort(" in modal
+        assert re.search(r'vstat\("Slots"', modal) is not None
