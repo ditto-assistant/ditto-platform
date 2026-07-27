@@ -233,3 +233,44 @@ def test_the_published_thresholds_are_the_enforced_thresholds() -> None:
     ).as_public_dict()
     assert published["min_prompt_tokens_per_case"] == MIN_PROMPT_TOKENS_PER_CASE
     assert published["min_calls_per_case"] == MIN_CALLS_PER_CASE
+
+
+def test_the_public_projection_round_trips_through_the_wire_model() -> None:
+    """What the score stores is exactly what the leaderboard can publish.
+
+    Guards the seam between `as_public_dict` (written at submit time) and
+    `PublicModelUse` (read at render time). A field added on one side without
+    the other silently disappears from the miner's view.
+    """
+    from ditto.api_models.public import PublicModelUse
+
+    stored = evaluate_model_use(
+        _usage(1, 74, 1), cases=280, policy=ENFORCE
+    ).as_public_dict()
+    published = PublicModelUse.model_validate(stored)
+
+    assert published.verdict == "not_used"
+    assert published.reason is not None
+    assert published.min_prompt_tokens_per_case == MIN_PROMPT_TOKENS_PER_CASE
+    assert published.min_calls_per_case == MIN_CALLS_PER_CASE
+    assert published.min_prompt_tokens_per_call == MIN_PROMPT_TOKENS_PER_CALL
+    assert published.model_dump(exclude_none=True).keys() <= set(stored)
+
+
+def test_the_wire_model_carries_no_source_or_case_content_field() -> None:
+    """Code-privacy preserving by construction, asserted rather than assumed."""
+    from ditto.api_models.public import PublicModelUse
+
+    forbidden = {
+        "source",
+        "prompt",
+        "prompts",
+        "completion",
+        "completions",
+        "case",
+        "cases_detail",
+        "answers",
+        "transcript",
+        "code",
+    }
+    assert set(PublicModelUse.model_fields) & forbidden == set()
