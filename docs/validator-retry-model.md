@@ -130,6 +130,81 @@ commit together.
 Recoveries are bounded (`MAX_OPERATOR_RECOVERIES_PER_AGENT = 3`) and audited in
 `ValidatorRetryRecovery`.
 
+## Removing a submission from the queue: withdrawal vs. eviction
+
+Two operator routes end a submission's benchmark era. Both write the same
+`ValidatorQueueWithdrawal` row — the record every queue predicate already reads —
+and both preserve the submission, the miner's payment, the artifact, the
+screening verdict, every accepted score, and the whole ticket history. Neither is
+a rejection or a rescreen.
+
+| | `POST .../withdraw` | `POST .../evict` |
+|---|---|---|
+| confirmation | `REMOVE FROM VALIDATOR QUEUE` | `EVICT LIVE VALIDATOR LEASES` |
+| gate | needs enough exhausted tickets that quorum is unreachable, **and** no live lease | needs only `evaluating` and below quorum |
+| live leases | refuses to act while one exists | force-expires each one, freeing the slot now |
+| audit | the withdrawal row | the withdrawal row **plus** one `validator_lease_audit` row per revoked lease (`action = operator_evicted`) |
+| `evicted_validator_hotkeys` | `NULL` | the revoked set (possibly `[]`) |
+
+**Why eviction exists.** Withdrawal is a cleanup tool: by construction it only
+accepts a submission that had already stopped consuming validator capacity. On
+2026-07-27 a family of hanging submissions held 6 of the fleet's 12 validator
+slots — every ticket running its full 90-minute lease and reporting nothing —
+and withdrawal refused all of them with *"submission can still reach quorum
+automatically"*. The only remedy available was to wait for each to exhaust its
+own retry budget, at ~4.5 validator-hours per attempt.
+
+**Why it does not go through the liveness gate.** `lease_liveness()` *infers*
+idleness from telemetry and refuses when the evidence is absent, including the
+blanket "a lease that never reported is not revocable" rule. That rule stays
+exactly as strict — pre-v16 validators still omit a leased-but-quiet slot
+entirely, so absence remains uninterpretable for every automatic path, and
+nothing here relaxes it.
+
+The operator route asks a different question, and since ditto-subnet#274
+(v0.35.0, accepted by ditto-platform#499) it can answer it with **positive
+evidence**. A protocol-16 validator announces a slot from the moment it is
+claimed and leaves `ActiveBenchmarkSlot.progress` null until it has something to
+say — the honest negative the gate always lacked. So *occupied and not
+progressing* is now an observation, and it is the observation a hang produces.
+The eviction records which of three it saw, and proceeds in all three (the
+2026-07-27 case was invisible on protocol 15, and refusing to act on
+invisibility is what left the operator with no move):
+
+| audit `reason` | what the platform saw |
+|---|---|
+| `operator_evicted_occupied_not_progressing` | v16 says it holds the slot with nothing to report — a hang, observed |
+| `operator_evicted_occupied_progressing` | the slot is visibly working; proceeds, but logged at WARNING and flagged in the audit row |
+| `operator_evicted_occupancy_unobservable` | pre-v16, stale/missing heartbeat, or an unparseable blob — recorded as unobservable, not dressed up as evidence |
+
+**Eviction never mints a no-fault retry grant.** `force_expire_lease`
+compensates the miner by default, because an automatic revocation is the platform
+possibly destroying a healthy run and the agent should not be billed the attempt
+the reissue charges. An eviction is the decision that there *is* no reissue, so
+there is nothing to offset — and granting anyway would raise the evicted agent's
+attempt cap. That is not hypothetical: ditto-subnet#279 established that the
+2026-07-27 leases were **misclassified, not silent**. All twelve expired `mnemo*`
+tickets carry the `fail_job(reason="infrastructure")` signature —
+`retry_after − deadline` of exactly +2min/+30min, the `infra_retry_backoff` base
+and cap — and `infrastructure` is the no-fault class, so every hang minted a
+grant, raised the cap and re-leased. `mnemox-v55` reached nine attempts against a
+base budget of two with zero scores that way. The eviction route passes
+`compensate=False` for exactly this reason.
+
+**A validator mid-run on an evicted lease** finishes and posts its score into a
+409: the ticket is no longer `issued` and its deadline has moved, so it fails the
+k=3 gate in `submit_score` exactly like any superseded lease. Nothing reaches the
+ledger.
+
+### Spotting one before it costs a day
+
+A hanging submission's signature is `silently_expired` — an `expired` ticket with
+no `failure_reason`, or one whose `failed_at` predates the lease it is attached
+to. Both admin views publish it (`silently_expired` per ticket,
+`silent_expiry_count` per submission). A submission whose silent-expiry count
+climbs while its score count stays at zero is hanging, not slow; that is the
+signal, and not having it is what let the 2026-07-27 incident run unnoticed.
+
 ## Retirement: when the benchmark generation closed instead
 
 Everything above assumes the submission's benchmark version is still being
