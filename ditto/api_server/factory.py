@@ -19,6 +19,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 import ditto
+from ditto.api_models.inference_concurrency_settings import (
+    MAX_EMBEDDING_GLOBAL_CONCURRENCY,
+)
 from ditto.api_server.config import (
     ApiServerConfig,
     parse_api_server_config_from_env,
@@ -50,7 +53,6 @@ from ditto.api_server.endpoints import (
     admin_validation_retry_router,
     admin_validator_slot_settings_router,
     health_router,
-    inference_router,
     metrics_router,
     public_router,
     retrieval_router,
@@ -58,6 +60,10 @@ from ditto.api_server.endpoints import (
     screener_router,
     upload_router,
     validator_router,
+)
+from ditto.api_server.endpoints.inference import (
+    INFERENCE_LANES,
+    inference_router_for_lanes,
 )
 from ditto.api_server.errors import ApiServerConfigError, ApiServerLifespanError
 from ditto.api_server.inference_concurrency_settings import (
@@ -122,6 +128,47 @@ def _process_role() -> str:
             f"DITTO_ROLE must be {PLATFORM_ROLE!r} or {RELAY_ROLE!r}, got {role!r}"
         )
     return role
+
+
+def _inference_lanes() -> frozenset[str]:
+    """Which inference lanes this process serves (``DITTO_INFERENCE_LANES``).
+
+    Defaults to every lane, so an unset variable is the behaviour every existing
+    deployment already has. Set it to ``embedding`` on a relay and that process
+    serves nothing but ``/inference/embeddings`` (and ``/inference/exchange``);
+    set it to ``chat`` on the others and the two lanes stop sharing an event
+    loop.
+
+    Why this exists at all, given that a relay is only at ~1% CPU duty cycle per
+    embedding: the shared loop is not a throughput problem, it is a *coupling*
+    problem. A chat completion is ~913 ms and an embedding is ~75 ms, and both
+    lanes' response handling runs on one thread, so a chat burst adds latency to
+    embeddings that has nothing to do with the embedding provider. That coupling
+    is invisible in aggregate CPU and shows up only as tail latency, which is
+    exactly the shape of the symptom this was opened to explain. Splitting the
+    lanes lets an operator test that claim by moving traffic, rather than by
+    arguing about it.
+
+    Deliberately NOT wired to ``DITTO_ROLE``. A ``platform`` process must keep
+    serving both lanes -- it is the fallback the load balancer uses -- and a
+    relay's lane assignment is a load-balancer-shaped decision that changes far
+    more often than its role does.
+
+    An unknown lane fails boot for the same reason an unknown role does: a
+    process serving no traffic still passes its health check, so a typo would
+    present as a load-balancer fault.
+    """
+    raw = os.environ.get("DITTO_INFERENCE_LANES", "").strip()
+    if not raw:
+        return frozenset(INFERENCE_LANES)
+    lanes = frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+    try:
+        inference_router_for_lanes(lanes)
+    except ValueError as error:
+        raise ApiServerConfigError(
+            f"DITTO_INFERENCE_LANES is invalid: {error}"
+        ) from error
+    return lanes
 
 
 def _efficiency_settings_ttl_seconds() -> float:
@@ -208,6 +255,40 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             stack.push_async_callback(inference_client.aclose)
             app.state.inference_client = inference_client
+            # The embedding lane gets its OWN pool, and this is a fix rather
+            # than tidiness. Both lanes used to share the client above, whose
+            # ceiling is `global_concurrency` -- the CHAT limit, 72. So the
+            # transport could carry at most 72 concurrent upstream calls of
+            # both kinds combined, while embedding admission was independently
+            # willing to admit 128. Any embedding_global_concurrency above 72
+            # was unreachable by construction: admission let the request
+            # through and it then blocked on pool acquisition, invisibly,
+            # inside the window `latency_ms` measures. Raising the board past
+            # 72 was therefore partly a no-op, and the part that did land
+            # showed up as latency rather than as a decline.
+            #
+            # Sized from MAX_EMBEDDING_GLOBAL_CONCURRENCY, not from the
+            # configured value, because the configured value is hot-swappable
+            # from Backroom and the pool is fixed at boot. Sizing it from the
+            # live setting would recreate exactly the bug above the moment an
+            # operator raised the board without a restart. The ceiling is the
+            # only number that is guaranteed to still be true tomorrow.
+            #
+            # This is connection-pool isolation, which is the level the
+            # contention is actually at today -- the hosts are at 7.7% CPU and
+            # ~1% CPU duty cycle per embedding, so sockets, not cores, are what
+            # the two lanes were fighting over. Process-level isolation is
+            # available on top via DITTO_INFERENCE_LANES, for when it isn't.
+            embedding_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(config.inference_proxy.timeout_seconds),
+                follow_redirects=False,
+                limits=httpx.Limits(
+                    max_connections=MAX_EMBEDDING_GLOBAL_CONCURRENCY,
+                    max_keepalive_connections=MAX_EMBEDDING_GLOBAL_CONCURRENCY,
+                ),
+            )
+            stack.push_async_callback(embedding_client.aclose)
+            app.state.inference_embedding_client = embedding_client
             provider_routes = ProviderRouteRefresher(
                 config=config.inference_proxy,
                 session_maker=app.state.session_maker,
@@ -321,12 +402,19 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
         # admin surface even if it is reachable and holds valid credentials.
         # /health and /metrics stay so the load balancer and Prometheus scrape
         # the same paths on both roles.
-        app.include_router(inference_router, prefix="/api/v1")
+        app.include_router(
+            inference_router_for_lanes(_inference_lanes()), prefix="/api/v1"
+        )
         return app
     app.include_router(upload_router, prefix="/api/v1")
     app.include_router(retrieval_router, prefix="/api/v1")
     app.include_router(validator_router, prefix="/api/v1")
-    app.include_router(inference_router, prefix="/api/v1")
+    # The platform role always carries every lane. It is what the load balancer
+    # falls back to, so narrowing it would turn a relay outage into a total
+    # inference outage rather than a slow one.
+    app.include_router(
+        inference_router_for_lanes(frozenset(INFERENCE_LANES)), prefix="/api/v1"
+    )
     app.include_router(screener_router, prefix="/api/v1")
     app.include_router(scoring_router, prefix="/api/v1")
     app.include_router(public_router, prefix="/api/v1")

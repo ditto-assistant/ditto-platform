@@ -47,6 +47,39 @@ const venvPython = path.join(root, ".venv", "bin", "python");
 // renders the Caddy upstreams.
 const RELAY_PORTS = [8010, 8011];
 
+// --- Per-lane relays (OFF by default; read this whole block before enabling) --
+//
+// Chat and embeddings are opposite-shaped traffic sharing one single-threaded
+// event loop per relay: a chat completion is ~913 ms and an embedding is ~75 ms
+// (measured on prod). Response handling for the slow lane is therefore
+// head-of-line blocking for the fast one, adding embedding latency that has
+// nothing to do with the embedding provider. `DITTO_INFERENCE_LANES` (see
+// factory.py `_inference_lanes`) restricts a relay to one lane, which is what
+// lets the two land on different cores.
+//
+// Map port -> lane here to enable it, e.g.:
+//
+//   const RELAY_LANES = { 8010: "chat", 8011: "embedding" };
+//
+// REASSIGNING, NOT ADDING, IS THE INTENDED MOVE. Two more relay processes would
+// need two more Postgres pools, and the budget above has no room: 84 + 3
+// superuser-reserved of 100 today, so 2 x 12 more overruns `max_connections`,
+// which is a postmaster setting needing a database RESTART. Reassignment costs
+// nothing: each relay currently runs at 0.01-0.02 of a core against a measured
+// per-relay ceiling of roughly 70-230 req/s, so one relay per lane is ample at
+// today's 10.8 req/s fleet-wide.
+//
+// !! ENABLING THIS REQUIRES THE CADDY CHANGE TO LAND FIRST. Caddy currently
+// !! round-robins ALL of /api/v1/inference/* across both relays. A lane-restricted
+// !! relay does not mount the other lane's route, so round-robin would 404 half
+// !! of one lane's traffic. Caddy must first route by path:
+// !!   /api/v1/inference/embeddings -> the embedding relay
+// !!   everything else under /api/v1/inference/* -> the chat relay
+// !! (`/inference/exchange` is mounted on EVERY inference process precisely so
+// !! that "everything else" needs no special case.)
+// !! Until that lands, leave this empty and both relays keep serving both lanes.
+const RELAY_LANES = {};
+
 // TWO relays, not one, from the start. Measured on prod (e2-standard-4):
 // `ditto-api` sits at 84% of ONE core serving 10.8 req/s, and inference is
 // 71.7% of requests / 81.7% of in-flight request-time. A single relay would
@@ -95,6 +128,13 @@ const relayApp = (port, index) => ({
     // every process here, so the role cannot come from there.
     DITTO_ROLE: "relay",
     API_PORT: String(port),
+    // Empty string = unset = every lane, which is what `_inference_lanes`
+    // treats as the default. Passing "" rather than omitting the key matters:
+    // `pm2 reload --update-env` reconciles the env it is given, so a key that
+    // disappears from this file would keep its previously-saved value in pm2's
+    // dump and a relay could stay pinned to one lane after the split is
+    // reverted.
+    DITTO_INFERENCE_LANES: RELAY_LANES[port] || "",
     POSTGRES_POOL_MIN_SIZE: "5",
     POSTGRES_POOL_MAX_SIZE: "12",
     // Dashboard validator-name enrichment is in-memory only and a relay serves

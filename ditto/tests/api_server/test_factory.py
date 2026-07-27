@@ -7,6 +7,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import FastAPI
 
+from ditto.api_models.inference_concurrency_settings import (
+    MAX_EMBEDDING_GLOBAL_CONCURRENCY,
+)
 from ditto.api_server import create_api_server
 from ditto.api_server.errors import ApiServerConfigError, ApiServerLifespanError
 from ditto.api_server.middleware import (
@@ -253,3 +256,195 @@ class TestProcessRole:
             return
         with pytest.raises(ApiServerConfigError):
             create_api_server(make_api_server_config())
+
+
+class TestInferenceLanes:
+    """``DITTO_INFERENCE_LANES`` puts chat and embeddings on separate processes.
+
+    The two lanes are opposite-shaped traffic sharing one single-threaded event
+    loop: a chat completion is ~913 ms of wall clock, an embedding ~75 ms. The
+    slow lane's response handling is head-of-line blocking for the fast one, so
+    a chat burst adds embedding latency that has nothing to do with the
+    embedding provider. Restricting a relay to one lane is what lets the two
+    land on different cores.
+
+    Every test here pins the same safety property from a different side: a
+    process must never silently serve less than the operator asked for.
+    """
+
+    @staticmethod
+    def _paths(app: FastAPI) -> set[str]:
+        return {getattr(route, "path", "") for route in app.routes}
+
+    def test_default_is_every_lane_so_an_unset_variable_changes_nothing(
+        self, monkeypatch
+    ):
+        """The knob must be inert until someone reaches for it.
+
+        Every existing deployment has this variable unset, and the Caddy path
+        split that a lane-restricted relay requires has not landed. An unset
+        default that dropped a route would 404 live traffic.
+        """
+        monkeypatch.setenv("DITTO_ROLE", "relay")
+        monkeypatch.delenv("DITTO_INFERENCE_LANES", raising=False)
+        unset = self._paths(create_api_server(make_api_server_config()))
+        monkeypatch.setenv("DITTO_INFERENCE_LANES", "chat,embedding")
+        explicit = self._paths(create_api_server(make_api_server_config()))
+        assert unset == explicit
+        assert "/api/v1/inference/chat/completions" in unset
+        assert "/api/v1/inference/embeddings" in unset
+
+    def test_an_embedding_relay_does_not_mount_the_chat_lane(self, monkeypatch):
+        monkeypatch.setenv("DITTO_ROLE", "relay")
+        monkeypatch.setenv("DITTO_INFERENCE_LANES", "embedding")
+        paths = self._paths(create_api_server(make_api_server_config()))
+        assert "/api/v1/inference/embeddings" in paths
+        assert "/api/v1/inference/chat/completions" not in paths
+
+    def test_a_chat_relay_does_not_mount_the_embedding_lane(self, monkeypatch):
+        monkeypatch.setenv("DITTO_ROLE", "relay")
+        monkeypatch.setenv("DITTO_INFERENCE_LANES", "chat")
+        paths = self._paths(create_api_server(make_api_server_config()))
+        assert "/api/v1/inference/chat/completions" in paths
+        assert "/api/v1/inference/embeddings" not in paths
+
+    def test_exchange_is_mounted_on_every_lane(self, monkeypatch):
+        """A lane-restricted relay must still be a drop-in behind a path split.
+
+        ``/exchange`` mints the grant BOTH lanes spend against and is called
+        once per grant rather than per request. Keeping it everywhere is what
+        lets Caddy route only ``/inference/embeddings`` and send *everything
+        else* to the chat relay with no special case.
+        """
+        monkeypatch.setenv("DITTO_ROLE", "relay")
+        for lanes in ("chat", "embedding", "chat,embedding"):
+            monkeypatch.setenv("DITTO_INFERENCE_LANES", lanes)
+            paths = self._paths(create_api_server(make_api_server_config()))
+            assert "/api/v1/inference/exchange" in paths, lanes
+
+    def test_the_platform_role_keeps_every_lane_regardless(self, monkeypatch):
+        """Narrowing the fallback would turn a relay outage into a full outage."""
+        monkeypatch.setenv("DITTO_ROLE", "platform")
+        monkeypatch.setenv("DITTO_INFERENCE_LANES", "embedding")
+        paths = self._paths(create_api_server(make_api_server_config()))
+        assert "/api/v1/inference/chat/completions" in paths
+        assert "/api/v1/inference/embeddings" in paths
+
+    @pytest.mark.parametrize("value", ["embeddings", "chat,embeddigs", "llm"])
+    def test_an_unknown_lane_fails_boot(self, monkeypatch, value: str):
+        """A typo must not produce a healthy process that serves no traffic.
+
+        That failure presents as a load-balancer fault and is considerably
+        harder to find than a crash-loop naming the bad value. Note that
+        ``embeddings`` (plural) is rejected: it is the route's name, so it is
+        the most likely thing an operator types.
+        """
+        monkeypatch.setenv("DITTO_ROLE", "relay")
+        monkeypatch.setenv("DITTO_INFERENCE_LANES", value)
+        with pytest.raises(ApiServerConfigError, match="DITTO_INFERENCE_LANES"):
+            create_api_server(make_api_server_config())
+
+    def test_a_lane_restricted_relay_is_still_a_subset_of_the_platform(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("DITTO_ROLE", "platform")
+        monkeypatch.delenv("DITTO_INFERENCE_LANES", raising=False)
+        platform = self._paths(create_api_server(make_api_server_config()))
+        monkeypatch.setenv("DITTO_ROLE", "relay")
+        monkeypatch.setenv("DITTO_INFERENCE_LANES", "embedding")
+        relay = self._paths(create_api_server(make_api_server_config()))
+        assert relay <= platform
+
+
+class TestEmbeddingConnectionPoolIsSeparate:
+    """The embedding lane gets its own httpx pool, and that is a bug fix.
+
+    Both lanes used to share one client whose ``max_connections`` is
+    ``global_concurrency`` -- the CHAT limit, 72 in production. Embedding
+    admission was independently willing to admit up to 128, so any
+    ``embedding_global_concurrency`` above 72 was unreachable by construction:
+    admission let the request through and it then blocked acquiring a
+    connection, invisibly, inside the window ``latency_ms`` measures. Raising
+    the board past 72 was therefore partly a no-op, and the part that did land
+    surfaced as latency rather than as an honest decline.
+    """
+
+    @staticmethod
+    async def _clients(config) -> tuple[object, object]:
+        engine = MagicMock()
+        engine.dispose = AsyncMock()
+        chain_ctx = MagicMock()
+        chain_ctx.__aenter__ = AsyncMock(return_value=MagicMock())
+        chain_ctx.__aexit__ = AsyncMock(return_value=False)
+        storage_ctx = MagicMock()
+        storage_ctx.__aenter__ = AsyncMock(return_value=MagicMock())
+        storage_ctx.__aexit__ = AsyncMock(return_value=False)
+        closeable = MagicMock()
+        closeable.aclose = AsyncMock()
+        refresher = MagicMock()
+        refresher.start = AsyncMock()
+        refresher.aclose = AsyncMock()
+
+        with (
+            patch("ditto.api_server.factory.create_db_engine", return_value=engine),
+            patch(
+                "ditto.api_server.factory.create_session_maker",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "ditto.api_server.factory.create_chain_client", return_value=chain_ctx
+            ),
+            patch(
+                "ditto.api_server.factory.create_price_oracle", return_value=closeable
+            ),
+            patch("ditto.api_server.factory.create_payment_verifier"),
+            patch(
+                "ditto.api_server.factory.create_storage_client",
+                return_value=storage_ctx,
+            ),
+            patch("ditto.api_server.factory.create_embedder", return_value=closeable),
+            patch("ditto.api_server.factory.create_generator", return_value=closeable),
+            patch(
+                "ditto.api_server.factory.ProviderRouteRefresher",
+                return_value=refresher,
+            ),
+        ):
+            app = create_api_server(config)
+            app.state.validator_names.start = AsyncMock()
+            app.state.validator_names.aclose = AsyncMock()
+            async with app.router.lifespan_context(app):
+                captured = (
+                    app.state.inference_client,
+                    app.state.inference_embedding_client,
+                )
+        return captured
+
+    async def test_the_two_lanes_do_not_share_a_client(self):
+        chat, embedding = await self._clients(make_api_server_config())
+        assert chat is not embedding
+
+    async def test_the_embedding_pool_can_carry_the_whole_ceiling(self):
+        """Sized from the CEILING, not from the configured value.
+
+        ``embedding_global_concurrency`` is hot-swappable from Backroom while
+        the pool is fixed at boot. Sizing the pool from the live setting would
+        recreate the original bug the instant an operator raised the board
+        without a restart -- the ceiling is the only number guaranteed to still
+        be true after the next revision.
+        """
+        _chat, embedding = await self._clients(make_api_server_config())
+        limits = embedding._transport._pool._max_connections
+        assert limits >= MAX_EMBEDDING_GLOBAL_CONCURRENCY
+
+    async def test_a_chat_burst_cannot_consume_the_embedding_lanes_sockets(self):
+        """The isolation property, stated as the thing an operator cares about.
+
+        The chat pool's ceiling is its own lane's limit, so chat saturating
+        itself leaves the embedding pool entirely untouched.
+        """
+        config = make_api_server_config()
+        chat, embedding = await self._clients(config)
+        chat_max = chat._transport._pool._max_connections
+        embedding_max = embedding._transport._pool._max_connections
+        assert chat_max == config.inference_proxy.global_concurrency
+        assert embedding_max == MAX_EMBEDDING_GLOBAL_CONCURRENCY

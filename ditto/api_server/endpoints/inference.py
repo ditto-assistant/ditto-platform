@@ -95,7 +95,58 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/inference", tags=["inference"])
+CHAT_LANE = "chat"
+EMBEDDING_LANE = "embedding"
+INFERENCE_LANES = (CHAT_LANE, EMBEDDING_LANE)
+
+# The two proxied lanes are declared on separate routers so a process can mount
+# one without the other. Nothing about a request changes; what changes is which
+# event loop it lands on.
+#
+# Chat and embeddings have opposite shapes. A chat completion is ~913 ms of
+# wall clock and arrives a few per second; an embedding is ~75 ms and arrives in
+# bursts of up to eight per run. They share a single-threaded uvicorn event
+# loop, so the expensive lane's response handling is head-of-line blocking for
+# the cheap one: an embedding that the provider answered in 75 ms can still wait
+# behind chat JSON decoding before its own callback runs. Splitting the routers
+# is what lets an operator put the two on different processes and therefore
+# different cores.
+#
+# ``/exchange`` is mounted on every inference process regardless of lane. It is
+# validator-authenticated, called once per grant rather than per request, and
+# mints the grant BOTH lanes then spend against -- so making it lane-specific
+# would mean a lane-restricted relay could not be a drop-in behind a plain
+# path split at the load balancer.
+_exchange_router = APIRouter(tags=["inference"])
+_chat_router = APIRouter(tags=["inference"])
+_embedding_router = APIRouter(tags=["inference"])
+_LANE_ROUTERS = {CHAT_LANE: _chat_router, EMBEDDING_LANE: _embedding_router}
+
+
+def inference_router_for_lanes(lanes: frozenset[str]) -> APIRouter:
+    """Build the inference router carrying only ``lanes`` (plus ``/exchange``).
+
+    An unknown lane raises rather than being ignored: a typo in a relay's
+    environment must not silently produce a process that serves no traffic and
+    reports itself healthy, which is indistinguishable from a load balancer
+    misconfiguration and considerably harder to find.
+    """
+    unknown = sorted(lanes - set(INFERENCE_LANES))
+    if unknown:
+        raise ValueError(
+            f"unknown inference lane(s) {unknown}; "
+            f"expected any of {list(INFERENCE_LANES)}"
+        )
+    if not lanes:
+        raise ValueError("an inference process must serve at least one lane")
+    built = APIRouter(prefix="/inference", tags=["inference"])
+    built.include_router(_exchange_router)
+    for lane in INFERENCE_LANES:
+        if lane in lanes:
+            built.include_router(_LANE_ROUTERS[lane])
+    return built
+
+
 _EXCHANGE_MAX_AGE = timedelta(minutes=2)
 _PROXY_MAX_AGE = timedelta(seconds=30)
 _EMBEDDING_MAX_INPUTS = 256
@@ -789,7 +840,7 @@ def _public_embedding_response(
     )
 
 
-@router.post("/exchange", response_model=InferenceExchangeResponse)
+@_exchange_router.post("/exchange", response_model=InferenceExchangeResponse)
 async def exchange_inference_grant(
     payload: InferenceExchangeRequest,
     request: Request,
@@ -857,7 +908,7 @@ async def exchange_inference_grant(
     )
 
 
-@router.post("/chat/completions")
+@_chat_router.post("/chat/completions")
 async def proxy_chat_completions(
     request: Request,
     x_ditto_grant: Annotated[UUID | None, Header()] = None,
@@ -1116,7 +1167,7 @@ async def proxy_chat_completions(
     )
 
 
-@router.post("/embeddings")
+@_embedding_router.post("/embeddings")
 async def proxy_embeddings(
     request: Request,
     x_ditto_grant: Annotated[UUID | None, Header()] = None,
@@ -1240,7 +1291,9 @@ async def proxy_embeddings(
     started = time.monotonic()
     try:
         provider_result = await _post_provider_with_retry(
-            request.app.state.inference_client,
+            # The embedding lane's own pool -- see `factory.py`. A chat burst
+            # can no longer consume the sockets an embedding call needs.
+            request.app.state.inference_embedding_client,
             config.embedding_upstream_url,
             payload=upstream_payload,
             headers={
@@ -1314,4 +1367,15 @@ async def proxy_embeddings(
     )
 
 
-__all__ = ["router"]
+# The full-fleet router, built after every route is declared. This is what a
+# process serving both lanes mounts, and it is the default: restricting lanes is
+# an explicit deployment choice, never something a plain checkout falls into.
+router = inference_router_for_lanes(frozenset(INFERENCE_LANES))
+
+__all__ = [
+    "CHAT_LANE",
+    "EMBEDDING_LANE",
+    "INFERENCE_LANES",
+    "inference_router_for_lanes",
+    "router",
+]
