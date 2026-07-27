@@ -2018,12 +2018,19 @@ class ValidatorTicket(Base):
     infra_retry_grants: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
-    """Automatic cap extensions earned when this lease failed on validator-side
-    infrastructure (a signed ``fail_job`` with reason ``infrastructure``) rather
-    than the agent. Each one offsets the :attr:`attempt_count` increment the
-    reissue will add, so an infrastructure outage never spends the agent's
-    genuine attempt budget. Like :attr:`manual_retry_grants` it only raises the
-    cap; it never rewrites :attr:`attempt_count`."""
+    """Automatic cap extensions earned when this lease ended for reasons that
+    were not the agent's fault. Two things qualify: a validator-side
+    infrastructure failure (a signed ``fail_job`` with reason
+    ``infrastructure``), and the platform force-expiring a live lease itself --
+    the latter being the case ditto-platform#460 named but did not reach, since
+    a revoked lease can no longer be resolved by ``fail_job``.
+
+    Each one offsets the :attr:`attempt_count` increment the reissue will add, so
+    neither an outage nor a platform revocation spends the agent's genuine
+    attempt budget. Like :attr:`manual_retry_grants` it only raises the cap; it
+    never rewrites :attr:`attempt_count`, so the ledger keeps saying how many
+    leases were really consumed while the grant says how many the miner should
+    not be billed for."""
 
     retry_after: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
