@@ -2066,6 +2066,25 @@ class ValidatorTicket(Base):
     )
     """When :attr:`failure_reason` was reported. Preserved across reissue."""
 
+    failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """The reporter's own code or note behind :attr:`failure_reason`, if any.
+
+    :attr:`failure_reason` is a three-value class chosen to drive reissue policy,
+    which makes it useless for diagnosis: ditto-subnet#279 traced twelve dead
+    ``mnemo*`` leases to ``fail_job(reason="infrastructure")`` and still could not
+    say *which* of the validator's five sandbox infrastructure codes fired,
+    because the wire could not carry it and the code survived only in a
+    validator-host log line. The ~60-minute killer is still unidentified for that
+    reason alone. This is where that code now lands.
+
+    Advisory and validator-supplied: it is not part of the signed fail payload
+    (neither is :attr:`failure_reason`), it drives no policy, and it is bounded
+    to 200 characters by ``FailJobRequest``. Written and cleared together with
+    :attr:`failure_reason`, so the pair is always read as one report. NULL means
+    the reporter sent none -- which is what every validator predating the field
+    does, and is not an error.
+    """
+
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=False,

@@ -216,6 +216,8 @@ from ditto.db.queries.king_reign import (
 )
 from ditto.db.queries.payments import get_miner_coldkey_for_agent
 from ditto.db.queries.retry_budget import (
+    INFRA_RETRY_BACKOFF_CAP,
+    agent_infra_retry_grants,
     grant_no_fault_retry,
     infra_retry_backoff,
 )
@@ -3607,11 +3609,19 @@ async def fail_job(
                 validator_hotkey=payload.validator_hotkey,
                 ticket_deadline=payload.ticket_deadline,
             )
+            # Read before the ticket is mutated below, so the total is the
+            # fleet's spend on this agent *before* this failure is priced in.
+            fleet_infra_grants = await agent_infra_retry_grants(
+                session,
+                agent_id=ticket.agent_id,
+                bench_version=ticket.bench_version,
+            )
             # Close for reissue without the 6h agent-failure cooldown so the
             # next request_job mints a fresh lease instead of resuming this one.
             ticket.status = TicketStatus.EXPIRED
             ticket.deadline = now
             ticket.failure_reason = payload.reason
+            ticket.failure_detail = payload.failure_detail
             ticket.failed_at = now
             if payload.reason == "infrastructure" or platform_revoked:
                 # Not the agent's fault: bump the (bounded) infra grant that
@@ -3625,10 +3635,43 @@ async def fail_job(
                 # persistently broken lease cannot mint attempts forever, and
                 # failure_reason still records what was actually reported --
                 # this corrects the billing, not the diagnosis.
-                grant_no_fault_retry(ticket)
-                ticket.retry_after = now + infra_retry_backoff(
-                    ticket.infra_retry_grants
+                #
+                # A *reported* infrastructure verdict additionally answers to the
+                # per-agent bound: eight grants per validator across a validator
+                # pool of any size is unbounded per agent, which is how one
+                # artifact held quorum slots for a day in ditto-subnet#279. A
+                # platform-revoked lease deliberately does not (see
+                # grant_no_fault_retry): repetition there is the platform's fault,
+                # and billing the miner for it is the rule #460/#497 settled.
+                granted = grant_no_fault_retry(
+                    ticket,
+                    agent_infra_grants=(
+                        fleet_infra_grants
+                        if payload.reason == "infrastructure"
+                        else None
+                    ),
                 )
+                # Refused means the next lease is billed to the miner. Cool all
+                # the way down rather than off this ticket's own (possibly small)
+                # count: the fleet has already spent its whole no-fault allowance
+                # on this artifact, so nothing about it deserves a fast retry.
+                ticket.retry_after = now + (
+                    infra_retry_backoff(ticket.infra_retry_grants)
+                    if granted
+                    else INFRA_RETRY_BACKOFF_CAP
+                )
+                if not granted:
+                    logger.warning(
+                        "no-fault retry refused; this failure bills the miner "
+                        "agent=%s validator=%s reason=%s detail=%s "
+                        "ticket_grants=%s fleet_grants=%s",
+                        payload.agent_id,
+                        payload.validator_hotkey,
+                        payload.reason,
+                        payload.failure_detail,
+                        ticket.infra_retry_grants,
+                        fleet_infra_grants,
+                    )
                 if platform_revoked and payload.reason != "infrastructure":
                     logger.warning(
                         "platform-revoked lease reported as %s; compensating "
