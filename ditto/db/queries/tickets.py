@@ -15,6 +15,7 @@ lock guarantees one validator cannot hold two live assignments across agents.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -45,6 +46,7 @@ from ditto.db.queries.queue_order import (
     MIN_OWNER_CONCURRENT_SUBMISSION_LIMIT,
     OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     PROVISIONAL_CONTENDER_LANE_SIZE,
+    SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     eligible_screened_image_predicate,
     owner_capacity_gate,
     owner_live_lease_agent_ids,
@@ -64,10 +66,22 @@ from ditto.db.queries.scores import (
     LedgerRow,
     list_eligible_ledger,
 )
+from ditto.db.queries.similarity_budget import (
+    SubmissionSketch,
+    live_lease_sketches,
+    load_submission_sketches,
+)
+from ditto.db.queries.similarity_grouping import (
+    SimilarityBudgetPolicy,
+    SimilarityMatch,
+    similar_submissions,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy import ColumnElement, Select
     from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -312,6 +326,10 @@ async def issue_ticket(
     slot_id: str = "slot-0",
     only_agent_ids: Collection[UUID] | None = None,
     owner_concurrent_submission_limit: int = OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
+    similarity_policy: SimilarityBudgetPolicy | None = None,
+    similarity_concurrent_submission_limit: int = (
+        SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT
+    ),
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
@@ -351,6 +369,18 @@ async def issue_ticket(
     but can never be served ahead of another owner. ``1`` disables the second
     pass entirely and restores strict serialization; see
     :func:`~ditto.db.queries.queue_order.owner_capacity_gate`.
+
+    ``similarity_policy`` turns on the fairness rail that the owner ceiling
+    cannot reach: near-identical submissions share one concurrency budget
+    whichever key paid for them, because spreading one submission across many
+    coldkeys defeats every ownership-derived rule the platform can verify.
+    ``None`` (the default) leaves it off entirely -- no sketch is read and the
+    allocator behaves exactly as it did before -- so the whole feature is inert
+    until an operator enables it. Unlike the owner ceiling this rail applies on
+    **both** passes, ordinary and last-resort: the monopoly it prevents is one
+    family filling the fleet precisely when nothing else is leasable, which is
+    the last-resort case. It never refuses a submission the owner has already
+    started; see the gate's docstring for that exemption and its bound.
     """
     # No row exists to lock before a validator's first claim. Serialize that
     # gap explicitly on Postgres; the unique partial index remains the durable
@@ -506,6 +536,10 @@ async def issue_ticket(
     # selection and are answered once per distinct owner rather than once per
     # candidate. That also makes the second pass free.
     owner_facts: dict[tuple[str, ...], tuple[UUID | None, set[UUID]]] = {}
+    # The fleet's live-lease sketches, for the same reason and with the same
+    # lifetime: a property of the fleet rather than of the row, read at most
+    # once per issuance and only when the similarity rail is enabled at all.
+    twin_sketches: tuple[SubmissionSketch, ...] | None = None
     skipped: list[UUID] = []
     # Rows this validator was refused purely by the owner ceiling, in the queue
     # order they were refused in. These -- and only these -- are what the
@@ -654,18 +688,50 @@ async def issue_ticket(
                 await owner_live_lease_agent_ids(session, linkage=linkage, now=now),
             )
         owner_selected_agent_id, owner_live_leases = owner_facts[owner_key]
-        if (
-            owner_capacity_gate(
-                agent_id=agent_id,
-                selected_agent_id=owner_selected_agent_id,
-                live_lease_agent_ids=owner_live_leases,
-                concurrent_submission_limit=owner_concurrent_submission_limit,
-                last_resort=last_resort,
-            )
-            is not None
-        ):
+        # The fairness rail's inputs. Read inside the loop but cached across
+        # it: the fleet's live-lease sketches are the same set for every
+        # candidate this pass, and the per-candidate sketch is one projection
+        # of a column the ticket path otherwise never touches.
+        twins: tuple[SimilarityMatch, ...] = ()
+        if similarity_policy is not None:
+            if twin_sketches is None:
+                twin_sketches = await live_lease_sketches(session, now=now)
+            candidate_sketch = (
+                await load_submission_sketches(session, agent_ids=[agent_id])
+            ).get(agent_id)
+            if candidate_sketch is not None:
+                twins = similar_submissions(
+                    candidate_sketch,
+                    [sketch for sketch in twin_sketches if sketch.agent_id != agent_id],
+                    policy=similarity_policy,
+                )
+        gate = owner_capacity_gate(
+            agent_id=agent_id,
+            selected_agent_id=owner_selected_agent_id,
+            live_lease_agent_ids=owner_live_leases,
+            concurrent_submission_limit=owner_concurrent_submission_limit,
+            last_resort=last_resort,
+            similar_lease_agent_ids=[twin.agent_id for twin in twins],
+            similarity_concurrent_submission_limit=(
+                similarity_concurrent_submission_limit
+            ),
+        )
+        if gate is not None:
+            if gate == "similarity_serialized":
+                # Logged rather than silently skipped, because this is the one
+                # refusal whose reason a miner cannot reconstruct from their own
+                # submission -- it depends on a row belonging to someone else.
+                logger.info(
+                    "similarity budget holds agent %s: %s",
+                    agent_id,
+                    ", ".join(twin.describe() for twin in twins[:3]),
+                )
             skipped.append(agent_id)
-            if not last_resort:
+            if not last_resort and gate == "owner_serialized":
+                # Only the owner ceiling is reconsidered on the last-resort
+                # pass. The similarity rail applies on both, so re-offering a
+                # row it refused would relax it in the one situation it exists
+                # for.
                 owner_capacity_skips.append(agent_id)
             continue
         occupied = await session.scalar(

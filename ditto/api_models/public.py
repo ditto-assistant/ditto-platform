@@ -1781,7 +1781,13 @@ class PublicActivityEntry(BaseModel):
         ),
     ]
     validator_queue_gate: Annotated[
-        Literal["previous_generation", "owner_serialized", "not_leasable"] | None,
+        Literal[
+            "previous_generation",
+            "owner_serialized",
+            "similarity_serialized",
+            "not_leasable",
+        ]
+        | None,
         Field(
             default=None,
             description=(
@@ -1794,6 +1800,11 @@ class PublicActivityEntry(BaseModel):
                 "hotkeys does not buy a second slot, though a validator that "
                 "finds nothing else eligible anywhere may still lease it rather "
                 "than idle, up to the operator's per-owner limit; "
+                "'similarity_serialized' means a near-identical submission is "
+                "already using this one's share of fleet capacity, whichever "
+                "key paid for it -- a queue-fairness wait and nothing more, "
+                "carrying no claim that either submission is illegitimate, and "
+                "it clears on its own when the other lease ends; "
                 "'not_leasable' means the allocator's candidate filter excludes "
                 "it (no versioned dataset, no eligible screened image, "
                 "withdrawn, not admitted to this era, or every quorum slot "
