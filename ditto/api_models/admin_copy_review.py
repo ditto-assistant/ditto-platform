@@ -21,6 +21,11 @@ class AdminCopyReviewEvidence(BaseModel):
     duplicate_of_name: str | None = None
     duplicate_of_version: int | None = None
     duplicate_of_hotkey: str | None = None
+    duplicate_of_coldkey: str | None = None
+    """Payment-time coldkey of the matched agent, so a reviewer can see whether
+    the two submissions were paid for from the same coldkey without a second
+    lookup. Null when the matched row is gone or carries no payment record.
+    Same caveat as ``AdminCopyReviewItem.miner_coldkey``: one signal, not proof."""
     duplicate_of_submitted_at: datetime | None = None
 
 
@@ -73,6 +78,16 @@ class AdminCopyReviewItem(BaseModel):
     review_id: UUID
     agent_id: UUID
     miner_hotkey: str
+    miner_coldkey: str | None = None
+    """Coldkey that paid for this evaluation, from ``evaluation_payments``.
+
+    Null for agents with no payment row: unknown, not absent. Payment-time
+    provenance, not on-chain metagraph ownership. Miners routinely pay from
+    several coldkeys, so matching this against ``original.duplicate_of_coldkey``
+    is one signal of common control — a match is worth following, a mismatch is
+    not evidence of different operators. ``GET /admin/miner-owners/{key}``
+    resolves the wider footprint.
+    """
     agent_name: str
     agent_version: int | None = None
     submitted_at: datetime

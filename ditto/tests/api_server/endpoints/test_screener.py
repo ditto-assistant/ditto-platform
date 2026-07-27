@@ -4650,10 +4650,15 @@ class TestQuarantineReviewContext:
         assert [q["agent_name"] for q in body["miner"]["recent_quarantines"]] == [
             "alpha-agent-v1"
         ]
+        # The coldkey behind ``same_owner`` is now named, so a reviewer can see
+        # WHY two hotkeys were treated as one owner instead of trusting a flag.
+        assert body["agent"]["miner_coldkey"] == "5SharedPaymentOwner"
+        assert body["miner"]["miner_coldkeys"] == ["5SharedPaymentOwner"]
         assert body["duplicates"] == [
             {
                 "agent_id": str(duplicate_agent),
                 "miner_hotkey": other_miner,
+                "miner_coldkey": "5SharedPaymentOwner",
                 "agent_name": "copycat-agent",
                 "agent_status": AgentStatus.UPLOADED,
                 "submitted_at": body["duplicates"][0]["submitted_at"],

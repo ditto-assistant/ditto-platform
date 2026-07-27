@@ -29,6 +29,9 @@ from ditto.api_server.endpoints.admin_lease_revocations import (
 from ditto.api_server.endpoints.admin_miner_fees import (
     router as admin_miner_fees_router,
 )
+from ditto.api_server.endpoints.admin_owner import (
+    router as admin_owner_router,
+)
 from ditto.api_server.endpoints.admin_quarantine import (
     router as admin_quarantine_router,
 )
@@ -76,6 +79,7 @@ __all__ = [
     "admin_copy_review_router",
     "admin_continual_retest_settings_router",
     "admin_miner_fees_router",
+    "admin_owner_router",
     "admin_quarantine_router",
     "admin_retirement_router",
     "admin_scoring_readiness_router",

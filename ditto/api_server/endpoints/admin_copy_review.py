@@ -73,6 +73,28 @@ def _fingerprint_versions(evidence: dict) -> dict[str, int | str | None]:
     }
 
 
+async def _review_coldkeys(
+    session: AsyncSession, agent: Agent, matched: Agent | None
+) -> tuple[str | None, str | None]:
+    """Payment-time coldkeys for a held agent and the agent it was matched to.
+
+    Both are single-row lookups on ``evaluation_payments.agent_id`` (unique).
+    Surfacing them lets a reviewer see at a glance whether a copy came from the
+    same payer without a manual database query — the question that repeatedly
+    stalled duplicate adjudication. It stays one signal: see
+    :mod:`ditto.db.queries.ownership`.
+    """
+    coldkeys = await get_miner_coldkeys_for_agents(
+        session,
+        agent_ids={agent.agent_id}
+        | ({matched.agent_id} if matched is not None else set()),
+    )
+    return (
+        coldkeys.get(agent.agent_id),
+        coldkeys.get(matched.agent_id) if matched is not None else None,
+    )
+
+
 def _item(
     review: AthReview,
     agent: Agent,
@@ -80,6 +102,9 @@ def _item(
     comparison: (
         AdminCopyReviewCurrentComparison | AdminCopyReviewComparisonUnavailable | None
     ) = None,
+    *,
+    miner_coldkey: str | None = None,
+    duplicate_of_coldkey: str | None = None,
 ) -> AdminCopyReviewItem:
     provenance = review.algorithm_provenance
     review_kind = provenance.get("review_kind")
@@ -89,6 +114,7 @@ def _item(
         review_id=review.review_id,
         agent_id=agent.agent_id,
         miner_hotkey=agent.miner_hotkey,
+        miner_coldkey=miner_coldkey,
         agent_name=agent.name,
         agent_version=agent.version,
         submitted_at=agent.created_at,
@@ -112,6 +138,7 @@ def _item(
             duplicate_of_name=matched.name if matched else None,
             duplicate_of_version=matched.version if matched else None,
             duplicate_of_hotkey=matched.miner_hotkey if matched else None,
+            duplicate_of_coldkey=duplicate_of_coldkey if matched else None,
             duplicate_of_submitted_at=matched.created_at if matched else None,
         ),
         current_comparison=comparison,
@@ -123,6 +150,9 @@ def _audit(
     agent: Agent,
     matched: Agent | None = None,
     actions: list[AthReviewAction] | None = None,
+    *,
+    miner_coldkey: str | None = None,
+    duplicate_of_coldkey: str | None = None,
 ) -> AdminCopyReviewAudit:
     evidence = review.original_evidence
     provenance = review.algorithm_provenance
@@ -143,7 +173,13 @@ def _audit(
     if not isinstance(opened_by, str):
         opened_by = None
     return AdminCopyReviewAudit(
-        review=_item(review, agent, matched),
+        review=_item(
+            review,
+            agent,
+            matched,
+            miner_coldkey=miner_coldkey,
+            duplicate_of_coldkey=duplicate_of_coldkey,
+        ),
         agent_status=agent.status.value,
         held_artifact_sha256=held_artifact_sha256,
         held_score_count=held_score_count,
@@ -384,6 +420,12 @@ async def list_copy_reviews(
     ] = {}
     if with_comparisons:
         comparisons = await _batch_comparisons(session, row_pairs, matched)
+    # One batched lookup for the whole page: the held agents and every agent
+    # they were matched against.
+    coldkeys = await get_miner_coldkeys_for_agents(
+        session,
+        agent_ids={agent.agent_id for _review, agent in row_pairs} | set(matched),
+    )
     return AdminCopyReviewList(
         items=[
             _item(
@@ -391,6 +433,12 @@ async def list_copy_reviews(
                 agent,
                 matched.get(review.original_duplicate_of),
                 comparison=comparisons.get(review.review_id),
+                miner_coldkey=coldkeys.get(agent.agent_id),
+                duplicate_of_coldkey=(
+                    coldkeys.get(review.original_duplicate_of)
+                    if review.original_duplicate_of is not None
+                    else None
+                ),
             )
             for review, agent in row_pairs
         ],
@@ -413,7 +461,16 @@ async def get_copy_review(
         if review.original_duplicate_of
         else None
     )
-    return _item(review, agent, matched)
+    candidate_coldkey, reference_coldkey = await _review_coldkeys(
+        session, agent, matched
+    )
+    return _item(
+        review,
+        agent,
+        matched,
+        miner_coldkey=candidate_coldkey,
+        duplicate_of_coldkey=reference_coldkey,
+    )
 
 
 @router.get("/copy-reviews/{agent_id}/audit", response_model=AdminCopyReviewAudit)
@@ -431,7 +488,17 @@ async def get_copy_review_audit(
         else None
     )
     actions = await _review_actions(session, review.review_id)
-    return _audit(review, agent, matched, actions)
+    candidate_coldkey, reference_coldkey = await _review_coldkeys(
+        session, agent, matched
+    )
+    return _audit(
+        review,
+        agent,
+        matched,
+        actions,
+        miner_coldkey=candidate_coldkey,
+        duplicate_of_coldkey=reference_coldkey,
+    )
 
 
 @router.get(
@@ -649,8 +716,9 @@ async def open_copy_review(
         session.add(review)
         await session.flush()
 
+    candidate_coldkey, _reference_coldkey = await _review_coldkeys(session, agent, None)
     return AdminCopyReviewOpenResponse(
-        review=_item(review, agent),
+        review=_item(review, agent, miner_coldkey=candidate_coldkey),
         agent_status=agent.status.value,
         idempotent=False,
         reopened=False,
@@ -687,8 +755,17 @@ async def resolve_copy_review(
         if review.status == "resolved":
             if review.resolution != canonical:
                 raise HTTPException(status_code=409, detail="review already resolved")
+            candidate_coldkey, reference_coldkey = await _review_coldkeys(
+                session, agent, matched
+            )
             return AdminCopyReviewResolveResponse(
-                review=_item(review, agent, matched),
+                review=_item(
+                    review,
+                    agent,
+                    matched,
+                    miner_coldkey=candidate_coldkey,
+                    duplicate_of_coldkey=reference_coldkey,
+                ),
                 agent_status=agent.status.value,
                 idempotent=True,
             )
@@ -742,8 +819,17 @@ async def resolve_copy_review(
             )
         )
         await session.flush()
+    candidate_coldkey, reference_coldkey = await _review_coldkeys(
+        session, agent, matched
+    )
     return AdminCopyReviewResolveResponse(
-        review=_item(review, agent, matched),
+        review=_item(
+            review,
+            agent,
+            matched,
+            miner_coldkey=candidate_coldkey,
+            duplicate_of_coldkey=reference_coldkey,
+        ),
         agent_status=agent.status.value,
         idempotent=False,
     )
