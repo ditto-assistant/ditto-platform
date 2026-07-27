@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.inference_routing import benchmark_model, select_route
 from ditto.db.models import InferenceGrant, InferenceRequest, ValidatorTicket
+from ditto.metrics import INFERENCE_ADMISSION_AT_CAPACITY
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -363,6 +364,36 @@ class InferenceDecline(StrEnum):
 # means "your lease is dead" is how a healthy run gets thrown away.
 
 
+def _at_capacity(request_kind: str, scope: str) -> InferenceDecline:
+    """Record which admission gate declined, then answer the one wire value.
+
+    The return is always :attr:`InferenceDecline.AT_CAPACITY`; only the metric
+    knows the difference. Keeping the decline itself undifferentiated is the
+    point -- a broker's correct response to every one of these is identical
+    (back off, retry), so splitting the wire contract would add a decision the
+    caller must not make. The operator's question is the opposite one, and it
+    has no answer today: *which* ceiling is binding, if any.
+    """
+    INFERENCE_ADMISSION_AT_CAPACITY.labels(lane=request_kind, scope=scope).inc()
+    return InferenceDecline.AT_CAPACITY
+
+
+def _first_exhausted_scope(
+    gates: tuple[tuple[str, int, int], ...],
+) -> str | None:
+    """Return the first ``(scope, observed, limit)`` gate that is at its limit.
+
+    First rather than all: the caller declines on any one of them, so the
+    remaining gates are not evaluated as causes. Ordering is therefore
+    significant and is narrowest-to-widest, so a report reads as the tightest
+    binding constraint rather than whichever check happened to be written last.
+    """
+    for scope, observed, limit in gates:
+        if observed >= limit:
+            return scope
+    return None
+
+
 async def begin_inference_request(
     session: AsyncSession,
     *,
@@ -622,7 +653,7 @@ async def begin_inference_request(
         # spent yet and they settle within the provider timeout, so this is
         # backpressure, not exhaustion -- answering it terminally would throw
         # away a run that still had room.
-        return InferenceDecline.AT_CAPACITY
+        return _at_capacity(request_kind, "token_reservation")
     active_requests = (
         grant.active_requests
         if request_kind == "chat"
@@ -637,7 +668,7 @@ async def begin_inference_request(
         # Healthy lease, lane momentarily full. This is the limit an operator
         # tunes from backroom, so it is also the one most likely to move under a
         # live run -- it must degrade to backpressure, never to a lost run.
-        return InferenceDecline.AT_CAPACITY
+        return _at_capacity(request_kind, "per_ticket")
 
     # Fast replay path avoids an ORM identity collision in the common case;
     # the composite primary key and nested transaction remain authoritative
@@ -710,14 +741,24 @@ async def begin_inference_request(
         if request_kind == "chat"
         else config.embedding_global_requests_per_minute
     )
-    if (
-        int(validator_active or 0) >= per_validator_concurrency
-        or int(global_active or 0) >= global_concurrency
-        or int(ticket_recent or 0) >= per_ticket_rpm
-        or int(validator_recent or 0) >= per_validator_rpm
-        or int(global_recent or 0) >= global_rpm
-    ):
-        return InferenceDecline.AT_CAPACITY
+    # One decline, five reasons. The caller still sees a single AT_CAPACITY --
+    # the wire contract is deliberately unchanged, because a broker must treat
+    # every one of these identically (back off and retry). The gates are
+    # enumerated rather than or-ed only so the metric can name which one tripped:
+    # "the lane declined" and "the *global* ceiling declined" are the same event
+    # to the validator and completely different events to the operator deciding
+    # whether a ceiling needs to move.
+    exhausted_scope = _first_exhausted_scope(
+        (
+            ("per_validator", int(validator_active or 0), per_validator_concurrency),
+            ("global", int(global_active or 0), global_concurrency),
+            ("per_ticket_rpm", int(ticket_recent or 0), per_ticket_rpm),
+            ("per_validator_rpm", int(validator_recent or 0), per_validator_rpm),
+            ("global_rpm", int(global_recent or 0), global_rpm),
+        )
+    )
+    if exhausted_scope is not None:
+        return _at_capacity(request_kind, exhausted_scope)
 
     request = InferenceRequest(
         grant_id=grant.grant_id,
