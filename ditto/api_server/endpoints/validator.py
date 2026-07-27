@@ -137,6 +137,7 @@ from ditto.api_server.koth import (
     retest_cohort,
     top5_round_is_due,
 )
+from ditto.api_server.model_use import evaluate_model_use, model_use_policy
 from ditto.api_server.onchain_seed import derive_validator_seed
 from ditto.api_server.queue_policy_settings import (
     DEFAULT_SETTINGS as QUEUE_POLICY_DEFAULTS,
@@ -1273,6 +1274,24 @@ def _score_details(
     if report.per_case:
         details["per_case"] = [item.model_dump(mode="json") for item in report.per_case]
     return details
+
+
+def _retry_details_match(
+    stored: dict[str, Any] | None, reported: dict[str, Any]
+) -> bool:
+    """Compare signed score details while excluding platform-owned annotations.
+
+    ``model_use`` is derived from the platform's inference ledger only after a
+    score is accepted; it is neither supplied nor signed by the validator. An
+    exact transport retry therefore cannot reproduce it. Every scorer-owned
+    field remains part of the exact comparison, so this does not weaken the
+    one-ticket/one-result guard.
+    """
+    if stored is None:
+        return not reported
+    comparable = dict(stored)
+    comparable.pop("model_use", None)
+    return comparable == reported
 
 
 def _score_signing_message(
@@ -4360,7 +4379,7 @@ async def submit_score(
                 and prior_score.n == report.n
                 and _aware_utc(prior_score.generated_at)
                 == _aware_utc(report.generated_at)
-                and prior_score.details == retry_details
+                and _retry_details_match(prior_score.details, retry_details)
             )
             if exact_retry:
                 return SubmitScoreResponse(
@@ -4549,6 +4568,14 @@ async def submit_score(
         # platform's own proxy meters them as it charges each request -- so
         # they are not part of the signed report and need no wire change.
         model_usage = await get_lease_model_usage(session, ticket=ticket)
+        # The verdict is stamped alongside the raw counters so a miner can see
+        # not just the numbers but the finding and its reason. In SHADOW (the
+        # default) this records what enforcement *would* have done and changes
+        # no score -- ditto-platform#506 invariant 5.
+        model_use = evaluate_model_use(
+            model_usage, cases=report.n, policy=model_use_policy()
+        )
+        score_details["model_use"] = model_use.as_public_dict()
         await upsert_score(
             session,
             agent_id=agent_id,
