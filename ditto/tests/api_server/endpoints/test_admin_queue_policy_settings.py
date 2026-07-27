@@ -56,6 +56,12 @@ def _settings(**overrides: object) -> dict[str, object]:
         "lane_cycle_size": 4,
         "fresh_submission_slots": [0, 1, 3],
         "owner_concurrent_submission_limit": 2,
+        "similarity_budget": {
+            "enabled": True,
+            "concurrent_submission_limit": 1,
+            "jaccard_threshold": 0.9,
+            "containment_threshold": 0.95,
+        },
         "prev_gen_carryover": {
             "enabled": False,
             "max_agents": 10,

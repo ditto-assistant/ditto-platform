@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
     from uuid import UUID
 
+    from ditto.api_models.queue_policy_settings import SimilarityBudgetSettings
     from ditto.db.queries.similarity_budget import SubmissionSketch
 
 # See "Where the defaults come from" above. Both are operator-tunable; these are
@@ -167,6 +168,30 @@ class SimilarityBudgetPolicy:
             )
         if self.min_shingles < 1:
             raise ValueError(f"min_shingles must be positive, got {self.min_shingles}")
+
+
+def policy_from_settings(
+    settings: SimilarityBudgetSettings,
+) -> SimilarityBudgetPolicy | None:
+    """The operator board, as the value object the gate holds.
+
+    Returns ``None`` when the board is disabled, because that is the one signal
+    the whole path already understands: a ``None`` policy means no sketch is
+    read and the allocator behaves exactly as it did before the rail existed.
+    Expressing "off" as an absent policy rather than an unreachable threshold
+    keeps the kill switch total rather than merely conservative.
+
+    The board's field-level bounds and this module's constructor bounds are the
+    same numbers by construction (``test_queue_policy_bounds_match_queue_
+    constants`` asserts it), so a value that validated on the wire cannot be
+    refused here.
+    """
+    if not settings.enabled:
+        return None
+    return SimilarityBudgetPolicy(
+        jaccard_threshold=settings.jaccard_threshold,
+        containment_threshold=settings.containment_threshold,
+    )
 
 
 @dataclass(frozen=True)
