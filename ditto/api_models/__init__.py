@@ -90,6 +90,7 @@ from ditto.api_models.public import (
     PublicValidatorName,
     PublicValidatorNamesResponse,
     PublicValidatorScore,
+    PublicValidatorSlotPolicy,
     PublicValidatorWeightVector,
 )
 from ditto.api_models.retrieval import AgentResponse, AgentStatusResponse
@@ -227,6 +228,7 @@ __all__ = [
     "PublicValidatorHeartbeatsResponse",
     "PublicValidatorName",
     "PublicValidatorNamesResponse",
+    "PublicValidatorSlotPolicy",
     "PublicValidatorWeightVector",
     "ScoreReport",
     "ScreenEvidenceItem",

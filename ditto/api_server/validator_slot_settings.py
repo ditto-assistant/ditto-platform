@@ -26,7 +26,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import ValidationError
 
@@ -259,6 +259,24 @@ class ValidatorSlotSettingsResolver:
             settings = settings_from_row(row)
             self._cache = _CacheEntry(settings=settings, loaded_at=time.monotonic())
             return settings
+
+
+async def resolve_slot_settings(app_state: Any) -> ValidatorSlotSettings:
+    """Resolve the policy dispatch is applying, from a request's ``app.state``.
+
+    The one place a read path should reach for the cap. An app built without
+    lifespan (unit tests, and any future entry point that forgets to wire the
+    resolver) has no resolver on its state, and answering "uncapped" there would
+    both over-issue tickets and make the fleet view claim capacity dispatch will
+    never fund -- so the conservative default is returned instead, exactly as
+    every other failure path in this module does.
+    """
+    resolver: ValidatorSlotSettingsResolver | None = getattr(
+        app_state, "validator_slot_settings", None
+    )
+    if resolver is None:
+        return DEFAULT_SETTINGS
+    return await resolver.resolve(getattr(app_state, "session_maker", None))
 
 
 def effective_view(

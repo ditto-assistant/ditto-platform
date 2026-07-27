@@ -55,6 +55,9 @@ from ditto.api_server.endpoints.public import _fleet_classification
 from ditto.api_server.koth import TOP5_MAX_CONFIRMATION_SEEDS
 from ditto.api_server.storage import ObjectDownloadFailedError
 from ditto.api_server.validator_names import ValidatorNamesSnapshot
+from ditto.api_server.validator_slot_settings import (
+    DEFAULT_SETTINGS as SLOT_SETTINGS_DEFAULT,
+)
 from ditto.chain import ChainError
 from ditto.chain.models import (
     ChainWeight,
@@ -3095,6 +3098,7 @@ class TestScorerLivenessSurfacing:
             orphaned_leases=[],
             now=now,
             active_bench_version=active_bench_version,
+            slot_settings=SLOT_SETTINGS_DEFAULT,
         )
         return response.validators[0]
 
@@ -3406,6 +3410,7 @@ class TestActiveBenchCapabilityGate:
             orphaned_leases=[],
             now=now,
             active_bench_version=version,
+            slot_settings=SLOT_SETTINGS_DEFAULT,
         )
 
     def test_ancient_software_cannot_serve_the_active_benchmark(self) -> None:

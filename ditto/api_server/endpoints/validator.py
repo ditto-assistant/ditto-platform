@@ -151,8 +151,8 @@ from ditto.api_server.validator_slot_settings import (
 )
 from ditto.api_server.validator_slot_settings import (
     HostResourceSample,
-    ValidatorSlotSettingsResolver,
     allowed_slot_count,
+    resolve_slot_settings,
 )
 from ditto.chain import ChainError
 from ditto.db.models import (
@@ -664,14 +664,11 @@ async def _validator_slot_settings(request: Request) -> ValidatorSlotSettings:
     """Resolve the operator slot cap, falling back to the conservative default.
 
     A missing resolver (an app built without lifespan) must not uncap the
-    fleet, so the default policy is returned instead of an unbounded one.
+    fleet, so the default policy is returned instead of an unbounded one. The
+    resolution itself is shared with the public fleet view, which must report
+    the same cap this path enforces.
     """
-    resolver: ValidatorSlotSettingsResolver | None = getattr(
-        request.app.state, "validator_slot_settings", None
-    )
-    if resolver is None:
-        return SLOT_SETTINGS_DEFAULT
-    return await resolver.resolve(getattr(request.app.state, "session_maker", None))
+    return await resolve_slot_settings(request.app.state)
 
 
 PREV_GEN_CARRYOVER_DEFAULTS = QUEUE_POLICY_DEFAULTS.prev_gen_carryover

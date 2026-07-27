@@ -2525,6 +2525,38 @@ class PublicOrphanedSlot(BaseModel):
     ]
 
 
+class PublicValidatorSlotPolicy(BaseModel):
+    """The operator slot policy ticket dispatch is applying to the fleet.
+
+    Reported alongside the heartbeats so a fleet view can say why a validator
+    advertising eight slots is only ever handed six, instead of presenting
+    advertised capacity as if it were available capacity.
+    """
+
+    max_concurrent_slots: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=8,
+            description=(
+                "Most benchmark slots the platform will hold live tickets on for "
+                "any ONE validator, whatever it advertises."
+            ),
+        ),
+    ]
+    disk_percent_ceiling: Annotated[
+        int,
+        Field(
+            ge=50,
+            le=100,
+            description=(
+                "Host disk utilization at or above which a validator is held to a "
+                "single slot until a fresh heartbeat reports headroom."
+            ),
+        ),
+    ]
+
+
 class PublicValidatorHeartbeat(BaseModel):
     """Latest signed software report from one permitted validator."""
 
@@ -2541,6 +2573,19 @@ class PublicValidatorHeartbeat(BaseModel):
     active_agent_id: UUID | None = None
     active_benchmark: PublicBenchmarkProgress | None = None
     configured_slots: Annotated[int, Field(ge=1, le=8)] = 1
+    allowed_slots: Annotated[
+        int,
+        Field(
+            ge=0,
+            le=8,
+            description=(
+                "How many of the advertised slots dispatch will actually fund "
+                "right now: the operator cap narrowing `configured_slots`, "
+                "clamped to one while this validator's disk ceiling is tripped. "
+                "Advertised capacity above this never receives a ticket."
+            ),
+        ),
+    ] = 1
     healthy_slots: list[str] = Field(default_factory=lambda: ["slot-0"])
     admission: BenchmarkAdmission = "accepting"
     active_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
@@ -2624,6 +2669,10 @@ class PublicValidatorHeartbeatsResponse(BaseModel):
     # is readable on its own: a client polling only this route can say which
     # benchmark a validator is being judged against.
     active_bench_version: Annotated[int, Field(ge=1)]
+    # Fleet-wide, so a reader can tell an idle slot ("nothing to run") from a
+    # slot the operator has capped ("nothing will be run here") without
+    # reimplementing the policy from the per-validator numbers.
+    slot_policy: PublicValidatorSlotPolicy
     reported_count: Annotated[int, Field(ge=0)]
     online_count: Annotated[int, Field(ge=0)]
     validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)
