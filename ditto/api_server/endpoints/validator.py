@@ -211,6 +211,7 @@ from ditto.db.queries.heartbeats import (
 )
 from ditto.db.queries.inference import (
     ensure_inference_grant,
+    get_lease_model_usage,
     revoke_ticket_inference,
     ticket_inference_revoked_mid_lease,
 )
@@ -4539,6 +4540,15 @@ async def submit_score(
                 },
                 recorded_at=audit_now,
             )
+        # What this run actually spent on the reader model, read off the grant
+        # bound to this exact lease. Captured here, before the grant is revoked
+        # a few hundred lines below, and denormalized onto the score because
+        # inference_grants is pruned within days while scores are permanent.
+        #
+        # The validator does not and cannot report these numbers -- the
+        # platform's own proxy meters them as it charges each request -- so
+        # they are not part of the signed report and need no wire change.
+        model_usage = await get_lease_model_usage(session, ticket=ticket)
         await upsert_score(
             session,
             agent_id=agent_id,
@@ -4554,6 +4564,7 @@ async def submit_score(
             generated_at=report.generated_at,
             signature=payload.signature,
             details=score_details or None,
+            model_usage=model_usage,
         )
         await record_ticket_route_quality(
             session,

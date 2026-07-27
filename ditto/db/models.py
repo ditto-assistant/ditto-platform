@@ -902,6 +902,25 @@ class Score(Base):
     details: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     """Optional per-case breakdown ``{"per_case": [...]}`` for audit."""
 
+    model_calls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """Reader-model calls this run made, off the lease's inference grant.
+
+    Denormalized at submit time from ``inference_grants``. That table is hot
+    and short-retention (grants are pruned within days) while scores are
+    permanent, so the join is not merely slow to reproduce later -- after
+    pruning it is impossible. ``NULL`` means *not measured* (no grant existed
+    for the lease), which is distinct from ``0`` meaning *measured, and the
+    model was never called*.
+    """
+
+    model_prompt_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    """Prompt tokens the reader model was sent across this run."""
+
+    model_completion_tokens: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    """Completion tokens the reader model produced across this run."""
+
     generated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
     )

@@ -33,6 +33,7 @@ from ditto.db.models import (
 )
 from ditto.db.queries.agents import get_agent_by_id
 from ditto.score_order import score_order_key, score_order_terms
+from ditto.db.queries.inference import LeaseModelUsage
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -427,6 +428,7 @@ async def upsert_score(
     generated_at: datetime,
     signature: str | None = None,
     details: dict | None = None,
+    model_usage: LeaseModelUsage | None = None,
 ) -> None:
     """Insert or update the score for ``(agent_id, validator_hotkey)``.
 
@@ -434,6 +436,11 @@ async def upsert_score(
     session.begin():``) so the score write and the agent status transition
     commit atomically. Re-reporting the same ``run_id`` is idempotent; a new
     ``run_id`` overwrites the validator's prior score for this agent.
+
+    ``model_usage`` is the lease's measured language-model spend. When it is
+    ``None`` the three ``model_*`` columns are left untouched rather than
+    written as ``NULL``: an unmeasured re-report must not erase a measurement
+    an earlier report already made.
 
     Raises:
         DbIntegrityError: Any constraint violation on ``scores`` (the FK to
@@ -459,6 +466,13 @@ async def upsert_score(
                 generated_at=generated_at,
                 signature=signature,
                 details=details,
+                model_calls=None if model_usage is None else model_usage.chat_calls,
+                model_prompt_tokens=(
+                    None if model_usage is None else model_usage.prompt_tokens
+                ),
+                model_completion_tokens=(
+                    None if model_usage is None else model_usage.completion_tokens
+                ),
             )
         )
     else:
@@ -472,6 +486,10 @@ async def upsert_score(
         existing.generated_at = generated_at
         existing.signature = signature
         existing.details = details
+        if model_usage is not None:
+            existing.model_calls = model_usage.chat_calls
+            existing.model_prompt_tokens = model_usage.prompt_tokens
+            existing.model_completion_tokens = model_usage.completion_tokens
     try:
         await session.flush()
     except SAIntegrityError as e:
