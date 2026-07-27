@@ -1483,6 +1483,15 @@ async def _validated_heartbeat_work(
                 and agent is not None
                 and agent.status in _SCOREABLE_STATUSES
             ):
+                if ticket.first_reported_at is None:
+                    # The first time the ledger confirms this lease against a
+                    # live slot. From here on its silence means something, and
+                    # the liveness gate is allowed to weigh it; before this it
+                    # was only ever "not heard from yet". Stamped once and never
+                    # moved -- the gate asks whether this lease has *ever*
+                    # testified, not when it last did, and the freshness of the
+                    # latest testimony is already ``heartbeat.seen_at``.
+                    ticket.first_reported_at = now
                 previous_slot = previous_slots.get(slot.slot_id)
                 if previous_slot is not None:
                     try:

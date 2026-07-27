@@ -938,12 +938,14 @@ async def test_rollout_screened_only_skips_and_releases_source_only_work(
             bench_version=rollout.desired_version,
             validator_hotkey="validator-b",
             status=TicketStatus.ISSUED,
-            # Old enough that the validator has had time to advertise the slot;
-            # its heartbeat says it is not, which is genuine idleness.
+            # The slot was advertised once and is not any more, which is genuine
+            # idleness. Without that first report its silence would just mean the
+            # run had not announced itself yet, and the lease would be protected.
             issued_at=now - timedelta(minutes=10),
             deadline=now + timedelta(minutes=90),
             attempt_count=1,
             manual_retry_grants=0,
+            first_reported_at=now - timedelta(minutes=9),
         )
         session.add(incompatible)
         await session.flush()
@@ -1007,12 +1009,13 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists(
             bench_version=2,
             validator_hotkey="validator-a",
             status=TicketStatus.ISSUED,
-            # Past the reporting grace, so validator-a's empty capacity blob is
-            # evidence the slot really is idle rather than merely starting up.
+            # Reported once and now absent, so validator-a's empty capacity blob
+            # is evidence the slot really is idle rather than merely starting up.
             issued_at=now - timedelta(minutes=10),
             deadline=now + timedelta(minutes=90),
             attempt_count=1,
             manual_retry_grants=0,
+            first_reported_at=now - timedelta(minutes=9),
         )
         running_source_ticket = ValidatorTicket(
             agent_id=ordinary_id,

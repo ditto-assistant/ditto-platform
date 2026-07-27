@@ -259,6 +259,7 @@ async def activate_next_score_retest(
         ticket.deadline = deadline
         ticket.attempt_count += 1
         ticket.retry_after = None
+        ticket.first_reported_at = None
         payload = dict(entry.payload)
         payload["replacement_deadline"] = deadline.isoformat()
         await append_audit_entry(

@@ -712,6 +712,10 @@ async def issue_ticket(
         ticket.deadline = now + ttl
         ticket.attempt_count += 1
         ticket.retry_after = None
+        # A fresh lease has its own silence to account for. Carrying the old
+        # stamp over would let the liveness gate weigh the *previous* lease's
+        # testimony against this one and revoke it while it is still seeding.
+        ticket.first_reported_at = None
     await session.flush()
     return ticket
 

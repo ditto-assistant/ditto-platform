@@ -34,6 +34,7 @@ from ditto.db.queries.lease_liveness import (
     lease_liveness,
 )
 from ditto.db.queries.score_retests import activate_next_score_retest
+from ditto.db.queries.tickets import expire_overdue_tickets
 
 _NOW = datetime(2026, 7, 25, 13, 33, 16, tzinfo=UTC)
 _HOTKEY = "5Rizzo"
@@ -41,7 +42,14 @@ _SLOT = "slot-0"
 _AGENT = uuid4()
 
 
-def _ticket(*, issued_at: datetime) -> ValidatorTicket:
+def _ticket(*, issued_at: datetime, reported: bool = True) -> ValidatorTicket:
+    """A lease that has already testified once, unless *reported* says otherwise.
+
+    Defaulting to reported keeps every case below about the question it was
+    written to ask -- what one stored heartbeat proves. A lease that has never
+    reported is a prior and stronger refusal that short-circuits all of them, so
+    it gets its own class rather than silently making the rest vacuous.
+    """
     return ValidatorTicket(
         agent_id=_AGENT,
         validator_hotkey=_HOTKEY,
@@ -52,6 +60,7 @@ def _ticket(*, issued_at: datetime) -> ValidatorTicket:
         deadline=issued_at + timedelta(minutes=90),
         attempt_count=1,
         manual_retry_grants=0,
+        first_reported_at=issued_at + timedelta(minutes=1) if reported else None,
     )
 
 
@@ -307,7 +316,7 @@ class TestScoreRetestLane:
     than expired) but must apply the same evidence rule before doing it."""
 
     async def _seed_requested_retest(
-        self, session: AsyncSession, *, issued_at: datetime
+        self, session: AsyncSession, *, issued_at: datetime, reported: bool = True
     ) -> ValidatorTicket:
         async with session.begin():
             session.add(
@@ -333,6 +342,9 @@ class TestScoreRetestLane:
                 deadline=issued_at + timedelta(minutes=90),
                 attempt_count=1,
                 manual_retry_grants=0,
+                first_reported_at=(
+                    issued_at + timedelta(minutes=1) if reported else None
+                ),
             )
             session.add(ticket)
             await append_audit_entry(
@@ -395,6 +407,35 @@ class TestScoreRetestLane:
         assert len(audit) == 1
         assert audit[0].action == "closed_unserviceable"
         assert audit[0].context == "score_retest"
+
+    async def test_never_reported_retest_is_not_closed(
+        self, session: AsyncSession
+    ) -> None:
+        """The retest lane ends a lease by a different verb, under the same rule.
+
+        It is the one revocation site that does not go through
+        ``maybe_force_expire_lease``, so it is also the one that could drift.
+        """
+        ticket = await self._seed_requested_retest(
+            session, issued_at=_NOW - timedelta(minutes=19), reported=False
+        )
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            benchmark_capacity=_capacity(),
+        )
+        async with session.begin():
+            promoted = await activate_next_score_retest(
+                session,
+                validator_hotkey=_HOTKEY,
+                now=_NOW,
+                supports_version=lambda _version: False,
+                slot_id=_SLOT,
+            )
+        assert promoted is None
+        assert ticket.status == TicketStatus.ISSUED
+        async with session.begin():
+            assert (await session.scalars(select(ValidatorLeaseAudit))).all() == []
 
 
 class TestUnconfirmedSlotIsNotIdle:
@@ -480,3 +521,120 @@ class TestUnconfirmedSlotIsNotIdle:
         )
         assert verdict.idle is True
         assert verdict.reason == "idle_capacity_reports_slot_free"
+
+
+class TestNeverReportedLeaseIsNotRevocable:
+    """A lease that has never testified cannot be revoked, however long it waits.
+
+    This is the failure that destroyed live v7 runs. The validator omits a leased
+    slot from ``capacity.active`` until its first progress report, so a slot that
+    is still pulling its image, rendering its dataset, or seeding is *absent* --
+    and absent is what an idle slot looks like too. Every other safeguard is
+    derived from that same list, including the ``claimed_slots`` fallback, so
+    they all read false together and only the grace timer was left. Seeding alone
+    may take 15 minutes against a 5-minute grace, which is why every observed
+    death landed just past the window rather than inside it.
+    """
+
+    async def test_never_reported_lease_survives_an_idle_capacity_blob(
+        self, session: AsyncSession
+    ) -> None:
+        """The exact production shape: fresh, post-grace, and reporting nothing."""
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            benchmark_capacity=_capacity(),
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - timedelta(minutes=7), reported=False),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is False
+        assert verdict.reason == "lease_never_reported"
+        assert verdict.evidence["lease_age_seconds"] == 420.0
+
+    @pytest.mark.parametrize("minutes", [6, 12, 60, 89])
+    async def test_no_amount_of_elapsed_time_makes_silence_evidence(
+        self, session: AsyncSession, minutes: int
+    ) -> None:
+        """Every observed death was 5m53s-11m32s in; none of those may revoke now."""
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            benchmark_capacity=_capacity(),
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - timedelta(minutes=minutes), reported=False),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is False
+        assert verdict.reason == "lease_never_reported"
+
+    async def test_a_lease_that_reported_once_is_still_revocable(
+        self, session: AsyncSession
+    ) -> None:
+        """The guard must not disarm the reclaim it was built around.
+
+        A validator that restarted keeps heartbeating and proves its own slot
+        idle. Having testified once, its later silence is real evidence.
+        """
+        await _seed_heartbeat(
+            session,
+            seen_at=_NOW - timedelta(seconds=5),
+            benchmark_capacity=_capacity(),
+        )
+        verdict = await lease_liveness(
+            session,
+            ticket=_ticket(issued_at=_NOW - timedelta(minutes=7), reported=True),
+            validator_hotkey=_HOTKEY,
+            slot_id=_SLOT,
+            now=_NOW,
+        )
+        assert verdict.idle is True
+        assert verdict.reason == "idle_capacity_reports_slot_free"
+
+    async def test_a_crashed_validator_still_loses_its_slot_on_the_deadline(
+        self, session: AsyncSession
+    ) -> None:
+        """The backstop that pays for the conservatism above.
+
+        A validator that dies while seeding never reports, so the gate will now
+        refuse to revoke its lease forever. That is only affordable because the
+        deadline sweep is unconditional and does not consult the gate at all --
+        the slot comes back at 90 minutes exactly as it always has for a
+        validator that crashed before it ever polled.
+        """
+        issued_at = _NOW - timedelta(minutes=95)
+        async with session.begin():
+            session.add(
+                Agent(
+                    agent_id=_AGENT,
+                    miner_hotkey="5Miner",
+                    name="never-reported",
+                    sha256="ab" * 32,
+                    status=AgentStatus.EVALUATING,
+                    screening_policy_version=SCREENING_POLICY_VERSION,
+                    created_at=_NOW - timedelta(days=1),
+                )
+            )
+            session.add(_ticket(issued_at=issued_at, reported=False))
+
+        async with session.begin():
+            assert await expire_overdue_tickets(session, now=_NOW) == 1
+
+        async with session.begin():
+            ticket = await session.get(ValidatorTicket, (_AGENT, 7, _HOTKEY))
+            assert ticket is not None
+            assert ticket.status is TicketStatus.EXPIRED
+            # Reclaimed by the deadline, not rewritten to `now` -- the signature
+            # that told a real expiry apart from a force-expiry in the ledger.
+            deadline = ticket.deadline
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=UTC)
+            assert deadline == issued_at + timedelta(minutes=90)
