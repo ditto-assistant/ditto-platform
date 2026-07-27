@@ -1537,7 +1537,12 @@ async def _validated_heartbeat_work(
         )
         stored_active_agent_id = primary.agent_id if primary is not None else None
         stored_benchmark_progress = (
-            primary.progress.model_dump(mode="json") if primary is not None else None
+            # None when a v16 reporter has claimed the slot but has nothing to
+            # report yet. The legacy scalar mirrors the primary slot, so it is
+            # absent for the same reason the slot's own progress is.
+            primary.progress.model_dump(mode="json")
+            if primary is not None and primary.progress is not None
+            else None
         )
     if (
         stored_benchmark_capacity is None

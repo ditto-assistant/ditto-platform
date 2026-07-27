@@ -110,8 +110,13 @@ def _is_same_run(previous: BenchmarkProgress, current: BenchmarkProgress) -> boo
 
 
 def _validate_same_lease_progress(
-    previous: BenchmarkProgress, current: BenchmarkProgress
+    previous: BenchmarkProgress | None, current: BenchmarkProgress | None
 ) -> None:
+    if previous is None or current is None:
+        # A v16 reporter announces a leased slot before it has progress to send,
+        # so one side being absent is the claim "nothing to compare yet", not a
+        # regression. There is no ordering to enforce against a null.
+        return
     if previous.ticket_deadline != current.ticket_deadline:
         return
     # `preparing` is the first stage of every run (the scorer's queued -> preparing),
