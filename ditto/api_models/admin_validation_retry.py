@@ -13,6 +13,7 @@ from ditto.api_models.retry_state import RetryState
 
 class AdminValidationTicket(BaseModel):
     validator_hotkey: str
+    slot_id: str
     status: Literal["issued", "scored", "expired"]
     issued_at: datetime
     deadline: datetime
@@ -22,6 +23,25 @@ class AdminValidationTicket(BaseModel):
     infra_retry_grants: int
     retry_after: datetime | None
     retry_budget_exhausted: bool
+    failure_reason: str | None
+    """Latest signed failure class reported for this ticket, if any.
+
+    History, not current state: reissue preserves it, so a ticket that failed,
+    was re-leased and then scored still carries one. Read it together with
+    :attr:`failed_at` and :attr:`silently_expired`.
+    """
+    failed_at: datetime | None
+    silently_expired: bool
+    """The lease ran out with nothing reported about *this* attempt.
+
+    True only for an ``expired`` ticket whose ``failure_reason`` is missing, or
+    whose ``failed_at`` predates the lease it is attached to (a failure from a
+    superseded attempt). Distinguishing this from an expiry that came with a
+    reported reason is what makes a hanging submission visible: on 2026-07-27
+    every ticket for the offending agents ran its full 90-minute lease and ended
+    ``expired`` with nothing reported, and the triage feed could not tell that
+    apart from an ordinary reported failure, so the incident ran unnoticed.
+    """
 
 
 class AdminValidationRecovery(BaseModel):
@@ -44,6 +64,8 @@ class AdminValidationQueueWithdrawal(BaseModel):
     reason: str
     expected_snapshot: str
     score_count: int
+    evicted_validator_hotkeys: list[str] | None = None
+    """``None`` for an ordinary withdrawal; the revoked leases for an eviction."""
     created_at: datetime
 
 
@@ -61,6 +83,10 @@ class AdminValidationRetryDetail(BaseModel):
     blocking_reason: str | None
     withdrawal_allowed: bool
     withdrawal_blocking_reason: str | None
+    eviction_allowed: bool
+    eviction_blocking_reason: str | None
+    live_ticket_count: int
+    """Leases an eviction would revoke right now — the slots it would free."""
     withdrawal: AdminValidationQueueWithdrawal | None
     tickets: list[AdminValidationTicket]
     recoveries: list[AdminValidationRecovery]
@@ -97,6 +123,10 @@ class AdminStuckSubmission(BaseModel):
     earliest_retry_after: datetime | None
     attempts_used: int
     exhausted_validator_count: int
+    silent_expiry_count: int
+    """Tickets that ran their whole lease and reported nothing (see
+    :attr:`AdminValidationTicket.silently_expired`). A submission whose count
+    climbs while its score count stays at zero is hanging, not merely slow."""
     snapshot: str
     tickets: list[AdminValidationTicket]
 
@@ -138,6 +168,65 @@ class AdminValidationQueueWithdrawalRequest(BaseModel):
 
 class AdminValidationQueueWithdrawalResponse(BaseModel):
     withdrawal: AdminValidationQueueWithdrawal
+    idempotent: bool
+
+
+class AdminValidationQueueEvictionRequest(BaseModel):
+    """Revoke a submission's live leases and close its benchmark era.
+
+    Carries the same three interlocks as the withdrawal route — an exact
+    ``expected_snapshot`` of the concurrency state the operator decided on, a
+    mandatory written ``reason``, and a literal confirmation phrase — with a
+    distinct phrase because the consequences are larger.
+
+    ``confirmation`` is deliberately **not** ``REMOVE FROM VALIDATOR QUEUE``.
+    Eviction is strictly more dangerous than the exhausted-only removal — it
+    destroys in-flight benchmark runs a validator may still be executing — so an
+    operator must never be able to perform one while believing they typed the
+    phrase for an ordinary removal.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: UUID
+    expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    reason: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+    ]
+    confirmation: Literal["EVICT LIVE VALIDATOR LEASES"]
+
+
+class AdminEvictedLease(BaseModel):
+    """One live lease an eviction revoked, and where its audit row is."""
+
+    validator_hotkey: str
+    slot_id: str
+    bench_version: int
+    issued_at: datetime
+    original_deadline: datetime
+    """The deadline the lease would otherwise have run to — the capacity freed."""
+    attempt_count: int
+    audit_id: UUID
+    """``validator_lease_audit`` row justifying this one revocation."""
+
+
+class AdminValidationQueueEviction(BaseModel):
+    eviction_id: UUID
+    agent_id: UUID
+    bench_version: int
+    actor: str
+    reason: str
+    expected_snapshot: str
+    score_count: int
+    evicted_validator_hotkeys: list[str]
+    created_at: datetime
+
+
+class AdminValidationQueueEvictionResponse(BaseModel):
+    eviction: AdminValidationQueueEviction
+    evicted_leases: list[AdminEvictedLease]
+    freed_slots: int
     idempotent: bool
 
 

@@ -2663,6 +2663,16 @@ class ValidatorQueueWithdrawal(Base):
     The submission, payment, artifact, scores, and ticket history remain intact.
     A later benchmark era is a separate eligibility decision, so a withdrawal
     never becomes an implicit permanent miner verdict.
+
+    Two operator routes write this row and both land in the same terminal state,
+    which is why they share a table rather than duplicating the queue predicates
+    that read it. They differ only in what they were allowed to act on, and
+    :attr:`evicted_validator_hotkeys` is what tells them apart:
+
+    * a **withdrawal** (``NULL``) cleans up a submission that had already stopped
+      consuming validator capacity;
+    * an **eviction** (a list, possibly empty) additionally revoked whatever live
+      leases the submission was still holding, naming them.
     """
 
     __tablename__ = "validator_queue_withdrawals"
@@ -2675,6 +2685,18 @@ class ValidatorQueueWithdrawal(Base):
     expected_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
     score_count: Mapped[int] = mapped_column(Integer, nullable=False)
     ticket_snapshot: Mapped[list[dict]] = mapped_column(_JSON_VARIANT, nullable=False)
+    evicted_validator_hotkeys: Mapped[list[str] | None] = mapped_column(
+        _JSON_VARIANT, nullable=True
+    )
+    """The live leases this action revoked, or ``NULL`` for a plain withdrawal.
+
+    Deliberately tri-state. ``NULL`` means the eviction route was not used at
+    all; ``[]`` means it was, and found nothing live to revoke. Collapsing those
+    into one value would make an eviction that arrived a minute too late
+    indistinguishable from an ordinary cleanup, which is precisely the
+    distinction an emissions-relevant action against a paying miner has to be
+    able to defend later.
+    """
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

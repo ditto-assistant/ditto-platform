@@ -24,6 +24,7 @@ from ditto.db.models import (
     Score,
     ScoreAuditEntry,
     ValidatorHeartbeat,
+    ValidatorLeaseAudit,
     ValidatorQueueWithdrawal,
     ValidatorRetryRecovery,
     ValidatorTicket,
@@ -37,7 +38,11 @@ from ditto.db.queries.audit import (
 )
 from ditto.db.queries.benchmark_rollout import DEFAULT_BENCH_VERSION
 from ditto.db.queries.score_retests import activate_next_score_retest
-from ditto.db.queries.tickets import issue_ticket
+from ditto.db.queries.tickets import (
+    MAX_ATTEMPTS_PER_VERSION,
+    issue_ticket,
+    ticket_attempt_cap,
+)
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "X-Admin-Actor": "operator"}
@@ -77,6 +82,8 @@ async def _seed(
     score_count: int = 0,
     bench_version: int = DEFAULT_BENCH_VERSION,
     composites: list[float] | None = None,
+    ticket_count: int = 4,
+    miner_hotkey: str = "5Miner",
 ) -> UUID:
     agent_id = uuid4()
     # Each call seeds an *independent* submission, so it needs its own identity:
@@ -90,7 +97,7 @@ async def _seed(
         session.add(
             Agent(
                 agent_id=agent_id,
-                miner_hotkey="5Miner",
+                miner_hotkey=miner_hotkey,
                 name=f"valid-agent-{agent_id.hex[:8]}",
                 version=1,
                 sha256=agent_id.hex * 2,
@@ -99,7 +106,7 @@ async def _seed(
                 created_at=_T0 - timedelta(days=1),
             )
         )
-        for index in range(4):
+        for index in range(ticket_count):
             hotkey = f"validator-{index}"
             status = (
                 TicketStatus.SCORED if index < score_count else TicketStatus.EXPIRED
@@ -470,6 +477,595 @@ async def test_withdraw_remains_available_after_operator_retry_limit(
     assert detail.status_code == 200
     assert detail.json()["recovery_allowed"] is False
     assert detail.json()["withdrawal_allowed"] is True
+
+
+_EVICT_CONFIRMATION = "EVICT LIVE VALIDATOR LEASES"
+_EVICT_REASON = "mnemox-v55 hangs every lease and reports nothing; freeing the fleet"
+
+
+async def _seed_live_lease(
+    maker: async_sessionmaker[AsyncSession],
+    agent_id: UUID,
+    *,
+    validator_hotkey: str = "validator-0",
+    slot_id: str = "slot-0",
+    bench_version: int = DEFAULT_BENCH_VERSION,
+) -> datetime:
+    """Seat the 2026-07-27 signature: a live 90-minute lease that never reported.
+
+    No heartbeat, no progress, no ``fail_job`` — exactly the shape that the
+    automatic liveness gate must (correctly) refuse to act on, and therefore
+    exactly the shape an operator eviction has to be able to end anyway.
+    """
+    issued_at = datetime.now(UTC) - timedelta(minutes=20)
+    deadline = issued_at + timedelta(minutes=90)
+    async with maker() as session, session.begin():
+        session.add(
+            ValidatorTicket(
+                agent_id=agent_id,
+                validator_hotkey=validator_hotkey,
+                slot_id=slot_id,
+                status=TicketStatus.ISSUED,
+                purpose=TicketPurpose.CANONICAL_QUORUM,
+                purpose_revision=1,
+                issued_at=issued_at,
+                deadline=deadline,
+                bench_version=bench_version,
+                attempt_count=1,
+            )
+        )
+    return deadline
+
+
+async def test_evict_frees_the_live_slot_and_preserves_every_source_record(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    burner = await _seed(retry_maker, ticket_count=0)
+    waiting = await _seed(retry_maker, ticket_count=0, miner_hotkey="5OtherMiner")
+    original_deadline = await _seed_live_lease(retry_maker, burner)
+    _install(app, retry_maker)
+
+    # Precondition: the slot is genuinely held. A claim from validator-0 resumes
+    # the burner's lease rather than picking up the waiting submission.
+    async with retry_maker() as session, session.begin():
+        held = await issue_ticket(
+            session,
+            validator_hotkey="validator-0",
+            now=datetime.now(UTC),
+            ttl=timedelta(minutes=90),
+            bench_version=DEFAULT_BENCH_VERSION,
+        )
+    assert held is not None and held.agent_id == burner
+
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{burner}", headers=_HEADERS
+    )
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["eviction_allowed"] is True
+    assert body["live_ticket_count"] == 1
+
+    request_id = uuid4()
+    payload = {
+        "request_id": str(request_id),
+        "expected_snapshot": body["snapshot"],
+        "reason": _EVICT_REASON,
+        "confirmation": _EVICT_CONFIRMATION,
+    }
+    response = await client.post(
+        f"/api/v1/admin/validation-retries/{burner}/evict",
+        headers=_HEADERS,
+        json=payload,
+    )
+    assert response.status_code == 200, response.text
+    evicted = response.json()
+    assert evicted["idempotent"] is False
+    assert evicted["freed_slots"] == 1
+    assert evicted["eviction"]["evicted_validator_hotkeys"] == ["validator-0"]
+    lease = evicted["evicted_leases"][0]
+    assert lease["validator_hotkey"] == "validator-0"
+    assert lease["slot_id"] == "slot-0"
+    assert datetime.fromisoformat(lease["original_deadline"]) == original_deadline
+
+    # The freed slot goes back to the pool now, not at the 90-minute deadline.
+    async with retry_maker() as session, session.begin():
+        reissued = await issue_ticket(
+            session,
+            validator_hotkey="validator-0",
+            now=datetime.now(UTC) + timedelta(seconds=1),
+            ttl=timedelta(minutes=90),
+            bench_version=DEFAULT_BENCH_VERSION,
+        )
+    assert reissued is not None and reissued.agent_id == waiting
+
+    # Eviction is not deletion: submission, artifact, screening verdict and the
+    # complete ticket history all survive, and one audit row justifies the lease.
+    async with retry_maker() as session:
+        agent = await session.get(Agent, burner)
+        tickets = list(
+            (
+                await session.scalars(
+                    select(ValidatorTicket).where(ValidatorTicket.agent_id == burner)
+                )
+            ).all()
+        )
+        record = await session.get(ValidatorQueueWithdrawal, request_id)
+        heartbeats = list((await session.scalars(select(ValidatorHeartbeat))).all())
+        audits = list(
+            (
+                await session.scalars(
+                    select(ValidatorLeaseAudit).where(
+                        ValidatorLeaseAudit.agent_id == burner
+                    )
+                )
+            ).all()
+        )
+    assert agent is not None
+    assert agent.status == AgentStatus.EVALUATING
+    assert agent.sha256 == burner.hex * 2
+    assert agent.screening_policy_version == SCREENING_POLICY_VERSION
+    assert len(tickets) == 1 and tickets[0].status == TicketStatus.EXPIRED
+    # The revocation's ledger signature: the deadline was rewritten, not honoured.
+    assert tickets[0].deadline < original_deadline
+    # THE correctness property: no no-fault retry grant was minted. Granting one
+    # would raise the cap on the artifact just evicted and rebuild the amplifier
+    # that took mnemox-v55 to 9 attempts against a base budget of 2.
+    assert tickets[0].infra_retry_grants == 0
+    assert tickets[0].attempt_count == 1
+    # And it got there with no heartbeat in the table at all — the automatic
+    # liveness gate could not have admitted this, which is the entire point.
+    assert heartbeats == []
+    assert record is not None
+    assert record.evicted_validator_hotkeys == ["validator-0"]
+    assert len(record.ticket_snapshot) == 1
+    assert len(audits) == 1
+    audit = audits[0]
+    assert audit.action == "operator_evicted"
+    assert audit.reason == "operator_evicted_occupancy_unobservable"
+    assert audit.context == "admin_queue_eviction"
+    assert audit.evidence["operator_actor"] == "operator"
+    assert audit.evidence["operator_reason"] == _EVICT_REASON
+    assert audit.evidence["operator_request_id"] == str(request_id)
+    assert audit.evidence["original_deadline"] == original_deadline.isoformat()
+
+    # And it reaches the same terminal state a withdrawal does.
+    triage = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    assert all(row["agent_id"] != str(burner) for row in triage.json()["submissions"])
+
+
+async def _seed_capacity_heartbeat(
+    maker: async_sessionmaker[AsyncSession],
+    agent_id: UUID,
+    *,
+    progress: dict[str, object] | None,
+    validator_hotkey: str = "validator-0",
+    slot_id: str = "slot-0",
+) -> None:
+    """A protocol-16 heartbeat that announces the slot as claimed.
+
+    ``progress=None`` is v16's honest negative — leased, nothing to report — the
+    report that makes "occupied but not progressing" an observation instead of an
+    inference (ditto-subnet#274 / ditto-platform#499).
+    """
+    now = datetime.now(UTC)
+    async with maker() as session, session.begin():
+        session.add(
+            ValidatorHeartbeat(
+                validator_hotkey=validator_hotkey,
+                software_version="0.35.0",
+                protocol_version=16,
+                code_digest="d" * 64,
+                state="running_benchmark",
+                first_seen_at=now,
+                reported_at=now,
+                seen_at=now,
+                signature="ab" * 64,
+                benchmark_capacity={
+                    "configured_slots": 1,
+                    "healthy_slots": [slot_id],
+                    "admission": "accepting",
+                    "active": [
+                        {
+                            "slot_id": slot_id,
+                            "agent_id": str(agent_id),
+                            "bench_version": DEFAULT_BENCH_VERSION,
+                            "progress": progress,
+                            "healthy": True,
+                        }
+                    ],
+                },
+            )
+        )
+
+
+async def test_evict_never_mints_a_no_fault_retry_grant(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The single most important correctness property of the feature.
+
+    ``force_expire_lease`` compensates the miner by default (#497): an automatic
+    revocation raises ``infra_retry_grants`` so the attempt the coming reissue
+    charges is not billed. An eviction must not do that. ditto-subnet#279
+    established that the 2026-07-27 leases were *misclassified*, not silent —
+    they carried ``fail_job(reason="infrastructure")``, the no-fault class — so
+    every hang minted a grant, raised the cap and re-leased, which is how
+    ``mnemox-v55`` reached nine attempts against a base budget of two with zero
+    scores. Granting on eviction would rebuild that amplifier.
+
+    Asserted as a contrast against the automatic path so the two cannot converge
+    silently.
+    """
+    from ditto.db.queries.lease_liveness import LeaseLiveness, force_expire_lease
+
+    automatic = await _seed(retry_maker, ticket_count=0)
+    evicted = await _seed(retry_maker, ticket_count=0, miner_hotkey="5EvictedMiner")
+    await _seed_live_lease(retry_maker, automatic)
+    await _seed_live_lease(retry_maker, evicted, validator_hotkey="validator-1")
+
+    # Automatic revocation on a proven-idle lease: the miner IS compensated.
+    async with retry_maker() as session, session.begin():
+        ticket = await session.get(
+            ValidatorTicket, (automatic, DEFAULT_BENCH_VERSION, "validator-0")
+        )
+        assert ticket is not None
+        await force_expire_lease(
+            session,
+            ticket=ticket,
+            now=datetime.now(UTC),
+            liveness=LeaseLiveness(
+                idle=True, reason="idle_state_not_running_benchmark"
+            ),
+            context="issue_ticket",
+        )
+    async with retry_maker() as session:
+        compensated = await session.get(
+            ValidatorTicket, (automatic, DEFAULT_BENCH_VERSION, "validator-0")
+        )
+    assert compensated is not None and compensated.infra_retry_grants == 1
+
+    # The same primitive, reached through eviction: the miner is NOT compensated.
+    _install(app, retry_maker)
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{evicted}", headers=_HEADERS
+    )
+    response = await client.post(
+        f"/api/v1/admin/validation-retries/{evicted}/evict",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": detail.json()["snapshot"],
+            "reason": _EVICT_REASON,
+            "confirmation": _EVICT_CONFIRMATION,
+        },
+    )
+    assert response.status_code == 200, response.text
+    async with retry_maker() as session:
+        uncompensated = await session.get(
+            ValidatorTicket, (evicted, DEFAULT_BENCH_VERSION, "validator-1")
+        )
+    assert uncompensated is not None
+    assert uncompensated.infra_retry_grants == 0
+    assert uncompensated.attempt_count == 1
+    # So the cap is untouched: the evicted artifact gained no attempt, while the
+    # automatically-revoked one gained exactly the attempt it was billed.
+    assert ticket_attempt_cap(uncompensated) == MAX_ATTEMPTS_PER_VERSION
+    assert ticket_attempt_cap(compensated) == MAX_ATTEMPTS_PER_VERSION + 1
+
+
+async def test_evict_records_what_the_platform_could_see_about_the_slot(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Protocol 16 turns "hung" from an inference into an observation.
+
+    A v16 validator announces a claimed slot immediately and leaves ``progress``
+    null until it has something to say, so the platform can now positively see
+    *occupied and not progressing* — the shape a hang produces, and the shape the
+    automatic gate still (correctly) refuses to act on for pre-v16 reporters.
+    The eviction proceeds either way; what changes is what the audit row claims.
+    """
+    for index, (progress, expected) in enumerate(
+        (
+            (None, "operator_evicted_occupied_not_progressing"),
+            (
+                {
+                    "stage": "running_benchmark",
+                    "completed": 12,
+                    "total": 114,
+                    "ticket_deadline": _FUTURE.isoformat(),
+                },
+                "operator_evicted_occupied_progressing",
+            ),
+        )
+    ):
+        # Each iteration needs its own validator: a heartbeat row is keyed by
+        # hotkey, and the two cases describe different fleet states.
+        hotkey = f"validator-{index}"
+        agent_id = await _seed(
+            retry_maker, ticket_count=0, miner_hotkey=f"5Miner{index}"
+        )
+        await _seed_live_lease(retry_maker, agent_id, validator_hotkey=hotkey)
+        await _seed_capacity_heartbeat(
+            retry_maker, agent_id, progress=progress, validator_hotkey=hotkey
+        )
+        _install(app, retry_maker)
+
+        detail = await client.get(
+            f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+        )
+        response = await client.post(
+            f"/api/v1/admin/validation-retries/{agent_id}/evict",
+            headers=_HEADERS,
+            json={
+                "request_id": str(uuid4()),
+                "expected_snapshot": detail.json()["snapshot"],
+                "reason": _EVICT_REASON,
+                "confirmation": _EVICT_CONFIRMATION,
+            },
+        )
+        assert response.status_code == 200, response.text
+
+        async with retry_maker() as session:
+            audits = list(
+                (
+                    await session.scalars(
+                        select(ValidatorLeaseAudit).where(
+                            ValidatorLeaseAudit.agent_id == agent_id
+                        )
+                    )
+                ).all()
+            )
+        assert len(audits) == 1
+        assert audits[0].reason == expected
+        assert audits[0].evidence["protocol_version"] == 16
+        assert audits[0].evidence["reported_agent_id"] == str(agent_id)
+
+        # The revocation is readable through the audit surface #498 shipped,
+        # filtered by the action that distinguishes it from an inferred one.
+        feed = await client.get(
+            "/api/v1/admin/lease-revocations",
+            headers=_HEADERS,
+            params={"agent_id": str(agent_id), "action": "operator_evicted"},
+        )
+        assert feed.status_code == 200, feed.text
+        assert feed.json()["total"] == 1
+        assert feed.json()["revocations"][0]["reason"] == expected
+
+
+async def test_evict_stops_a_submission_withdrawal_refuses_to_touch(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The gap this route exists for, stated as an assertion.
+
+    ``/withdraw`` accepts only submissions that had already stopped consuming
+    capacity, so on 2026-07-27 it refused every agent that was actively burning
+    validator slots. Both of its refusals are reproduced here, and ``/evict``
+    succeeds on both.
+    """
+    holding = await _seed(retry_maker, ticket_count=0)
+    await _seed_live_lease(retry_maker, holding)
+    fresh = await _seed(retry_maker, ticket_count=0, miner_hotkey="5FreshMiner")
+    _install(app, retry_maker)
+
+    for agent_id, refusal in (
+        (holding, "a validator ticket is still active"),
+        (fresh, "submission can still reach quorum automatically"),
+    ):
+        detail = await client.get(
+            f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+        )
+        body = detail.json()
+        assert body["withdrawal_allowed"] is False
+        assert body["withdrawal_blocking_reason"] == refusal
+        assert body["eviction_allowed"] is True
+        assert body["eviction_blocking_reason"] is None
+
+        refused = await client.post(
+            f"/api/v1/admin/validation-retries/{agent_id}/withdraw",
+            headers=_HEADERS,
+            json={
+                "request_id": str(uuid4()),
+                "expected_snapshot": body["snapshot"],
+                "reason": _EVICT_REASON,
+                "confirmation": "REMOVE FROM VALIDATOR QUEUE",
+            },
+        )
+        assert refused.status_code == 409
+        assert refusal in refused.text
+
+        allowed = await client.post(
+            f"/api/v1/admin/validation-retries/{agent_id}/evict",
+            headers=_HEADERS,
+            json={
+                "request_id": str(uuid4()),
+                "expected_snapshot": body["snapshot"],
+                "reason": _EVICT_REASON,
+                "confirmation": _EVICT_CONFIRMATION,
+            },
+        )
+        assert allowed.status_code == 200, allowed.text
+
+
+async def test_evict_interlocks_reject_a_mismatched_or_malformed_call(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker, ticket_count=0)
+    await _seed_live_lease(retry_maker, agent_id)
+    _install(app, retry_maker)
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    snapshot = detail.json()["snapshot"]
+
+    def _payload(**overrides: object) -> dict[str, object]:
+        base: dict[str, object] = {
+            "request_id": str(uuid4()),
+            "expected_snapshot": snapshot,
+            "reason": _EVICT_REASON,
+            "confirmation": _EVICT_CONFIRMATION,
+        }
+        base.update(overrides)
+        return base
+
+    stale = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/evict",
+        headers=_HEADERS,
+        json=_payload(expected_snapshot="0" * 64),
+    )
+    assert stale.status_code == 409
+    assert "validation state changed" in stale.text
+
+    # The removal route's phrase must never authorize an eviction: it is the one
+    # confusion that would let an operator destroy live runs believing they were
+    # tidying up dead ones.
+    wrong_phrase = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/evict",
+        headers=_HEADERS,
+        json=_payload(confirmation="REMOVE FROM VALIDATOR QUEUE"),
+    )
+    assert wrong_phrase.status_code == 422
+
+    for malformed in (
+        _payload(expected_snapshot="not-a-snapshot"),
+        _payload(reason="short"),
+        _payload(unexpected_field="x"),
+    ):
+        response = await client.post(
+            f"/api/v1/admin/validation-retries/{agent_id}/evict",
+            headers=_HEADERS,
+            json=malformed,
+        )
+        assert response.status_code == 422, response.text
+
+    no_actor = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/evict",
+        headers={"Authorization": _HEADERS["Authorization"]},
+        json=_payload(),
+    )
+    assert no_actor.status_code == 422
+    unauthorized = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/evict", json=_payload()
+    )
+    assert unauthorized.status_code == 401
+
+    # Nothing above may have touched the lease.
+    async with retry_maker() as session:
+        ticket = await session.get(
+            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-0")
+        )
+    assert ticket is not None and ticket.status == TicketStatus.ISSUED
+
+
+async def test_evict_replay_is_idempotent_and_never_double_revokes(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker, ticket_count=0)
+    await _seed_live_lease(retry_maker, agent_id)
+    _install(app, retry_maker)
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    payload = {
+        "request_id": str(uuid4()),
+        "expected_snapshot": detail.json()["snapshot"],
+        "reason": _EVICT_REASON,
+        "confirmation": _EVICT_CONFIRMATION,
+    }
+    first = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/evict",
+        headers=_HEADERS,
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+
+    replay = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/evict",
+        headers=_HEADERS,
+        json=payload,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["idempotent"] is True
+    assert replay.json()["freed_slots"] == 1
+    assert replay.json()["eviction"]["evicted_validator_hotkeys"] == ["validator-0"]
+
+    # A different request id against an already-removed era is a conflict, and a
+    # replay must never write a second audit row for the same lease.
+    conflict = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/evict",
+        headers=_HEADERS,
+        json={**payload, "request_id": str(uuid4())},
+    )
+    assert conflict.status_code == 409
+
+    async with retry_maker() as session:
+        audits = list(
+            (
+                await session.scalars(
+                    select(ValidatorLeaseAudit).where(
+                        ValidatorLeaseAudit.agent_id == agent_id
+                    )
+                )
+            ).all()
+        )
+    assert len(audits) == 1
+
+
+async def test_triage_tells_a_silent_expiry_apart_from_a_reported_failure(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Not being able to tell these apart is what let the incident run unseen."""
+    agent_id = await _seed(retry_maker, ticket_count=3)
+    async with retry_maker() as session, session.begin():
+        reported = await session.get(
+            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-0")
+        )
+        assert reported is not None
+        reported.failure_reason = "scoring_error"
+        reported.failed_at = reported.issued_at + timedelta(minutes=5)
+        superseded = await session.get(
+            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-1")
+        )
+        assert superseded is not None
+        # A failure kept from a lease that has since been re-leased is history,
+        # not a report about this attempt.
+        superseded.failure_reason = "scoring_error"
+        superseded.failed_at = superseded.issued_at - timedelta(hours=1)
+    _install(app, retry_maker)
+
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    silent = {
+        ticket["validator_hotkey"]: ticket["silently_expired"]
+        for ticket in detail.json()["tickets"]
+    }
+    assert silent == {
+        "validator-0": False,
+        "validator-1": True,
+        "validator-2": True,
+    }
+
+    triage = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    rows = [
+        item
+        for item in triage.json()["submissions"]
+        if item["agent_id"] == str(agent_id)
+    ]
+    assert len(rows) == 1
+    assert rows[0]["silent_expiry_count"] == 2
 
 
 async def test_replace_one_validators_score_and_reissue_same_ticket(

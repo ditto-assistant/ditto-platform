@@ -5437,6 +5437,64 @@ class TestSubmitScore:
         assert response.status_code == 409
         assert "no open scoring ticket" in response.json()["message"]
 
+    async def test_operator_evicted_lease_rejects_a_late_score(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A validator still mid-run on an evicted lease must fail cleanly.
+
+        The operator eviction route revokes a live lease before its deadline, so
+        the validator holding it may finish its benchmark minutes later and post
+        a perfectly well-formed, correctly-signed score for work the platform has
+        already written off. That has to be a plain refusal — not a crash for the
+        validator, and not a row in the ledger for an era the submission has been
+        removed from.
+        """
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        token = "test-admin-token-at-least-32-characters"
+        app.state.config = replace(app.state.config, admin_api_token=token)
+        admin_headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Admin-Actor": "operator",
+        }
+
+        detail = await client.get(
+            f"/api/v1/admin/validation-retries/{agent_id}", headers=admin_headers
+        )
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["live_ticket_count"] == 1
+        eviction = await client.post(
+            f"/api/v1/admin/validation-retries/{agent_id}/evict",
+            headers=admin_headers,
+            json={
+                "request_id": str(uuid4()),
+                "expected_snapshot": detail.json()["snapshot"],
+                "reason": "hangs every lease and reports nothing; freeing the fleet",
+                "confirmation": "EVICT LIVE VALIDATOR LEASES",
+            },
+        )
+        assert eviction.status_code == 200, eviction.text
+        assert eviction.json()["freed_slots"] == 1
+
+        late = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id, run_id="late_after_eviction"),
+        )
+
+        assert late.status_code == 409
+        assert "no open scoring ticket" in late.json()["message"]
+        async with session_maker() as session:
+            from ditto.db.queries.scores import list_scores_for_agent
+
+            assert await list_scores_for_agent(session, agent_id=agent_id) == []
+            agent = await session.get(Agent, agent_id)
+        assert agent is not None and agent.status == AgentStatus.EVALUATING
+
     async def test_bad_signature_returns_401(
         self,
         app: FastAPI,

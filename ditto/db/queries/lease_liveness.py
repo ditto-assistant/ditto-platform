@@ -64,6 +64,13 @@ Revocations are also no longer silent: :func:`force_expire_lease` writes a
 :class:`~ditto.db.models.ValidatorLeaseAudit` row and a WARNING log carrying the
 evidence it acted on, and both outcomes increment a Prometheus counter labelled
 by reason, so the near-misses are as visible as the revocations.
+
+One caller deliberately sits outside all of the above: an **operator eviction**
+(:func:`operator_eviction_liveness`) answers a different question and therefore
+does not consult this gate. It acts on protocol-16's positive
+occupied-but-not-progressing report rather than on inferred absence, and it
+never relaxes anything here -- the never-reported rule stays exactly as strict
+for every automatic path, because pre-v16 validators still omit a quiet slot.
 """
 
 from __future__ import annotations
@@ -123,6 +130,19 @@ REASON_AGENT_CLAIMED_ELSEWHERE = "agent_claimed_on_another_slot"
 REASON_AGENT_ACTIVE_ELSEWHERE = "agent_active_on_another_slot"
 REASON_IDLE_CAPACITY = "idle_capacity_reports_slot_free"
 REASON_IDLE_STATE = "idle_state_not_running_benchmark"
+# Operator-eviction verdicts. Not inferred idleness -- see
+# :func:`operator_eviction_liveness`. Each names what the platform could see
+# about the slot at the moment the operator acted, which is what makes the
+# audit row defensible afterwards.
+REASON_EVICT_OCCUPIED_NOT_PROGRESSING = "operator_evicted_occupied_not_progressing"
+REASON_EVICT_OCCUPIED_PROGRESSING = "operator_evicted_occupied_progressing"
+REASON_EVICT_OCCUPANCY_UNOBSERVABLE = "operator_evicted_occupancy_unobservable"
+
+# ``ValidatorLeaseAudit.action`` values. An automatic revocation and an operator
+# eviction end a lease the same way but are not the same event, and the audit
+# feed must be able to filter them apart.
+ACTION_FORCE_EXPIRED = "force_expired"
+ACTION_OPERATOR_EVICTED = "operator_evicted"
 
 LEASE_FORCE_EXPIRY_TOTAL = Counter(
     "ditto_validator_lease_force_expiry_total",
@@ -325,6 +345,127 @@ async def lease_liveness(
     )
 
 
+def _slot_occupancy(
+    heartbeat: ValidatorHeartbeat | None, *, ticket: ValidatorTicket, now: datetime
+) -> tuple[str, dict[str, Any]]:
+    """Classify what the platform can currently *see* about one leased slot.
+
+    Total and defensive: an unparseable, missing, or stale heartbeat degrades to
+    :data:`REASON_EVICT_OCCUPANCY_UNOBSERVABLE` rather than raising. This is a
+    read of the record, never a permission check — the caller has already decided
+    to act, and this only determines what the audit row gets to say about it.
+    """
+    if heartbeat is None:
+        return REASON_EVICT_OCCUPANCY_UNOBSERVABLE, {"observation": "no heartbeat row"}
+    seen_at = _as_utc(heartbeat.seen_at)
+    evidence: dict[str, Any] = {
+        "heartbeat_age_seconds": round((now - seen_at).total_seconds(), 3),
+        "protocol_version": heartbeat.protocol_version,
+    }
+    if heartbeat.benchmark_capacity is None:
+        return REASON_EVICT_OCCUPANCY_UNOBSERVABLE, {
+            **evidence,
+            "observation": "validator advertises no per-slot capacity",
+        }
+    try:
+        capacity = BenchmarkCapacity.model_validate(heartbeat.benchmark_capacity)
+    except ValidationError:
+        return REASON_EVICT_OCCUPANCY_UNOBSERVABLE, {
+            **evidence,
+            "observation": "capacity blob did not parse",
+        }
+    for slot in capacity.active:
+        if slot.slot_id != ticket.slot_id:
+            continue
+        evidence["reported_agent_id"] = str(slot.agent_id)
+        if slot.progress is None:
+            # Protocol 16's "honest negative": the validator says it holds this
+            # slot and has nothing to report on it. That is a hang, observed.
+            return REASON_EVICT_OCCUPIED_NOT_PROGRESSING, evidence
+        evidence["progress"] = slot.progress.model_dump(mode="json")
+        return REASON_EVICT_OCCUPIED_PROGRESSING, evidence
+    return REASON_EVICT_OCCUPANCY_UNOBSERVABLE, {
+        **evidence,
+        "observation": "slot absent from capacity.active",
+        "active_slot_ids": [slot.slot_id for slot in capacity.active],
+    }
+
+
+async def operator_eviction_liveness(
+    session: AsyncSession,
+    *,
+    ticket: ValidatorTicket,
+    now: datetime,
+    actor: str,
+    reason: str,
+    request_id: UUID,
+) -> LeaseLiveness:
+    """The verdict for a lease an operator has decided must end, right now.
+
+    **This deliberately does not go through :func:`lease_liveness`.** That
+    function infers idleness from telemetry and is built to refuse, and it stays
+    exactly as strict as it is: no automatic revocation site reaches this
+    function, and nothing here relaxes the never-reported guard. Pre-v16
+    validators still omit a leased-but-quiet slot entirely, so the blanket rule
+    remains the only safe automatic answer for them.
+
+    But the operator route does not need the same answer, because it is asking a
+    different question, and since ditto-subnet#274 (v0.35.0, accepted by
+    ditto-platform#499) it can get **positive evidence** rather than an
+    inference. A protocol-16 validator now announces a slot from the moment it is
+    claimed and leaves :attr:`ActiveBenchmarkSlot.progress` null until there is
+    something to say — the honest negative the gate always lacked. So
+    ``occupied and not progressing`` is now an observation the platform can make,
+    and it is exactly the observation a hang produces. That, not bare operator
+    assertion, is what this acts on.
+
+    :func:`_slot_occupancy` records which of the three it saw:
+
+    * :data:`REASON_EVICT_OCCUPIED_NOT_PROGRESSING` — the strong case: the
+      validator itself attests it holds the slot with nothing to report.
+    * :data:`REASON_EVICT_OCCUPIED_PROGRESSING` — the slot is visibly working.
+      The eviction still proceeds (the operator may be ending a run that is
+      progressing but doomed), but it is logged at WARNING and the audit row says
+      so, because that is the one shape a reviewer should question afterwards.
+    * :data:`REASON_EVICT_OCCUPANCY_UNOBSERVABLE` — a pre-v16 reporter, a stale
+      or missing heartbeat, or an unparseable blob. Recorded as unobservable
+      rather than dressed up as evidence.
+
+    The verdict never *blocks*: an operator eviction is admissible in all three
+    states, because the fleet-starving case on 2026-07-27 was invisible on
+    protocol 15 and refusing to act on invisibility is what left the operator
+    with no move. What varies is only what the audit row can honestly claim.
+
+    Confinement is what keeps this from re-opening the #437/#443 bug class: it is
+    unreachable except from the admin eviction route, behind the admin bearer
+    token, a named ``X-Admin-Actor``, an exact snapshot precondition, and a
+    confirmation phrase distinct from every other operator action. Blast radius:
+    one operator, one submission, one benchmark era, one audit row per lease.
+    """
+    heartbeat = await session.get(ValidatorHeartbeat, ticket.validator_hotkey)
+    verdict, evidence = _slot_occupancy(heartbeat, ticket=ticket, now=now)
+    if verdict == REASON_EVICT_OCCUPIED_PROGRESSING:
+        logger.warning(
+            "operator eviction is ending a slot that is still reporting progress "
+            "agent=%s validator=%s slot=%s actor=%s evidence=%s",
+            ticket.agent_id,
+            ticket.validator_hotkey,
+            ticket.slot_id,
+            actor,
+            evidence,
+        )
+    return LeaseLiveness(
+        idle=True,
+        reason=verdict,
+        evidence={
+            **evidence,
+            "operator_actor": actor,
+            "operator_reason": reason,
+            "operator_request_id": str(request_id),
+        },
+    )
+
+
 async def record_lease_revocation(
     session: AsyncSession,
     *,
@@ -334,7 +475,7 @@ async def record_lease_revocation(
     context: str,
     action: str,
     requested_bench_version: int | None = None,
-) -> None:
+) -> ValidatorLeaseAudit:
     """Log, count, and durably record one platform-initiated lease revocation.
 
     Refuses outright unless ``liveness`` carries an idle verdict, so no call site
@@ -374,20 +515,20 @@ async def record_lease_revocation(
         evidence,
     )
     LEASE_FORCE_EXPIRY_TOTAL.labels(context=context, reason=liveness.reason).inc()
-    session.add(
-        ValidatorLeaseAudit(
-            audit_id=uuid4(),
-            agent_id=ticket.agent_id,
-            validator_hotkey=ticket.validator_hotkey,
-            slot_id=ticket.slot_id,
-            bench_version=ticket.bench_version,
-            action=action,
-            reason=liveness.reason,
-            context=context,
-            evidence=evidence,
-            recorded_at=now,
-        )
+    audit = ValidatorLeaseAudit(
+        audit_id=uuid4(),
+        agent_id=ticket.agent_id,
+        validator_hotkey=ticket.validator_hotkey,
+        slot_id=ticket.slot_id,
+        bench_version=ticket.bench_version,
+        action=action,
+        reason=liveness.reason,
+        context=context,
+        evidence=evidence,
+        recorded_at=now,
     )
+    session.add(audit)
+    return audit
 
 
 async def force_expire_lease(
@@ -397,8 +538,10 @@ async def force_expire_lease(
     now: datetime,
     liveness: LeaseLiveness,
     context: str,
+    action: str = ACTION_FORCE_EXPIRED,
     requested_bench_version: int | None = None,
-) -> None:
+    compensate: bool = True,
+) -> ValidatorLeaseAudit:
     """Expire a lease proven idle, leaving a log line and an audit row behind.
 
     Compensates the miner on the way out. ditto-platform#460 settled the rule --
@@ -413,24 +556,45 @@ async def force_expire_lease(
     The miner was therefore billed an attempt for every lease the platform
     destroyed -- which is how held agents reached ``attempt_count: 4,
     retry_budget_exhausted: true`` without four real failures.
+
+    ``compensate=False`` suppresses that grant, and **only the operator eviction
+    route passes it.** The grant exists to offset the attempt the *coming
+    reissue* will charge; an eviction is precisely the decision that there will
+    be no reissue in this era, so there is no attempt to offset. Granting anyway
+    would raise the agent's cap on the way out and re-arm the exact amplifier
+    behind the 2026-07-27 incident: ditto-subnet#279 established that those
+    leases were not silent but *misclassified* -- all twelve expired ``mnemo*``
+    tickets carry the ``fail_job(reason="infrastructure")`` signature
+    (``retry_after - deadline`` of exactly +2min/+30min, the
+    :func:`~ditto.db.queries.retry_budget.infra_retry_backoff` base and cap) --
+    and ``infrastructure`` is the no-fault class, so every hang minted a grant,
+    raised the cap and re-leased. That is how ``mnemox-v55`` reached nine
+    attempts against a base budget of two with zero scores. An eviction must not
+    hand the artifact it just evicted another attempt.
+
+    ``action`` names the *kind* of revocation for the audit feed and defaults to
+    the automatic one. The eviction route passes :data:`ACTION_OPERATOR_EVICTED`
+    so a deliberate human eviction is never read back as an inferred idle
+    verdict. Returns the audit row it wrote, so a caller can hand the operator a
+    durable id to cite afterwards.
     """
-    await record_lease_revocation(
+    audit = await record_lease_revocation(
         session,
         ticket=ticket,
         now=now,
         liveness=liveness,
         context=context,
-        action="force_expired",
+        action=action,
         requested_bench_version=requested_bench_version,
     )
     # Before the status change, so the grant is part of the same transaction the
     # audit row records. Bounded, so a persistently sick slot cannot mint
     # attempts forever; the audit row is the per-grant justification.
-    granted = grant_no_fault_retry(ticket)
+    exhausted = compensate and not grant_no_fault_retry(ticket)
     ticket.status = TicketStatus.EXPIRED
     ticket.deadline = now
     ticket.retry_after = now
-    if not granted:
+    if exhausted:
         logger.warning(
             "platform revoked a lease whose no-fault retry budget is already "
             "exhausted; this revocation bills the miner agent=%s validator=%s "
@@ -441,6 +605,7 @@ async def force_expire_lease(
             ticket.infra_retry_grants,
         )
     await session.flush()
+    return audit
 
 
 def record_declined_force_expiry(
@@ -509,14 +674,20 @@ async def maybe_force_expire_lease(
 
 
 __all__ = [
+    "ACTION_FORCE_EXPIRED",
+    "ACTION_OPERATOR_EVICTED",
     "IDLE_EVIDENCE_MAX_AGE",
     "LEASE_FORCE_EXPIRY_DECLINED_TOTAL",
     "LEASE_FORCE_EXPIRY_TOTAL",
     "LEASE_REPORTING_GRACE",
+    "REASON_EVICT_OCCUPANCY_UNOBSERVABLE",
+    "REASON_EVICT_OCCUPIED_NOT_PROGRESSING",
+    "REASON_EVICT_OCCUPIED_PROGRESSING",
     "LeaseLiveness",
     "force_expire_lease",
     "lease_liveness",
     "maybe_force_expire_lease",
+    "operator_eviction_liveness",
     "record_declined_force_expiry",
     "record_lease_revocation",
 ]

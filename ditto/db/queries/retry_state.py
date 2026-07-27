@@ -178,6 +178,51 @@ def withdrawal_gate(
     return True, None
 
 
+def eviction_gate(
+    *,
+    agent: Agent,
+    scores: list[Score],
+) -> tuple[bool, str | None]:
+    """Allow an operator eviction: the same terminal state, reachable sooner.
+
+    :func:`withdrawal_gate` is a *cleanup* tool. It only accepts a submission
+    that has already stopped consuming validator capacity — enough exhausted
+    tickets that quorum is unreachable, and no live lease — which means it can
+    tidy up a corpse but cannot stop an agent that is actively burning slots.
+
+    That was the entire gap on 2026-07-27: a family of hanging submissions held
+    6 of the fleet's 12 validator slots, each attempt running the full 90-minute
+    lease and reporting nothing, and the only available answer was to wait for
+    each of them to exhaust its own retry budget at a cost of ~4.5
+    validator-hours per attempt. Eviction is the answer to that, so it must be
+    permitted in exactly the two states withdrawal refuses:
+
+    * ``a validator ticket is still active`` — the live leases are the capacity
+      the operator is trying to reclaim, so refusing on their presence refuses
+      the whole point;
+    * ``submission can still reach quorum automatically`` — "it could still
+      finish on its own" is true of every fleet-starving agent, right up until
+      it has burned everything.
+
+    The screening-policy check is dropped as well: a submission below the
+    current policy is no longer leasable, but it can still be *holding* a lease
+    issued before the bump, and that slot is just as stuck.
+
+    What remains is the pair of conditions under which eviction would be
+    meaningless rather than merely dangerous — the submission is not waiting for
+    validator scores at all, or it already has its quorum. Everything else that
+    makes this safe is at the route: an exact expected-state snapshot, a written
+    reason, a distinct confirmation phrase, a named actor, and one audit row per
+    evicted lease.
+    """
+
+    if agent.status != AgentStatus.EVALUATING:
+        return False, "submission is not waiting for validator scores"
+    if len(scores) >= SCORING_QUORUM:
+        return False, "submission already reached scoring quorum"
+    return True, None
+
+
 def classify_retry_state(
     *,
     automatic: bool,
