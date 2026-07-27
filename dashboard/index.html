@@ -2123,7 +2123,7 @@
     .fleet-retired summary span { font: 10px/1.4 var(--mono); }
     .fleet-retired-note { margin: 0; padding: 0 14px 11px; color: var(--text-faint); font-size: 11px; line-height: 1.45; }
     .fleet-retired .board { margin: 0; border-right: 0; border-bottom: 0; border-left: 0; border-radius: 0; }
-    .fleet-retired-table { min-width: 640px; }
+    .fleet-retired-table { min-width: 760px; }
     .fleet-table { min-width: 1220px; table-layout: fixed; }
     .fleet-table thead th,
     .fleet-table tbody td { padding-inline: 12px; }
@@ -2557,13 +2557,14 @@
         </table>
       </div>
       <details class="fleet-retired" id="fleet-retired" hidden>
-        <summary><strong>Recently offline</strong><span id="fleet-retired-summary"></span></summary>
-        <p class="fleet-retired-note">Heartbeat history remains visible for 24 hours, then expires automatically.</p>
-        <div class="board validators" tabindex="0" role="region" aria-label="Recently offline screeners, horizontally scrollable on small screens">
-          <table class="fleet-table fleet-retired-table" aria-label="Recently offline screeners">
+        <summary><strong id="fleet-retired-title">Recently offline</strong><span id="fleet-retired-summary"></span></summary>
+        <p class="fleet-retired-note" id="fleet-retired-note">Heartbeat history remains visible for 24 hours, then expires automatically.</p>
+        <div class="board validators" tabindex="0" role="region" aria-label="Offline fleet nodes, horizontally scrollable on small screens">
+          <table class="fleet-table fleet-retired-table" id="fleet-retired-table" aria-label="Offline validators">
             <thead>
               <tr>
-                <th scope="col" style="width:240px">Screener</th>
+                <th scope="col" id="fleet-retired-node-heading" style="width:240px">Validator</th>
+                <th scope="col" style="width:100px">Status</th>
                 <th scope="col" style="width:130px">Last heartbeat</th>
                 <th scope="col" style="width:180px">Last reported state</th>
                 <th scope="col" style="width:108px">Version</th>
@@ -7616,6 +7617,16 @@
       return ["Not reported", "unknown"];
     }
 
+    // For a node that is already offline, a liveness badge ("Heartbeat stale",
+    // "Stale") only restates that it is gone, in the gentler warn tone. Name it
+    // offline instead; a real fault (scorer down, critical, mismatch) outranks
+    // that and keeps its own label. A reporting node is untouched.
+    function offlineAwareFleetStatus(entry) {
+      var status = fleetStatus(entry);
+      if (entry.availability === "offline" && status[1] !== "bad") return ["Offline", "bad"];
+      return status;
+    }
+
     function fleetMeter(value, tone) {
       return '<span class="fleet-meter' + (tone ? " " + tone : "") + '">' +
         '<span class="fleet-meter-track" aria-hidden="true"><i style="--value:' + esc(value) + '"></i></span>' +
@@ -7965,7 +7976,7 @@
       document.querySelector("#modal .dk-label").textContent = "Validator";
       document.getElementById("d-title").textContent = validatorNames[hotkey] || "Validator";
       var chip = document.getElementById("d-bench");
-      var status = fleetStatus(entry);
+      var status = offlineAwareFleetStatus(entry);
       chip.className = status[1];
       chip.textContent = status[0];
       chip.title = "Current fleet status";
@@ -8009,6 +8020,53 @@
       });
     }
 
+    // "Offline" is a window, not a constant: read it from the snapshot the rows
+    // were classified with rather than restating 15 minutes in the copy.
+    function fleetWindowLabel(seconds) {
+      var total = Number(seconds);
+      if (!Number.isFinite(total) || total <= 0) return "the offline window";
+      if (total < 3600) return Math.max(1, Math.round(total / 60)) + "m";
+      var hours = Math.floor(total / 3600);
+      var minutes = Math.round((total % 3600) / 60);
+      return hours + "h" + (minutes ? " " + minutes + "m" : "");
+    }
+
+    function renderRetiredFleetRow(entry, singular) {
+      var hotkey = entry[singular + "_hotkey"] || "Unknown";
+      var displayName = singular === "validator"
+        ? (validatorNames[hotkey] || "")
+        : (entry.instance_id || "Unknown screener");
+      var nameNode = singular === "validator"
+        ? entityAnchor(singular, hotkey, displayName)
+        : esc(displayName);
+      var reportedAt = entry.seen_at || entry.reported_at;
+      // The status badge survives the fold: a validator that went quiet *and*
+      // whose scorer was down is counted "Critical" in the ledger, so the reason
+      // has to be readable here rather than flattened to "offline".
+      var status = offlineAwareFleetStatus(entry);
+      var work = fleetWork(entry.state, singular);
+      var version = String(entry.software_version || "Unknown");
+      if (version !== "Unknown" && version.charAt(0).toLowerCase() !== "v") version = "v" + version;
+      var protocol = singular === "screener"
+        ? "Protocol " + entry.protocol_version + " · Policy " + entry.policy_version
+        : "Protocol " + entry.protocol_version;
+      var identity = displayName
+        ? '<span class="fleet-node-identity"><span class="fleet-node-name" title="' + esc(displayName) + '">' + nameNode + '</span><span class="fleet-node fleet-node-key copyable" title="' + esc(hotkey) + '"><span>' + entityAnchor(singular, hotkey, shortKey(hotkey)) + '</span>' + copyButton(hotkey, singular + " hotkey") + '</span></span>'
+        : '<span class="fleet-node copyable" title="' + esc(hotkey) + '"><span>' + entityAnchor(singular, hotkey, shortKey(hotkey)) + '</span>' + copyButton(hotkey, singular + " hotkey") + '</span>';
+      // Folded rows keep their entity identity so a deep link to an offline
+      // validator still highlights, focuses and opens the same drill-down.
+      var rowAttrs = singular === "validator"
+        ? ' tabindex="-1" data-entity-kind="validator" data-entity-id="' + esc(hotkey) + '"'
+        : '';
+      return '<tr' + rowAttrs + '>' +
+        '<td><span class="fleet-node-wrap">' + identity + '</span></td>' +
+        '<td><span class="stage ' + status[1] + '">' + status[0] + '</span></td>' +
+        '<td><span class="fleet-time" title="' + esc(reportedAt) + '">' + relTime(reportedAt) + '</span></td>' +
+        '<td><span class="stage unknown">' + esc(work[0]) + '</span></td>' +
+        '<td><span class="fleet-version">' + esc(version) + '</span><span class="fleet-protocol">' + esc(protocol) + '</span></td>' +
+        '</tr>';
+    }
+
     function renderFleet() {
       var showScreeners = document.getElementById("show-screeners").checked;
       var kind = showScreeners ? "screeners" : "validators";
@@ -8022,6 +8080,8 @@
       var retiredSummary = document.getElementById("fleet-retired-summary");
       var retiredRows = document.getElementById("fleet-retired-rows");
       document.getElementById("fleet-node-heading").textContent = showScreeners ? "Screener" : "Validator";
+      document.getElementById("fleet-retired-node-heading").textContent = showScreeners ? "Screener" : "Validator";
+      document.getElementById("fleet-retired-table").setAttribute("aria-label", showScreeners ? "Offline screeners" : "Offline validators");
       table.setAttribute("aria-label", (showScreeners ? "Screener" : "Validator") + " fleet health");
       if (unavailable) {
         resetFleetLedger();
@@ -8040,12 +8100,16 @@
         return;
       }
       var allEntries = sortFleetEntries(data[kind] || [], singular);
-      var retiredEntries = showScreeners ? allEntries.filter(function (entry) {
+      // One rule for both fleets: a node with no heartbeat inside the offline
+      // window is inoperative and folds away. A validator hotkey's last report is
+      // kept indefinitely, so without this the table fills up with hosts that
+      // stopped running the software long ago and buries the live fleet.
+      var retiredEntries = allEntries.filter(function (entry) {
         return entry.availability === "offline";
-      }) : [];
-      var entries = showScreeners ? allEntries.filter(function (entry) {
+      });
+      var entries = allEntries.filter(function (entry) {
         return entry.availability !== "offline";
-      }) : allEntries;
+      });
       updateFleetLedger(allEntries);
       var available = entries.filter(function (entry) {
         return entry.availability === "available";
@@ -8054,29 +8118,33 @@
       summary.textContent = (entries.length
         ? available + " of " + entries.length + " active " + kind + " available"
         : "No active " + kind + " reporting") +
-        (retiredEntries.length ? " · " + retiredEntries.length + " recently offline" : "") + snapshot;
-      retired.hidden = !showScreeners || !retiredEntries.length;
+        (retiredEntries.length ? " · " + retiredEntries.length + " offline" : "") + snapshot;
+      retired.hidden = !retiredEntries.length;
+      document.getElementById("fleet-retired-title").textContent = showScreeners
+        ? "Recently offline"
+        : "Inoperative validators";
+      document.getElementById("fleet-retired-note").textContent = showScreeners
+        ? "Heartbeat history remains visible for 24 hours, then expires automatically."
+        : "No heartbeat for over " + fleetWindowLabel(data.stale_window_seconds) +
+          ". A validator's last report stays on record until it reports again, and the row rejoins the fleet table on its next heartbeat.";
       // Preserve focus/expanded state: rebuild rows only when the fleet data,
       // display names, or stake ordering actually changed.
       if (sectionChanged("fleet", { kind: kind, entries: entries, retired: retiredEntries, names: validatorNames, stakes: validatorStakeWeights })) {
       if (retiredEntries.length) {
-        retiredSummary.textContent = retiredEntries.length + (retiredEntries.length === 1 ? " screener" : " screeners");
+        // Name the critical count in the summary: the ledger counts a broken
+        // validator as Critical before it counts it offline, and a number with no
+        // matching row in the open table is how it went invisible before.
+        var retiredCritical = retiredEntries.filter(function (entry) {
+          return entry.health === "critical";
+        }).length;
+        retiredSummary.textContent = retiredEntries.length + " " + singular +
+          (retiredEntries.length === 1 ? "" : "s") +
+          (retiredCritical ? " · " + retiredCritical + " critical" : "");
         retiredRows.innerHTML = retiredEntries.map(function (entry) {
-          var hotkey = entry.screener_hotkey || "Unknown";
-          var displayName = entry.instance_id || "Unknown screener";
-          var reportedAt = entry.seen_at || entry.reported_at;
-          var work = fleetWork(entry.state, "screener");
-          var version = String(entry.software_version || "Unknown");
-          if (version !== "Unknown" && version.charAt(0).toLowerCase() !== "v") version = "v" + version;
-          var identity = '<span class="fleet-node-identity"><span class="fleet-node-name" title="' + esc(displayName) + '">' + esc(displayName) + '</span><span class="fleet-node fleet-node-key copyable" title="' + esc(hotkey) + '"><span>' + entityAnchor("screener", hotkey, shortKey(hotkey)) + '</span>' + copyButton(hotkey, "screener hotkey") + '</span></span>';
-          return '<tr>' +
-            '<td><span class="fleet-node-wrap">' + identity + '</span></td>' +
-            '<td><span class="fleet-time" title="' + esc(reportedAt) + '">' + relTime(reportedAt) + '</span></td>' +
-            '<td><span class="stage unknown">' + esc(work[0]) + '</span></td>' +
-            '<td><span class="fleet-version">' + esc(version) + '</span><span class="fleet-protocol">Protocol ' + esc(entry.protocol_version) + ' · Policy ' + esc(entry.policy_version) + '</span></td>' +
-            '</tr>';
+          return renderRetiredFleetRow(entry, singular);
         }).join("");
       } else {
+        retiredSummary.textContent = "";
         retiredRows.innerHTML = "";
       }
       if (!entries.length) {
@@ -8158,26 +8226,30 @@
       resolveEntityRoute();
     }
 
-    var fleetRowsEl = document.getElementById("fleet-rows");
     function activateFleetRow(tr) {
       if (tr.getAttribute("data-entity-kind") !== "validator") return;
       var entry = findValidatorEntry(tr.getAttribute("data-entity-id"));
       if (entry) openValidatorEntry(entry);
     }
-    fleetRowsEl.addEventListener("click", function (ev) {
-      if (ev.target.closest(".copy") || ev.target.closest("[data-entity-link]")) return;
-      var tr = ev.target.closest("tr[data-entity-kind]");
-      if (tr) activateFleetRow(tr);
-    });
-    fleetRowsEl.addEventListener("keydown", function (ev) {
-      if (ev.target.closest(".copy") || ev.target.closest("[data-entity-link]")) return;
-      var tr = ev.target.closest("tr[data-entity-kind]");
-      if (!tr) return;
-      if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
-        ev.preventDefault();
-        activateFleetRow(tr);
-      }
-    });
+    // Folded-away validators stay as clickable as the ones in the open table.
+    function bindFleetRowActivation(tbody) {
+      tbody.addEventListener("click", function (ev) {
+        if (ev.target.closest(".copy") || ev.target.closest("[data-entity-link]")) return;
+        var tr = ev.target.closest("tr[data-entity-kind]");
+        if (tr) activateFleetRow(tr);
+      });
+      tbody.addEventListener("keydown", function (ev) {
+        if (ev.target.closest(".copy") || ev.target.closest("[data-entity-link]")) return;
+        var tr = ev.target.closest("tr[data-entity-kind]");
+        if (!tr) return;
+        if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
+          ev.preventDefault();
+          activateFleetRow(tr);
+        }
+      });
+    }
+    bindFleetRowActivation(document.getElementById("fleet-rows"));
+    bindFleetRowActivation(document.getElementById("fleet-retired-rows"));
 
     document.getElementById("show-screeners").addEventListener("change", renderFleet);
     setInterval(updateElapsedTimes, 1000);
@@ -8343,7 +8415,7 @@
 
     function resolveEntityRoute() {
       var entity = readEntityRoute();
-      document.querySelectorAll("#fleet-rows tr.entity-target").forEach(function (row) {
+      document.querySelectorAll("#fleet-rows tr.entity-target, #fleet-retired-rows tr.entity-target").forEach(function (row) {
         row.classList.remove("entity-target");
         row.removeAttribute("aria-current");
       });
@@ -8420,12 +8492,16 @@
           openValidatorEntry(validatorEntry, true);
         }
       }
-      var target = Array.prototype.find.call(document.querySelectorAll("#fleet-rows tr[data-entity-id]"), function (row) {
+      var target = Array.prototype.find.call(document.querySelectorAll("#fleet-rows tr[data-entity-id], #fleet-retired-rows tr[data-entity-id]"), function (row) {
         return row.getAttribute("data-entity-id") === entity.id;
       });
       if (!target) return;
       target.classList.add("entity-target");
       target.setAttribute("aria-current", "true");
+      // An inoperative validator's row lives inside the collapsible; unfold it
+      // rather than scrolling to and focusing something the reader cannot see.
+      var folded = target.closest("details");
+      if (folded) folded.open = true;
       if (activeEntityKey !== entity.key) {
         activeEntityKey = entity.key;
         requestAnimationFrame(function () {

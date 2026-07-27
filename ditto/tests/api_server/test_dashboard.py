@@ -838,8 +838,44 @@ class TestDashboard:
         assert '" reporting " + kind' not in body
         assert 'available + " of " + entries.length + " active " + kind' in body
         assert 'entry.availability === "offline"' in body
-        assert "retired.hidden = !showScreeners || !retiredEntries.length" in body
-        assert '" · " + retiredEntries.length + " recently offline"' in body
+        assert "retired.hidden = !retiredEntries.length" in body
+        assert '" · " + retiredEntries.length + " offline"' in body
+
+    async def test_inoperative_fleet_nodes_fold_into_the_collapsible(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        # One offline rule for both fleets: a validator hotkey's last report is
+        # never pruned, so without the fold the table fills with dead hosts.
+        assert "var retiredEntries = allEntries.filter" in body
+        assert "showScreeners ? allEntries.filter" not in body
+        assert "retired.hidden = !retiredEntries.length" in body
+        assert "Inoperative validators" in body
+        assert 'id="fleet-retired-title"' in body
+        assert 'id="fleet-retired-note"' in body
+        assert 'id="fleet-retired-node-heading"' in body
+        # The offline window is read from the snapshot, never restated in copy.
+        assert "fleetWindowLabel(data.stale_window_seconds)" in body
+        assert "No heartbeat for over 15" not in body
+        # A folded validator keeps its badge, its drill-down and its deep link.
+        assert "function offlineAwareFleetStatus(entry)" in body
+        assert (
+            'if (entry.availability === "offline" && status[1] !== "bad") '
+            'return ["Offline", "bad"];' in body
+        )
+        assert "var status = offlineAwareFleetStatus(entry);" in body
+        assert 'data-entity-kind="validator" data-entity-id="' in body
+        assert (
+            'bindFleetRowActivation(document.getElementById("fleet-retired-rows"))'
+            in body
+        )
+        assert (
+            '"#fleet-rows tr[data-entity-id], #fleet-retired-rows tr[data-entity-id]"'
+            in body
+        )
+        assert "if (folded) folded.open = true;" in body
+        # A ledger count with no row in the open table is how a broken validator
+        # went invisible before; the summary names it.
+        assert '" · " + retiredCritical + " critical"' in body
 
     async def test_operations_panels_share_one_snapshot_and_show_skew(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
