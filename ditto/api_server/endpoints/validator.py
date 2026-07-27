@@ -44,7 +44,7 @@ import os
 import re
 import statistics
 import time
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, Literal
@@ -189,6 +189,7 @@ from ditto.db.queries.confirmation_scores import (
     WaveMembership,
     append_confirmation_scores,
     completed_confirmation_wave_seeds,
+    confirmation_catchup_seeds,
     confirmation_composites_by_seed,
     fold_eligible_seeds_by_agent,
 )
@@ -900,6 +901,9 @@ _TICKET_TTL = timedelta(minutes=90)
 # the database for the same window, making replay rejection consistent across
 # every API replica without introducing another secret.
 _JOB_REQUEST_MAX_AGE = timedelta(minutes=2)
+# A leased seed of ``None`` is meaningful (a legacy bundle lease), so "this
+# validator holds no lease" needs a sentinel distinct from it.
+_MISSING_LEASE: Any = object()
 # Throttle + timeout for the post-commit on-chain weight-confirmation sweep that
 # arms a king's public source-release window. Bounds how often the score path
 # reads the revealed weight matrix while any king still awaits confirmation.
@@ -2578,13 +2582,31 @@ async def _top5_confirmation_seed_plan(
     wave_member_ids: tuple[UUID, ...],
     canonical_version: int,
 ) -> tuple[int, ...]:
-    """Return at most one seed: the current incomplete wave.
+    """Every seed this member still owes: its backlog first, then wave growth.
 
     Which seed is open is decided by the emission set alone, never by the wider
     retest cohort. An extended member that never gets leased (or fails) must not
     be able to hold the wave open, because the open wave is what gates the KOTH
     fold: keying completion to the top five keeps the crown moving at exactly
     the cadence it did before the cohort could be widened.
+
+    Two kinds of work come back, and the difference is load-bearing:
+
+    *Catch-up* -- seeds every OTHER emission member already holds and this one
+    does not. Settled evidence, no wave left to tear, so the whole backlog is
+    returned at once and the fleet can drain it in parallel (one lease per seed,
+    see :func:`_claimable_confirmation_seed`). This is what a member promoted
+    into the top five at depth zero owes, and returning it one seed at a time is
+    what made a membership change degrade the board for N rounds instead of one.
+
+    *Growth* -- at most the single next unfinished wave seed, exactly as before.
+    Paced one at a time because the wave is a synchronisation point: nobody may
+    run ahead of the seed the rest of the set is still working.
+
+    Catch-up is scoped to emission-set members on purpose. The extended retest
+    cohort is spare-capacity work whose depth gates nothing, so widening it to
+    a full backlog would multiply retest volume by the cohort size for no
+    convergence benefit; it keeps the one-seed-per-round pacing it has today.
     """
     full = champion_anchored_seeds(
         champion_agent_id,
@@ -2596,6 +2618,17 @@ async def _top5_confirmation_seed_plan(
         agent_ids=tuple(dict.fromkeys((*wave_member_ids, member_agent_id))),
         bench_version=canonical_version,
     )
+    seeds_by_agent = {agent_id: values.keys() for agent_id, values in history.items()}
+    catchup = (
+        confirmation_catchup_seeds(
+            member_id=member_agent_id,
+            peer_ids=wave_member_ids,
+            anchored_seeds=full,
+            seeds_by_agent=seeds_by_agent,
+        )
+        if member_agent_id in wave_member_ids
+        else ()
+    )
     # Deliberately the STRICT intersection, and not ``wave_membership``. This
     # decides which seed to ISSUE next, not which evidence may be folded. A
     # member at depth zero is exactly the member that still needs leasing, so
@@ -2605,14 +2638,133 @@ async def _top5_confirmation_seed_plan(
     # the two disagree about whether there is work left to do.
     completed = completed_confirmation_wave_seeds(
         member_ids=wave_member_ids,
-        seeds_by_agent={
-            agent_id: values.keys() for agent_id, values in history.items()
-        },
+        seeds_by_agent=seeds_by_agent,
     )
     next_seed = next((seed for seed in full if seed not in completed), None)
-    if next_seed is None or next_seed in history.get(member_agent_id, {}):
-        return ()
-    return (next_seed,)
+    if (
+        next_seed is None
+        or next_seed in history.get(member_agent_id, {})
+        or next_seed in catchup
+    ):
+        return catchup
+    return (*catchup, next_seed)
+
+
+async def _live_retest_leases(
+    session: AsyncSession,
+    *,
+    member_agent_ids: Sequence[UUID],
+    canonical_version: int,
+    now: datetime,
+) -> dict[UUID, dict[str, int | None]]:
+    """Per member, ``{validator_hotkey: leased seed}`` for open retest leases.
+
+    A ``None`` seed is a pre-protocol-13 bundle lease, which was authorised
+    against the whole champion-anchored family rather than one seed; callers
+    have to treat it as covering everything the member owes.
+    """
+    if not member_agent_ids:
+        return {}
+    rows = await session.execute(
+        select(
+            ValidatorTicket.agent_id,
+            ValidatorTicket.validator_hotkey,
+            ValidatorTicket.seed,
+        ).where(
+            ValidatorTicket.agent_id.in_(list(dict.fromkeys(member_agent_ids))),
+            ValidatorTicket.bench_version == canonical_version,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.purpose == TicketPurpose.CONTINUAL_RETEST,
+            ValidatorTicket.deadline > now,
+        )
+    )
+    leases: dict[UUID, dict[str, int | None]] = {}
+    for agent_id, validator_hotkey, seed in rows:
+        leases.setdefault(agent_id, {})[validator_hotkey] = seed
+    return leases
+
+
+def _claimable_confirmation_seed(
+    *,
+    seeds: Sequence[int],
+    leases: Mapping[str, int | None],
+    validator_hotkey: str,
+) -> int | None:
+    """Which pending seed this validator may run, or None when all are taken.
+
+    The plan is the member's whole outstanding gap; this hands out one seed of
+    it per validator so K validators converge K seeds in the time one used to
+    take one. The ticket key is ``(agent, version, validator)``, so distinct
+    validators leasing distinct seeds of the same member is already
+    representable -- what was missing was the platform ever offering them a
+    second seed.
+
+    A validator that already holds a lease on this member gets that same seed
+    back. Re-polls and restarts have to be idempotent, and the downstream
+    coverage guard recognises its own live ticket only by an exact
+    ``(member, version, seed)`` match.
+    """
+    own = leases.get(validator_hotkey, _MISSING_LEASE)
+    if own is not _MISSING_LEASE:
+        # A legacy bundle lease named no seed; answer with the head of the plan
+        # exactly as the single-seed planner did before it.
+        return own if own is not None else (seeds[0] if seeds else None)
+    if any(seed is None for seed in leases.values()):
+        return None
+    claimed = {seed for seed in leases.values() if seed is not None}
+    return next((seed for seed in seeds if seed not in claimed), None)
+
+
+async def _unserved_catchup_members(
+    session: AsyncSession,
+    *,
+    champion_agent_id: UUID,
+    emission_member_ids: Sequence[UUID],
+    canonical_version: int,
+    now: datetime,
+) -> frozenset[UUID]:
+    """Emission members owing backlog seeds that no live lease is covering.
+
+    "Unserved" rather than merely "behind": a member whose whole backlog is
+    already leased out is converging as fast as it can, and letting it keep
+    blocking extended-cohort work would idle capacity for nothing.
+    """
+    members = tuple(dict.fromkeys(emission_member_ids))
+    if len(members) < 2:
+        return frozenset()
+    full = champion_anchored_seeds(
+        champion_agent_id,
+        version=canonical_version,
+        max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+    )
+    history = await confirmation_composites_by_seed(
+        session, agent_ids=members, bench_version=canonical_version
+    )
+    seeds_by_agent = {agent_id: values.keys() for agent_id, values in history.items()}
+    leases = await _live_retest_leases(
+        session,
+        member_agent_ids=members,
+        canonical_version=canonical_version,
+        now=now,
+    )
+    unserved: list[UUID] = []
+    for member_id in members:
+        catchup = confirmation_catchup_seeds(
+            member_id=member_id,
+            peer_ids=members,
+            anchored_seeds=full,
+            seeds_by_agent=seeds_by_agent,
+        )
+        if not catchup:
+            continue
+        member_leases = leases.get(member_id, {})
+        if any(seed is None for seed in member_leases.values()):
+            # A legacy bundle lease covers the whole family; nothing is unserved.
+            continue
+        covered = {seed for seed in member_leases.values() if seed is not None}
+        if any(seed not in covered for seed in catchup):
+            unserved.append(member_id)
+    return frozenset(unserved)
 
 
 async def _top5_member_is_least_covered(
@@ -2620,13 +2772,14 @@ async def _top5_member_is_least_covered(
     *,
     members: tuple[KothEntry, ...],
     emission_member_ids: frozenset[UUID],
+    catchup_member_ids: frozenset[UUID],
     requested_member_id: UUID,
     wave_seed: int,
     validator_hotkey: str,
     canonical_version: int,
     now: datetime,
 ) -> bool:
-    """Admit one unclaimed member in the current one-seed cohort wave.
+    """Admit one unclaimed member in the current cohort wave.
 
     ``members`` is the whole retest cohort; ``emission_member_ids`` is the top
     five inside it. While any emission-set member still needs this seed, only
@@ -2634,6 +2787,20 @@ async def _top5_member_is_least_covered(
     spending a slot on rank 12 first would delay every crown decision behind it.
     Extended members take the seed once the five are claimed or already scored,
     which is precisely the spare capacity the wider cohort is meant to use.
+
+    ``catchup_member_ids`` extends that same priority one step: emission members
+    that still owe backlog seeds nothing else is waiting on. Without it a member
+    promoted at depth zero could hold one lease while every other validator
+    spent its slot topping up rank 12, and the board would stay on the degraded
+    estimator for longer than the backlog actually needs.
+
+    Being "behind" is a fact about stored evidence, not an event: a member is
+    privileged exactly while it owes seeds its peers already hold, and stops the
+    moment it does not. Confirmation rows are append-only, so a member that
+    oscillates in and out of the emission set keeps what it earned and cannot
+    re-acquire a backlog by re-entering -- there is no promotion timestamp to
+    game. The privilege only ever *declines* another retest claim; it can no
+    more reach the ordinary scoring queue than any other predicate here can.
     """
     member_ids = [member.agent_id for member in members]
     if requested_member_id not in member_ids:
@@ -2717,9 +2884,23 @@ async def _top5_member_is_least_covered(
         for member_id in eligible
         if member_id in emission_member_ids and member_id not in claimed
     ]
-    return (
-        not waiting_emission_members or requested_member_id in waiting_emission_members
+    # Members with an unserved backlog join the waiting set even when they are
+    # not waiting on THIS seed -- they may already hold a lease on another one.
+    # Ordering only, and only inside this lane: the result of a False here is a
+    # 409 on the retest endpoint, never a slot taken from ``request_job``.
+    waiting = list(
+        dict.fromkeys(
+            (
+                *waiting_emission_members,
+                *(
+                    member_id
+                    for member_id in member_ids
+                    if member_id in catchup_member_ids
+                ),
+            )
+        )
     )
+    return not waiting or requested_member_id in waiting
 
 
 async def _canonical_tail_is_draining(
@@ -2986,7 +3167,29 @@ async def request_top5_confirmation_job(
                 status_code=409,
                 detail="the requested member has no pending confirmation seeds",
             )
-        wave_seed = seeds[0]
+        # The plan is the member's whole outstanding gap; take one unleased seed
+        # of it so sibling validators converge the rest of the gap in parallel
+        # instead of queueing behind a single open wave seed.
+        member_leases = (
+            await _live_retest_leases(
+                session,
+                member_agent_ids=(payload.member_agent_id,),
+                canonical_version=canonical_version,
+                now=now,
+            )
+        ).get(payload.member_agent_id, {})
+        claimable = _claimable_confirmation_seed(
+            seeds=seeds,
+            leases=member_leases,
+            validator_hotkey=payload.validator_hotkey,
+        )
+        # Every pending seed already leased falls back to the head of the plan so
+        # the coverage guard below declines it with the answer it has always
+        # given ("another cohort member has less confirmation coverage"). That
+        # guard sees the same live leases, so it cannot admit the claim; routing
+        # through it keeps one 409 vocabulary on the wire rather than adding a
+        # second reason validators would have to learn.
+        wave_seed = claimable if claimable is not None else seeds[0]
         confirmation_datasets: list[ConfirmationDatasetPin] = []
         if canonical_version >= 3:
             if generator.run_size is None:
@@ -3007,6 +3210,15 @@ async def request_top5_confirmation_job(
             session,
             members=members,
             emission_member_ids=emission_member_ids,
+            catchup_member_ids=await _unserved_catchup_members(
+                session,
+                champion_agent_id=payload.champion_agent_id,
+                emission_member_ids=tuple(
+                    member.agent_id for member in emission_members
+                ),
+                canonical_version=canonical_version,
+                now=now,
+            ),
             requested_member_id=payload.member_agent_id,
             wave_seed=wave_seed,
             validator_hotkey=payload.validator_hotkey,

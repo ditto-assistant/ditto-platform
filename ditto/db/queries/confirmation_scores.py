@@ -94,6 +94,51 @@ def completed_confirmation_wave_seeds(
     return frozenset(common or ())
 
 
+def confirmation_catchup_seeds(
+    *,
+    member_id: UUID,
+    peer_ids: Iterable[UUID],
+    anchored_seeds: Sequence[int],
+    seeds_by_agent: Mapping[UUID, Iterable[int]],
+) -> tuple[int, ...]:
+    """The member's whole backlog: seeds its peers all hold and it does not.
+
+    This is the *coverage gap* of one member measured against the rest of its
+    wave, in champion-anchored order. It is deliberately not "every seed the
+    member is missing": a seed nobody has reached yet is ordinary wave growth,
+    paced one at a time by :func:`completed_confirmation_wave_seeds`, and a
+    member must never run ahead of the wave. A seed every *other* member already
+    holds is different in kind -- it is settled evidence that this member alone
+    lacks, so there is no wave left to tear and no ordering to preserve. Every
+    one of them can be leased at once.
+
+    That distinction is the whole point. A member promoted into the emission set
+    arrives at seed depth zero and, under one-seed-per-round pacing, needs one
+    round per anchored seed to converge -- during which the strict intersection
+    that gates the KOTH fold stays empty and every sibling's accumulated depth
+    stops counting (see :func:`fold_eligible_seeds_by_agent`). Returning the
+    backlog in full lets the fleet drain it in one round instead of N, so the
+    degraded window is brief rather than chronic.
+
+    Returns ``()`` when there are no peers: a lone member has nothing to catch
+    up to, and growth pacing owns the decision.
+    """
+    peers = tuple(
+        peer_id for peer_id in dict.fromkeys(peer_ids) if peer_id != member_id
+    )
+    if not peers:
+        return ()
+    reached = completed_confirmation_wave_seeds(
+        member_ids=peers, seeds_by_agent=seeds_by_agent
+    )
+    if not reached:
+        return ()
+    held = frozenset(seeds_by_agent.get(member_id, ()))
+    return tuple(
+        seed for seed in anchored_seeds if seed in reached and seed not in held
+    )
+
+
 def fold_eligible_seeds_by_agent(
     *,
     member_ids: Iterable[UUID],

@@ -8098,3 +8098,558 @@ class TestUnmatchableWorkClaimIsLoud:
             for record in caplog.records
             if record.levelno >= logging.WARNING
         ), "the contradictory heartbeat produced no warning"
+
+
+async def _seed_catchup_board(
+    app: FastAPI,
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    settled_depth: int = 4,
+    newcomer_composite: float = 0.87,
+    pool_composites: Sequence[float] = (0.90, 0.88, 0.86, 0.84, 0.82),
+    extra_keypairs: Sequence[bittensor.Keypair] = (),
+    benchmark_capacity: dict[str, object] | None = None,
+    bench_version: int = 3,
+) -> tuple[UUID, UUID, list[int]]:
+    """Reproduce today's incident: a promotion into a settled emission set.
+
+    Five members share ``settled_depth`` completed waves, then a freshly
+    finalized agent lands in the top five at seed depth zero and gates the
+    intersection for everyone. Returns ``(champion, newcomer, settled_seeds)``.
+
+    Runs on benchmark v3 because that is the first version where the platform
+    pins a dataset -- and therefore a ``seed`` -- onto the retest ticket. At v2
+    every retest lease is a seedless legacy bundle, so nothing here about which
+    seed a validator holds would be observable.
+    """
+    from ditto.api_server.crn import champion_anchored_seeds
+
+    keypairs = (*_KEYPAIRS, *extra_keypairs)
+    agent_ids = await _seed_top5_emission_set(
+        maker,
+        bench_version=bench_version,
+        composites=list(pool_composites),
+        seed_heartbeats=False,
+    )
+    now = datetime.now(UTC)
+    for keypair in keypairs:
+        await _seed_validator_heartbeat(
+            maker,
+            keypair=keypair,
+            protocol_version=13,
+            capabilities=_v3_capable_capabilities(now=now),
+            stack=_V7_STACK,
+            benchmark_capacity=benchmark_capacity,
+        )
+    champion = agent_ids[0]
+    settled_seeds = champion_anchored_seeds(
+        champion, version=bench_version, max_seeds=16
+    )[:settled_depth]
+    newcomer = await _seed_agent(
+        maker,
+        status=AgentStatus.SCORED,
+        name="promoted-newcomer",
+        miner_hotkey="5PromotedNewcomer",
+        sha256="ee" * 32,
+        created_at=now,
+    )
+    async with maker() as session, session.begin():
+        champion_row = await session.get(Agent, champion)
+        assert champion_row is not None
+        champion_row.dataset_seed_block = 1
+        if bench_version > 2:
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=2,
+                    desired_version=bench_version,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now - timedelta(hours=1),
+                    activated_at=now,
+                )
+            )
+        for index, keypair in enumerate(_KEYPAIRS):
+            session.add(
+                Score(
+                    agent_id=newcomer,
+                    bench_version=bench_version,
+                    validator_hotkey=keypair.ss58_address,
+                    run_id=f"newcomer-{index}",
+                    signature=None,
+                    seed=index,
+                    composite=newcomer_composite,
+                    tool_mean=newcomer_composite,
+                    memory_mean=newcomer_composite,
+                    median_ms=100,
+                    n=114,
+                    details={
+                        "bench_version": bench_version,
+                        "composite_stderr": 0.03,
+                    },
+                    generated_at=now,
+                )
+            )
+        # Each settled member's wave composite equals its own quorum median, so
+        # folding the waves in leaves the ranking exactly where it was. Any
+        # other value would re-rank the pool and change which agents the test
+        # is talking about.
+        await append_confirmation_scores(
+            session,
+            rows=[
+                ConfirmationSeedScore(
+                    agent_id,
+                    _VALIDATOR_HOTKEY,
+                    seed,
+                    composite,
+                    f"settled-{agent_id}-{seed}",
+                    None,
+                )
+                for agent_id, composite in zip(
+                    agent_ids[:5], pool_composites[:5], strict=True
+                )
+                for seed in settled_seeds
+            ],
+            bench_version=bench_version,
+            created_at=now,
+        )
+    _install_db(app, maker)
+    app.state.session_maker = maker
+    app.state.continual_retest_settings.invalidate()
+    _install_chain_with_block(app, block_number=1, extra_keypairs=tuple(extra_keypairs))
+    generator = MagicMock(run_size="full")
+    generator.generate = AsyncMock(
+        side_effect=lambda seed, *, bench_version: hashlib.sha256(
+            f"{bench_version}:{seed}".encode()
+        ).hexdigest()
+    )
+    app.dependency_overrides[get_dataset_generator] = lambda: generator
+    return champion, newcomer, settled_seeds
+
+
+async def _leased_retest_seeds(
+    maker: async_sessionmaker[AsyncSession], agent_id: UUID
+) -> dict[str, int | None]:
+    """``{validator_hotkey: leased seed}`` for one agent's open retest leases."""
+    async with maker() as session:
+        rows = await session.execute(
+            select(ValidatorTicket.validator_hotkey, ValidatorTicket.seed).where(
+                ValidatorTicket.agent_id == agent_id,
+                ValidatorTicket.bench_version == 3,
+                ValidatorTicket.purpose == TicketPurpose.CONTINUAL_RETEST,
+                ValidatorTicket.status == TicketStatus.ISSUED,
+            )
+        )
+        return dict(rows.all())  # type: ignore[arg-type]
+
+
+class TestTop5CatchUpConvergence:
+    """A member promoted at depth zero converges in one round, not N.
+
+    ``ConfirmationScore`` is append-only and a completed wave is recomputed at
+    read time by intersecting the CURRENT emission set's seed sets. A promotion
+    therefore arrives at depth zero and gates that intersection for everyone.
+    ditto-platform#489 stopped it from discarding accumulated evidence on the
+    read side; these tests cover the write side -- making the newcomer's whole
+    coverage gap claimable at once so the degraded window is brief.
+    """
+
+    async def test_promotion_makes_the_whole_backlog_claimable_at_once(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from ditto.api_server.endpoints.validator import (
+            _current_emission_set,
+            _top5_confirmation_seed_plan,
+        )
+
+        champion, newcomer, settled = await _seed_catchup_board(app, session_maker)
+
+        async with session_maker() as session:
+            members = await _current_emission_set(session, canonical_version=3)
+        member_ids = [member.agent_id for member in members]
+        assert members[0].agent_id == champion
+        assert newcomer in member_ids, "the newcomer must have been promoted"
+        # The incident state: four settled members still carry their waves
+        # (ditto-platform#489), the newcomer carries none and gates the strict
+        # intersection.
+        by_id = {member.agent_id: member for member in members}
+        assert by_id[newcomer].completed_wave_composites is None
+        assert all(
+            len(by_id[agent_id].completed_wave_composites or ()) == len(settled)
+            for agent_id in member_ids
+            if agent_id != newcomer
+        )
+
+        async with session_maker() as session:
+            plan = await _top5_confirmation_seed_plan(
+                session,
+                champion_agent_id=champion,
+                member_agent_id=newcomer,
+                wave_member_ids=tuple(member_ids),
+                canonical_version=3,
+            )
+
+        # Every missing pair at once -- not the single open wave seed that took
+        # one round per seed to work through.
+        assert plan == tuple(settled)
+
+        # ...and three validators claim three DIFFERENT seeds in one round.
+        for keypair in _KEYPAIRS:
+            response = await client.post(
+                "/api/v1/validator/top5-confirmation-job",
+                headers=_top5_auth_header(keypair),
+                json=_top5_job_payload(champion, newcomer, keypair=keypair),
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["agent_id"] == str(newcomer)
+
+        leased = await _leased_retest_seeds(session_maker, newcomer)
+        assert sorted(leased) == sorted(keypair.ss58_address for keypair in _KEYPAIRS)
+        assert sorted(seed for seed in leased.values() if seed is not None) == sorted(
+            settled[:3]
+        ), "each validator must hold a distinct backlog seed"
+
+    async def test_draining_the_backlog_restores_the_shared_seed_set(
+        self,
+        app: FastAPI,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """One round of parallel catch-up puts every member back on one wave."""
+        from ditto.api_server.endpoints.validator import _current_emission_set
+
+        champion, newcomer, settled = await _seed_catchup_board(app, session_maker)
+        async with session_maker() as session:
+            before = {
+                member.agent_id: member.completed_wave_composites
+                for member in await _current_emission_set(session, canonical_version=3)
+            }
+
+        async with session_maker() as session, session.begin():
+            await append_confirmation_scores(
+                session,
+                rows=[
+                    ConfirmationSeedScore(
+                        newcomer,
+                        _VALIDATOR_HOTKEY,
+                        seed,
+                        0.87,
+                        f"catchup-{seed}",
+                        None,
+                    )
+                    for seed in settled
+                ],
+                bench_version=3,
+                created_at=datetime.now(UTC),
+            )
+
+        async with session_maker() as session:
+            after = {
+                member.agent_id: member.completed_wave_composites
+                for member in await _current_emission_set(session, canonical_version=3)
+            }
+
+        assert before[newcomer] is None
+        assert after[newcomer] == (0.87,) * len(settled)
+        # The survivors never moved. Faster convergence must add the newcomer's
+        # evidence, not perturb anybody else's published score.
+        assert {
+            agent_id: value for agent_id, value in after.items() if agent_id != newcomer
+        } == {
+            agent_id: value
+            for agent_id, value in before.items()
+            if agent_id != newcomer
+        }
+
+    async def test_reconciliation_covers_exactly_the_gap_and_repeats_cleanly(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Exactly the missing pairs, nothing else, stable under repetition."""
+        from ditto.api_server.endpoints.validator import (
+            _claimable_confirmation_seed,
+            _current_emission_set,
+            _top5_confirmation_seed_plan,
+        )
+
+        champion, newcomer, settled = await _seed_catchup_board(app, session_maker)
+        async with session_maker() as session:
+            member_ids = tuple(
+                member.agent_id
+                for member in await _current_emission_set(session, canonical_version=3)
+            )
+
+        # Half the gap already covered: the plan must name the other half only.
+        covered, missing = settled[:2], settled[2:]
+        async with session_maker() as session, session.begin():
+            await append_confirmation_scores(
+                session,
+                rows=[
+                    ConfirmationSeedScore(
+                        newcomer, _VALIDATOR_HOTKEY, seed, 0.87, f"partial-{seed}", None
+                    )
+                    for seed in covered
+                ],
+                bench_version=3,
+                created_at=datetime.now(UTC),
+            )
+
+        async def _plan(member: UUID) -> tuple[int, ...]:
+            async with session_maker() as session:
+                return await _top5_confirmation_seed_plan(
+                    session,
+                    champion_agent_id=champion,
+                    member_agent_id=member,
+                    wave_member_ids=member_ids,
+                    canonical_version=3,
+                )
+
+        assert await _plan(newcomer) == tuple(missing)
+        # Idempotent: reading the plan is not what makes work happen, so a
+        # repeat invocation must return the identical set.
+        assert await _plan(newcomer) == tuple(missing)
+
+        # A member that already holds every settled seed has no backlog, and no
+        # growth seed either while the newcomer is holding the wave open.
+        settled_member = next(
+            agent_id for agent_id in member_ids if agent_id != newcomer
+        )
+        assert await _plan(settled_member) == ()
+
+        # A lease is not evidence: claiming one seed leaves the plan alone but
+        # takes that seed out of circulation for other validators.
+        first = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[0]),
+            json=_top5_job_payload(champion, newcomer, keypair=_KEYPAIRS[0]),
+        )
+        assert first.status_code == 200, first.text
+        assert await _plan(newcomer) == tuple(missing)
+        assert await _leased_retest_seeds(session_maker, newcomer) == {
+            _KEYPAIRS[0].ss58_address: missing[0]
+        }
+
+        # A second validator takes the NEXT seed rather than queueing behind the
+        # first, and the holder re-polling resumes its own seed instead of
+        # opening a second one. (End to end the re-poll is refused one layer
+        # further down -- a single-slot validator has no idle slot left while it
+        # holds this very lease -- so the idempotency is asserted where it
+        # lives.)
+        leases = await _leased_retest_seeds(session_maker, newcomer)
+        assert (
+            _claimable_confirmation_seed(
+                seeds=missing,
+                leases=leases,
+                validator_hotkey=_KEYPAIRS[1].ss58_address,
+            )
+            == missing[1]
+        )
+        assert (
+            _claimable_confirmation_seed(
+                seeds=missing,
+                leases=leases,
+                validator_hotkey=_KEYPAIRS[0].ss58_address,
+            )
+            == missing[0]
+        )
+
+    async def test_catchup_preempts_extended_cohort_top_up(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A behind emission member outranks spare-capacity work below it.
+
+        Preemption is a fact about stored evidence, not a promotion timestamp:
+        the privilege exists exactly while a backlog does. A member that leaves
+        and re-enters the top five keeps its append-only rows and so cannot
+        re-acquire a backlog by oscillating.
+        """
+        from ditto.api_server.endpoints.validator import (
+            _current_emission_set,
+            _unserved_catchup_members,
+        )
+
+        champion, newcomer, settled = await _seed_catchup_board(
+            app,
+            session_maker,
+            pool_composites=(0.90, 0.88, 0.86, 0.84, 0.82, 0.70),
+        )
+        await _set_retest_cohort_size(session_maker, 10, idle_retests_enabled=True)
+        app.state.continual_retest_settings.invalidate()
+        async with session_maker() as session:
+            member_ids = {
+                member.agent_id
+                for member in await _current_emission_set(session, canonical_version=3)
+            }
+            extended = await session.scalars(
+                select(Agent.agent_id).where(Agent.name == "top5-5")
+            )
+        extended_member = extended.one()
+        assert extended_member not in member_ids
+
+        # The newcomer takes one backlog seed. Before this change that emptied
+        # the waiting set -- it was the only member wanting the open wave seed --
+        # and the next validator spent its slot on rank six while fifteen
+        # backlog seeds sat unclaimed.
+        held = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[0]),
+            json=_top5_job_payload(champion, newcomer, keypair=_KEYPAIRS[0]),
+        )
+        assert held.status_code == 200, held.text
+
+        # Rank six has no confirmation rows at all, so it genuinely wants work.
+        # It is refused while the newcomer's backlog is still unserved.
+        preempted = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[1]),
+            json=_top5_job_payload(champion, extended_member, keypair=_KEYPAIRS[1]),
+        )
+        assert preempted.status_code == 409
+        assert "less confirmation coverage" in preempted.json()["message"]
+
+        async def _behind() -> frozenset[UUID]:
+            async with session_maker() as session:
+                return await _unserved_catchup_members(
+                    session,
+                    champion_agent_id=champion,
+                    emission_member_ids=tuple(member_ids),
+                    canonical_version=3,
+                    now=datetime.now(UTC),
+                )
+
+        assert await _behind() == frozenset({newcomer})
+
+        # The privilege is bounded by the backlog, and expires with it. Once the
+        # newcomer holds every settled seed it stops preempting anything, and
+        # ordinary emission-first ordering is all that is left. There is no
+        # promotion timestamp here to re-arm, so a member churning in and out of
+        # the top five cannot keep jumping the queue.
+        async with session_maker() as session, session.begin():
+            await append_confirmation_scores(
+                session,
+                rows=[
+                    ConfirmationSeedScore(
+                        newcomer, _VALIDATOR_HOTKEY, seed, 0.87, f"caught-{seed}", None
+                    )
+                    for seed in settled
+                ],
+                bench_version=3,
+                created_at=datetime.now(UTC),
+            )
+
+        assert await _behind() == frozenset()
+
+    async def test_catchup_never_takes_a_slot_from_ordinary_scoring(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Preemption reorders the retest lane and nothing else.
+
+        Retests are the idle-time consumer: a validator asks ``/job`` for
+        ordinary work first and claims a retest only when that returns nothing.
+        The strongest thing catch-up preemption can do to any claim is turn one
+        409 on the *retest* endpoint into a different one -- it has no reach
+        into ``request_job`` at all -- so a validator it refuses still gets a
+        first-quorum submission the instant it asks for one.
+        """
+        one_slot: dict[str, object] = {
+            "configured_slots": 1,
+            "healthy_slots": ["slot-0"],
+            "admission": "accepting",
+            "active": [],
+        }
+        champion, newcomer, settled = await _seed_catchup_board(
+            app,
+            session_maker,
+            bench_version=2,
+            pool_composites=(0.90, 0.88, 0.86, 0.84, 0.82, 0.70),
+            benchmark_capacity=one_slot,
+        )
+        await _set_retest_cohort_size(session_maker, 10, idle_retests_enabled=True)
+        app.state.continual_retest_settings.invalidate()
+        async with session_maker() as session:
+            extended_member = (
+                await session.scalars(
+                    select(Agent.agent_id).where(Agent.name == "top5-5")
+                )
+            ).one()
+        # A brand-new submission with no scores at all: exactly the work that
+        # must never queue behind catch-up.
+        fresh = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="fresh-submission",
+            miner_hotkey="5FreshSubmission",
+            sha256="cd" * 32,
+        )
+        # One validator is already running the newcomer's first backlog seed,
+        # which is precisely the state that used to empty the waiting set and
+        # let the next validator spend its slot on rank six.
+        await _seed_ticket(
+            session_maker,
+            newcomer,
+            keypair=_KEYPAIRS[0],
+            deadline=datetime.now(UTC) + timedelta(hours=1),
+            purpose=TicketPurpose.CONTINUAL_RETEST,
+            seed=settled[0],
+        )
+
+        # Catch-up preempts the extended cohort's top-up claim...
+        preempted = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[1]),
+            json=_top5_job_payload(champion, extended_member, keypair=_KEYPAIRS[1]),
+        )
+        assert preempted.status_code == 409
+        assert "less confirmation coverage" in preempted.json()["message"]
+
+        # ...and costs it nothing: the same validator's slot is still free, and
+        # ordinary scoring hands it the new submission. This is the starvation
+        # property -- catch-up reorders the retest lane, never the queue.
+        after_preemption = await client.post(
+            "/api/v1/validator/job",
+            headers=_top5_auth_header(_KEYPAIRS[1]),
+            json=_job_payload(_KEYPAIRS[1], slot_id="slot-0"),
+        )
+        assert after_preemption.status_code == 200, after_preemption.text
+        assert after_preemption.json()["agent_id"] == str(fresh)
+
+        # And the reverse rail still holds: a validator whose only slot is on a
+        # canonical lease cannot be handed catch-up work, however badly the
+        # newcomer needs it. Catch-up never evicts or double-books queue work.
+        denied = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[1]),
+            json=_top5_job_payload(champion, newcomer, keypair=_KEYPAIRS[1]),
+        )
+        assert denied.status_code == 409
+        assert "no idle slot" in denied.json()["message"]
+
+        # A third validator, untouched by any of it, still scores the queue.
+        third = await client.post(
+            "/api/v1/validator/job",
+            headers=_top5_auth_header(_KEYPAIRS[2]),
+            json=_job_payload(_KEYPAIRS[2], slot_id="slot-0"),
+        )
+        assert third.status_code == 200, third.text
+        assert third.json()["agent_id"] == str(fresh)
+        async with session_maker() as session:
+            issued = await session.scalar(
+                select(func.count())
+                .select_from(ValidatorTicket)
+                .where(
+                    ValidatorTicket.agent_id == fresh,
+                    ValidatorTicket.status == TicketStatus.ISSUED,
+                    ValidatorTicket.purpose == TicketPurpose.CANONICAL_QUORUM,
+                )
+            )
+        assert issued == 2, "ordinary quorum scoring must be untouched"

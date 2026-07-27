@@ -15,6 +15,7 @@ from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
     completed_confirmation_wave_seeds,
+    confirmation_catchup_seeds,
     confirmation_composites_by_seed,
     confirmation_depths,
     confirmation_history_by_agent,
@@ -292,3 +293,82 @@ class TestConfirmationAggregates:
             await confirmation_depths(session, agent_ids=[uuid4()], bench_version=2)
             == {}
         )
+
+
+class TestConfirmationCatchupSeeds:
+    """The coverage gap of one member measured against the rest of its wave."""
+
+    _ANCHORED = [11, 22, 33, 44]
+
+    def test_depth_zero_member_owes_everything_its_peers_settled(self) -> None:
+        newcomer, *peers = (uuid4() for _ in range(4))
+        seeds_by_agent = {peer: [11, 22, 33] for peer in peers}
+
+        assert confirmation_catchup_seeds(
+            member_id=newcomer,
+            peer_ids=[newcomer, *peers],
+            anchored_seeds=self._ANCHORED,
+            seeds_by_agent=seeds_by_agent,
+        ) == (11, 22, 33)
+
+    def test_excludes_seeds_no_peer_has_reached(self) -> None:
+        """Backlog is settled evidence; unreached seeds are wave growth.
+
+        Seed 44 is missing for everyone, so leasing it here would let one member
+        run ahead of the wave. Growth pacing owns that seed, one round at a time.
+        """
+        newcomer, peer_a, peer_b = (uuid4() for _ in range(3))
+
+        assert confirmation_catchup_seeds(
+            member_id=newcomer,
+            peer_ids=[peer_a, peer_b],
+            anchored_seeds=self._ANCHORED,
+            seeds_by_agent={peer_a: [11, 22], peer_b: [11, 22, 33]},
+        ) == (11, 22)
+
+    def test_omits_seeds_the_member_already_holds(self) -> None:
+        member, peer = uuid4(), uuid4()
+
+        assert confirmation_catchup_seeds(
+            member_id=member,
+            peer_ids=[peer],
+            anchored_seeds=self._ANCHORED,
+            seeds_by_agent={member: [11, 33], peer: [11, 22, 33]},
+        ) == (22,)
+
+    def test_caught_up_member_owes_nothing(self) -> None:
+        member, peer = uuid4(), uuid4()
+
+        assert (
+            confirmation_catchup_seeds(
+                member_id=member,
+                peer_ids=[member, peer],
+                anchored_seeds=self._ANCHORED,
+                seeds_by_agent={member: [11, 22], peer: [11, 22]},
+            )
+            == ()
+        )
+
+    def test_a_lone_member_has_nothing_to_catch_up_to(self) -> None:
+        member = uuid4()
+
+        assert (
+            confirmation_catchup_seeds(
+                member_id=member,
+                peer_ids=[member],
+                anchored_seeds=self._ANCHORED,
+                seeds_by_agent={},
+            )
+            == ()
+        )
+
+    def test_result_follows_champion_anchored_order(self) -> None:
+        """Issuance order is the seed family's order, not set-iteration order."""
+        member, peer = uuid4(), uuid4()
+
+        assert confirmation_catchup_seeds(
+            member_id=member,
+            peer_ids=[peer],
+            anchored_seeds=[44, 33, 22, 11],
+            seeds_by_agent={peer: [11, 22, 33, 44]},
+        ) == (44, 33, 22, 11)
