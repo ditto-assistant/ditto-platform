@@ -19,6 +19,7 @@ from ditto.db.models import (
     ValidatorTicket,
 )
 from ditto.db.queries.audit import benchmark_contract_refresh_event
+from ditto.db.queries.queue_removal import removal_in_force
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -144,6 +145,9 @@ def validator_queue_admission_predicate(
         .where(
             ValidatorQueueWithdrawal.agent_id == agent.agent_id,
             ValidatorQueueWithdrawal.bench_version == bench_version,
+            # A reinstated removal is not a removal. This is the predicate that
+            # actually returns an evicted submission to validator assignment.
+            removal_in_force(),
         )
         .correlate(agent)
         .exists()

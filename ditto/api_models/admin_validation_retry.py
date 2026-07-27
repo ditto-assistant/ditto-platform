@@ -77,6 +77,50 @@ class AdminValidationQueueWithdrawal(BaseModel):
     evicted_validator_hotkeys: list[str] | None = None
     """``None`` for an ordinary withdrawal; the revoked leases for an eviction."""
     created_at: datetime
+    reinstated_at: datetime | None = None
+    """When this removal was reversed, or ``None`` while it is still in force.
+
+    Present so a non-null ``withdrawal`` never has to mean "removed" on its own.
+    A reversed eviction stays visible here on purpose: it happened, it revoked
+    named leases, and those revocations are still in the lease-audit feed.
+    """
+
+
+class AdminReinstatementRetryBudget(BaseModel):
+    """What the submission's attempt budget was when it came back.
+
+    Reinstatement adds nothing to any of these. They are recorded so a reviewer
+    can confirm that afterwards: an evict/reinstate cycle that had quietly
+    forgiven attempts would show up here as a count that fell between the
+    eviction and the reversal.
+    """
+
+    attempts_used: int
+    """Highest ``attempt_count`` across the era's tickets, unchanged by this."""
+    agent_infra_retry_grants: int
+    """No-fault grants every validator has minted for this agent this era."""
+    max_agent_infra_retry_grants: int
+    """The bound those grants are counted against (ditto-platform#522)."""
+    manual_retry_grants: int
+    """Operator-granted attempts already spent on the era's tickets."""
+    operator_recoveries: int
+    """Recovery grants already issued for this agent and era."""
+    max_operator_recoveries: int
+    """The bound those recoveries are counted against."""
+
+
+class AdminValidationQueueReinstatement(BaseModel):
+    reinstatement_id: UUID
+    withdrawal_id: UUID
+    """The eviction row this reversed. That row is resolved, never deleted."""
+    agent_id: UUID
+    bench_version: int
+    actor: str
+    reason: str
+    expected_snapshot: str
+    score_count: int
+    retry_budget_snapshot: AdminReinstatementRetryBudget
+    created_at: datetime
 
 
 class AdminValidationRetryDetail(BaseModel):
@@ -95,9 +139,18 @@ class AdminValidationRetryDetail(BaseModel):
     withdrawal_blocking_reason: str | None
     eviction_allowed: bool
     eviction_blocking_reason: str | None
+    reinstatement_allowed: bool
+    reinstatement_blocking_reason: str | None
     live_ticket_count: int
     """Leases an eviction would revoke right now — the slots it would free."""
     withdrawal: AdminValidationQueueWithdrawal | None
+    """The era's most recent queue removal, reversed or not.
+
+    Read it with :attr:`AdminValidationQueueWithdrawal.reinstated_at`: a non-null
+    value here means "a removal was recorded", not "the submission is removed".
+    """
+    reinstatement: AdminValidationQueueReinstatement | None
+    """The reversal of :attr:`withdrawal`, if it has been reversed."""
     tickets: list[AdminValidationTicket]
     recoveries: list[AdminValidationRecovery]
 
@@ -231,12 +284,48 @@ class AdminValidationQueueEviction(BaseModel):
     score_count: int
     evicted_validator_hotkeys: list[str]
     created_at: datetime
+    reinstated_at: datetime | None = None
+    """Set once this eviction has been reversed; the row itself is preserved."""
 
 
 class AdminValidationQueueEvictionResponse(BaseModel):
     eviction: AdminValidationQueueEviction
     evicted_leases: list[AdminEvictedLease]
     freed_slots: int
+    idempotent: bool
+
+
+class AdminValidationQueueReinstatementRequest(BaseModel):
+    """Return an evicted submission to the validator queue in its own era.
+
+    Carries the same three interlocks as the two removal routes — an exact
+    ``expected_snapshot``, a written ``reason`` of the same 8–500 characters, and
+    a literal confirmation phrase — because reversing an emissions-relevant
+    action against a paying miner deserves the same deliberation as taking it.
+
+    ``confirmation`` is its own phrase, distinct from both
+    ``REMOVE FROM VALIDATOR QUEUE`` and ``EVICT LIVE VALIDATOR LEASES``. Two of
+    these three actions are irreversible-in-effect from the miner's point of
+    view, and an operator who mistypes which one they are performing should get a
+    422 rather than the opposite of what they intended.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: UUID
+    expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    reason: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+    ]
+    confirmation: Literal["REINSTATE TO VALIDATOR QUEUE"]
+
+
+class AdminValidationQueueReinstatementResponse(BaseModel):
+    reinstatement: AdminValidationQueueReinstatement
+    eviction: AdminValidationQueueEviction
+    """The eviction that was reversed, preserved and now carrying a resolution."""
+    restored_bench_version: int
     idempotent: bool
 
 

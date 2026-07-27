@@ -216,6 +216,48 @@ base budget of two with zero scores that way. The eviction route passes
 k=3 gate in `submit_score` exactly like any superseded lease. Nothing reaches the
 ledger.
 
+### Reversing an eviction
+
+`POST .../reinstate` (confirmation `REINSTATE TO VALIDATOR QUEUE`) puts an
+evicted submission back in the queue in the era it was evicted from. Eviction
+shipped one-way, and that is the only reason it went unused: an evicted miner has
+already paid an evaluation fee for an era an operator ended, so without a way
+back a capacity decision doubles as a fine, and taking it means being sure the
+miner earned one. The `mnemo*` family that prompted the route was expensive, not
+shown to be malicious — a source review found self-imposed per-case deadlines, no
+hang primitives, and a version history of pure latency work.
+
+The reversal resolves the removal row (`reinstated_at`) rather than deleting it,
+and writes its own append-only `ValidatorQueueReinstatement` row with its own
+actor, reason and idempotency key. The eviction stays readable, and so do the
+`validator_lease_audit` rows it wrote, which `GET /admin/lease-revocations
+?action=operator_evicted` still returns. Every queue predicate reads a removal as
+in force only while `reinstated_at` is null; the unique constraint over
+(agent, era) is partial on the same condition, so a reinstated submission that
+starves the fleet again can be evicted a second time.
+
+**It restores eligibility and nothing else.** It does not resurrect the revoked
+leases, reset `attempt_count`, mint a no-fault grant, or forgive a spent operator
+recovery. That is the security property, not an omission: eviction refuses to
+compensate precisely so it cannot raise the cap on the artifact it just evicted,
+and a reinstatement that handed the cap back would turn the pair into an attempt
+printer — evict, reinstate, collect — farming leases past
+`MAX_AGENT_INFRA_RETRY_GRANTS` (12 per agent per era) and resetting
+`MAX_OPERATOR_RECOVERIES_PER_AGENT`. Both counters are keyed on (agent, bench
+version) and this route writes neither, so the cycle is budget-neutral however
+many times it runs; the counts as they stood are recorded on the reinstatement
+row. Handing back attempts is still `POST .../retry`, bounded and audited per
+grant.
+
+It refuses, by name, the cases where re-admission would change nothing: the
+removal was a withdrawal rather than an eviction (withdrawal is only reachable
+once quorum is already unreachable), the removal was already reversed, the
+submission is no longer evaluating or has reached quorum or has fallen behind the
+screening policy, or **the era moved on** — no validator is ever issued a ticket
+for a closed benchmark version, so reinstating into one would report success and
+do nothing. `reinstatement_allowed` / `reinstatement_blocking_reason` on the
+detail route say which, before the operator acts.
+
 ### Spotting one before it costs a day
 
 A hanging submission's signature is `silently_expired` — an `expired` ticket with

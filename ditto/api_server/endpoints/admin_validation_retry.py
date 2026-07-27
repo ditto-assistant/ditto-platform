@@ -24,6 +24,7 @@ from ditto.api_models.admin_validation_retry import (
     AdminBatchRetryResponse,
     AdminBatchRetryResult,
     AdminEvictedLease,
+    AdminReinstatementRetryBudget,
     AdminScoreOutlier,
     AdminScoreOutlierList,
     AdminScoreOutlierScore,
@@ -32,6 +33,9 @@ from ditto.api_models.admin_validation_retry import (
     AdminValidationQueueEviction,
     AdminValidationQueueEvictionRequest,
     AdminValidationQueueEvictionResponse,
+    AdminValidationQueueReinstatement,
+    AdminValidationQueueReinstatementRequest,
+    AdminValidationQueueReinstatementResponse,
     AdminValidationQueueWithdrawal,
     AdminValidationQueueWithdrawalRequest,
     AdminValidationQueueWithdrawalResponse,
@@ -59,6 +63,7 @@ from ditto.db.models import (
     Score,
     ScoreAuditEntry,
     ValidatorHeartbeat,
+    ValidatorQueueReinstatement,
     ValidatorQueueWithdrawal,
     ValidatorRetryRecovery,
     ValidatorTicket,
@@ -80,11 +85,22 @@ from ditto.db.queries.lease_liveness import (
     force_expire_lease,
     operator_eviction_liveness,
 )
+from ditto.db.queries.queue_removal import (
+    is_in_force,
+    load_queue_removal,
+    load_reinstatement,
+)
+from ditto.db.queries.retry_budget import (
+    MAX_AGENT_INFRA_RETRY_GRANTS,
+    agent_infra_retry_grants,
+)
 from ditto.db.queries.retry_state import (
+    MAX_OPERATOR_RECOVERIES_PER_AGENT,
     classify_agent_retry_states,
     eviction_gate,
     is_exhausted,
     recovery_gate,
+    reinstatement_gate,
     resolve_bench_version,
     withdrawal_gate,
 )
@@ -255,6 +271,26 @@ def _withdrawal_item(
         score_count=row.score_count,
         evicted_validator_hotkeys=row.evicted_validator_hotkeys,
         created_at=row.created_at,
+        reinstated_at=row.reinstated_at,
+    )
+
+
+def _reinstatement_item(
+    row: ValidatorQueueReinstatement,
+) -> AdminValidationQueueReinstatement:
+    return AdminValidationQueueReinstatement(
+        reinstatement_id=row.reinstatement_id,
+        withdrawal_id=row.withdrawal_id,
+        agent_id=row.agent_id,
+        bench_version=row.bench_version,
+        actor=row.actor,
+        reason=row.reason,
+        expected_snapshot=row.expected_snapshot,
+        score_count=row.score_count,
+        retry_budget_snapshot=AdminReinstatementRetryBudget.model_validate(
+            row.retry_budget_snapshot
+        ),
+        created_at=row.created_at,
     )
 
 
@@ -269,6 +305,7 @@ def _eviction_item(row: ValidatorQueueWithdrawal) -> AdminValidationQueueEvictio
         score_count=row.score_count,
         evicted_validator_hotkeys=list(row.evicted_validator_hotkeys or []),
         created_at=row.created_at,
+        reinstated_at=row.reinstated_at,
     )
 
 
@@ -379,13 +416,19 @@ async def _load_withdrawal(
     bench_version: int,
     for_update: bool,
 ) -> ValidatorQueueWithdrawal | None:
-    statement = select(ValidatorQueueWithdrawal).where(
-        ValidatorQueueWithdrawal.agent_id == agent_id,
-        ValidatorQueueWithdrawal.bench_version == bench_version,
+    """The removal currently keeping this submission out of the era's queue.
+
+    In-force only: a reinstated eviction is not a removal any more, so every gate
+    that reads this treats a reinstated submission exactly like one that was
+    never evicted.
+    """
+    return await load_queue_removal(
+        session,
+        agent_id=agent_id,
+        bench_version=bench_version,
+        for_update=for_update,
+        in_force_only=True,
     )
-    if for_update:
-        statement = statement.with_for_update()
-    return await session.scalar(statement)
 
 
 @router.get("/validation-retries", response_model=AdminStuckSubmissionsResponse)
@@ -487,11 +530,28 @@ async def get_validation_retry(
         now=datetime.now(UTC),
         bench_version=bench_version,
     )
-    withdrawal = await _load_withdrawal(
+    # The most recent removal, reversed or not: the operator surface has to be
+    # able to show an eviction that was undone, while every gate below asks the
+    # narrower question of whether a removal is still in force.
+    latest_removal = await load_queue_removal(
         session,
         agent_id=agent.agent_id,
         bench_version=bench_version,
         for_update=False,
+        in_force_only=False,
+    )
+    withdrawal = latest_removal if is_in_force(latest_removal) else None
+    reinstatement = (
+        await load_reinstatement(session, withdrawal_id=latest_removal.withdrawal_id)
+        if latest_removal is not None
+        else None
+    )
+    reinstatement_allowed, reinstatement_reason = reinstatement_gate(
+        agent=agent,
+        scores=scores,
+        removal=latest_removal,
+        bench_version=bench_version,
+        active_version=await active_bench_version(session),
     )
     withdrawal_allowed, withdrawal_reason = withdrawal_gate(
         agent=agent,
@@ -532,10 +592,17 @@ async def get_validation_retry(
         withdrawal_blocking_reason=withdrawal_blocking_reason,
         eviction_allowed=eviction_allowed,
         eviction_blocking_reason=eviction_blocking_reason,
+        reinstatement_allowed=reinstatement_allowed,
+        reinstatement_blocking_reason=reinstatement_reason,
         live_ticket_count=sum(
             1 for ticket in tickets if ticket.status == TicketStatus.ISSUED
         ),
-        withdrawal=(_withdrawal_item(withdrawal) if withdrawal is not None else None),
+        withdrawal=(
+            _withdrawal_item(latest_removal) if latest_removal is not None else None
+        ),
+        reinstatement=(
+            _reinstatement_item(reinstatement) if reinstatement is not None else None
+        ),
         tickets=[_ticket_item(ticket) for ticket in tickets],
         recoveries=[_recovery_item(row) for row in recoveries],
     )
@@ -865,6 +932,173 @@ async def evict_submission_from_validator_queue(
             eviction=_eviction_item(eviction),
             evicted_leases=evicted,
             freed_slots=len(evicted),
+            idempotent=False,
+        )
+
+
+async def _retry_budget_snapshot(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    bench_version: int,
+    tickets: list[ValidatorTicket],
+    recovery_count: int,
+) -> AdminReinstatementRetryBudget:
+    """Read the attempt budget a reinstatement is about to leave untouched.
+
+    Recorded on the reinstatement row so "nothing was granted" is checkable after
+    the fact rather than merely asserted in a docstring.
+    """
+    return AdminReinstatementRetryBudget(
+        attempts_used=max((ticket.attempt_count for ticket in tickets), default=0),
+        agent_infra_retry_grants=await agent_infra_retry_grants(
+            session, agent_id=agent_id, bench_version=bench_version
+        ),
+        max_agent_infra_retry_grants=MAX_AGENT_INFRA_RETRY_GRANTS,
+        manual_retry_grants=sum(ticket.manual_retry_grants for ticket in tickets),
+        operator_recoveries=recovery_count,
+        max_operator_recoveries=MAX_OPERATOR_RECOVERIES_PER_AGENT,
+    )
+
+
+@router.post(
+    "/validation-retries/{agent_id}/reinstate",
+    response_model=AdminValidationQueueReinstatementResponse,
+)
+async def reinstate_evicted_submission_to_validator_queue(
+    agent_id: UUID,
+    payload: AdminValidationQueueReinstatementRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminValidationQueueReinstatementResponse:
+    """Undo an operator eviction: back in the queue, with nothing added.
+
+    Eviction (#515) shipped one-way, and that is the only reason it went unused
+    against the submissions it was built for. An evicted miner has paid an
+    evaluation fee for a benchmark era that an operator ended, and without this
+    route their only way back is a fresh submission and a second fee — so a
+    capacity decision doubles as a fine, and taking it requires being sure the
+    miner deserved one. The ``mnemo*`` family that prompted #515 was expensive,
+    not shown to be malicious: a source review found self-imposed per-case
+    deadlines, no hang primitives, and a version history of pure latency work.
+
+    What this restores is exactly the queue effect and nothing else. The removal
+    row is resolved (``reinstated_at``), so
+    :func:`~ditto.db.queries.benchmark_admission.validator_queue_admission_predicate`
+    admits the agent again and its expired tickets are re-leasable on their
+    ordinary terms. What it deliberately does **not** do:
+
+    * resurrect the revoked leases — those slots were handed to other
+      submissions on the validators' next poll and are not the platform's to
+      take back;
+    * touch ``attempt_count``, ``manual_retry_grants`` or ``infra_retry_grants``;
+    * reset the operator-recovery count for the era.
+
+    That inertness is the security property, not an omission. Eviction refuses to
+    compensate the miner (``compensate=False``) precisely so it cannot raise the
+    attempt cap on the artifact it just evicted; if reinstatement handed the cap
+    back, the pair would become an attempt printer and a miner could be evicted
+    and reinstated in a loop to farm free leases past
+    :data:`~ditto.db.queries.retry_budget.MAX_AGENT_INFRA_RETRY_GRANTS` (12 per
+    agent per era, #522) — rebuilding the exact amplifier that took
+    ``mnemox-v55`` to nine attempts against a base budget of two. Both bounds are
+    keyed on (agent, benchmark version) and this route writes neither, so the
+    cycle is budget-neutral however many times it runs. An operator who *does*
+    want to hand back attempts still has one route for it, ``/retry``, which is
+    separately bounded at :data:`MAX_OPERATOR_RECOVERIES_PER_AGENT` and audited
+    per grant. The counts as they stood are recorded on the reinstatement row.
+
+    The eviction record is preserved, never deleted: the leases it revoked each
+    carry a ``validator_lease_audit`` row that
+    ``GET /admin/lease-revocations?action=operator_evicted`` still reads, and an
+    eviction that was later reversed is a fact worth keeping. This writes its own
+    append-only row with its own actor, reason and idempotency key instead.
+    """
+
+    actor = _require_actor(x_admin_actor)
+    now = datetime.now(UTC)
+    async with session.begin():
+        agent, bench_version, scores, tickets, recoveries = await _load(
+            session, agent_id=agent_id, for_update=True
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+
+        existing_request = await session.get(
+            ValidatorQueueReinstatement, payload.request_id
+        )
+        if existing_request is not None:
+            if (
+                existing_request.agent_id != agent_id
+                or existing_request.actor != actor
+                or existing_request.reason != payload.reason
+                or existing_request.expected_snapshot != payload.expected_snapshot
+            ):
+                raise HTTPException(status_code=409, detail="request id already used")
+            reversed_row = await session.get(
+                ValidatorQueueWithdrawal, existing_request.withdrawal_id
+            )
+            assert reversed_row is not None
+            return AdminValidationQueueReinstatementResponse(
+                reinstatement=_reinstatement_item(existing_request),
+                eviction=_eviction_item(reversed_row),
+                restored_bench_version=existing_request.bench_version,
+                idempotent=True,
+            )
+
+        removal = await load_queue_removal(
+            session,
+            agent_id=agent_id,
+            bench_version=bench_version,
+            for_update=True,
+            in_force_only=False,
+        )
+        current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
+        if current_snapshot != payload.expected_snapshot:
+            raise HTTPException(status_code=409, detail="validation state changed")
+
+        allowed, reason = reinstatement_gate(
+            agent=agent,
+            scores=scores,
+            removal=removal,
+            bench_version=bench_version,
+            active_version=await active_bench_version(session),
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=409, detail=reason or "reinstatement unavailable"
+            )
+        assert removal is not None
+
+        removal.reinstated_at = now
+        reinstatement = ValidatorQueueReinstatement(
+            reinstatement_id=payload.request_id,
+            withdrawal_id=removal.withdrawal_id,
+            agent_id=agent_id,
+            bench_version=bench_version,
+            actor=actor,
+            reason=payload.reason,
+            expected_snapshot=current_snapshot,
+            score_count=len(scores),
+            ticket_snapshot=[_ticket_wire(ticket) for ticket in tickets],
+            retry_budget_snapshot=(
+                await _retry_budget_snapshot(
+                    session,
+                    agent_id=agent_id,
+                    bench_version=bench_version,
+                    tickets=tickets,
+                    recovery_count=len(recoveries),
+                )
+            ).model_dump(mode="json"),
+            created_at=now,
+        )
+        session.add(reinstatement)
+        await session.flush()
+        return AdminValidationQueueReinstatementResponse(
+            reinstatement=_reinstatement_item(reinstatement),
+            eviction=_eviction_item(removal),
+            restored_bench_version=bench_version,
             idempotent=False,
         )
 
