@@ -79,7 +79,10 @@ from ditto.db.queries.audit import (
     GENESIS_HASH,
     append_audit_entry,
 )
-from ditto.db.queries.benchmark_rollout import DEFAULT_BENCH_VERSION
+from ditto.db.queries.benchmark_rollout import (
+    DEFAULT_BENCH_VERSION,
+    LEGACY_BENCH_VERSION,
+)
 from ditto.db.queries.scores import upsert_score
 
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
@@ -2464,13 +2467,26 @@ class TestScorerLivenessSurfacing:
     every validator that merely had a full disk.
     """
 
-    def _entry(self, *, protocol_version: int, scorer: dict | None):
+    def _entry(
+        self,
+        *,
+        protocol_version: int,
+        scorer: dict | None,
+        active_bench_version: int = LEGACY_BENCH_VERSION,
+    ):
+        """One entry, judged at the legacy era so only liveness can colour it.
+
+        The bench-capability gate exempts the legacy version exactly as ticket
+        issuance does, which keeps these cases about the scorer probe: every row
+        here advertises v2, so none of them can be failed for the wrong reason.
+        """
         now = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
         response = public_endpoint._validator_heartbeats_response(
             rows=[_liveness_row(now, protocol_version=protocol_version, scorer=scorer)],
             assignments=[],
             active_work=[],
             now=now,
+            active_bench_version=active_bench_version,
         )
         return response.validators[0]
 
@@ -2640,6 +2656,223 @@ class TestScorerLivenessSurfacing:
 
         assert entry.scorer_liveness == expected
         assert entry.health_reasons == [reason]
+
+
+def _v7_capable_row(
+    now: datetime, *, hotkey: str, seen_at: datetime
+) -> SimpleNamespace:
+    """A heartbeat that clears every clause of the v7 capability gate."""
+    revision = "a" * 40
+    capabilities = {
+        "screened_images": True,
+        "require_screened_image": True,
+        "source_build_fallback": False,
+        "full_stack_managed": True,
+        "stack_updater": True,
+        "sandbox_egress_restricted": True,
+        "ticket_inference": True,
+        "signed_score_quorum": True,
+        "executor_isolation": "privileged_dind",
+        "scorer_benchmarks": {
+            "status": "fresh_verified",
+            "supported_bench_versions": [2, 3, 4, 5, 6, 7],
+            "observed_at": int(now.timestamp()),
+            "software_version": "1.3.0",
+            "source_revision": revision,
+            "v7_calibration": {
+                "manifest_sha256": "c" * 64,
+                "supported_routes": [
+                    {
+                        "provider": "Groq",
+                        "profile_revision": "openrouter-route-test-v1",
+                        "model": "openai/gpt-oss-20b",
+                    }
+                ],
+            },
+            "probe": {
+                "outcome": "served",
+                "observed_at": int(now.timestamp()),
+                "http_status": 200,
+                "last_served_at": int(now.timestamp()),
+                "consecutive_failures": 0,
+            },
+        },
+    }
+    stack = {
+        "mode": "source",
+        "compose_schema": 1,
+        "release_descriptor_digest": None,
+        "components": {
+            name: {
+                "source_revision": revision if name == "dittobench_api" else "b" * 40,
+                "version": "1.3.0" if name == "dittobench_api" else "1.2.0",
+                "provenance": "committed_pin",
+            }
+            for name in (
+                "ditto_subnet",
+                "dittobench_api",
+                "sandbox_docker",
+                "model_relay",
+                "pylon",
+                "ollama",
+            )
+        },
+    }
+    return SimpleNamespace(
+        validator_hotkey=hotkey,
+        software_version="0.34.1",
+        protocol_version=15,
+        state="idle",
+        active_agent_id=None,
+        system_metrics={
+            "collected_at": int(now.timestamp()),
+            "cpu_percent": 10,
+            "memory_percent": 20,
+            "disk_percent": 30,
+            "docker": {
+                "status": "healthy",
+                "running_containers": 2,
+                "unhealthy_containers": 0,
+            },
+        },
+        benchmark_progress=None,
+        benchmark_capacity=None,
+        capabilities=capabilities,
+        stack=stack,
+        stack_health=None,
+        first_seen_at=now - timedelta(days=30),
+        reported_at=seen_at,
+        seen_at=seen_at,
+    )
+
+
+def _legacy_row(now: datetime, *, hotkey: str) -> SimpleNamespace:
+    """The validator this gate exists for: ancient software, no capabilities.
+
+    Protocol 6 predates the signed capability payload entirely, so it cannot
+    advertise a benchmark and the platform leases it nothing. Its host metrics
+    are deliberately spotless — that is exactly how it read as healthy.
+    """
+    return SimpleNamespace(
+        validator_hotkey=hotkey,
+        software_version="0.9.6",
+        protocol_version=6,
+        state="idle",
+        active_agent_id=None,
+        system_metrics={
+            "collected_at": int(now.timestamp()),
+            "cpu_percent": 0,
+            "memory_percent": 10,
+            "disk_percent": 5,
+            "docker": {
+                "status": "healthy",
+                "running_containers": 1,
+                "unhealthy_containers": 0,
+            },
+        },
+        benchmark_progress=None,
+        benchmark_capacity=None,
+        capabilities=None,
+        stack=None,
+        stack_health=None,
+        first_seen_at=now - timedelta(days=3),
+        reported_at=now,
+        seen_at=now,
+    )
+
+
+class TestActiveBenchCapabilityGate:
+    """A validator that cannot serve the benchmark being scored earns nothing.
+
+    Ticket issuance already gates every lease on ``heartbeat_supports_version``,
+    so a stack that cannot serve the active benchmark is issued no work at all.
+    Published as ``healthy`` and idle beside the fleet doing the work, it read as
+    a spare validator rather than a spectator.
+    """
+
+    def _snapshot(self, rows: list[SimpleNamespace], *, version: int, now: datetime):
+        return public_endpoint._validator_heartbeats_response(
+            rows=rows,
+            assignments=[],
+            active_work=[],
+            now=now,
+            active_bench_version=version,
+        )
+
+    def test_ancient_software_cannot_serve_the_active_benchmark(self) -> None:
+        now = datetime(2026, 7, 27, 3, 0, tzinfo=UTC)
+        snapshot = self._snapshot(
+            [_legacy_row(now, hotkey=_VALIDATOR_C)], version=7, now=now
+        )
+
+        entry = snapshot.validators[0]
+        assert entry.bench_serviceability == "software_obsolete"
+        # Not a host problem, and not a warning: it cannot do its one job.
+        assert entry.health == "critical"
+        assert entry.health_reasons[0] == (
+            "software too old for bench v7 (heartbeat protocol 6)"
+        )
+        # The window it is judged against travels with the verdict.
+        assert snapshot.active_bench_version == 7
+
+    def test_a_v7_capable_validator_passes_the_gate(self) -> None:
+        now = datetime(2026, 7, 27, 3, 0, tzinfo=UTC)
+        entry = self._snapshot(
+            [_v7_capable_row(now, hotkey=_VALIDATOR_C, seen_at=now)],
+            version=7,
+            now=now,
+        ).validators[0]
+
+        assert entry.bench_serviceability == "serving"
+        assert entry.health == "healthy"
+        assert entry.health_reasons == []
+
+    def test_a_quiet_validator_is_not_called_incapable(self) -> None:
+        """Liveness and capability must not be conflated in either direction.
+
+        A validator that stopped heartbeating an hour ago still advertises the
+        active benchmark; calling it incapable would blame the wrong thing and
+        would survive the reboot that fixes it.
+        """
+        now = datetime(2026, 7, 27, 3, 0, tzinfo=UTC)
+        entry = self._snapshot(
+            [
+                _v7_capable_row(
+                    now, hotkey=_VALIDATOR_C, seen_at=now - timedelta(hours=1)
+                )
+            ],
+            version=7,
+            now=now,
+        ).validators[0]
+
+        assert entry.availability == "offline"
+        assert entry.bench_serviceability == "serving"
+        assert entry.health_reasons == []
+
+    def test_the_legacy_era_gates_nobody(self) -> None:
+        """Mirror the leasing rule: below the legacy floor no capability is asked."""
+        now = datetime(2026, 7, 27, 3, 0, tzinfo=UTC)
+        snapshot = self._snapshot(
+            [_legacy_row(now, hotkey=_VALIDATOR_C)],
+            version=LEGACY_BENCH_VERSION,
+            now=now,
+        )
+
+        entry = snapshot.validators[0]
+        assert entry.bench_serviceability == "serving"
+        assert entry.health == "healthy"
+
+    def test_a_capable_stack_at_the_wrong_version_is_still_gated(self) -> None:
+        """Support is per version: v7 support says nothing about v8."""
+        now = datetime(2026, 7, 27, 3, 0, tzinfo=UTC)
+        entry = self._snapshot(
+            [_v7_capable_row(now, hotkey=_VALIDATOR_C, seen_at=now)],
+            version=8,
+            now=now,
+        ).validators[0]
+
+        assert entry.bench_serviceability == "scorer_unverified"
+        assert entry.health_reasons[0] == "scorer not advertising bench v8"
 
 
 class TestPublicFleet:

@@ -2366,6 +2366,19 @@ FleetAvailability = Literal["available", "stale", "offline", "paused", "unknown"
 # disk: both were ``warning`` before, and the fleet view could not tell an
 # inconvenience from a validator taking leases it can never complete.
 FleetHealth = Literal["healthy", "warning", "critical", "unknown"]
+# Whether a validator can serve the benchmark the fleet is actually scoring.
+# Not a health rollup and not a liveness claim: it is the leasing gate's own
+# answer, kept separate because a validator that cannot serve the active
+# benchmark is issued no work at all -- the one failure that host metrics, a
+# fresh heartbeat and a green scorer probe can all coexist with.
+#
+# ``serving``            clears the gate for the active benchmark.
+# ``scorer_unverified``  software new enough to advertise it, scorer not
+#                        advertising it (unverified identity, missing
+#                        calibration, or simply a narrower version set).
+# ``software_obsolete``  a heartbeat protocol that cannot describe the active
+#                        benchmark at all. Only an upgrade changes this.
+BenchServiceability = Literal["serving", "scorer_unverified", "software_obsolete"]
 # Whether the validator's scorer actually answered its capability probe.
 # ``unreported`` covers both a validator too old to carry probe evidence and one
 # that carried none; it is never a claim that the scorer is fine.
@@ -2451,6 +2464,25 @@ class PublicValidatorHeartbeat(BaseModel):
             ),
         ),
     ]
+    bench_serviceability: Annotated[
+        BenchServiceability,
+        Field(
+            description=(
+                "Whether this validator can serve the `active_bench_version` of "
+                "the same response, and if not, why. This is the gate the "
+                "platform itself applies before leasing work, so anything other "
+                "than `serving` means the validator is issued nothing and cannot "
+                "earn a score however healthy its host metrics read. "
+                "`software_obsolete` is a heartbeat protocol that cannot "
+                "describe the active benchmark at all — no probe result and no "
+                "restart changes it, only an upgrade. `scorer_unverified` is "
+                "current-enough software whose scorer is not advertising the "
+                "active benchmark, which a fix can clear. Judged on capability "
+                "alone: a quiet or offline validator that still advertises the "
+                "active benchmark reads `serving`."
+            ),
+        ),
+    ]
     system_metrics: PublicSystemMetrics | None = None
     capabilities: ValidatorCapabilities | None = None
     stack: ValidatorStackIdentity | None = None
@@ -2463,6 +2495,10 @@ class PublicValidatorHeartbeatsResponse(BaseModel):
     generated_at: datetime
     online_window_seconds: Annotated[int, Field(ge=1)]
     stale_window_seconds: Annotated[int, Field(ge=1)]
+    # Carried here as well as on the operations snapshot so `serves_active_bench`
+    # is readable on its own: a client polling only this route can say which
+    # benchmark a validator is being judged against.
+    active_bench_version: Annotated[int, Field(ge=1)]
     reported_count: Annotated[int, Field(ge=0)]
     online_count: Annotated[int, Field(ge=0)]
     validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)

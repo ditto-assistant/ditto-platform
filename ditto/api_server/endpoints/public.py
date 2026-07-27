@@ -123,6 +123,7 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_capacity import BenchmarkCapacity
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.public import (
+    BenchServiceability,
     FleetAvailability,
     FleetHealth,
     ScorerLiveness,
@@ -210,9 +211,12 @@ from ditto.db.queries.benchmark_admission import (
     agent_is_admitted,
 )
 from ditto.db.queries.benchmark_rollout import (
+    LEGACY_BENCH_VERSION,
     active_bench_version,
     open_rollout,
+    protocol_serves_version,
     rollout_state,
+    verified_scorer_for_version,
 )
 from ditto.db.queries.confirmation_scores import (
     DEFAULT_WAVE_MEMBERSHIP,
@@ -1065,6 +1069,43 @@ def _scorer_liveness(
     return liveness, [f"{label}: {detail}"]
 
 
+def _bench_serviceability(
+    row: Any, *, active_bench_version: int
+) -> BenchServiceability:
+    """Can this validator serve the benchmark being scored, and if not, why?
+
+    Exactly the gate ticket issuance applies, minus liveness: capability is a
+    property of the stack, so a validator that merely went quiet keeps whatever
+    verdict its last report earned. The legacy era is exempt here for the same
+    reason it is exempt there — below the legacy floor the platform asks for no
+    capability advertisement, so nobody is gated out.
+    """
+    if active_bench_version <= LEGACY_BENCH_VERSION:
+        return "serving"
+    if verified_scorer_for_version(row, version=active_bench_version) is not None:
+        return "serving"
+    if not protocol_serves_version(row.protocol_version, version=active_bench_version):
+        # The distinction that matters operationally: this one cannot be fixed
+        # from the scorer side at all, and it is permanent until someone
+        # upgrades the validator.
+        return "software_obsolete"
+    return "scorer_unverified"
+
+
+def _bench_serviceability_reason(
+    serviceability: BenchServiceability, *, version: int, protocol_version: int
+) -> str | None:
+    """The tooltip label naming why a validator is earning nothing."""
+    if serviceability == "software_obsolete":
+        return (
+            f"software too old for bench v{version} "
+            f"(heartbeat protocol {protocol_version})"
+        )
+    if serviceability == "scorer_unverified":
+        return f"scorer not advertising bench v{version}"
+    return None
+
+
 def _health_reasons(
     *,
     state: str,
@@ -1072,6 +1113,7 @@ def _health_reasons(
     active_benchmark: PublicBenchmarkProgress | None,
     stack_health: ValidatorStackHealth | None,
     scorer_reasons: list[str],
+    bench_reason: str | None = None,
 ) -> list[str]:
     """Human-readable labels explaining a non-healthy fleet badge.
 
@@ -1081,6 +1123,10 @@ def _health_reasons(
     Intended for a badge tooltip: detailed, but off the main view.
     """
     reasons: list[str] = []
+    if bench_reason is not None:
+        # First, because it is the reason the validator earns nothing: every other
+        # label describes a validator that is at least in the running.
+        reasons.append(bench_reason)
     if state == "error":
         reasons.append("worker reported an error state")
     if metrics is None:
@@ -2533,6 +2579,7 @@ def _validator_heartbeats_response(
     assignments: list[ActiveValidatorAssignment],
     active_work: list[ActiveValidatorWork],
     now: datetime,
+    active_bench_version: int,
 ) -> PublicValidatorHeartbeatsResponse:
     """Reconcile platform leases and signed heartbeat claims without conflating them."""
     assignments_by_hotkey: dict[str, list[ActiveValidatorAssignment]] = {}
@@ -2658,6 +2705,15 @@ def _validator_heartbeats_response(
         scorer_liveness, scorer_reasons = _scorer_liveness(
             capabilities, row.protocol_version
         )
+        # The platform's own leasing gate, asked one question earlier: can this
+        # stack serve what the fleet is scoring? A validator that cannot is
+        # issued no work at all, so publishing it as healthy-and-idle described a
+        # host, not a participant. The legacy era is exempt for the same reason
+        # ticket issuance exempts it — below the legacy floor the platform
+        # requires no capability advertisement, so nobody is gated out.
+        bench_serviceability = _bench_serviceability(
+            row, active_bench_version=active_bench_version
+        )
         entries.append(
             PublicValidatorHeartbeat(
                 validator_hotkey=row.validator_hotkey,
@@ -2688,7 +2744,8 @@ def _validator_heartbeats_response(
                 seen_at=seen_at,
                 online=online,
                 availability=availability,
-                # A scorer that is not serving outranks everything else here: the
+                # A scorer that cannot serve the benchmark being scored, or that
+                # is not serving at all, outranks everything else here: the
                 # validator cannot complete a single lease, which is worse than
                 # any host-metric warning and must not read like one. Below it, a
                 # wedged benchmark or a required stack component that is
@@ -2699,6 +2756,7 @@ def _validator_heartbeats_response(
                 health=(
                     "critical"
                     if scorer_liveness == "not_serving"
+                    or bench_serviceability != "serving"
                     else (
                         "warning"
                         if scorer_reasons
@@ -2716,7 +2774,13 @@ def _validator_heartbeats_response(
                     active_benchmark=active_benchmark,
                     stack_health=stack_health,
                     scorer_reasons=scorer_reasons,
+                    bench_reason=_bench_serviceability_reason(
+                        bench_serviceability,
+                        version=active_bench_version,
+                        protocol_version=row.protocol_version,
+                    ),
                 ),
+                bench_serviceability=bench_serviceability,
                 system_metrics=metrics,
                 capabilities=capabilities,
                 stack=stack,
@@ -2727,6 +2791,7 @@ def _validator_heartbeats_response(
         generated_at=now,
         online_window_seconds=int(_VALIDATOR_ONLINE_WINDOW.total_seconds()),
         stale_window_seconds=int(_VALIDATOR_STALE_WINDOW.total_seconds()),
+        active_bench_version=active_bench_version,
         reported_count=len(entries),
         online_count=sum(entry.online for entry in entries),
         validators=entries,
@@ -2748,6 +2813,7 @@ async def validators(
             session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
         ),
         now=now,
+        active_bench_version=await active_bench_version(session),
     )
 
 
@@ -3597,6 +3663,7 @@ async def operations(
         assignments=assignments,
         active_work=active_work,
         now=now,
+        active_bench_version=active_version,
     )
     return PublicOperationsResponse(
         generated_at=now,

@@ -363,6 +363,21 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   Reporting is deliberately not a precondition for acceptance: telemetry that
   can silence a validator is worse than telemetry that is missing.
 
+  Each entry also carries `bench_serviceability` against the response's
+  `active_bench_version`: `serving`, `scorer_unverified`, or
+  `software_obsolete`. This is the gate ticket issuance already applies, asked
+  one question earlier — a validator that cannot serve the benchmark the fleet
+  is scoring is leased nothing, so anything other than `serving` is published as
+  `health: critical` no matter how clean its host metrics are. The two failure
+  values are kept apart because they call for different responses:
+  `software_obsolete` is a heartbeat protocol that cannot describe the active
+  benchmark at all and only an upgrade clears it, while `scorer_unverified` is
+  current-enough software whose scorer is not advertising that benchmark and a
+  fix can clear it. The verdict is capability alone: a quiet or offline
+  validator that still advertises the active benchmark reads `serving`, so
+  liveness is never laundered into a capability claim. The legacy benchmark
+  version is exempt, exactly as it is exempt from the leasing gate.
+
   Heartbeat protocol v4 optionally signs a ticket-bound benchmark stage and
   aggregate `completed`/`total` check counts. The platform revalidates the live
   ticket, evaluating agent, freshness, stage allowlist, bounds, and monotonic

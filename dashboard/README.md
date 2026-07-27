@@ -44,13 +44,18 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 - **Validator fleet** — signed worker availability, coarse system health, and
   the public active agent with the same stage/progress shown in the pipeline.
   Old clients render as progress not reported; expired or stale work disappears.
-  Inoperative nodes — no heartbeat inside the offline window — fold into a
-  collapsible below the table for both fleets, so a validator hotkey whose last
-  report is months old stops crowding the live fleet. The fold keeps the reason:
-  a folded row still carries its status badge (a scorer-down validator reads as
-  such, not merely offline), its drill-down, and its deep link, which unfolds the
-  section. Status counts in the side ledger stay whole-fleet, and the summary
-  names how many folded nodes are critical.
+  Inoperative nodes fold into a collapsible below the table, so a validator that
+  cannot take work stops crowding the fleet that can. Two ways to qualify: no
+  heartbeat inside the offline window (a validator hotkey's last report is kept
+  indefinitely, so this is what stops months-dead hosts accumulating), or
+  software too old to serve the benchmark being scored, which the platform
+  leases nothing to. A *current* validator whose scorer broke is deliberately
+  left in the open table reading "Scorer down" — that is a live incident, not an
+  obsolete build. The fold keeps the reason: a folded row still carries its
+  status badge ("Obsolete build", "Scorer down", "No bench v7"), its drill-down —
+  which names the upgrade — and its deep link, which unfolds the section. Status
+  counts in the side ledger stay whole-fleet, and the closed summary names every
+  fold reason and its count.
 - **Stable object links** — all SPA state (popup/selected-row params, the
   submissions filters, and both pagers) lives in a query string inside the hash,
   on whatever page it was opened from (`#/submissions?agent={id}`,

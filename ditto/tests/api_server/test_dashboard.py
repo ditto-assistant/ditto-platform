@@ -839,7 +839,7 @@ class TestDashboard:
         assert 'available + " of " + entries.length + " active " + kind' in body
         assert 'entry.availability === "offline"' in body
         assert "retired.hidden = !retiredEntries.length" in body
-        assert '" · " + retiredEntries.length + " offline"' in body
+        assert '" · " + retiredEntries.length + " inoperative"' in body
 
     async def test_inoperative_fleet_nodes_fold_into_the_collapsible(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
@@ -874,8 +874,51 @@ class TestDashboard:
         )
         assert "if (folded) folded.open = true;" in body
         # A ledger count with no row in the open table is how a broken validator
-        # went invisible before; the summary names it.
-        assert '" · " + retiredCritical + " critical"' in body
+        # went invisible before; the closed summary names every fold reason.
+        assert 'retiredWhy.push(retiredOffline + " offline")' in body
+        assert 'retiredObsolete + " obsolete build"' in body
+
+    async def test_a_validator_that_cannot_serve_the_scored_bench_is_gated(
+        self,
+    ) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        # Obsolete software folds away with the offline nodes: the platform leases
+        # it nothing, so "Healthy · Idle" beside the working fleet was a fiction.
+        assert "function isInoperativeFleetEntry(entry)" in body
+        assert (
+            'entry.availability === "offline" || '
+            'entry.bench_serviceability === "software_obsolete"' in body
+        )
+        assert "var retiredEntries = allEntries.filter(isInoperativeFleetEntry)" in body
+        # A CURRENT validator whose scorer broke stays visible — that is an
+        # incident, not an obsolete build, and hiding it would repeat #511.
+        assert '"scorer_unverified"' in body
+        assert (
+            'entry.availability === "offline" || '
+            'entry.bench_serviceability !== "serving"' not in body
+        )
+        # Obsolete software outranks every other badge; a dead scorer keeps
+        # "Scorer down", which names the cause the bench gate only implies.
+        assert (
+            'if (entry.bench_serviceability === "software_obsolete") '
+            'return ["Obsolete build", "bad"];' in body
+        )
+        assert body.index('return ["Obsolete build", "bad"]') < body.index(
+            'return ["Scorer down", "bad"]'
+        )
+        assert body.index('return ["Scorer down", "bad"]') < body.index(
+            'return [benchGateLabel(), "bad"]'
+        )
+        assert '"No bench v" + version' in body
+        # The version comes from the snapshot that produced the verdicts.
+        assert "function activeBenchVersion()" in body
+        assert "report && Number(report.active_bench_version)" in body
+        assert '"No bench v7"' not in body
+        # The drill-down says what to do about it instead of only that it is bad.
+        assert "Benchmark eligibility" in body
+        assert '"Cannot serve " + scored + " · needs a software upgrade"' in body
+        assert '"Scorer is not advertising " + scored' in body
 
     async def test_operations_panels_share_one_snapshot_and_show_skew(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
