@@ -76,6 +76,7 @@ from uuid import UUID, uuid4
 
 from prometheus_client import Counter
 from pydantic import ValidationError
+from sqlalchemy import func, select
 
 from ditto.api_models.benchmark_capacity import BenchmarkCapacity
 from ditto.api_models.ticket_status import TicketStatus
@@ -83,6 +84,9 @@ from ditto.db.models import ValidatorHeartbeat, ValidatorLeaseAudit, ValidatorTi
 from ditto.db.queries.retry_budget import grant_no_fault_retry
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from sqlalchemy import Select
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -516,3 +520,84 @@ __all__ = [
     "record_declined_force_expiry",
     "record_lease_revocation",
 ]
+
+
+def _filter_lease_revocations(
+    stmt: Select[Any],
+    *,
+    agent_id: UUID | None,
+    validator_hotkey: str | None,
+    actions: Sequence[str] | None,
+    contexts: Sequence[str] | None,
+    since: datetime | None,
+) -> Select[Any]:
+    """Apply the operator's filters. Shared so the page and its count agree."""
+    if agent_id is not None:
+        stmt = stmt.where(ValidatorLeaseAudit.agent_id == agent_id)
+    if validator_hotkey is not None:
+        stmt = stmt.where(ValidatorLeaseAudit.validator_hotkey == validator_hotkey)
+    if actions:
+        stmt = stmt.where(ValidatorLeaseAudit.action.in_(list(actions)))
+    if contexts:
+        stmt = stmt.where(ValidatorLeaseAudit.context.in_(list(contexts)))
+    if since is not None:
+        stmt = stmt.where(ValidatorLeaseAudit.recorded_at >= since)
+    return stmt
+
+
+async def count_lease_revocations(
+    session: AsyncSession,
+    *,
+    agent_id: UUID | None = None,
+    validator_hotkey: str | None = None,
+    actions: Sequence[str] | None = None,
+    contexts: Sequence[str] | None = None,
+    since: datetime | None = None,
+) -> int:
+    """How many revocations match, ignoring paging."""
+    stmt = select(func.count()).select_from(ValidatorLeaseAudit)
+    return int(
+        (
+            await session.execute(
+                _filter_lease_revocations(
+                    stmt,
+                    agent_id=agent_id,
+                    validator_hotkey=validator_hotkey,
+                    actions=actions,
+                    contexts=contexts,
+                    since=since,
+                )
+            )
+        ).scalar_one()
+    )
+
+
+async def list_lease_revocations(
+    session: AsyncSession,
+    *,
+    agent_id: UUID | None = None,
+    validator_hotkey: str | None = None,
+    actions: Sequence[str] | None = None,
+    contexts: Sequence[str] | None = None,
+    since: datetime | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[ValidatorLeaseAudit]:
+    """Read the revocation ledger, newest first.
+
+    ``audit_id`` breaks ties because ``recorded_at`` is the caller's ``now``:
+    two lanes revoking in one sweep share it exactly, and an unstable sort would
+    silently drop or repeat a row across pages.
+    """
+    stmt = _filter_lease_revocations(
+        select(ValidatorLeaseAudit),
+        agent_id=agent_id,
+        validator_hotkey=validator_hotkey,
+        actions=actions,
+        contexts=contexts,
+        since=since,
+    )
+    stmt = stmt.order_by(
+        ValidatorLeaseAudit.recorded_at.desc(), ValidatorLeaseAudit.audit_id.desc()
+    )
+    return list(await session.scalars(stmt.limit(limit).offset(offset)))
