@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Literal, cast
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Load, undefer_group
@@ -29,6 +29,7 @@ from ditto.api_models.admin_copy_review import (
     AdminSourceDiffManifest,
 )
 from ditto.api_server.anti_copy_comparison import compare_anti_copy_pair
+from ditto.api_server.artifact_audit import client_ip, request_detail
 from ditto.api_server.dependencies import get_session, get_storage_client
 from ditto.api_server.endpoints.admin_quarantine import require_admin
 from ditto.api_server.source_diff import (
@@ -42,6 +43,11 @@ from ditto.api_server.source_inspect import (
 )
 from ditto.api_server.storage import ObjectDownloadFailedError, S3StorageClient
 from ditto.db.models import Agent, AgentStatus, AthReview, AthReviewAction, Score
+from ditto.db.queries.artifact_fetch_audit import (
+    ENDPOINT_ADMIN_COPY_REVIEW_DIFF,
+    ENDPOINT_ADMIN_COPY_REVIEW_DIFF_FILE,
+    record_artifact_fetch,
+)
 from ditto.db.queries.payments import (
     get_miner_coldkey_for_agent,
     get_miner_coldkeys_for_agents,
@@ -797,12 +803,51 @@ async def _diff_pair(
     return candidate_agent, reference_agent, candidate_text, reference_text
 
 
+async def _audit_diff_pair(
+    session: AsyncSession,
+    *,
+    request: Request,
+    actor: str,
+    endpoint: str,
+    candidate: Agent,
+    reference: Agent,
+    path: str | None = None,
+) -> None:
+    """Record one audit row per agent whose source this diff exposed.
+
+    Both sides of a copy-review diff are real miner source. Writing a row for
+    each -- tagged with the role it played -- is what lets the agent-scoped
+    index answer "who read this submission's source" for the *reference* agent,
+    who never asked to be part of anyone else's review.
+    """
+    for role, agent, counterpart in (
+        ("candidate", candidate, reference),
+        ("reference", reference, candidate),
+    ):
+        await record_artifact_fetch(
+            session,
+            agent_id=agent.agent_id,
+            endpoint=endpoint,
+            requester_kind="admin",
+            requester_id=actor,
+            artifact_sha256=agent.sha256,
+            source_ip=client_ip(request),
+            detail=request_detail(
+                request,
+                role=role,
+                counterpart_agent_id=str(counterpart.agent_id),
+                path=path,
+            ),
+        )
+
+
 @router.get(
     "/copy-reviews/{agent_id}/source-diff",
     response_model=AdminSourceDiffManifest,
 )
 async def get_copy_review_source_diff(
     agent_id: UUID,
+    request: Request,
     _admin: AdminDep,
     session: SessionDep,
     storage: StorageDep,
@@ -828,6 +873,17 @@ async def get_copy_review_source_diff(
         agent_id,
         reference.agent_id,
     )
+    # This route reads BOTH artifacts, so it writes one row per agent. A later
+    # "who read this agent's source" query must find the fetch whether the agent
+    # was the held candidate or the reference it was diffed against.
+    await _audit_diff_pair(
+        session,
+        request=request,
+        actor=x_admin_actor,
+        endpoint=ENDPOINT_ADMIN_COPY_REVIEW_DIFF,
+        candidate=candidate,
+        reference=reference,
+    )
     return AdminSourceDiffManifest(
         agent_id=agent_id,
         reference_agent_id=reference.agent_id,
@@ -843,6 +899,7 @@ async def get_copy_review_source_diff(
 )
 async def get_copy_review_source_diff_file(
     agent_id: UUID,
+    request: Request,
     _admin: AdminDep,
     session: SessionDep,
     storage: StorageDep,
@@ -869,6 +926,15 @@ async def get_copy_review_source_diff_file(
         x_admin_actor,
         agent_id,
         normalized,
+    )
+    await _audit_diff_pair(
+        session,
+        request=request,
+        actor=x_admin_actor,
+        endpoint=ENDPOINT_ADMIN_COPY_REVIEW_DIFF_FILE,
+        candidate=candidate,
+        reference=reference,
+        path=normalized,
     )
     return AdminSourceDiffFileDetail(
         agent_id=agent_id,

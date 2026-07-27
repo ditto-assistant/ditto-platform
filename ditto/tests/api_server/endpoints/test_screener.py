@@ -67,6 +67,7 @@ from ditto.chain import ChainError
 from ditto.chain.models import BlockInfo, NeuronInfo
 from ditto.db.models import (
     Agent,
+    ArtifactFetchAudit,
     BenchmarkDataset,
     BenchmarkRollout,
     EvaluationPayment,
@@ -2964,6 +2965,104 @@ class TestQuarantineAdmin:
 # --- Artifact --------------------------------------------------------------
 
 
+class TestArtifactFetchAuditTrail:
+    """Screener and admin source reads must be attributable."""
+
+    async def test_screener_fetch_writes_an_audit_row(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        _install_storage(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = claim.json()["items"][0]["attempt_id"]
+
+        response = await client.get(
+            f"/api/v1/screener/agent/{agent_id}/artifact",
+            headers=_AUTH_HEADER,
+            params={"attempt_id": attempt_id, "instance_id": "screener-fleet-abc1"},
+        )
+
+        assert response.status_code == 200
+        async with session_maker() as s:
+            rows = (await s.scalars(select(ArtifactFetchAudit))).all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.agent_id == agent_id
+        assert row.endpoint == "screener.agent_artifact"
+        assert row.requester_kind == "screener"
+        assert row.lease_id == UUID(attempt_id)
+        assert row.artifact_sha256 == _SHA256
+        # The fleet shares one hotkey, so this is the column that says which
+        # worker actually took the source.
+        assert row.requester_instance_id == "screener-fleet-abc1"
+
+    async def test_screener_fetch_without_instance_id_still_audits(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A screener that has not been updated yet is still served and recorded.
+
+        instance_id is additive: until ditto-screener sends it, the row lands
+        with hotkey-only attribution rather than not landing at all.
+        """
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        _install_storage(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = claim.json()["items"][0]["attempt_id"]
+
+        response = await client.get(
+            f"/api/v1/screener/agent/{agent_id}/artifact",
+            headers=_AUTH_HEADER,
+            params={"attempt_id": attempt_id},
+        )
+
+        assert response.status_code == 200
+        async with session_maker() as s:
+            rows = (await s.scalars(select(ArtifactFetchAudit))).all()
+        assert len(rows) == 1
+        assert rows[0].requester_instance_id is None
+        assert rows[0].requester_id is not None
+
+    async def test_admin_artifact_fetch_writes_an_audit_row(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        _install_db(app, session_maker)
+        _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/artifact",
+            headers={
+                "Authorization": "Bearer test-admin-token-at-least-32-characters",
+                "X-Admin-Actor": "backroom:test-user",
+            },
+        )
+
+        assert response.status_code == 200
+        async with session_maker() as s:
+            rows = (await s.scalars(select(ArtifactFetchAudit))).all()
+        assert len(rows) == 1
+        assert rows[0].endpoint == "admin.get_screening_artifact"
+        assert rows[0].requester_kind == "admin"
+        assert rows[0].requester_id == "backroom:test-user"
+
+
 class TestArtifact:
     async def test_returns_presigned_url_and_sha(
         self,
@@ -5030,6 +5129,46 @@ class TestQuarantineSourceInspection:
             }
         ]
         storage.get_object.assert_awaited_once()
+
+    async def test_source_reads_are_audited_per_file(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Reading source through the operator console is a source fetch too.
+
+        The listing and the excerpt both decrypt real miner code to a human, so
+        both leave a row -- and the excerpt records which path was opened, which
+        is what makes an operator read reconstructable after the fact.
+        """
+        agent_id, _storage = await self._seed_with_tarball(app, session_maker)
+
+        listing = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/source-files",
+            headers=_ADMIN_HEADERS,
+        )
+        excerpt = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/source-file",
+            params={"path": "src/main.rs", "start_line": 1, "end_line": 999},
+            headers=_ADMIN_HEADERS,
+        )
+
+        assert listing.status_code == 200
+        assert excerpt.status_code == 200
+        async with session_maker() as s:
+            rows = (
+                await s.scalars(
+                    select(ArtifactFetchAudit).order_by(ArtifactFetchAudit.seq)
+                )
+            ).all()
+        assert [row.endpoint for row in rows] == [
+            "admin.list_screening_source_files",
+            "admin.read_screening_source_file",
+        ]
+        assert all(row.agent_id == agent_id for row in rows)
+        assert all(row.requester_kind == "admin" for row in rows)
+        assert (rows[1].detail or {}).get("path") == "src/main.rs"
 
     async def test_excerpt_reads_bounded_flagged_lines(
         self,

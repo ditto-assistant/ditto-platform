@@ -143,6 +143,7 @@ from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
     ValidatorStackIdentity,
 )
+from ditto.api_server.artifact_audit import client_ip, request_detail
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.benchmark_rollout import rolling_qualification_blockers
 from ditto.api_server.continual_retest_settings import aggregate_is_active
@@ -191,6 +192,10 @@ from ditto.db.models import (
     ValidatorTicket,
 )
 from ditto.db.queries.agents import list_public_activity
+from ditto.db.queries.artifact_fetch_audit import (
+    ENDPOINT_PUBLIC_ARTIFACT,
+    record_artifact_fetch,
+)
 from ditto.db.queries.artifact_release import (
     ArtifactScoreQuorum,
     list_first_score_quorums,
@@ -4086,6 +4091,7 @@ async def agent_scores(
 
 @router.get("/agent/{agent_id}/artifact", response_model=PublicArtifactDownload)
 async def agent_artifact(
+    request: Request,
     response: Response,
     session: SessionDep,
     storage: StorageDep,
@@ -4134,6 +4140,26 @@ async def agent_artifact(
         key=f"{agent_id}/agent.tar.gz",
         expires_in=_ARTIFACT_DOWNLOAD_TTL_SECONDS,
         attachment_filename=f"ditto-agent-{agent_id}.tar.gz",
+    )
+    # Audited only once the release gate above has passed, so a row means source
+    # was actually handed out. That is also what keeps this unauthenticated route
+    # from being a write-amplification lever: a caller cannot make the platform
+    # insert rows without first getting past the king-reveal and embargo checks.
+    # There is no requester identity to record here by design -- the peer address
+    # is the only discriminator the route has.
+    await record_artifact_fetch(
+        session,
+        agent_id=agent_id,
+        endpoint=ENDPOINT_PUBLIC_ARTIFACT,
+        requester_kind="public",
+        bench_version=score_quorum.bench_version,
+        artifact_sha256=agent.sha256,
+        source_ip=client_ip(request),
+        detail=request_detail(
+            request,
+            user_agent=request.headers.get("user-agent"),
+            request_id=getattr(request.state, "request_id", None),
+        ),
     )
     return PublicArtifactDownload(
         agent_id=agent.agent_id,

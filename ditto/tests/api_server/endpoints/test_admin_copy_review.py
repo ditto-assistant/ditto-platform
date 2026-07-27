@@ -22,7 +22,14 @@ from sqlalchemy.ext.asyncio import (
 from ditto.api_server.dependencies import get_session, get_storage_client
 from ditto.api_server.fingerprint import reference_corpus_provenance
 from ditto.api_server.storage import ObjectDownloadFailedError
-from ditto.db.models import Agent, AgentStatus, AthReview, AthReviewAction, Score
+from ditto.db.models import (
+    Agent,
+    AgentStatus,
+    ArtifactFetchAudit,
+    AthReview,
+    AthReviewAction,
+    Score,
+)
 from ditto.db.queries.scores import list_eligible_ledger
 
 _TOKEN = "test-admin-token-at-least-32-characters"
@@ -819,6 +826,63 @@ async def test_source_diff_manifest_classifies_files(
     assert by_path["src/util.rs"]["status"] == "modified"
     assert by_path["src/new.rs"]["status"] == "added"
     assert by_path["src/gone.rs"]["status"] == "removed"
+
+
+async def test_source_diff_audits_both_agents_whose_source_was_read(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """A diff exposes two miners' source, so it must record two fetches.
+
+    The reference agent never asked to be part of anyone else's review. If only
+    the candidate were audited, "who read this submission's source" would come
+    back empty for the agent that was actually copied *from*.
+    """
+    candidate_id, reference_id, objects = await _seed_diff_pair(
+        maker,
+        candidate_files={"src/main.rs": "fn main() {}\n"},
+        reference_files={"src/main.rs": "fn main() {}\n"},
+    )
+    _install(app, maker)
+    _install_storage(app, objects)
+
+    response = await client.get(
+        f"/api/v1/admin/copy-reviews/{candidate_id}/source-diff", headers=_HEADERS
+    )
+
+    assert response.status_code == 200
+    async with maker() as s:
+        rows = (await s.scalars(select(ArtifactFetchAudit))).all()
+    assert {row.agent_id for row in rows} == {candidate_id, reference_id}
+    assert all(row.endpoint == "admin.get_copy_review_source_diff" for row in rows)
+    assert all(row.requester_kind == "admin" for row in rows)
+    roles = {row.agent_id: (row.detail or {}).get("role") for row in rows}
+    assert roles[candidate_id] == "candidate"
+    assert roles[reference_id] == "reference"
+
+
+async def test_source_diff_file_audits_the_path_that_was_read(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    candidate_id, reference_id, objects = await _seed_diff_pair(
+        maker,
+        candidate_files={"src/util.rs": "fn util() -> i32 { 1 }\n"},
+        reference_files={"src/util.rs": "fn util() -> i32 { 2 }\n"},
+    )
+    _install(app, maker)
+    _install_storage(app, objects)
+
+    response = await client.get(
+        f"/api/v1/admin/copy-reviews/{candidate_id}/source-diff/file",
+        headers=_HEADERS,
+        params={"path": "src/util.rs"},
+    )
+
+    assert response.status_code == 200
+    async with maker() as s:
+        rows = (await s.scalars(select(ArtifactFetchAudit))).all()
+    assert len(rows) == 2
+    assert {row.agent_id for row in rows} == {candidate_id, reference_id}
+    assert all((row.detail or {}).get("path") == "src/util.rs" for row in rows)
 
 
 async def test_source_diff_file_returns_unified_body(

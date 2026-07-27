@@ -3213,3 +3213,135 @@ class ValidatorSlotSettingsRevision(Base):
             name="validator_slot_settings_scope_parent_key",
         ),
     )
+
+
+class ArtifactFetchAudit(Base):
+    """One durable record of a served artifact — bytes or a presigned URL.
+
+    Every path that hands a caller miner source (the tarball, a source file, a
+    source diff) or a presigned URL to it appends one row here. Before this
+    table the only trace of an artifact fetch was a stdout line, so an artifact
+    leak could be observed in its consequences and never attributed to a
+    fetcher. This is the forensic record that answers "who fetched this
+    artifact, and when".
+
+    Insert-only and *not* FK-bound to ``agents``: the record must outlive the
+    submission it describes, exactly as :class:`ScoreAuditEntry` does. An agent
+    row may be pruned; the history of who read its source must not cascade away.
+
+    Deliberately *not* hash-chained. :class:`ScoreAuditEntry` serializes every
+    append on a ``FOR UPDATE`` head lock to keep one linear chain; that is the
+    right trade for a public tamper-evident score projection, and the wrong one
+    for a read-path audit, where it would turn concurrent artifact fetches into
+    a queue behind a single row. This table takes plain concurrent INSERTs.
+
+    ``requester_kind`` is a closed vocabulary; ``requester_id`` is that kind's
+    identity (validator hotkey, screener hotkey, admin actor) and is NULL only
+    for the unauthenticated public path, where no identity exists to record.
+
+    Distinct from :class:`ValidatorLeaseAudit`, which records lease *revocations*
+    — a destructive write the platform performs on a validator. This records
+    *reads* a caller performs against miner source. They share neither a
+    requester model (that table is validator-only and requires a hotkey, a slot
+    and a bench version on every row; fetches also arrive from an
+    identity-less public route and a shared-hotkey screener fleet) nor a query
+    shape, so they stay separate tables.
+
+    One row per *fetch*, never updated. ``validator_tickets`` is keyed by
+    ``(agent_id, bench_version, validator_hotkey)`` and is UPSERTed on reissue,
+    so a repeated claim/fail loop collapses into one row with an inflated
+    ``attempt_count`` and only the latest ``issued_at``. Because a fetch appends
+    here instead, that same loop leaves one durable row per artifact hand-off —
+    the per-lease history the ticket table cannot keep.
+    """
+
+    __tablename__ = "artifact_fetch_audit"
+
+    seq: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    """Monotonic append order (BIGSERIAL on Postgres, INTEGER rowid on SQLite)."""
+
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """Agent whose artifact was served. Not FK-bound — see the class docstring."""
+
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False)
+    """Stable identifier of the serving route, e.g. ``validator.agent_artifact``.
+
+    A route *name*, not the request path: paths carry ids and change shape, and
+    the question this column answers is "which door did they come through"."""
+
+    requester_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    """``validator`` | ``screener`` | ``admin`` | ``public``."""
+
+    requester_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Hotkey (validator/screener) or admin actor. NULL only for ``public``."""
+
+    requester_instance_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Screener worker instance within the shared-hotkey fleet, when known.
+
+    ``SCREENER_HOTKEY`` is one shared string across an autoscaled fleet, so the
+    hotkey alone cannot say *which* worker read the source. NULL means the
+    caller did not identify its instance — an attribution gap, not an error."""
+
+    lease_id: Mapped[UUID | None] = mapped_column(SaUUID(as_uuid=True), nullable=True)
+    """The claim this fetch was bound to: a screening ``attempt_id`` today.
+
+    Validator leases have no surrogate id — ``validator_tickets`` is keyed by
+    ``(agent_id, validator_hotkey)``, both already recorded above — so the
+    ticket is identified by that pair plus :attr:`bench_version`."""
+
+    bench_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """Benchmark era of the authorizing validator ticket, when there was one."""
+
+    artifact_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Digest of the artifact served, so a leaked copy can be matched to a fetch."""
+
+    source_ip: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Peer address when the ASGI transport exposed one; NULL when it did not."""
+
+    detail: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
+    """Route-specific extras (the source path read, the diff side, ...)."""
+
+    fetched_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    """When the artifact was served (UTC)."""
+
+    __table_args__ = (
+        CheckConstraint(
+            "requester_kind IN ('validator', 'screener', 'admin', 'public')",
+            name="artifact_fetch_audit_requester_kind_check",
+        ),
+        CheckConstraint(
+            "(requester_kind = 'public') = (requester_id IS NULL)",
+            name="artifact_fetch_audit_requester_id_presence_check",
+        ),
+        CheckConstraint(
+            "bench_version IS NULL OR bench_version > 0",
+            name="artifact_fetch_audit_bench_version_check",
+        ),
+        # "Who fetched this agent's artifact, newest first" — the question asked
+        # first when a specific submission is suspected of having leaked.
+        Index(
+            "artifact_fetch_audit_agent_idx",
+            "agent_id",
+            "fetched_at",
+        ),
+        # "Everything this requester ever fetched" — the pivot from a suspected
+        # agent to the full reach of whoever fetched it.
+        Index(
+            "artifact_fetch_audit_requester_idx",
+            "requester_kind",
+            "requester_id",
+            "fetched_at",
+        ),
+        # Bare time-range sweeps ("everything fetched during the leak window").
+        Index(
+            "artifact_fetch_audit_fetched_idx",
+            "fetched_at",
+            "seq",
+        ),
+    )

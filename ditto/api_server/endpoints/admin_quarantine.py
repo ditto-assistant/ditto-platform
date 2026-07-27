@@ -70,6 +70,7 @@ from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator import ArtifactResponse
+from ditto.api_server.artifact_audit import client_ip, request_detail
 from ditto.api_server.benchmark_rollout import (
     PendingQualification,
     inference_activation_requirements,
@@ -105,6 +106,12 @@ from ditto.db.models import (
     ScreeningQuarantineResolution,
     ValidatorHeartbeat,
     ValidatorTicket,
+)
+from ditto.db.queries.artifact_fetch_audit import (
+    ENDPOINT_ADMIN_SCREENING_ARTIFACT,
+    ENDPOINT_ADMIN_SOURCE_FILE,
+    ENDPOINT_ADMIN_SOURCE_FILES,
+    record_artifact_fetch,
 )
 from ditto.db.queries.audit import (
     append_audit_entry,
@@ -2413,6 +2420,7 @@ async def migrate_benchmark_contract(
 )
 async def get_screening_artifact(
     agent_id: UUID,
+    request: Request,
     _admin: AdminDep,
     session: SessionDep,
     storage: StorageDep,
@@ -2432,6 +2440,19 @@ async def get_screening_artifact(
         "admin_actor=%s issued screening artifact url for agent_id=%s",
         x_admin_actor,
         agent_id,
+    )
+    # X-Admin-Actor is unauthenticated free text behind a shared bearer token,
+    # so this attributes to a claimed operator, not a proven one. Recorded as
+    # the best identity the route has; the peer address corroborates it.
+    await record_artifact_fetch(
+        session,
+        agent_id=agent_id,
+        endpoint=ENDPOINT_ADMIN_SCREENING_ARTIFACT,
+        requester_kind="admin",
+        requester_id=x_admin_actor,
+        artifact_sha256=agent.sha256,
+        source_ip=client_ip(request),
+        detail=request_detail(request),
     )
     return ArtifactResponse(
         agent_id=agent_id,
@@ -2478,6 +2499,7 @@ async def _load_inspector(
 )
 async def list_screening_source_files(
     agent_id: UUID,
+    request: Request,
     _admin: AdminDep,
     session: SessionDep,
     storage: StorageDep,
@@ -2491,6 +2513,16 @@ async def list_screening_source_files(
         "admin_actor=%s listed screening source for agent_id=%s",
         x_admin_actor,
         agent_id,
+    )
+    await record_artifact_fetch(
+        session,
+        agent_id=agent_id,
+        endpoint=ENDPOINT_ADMIN_SOURCE_FILES,
+        requester_kind="admin",
+        requester_id=x_admin_actor,
+        artifact_sha256=agent.sha256,
+        source_ip=client_ip(request),
+        detail=request_detail(request),
     )
     listing = await asyncio.to_thread(inspector.listing)
     return AdminSourceListing(
@@ -2506,6 +2538,7 @@ async def list_screening_source_files(
 )
 async def read_screening_source_file(
     agent_id: UUID,
+    request: Request,
     _admin: AdminDep,
     session: SessionDep,
     storage: StorageDep,
@@ -2521,7 +2554,7 @@ async def read_screening_source_file(
     """
     if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
         raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
-    _agent, inspector = await _load_inspector(agent_id, session, storage)
+    agent, inspector = await _load_inspector(agent_id, session, storage)
     try:
         excerpt = await asyncio.to_thread(inspector.read, path, start_line, end_line)
     except SourceInspectError as error:
@@ -2534,6 +2567,21 @@ async def read_screening_source_file(
         path,
         excerpt["start_line"],
         excerpt["end_line"],
+    )
+    await record_artifact_fetch(
+        session,
+        agent_id=agent_id,
+        endpoint=ENDPOINT_ADMIN_SOURCE_FILE,
+        requester_kind="admin",
+        requester_id=x_admin_actor,
+        artifact_sha256=agent.sha256,
+        source_ip=client_ip(request),
+        detail=request_detail(
+            request,
+            path=path,
+            start_line=excerpt["start_line"],
+            end_line=excerpt["end_line"],
+        ),
     )
     return AdminSourceExcerpt(agent_id=agent_id, **excerpt)  # type: ignore[arg-type]
 
