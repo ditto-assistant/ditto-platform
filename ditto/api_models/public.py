@@ -2413,6 +2413,88 @@ class PublicSystemMetrics(BaseModel):
     unhealthy_containers: Annotated[int, Field(ge=0, le=1000)]
 
 
+# What the platform can see about a slot whose lease it evicted while the
+# validator's container kept executing. Deliberately three-valued minus the
+# fourth: ``released`` never reaches the wire, because a released slot is
+# genuinely idle and must keep rendering as idle.
+#
+# ``still_running``  the validator's own signed occupancy claim still lists this
+#                    slot, held by the evicted agent. Positive evidence.
+# ``indeterminate``  the platform cannot tell. Most often a heartbeat protocol
+#                    below 16, which omits a claimed-but-quiet slot entirely and
+#                    so cannot distinguish "the container exited" from "the
+#                    container is between progress reports".
+OrphanedSlotState = Literal["still_running", "indeterminate"]
+
+
+class PublicOrphanedSlot(BaseModel):
+    """A slot the platform released out from under a still-executing benchmark.
+
+    An operator eviction ends the platform's half of a lease at once; the
+    validator's container runs to completion and has its late score refused with
+    a 409. For that window the host is doing a full benchmark's worth of work
+    that cannot produce a score, and before this existed every such slot rendered
+    as `Idle` -- which is how a fleet with no headroom reads as a fleet with
+    plenty.
+
+    Derived, never asserted: see `ditto.db.queries.orphaned_leases`. `reason`
+    names the observation behind `state`, so an `indeterminate` row can say
+    whether the platform is blind because the validator is too old to answer or
+    because its heartbeat is stale.
+    """
+
+    slot_id: Annotated[str, Field(description="Which slot, e.g. `slot-0`.")]
+    agent_id: UUID
+    agent_name: str | None = None
+    bench_version: Annotated[int, Field(ge=1)]
+    state: OrphanedSlotState
+    reason: Annotated[
+        str,
+        Field(
+            description=(
+                "The observation behind `state` (e.g. "
+                "`validator_still_claims_slot`, "
+                "`pre_v16_reporter_omits_a_quiet_slot`). Plain string rather "
+                "than an enum: a new evidence code must never turn an "
+                "operator's read into a client error."
+            )
+        ),
+    ]
+    evicted_at: Annotated[
+        datetime, Field(description="When the operator eviction released the lease.")
+    ]
+    orphaned_for_seconds: Annotated[
+        float,
+        Field(
+            ge=0,
+            description="How long the run has been executing without a lease.",
+        ),
+    ]
+    original_deadline: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description=(
+                "The deadline the evicted lease would otherwise have run to. "
+                "These runs are expected to self-terminate by roughly this "
+                "time; null when the audit row records no readable deadline."
+            ),
+        ),
+    ]
+    protocol_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            description=(
+                "Heartbeat protocol of the report this was derived from, or "
+                "null when there is no heartbeat row. Below 16 a validator "
+                "omits a claimed-but-quiet slot, which is why `state` is often "
+                "`indeterminate` there."
+            ),
+        ),
+    ]
+
+
 class PublicValidatorHeartbeat(BaseModel):
     """Latest signed software report from one permitted validator."""
 
@@ -2433,6 +2515,19 @@ class PublicValidatorHeartbeat(BaseModel):
     admission: Literal["accepting", "draining", "paused"] = "accepting"
     active_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
     assigned_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
+    orphaned_slots: Annotated[
+        list[PublicOrphanedSlot],
+        Field(
+            default_factory=list,
+            description=(
+                "Slots whose lease an operator evicted while the validator's "
+                "benchmark container may still be executing. Empty in the "
+                "ordinary case. A slot listed here is NOT free: treat it as "
+                "occupied when reasoning about fleet headroom, even in the "
+                "`indeterminate` state."
+            ),
+        ),
+    ]
     first_seen_at: datetime | None = None
     reported_at: datetime
     seen_at: datetime

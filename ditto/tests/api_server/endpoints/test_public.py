@@ -2485,6 +2485,7 @@ class TestScorerLivenessSurfacing:
             rows=[_liveness_row(now, protocol_version=protocol_version, scorer=scorer)],
             assignments=[],
             active_work=[],
+            orphaned_leases=[],
             now=now,
             active_bench_version=active_bench_version,
         )
@@ -2795,6 +2796,7 @@ class TestActiveBenchCapabilityGate:
             rows=rows,
             assignments=[],
             active_work=[],
+            orphaned_leases=[],
             now=now,
             active_bench_version=version,
         )

@@ -44,6 +44,15 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 - **Validator fleet** — signed worker availability, coarse system health, and
   the public active agent with the same stage/progress shown in the pipeline.
   Old clients render as progress not reported; expired or stale work disappears.
+  A slot whose lease an operator evicted is the one exception to "expired work
+  disappears": the platform releases its half of the lease at once but the
+  validator's container keeps running, so the slot reads `Evicted · still
+  running` for as long as the validator's own signed report still claims it.
+  Where the platform cannot tell — heartbeat protocol below 16 omits a
+  claimed-but-quiet slot, so its silence proves nothing — the slot reads
+  `Evicted · state unknown` rather than either confident answer. Neither is
+  headroom. Only a slot with positive evidence the container is gone goes back
+  to `Idle`.
   Inoperative nodes fold into a collapsible below the table, so a validator that
   cannot take work stops crowding the fleet that can. Two ways to qualify: no
   heartbeat inside the offline window (a validator hotkey's last report is kept
