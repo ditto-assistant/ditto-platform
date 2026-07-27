@@ -2136,10 +2136,50 @@ class PublicSubmissionPipeline(BaseModel):
             le=1.0,
             description=(
                 "Current finalized fifth-place score used for safe continuation "
-                "after two scores; 0 when fewer than five ranked miners exist."
+                "after two scores; 0 when fewer than five ranked miners exist.\n\n"
+                "This is the fifth-highest finalized ``composite`` in "
+                "``active_bench_version``. It is NOT the ``composite`` of the "
+                "row the public leaderboard shows at ``rank: 5``: that board is "
+                "ordered by ``official_composite``, so once any agent has "
+                "completed continual waves the two selections name different "
+                "agents. ``score_floor_agent_id`` says which row this number "
+                "was actually cut from."
             ),
         ),
     ]
+    score_floor_agent_id: Annotated[
+        UUID | None,
+        Field(
+            default=None,
+            description=(
+                "The agent whose finalized composite IS ``score_floor``, so the "
+                "quoted number can be checked against "
+                "/public/agent/{id}/scores. Null when the era has fewer than "
+                "five ranked agents and no floor applies."
+            ),
+        ),
+    ] = None
+    score_floor_agent_name: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Human-friendly name of the agent holding ``score_floor``. Null "
+                "whenever ``score_floor_agent_id`` is null."
+            ),
+        ),
+    ] = None
+    score_floor_agent_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description=(
+                "Submission version of the agent holding ``score_floor``; null "
+                "for a legacy upload with no version, or when no floor applies."
+            ),
+        ),
+    ] = None
     provisional_scores: list[PublicProvisionalScore] = Field(default_factory=list)
     confirmation_scores: list[PublicConfirmationScore] = Field(default_factory=list)
     final_composite: Annotated[

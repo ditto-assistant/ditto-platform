@@ -280,7 +280,7 @@ from ditto.db.queries.screening import (
     list_screening_attempts,
 )
 from ditto.db.queries.tickets import (
-    get_score_continuation_floor,
+    get_score_continuation_floor_row,
     get_score_priority_floors,
 )
 
@@ -4040,8 +4040,18 @@ async def agent_pipeline(
     running_attempt = next(
         (attempt for attempt in attempts if attempt.status == "running"), None
     )
-    score_continuation_floor = await get_score_continuation_floor(
+    # One read, so the quoted floor and the agent credited with it cannot come
+    # from two different snapshots of a ledger that moves between calls.
+    score_floor_row = await get_score_continuation_floor_row(
         session, bench_version=canonical_version
+    )
+    score_continuation_floor = (
+        score_floor_row.composite if score_floor_row is not None else None
+    )
+    score_floor_agent = (
+        await session.get(Agent, score_floor_row.agent_id)
+        if score_floor_row is not None
+        else None
     )
     benchmark_admitted = await agent_is_admitted(
         session, bench_version=canonical_version, agent_id=agent_id
@@ -4089,6 +4099,15 @@ async def agent_pipeline(
         score_count=len(era_scores),
         quorum=SCORING_QUORUM,
         score_floor=score_continuation_floor or 0.0,
+        score_floor_agent_id=(
+            score_floor_row.agent_id if score_floor_row is not None else None
+        ),
+        score_floor_agent_name=(
+            score_floor_agent.name if score_floor_agent is not None else None
+        ),
+        score_floor_agent_version=(
+            score_floor_agent.version if score_floor_agent is not None else None
+        ),
         provisional_scores=[
             PublicProvisionalScore(
                 composite=score.composite,

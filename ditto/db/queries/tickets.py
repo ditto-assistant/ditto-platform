@@ -56,6 +56,7 @@ from ditto.db.queries.queue_order import (
 )
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
+    LedgerRow,
     list_eligible_ledger,
 )
 
@@ -119,10 +120,23 @@ def retry_budget_spent() -> ColumnElement[bool]:
 # that already import them from this module.
 
 
-async def get_score_priority_floors(
+async def get_score_priority_floor_rows(
     session: AsyncSession, *, bench_version: int | None = None
-) -> tuple[float | None, float | None]:
-    """Return finalized fifth-place and tenth-place floors for one benchmark era."""
+) -> tuple[LedgerRow | None, LedgerRow | None]:
+    """Return the ledger rows that *hold* the fifth- and tenth-place floors.
+
+    The floats alone are not checkable by a miner. Both floors are cut from
+    :func:`list_eligible_ledger`, which orders by ``composite`` -- the canonical
+    quorum median -- while the public board's ``rank`` orders by
+    ``official_composite`` (the continual-mean estimator). Those two orderings
+    agree only until some agent completes a continual wave, so "the fifth-place
+    score" names two different agents depending on which surface you read. Any
+    message that quotes a floor must therefore be able to name the row it came
+    from; that is what these return.
+
+    Returns ``(continuation_row, provisional_row)``, each ``None`` when the era
+    has fewer eligible agents than the position needs.
+    """
     eligible = [
         row
         for row in await list_eligible_ledger(
@@ -134,16 +148,44 @@ async def get_score_priority_floors(
         if row.eligible
     ]
     continuation = (
-        eligible[EMISSION_CONTENDER_COUNT - 1].composite
+        eligible[EMISSION_CONTENDER_COUNT - 1]
         if len(eligible) >= EMISSION_CONTENDER_COUNT
         else None
     )
     provisional = (
-        eligible[PROVISIONAL_CONTENDER_LANE_SIZE - 1].composite
+        eligible[PROVISIONAL_CONTENDER_LANE_SIZE - 1]
         if len(eligible) >= PROVISIONAL_CONTENDER_LANE_SIZE
         else None
     )
     return continuation, provisional
+
+
+async def get_score_priority_floors(
+    session: AsyncSession, *, bench_version: int | None = None
+) -> tuple[float | None, float | None]:
+    """Return finalized fifth-place and tenth-place floors for one benchmark era."""
+    continuation, provisional = await get_score_priority_floor_rows(
+        session, bench_version=bench_version
+    )
+    return (
+        continuation.composite if continuation is not None else None,
+        provisional.composite if provisional is not None else None,
+    )
+
+
+async def get_score_continuation_floor_row(
+    session: AsyncSession, *, bench_version: int | None = None
+) -> LedgerRow | None:
+    """Return the ledger row holding the fifth-place continuation floor.
+
+    Same selection as :func:`get_score_continuation_floor`, kept as one call so
+    the quoted number and the agent it belongs to can never come from two
+    separate reads of a moving ledger.
+    """
+    continuation, _ = await get_score_priority_floor_rows(
+        session, bench_version=bench_version
+    )
+    return continuation
 
 
 async def get_score_continuation_floor(
@@ -163,6 +205,12 @@ async def get_score_continuation_floor(
     version-scoped composite against this floor must pass that same version.
     Returns ``None`` when the era does not yet have five eligible agents, which
     correctly disables the floor for a benchmark version still filling up.
+
+    The cut is by ``composite``, so this is the fifth-highest finalized
+    composite, not whichever row the public board shows at ``rank: 5`` (that
+    board orders by ``official_composite``). Use
+    :func:`get_score_continuation_floor_row` when the number has to be
+    attributed to an agent a miner can look up.
     """
     continuation, _ = await get_score_priority_floors(
         session, bench_version=bench_version

@@ -727,6 +727,51 @@ class TestDashboard:
         assert "No submissions match these filters." in body
         assert "Could not load submissions. Try again." in body
 
+    async def test_score_floor_message_attributes_the_number_it_quotes(
+        self,
+    ) -> None:
+        """The low-priority explanation has to be falsifiable from public data.
+
+        It used to say "below the current fifth-place score of 0.886", which a
+        miner cannot check: the floor is the fifth-highest ``composite`` while
+        the leaderboard's rank column orders by ``official_composite``, so the
+        row displayed at rank 5 is routinely a different agent with a different
+        number. Both readings are live and they disagree, which is what
+        generated the support report. The message must therefore name the agent
+        the floor belongs to and say which ordering produced it.
+        """
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+
+        # The unfalsifiable phrasing must not come back.
+        assert "fifth-place score of" not in body
+        assert "the current fifth-place score" not in body
+
+        assert "function scoreFloorAttribution(e) {" in body
+        assert '"That floor is the 5th-highest finalized composite" + where' in body
+        assert 'if (!e.score_floor_agent_id) return basis + ".";' in body
+        assert (
+            "agentLabel(e.score_floor_agent_name, e.score_floor_agent_version)" in body
+        )
+        assert "Open that submission to read the same number back." in body
+        assert (
+            "The leaderboard rank column orders by official_composite, so the row "
+            "it shows at rank 5 can belong to a different agent." in body
+        )
+
+        # Both surfaces that quote the floor go through the same attribution.
+        assert (
+            'fx(bestPossible) + ", below the continuation floor of " '
+            '+ fx(scoreFloor) + ". " +' in body
+        )
+        assert "          scoreFloorAttribution(e) +" in body
+        assert (
+            'the best reachable median is below the continuation floor. " '
+            '+ scoreFloorAttribution(pipeline) + " This result remains provisional'
+            in body
+        )
+        assert "The third score is still queued at low priority" in body
+
     async def test_submission_filters_and_page_restore_and_sanitize_the_url(
         self,
     ) -> None:
