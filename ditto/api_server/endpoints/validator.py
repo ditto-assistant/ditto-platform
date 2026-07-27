@@ -150,10 +150,9 @@ from ditto.api_server.validator_slot_settings import (
     DEFAULT_SETTINGS as SLOT_SETTINGS_DEFAULT,
 )
 from ditto.api_server.validator_slot_settings import (
-    DISK_RESTRICTED_SLOTS,
+    HostResourceSample,
     ValidatorSlotSettingsResolver,
     allowed_slot_count,
-    disk_ceiling_tripped,
 )
 from ditto.chain import ChainError
 from ditto.db.models import (
@@ -510,7 +509,8 @@ def _slot_cap_decline_reason(
     slot_id: str,
     settings: ValidatorSlotSettings,
     advertised_slots: int,
-    disk_percent: int | None,
+    sample: HostResourceSample | None = None,
+    disk_percent: int | None = None,
 ) -> DispatchDeclineReason:
     """Name the lever behind a :func:`_slot_cap_declines` refusal.
 
@@ -526,17 +526,26 @@ def _slot_cap_decline_reason(
     is a backroom setting somebody has to raise.
 
     The breaker is only named when it actually *narrowed* the allowance: with a
-    ``max_concurrent_slots`` already at or below :data:`DISK_RESTRICTED_SLOTS`,
-    the operator cap alone would have declined this poll, and blaming the disk
-    would send whoever is reading the dashboard to clear space for nothing.
+    ``max_concurrent_slots`` already at or below the resource throttle's
+    one-slot allowance, the operator cap alone would have declined this poll.
+    The wire label retains its historical ``disk_breaker`` name while the
+    breaker now covers CPU, memory, and disk pressure.
     """
     if _slot_ordinal(slot_id) >= HARD_SLOT_CEILING:
         return "slot_ceiling"
-    if disk_ceiling_tripped(settings, disk_percent=disk_percent) and (
+    observed = sample or HostResourceSample(disk_percent=disk_percent)
+    unrestricted = allowed_slot_count(
+        settings,
+        advertised_slots=advertised_slots,
+        sample=HostResourceSample(),
+    )
+    if (
         allowed_slot_count(
-            settings, advertised_slots=advertised_slots, disk_percent=None
+            settings,
+            advertised_slots=advertised_slots,
+            sample=observed,
         )
-        > DISK_RESTRICTED_SLOTS
+        < unrestricted
     ):
         return "disk_breaker"
     return "slot_cap"
@@ -612,7 +621,7 @@ async def _idle_retest_slot(
     allowed = allowed_slot_count(
         slot_settings,
         advertised_slots=(capacity.configured_slots if capacity is not None else 1),
-        disk_percent=_heartbeat_disk_percent(heartbeat),
+        sample=_heartbeat_resource_sample(heartbeat),
     )
     if len(held) >= allowed:
         return None
@@ -623,21 +632,32 @@ async def _idle_retest_slot(
     return min(free, key=_slot_ordinal)
 
 
-def _heartbeat_disk_percent(heartbeat: ValidatorHeartbeat | None) -> int | None:
-    """Read the last reported host disk usage, or None when it is unknown.
+def _heartbeat_percent(metrics: object, key: str) -> int | None:
+    """Read one coarse percentage out of the stored metrics blob."""
+    if not isinstance(metrics, dict):
+        return None
+    value = metrics.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _heartbeat_resource_sample(
+    heartbeat: ValidatorHeartbeat | None,
+) -> HostResourceSample:
+    """Read the last reported host utilisation, per resource.
 
     Unknown is deliberately not treated as a tripped breaker: a validator that
     reports no metrics must not lose the slots it already had.
     """
     if heartbeat is None:
-        return None
+        return HostResourceSample()
     metrics = heartbeat.system_metrics
-    if not isinstance(metrics, dict):
-        return None
-    value = metrics.get("disk_percent")
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value
+    return HostResourceSample(
+        cpu_percent=_heartbeat_percent(metrics, "cpu_percent"),
+        memory_percent=_heartbeat_percent(metrics, "memory_percent"),
+        disk_percent=_heartbeat_percent(metrics, "disk_percent"),
+    )
 
 
 async def _validator_slot_settings(request: Request) -> ValidatorSlotSettings:
@@ -877,7 +897,7 @@ async def _issue_source_backfill_ticket(
                 allowed_slot_count(
                     slot_settings,
                     advertised_slots=len(capacity.healthy_slots),
-                    disk_percent=_heartbeat_disk_percent(candidate),
+                    sample=_heartbeat_resource_sample(candidate),
                 )
                 if capacity.admission == "accepting"
                 else 0
@@ -2163,11 +2183,11 @@ async def request_job(
             # The exemption cannot be forged -- heartbeat ingest drops any
             # active slot with no matching open ticket -- so ``capacity.active``
             # only ever names slots the platform itself leased.
-            disk_percent = _heartbeat_disk_percent(heartbeat)
+            resource_sample = _heartbeat_resource_sample(heartbeat)
             allowed_slots = allowed_slot_count(
                 slot_settings,
                 advertised_slots=capacity.configured_slots,
-                disk_percent=disk_percent,
+                sample=resource_sample,
             )
             if _slot_cap_declines(
                 slot_id=slot_id,
@@ -2186,7 +2206,7 @@ async def request_job(
                         slot_id=slot_id,
                         settings=slot_settings,
                         advertised_slots=capacity.configured_slots,
-                        disk_percent=disk_percent,
+                        sample=resource_sample,
                     ),
                     validator_hotkey=payload.validator_hotkey,
                     slot_id=slot_id,

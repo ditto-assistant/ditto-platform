@@ -24,13 +24,16 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from ditto.api_models.validator_slot_settings import CEILING_DISABLED
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.validator_slot_settings import (
     DEFAULT_SETTINGS,
+    HostResourceSample,
     ValidatorSlotSettingsResolver,
     allowed_slot_count,
-    disk_ceiling_tripped,
+    blocked_resources,
     settings_from_row,
+    throttled_resources,
 )
 from ditto.db.models import ValidatorSlotSettingsRevision
 from ditto.tests.pgharness import Dsn
@@ -77,9 +80,26 @@ def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
 
 
 def _settings(**overrides: Any) -> dict[str, Any]:
-    base: dict[str, Any] = {"max_concurrent_slots": 4, "disk_percent_ceiling": 90}
+    """A COMPLETE policy body, as backroom is required to send.
+
+    Every key is spelled out on purpose. Backroom parses this object with a
+    ``z.object``, which strips keys it does not declare, so a body that omits a
+    field is exactly the shape that silently resets that field to its default --
+    see :class:`~ditto.api_models.validator_slot_settings.ValidatorSlotSettings`.
+    """
+    base: dict[str, Any] = {
+        "max_concurrent_slots": 4,
+        "disk_percent_ceiling": 90,
+        "memory_percent_ceiling": 90,
+        "cpu_percent_ceiling": CEILING_DISABLED,
+        "resource_block_percent_ceiling": 95,
+    }
     base.update(overrides)
     return base
+
+
+def _disk(percent: int | None) -> HostResourceSample:
+    return HostResourceSample(disk_percent=percent)
 
 
 def _payload(
@@ -143,6 +163,9 @@ class TestDefaultsAndRoundTrip:
         assert body["default"] == {
             "max_concurrent_slots": 2,
             "disk_percent_ceiling": 90,
+            "memory_percent_ceiling": 90,
+            "cpu_percent_ceiling": 0,
+            "resource_block_percent_ceiling": 95,
         }
         assert body["effective"]["source"] == "default"
         assert body["effective"]["revision"] == 0
@@ -184,12 +207,59 @@ class TestDefaultsAndRoundTrip:
         resp = await client.post(
             _URL,
             headers=_ADMIN_HEADERS,
-            json=_payload(max_concurrent_slots=6, disk_percent_ceiling=75),
+            json=_payload(
+                max_concurrent_slots=6,
+                disk_percent_ceiling=75,
+                memory_percent_ceiling=85,
+                cpu_percent_ceiling=95,
+                resource_block_percent_ceiling=100,
+            ),
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["settings"] == {
             "max_concurrent_slots": 6,
             "disk_percent_ceiling": 75,
+            "memory_percent_ceiling": 85,
+            "cpu_percent_ceiling": 95,
+            "resource_block_percent_ceiling": 100,
+        }
+
+    async def test_an_omitted_ceiling_falls_back_to_its_shipped_default(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        settings_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Pins the backroom ``z.object`` hazard, in the safe direction.
+
+        Backroom strips keys its schema does not declare, so a stale backroom
+        sends a body missing the new ceilings. The platform must not 422 that
+        write (which would make the policy unwritable) and must not invent a
+        permissive value: it falls back to the shipped default, which is the
+        conservative one. The matching backroom schema change is what stops the
+        reset from happening at all.
+        """
+        _install(app, settings_maker)
+        resp = await client.post(
+            _URL,
+            headers=_ADMIN_HEADERS,
+            json={
+                "scope": "*",
+                "expected_revision": 0,
+                "settings": {"max_concurrent_slots": 3, "disk_percent_ceiling": 90},
+                "reason": "a backroom that predates the resource ceilings",
+                "actor": "backroom:test",
+                "confirmation": "APPLY VALIDATOR SLOT CAP 3",
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["settings"] == {
+            "max_concurrent_slots": 3,
+            "disk_percent_ceiling": 90,
+            "memory_percent_ceiling": 90,
+            "cpu_percent_ceiling": 0,
+            "resource_block_percent_ceiling": 95,
         }
 
     async def test_kill_switch_to_one_slot(
@@ -308,6 +378,18 @@ class TestValidation:
             {"disk_percent_ceiling": 49},  # below 50
             {"disk_percent_ceiling": 101},  # above 100
             {"disk_percent_ceiling": 87},  # off the heartbeat's 5% grid
+            {"memory_percent_ceiling": 49},
+            {"memory_percent_ceiling": 101},
+            {"memory_percent_ceiling": 87},
+            {"cpu_percent_ceiling": 49},
+            {"cpu_percent_ceiling": 101},
+            {"cpu_percent_ceiling": 87},
+            {"resource_block_percent_ceiling": 49},
+            {"resource_block_percent_ceiling": 101},
+            {"resource_block_percent_ceiling": 87},
+            # A hard stop below the throttle makes the throttle unreachable.
+            {"disk_percent_ceiling": 95, "resource_block_percent_ceiling": 90},
+            {"memory_percent_ceiling": 95, "resource_block_percent_ceiling": 90},
         ],
     )
     async def test_out_of_range_values_rejected(
@@ -328,6 +410,8 @@ class TestValidation:
         [
             {"max_concurrent_slots": "4"},  # strict: no string coercion
             {"disk_percent_ceiling": 90.0},  # strict: no float coercion
+            {"memory_percent_ceiling": "90"},
+            {"resource_block_percent_ceiling": 95.0},
         ],
     )
     async def test_strict_types_rejected(
@@ -366,6 +450,38 @@ class TestValidation:
         payload["reason"] = "nope"
         resp = await client.post(_URL, headers=_ADMIN_HEADERS, json=payload)
         assert resp.status_code == 422
+
+
+class TestCeilingsCanBeDisabled:
+    """Zero is the documented "do not gate on this" value, not an out-of-range one."""
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"cpu_percent_ceiling": 0},
+            {"memory_percent_ceiling": 0},
+            {"disk_percent_ceiling": 0},
+            {"resource_block_percent_ceiling": 0},
+            {
+                "disk_percent_ceiling": 0,
+                "memory_percent_ceiling": 0,
+                "cpu_percent_ceiling": 0,
+                "resource_block_percent_ceiling": 0,
+            },
+        ],
+    )
+    async def test_zero_is_accepted(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        settings_maker: async_sessionmaker[AsyncSession],
+        overrides: dict[str, Any],
+    ) -> None:
+        _install(app, settings_maker)
+        resp = await client.post(
+            _URL, headers=_ADMIN_HEADERS, json=_payload(**overrides)
+        )
+        assert resp.status_code == 200, resp.text
 
 
 class TestAppendOnlyHistory:
@@ -502,19 +618,22 @@ class TestResolverFailClosed:
 class TestSlotArithmetic:
     def test_cap_only_narrows_what_is_advertised(self) -> None:
         settings = DEFAULT_SETTINGS.model_copy(update={"max_concurrent_slots": 4})
-        assert allowed_slot_count(settings, advertised_slots=8, disk_percent=10) == 4
-        assert allowed_slot_count(settings, advertised_slots=2, disk_percent=10) == 2
-        assert allowed_slot_count(settings, advertised_slots=0, disk_percent=10) == 0
+        assert allowed_slot_count(settings, advertised_slots=8, sample=_disk(10)) == 4
+        assert allowed_slot_count(settings, advertised_slots=2, sample=_disk(10)) == 2
+        assert allowed_slot_count(settings, advertised_slots=0, sample=_disk(10)) == 0
 
     def test_disk_ceiling_holds_a_full_host_to_one_slot(self) -> None:
         settings = DEFAULT_SETTINGS.model_copy(update={"max_concurrent_slots": 8})
-        assert allowed_slot_count(settings, advertised_slots=8, disk_percent=85) == 8
-        assert allowed_slot_count(settings, advertised_slots=8, disk_percent=90) == 1
-        assert allowed_slot_count(settings, advertised_slots=8, disk_percent=95) == 1
+        assert allowed_slot_count(settings, advertised_slots=8, sample=_disk(85)) == 8
+        assert allowed_slot_count(settings, advertised_slots=8, sample=_disk(90)) == 1
+        # Past the shared hard stop it is not one slot, it is none.
+        assert allowed_slot_count(settings, advertised_slots=8, sample=_disk(95)) == 0
         # Missing telemetry is not evidence of a full disk.
-        assert allowed_slot_count(settings, advertised_slots=8, disk_percent=None) == 8
-        assert not disk_ceiling_tripped(settings, disk_percent=None)
-        assert disk_ceiling_tripped(settings, disk_percent=100)
+        assert allowed_slot_count(settings, advertised_slots=8, sample=_disk(None)) == 8
+        assert not throttled_resources(settings, _disk(None))
+        assert not blocked_resources(settings, _disk(None))
+        assert throttled_resources(settings, _disk(100)) == ("disk",)
+        assert blocked_resources(settings, _disk(100)) == ("disk",)
 
 
 class TestHotSwap:
@@ -566,7 +685,7 @@ class TestHotSwap:
         assert applied.status_code == 200, applied.text
         settings = await resolver.resolve(settings_maker)
         assert settings.disk_percent_ceiling == 70
-        assert allowed_slot_count(settings, advertised_slots=4, disk_percent=75) == 1
+        assert allowed_slot_count(settings, advertised_slots=4, sample=_disk(75)) == 1
 
     async def test_cached_read_is_bounded_by_the_ttl(
         self,
