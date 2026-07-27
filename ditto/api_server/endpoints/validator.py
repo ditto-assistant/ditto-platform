@@ -254,6 +254,7 @@ from ditto.metrics import (
     VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED,
     DispatchDeclineReason,
 )
+from ditto.score_order import rank_submissions
 
 if TYPE_CHECKING:
     from ditto.api_server.config import InferenceProxyConfig
@@ -2628,7 +2629,7 @@ async def _current_koth_entries(
         )
         if row.eligible and row.composite > 0.0
     ]
-    rows.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
+    rows = rank_submissions(rows)
     quorum = await quorum_composites(
         session,
         [row.agent_id for row in rows],

@@ -66,6 +66,7 @@ from ditto.db.queries.validator_auth import (
     ValidatorRequestReplayError,
     consume_validator_nonce,
 )
+from ditto.score_order import rank_submissions
 
 logger = logging.getLogger(__name__)
 
@@ -347,7 +348,7 @@ async def scores(
         return _serve_last_known(request, x_validator_hotkey, e)
 
     raw_candidates = [row for row in rows if row.eligible and row.composite > 0.0]
-    raw_candidates.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
+    raw_candidates = rank_submissions(raw_candidates)
     raw_projection = project_koth(
         [
             KothEntry(

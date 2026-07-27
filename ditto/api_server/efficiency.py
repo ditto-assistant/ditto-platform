@@ -46,6 +46,8 @@ from statistics import median
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+from ditto.score_order import rank_submissions
+
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -192,8 +194,9 @@ def dedupe_lineages(
 ) -> list[CohortMember]:
     """Collapse candidates sharing a lineage key to one entry each.
 
-    The surviving entry is the best-scoring one (highest composite, then
-    earliest ``first_seen``, then lowest ``agent_id`` — fully deterministic).
+    The surviving entry is the best-scoring one, picked with the canonical
+    comparator (:func:`ditto.score_order.rank_submissions`):
+    highest composite, then earliest ``first_seen``, then lowest ``agent_id``.
     Candidates without an audited token total never reach this function.
     """
     by_lineage: dict[str, list[EfficiencyCandidate]] = {}
@@ -201,10 +204,7 @@ def dedupe_lineages(
         by_lineage.setdefault(candidate.lineage_key, []).append(candidate)
     members: list[CohortMember] = []
     for key, group in by_lineage.items():
-        ordered = sorted(
-            group,
-            key=lambda c: (-c.composite, c.first_seen, str(c.agent_id)),
-        )
+        ordered = rank_submissions(group)
         best = ordered[0]
         assert best.token_total is not None  # filtered upstream
         members.append(

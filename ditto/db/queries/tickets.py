@@ -16,6 +16,7 @@ lock guarantees one validator cannot hold two live assignments across agents.
 from __future__ import annotations
 
 from collections.abc import Collection
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
@@ -53,6 +54,10 @@ from ditto.db.queries.queue_order import (
     resolve_fifo_start_at,
     resolve_owner_linkage,
     selected_owner_agent_id,
+)
+from ditto.db.queries.score_ranking import (
+    rank_submissions,
+    resolve_ranking_scores,
 )
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
@@ -120,19 +125,34 @@ def retry_budget_spent() -> ColumnElement[bool]:
 # that already import them from this module.
 
 
+@dataclass(frozen=True)
+class ScoreFloor:
+    """One queue floor: the number, and the ledger row it was cut from."""
+
+    row: LedgerRow
+    score: float
+    """The holder's ``official_composite`` -- the number the board ranks it on,
+    which is not in general the raw quorum median on :attr:`row`."""
+
+
 async def get_score_priority_floor_rows(
     session: AsyncSession, *, bench_version: int | None = None
-) -> tuple[LedgerRow | None, LedgerRow | None]:
-    """Return the ledger rows that *hold* the fifth- and tenth-place floors.
+) -> tuple[ScoreFloor | None, ScoreFloor | None]:
+    """Return the fifth- and tenth-place floors with the rows that hold them.
 
-    The floats alone are not checkable by a miner. Both floors are cut from
-    :func:`list_eligible_ledger`, which orders by ``composite`` -- the canonical
-    quorum median -- while the public board's ``rank`` orders by
-    ``official_composite`` (the continual-mean estimator). Those two orderings
-    agree only until some agent completes a continual wave, so "the fifth-place
-    score" names two different agents depending on which surface you read. Any
-    message that quotes a floor must therefore be able to name the row it came
-    from; that is what these return.
+    Both floors are cut in the canonical order
+    (:func:`ditto.score_order.rank_submissions`) on the canonical
+    score (``official_composite``, the continual-mean estimator), which is the
+    same order and the same number the public board's ``rank`` and the
+    validator's weight fold read. The floors used to be cut on the raw
+    ``composite`` the ledger read happens to return, so "fifth place" named two
+    different agents depending on which surface you asked -- and, worse, the
+    gate the floor drives claims a submission "cannot reach the emission set"
+    while emission-set membership is decided by ``official_composite``.
+
+    The floats alone are still not checkable by a miner, so these return the
+    rows: any message that quotes a floor must be able to name the row it came
+    from.
 
     Returns ``(continuation_row, provisional_row)``, each ``None`` when the era
     has fewer eligible agents than the position needs.
@@ -142,41 +162,49 @@ async def get_score_priority_floor_rows(
         for row in await list_eligible_ledger(
             session,
             include_fingerprints=False,
-            include_details=False,
             bench_version=bench_version,
         )
         if row.eligible
     ]
-    continuation = (
-        eligible[EMISSION_CONTENDER_COUNT - 1]
-        if len(eligible) >= EMISSION_CONTENDER_COUNT
-        else None
+    # Nothing below rank five can move either floor, so an era still filling up
+    # never pays for the continual-mean reads.
+    if len(eligible) < EMISSION_CONTENDER_COUNT:
+        return None, None
+    official = await resolve_ranking_scores(
+        session, rows=eligible, bench_version=bench_version
     )
-    provisional = (
-        eligible[PROVISIONAL_CONTENDER_LANE_SIZE - 1]
-        if len(eligible) >= PROVISIONAL_CONTENDER_LANE_SIZE
-        else None
-    )
-    return continuation, provisional
+    ranked = rank_submissions(eligible, scores=official)
+
+    def floor_at(position: int) -> ScoreFloor | None:
+        if len(ranked) < position:
+            return None
+        row = ranked[position - 1]
+        return ScoreFloor(row=row, score=official.get(row.agent_id, row.composite))
+
+    return floor_at(EMISSION_CONTENDER_COUNT), floor_at(PROVISIONAL_CONTENDER_LANE_SIZE)
 
 
 async def get_score_priority_floors(
     session: AsyncSession, *, bench_version: int | None = None
 ) -> tuple[float | None, float | None]:
-    """Return finalized fifth-place and tenth-place floors for one benchmark era."""
+    """Return finalized fifth-place and tenth-place floors for one benchmark era.
+
+    The floats are the holders' ``official_composite`` -- the number the board
+    ranks them on -- not the raw quorum median stored on the ledger row.
+    """
     continuation, provisional = await get_score_priority_floor_rows(
         session, bench_version=bench_version
     )
     return (
-        continuation.composite if continuation is not None else None,
-        provisional.composite if provisional is not None else None,
+        continuation.score if continuation is not None else None,
+        provisional.score if provisional is not None else None,
     )
 
 
 async def get_score_continuation_floor_row(
     session: AsyncSession, *, bench_version: int | None = None
-) -> LedgerRow | None:
-    """Return the ledger row holding the fifth-place continuation floor.
+) -> ScoreFloor | None:
+    """Return the fifth-place continuation floor and the row that holds it.
 
     Same selection as :func:`get_score_continuation_floor`, kept as one call so
     the quoted number and the agent it belongs to can never come from two
@@ -206,11 +234,14 @@ async def get_score_continuation_floor(
     Returns ``None`` when the era does not yet have five eligible agents, which
     correctly disables the floor for a benchmark version still filling up.
 
-    The cut is by ``composite``, so this is the fifth-highest finalized
-    composite, not whichever row the public board shows at ``rank: 5`` (that
-    board orders by ``official_composite``). Use
-    :func:`get_score_continuation_floor_row` when the number has to be
-    attributed to an agent a miner can look up.
+    The cut is by ``official_composite`` in the canonical order, so this IS the
+    score of the row the public board shows at ``rank: 5`` among finalized
+    entries. That is deliberate: the gate this floor drives says a submission
+    "cannot reach the emission set", and emission-set membership is decided by
+    ``official_composite`` in :func:`ditto.api_server.koth.project_koth`. Cutting
+    the floor on the raw quorum median instead was gating on a number nothing
+    downstream ranks by. Use :func:`get_score_continuation_floor_row` when the
+    number has to be attributed to an agent a miner can look up.
     """
     continuation, _ = await get_score_priority_floors(
         session, bench_version=bench_version

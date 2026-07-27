@@ -32,6 +32,7 @@ from ditto.db.models import (
     Score,
 )
 from ditto.db.queries.agents import get_agent_by_id
+from ditto.score_order import score_order_key, score_order_terms
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -1049,11 +1050,11 @@ async def list_eligible_ledger(
             partition_by=authoritative.c.emission_owner,
             # Eligible-first so a miner is represented by their best full-benchmark
             # agent, not an inflated smoke run; composite breaks ties within a tier.
-            order_by=(
-                authoritative.c.eligible.desc(),
-                authoritative.c.composite.desc(),
-                authoritative.c.first_seen.asc(),
-                authoritative.c.agent_id.asc(),
+            order_by=score_order_terms(
+                eligible=authoritative.c.eligible,
+                composite=authoritative.c.composite,
+                first_seen=authoritative.c.first_seen,
+                agent_id=authoritative.c.agent_id,
             ),
         )
         .label("rn")
@@ -1063,12 +1064,17 @@ async def list_eligible_ledger(
         select(ranked)
         .where(ranked.c.rn == 1)
         # Eligible (ranked) entries first, then provisional ones; the public rank
-        # and the validator fold both read this order.
+        # and the validator fold both read this order. This is the raw-composite
+        # cut: it is the pool the continual mean is computed OVER, so it must not
+        # itself be ordered by the continual mean. Callers that publish a
+        # standing re-rank with ``rank_submissions(..., scores=official)``.
         .order_by(
-            ranked.c.eligible.desc(),
-            ranked.c.composite.desc(),
-            ranked.c.first_seen.asc(),
-            ranked.c.agent_id.asc(),
+            *score_order_terms(
+                eligible=ranked.c.eligible,
+                composite=ranked.c.composite,
+                first_seen=ranked.c.first_seen,
+                agent_id=ranked.c.agent_id,
+            )
         )
     )
     result = await session.execute(stmt)
@@ -1250,14 +1256,9 @@ async def list_provisional_ledger(
             )
         )
 
-    candidates.sort(
-        key=lambda candidate: (
-            not candidate[0].eligible,
-            -candidate[0].composite,
-            candidate[0].first_seen,
-            str(candidate[0].agent_id),
-        ),
-    )
+    # A provisional row has no continual mean to rank on -- it has not reached
+    # quorum -- so the canonical comparator reads its raw composite here.
+    candidates.sort(key=lambda candidate: score_order_key(candidate[0]))
     best_by_owner: dict[str, tuple[LedgerRow, int]] = {}
     for candidate in candidates:
         best_by_owner.setdefault(
