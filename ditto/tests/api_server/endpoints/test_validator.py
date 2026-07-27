@@ -3628,7 +3628,6 @@ class TestArtifactFetchAudit:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
         monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A logging fault must never become a scoring outage.
 
@@ -3652,8 +3651,12 @@ class TestArtifactFetchAudit:
             "ditto.db.queries.artifact_fetch_audit.ArtifactFetchAudit",
             _explode,
         )
+        logged: list[str] = []
+        monkeypatch.setattr(
+            "ditto.db.queries.artifact_fetch_audit.logger.exception",
+            lambda message, *args, **_kwargs: logged.append(message % args),
+        )
 
-        caplog.set_level(logging.ERROR)
         response = await client.get(
             f"/api/v1/validator/agent/{agent_id}/artifact",
             headers=_artifact_headers(agent_id),
@@ -3665,7 +3668,7 @@ class TestArtifactFetchAudit:
         assert body["download_url"].startswith("https://")
         assert body["sha256"] == _SHA256
         # ...and the gap is loud, not silent: this is the string alerting keys on.
-        assert AUDIT_WRITE_FAILED in caplog.text
+        assert any(AUDIT_WRITE_FAILED in message for message in logged)
         async with session_maker() as s:
             assert (
                 await s.scalar(select(func.count()).select_from(ArtifactFetchAudit))
@@ -3674,10 +3677,14 @@ class TestArtifactFetchAudit:
     async def test_audit_write_failure_is_swallowed_and_logged(
         self,
         session_maker: async_sessionmaker[AsyncSession],
-        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The helper itself never raises, and never fails silently."""
-        caplog.set_level(logging.ERROR)
+        logged: list[str] = []
+        monkeypatch.setattr(
+            "ditto.db.queries.artifact_fetch_audit.logger.exception",
+            lambda message, *args, **_kwargs: logged.append(message % args),
+        )
         async with session_maker() as s:
             wrote = await record_artifact_fetch(
                 s,
@@ -3690,7 +3697,7 @@ class TestArtifactFetchAudit:
             )
 
         assert wrote is False
-        assert AUDIT_WRITE_FAILED in caplog.text
+        assert any(AUDIT_WRITE_FAILED in message for message in logged)
 
 
 class TestArtifact:
