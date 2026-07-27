@@ -201,7 +201,8 @@ from ditto.db.queries.artifact_release import (
     list_first_score_quorums,
 )
 from ditto.db.queries.artifact_release_settings import (
-    artifact_release_embargo_hours,
+    ArtifactReleasePolicy,
+    artifact_release_policy,
 )
 from ditto.db.queries.audit import GENESIS_HASH, list_audit_entries
 from ditto.db.queries.benchmark_admission import (
@@ -714,7 +715,7 @@ def _public_artifact_release(
     *,
     status: AgentStatus,
     score_quorum: ArtifactScoreQuorum | None,
-    embargo_hours: int,
+    policy: ArtifactReleasePolicy,
     king_reveal: KingReveal | None,
     now: datetime,
 ) -> PublicArtifactRelease:
@@ -727,7 +728,16 @@ def _public_artifact_release(
     (``king_reveal.weight_confirmed_at``), not from the score quorum. An agent
     that touched the crown but is not yet chain-confirmed stays ``embargoed``
     with no unlock time; one that never reigned stays ``unavailable`` forever.
+
+    Subnet policy short-circuits all of that. It is checked first, ahead of
+    even the rejected/banned branch, because it is the one input whose answer
+    does not depend on the submission: under ``never`` every submission is
+    withheld identically, and checking it first means a future branch added
+    above the ladder cannot accidentally publish one.
     """
+    if not policy.releases_publicly:
+        return PublicArtifactRelease(status="withheld", disclosure="never")
+
     if status in (AgentStatus.REJECTED, AgentStatus.BANNED):
         return PublicArtifactRelease(status="unavailable")
 
@@ -737,7 +747,7 @@ def _public_artifact_release(
         king_reveal.weight_confirmed_at if king_reveal is not None else None
     )
     available_at = (
-        weight_confirmed_at + timedelta(hours=embargo_hours)
+        weight_confirmed_at + timedelta(hours=policy.embargo_hours)
         if weight_confirmed_at is not None
         else None
     )
@@ -766,7 +776,7 @@ def _public_artifact_release(
             score_quorum.bench_version if score_quorum is not None else None
         ),
         score_quorum=SCORING_QUORUM,
-        embargo_hours=embargo_hours,
+        embargo_hours=policy.embargo_hours,
         finalized_at=finalized_at,
         crowned_at=first_crowned_at,
         weight_confirmed_at=weight_confirmed_at,
@@ -795,12 +805,14 @@ async def _artifact_release_snapshot(
         quorum=SCORING_QUORUM,
     )
     king_reveals = await get_king_reveal(session, agent_ids=list(statuses))
-    embargo_hours = await artifact_release_embargo_hours(session)
+    # One policy read for the whole batch: the setting is subnet-wide, so there
+    # is nothing per-agent to look up and no per-agent column to join.
+    policy = await artifact_release_policy(session)
     return {
         agent_id: _public_artifact_release(
             status=status,
             score_quorum=score_quorums.get(agent_id),
-            embargo_hours=embargo_hours,
+            policy=policy,
             king_reveal=king_reveals.get(agent_id),
             now=now,
         )
@@ -4104,6 +4116,25 @@ async def agent_artifact(
         raise HTTPException(status_code=404, detail="source is not publicly available")
 
     now = datetime.now(UTC)
+    # Re-read the live policy on the request that is about to mint a public
+    # credential, rather than trusting the batch projection. This is the only
+    # place in the platform that hands out a public URL for miner source, so it
+    # is the one place the policy has to be checked against the database and
+    # not against a value computed for a different response.
+    #
+    # 403, not 404 and not 425. 404 would deny the submission exists (it does,
+    # and the rest of its record is public). 425 means "too early" and invites
+    # a retry that will never succeed under this policy.
+    policy = await artifact_release_policy(session)
+    if not policy.releases_publicly:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "subnet policy withholds all submitted source from public "
+                "release; no source is published, however long you wait"
+            ),
+        )
+
     score_quorum = (
         await list_first_score_quorums(
             session, agent_ids=[agent_id], quorum=SCORING_QUORUM
@@ -4121,7 +4152,7 @@ async def agent_artifact(
     release = _public_artifact_release(
         status=agent.status,
         score_quorum=score_quorum,
-        embargo_hours=await artifact_release_embargo_hours(session),
+        policy=policy,
         king_reveal=king_reveal,
         now=now,
     )

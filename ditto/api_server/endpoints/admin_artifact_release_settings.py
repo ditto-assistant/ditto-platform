@@ -16,10 +16,12 @@ from ditto.api_models.artifact_release_settings import (
 from ditto.api_models.artifact_release_settings import (
     ArtifactReleaseSettingsRevision as RevisionModel,
 )
+from ditto.api_models.source_disclosure import SourceDisclosure, release_confirmation
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
 from ditto.db.models import ArtifactReleaseSettingsRevision
 from ditto.db.queries.artifact_release_settings import (
+    DEFAULT_ARTIFACT_RELEASE_DISCLOSURE,
     DEFAULT_ARTIFACT_RELEASE_EMBARGO_HOURS,
     latest_artifact_release_settings,
 )
@@ -33,6 +35,7 @@ def _revision(row: ArtifactReleaseSettingsRevision) -> RevisionModel:
     return RevisionModel(
         revision=row.revision,
         parent_revision=row.parent_revision,
+        disclosure=SourceDisclosure(row.disclosure),
         embargo_hours=row.embargo_hours,
         reason=row.reason,
         actor=row.actor,
@@ -44,6 +47,7 @@ def _default_revision() -> RevisionModel:
     return RevisionModel(
         revision=0,
         parent_revision=0,
+        disclosure=DEFAULT_ARTIFACT_RELEASE_DISCLOSURE,
         embargo_hours=DEFAULT_ARTIFACT_RELEASE_EMBARGO_HOURS,
         reason="Built-in privacy-first default",
         actor="platform",
@@ -75,15 +79,29 @@ async def create_settings_revision(
     _admin: AdminDep,
     session: SessionDep,
 ) -> RevisionModel:
-    """Set the global embargo with CAS and an append-only audit record.
+    """Set the global release policy with CAS and an append-only audit record.
 
-    The window may be shortened or lengthened anywhere in the 6-to-720-hour
-    range; 48 hours remains the community-agreed default, not a cap.
-    Shortening still releases source earlier and cannot be reversed, so the
-    console surfaces that warning; the server only enforces the CAS revision
-    and the exact confirmation phrase.
+    Two values on one revision. ``disclosure`` says whether source is ever
+    published; ``embargo_hours`` says how soon, anywhere in the 6-hour-to-one-
+    year range. 48 hours remains the community-agreed default, not a cap.
+
+    They are written together because they are one decision. Split across two
+    endpoints, a policy change from "48 hours" to "never" would be two writes
+    with a window between them in which the subnet was in neither state, and
+    the audit would record a transition nobody chose.
+
+    ``embargo_hours`` stays required and in range even when disclosure is
+    ``never``: it is retained so that returning to ``public`` restores the
+    window the subnet last agreed on, rather than forcing one to be re-chosen
+    under whatever pressure prompted the reversal.
+
+    Shortening a window still releases source earlier and cannot be reversed,
+    so the console surfaces that warning; the server only enforces the CAS
+    revision and the exact confirmation phrase.
     """
-    expected_confirmation = f"SET SOURCE EMBARGO {payload.embargo_hours} HOURS"
+    expected_confirmation = release_confirmation(
+        payload.disclosure, payload.embargo_hours
+    )
     if payload.confirmation != expected_confirmation:
         raise HTTPException(
             status_code=409,
@@ -103,6 +121,7 @@ async def create_settings_revision(
 
     row = ArtifactReleaseSettingsRevision(
         parent_revision=actual_revision,
+        disclosure=payload.disclosure.value,
         embargo_hours=payload.embargo_hours,
         reason=payload.reason.strip(),
         actor=payload.actor.strip(),

@@ -286,8 +286,37 @@ class PublicArtifactRelease(BaseModel):
     """Public-source eligibility derived from a submission's score quorum."""
 
     status: Literal[
-        "awaiting_quorum", "under_review", "embargoed", "available", "unavailable"
+        "awaiting_quorum",
+        "under_review",
+        "embargoed",
+        "available",
+        "unavailable",
+        "withheld",
     ]
+    """Where this submission sits on the release ladder.
+
+    ``withheld`` is the only value that does not describe a stage of the
+    release process: subnet policy is ``disclosure = never``, so no submission
+    is published at all. It is deliberately distinct from ``unavailable``,
+    which means "not eligible under the king-only rule" and flips to
+    ``embargoed`` the moment that submission is crowned. A client that
+    conflates the two shows a withheld submission as merely un-crowned and
+    implies it could still be published by winning.
+    """
+
+    disclosure: Annotated[
+        Literal["public", "never"],
+        Field(
+            default="public",
+            description=(
+                "Subnet-wide source-disclosure policy, identical for every "
+                "submission. 'never' means no source is published at all; the "
+                "screener, the k=3 validators and operator copy review still "
+                "read it, so submissions are scored and plagiarism-checked "
+                "exactly as before."
+            ),
+        ),
+    ] = "public"
     bench_version: Annotated[int | None, Field(default=None, ge=1)] = None
     score_quorum: Annotated[int, Field(default=3, ge=1)] = 3
     embargo_hours: Annotated[int, Field(default=6, ge=1)] = 6

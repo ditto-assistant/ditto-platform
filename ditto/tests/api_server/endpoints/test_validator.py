@@ -84,6 +84,7 @@ from ditto.chain.models import NeuronInfo
 from ditto.db.models import (
     Agent,
     ArtifactFetchAudit,
+    ArtifactReleaseSettingsRevision,
     AthReview,
     BenchmarkDataset,
     BenchmarkRollout,
@@ -3082,6 +3083,49 @@ class TestArtifact:
         assert body["screened_image_sha256"] is None
         assert body["bench_version"] == 3
         storage.presigned_get_url.assert_awaited_once()
+        assert (
+            storage.presigned_get_url.await_args.kwargs["key"]
+            == f"{agent_id}/agent.tar.gz"
+        )
+
+    async def test_a_never_disclose_policy_still_serves_a_ticketed_validator(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Under `never`, submissions are scored exactly as before.
+
+        Same deliberate choice as the screener path, same reason:
+        `disclosure = never` governs the public release route, not who may
+        execute the code. A validator that could not fetch the tarball could
+        not produce a k=3 score, and the subnet would stop paying anyone.
+        """
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, bench_version=3)
+        async with session_maker() as session, session.begin():
+            head = await session.scalar(
+                select(func.max(ArtifactReleaseSettingsRevision.revision))
+            )
+            session.add(
+                ArtifactReleaseSettingsRevision(
+                    parent_revision=head or 0,
+                    disclosure="never",
+                    embargo_hours=48,
+                    reason="Subnet policy: submitted source is not published",
+                    actor="operator@example.com",
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+
+        response = await client.get(
+            f"/api/v1/validator/agent/{agent_id}/artifact",
+            headers=_artifact_headers(agent_id),
+        )
+        assert response.status_code == 200
+        assert response.json()["agent_id"] == str(agent_id)
         assert (
             storage.presigned_get_url.await_args.kwargs["key"]
             == f"{agent_id}/agent.tar.gz"

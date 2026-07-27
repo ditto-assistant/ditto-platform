@@ -20,7 +20,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -68,6 +68,7 @@ from ditto.chain.models import BlockInfo, NeuronInfo
 from ditto.db.models import (
     Agent,
     ArtifactFetchAudit,
+    ArtifactReleaseSettingsRevision,
     BenchmarkDataset,
     BenchmarkRollout,
     EvaluationPayment,
@@ -3087,6 +3088,52 @@ class TestArtifact:
         assert body["agent_id"] == str(agent_id)
         assert body["sha256"] == _SHA256
         assert body["download_url"].startswith("https://")
+        assert (
+            storage.presigned_get_url.await_args.kwargs["key"]
+            == f"{agent_id}/agent.tar.gz"
+        )
+
+    async def test_a_never_disclose_policy_still_serves_the_screener(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Under `never`, submissions are screened exactly as before.
+
+        A deliberate policy choice, pinned here so nobody later "fixes" it into
+        a leak-proof-looking gate. `disclosure = never` withholds source from
+        the **public** release path. Extending it to the screener would mean no
+        submission could ever be screened, therefore never scored, and the
+        subnet would stop -- which is not a privacy policy, it is an outage.
+        """
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        async with session_maker() as session, session.begin():
+            head = await session.scalar(
+                select(func.max(ArtifactReleaseSettingsRevision.revision))
+            )
+            session.add(
+                ArtifactReleaseSettingsRevision(
+                    parent_revision=head or 0,
+                    disclosure="never",
+                    embargo_hours=48,
+                    reason="Subnet policy: submitted source is not published",
+                    actor="operator@example.com",
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        storage = _install_storage(app)
+        claim = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        attempt_id = claim.json()["items"][0]["attempt_id"]
+
+        response = await client.get(
+            f"/api/v1/screener/agent/{agent_id}/artifact",
+            headers=_AUTH_HEADER,
+            params={"attempt_id": attempt_id},
+        )
+        assert response.status_code == 200
+        assert response.json()["agent_id"] == str(agent_id)
         assert (
             storage.presigned_get_url.await_args.kwargs["key"]
             == f"{agent_id}/agent.tar.gz"

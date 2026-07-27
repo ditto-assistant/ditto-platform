@@ -5997,6 +5997,241 @@ class TestPublicArtifactRelease:
         storage.presigned_get_url.assert_not_awaited()
 
 
+async def _set_never(maker: async_sessionmaker[AsyncSession]) -> None:
+    """Append a `never` policy the way the admin board would.
+
+    Chains onto the current head: `parent_revision` is UNIQUE and the
+    migration chain seeds the operative default, so the table is never empty
+    in production.
+    """
+    async with maker() as session, session.begin():
+        head = await session.scalar(
+            select(func.max(ArtifactReleaseSettingsRevision.revision))
+        )
+        session.add(
+            ArtifactReleaseSettingsRevision(
+                parent_revision=head or 0,
+                disclosure="never",
+                embargo_hours=48,
+                reason="Subnet policy: submitted source is not published",
+                actor="operator@example.com",
+            )
+        )
+
+
+class TestNeverDiscloseReleasePolicy:
+    """`disclosure = never`: the subnet publishes no source at all.
+
+    The gate it overrides is narrow already -- king-only, chain-confirmed,
+    embargoed -- so the cases worth pinning are the ones where every other term
+    of that conjunction is satisfied and release still must not happen.
+    """
+
+    async def test_a_fully_released_king_is_withheld_under_the_never_policy(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        first_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.7, 0.8, 0.9]
+        )
+        second_id = await _seed_k3(
+            session_maker, miner=_MINER_B, composites=[0.4, 0.5, 0.6]
+        )
+        for agent_id in (first_id, second_id):
+            await _crown(
+                session_maker,
+                agent_id=agent_id,
+                first_crowned_at=now - timedelta(hours=72),
+            )
+        await _set_never(session_maker)
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+        storage.presigned_get_url.side_effect = lambda **kwargs: (
+            f"https://objects.example/{kwargs['key']}"
+        )
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        releases = {
+            entry["agent_id"]: entry["artifact_release"]
+            for entry in (await client.get("/api/v1/public/submissions")).json()[
+                "submissions"
+            ]
+        }
+        # Uniform: both submissions, identically, with no per-agent input to
+        # the decision. There is nothing here for a miner to opt into or out
+        # of, and so nothing to game.
+        assert {release["status"] for release in releases.values()} == {"withheld"}
+        assert {release["disclosure"] for release in releases.values()} == {"never"}
+        assert all(
+            release["download_available"] is False for release in releases.values()
+        )
+        assert all(release["available_at"] is None for release in releases.values())
+
+        for agent_id in (first_id, second_id):
+            refused = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+            # 403, not 425: 425 means "too early" and invites a retry loop
+            # that would never terminate.
+            assert refused.status_code == 403
+            assert "withholds all submitted source" in refused.json()["message"]
+
+        # The assertion that makes this a privacy policy rather than a label:
+        # no presigned URL was minted for anything.
+        storage.presigned_get_url.assert_not_awaited()
+
+    async def test_withholding_reaches_every_public_release_surface(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Gating one endpoint would be a false promise.
+
+        `artifact_release` is projected onto several public responses. A reader
+        who consults the leaderboard rather than `/submissions` must get the
+        same answer, or the console renders a download affordance the download
+        route then refuses.
+        """
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.7, 0.8, 0.9]
+        )
+        await _crown(
+            session_maker,
+            agent_id=agent_id,
+            first_crowned_at=now - timedelta(hours=72),
+        )
+        await _set_never(session_maker)
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        scores = (await client.get(f"/api/v1/public/agent/{agent_id}/scores")).json()[
+            "artifact_release"
+        ]
+        assert scores["status"] == "withheld"
+        assert scores["download_available"] is False
+
+        entry = next(
+            entry
+            for entry in (await client.get("/api/v1/public/leaderboard")).json()[
+                "entries"
+            ]
+            if entry["agent_id"] == agent_id
+        )
+        assert entry["artifact_release"]["status"] == "withheld"
+        assert entry["artifact_release"]["download_available"] is False
+
+        storage.presigned_get_url.assert_not_awaited()
+
+    async def test_the_rest_of_the_public_record_is_unchanged(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Withholding source withholds source. It is not a hidden retirement.
+
+        v7 is live and driving validator weights; a release-visibility setting
+        that also removed submissions from the ledger would be a scoring change
+        wearing a privacy label. Scores, the dataset pin and rank stay exactly
+        as public as they were.
+        """
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.7, 0.8, 0.9]
+        )
+        await _crown(
+            session_maker,
+            agent_id=agent_id,
+            first_crowned_at=now - timedelta(hours=72),
+        )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        before = (await client.get(f"/api/v1/public/agent/{agent_id}/scores")).json()
+        await _set_never(session_maker)
+        after = (await client.get(f"/api/v1/public/agent/{agent_id}/scores")).json()
+
+        assert after["artifact_release"] != before["artifact_release"]
+        # `generated_at` is the response timestamp and moves on every call.
+        volatile = {"artifact_release", "generated_at"}
+        assert {k: v for k, v in after.items() if k not in volatile} == {
+            k: v for k, v in before.items() if k not in volatile
+        }
+
+    async def test_a_year_long_window_is_embargoed_not_withheld(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A year and `never` are different answers, and stay distinguishable.
+
+        Under a long window the source is still going to be published, and the
+        response still carries the instant. Collapsing the two would erase the
+        one property that separates option 3 from option 4 -- that external
+        verification is delayed rather than abolished.
+        """
+        now = datetime.now(UTC)
+        agent_id = await _seed_k3(
+            session_maker, miner=_MINER_A, composites=[0.7, 0.8, 0.9]
+        )
+        await _crown(
+            session_maker,
+            agent_id=agent_id,
+            first_crowned_at=now - timedelta(hours=72),
+        )
+        async with session_maker() as session, session.begin():
+            head = await session.scalar(
+                select(func.max(ArtifactReleaseSettingsRevision.revision))
+            )
+            session.add(
+                ArtifactReleaseSettingsRevision(
+                    parent_revision=head or 0,
+                    disclosure="public",
+                    embargo_hours=8760,
+                    reason="Subnet policy: one-year disclosure window",
+                    actor="operator@example.com",
+                )
+            )
+        _install_db(app, session_maker)
+        storage = AsyncMock()
+
+        async def _storage():
+            return storage
+
+        app.dependency_overrides[get_storage_client] = _storage
+
+        release = (await client.get("/api/v1/public/submissions")).json()[
+            "submissions"
+        ][0]["artifact_release"]
+        assert release["status"] == "embargoed"
+        assert release["disclosure"] == "public"
+        assert release["embargo_hours"] == 8760
+        # The unlock instant is published: delayed disclosure, not withheld.
+        assert release["available_at"] is not None
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/artifact")
+        assert response.status_code == 425
+        storage.presigned_get_url.assert_not_awaited()
+
+
 async def _seed_audit(maker: async_sessionmaker[AsyncSession], *, n: int) -> None:
     """Append ``n`` chained score entries to the audit log."""
     async with maker() as s, s.begin():
