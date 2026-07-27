@@ -19,6 +19,7 @@ Each validator gets a bounded number of attempts **per benchmark version**:
 | `MAX_ATTEMPTS_PER_VERSION` | `2` | Base attempts a validator may spend on one agent+version. |
 | `manual_retry_grants` | `0`+ | Per-ticket operator extension; raises the cap for that ticket. |
 | `infra_retry_grants` | `0`–`8` | Per-ticket automatic extension earned when a lease fails on validator-side infrastructure; raises the cap so an outage doesn't spend the agent's budget. |
+| `MAX_AGENT_INFRA_RETRY_GRANTS` | `12` | The same allowance summed over **every** validator on one agent+version. Reported `infrastructure` verdicts stop earning grants once the fleet total reaches it. |
 | `RETRY_COOLDOWN` | `6h` | Delay before the **same** validator may re-lease after a timeout. |
 
 The issuance cap for a ticket is:
@@ -43,6 +44,25 @@ attempt_count  >=  MAX_ATTEMPTS_PER_VERSION + manual_retry_grants + infra_retry_
   validator-side outage (e.g. a model-relay/upstream failure) never spends the
   agent's genuine `MAX_ATTEMPTS_PER_VERSION` budget. A `scoring_error` is the
   agent's own failure and consumes an attempt normally.
+- **…but only up to a per-agent bound.** `infra_retry_grants` is per *ticket*,
+  and a ticket is one (agent, version, validator) slot, so eight grants per
+  validator across a validator pool of any size is unbounded per agent. An
+  artifact whose run reliably reports a scorer-side infrastructure code
+  therefore never spent its budget, never reached a verdict, and re-occupied
+  quorum slots indefinitely — ditto-subnet#279, where `mnemox-v55` reached
+  `attempts_used: 9` against a base budget of 2 with zero scores while the
+  family held three validator slots per round for a day. A **reported**
+  `infrastructure` verdict now additionally checks the fleet-wide total for
+  that agent and version against `MAX_AGENT_INFRA_RETRY_GRANTS` (`12`). Past it
+  the grant is refused, the attempt is billed as normal, the ticket walks down
+  to `retry_state = exhausted`, and the artifact appears on the operator
+  stuck-list for a manual grant. Nothing is punished; the loop just becomes
+  finite and visible. `12` is twice an agent's genuine budget at quorum
+  (`MAX_ATTEMPTS_PER_VERSION` × `SCORING_QUORUM` = 6) and sits above the
+  per-ticket `8`, so a single validator's local outage is still absorbed whole.
+  A lease the **platform** revoked is deliberately exempt: repetition there is
+  evidence about the platform, not the artifact, and billing the miner for it
+  is the rule #460/#497 settled in the other direction.
 - **Infrastructure retries back off; scoring failures reissue immediately.** A
   `scoring_error` sets `retry_after = now` (immediate reissue for another
   validator/attempt). An `infrastructure` failure instead sets an **escalating
@@ -204,6 +224,18 @@ to. Both admin views publish it (`silently_expired` per ticket,
 `silent_expiry_count` per submission). A submission whose silent-expiry count
 climbs while its score count stays at zero is hanging, not slow; that is the
 signal, and not having it is what let the 2026-07-27 incident run unnoticed.
+
+The complementary case — an expiry that *did* report — is now readable too.
+`failure_reason` is a three-value class chosen to drive reissue policy, so on
+its own it says how the platform responded and nothing about what happened:
+ditto-subnet#279 read twelve `infrastructure` verdicts off these rows and still
+could not name which of the validator's five sandbox codes fired, because the
+wire had nowhere to put it and the code survived only in a log line on the
+validator host. `failure_detail` carries it. It is validator-supplied,
+advisory (unsigned, drives no policy), bounded to 200 characters, optional —
+a validator predating the field simply sends nothing — and written and cleared
+with `failure_reason`, so the pair is read as one report. It appears on every
+admin ticket projection, which is where a triage session already looks.
 
 ## Retirement: when the benchmark generation closed instead
 

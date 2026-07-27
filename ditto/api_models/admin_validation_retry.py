@@ -31,6 +31,16 @@ class AdminValidationTicket(BaseModel):
     :attr:`failed_at` and :attr:`silently_expired`.
     """
     failed_at: datetime | None
+    failure_detail: str | None = None
+    """The reporter's own code or note behind :attr:`failure_reason`, if any.
+
+    ``failure_reason`` is a three-value class chosen to drive reissue policy, so
+    it says how the platform responded and nothing about what happened.
+    ditto-subnet#279 read twelve ``infrastructure`` verdicts off these rows and
+    still could not name which of the validator's five sandbox codes fired.
+    This is where that code lands. ``None`` means the reporter sent none, which
+    is what every validator predating the field does.
+    """
     silently_expired: bool
     """The lease ran out with nothing reported about *this* attempt.
 

@@ -108,7 +108,11 @@ from ditto.db.queries.confirmation_scores import (
 from ditto.db.queries.queue_policy_settings import (
     insert_queue_policy_settings_revision,
 )
-from ditto.db.queries.retry_budget import MAX_INFRA_RETRY_GRANTS
+from ditto.db.queries.retry_budget import (
+    INFRA_RETRY_BACKOFF_CAP,
+    MAX_AGENT_INFRA_RETRY_GRANTS,
+    MAX_INFRA_RETRY_GRANTS,
+)
 
 # Real dev keypairs: sign for real so _verify_signature runs end to end. The k=3
 # quorum needs three distinct permitted validators before an agent finalizes.
@@ -428,16 +432,20 @@ def _job_fail_payload(
     requested_at: datetime | None = None,
     ticket_deadline: datetime = _TICKET_DEADLINE,
     reason: str = "infrastructure",
+    failure_detail: str | None = None,
 ) -> dict:
     nonce = nonce or uuid4()
     requested_at = requested_at or datetime.now(UTC)
     deadline = ticket_deadline.astimezone(UTC).isoformat(timespec="microseconds")
     requested = requested_at.astimezone(UTC).isoformat(timespec="microseconds")
+    # failure_detail is deliberately absent from the signed payload, exactly as
+    # `reason` is: neither authorizes anything, and signing it would have made
+    # the field a protocol break instead of an additive one.
     signed = (
         f"validator-job-fail:v1:{keypair.ss58_address}:{agent_id}:{deadline}:"
         f"{nonce}:{requested}"
     ).encode()
-    return {
+    payload = {
         "validator_hotkey": keypair.ss58_address,
         "agent_id": str(agent_id),
         "ticket_deadline": ticket_deadline.isoformat(),
@@ -446,6 +454,11 @@ def _job_fail_payload(
         "requested_at": requested_at.isoformat(),
         "signature": keypair.sign(signed).hex(),
     }
+    # Omitted entirely when None, so the default shape is byte-identical to what
+    # a validator predating the field sends.
+    if failure_detail is not None:
+        payload["failure_detail"] = failure_detail
+    return payload
 
 
 def _artifact_headers(
@@ -776,6 +789,7 @@ async def _seed_revoked_grant(
     bench_version: int = 2,
     deadline: datetime = _TICKET_DEADLINE,
     status: str = "revoked",
+    keypair: bittensor.Keypair = _KEYPAIR,
 ) -> None:
     """Record the platform having terminated a lease's inference grant.
 
@@ -789,7 +803,7 @@ async def _seed_revoked_grant(
                 grant_id=uuid4(),
                 agent_id=agent_id,
                 bench_version=bench_version,
-                validator_hotkey=_VALIDATOR_HOTKEY,
+                validator_hotkey=keypair.ss58_address,
                 slot_id="slot-0",
                 ticket_deadline=deadline,
                 expires_at=deadline,
@@ -4791,6 +4805,211 @@ class TestFailJob:
             ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
             assert ticket is not None
             assert ticket.infra_retry_grants == MAX_INFRA_RETRY_GRANTS
+
+    async def test_failure_detail_is_recorded_on_the_ticket(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # ditto-subnet#279 deliverable (1). The three-value `reason` says how the
+        # platform should respond and nothing about what happened, which is why
+        # twelve `infrastructure` verdicts could not name which of the
+        # validator's five sandbox codes killed the run. The code now survives on
+        # the ticket instead of only in a log line on the validator host.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(
+                agent_id,
+                reason="infrastructure",
+                failure_detail="sandbox_network_unavailable",
+            ),
+        )
+        assert failed.status_code == 200, failed.text
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.failure_reason == "infrastructure"
+            assert ticket.failure_detail == "sandbox_network_unavailable"
+
+    async def test_validator_omitting_failure_detail_still_succeeds(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # Backward compatibility, pinned. A validator built before the field
+        # exists sends a body with no `failure_detail` key at all. That must
+        # still resolve the lease: a hand-back rejected as 422 would leave the
+        # ticket to expire silently, which is precisely the ambiguity the field
+        # was added to remove. No heartbeat protocol bump gates this -- the fail
+        # route has its own signature and does not read protocol_version.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        body = _job_fail_payload(agent_id, reason="scoring_error")
+        assert "failure_detail" not in body
+        failed = await client.post(
+            "/api/v1/validator/job/fail", headers=_AUTH_HEADER, json=body
+        )
+        assert failed.status_code == 200, failed.text
+        assert failed.json()["reopened"] is True
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.status == TicketStatus.EXPIRED
+            assert ticket.failure_reason == "scoring_error"
+            assert ticket.failure_detail is None
+
+    async def test_overlong_failure_detail_is_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The field is a diagnosis, not a log-shipping channel into a hot table.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(
+                agent_id, reason="infrastructure", failure_detail="x" * 201
+            ),
+        )
+        assert failed.status_code == 422, failed.text
+
+    async def test_repeated_infrastructure_stops_minting_grants_per_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # ditto-subnet#279 deliverable (3), and the one that stops recurrence.
+        # MAX_INFRA_RETRY_GRANTS bounds a *validator*, and every validator gets
+        # its own eight, so an artifact that reliably reports a scorer-side
+        # infrastructure code collects eight free attempts per validator that
+        # ever touches it -- unbounded per agent. Here a second validator arrives
+        # at an agent whose fleet total is already at the bound and is refused,
+        # even though its own ticket has never earned a grant.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        await _seed_ticket(session_maker, agent_id, keypair=_KEYPAIRS[1])
+        async with session_maker() as s, s.begin():
+            first = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert first is not None
+            first.infra_retry_grants = MAX_AGENT_INFRA_RETRY_GRANTS
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        second_hotkey = _KEYPAIRS[1].ss58_address
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers={"X-Validator-Hotkey": second_hotkey},
+            json=_job_fail_payload(
+                agent_id,
+                keypair=_KEYPAIRS[1],
+                reason="infrastructure",
+                failure_detail="model_relay_unavailable",
+            ),
+        )
+        assert failed.status_code == 200, failed.text
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, second_hotkey))
+            assert ticket is not None
+            # Refused: this failure bills the miner, so the ticket walks its
+            # ordinary budget down to `exhausted` and the artifact surfaces on
+            # the operator stuck-list instead of looping invisibly forever.
+            assert ticket.infra_retry_grants == 0
+            # And it cools all the way down rather than off its own count of
+            # zero, so the fleet is not immediately handed the same artifact.
+            assert ticket.retry_after is not None
+            retry_after = ticket.retry_after
+            if retry_after.tzinfo is None:
+                retry_after = retry_after.replace(tzinfo=UTC)
+            assert retry_after - datetime.now(UTC) > INFRA_RETRY_BACKOFF_CAP / 2
+            # The diagnosis is still recorded; only the billing changed.
+            assert ticket.failure_detail == "model_relay_unavailable"
+
+    async def test_per_agent_bound_leaves_room_below_it(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The bound is generous on purpose: an agent's genuine budget at quorum
+        # is 2 x 3 = 6 leases, and this hands one artifact twice that for free
+        # before a single attempt is billed. One short of it still grants.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        await _seed_ticket(session_maker, agent_id, keypair=_KEYPAIRS[1])
+        async with session_maker() as s, s.begin():
+            first = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert first is not None
+            first.infra_retry_grants = MAX_AGENT_INFRA_RETRY_GRANTS - 1
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        second_hotkey = _KEYPAIRS[1].ss58_address
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers={"X-Validator-Hotkey": second_hotkey},
+            json=_job_fail_payload(
+                agent_id, keypair=_KEYPAIRS[1], reason="infrastructure"
+            ),
+        )
+        assert failed.status_code == 200, failed.text
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, second_hotkey))
+            assert ticket is not None
+            assert ticket.infra_retry_grants == 1
+
+    async def test_per_agent_bound_does_not_apply_to_platform_revoked_leases(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The converse guarantee. Repetition on a *reported* infrastructure
+        # verdict is evidence about the artifact, but repetition on a lease the
+        # platform itself revoked is evidence about the platform -- and billing
+        # the miner for that is exactly the rule #460/#497 settled in the other
+        # direction. Only the per-ticket bound governs that path.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        await _seed_ticket(session_maker, agent_id, keypair=_KEYPAIRS[1])
+        await _seed_revoked_grant(session_maker, agent_id, keypair=_KEYPAIRS[1])
+        async with session_maker() as s, s.begin():
+            first = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert first is not None
+            first.infra_retry_grants = MAX_AGENT_INFRA_RETRY_GRANTS
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        second_hotkey = _KEYPAIRS[1].ss58_address
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers={"X-Validator-Hotkey": second_hotkey},
+            json=_job_fail_payload(
+                agent_id, keypair=_KEYPAIRS[1], reason="scoring_error"
+            ),
+        )
+        assert failed.status_code == 200, failed.text
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, second_hotkey))
+            assert ticket is not None
+            assert ticket.infra_retry_grants == 1
 
     async def test_no_live_ticket_is_a_noop(
         self,

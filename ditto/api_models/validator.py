@@ -25,7 +25,14 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_capacity import BenchmarkCapacity
@@ -326,6 +333,19 @@ maps to the validator's ``ValidatorInfrastructureError`` sweep-ending branch;
 ``scoring_error`` maps to other ``DittobenchError`` scoring failures. These
 values are the wire contract shared verbatim with ditto-subnet (which emits
 them).
+
+Being low-cardinality is also what makes it useless for diagnosis, which is what
+``FailJobRequest.failure_detail`` exists to carry.
+"""
+
+_FAILURE_DETAIL_MAX_LENGTH = 200
+"""Cap on ``FailJobRequest.failure_detail``.
+
+Long enough for a scorer failure code plus a short qualifier, short enough that
+the field cannot become a log-shipping channel into a hot table. The validator
+truncates to the same number before sending: a detail that overflows must never
+turn a hand-back into a 422 and leave the lease to expire silently -- that would
+trade the diagnosis this field adds for the ambiguity it exists to remove.
 """
 
 
@@ -355,6 +375,17 @@ class FailJobRequest(BaseModel):
             description="Coarse failure class; drives the platform's reissue policy."
         ),
     ]
+    failure_detail: Annotated[
+        str | None,
+        StringConstraints(strip_whitespace=True, max_length=_FAILURE_DETAIL_MAX_LENGTH),
+        Field(
+            default=None,
+            description=(
+                "Reporter's own failure code or short note behind ``reason``. "
+                "Advisory: drives no policy, unsigned, and optional."
+            ),
+        ),
+    ] = None
     nonce: Annotated[UUID, Field(description="One-time claim nonce.")]
     requested_at: Annotated[
         datetime, Field(description="UTC time at which the request was signed.")
