@@ -19,6 +19,7 @@ from ditto.api_models.benchmark_contract import (
 )
 from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_models.validator_capabilities import (
+    ScorerBenchmarkCapability,
     ValidatorCapabilities,
     ValidatorStackIdentity,
 )
@@ -1139,6 +1140,70 @@ async def _validate_frozen_members(
     return True
 
 
+def protocol_serves_version(protocol_version: int, *, version: int) -> bool:
+    """Whether a heartbeat of this protocol can advertise ``version`` at all.
+
+    Protocol 8 is the floor at which a heartbeat carries a SIGNED capability and
+    stack-identity payload at all -- it is a wire-format floor, not a
+    per-benchmark one, so it stays fixed as the benchmark version moves. Any
+    validator that can advertise a post-v2 benchmark is already >= 8.
+
+    Split out because failing *this* clause is categorically different from
+    failing the ones below it: the validator's software cannot describe the
+    benchmark being scored, so no probe result and no restart will change the
+    answer until it is upgraded.
+    """
+    if protocol_version < 8:
+        return False
+    return not (version >= 7 and protocol_version < 12)
+
+
+def verified_scorer_for_version(
+    heartbeat: ValidatorHeartbeat,
+    *,
+    version: int,
+) -> ScorerBenchmarkCapability | None:
+    """The signed scorer capability that advertises ``version``, else ``None``.
+
+    Capability only: every clause here is about what this validator's stack *is*,
+    never about when it last said so. Liveness and observation freshness belong
+    to :func:`heartbeat_supports_version`, which adds them before leasing work.
+    Split out so a caller that wants to explain a validator's standing -- the
+    public fleet view naming a legacy stack that can never score the active
+    benchmark -- does not have to call a quiet validator incapable.
+    """
+    if not protocol_serves_version(heartbeat.protocol_version, version=version):
+        return None
+    try:
+        capabilities = ValidatorCapabilities.model_validate_json(
+            json.dumps(heartbeat.capabilities)
+        )
+        stack = ValidatorStackIdentity.model_validate_json(json.dumps(heartbeat.stack))
+    except ValidationError:
+        return None
+    scorer = capabilities.scorer_benchmarks
+    if (
+        scorer is None
+        or scorer.status != "fresh_verified"
+        or version not in scorer.supported_bench_versions
+    ):
+        return None
+    if version >= 7 and (
+        not capabilities.ticket_inference
+        or not capabilities.signed_score_quorum
+        or scorer.v7_calibration is None
+    ):
+        return None
+    component = stack.components.dittobench_api
+    if not (
+        capabilities.screened_images
+        and component.source_revision == scorer.source_revision
+        and (component.version is None or component.version == scorer.software_version)
+    ):
+        return None
+    return scorer
+
+
 def heartbeat_supports_version(
     heartbeat: ValidatorHeartbeat,
     *,
@@ -1146,14 +1211,6 @@ def heartbeat_supports_version(
     version: int = CANARY_BENCH_VERSION,
 ) -> bool:
     """Accept ``version`` only from a fresh scorer report matching its identity."""
-    # Protocol 8 is the floor at which a heartbeat carries a SIGNED capability
-    # and stack-identity payload at all -- it is a wire-format floor, not a
-    # per-benchmark one, so it stays fixed as the benchmark version moves. Any
-    # validator that can advertise a post-v2 benchmark is already >= 8.
-    if heartbeat.protocol_version < 8:
-        return False
-    if version >= 7 and heartbeat.protocol_version < 12:
-        return False
     seen_at = (
         heartbeat.seen_at.replace(tzinfo=UTC)
         if heartbeat.seen_at.tzinfo is None
@@ -1161,36 +1218,12 @@ def heartbeat_supports_version(
     )
     if now - seen_at > timedelta(minutes=5):
         return False
-    try:
-        capabilities = ValidatorCapabilities.model_validate_json(
-            json.dumps(heartbeat.capabilities)
-        )
-        stack = ValidatorStackIdentity.model_validate_json(json.dumps(heartbeat.stack))
-    except ValidationError:
+    scorer = verified_scorer_for_version(heartbeat, version=version)
+    if scorer is None:
         return False
-    scorer = capabilities.scorer_benchmarks
-    if (
-        scorer is None
-        or scorer.status != "fresh_verified"
-        or version not in scorer.supported_bench_versions
-    ):
-        return False
-    if version >= 7 and (
-        not capabilities.ticket_inference
-        or not capabilities.signed_score_quorum
-        or scorer.v7_calibration is None
-    ):
-        return False
-    if (
-        scorer.observed_at is None
-        or abs(int(now.timestamp()) - scorer.observed_at) > 300
-    ):
-        return False
-    component = stack.components.dittobench_api
     return (
-        capabilities.screened_images
-        and component.source_revision == scorer.source_revision
-        and (component.version is None or component.version == scorer.software_version)
+        scorer.observed_at is not None
+        and abs(int(now.timestamp()) - scorer.observed_at) <= 300
     )
 
 

@@ -2525,7 +2525,7 @@
           <div class="fleet-ledger-row offline"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-offline">–</strong><span>Offline</span></div>
           <div class="fleet-ledger-row paused"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-paused">–</strong><span>Paused</span></div>
           <div class="fleet-ledger-row unknown"><span class="fleet-ledger-dot" aria-hidden="true"></span><strong id="fleet-count-unknown">–</strong><span>Not reported</span></div>
-          <p>Missing optional telemetry is not an outage.</p>
+          <p>Missing optional telemetry is not an outage. Software that cannot serve the scored benchmark counts as critical: the platform leases it no work.</p>
         </aside>
       </div>
 
@@ -7600,10 +7600,30 @@
       });
     }
 
+    // The benchmark the fleet is actually scoring, as reported alongside the
+    // verdicts that were computed against it; the page-wide badge is the fallback.
+    function activeBenchVersion() {
+      var report = fleetReports.validators;
+      return (report && Number(report.active_bench_version)) || Number(activeBench) || null;
+    }
+
+    function benchGateLabel() {
+      var version = activeBenchVersion();
+      return version ? "No bench v" + version : "Bench unsupported";
+    }
+
     function fleetStatus(entry) {
-      // A scorer that is not serving comes first: the validator cannot finish a
-      // single lease, so nothing below this is the headline.
+      // Software that cannot describe the benchmark being scored comes first: the
+      // validator is leased nothing, there is no scorer signal to explain it, and
+      // "Idle · Healthy" beside the fleet doing the work was the opposite of the
+      // story. Nothing on the scorer side will fix it either — only an upgrade.
+      if (entry.bench_serviceability === "software_obsolete") return ["Obsolete build", "bad"];
+      // A scorer that is not serving comes next: it names the CAUSE, where the
+      // bench gate below it names the consequence. Both mean no lease completes.
       if (entry.scorer_liveness === "not_serving") return ["Scorer down", "bad"];
+      // Serving, but not the benchmark being scored — a narrower version set, an
+      // unverified identity, missing calibration. Still leased nothing.
+      if (entry.bench_serviceability === "scorer_unverified") return [benchGateLabel(), "bad"];
       if (entry.health === "critical") return ["Critical", "bad"];
       // A live-but-off-assignment validator (bad) is distinct from a quiet one
       // (warn); "assigning" is a normal hand-off and stays green via health below.
@@ -7873,9 +7893,20 @@
     }
 
     function renderValidatorDetail(entry) {
-      var status = fleetStatus(entry);
+      // Same reading as the chip above it and the row behind it: one validator
+      // must not carry three different verdicts on one screen.
+      var status = offlineAwareFleetStatus(entry);
       var report = "";
       report += vstat("Fleet status", '<span class="stage ' + status[1] + '">' + esc(status[0]) + '</span>');
+      if (entry.bench_serviceability && entry.bench_serviceability !== "serving") {
+        // The one line that explains an idle validator earning nothing.
+        var gatedVersion = activeBenchVersion();
+        var scored = gatedVersion ? "bench v" + gatedVersion : "the scored benchmark";
+        report += vstat("Benchmark eligibility", '<span class="stage bad">' + esc(
+          entry.bench_serviceability === "software_obsolete"
+            ? "Cannot serve " + scored + " · needs a software upgrade"
+            : "Scorer is not advertising " + scored) + '</span>');
+      }
       report += vstat("Worker state", esc(entry.state || "unknown"));
       report += vstat("Software version", esc(entry.software_version || "Unknown"));
       report += vstat("Heartbeat protocol", esc(String(entry.protocol_version)));
@@ -8031,6 +8062,10 @@
       return hours + "h" + (minutes ? " " + minutes + "m" : "");
     }
 
+    function isInoperativeFleetEntry(entry) {
+      return entry.availability === "offline" || entry.bench_serviceability === "software_obsolete";
+    }
+
     function renderRetiredFleetRow(entry, singular) {
       var hotkey = entry[singular + "_hotkey"] || "Unknown";
       var displayName = singular === "validator"
@@ -8100,15 +8135,16 @@
         return;
       }
       var allEntries = sortFleetEntries(data[kind] || [], singular);
-      // One rule for both fleets: a node with no heartbeat inside the offline
-      // window is inoperative and folds away. A validator hotkey's last report is
-      // kept indefinitely, so without this the table fills up with hosts that
-      // stopped running the software long ago and buries the live fleet.
-      var retiredEntries = allEntries.filter(function (entry) {
-        return entry.availability === "offline";
-      });
+      // Two ways to be inoperative, and both fold away. No heartbeat inside the
+      // offline window: a validator hotkey's last report is kept indefinitely, so
+      // without this the table fills up with hosts that stopped running the
+      // software long ago. Or software that cannot describe the benchmark being
+      // scored, which the platform leases nothing to and no restart will fix.
+      // A CURRENT validator whose scorer broke is deliberately not folded — that
+      // is a live incident, and it belongs in the open table reading "Scorer down".
+      var retiredEntries = allEntries.filter(isInoperativeFleetEntry);
       var entries = allEntries.filter(function (entry) {
-        return entry.availability !== "offline";
+        return !isInoperativeFleetEntry(entry);
       });
       updateFleetLedger(allEntries);
       var available = entries.filter(function (entry) {
@@ -8118,28 +8154,36 @@
       summary.textContent = (entries.length
         ? available + " of " + entries.length + " active " + kind + " available"
         : "No active " + kind + " reporting") +
-        (retiredEntries.length ? " · " + retiredEntries.length + " offline" : "") + snapshot;
+        (retiredEntries.length ? " · " + retiredEntries.length + " inoperative" : "") + snapshot;
       retired.hidden = !retiredEntries.length;
       document.getElementById("fleet-retired-title").textContent = showScreeners
         ? "Recently offline"
         : "Inoperative validators";
+      var benchVersion = activeBenchVersion();
       document.getElementById("fleet-retired-note").textContent = showScreeners
         ? "Heartbeat history remains visible for 24 hours, then expires automatically."
         : "No heartbeat for over " + fleetWindowLabel(data.stale_window_seconds) +
-          ". A validator's last report stays on record until it reports again, and the row rejoins the fleet table on its next heartbeat.";
+          (benchVersion ? ", or software that cannot serve bench v" + benchVersion : "") +
+          ". The platform leases work to neither. Last reports stay on record, and a row rejoins the fleet table as soon as it can take work again.";
       // Preserve focus/expanded state: rebuild rows only when the fleet data,
       // display names, or stake ordering actually changed.
       if (sectionChanged("fleet", { kind: kind, entries: entries, retired: retiredEntries, names: validatorNames, stakes: validatorStakeWeights })) {
       if (retiredEntries.length) {
-        // Name the critical count in the summary: the ledger counts a broken
-        // validator as Critical before it counts it offline, and a number with no
-        // matching row in the open table is how it went invisible before.
-        var retiredCritical = retiredEntries.filter(function (entry) {
-          return entry.health === "critical";
+        // Name why, on the closed summary. The ledger counts these nodes as
+        // Critical or Offline while the open table shows no such row, and a count
+        // with nothing behind it is how a broken validator went invisible before.
+        var retiredObsolete = retiredEntries.filter(function (entry) {
+          return entry.bench_serviceability === "software_obsolete";
         }).length;
+        var retiredOffline = retiredEntries.filter(function (entry) {
+          return entry.availability === "offline";
+        }).length;
+        var retiredWhy = [];
+        if (retiredOffline) retiredWhy.push(retiredOffline + " offline");
+        if (retiredObsolete) retiredWhy.push(retiredObsolete + " obsolete build" + (retiredObsolete === 1 ? "" : "s"));
         retiredSummary.textContent = retiredEntries.length + " " + singular +
           (retiredEntries.length === 1 ? "" : "s") +
-          (retiredCritical ? " · " + retiredCritical + " critical" : "");
+          (retiredWhy.length ? " · " + retiredWhy.join(" · ") : "");
         retiredRows.innerHTML = retiredEntries.map(function (entry) {
           return renderRetiredFleetRow(entry, singular);
         }).join("");
