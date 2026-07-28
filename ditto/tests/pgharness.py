@@ -604,4 +604,24 @@ async def reset_database(conn: Any, reset_sql: str) -> None:
     Driver-level on purpose. ``text()`` would read the ``:`` in the embedded
     seed JSON as bind-parameter syntax and reject the statement.
     """
+    # Evict anything still attached to this worker's database before touching
+    # it. A test that fails while it holds an open transaction can leave its
+    # connection CHECKED OUT -- `engine.dispose()` returns pooled connections
+    # but cannot force-close one the application never handed back, so the
+    # locks it holds outlive the test that took them. The TRUNCATE below then
+    # blocks on those locks forever: the whole run hangs, with no failing test
+    # to point at and nothing in the output but a stalled progress bar.
+    #
+    # Each xdist worker owns its database exclusively (that is the entire point
+    # of the per-worker clone), so any other backend on it at reset time is by
+    # definition a straggler from a previous test and safe to terminate.
+    await conn.exec_driver_sql(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+        "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+    )
+    # Belt and braces: if something still cannot be evicted, FAIL rather than
+    # hang. A reset that cannot take its locks in ten seconds is a bug that
+    # deserves a traceback naming this function, not an infinite wait that
+    # looks like a slow test.
+    await conn.exec_driver_sql("SET LOCAL lock_timeout = '10s'")
     await conn.exec_driver_sql(reset_sql)
