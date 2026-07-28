@@ -27,6 +27,7 @@ from ditto.db.queries.attestation import (
     record_attestation,
     revoke_attestation,
 )
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
 from ditto.db.queries.scores import (
     MIN_ELIGIBLE_CASES,
     list_eligible_ledger,
@@ -274,6 +275,7 @@ async def _seed_scored_agent(
             median_ms=500,
             n=MIN_ELIGIBLE_CASES,
             generated_at=created_at,
+            bench_version=MIN_SCOREABLE_BENCH_VERSION,
         )
     return agent
 
