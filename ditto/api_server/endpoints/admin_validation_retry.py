@@ -18,6 +18,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from ditto.api_models.admin_validation_retry import (
     AdminBatchRetryRequest,
@@ -1250,6 +1251,58 @@ def _queue_gate(
     return None
 
 
+async def _finalized_quorum_state(
+    session: AsyncSession,
+) -> tuple[dict[UUID, list[Score]], dict[UUID, list[ValidatorTicket]], int]:
+    """Load every finalized agent's scores and tickets in three statements.
+
+    The per-agent :func:`_load` costs seven round trips: the agent row this
+    scan already holds, its scores, its tickets, three to resolve a canonical
+    version that cannot change inside one request, and a recovery list this
+    route never reads. Multiplied by the whole finalized fleet that is
+    thousands of sequential queries, and the scan outruns its caller's timeout
+    long before it can answer. The row order matches ``_load`` exactly:
+    ``_snapshot`` hashes tickets in the order it receives them, and the
+    operator actions on this page replay that hash as their concurrency guard.
+
+    ``Score.details`` is deferred because it is the other half of the cost.
+    Outlier detection reads composites and the snapshot fields; the per-case
+    audit breakdown is ~18KB a row, so carrying it fleet-wide is tens of
+    megabytes of JSON parsed to reach a handful of floats. Nothing on this
+    route touches it, and under the async session a future reader that does
+    fails loudly rather than silently re-fetching.
+    """
+    canonical_version = await active_bench_version(session)
+    finalized_ids = (
+        select(Agent.agent_id)
+        .where(Agent.status.in_(_FINALIZED_STATUSES))
+        .scalar_subquery()
+    )
+    scores_by_agent: dict[UUID, list[Score]] = {}
+    for score in (
+        await session.scalars(
+            select(Score)
+            .where(Score.agent_id.in_(finalized_ids))
+            .options(defer(Score.details))
+            .order_by(Score.validator_hotkey.asc(), Score.run_id.asc())
+        )
+    ).all():
+        scores_by_agent.setdefault(score.agent_id, []).append(score)
+    tickets_by_agent: dict[UUID, list[ValidatorTicket]] = {}
+    for ticket in (
+        await session.scalars(
+            select(ValidatorTicket)
+            .where(ValidatorTicket.agent_id.in_(finalized_ids))
+            .order_by(
+                ValidatorTicket.deadline.asc(),
+                ValidatorTicket.validator_hotkey.asc(),
+            )
+        )
+    ).all():
+        tickets_by_agent.setdefault(ticket.agent_id, []).append(ticket)
+    return scores_by_agent, tickets_by_agent, canonical_version
+
+
 @router.get("/score-outliers", response_model=AdminScoreOutlierList)
 async def list_score_outliers(
     _admin: AdminDep,
@@ -1267,14 +1320,26 @@ async def list_score_outliers(
             )
         ).all()
     )
+    (
+        scores_by_agent,
+        tickets_by_agent,
+        canonical_version,
+    ) = await _finalized_quorum_state(session)
     detected: list[AdminScoreOutlier] = []
     lifecycle_cache: dict[str, dict[UUID, ScoreAuditEntry]] = {}
     position_cache: dict[str, dict[UUID, int]] = {}
-    for listed_agent in agents:
-        agent, bench_version, scores, tickets, _ = await _load(
-            session, agent_id=listed_agent.agent_id, for_update=False
+    for agent in agents:
+        all_scores = scores_by_agent.get(agent.agent_id, [])
+        all_tickets = tickets_by_agent.get(agent.agent_id, [])
+        bench_version = resolve_bench_version(
+            all_tickets=all_tickets,
+            all_scores=all_scores,
+            canonical_version=canonical_version,
         )
-        assert agent is not None
+        scores = [score for score in all_scores if score.bench_version == bench_version]
+        tickets = [
+            ticket for ticket in all_tickets if ticket.bench_version == bench_version
+        ]
         result = _detect_outlier(scores)
         if result is None:
             continue

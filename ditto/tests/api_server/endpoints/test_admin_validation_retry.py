@@ -3,12 +3,13 @@
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -1696,6 +1697,72 @@ async def test_lists_only_unambiguous_finalized_score_outliers(
     assert by_agent[str(high_id)]["direction"] == "high"
     assert by_agent[str(high_id)]["outlier"]["validator_hotkey"] == "validator-2"
     assert str(broad_id) not in by_agent
+
+
+async def test_score_outlier_scan_reads_the_fleet_in_bulk(
+    app: FastAPI,
+    retry_engine: AsyncEngine,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Doubling the finalized fleet must not cost a single extra statement.
+
+    The scan used to load each finalized submission on its own — seven round
+    trips per agent, including a canonical version that cannot change inside
+    one request. At the production fleet size that is thousands of sequential
+    queries, and Backroom's score-outlier page gave up before the platform
+    answered. Only a statement count catches the regression: a per-agent scan
+    returns exactly the same body, just far too late.
+    """
+
+    def _record(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    async def _finalize(count: int, composites: list[float]) -> None:
+        for _ in range(count):
+            agent_id = await _seed(retry_maker, score_count=3, composites=composites)
+            async with retry_maker() as session, session.begin():
+                agent = await session.get(Agent, agent_id)
+                assert agent is not None
+                agent.status = AgentStatus.SCORED
+
+    async def _scan() -> tuple[int, int]:
+        """Statements the handler runs, and the outliers it reported."""
+        statements.clear()
+        event.listen(retry_engine.sync_engine, "before_cursor_execute", _record)
+        try:
+            response = await client.get(
+                "/api/v1/admin/score-outliers", headers=_HEADERS
+            )
+        finally:
+            event.remove(retry_engine.sync_engine, "before_cursor_execute", _record)
+        assert response.status_code == 200, response.text
+        return len(statements), response.json()["count"]
+
+    statements: list[str] = []
+    _install(app, retry_maker)
+    # One outlier throughout, so the finalized fleet around it is the only
+    # thing growing: the per-outlier gate checks are meant to scale with the
+    # outliers an operator has to act on, not with every submission ever
+    # scored.
+    await _finalize(1, [0.12, 0.81, 0.83])
+    await _finalize(3, [0.20, 0.50, 0.80])
+    small_fleet, small_count = await _scan()
+    await _finalize(8, [0.20, 0.50, 0.80])
+    large_fleet, large_count = await _scan()
+
+    assert small_count == large_count == 1
+    assert large_fleet == small_fleet, (
+        f"{small_fleet} statements across 4 finalized agents but {large_fleet} "
+        f"across 12: the scan is loading the fleet one submission at a time"
+    )
 
 
 async def _seed_capable_heartbeat(
