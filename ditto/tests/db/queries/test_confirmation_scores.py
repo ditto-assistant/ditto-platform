@@ -20,6 +20,7 @@ from ditto.db.queries.confirmation_scores import (
     confirmation_depths,
     confirmation_history_by_agent,
     fold_eligible_seeds_by_agent,
+    lane_seed_universe,
 )
 
 _NOW = datetime(2026, 7, 21, 12, 0, 0, tzinfo=UTC)
@@ -282,6 +283,54 @@ class TestConfirmationAggregates:
         assert {r.composite for r in rows} == {0.80, 0.84}
         assert all(r.bench_version == 2 for r in rows)
 
+    async def test_universe_is_every_recorded_seed_across_reigns(
+        self, session: AsyncSession
+    ) -> None:
+        """The cumulative set the lane may lease, not one reign's anchor.
+
+        Two agents carrying seeds from different champions: the universe is the
+        union, deduplicated and seed-ordered, so an outgoing reign's coverage
+        stays in scope as backlog. Version-scoped, because the anchor is keyed on
+        the major bench version and seeds do not carry across one.
+        """
+        first = await _seed_agent(session, "first")
+        second = await _seed_agent(session, "second")
+        async with session.begin():
+            await append_confirmation_scores(
+                session,
+                rows=[
+                    _row(first, "5V1", 300, 0.80),
+                    _row(first, "5V2", 300, 0.81),  # dedup across validators
+                    _row(first, "5V1", 100, 0.82),
+                    _row(second, "5V1", 200, 0.83),  # only the other agent has it
+                ],
+                bench_version=2,
+                created_at=_NOW,
+            )
+            await append_confirmation_scores(
+                session,
+                rows=[_row(first, "5V1", 999, 0.90)],
+                bench_version=3,
+                created_at=_NOW,
+            )
+
+        assert await lane_seed_universe(
+            session, agent_ids=[first, second], bench_version=2
+        ) == (100, 200, 300)
+        # A version the caller did not ask about contributes nothing.
+        assert await lane_seed_universe(
+            session, agent_ids=[first, second], bench_version=3
+        ) == (999,)
+        # And an agent outside the cohort contributes nothing.
+        assert await lane_seed_universe(
+            session, agent_ids=[second], bench_version=2
+        ) == (200,)
+
+    async def test_universe_is_empty_without_agents(
+        self, session: AsyncSession
+    ) -> None:
+        assert await lane_seed_universe(session, agent_ids=[], bench_version=2) == ()
+
     async def test_absent_agents_map_to_empty(self, session: AsyncSession) -> None:
         assert (
             await confirmation_composites_by_seed(
@@ -311,11 +360,17 @@ class TestConfirmationCatchupSeeds:
             seeds_by_agent=seeds_by_agent,
         ) == (11, 22, 33)
 
-    def test_excludes_seeds_no_peer_has_reached(self) -> None:
-        """Backlog is settled evidence; unreached seeds are wave growth.
+    def test_excludes_only_seeds_no_peer_has_reached(self) -> None:
+        """Backlog is any peer's evidence; unreached seeds are wave growth.
 
-        Seed 44 is missing for everyone, so leasing it here would let one member
-        run ahead of the wave. Growth pacing owns that seed, one round at a time.
+        Seed 33 is held by one peer and not the other. That is still recorded
+        evidence this member lacks, so it is backlog: one holder is sufficient
+        reason to send everybody else to it. Reading the intersection here left
+        such a seed invisible to catch-up -- nobody was ever sent to it, and it
+        could not enter the fold either, so it stayed a permanent orphan.
+
+        Seed 44 is missing for EVERYONE, and that is the line. Leasing it here
+        would let one member run ahead of the wave; growth pacing owns it.
         """
         newcomer, peer_a, peer_b = (uuid4() for _ in range(3))
 
@@ -324,7 +379,28 @@ class TestConfirmationCatchupSeeds:
             peer_ids=[peer_a, peer_b],
             anchored_seeds=self._ANCHORED,
             seeds_by_agent={peer_a: [11, 22], peer_b: [11, 22, 33]},
-        ) == (11, 22)
+        ) == (11, 22, 33)
+
+    def test_a_single_peers_orphan_seed_becomes_everyone_elses_backlog(self) -> None:
+        """The 2026-07-28 orphan case, reduced.
+
+        A previous reign's seed survives on one agent and nowhere else. Under the
+        intersection reading it was owed by nobody, so 188 of 288 recorded runs
+        contributed to nothing. It has to come back as backlog for every member
+        that lacks it, which is what lets the shared set grow across a dethrone
+        instead of resetting.
+        """
+        holder, *others = (uuid4() for _ in range(4))
+        stale = 33
+        seeds_by_agent = {holder: [11, stale], **{other: [11] for other in others}}
+
+        for other in others:
+            assert confirmation_catchup_seeds(
+                member_id=other,
+                peer_ids=[holder, *others],
+                anchored_seeds=self._ANCHORED,
+                seeds_by_agent=seeds_by_agent,
+            ) == (stale,)
 
     def test_omits_seeds_the_member_already_holds(self) -> None:
         member, peer = uuid4(), uuid4()

@@ -197,6 +197,7 @@ from ditto.db.queries.confirmation_scores import (
     confirmation_catchup_seeds,
     confirmation_composites_by_seed,
     fold_eligible_seeds_by_agent,
+    lane_seed_universe,
 )
 from ditto.db.queries.desired_era_backlog import desired_era_work_outstanding
 from ditto.db.queries.heartbeats import (
@@ -2596,6 +2597,7 @@ async def _top5_confirmation_seed_plan(
     champion_agent_id: UUID,
     member_agent_id: UUID,
     wave_member_ids: tuple[UUID, ...],
+    cohort_member_ids: tuple[UUID, ...] = (),
     canonical_version: int,
 ) -> tuple[int, ...]:
     """Every seed this member still owes: its backlog first, then wave growth.
@@ -2604,12 +2606,14 @@ async def _top5_confirmation_seed_plan(
     retest cohort. An extended member that never gets leased (or fails) must not
     be able to hold the wave open, because the open wave is what gates the KOTH
     fold: keying completion to the top five keeps the crown moving at exactly
-    the cadence it did before the cohort could be widened.
+    the cadence it did before the cohort could be widened. That is *growth*
+    pacing only -- ``cohort_member_ids`` widens whose coverage counts as backlog,
+    which cannot hold any wave open because backlog is never a wave.
 
     Two kinds of work come back, and the difference is load-bearing:
 
-    *Catch-up* -- seeds every OTHER emission member already holds and this one
-    does not. Settled evidence, no wave left to tear, so the whole backlog is
+    *Catch-up* -- seeds ANY other cohort member already holds and this one does
+    not. Recorded evidence, no wave left to tear, so the whole backlog is
     returned at once and the fleet can drain it in parallel (one lease per seed,
     see :func:`_claimable_confirmation_seed`). This is what a member promoted
     into the top five at depth zero owes, and returning it one seed at a time is
@@ -2624,26 +2628,40 @@ async def _top5_confirmation_seed_plan(
     a full backlog would multiply retest volume by the cohort size for no
     convergence benefit; it keeps the one-seed-per-round pacing it has today.
     """
-    full = champion_anchored_seeds(
+    anchor = champion_anchored_seeds(
         champion_agent_id,
         version=canonical_version,
         max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
     )
+    cohort_ids = tuple(dict.fromkeys((*cohort_member_ids, *wave_member_ids)))
     history = await confirmation_composites_by_seed(
         session,
-        agent_ids=tuple(dict.fromkeys((*wave_member_ids, member_agent_id))),
+        agent_ids=tuple(dict.fromkeys((*cohort_ids, member_agent_id))),
         bench_version=canonical_version,
     )
     seeds_by_agent = {agent_id: values.keys() for agent_id, values in history.items()}
-    catchup = (
-        confirmation_catchup_seeds(
-            member_id=member_agent_id,
-            peer_ids=wave_member_ids,
-            anchored_seeds=full,
-            seeds_by_agent=seeds_by_agent,
-        )
-        if member_agent_id in wave_member_ids
-        else ()
+    # The live reign's seeds first, in issuing order, then everything the lane has
+    # already recorded. Growth walks the anchor prefix exactly as before; catch-up
+    # reaches the whole cumulative set so an outgoing reign's coverage becomes
+    # backlog to converge onto rather than a write-off.
+    universe = await lane_seed_universe(
+        session, agent_ids=cohort_ids, bench_version=canonical_version
+    )
+    anchored = set(anchor)
+    full = (*anchor, *(seed for seed in universe if seed not in anchored))
+    # Catch-up spans the whole retest cohort, not just the emission set. It used
+    # to be scoped to the top five on the grounds that widening it "would
+    # multiply retest volume by the cohort size for no convergence benefit" --
+    # true while the fold only ever read the emission set's intersection, and no
+    # longer true now that every cohort member's coverage is a lease target for
+    # every other. The volume argument also assumed the fleet was slot-starved;
+    # validators advertise up to eight slots each (ditto-subnet #280) and sit
+    # mostly idle, so the backlog drains in parallel rather than queueing.
+    catchup = confirmation_catchup_seeds(
+        member_id=member_agent_id,
+        peer_ids=cohort_ids,
+        anchored_seeds=full,
+        seeds_by_agent=seeds_by_agent,
     )
     # Deliberately the STRICT intersection, and not ``wave_membership``. This
     # decides which seed to ISSUE next, not which evidence may be folded. A
@@ -2656,7 +2674,12 @@ async def _top5_confirmation_seed_plan(
         member_ids=wave_member_ids,
         seeds_by_agent=seeds_by_agent,
     )
-    next_seed = next((seed for seed in full if seed not in completed), None)
+    # Growth walks the live anchor only, never the cumulative universe. A
+    # universe seed the cohort has partly covered is backlog and belongs to
+    # catch-up, which leases it in full; routing it through growth as well would
+    # pace it one round at a time and reintroduce exactly the slow convergence
+    # the union reading exists to remove.
+    next_seed = next((seed for seed in anchor if seed not in completed), None)
     if (
         next_seed is None
         or next_seed in history.get(member_agent_id, {})
@@ -3176,6 +3199,7 @@ async def request_top5_confirmation_job(
             champion_agent_id=payload.champion_agent_id,
             member_agent_id=payload.member_agent_id,
             wave_member_ids=tuple(member.agent_id for member in emission_members),
+            cohort_member_ids=tuple(member.agent_id for member in members),
             canonical_version=canonical_version,
         )
         if not seeds:
