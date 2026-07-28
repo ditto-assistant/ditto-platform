@@ -1732,16 +1732,19 @@
       cursor: pointer;
     }
     .harness-comparison-method > summary:hover { color: var(--accent); }
+    /* Prose runs the full width with the evidence links on their own row
+       beneath it — a side column of two links left a tall blank gutter under
+       them next to the paragraph. */
     .harness-comparison-method-body {
       display: flex;
+      flex-direction: column;
       align-items: flex-start;
-      justify-content: space-between;
-      gap: 18px;
+      gap: 12px;
       padding-top: 12px;
     }
     .harness-comparison-method p { max-width: 86ch; margin: 0; }
     .harness-comparison-method a { flex: none; color: var(--accent); font-weight: 700; white-space: nowrap; }
-    .harness-comparison-evidence-links { display: flex; flex: none; gap: 12px; }
+    .harness-comparison-evidence-links { display: flex; flex-wrap: wrap; gap: 12px; }
     .harness-comparison-state {
       padding: 28px 18px;
       border: 1px dashed var(--border-strong);
