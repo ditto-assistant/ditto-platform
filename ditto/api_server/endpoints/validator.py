@@ -116,7 +116,7 @@ from ditto.api_server.continual_retest_settings import (
     ContinualRetestSettingsResolver,
     rollout_standdown_reason,
 )
-from ditto.api_server.crn import champion_anchored_seeds
+from ditto.api_server.crn import champion_anchored_seeds, fold_seed_bound
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -2409,10 +2409,12 @@ async def _current_koth_entries(
         },
         mode=wave_membership,
         anchored_seeds=(
-            champion_anchored_seeds(
-                raw_members[0].agent_id,
-                version=canonical_version,
-                max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+            fold_seed_bound(
+                champion_agent_id=raw_members[0].agent_id,
+                anchor_version=canonical_version,
+                seeds_by_agent={
+                    agent_id: values.keys() for agent_id, values in history.items()
+                },
             )
             if raw_members
             else None
