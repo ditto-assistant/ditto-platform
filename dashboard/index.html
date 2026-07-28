@@ -2441,6 +2441,12 @@
        bench board — label on top, serif numeral under it. */
     .stat-ledger { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; margin: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--border); overflow: hidden; }
     .ledger-line { display: block; min-width: 0; padding: 11px 14px; background: var(--bg-elev); }
+    /* The population headline gets the hero treatment: one tall tile
+       anchoring the grid's left edge, the eight singles filling a clean
+       5-column rectangle around it. Detail stays in the tooltip. */
+    .ledger-line.featured { grid-row: span 2; display: flex; flex-direction: column; justify-content: center; background: color-mix(in oklch, var(--accent) 8%, var(--bg-elev)); }
+    .ledger-line.featured .ledger-label { color: var(--accent); }
+    .ledger-line.featured .ledger-value { font-size: clamp(30px, 2.6vw, 40px); }
     .ledger-label { display: block; color: var(--text-dim); font: 700 11px/1.4 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
     .ledger-value { margin: 4px 0 0; min-width: 0; font-family: var(--display); font-size: clamp(19px, 1.5vw, 24px); line-height: 1.1; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
     @media (max-width: 720px) {
@@ -2548,13 +2554,13 @@
     <section class="snapshot" id="cards" aria-labelledby="snapshot-title">
       <h2 class="visually-hidden" id="snapshot-title">Subnet snapshot</h2>
       <dl class="stat-ledger">
+        <div class="ledger-line featured"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Distinct miners who have submitted to Subnet 118.">Miners total</span></dt><dd class="ledger-value" id="h-miners">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Distinct miners with at least one scored run on the board (provisional runs included).">Miners scored</span></dt><dd class="ledger-value" id="c-miners">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="The highest composite among ranked full-benchmark runs. Start with 0.5 × tool mean + 0.5 × memory mean, apply the benchmark quality gates, then apply the v5 token-efficiency multiplier. Token efficiency can remove at most 10%. Provisional runs are excluded.">Top composite</span></dt><dd class="ledger-value" id="c-top">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Median composite across ranked (full-benchmark) runs. The middle of the field, robust to one outlier.">Median composite</span></dt><dd class="ledger-value" id="c-median">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="All validator score records stored by the platform, including the independent scores that make up each finalized result.">Total scores</span></dt><dd class="ledger-value" id="h-scores">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Validators currently reporting heartbeat-capable software to the platform.">Validators</span></dt><dd class="ledger-value" id="h-validators">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label">Scored agents</dt><dd class="ledger-value" id="h-agents">–</dd></div>
-        <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="Distinct miners who have submitted to Subnet 118.">Miners total</span></dt><dd class="ledger-value" id="h-miners">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label"><span class="tip" tabindex="0" data-tooltip="How contested #1 is: the #1 composite minus the #2 composite among ranked runs. A small gap means a near-tie at the top.">Top gap</span></dt><dd class="ledger-value" id="c-spread">–</dd></div>
         <div class="ledger-line"><dt class="ledger-label">Last scored</dt><dd class="ledger-value" id="h-last">–</dd></div>
       </dl>
