@@ -1310,7 +1310,14 @@ async def list_score_outliers(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> AdminScoreOutlierList:
-    """List finalized three-score quorums with one unambiguous extreme."""
+    """List active-era three-score quorums with one unambiguous extreme.
+
+    Restricted to the benchmark era the platform is scoring now. The action
+    this page offers is a re-test, and a re-test runs the current contract:
+    a submission finalized under an older era cannot be re-scored into a
+    number comparable with the one it holds, so listing it would only offer
+    the operator a button that cannot honestly be pressed.
+    """
     agents = list(
         (
             await session.scalars(
@@ -1336,6 +1343,8 @@ async def list_score_outliers(
             all_scores=all_scores,
             canonical_version=canonical_version,
         )
+        if bench_version != canonical_version:
+            continue
         scores = [score for score in all_scores if score.bench_version == bench_version]
         tickets = [
             ticket for ticket in all_tickets if ticket.bench_version == bench_version
@@ -1423,12 +1432,18 @@ async def list_score_outliers(
             )
         )
 
+    # Ranked before slicing: the page is a worklist ordered by how far the
+    # outlier sits from its peers, so a stable full-set ordering is what makes
+    # `offset` mean the same thing from one request to the next. `agent_id`
+    # breaks ties, since equal deviations are otherwise ordered by nothing and
+    # could swap between pages and hide a row.
     detected.sort(key=lambda item: (-item.deviation, str(item.agent_id)))
     return AdminScoreOutlierList(
         items=detected[offset : offset + limit],
         count=len(detected),
         limit=limit,
         offset=offset,
+        bench_version=canonical_version,
     )
 
 
