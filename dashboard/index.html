@@ -4955,7 +4955,7 @@
 
     function renderBoardRows() {
       var tb = document.getElementById("rows");
-      var needle = (boardView.query || "").trim().toLowerCase();
+      var needle = boardView.query.trim().toLowerCase();
       var all = (lastEntries || []).filter(function (e) { return boardMatches(e, needle); });
       var scored = all.filter(isFinalized);
       var provisional = all.filter(function (e) { return !isFinalized(e); });
@@ -5001,7 +5001,7 @@
       if (!pageRows.length) {
         if (sectionChanged("leaderboard", { empty: true, tab: boardView.tab, page: boardView.page, query: needle })) {
           tb.innerHTML = '<tr><td colspan="9" class="empty"><div class="empty-msg">' + (needle
-            ? "No miners match “" + esc(boardView.query.trim()) + "”. Try a partial agent name, UID, or hotkey — or clear the filter."
+            ? "No miner matches that filter."
             : boardView.tab === "provisional"
             ? "No provisional runs right now. Pre-quorum scores appear here as validators report them."
             : "No miners have been scored yet. As soon as a submission clears scoring it appears here.") + '</div></td></tr>';
