@@ -277,7 +277,7 @@
       .board-toolbar { align-items: stretch; flex-direction: column; }
       .board-search { flex: 1 1 auto; }
     }
-    .leaderboard-version-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
+    .leaderboard-version-switch { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
     .leaderboard-version-switch .context { color: var(--text-dim); font-size: 12px; }
     /* One pill per shipped bench version: the list must be allowed to shrink
        and wrap, or it pushes the row past the column and the page gains a
@@ -2370,6 +2370,18 @@
        stay on the Leaderboard page and in row detail. */
     .overview-main .board { overflow-x: hidden; }
     .overview-main #board .cline2 { display: none; }
+    /* The compact pane can't give the filter a 200px minimum next to three
+       tab pills; let it shrink to share their row (placeholder may clip) and
+       only wrap below ~84px of remaining space. Split widths only: below the
+       breakpoint the board is full-width and the stock sizing (including the
+       640px column-stretch) must win.
+       TODO(board-filter): at narrow pane widths the placeholder clips
+       mid-list ("Filter by agent, UID,"). Accepted for now — the hidden
+       label and the filter's empty state carry the full field list. If it
+       bothers in screenshots, shorten the placeholder to "Filter miners". */
+    @media (min-width: 1181px) {
+      .overview-main .board-search { flex: 1 1 120px; min-width: 84px; max-width: 240px; }
+    }
     /* The strips were spaced for their old above-table home; give the first
        one clear separation from the board on the Leaderboard page. */
     .page[data-page="leaderboard"] #emissions-strip { margin-top: 28px; }
@@ -4938,7 +4950,7 @@
 
     function renderBoardRows() {
       var tb = document.getElementById("rows");
-      var needle = boardView.query.trim().toLowerCase();
+      var needle = (boardView.query || "").trim().toLowerCase();
       var all = (lastEntries || []).filter(function (e) { return boardMatches(e, needle); });
       var scored = all.filter(isFinalized);
       var provisional = all.filter(function (e) { return !isFinalized(e); });
@@ -4984,7 +4996,7 @@
       if (!pageRows.length) {
         if (sectionChanged("leaderboard", { empty: true, tab: boardView.tab, page: boardView.page, query: needle })) {
           tb.innerHTML = '<tr><td colspan="9" class="empty"><div class="empty-msg">' + (needle
-            ? "No miner matches that filter."
+            ? "No miners match “" + esc(boardView.query.trim()) + "”. Try a partial agent name, UID, or hotkey — or clear the filter."
             : boardView.tab === "provisional"
             ? "No provisional runs right now. Pre-quorum scores appear here as validators report them."
             : "No miners have been scored yet. As soon as a submission clears scoring it appears here.") + '</div></td></tr>';
