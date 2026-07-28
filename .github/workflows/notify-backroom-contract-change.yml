@@ -1,0 +1,45 @@
+name: Notify Backroom of platform contract changes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ditto/api_models/**"
+      - "ditto/api_server/endpoints/**"
+      - "ditto/api_server/factory.py"
+  workflow_dispatch:
+    inputs:
+      platform_sha:
+        description: Platform commit to synchronize (defaults to this workflow SHA)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notify-backroom-platform-contract
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint scoped cross-repository token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.BACKROOM_CONTRACT_SYNC_APP_ID }}
+          private-key: ${{ secrets.BACKROOM_CONTRACT_SYNC_APP_PRIVATE_KEY }}
+          owner: ditto-assistant
+          repositories: backroom
+
+      - name: Dispatch exact platform commit
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PLATFORM_SHA: ${{ inputs.platform_sha || github.sha }}
+        run: |
+          gh api --method POST repos/ditto-assistant/backroom/dispatches \
+            -f event_type=platform-contract-changed \
+            -f "client_payload[platform_sha]=${PLATFORM_SHA}" \
+            -f "client_payload[platform_repository]=${GITHUB_REPOSITORY}"
