@@ -372,6 +372,137 @@ async def test_caller_reasoning_effort_is_accepted_pinned_to_medium_and_charged(
 
 
 @pytest.mark.asyncio
+async def test_structured_outputs_reach_the_provider_and_return_unmangled(
+    session_maker: async_sessionmaker[Any],
+) -> None:
+    """`response_format` is forwarded byte-identical and its answer survives.
+
+    Verified upstream before forwarding: against the pinned v7 model, a
+    `json_schema` request conforms on every supporting provider WITH the pinned
+    reasoning block active, and OpenRouter routes around the one provider that
+    lacks `response_format` rather than failing the request. So forwarding
+    cannot manufacture the live 400 that would have made this worse than the
+    silent strip it replaces.
+
+    Both halves matter. A schema that arrives mutated is useless, and a
+    conforming answer that the response allowlist mangles on the way back is the
+    same silent failure wearing a different hat.
+    """
+    config = _config()
+    private = Ed25519PrivateKey.generate()
+    public = private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    grant_id, bearer, generation = await _seed_v7_grant(
+        session_maker,
+        config=config,
+        public_key=base64.urlsafe_b64encode(public).decode().rstrip("="),
+    )
+
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "answer",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"color": {"type": "string"}},
+                "required": ["color"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    seen: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "gen-1",
+                "object": "chat.completion",
+                "created": 1_700_000_000,
+                "model": V7_MODEL,
+                "openrouter_metadata": {
+                    "endpoints": {
+                        "available": [{"provider": "Fireworks", "selected": True}]
+                    }
+                },
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"color":"blue"}',
+                        },
+                        "logprobs": {
+                            "content": [
+                                {"token": "blue", "logprob": -0.5, "top_logprobs": []}
+                            ]
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 6,
+                    "total_tokens": 18,
+                    "cost": 0.000045,
+                },
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = _App(_State(config=config, session_maker=session_maker, client=client))
+    body = json.dumps(
+        {
+            "model": V7_MODEL,
+            "messages": [{"role": "user", "content": "Name one color."}],
+            "response_format": schema,
+            "logprobs": True,
+            "logit_bias": {"1234": -100},
+            "frequency_penalty": 0.25,
+            "seed": 42,
+        }
+    ).encode()
+
+    try:
+        response = await proxy_chat_completions(
+            **_signed_request(
+                app=app,
+                grant_id=grant_id,
+                bearer=bearer,
+                generation=generation,
+                private=private,
+                body=body,
+            )
+        )
+    finally:
+        await client.aclose()
+
+    assert response.status_code == 200
+    # Reached the provider byte-identical -- a mutated schema is a broken one.
+    assert seen[0]["response_format"] == schema
+    assert seen[0]["logprobs"] is True
+    assert seen[0]["logit_bias"] == {"1234": -100}
+    assert seen[0]["frequency_penalty"] == 0.25
+    assert seen[0]["seed"] == 42
+    # Still pinned alongside it: structured outputs buy no reasoning effort.
+    assert seen[0]["reasoning"] == {"effort": "medium", "exclude": True}
+    assert seen[0]["model"] == V7_MODEL
+
+    # And the answer survives the response allowlist unmangled, logprobs
+    # included -- forwarding a request field whose response is stripped would
+    # be a silent no-op.
+    returned = json.loads(bytes(response.body))
+    choice = returned["choices"][0]
+    assert choice["message"]["content"] == '{"color":"blue"}'
+    assert json.loads(choice["message"]["content"]) == {"color": "blue"}
+    assert choice["logprobs"]["content"][0]["token"] == "blue"
+
+
+@pytest.mark.asyncio
 async def test_unknown_request_field_names_itself_in_the_error(
     session_maker: async_sessionmaker[Any],
 ) -> None:

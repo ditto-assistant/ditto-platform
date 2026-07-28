@@ -15,6 +15,7 @@ from ditto.api_server.endpoints.inference import (
     _DROPPED_REQUEST_FIELDS,
     _FORWARDED_REQUEST_FIELDS,
     _PINNED_REQUEST_FIELDS,
+    _REFUSED_REQUEST_FIELDS,
     _bounded_provider_cost,
     _estimated_tokens,
     _exchange_message,
@@ -455,46 +456,158 @@ def test_caller_reasoning_is_accepted_then_overwritten_with_the_pinned_effort() 
     assert upstream["reasoning"] == {"effort": "medium", "exclude": True}
 
 
-def test_harmless_client_defaults_are_accepted_and_never_reach_the_provider() -> None:
-    """Fields mainstream OpenAI clients emit by default cost nobody a run.
+def test_identity_fields_are_accepted_and_never_reach_the_provider() -> None:
+    """The only drops left: zero effect on the completion or on observation.
 
-    Each is accepted at the door and stripped before the upstream call, so the
-    harness is not killed for sending it and the provider never sees it.
+    Stripping is acceptable exactly when it changes neither what the model
+    produces nor what the harness can see. These carry or fingerprint agent
+    identity toward a third party under the pinned deny-retention posture and
+    affect nothing about the answer, so dropping them cannot alter a result.
     """
     payload: dict[str, object] = {
         "model": "openai/gpt-oss-20b",
         "messages": [{"role": "user", "content": "hello"}],
         "user": "agent-7",
         "metadata": {"run": "abc"},
+        "safety_identifier": "agent-7",
         "store": False,
         "stream_options": {"include_usage": True},
-        "response_format": {"type": "json_object"},
-        "logprobs": True,
-        "top_logprobs": 5,
-        "logit_bias": {"1234": -100},
-        "service_tier": "priority",
-        "best_of": 4,
-        "n": 3,
     }
     _validate_request_schema(payload)
     upstream = _locked_upstream_payload(
         payload, model="openai/gpt-oss-20b", max_tokens=256
     )
-    for dropped in (
-        "user",
-        "metadata",
-        "store",
-        "stream_options",
-        "response_format",
-        "logprobs",
-        "top_logprobs",
-        "logit_bias",
-        "service_tier",
-        "best_of",
-    ):
+    for dropped in _DROPPED_REQUEST_FIELDS:
         assert dropped not in upstream, dropped
-    # `n` is pinned rather than dropped: exactly one billed generation.
+
+
+def test_grant_protecting_fields_are_pinned_not_forwarded() -> None:
+    """The anti-cheat boundary, which does not loosen under default-forward."""
+    payload: dict[str, object] = {
+        "model": "attacker/model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "n": 3,
+        "best_of": 4,
+        "reasoning": {"effort": "high"},
+        "reasoning_effort": "high",
+        "include_reasoning": True,
+        "service_tier": "priority",
+        "usage": {"include": True},
+        "prompt_cache_key": "shared-bucket",
+        "max_completion_tokens": 999_999,
+    }
+    _validate_request_schema(payload)
+    upstream = _locked_upstream_payload(
+        payload, model="openai/gpt-oss-20b", max_tokens=256
+    )
+    # Replaced with the ticket's values.
+    assert upstream["model"] == "openai/gpt-oss-20b"
     assert upstream["n"] == 1
+    assert upstream["max_tokens"] == 256
+    assert upstream["reasoning"] == {"effort": "medium", "exclude": True}
+    # Pinned by removal, so the platform's own request governs.
+    for removed in (
+        "best_of",
+        "reasoning_effort",
+        "include_reasoning",
+        "service_tier",
+        "usage",
+        "prompt_cache_key",
+        "max_completion_tokens",
+    ):
+        assert removed not in upstream, removed
+
+
+def test_structured_outputs_and_logprobs_are_forwarded_intact() -> None:
+    """Verified against the pinned v7 model on every supporting provider.
+
+    `json_schema` conforms WITH the pinned reasoning block active, and OpenRouter
+    routes around providers that lack `response_format` rather than failing, so
+    forwarding cannot manufacture a 400. `logprobs` does not alter generation at
+    all, so there was never an argument against it beyond the allowlist's
+    silence.
+    """
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "answer",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"color": {"type": "string"}},
+                "required": ["color"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    payload: dict[str, object] = {
+        "model": "openai/gpt-oss-20b",
+        "messages": [{"role": "user", "content": "hello"}],
+        "response_format": schema,
+        "structured_outputs": True,
+        "logprobs": True,
+        "logit_bias": {"1234": -100},
+        "prediction": {"type": "content", "content": "red"},
+        "verbosity": "low",
+    }
+    _validate_request_schema(payload)
+    upstream = _locked_upstream_payload(
+        payload, model="openai/gpt-oss-20b", max_tokens=256
+    )
+    # Byte-identical, not merely present: a schema is only useful intact.
+    assert upstream["response_format"] == schema
+    assert upstream["structured_outputs"] is True
+    assert upstream["logprobs"] is True
+    assert upstream["logit_bias"] == {"1234": -100}
+    assert upstream["prediction"] == {"type": "content", "content": "red"}
+    assert upstream["verbosity"] == "low"
+
+
+def test_forwarded_logprobs_are_actually_returned_to_the_caller() -> None:
+    """Forwarding a field the response strips would be a silent no-op.
+
+    The caller sets the flag, pays for the larger provider response, and
+    receives nothing -- which is the bug this whole change exists to remove.
+    """
+    logprobs = {"content": [{"token": "hi", "logprob": -0.25, "top_logprobs": []}]}
+    public = _public_provider_response(
+        {
+            "id": "gen-1",
+            "object": "chat.completion",
+            "created": 1_700_000_000,
+            "model": "openai/gpt-oss-20b",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "hi"},
+                    "logprobs": logprobs,
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+    )
+    assert public["choices"][0]["logprobs"] == logprobs
+
+    # A provider that does not support them returns null, which is the honest
+    # answer rather than a fabricated one.
+    without = _public_provider_response(
+        {
+            "id": "gen-2",
+            "object": "chat.completion",
+            "created": 1_700_000_000,
+            "model": "openai/gpt-oss-20b",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "hi"},
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+    )
+    assert without["choices"][0]["logprobs"] is None
 
 
 def test_sampling_knobs_the_miner_owns_are_forwarded_unchanged() -> None:
@@ -535,9 +648,32 @@ def test_unsupported_parameter_error_names_every_offending_key() -> None:
     assert refused.value.status_code == 400
     detail = str(refused.value.detail)
     assert "unsupported inference parameter" in detail
-    # Sorted, so the message is stable across dict ordering.
-    assert "models, plugins" in detail
+    # Both keys named, sorted so the message is stable across dict ordering,
+    # and each carrying the reason rather than a bare "unsupported".
+    assert "models" in detail
+    assert "plugins" in detail
+    assert detail.index("models") < detail.index("plugins")
+    assert "pinned by the ticket" in detail
 
+    # A key nobody has classified still names itself.
+    with pytest.raises(HTTPException) as novel:
+        _validate_request_schema(
+            {
+                "model": "openai/gpt-oss-20b",
+                "messages": [{"role": "user", "content": "hello"}],
+                "some_future_openrouter_field": 1,
+            }
+        )
+    assert "some_future_openrouter_field" in str(novel.value.detail)
+
+
+def test_capability_limits_say_they_are_limits() -> None:
+    """`stream` and `top_logprobs` are refusals we would rather not make.
+
+    Both are capability limits of this lane rather than policy, so the message
+    has to say which key and why -- a miner reading it should know whether to
+    change their harness or ask us to change the platform.
+    """
     with pytest.raises(HTTPException) as streaming:
         _validate_request_schema(
             {
@@ -547,26 +683,80 @@ def test_unsupported_parameter_error_names_every_offending_key() -> None:
             }
         )
     assert "stream" in str(streaming.value.detail)
+    assert "non-streaming" in str(streaming.value.detail)
+
+    with pytest.raises(HTTPException) as top:
+        _validate_request_schema(
+            {
+                "model": "openai/gpt-oss-20b",
+                "messages": [{"role": "user", "content": "hello"}],
+                "logprobs": True,
+                "top_logprobs": 5,
+            }
+        )
+    detail = str(top.value.detail)
+    assert "top_logprobs" in detail
+    # Says the neighbouring field DOES work, so the miner keeps what they can.
+    assert "logprobs is supported" in detail
+    assert "response size" in detail
 
 
-def test_every_accepted_field_is_pinned_dropped_or_deliberately_forwarded() -> None:
-    """The anti-cheat property, stated as a partition over the allowlist.
+def test_every_field_has_exactly_one_decided_fate() -> None:
+    """The partition, which is what makes default-forward reviewable.
 
-    Nothing may be accepted without a decided fate. A field that is neither
-    pinned nor dropped is forwarded to the provider verbatim, so this partition
-    is what makes "accept it" reviewable one field at a time.
+    Under a forward-by-default posture the risk is no longer "a normal field is
+    refused" but "a field that should have been pinned is forwarded by
+    omission". These four sets must stay disjoint and must cover the surface.
     """
     assert (
         _PINNED_REQUEST_FIELDS | _DROPPED_REQUEST_FIELDS | _FORWARDED_REQUEST_FIELDS
         == _ALLOWED_REQUEST_FIELDS
     )
-    assert not _PINNED_REQUEST_FIELDS & _DROPPED_REQUEST_FIELDS
-    assert not _PINNED_REQUEST_FIELDS & _FORWARDED_REQUEST_FIELDS
-    assert not _DROPPED_REQUEST_FIELDS & _FORWARDED_REQUEST_FIELDS
-    # Nothing that selects a model, a route, or server-side network egress may
-    # be accepted at any tier.
+    for left, right in (
+        (_PINNED_REQUEST_FIELDS, _DROPPED_REQUEST_FIELDS),
+        (_PINNED_REQUEST_FIELDS, _FORWARDED_REQUEST_FIELDS),
+        (_DROPPED_REQUEST_FIELDS, _FORWARDED_REQUEST_FIELDS),
+    ):
+        assert not left & right, sorted(left & right)
+    # An accepted field can never also be a named refusal.
+    assert not _ALLOWED_REQUEST_FIELDS & set(_REFUSED_REQUEST_FIELDS)
+    # Every named refusal explains itself; "unsupported" alone is what we are
+    # replacing, so an empty or lazy reason is a test failure.
+    for key, reason in _REFUSED_REQUEST_FIELDS.items():
+        assert reason and len(reason) > 12, key
+
+    # The anti-cheat boundary, asserted by name. Anything that could buy
+    # compute, a model, or an effort level the ticket did not grant must be
+    # pinned or refused -- never forwarded.
+    for lever in (
+        "model",
+        "n",
+        "best_of",
+        "reasoning",
+        "reasoning_effort",
+        "include_reasoning",
+        "service_tier",
+        "max_tokens",
+        "max_completion_tokens",
+    ):
+        assert lever in _PINNED_REQUEST_FIELDS, lever
+        assert lever not in _FORWARDED_REQUEST_FIELDS, lever
     for escape in ("models", "provider", "plugins", "transforms", "route"):
         assert escape not in _ALLOWED_REQUEST_FIELDS
+        assert escape in _REFUSED_REQUEST_FIELDS
+
+    # The fields the operator explicitly asked to be usable by harnesses.
+    for normal in (
+        "seed",
+        "logprobs",
+        "response_format",
+        "logit_bias",
+        "frequency_penalty",
+        "presence_penalty",
+        "stop",
+        "top_k",
+    ):
+        assert normal in _FORWARDED_REQUEST_FIELDS, normal
 
 
 def test_caller_shape_rejections_do_not_cool_shared_provider_route() -> None:

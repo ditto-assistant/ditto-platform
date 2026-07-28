@@ -395,6 +395,16 @@ def _public_provider_response(payload: dict[str, Any]) -> dict[str, Any]:
     if usage is None:
         raise HTTPException(status_code=502, detail="invalid provider response")
     prompt_tokens, completion_tokens, _ = usage
+    # ``logprobs`` is a forwarded request field, so it has to come back or
+    # forwarding it would be a silent no-op -- the caller sets the flag, pays for
+    # the larger provider response, and receives nothing. Passed through as the
+    # provider sent it; only the two providers serving this model that support
+    # logprobs populate it, and the rest return null, which is the honest
+    # answer. ``top_logprobs`` is refused at the door, so the per-token
+    # alternatives array is never present and the body stays bounded.
+    logprobs = choice.get("logprobs")
+    if logprobs is not None and not isinstance(logprobs, dict):
+        raise HTTPException(status_code=502, detail="invalid provider response")
     return {
         "id": response_id,
         "object": "chat.completion",
@@ -405,6 +415,7 @@ def _public_provider_response(payload: dict[str, Any]) -> dict[str, Any]:
                 "index": index,
                 "finish_reason": finish_reason,
                 "message": public_message,
+                "logprobs": logprobs,
             }
         ],
         "usage": {
@@ -442,41 +453,61 @@ def _provider_preferences(
 # How this gate treats an unexpected request field, and why it changed
 # ---------------------------------------------------------------------
 #
-# This used to be one flat allowlist, and anything outside it was a 400 raised
-# *before* ``begin_inference_request``. That combination was quietly expensive:
-# no ``inference_requests`` row is written on that path, so the rejections were
-# invisible in telemetry, and the error body did not name the offending key. A
-# rank-15 miner (``Cooking``) burned three submissions adding a single line that
-# sent ``reasoning: {"effort": "medium"}`` -- the very value this platform was
-# already stamping on their request for them (``benchmark_reasoning`` below) --
-# and had no way to discover which field killed the run.
+# **The default is FORWARD.** Forwarding needs no justification; every pin and
+# every drop below carries a concrete, stated reason. This is a retrieval-agent
+# competition, not a prompt-shape competition -- a harness's own sampling and
+# observability choices are its business.
 #
-# The philosophy is now the broker's: normalise rather than refuse, wherever
-# refusing buys no safety. ``dittobench-api`` already overwrites the caller's
-# ``model`` instead of refusing a request that names one, and pins its own
-# embedding model and nonce. The same reasoning applies field by field here, so
-# the allowlist is split into three sets by what the field can actually do:
+# The default used to be the opposite, and it was expensive. Anything outside a
+# flat allowlist was a 400 raised *before* ``begin_inference_request``, so no
+# ``inference_requests`` row was written, the rejections were invisible in
+# telemetry, and the error named no key. ``Cooking`` (rank 15 on v1) burned three
+# submissions on one line sending ``reasoning: {"effort": "medium"}`` -- the very
+# value this platform already stamps on their request (``benchmark_reasoning``)
+# -- with no way to discover which field killed the run.
 #
-# ``_PINNED_REQUEST_FIELDS``   accepted, then *overwritten* with the value the
-#                              ticket grants, in ``_locked_upstream_payload``.
-#                              The caller's value never reaches the provider, so
-#                              asking for more than the ticket granted is inert
-#                              rather than fatal.
-# ``_DROPPED_REQUEST_FIELDS``  accepted, then removed before the provider call.
-#                              These have no bearing on the answer the harness
-#                              gets, and each one is dropped for a stated reason
-#                              (cost lever, egress channel, determinism, or dead
-#                              weight against a contract we already refuse).
+# The governing rule for a drop: **stripping a field is only acceptable when it
+# changes neither what the model produces nor what the harness can observe.**
+# Silently discarding a knob a miner deliberately set is the Cooking bug with
+# extra steps -- they ask for a JSON schema, receive prose, their parser fails,
+# and nothing anywhere names the cause. Fields with genuinely zero effect on
+# either (``user``, ``metadata``) are inert to strip; fields that shape
+# generation or output (``response_format``, ``logit_bias``, ``logprobs``) are
+# not, and are forwarded.
+#
+# The four fates:
+#
+# ``_PINNED_REQUEST_FIELDS``    accepted, then overwritten or removed in
+#                               ``_locked_upstream_payload`` so the ticket's own
+#                               value governs. This is the anti-cheat boundary
+#                               and it does not loosen: nothing here can obtain
+#                               compute, a model, or an effort the ticket did
+#                               not grant.
+# ``_DROPPED_REQUEST_FIELDS``   accepted, then removed. Zero effect on the
+#                               completion or on what the harness observes.
 # ``_FORWARDED_REQUEST_FIELDS`` validated and passed through unchanged.
+# (refused)                     named explicitly in ``_validate_request_schema``
+#                               with the reason, including the two capability
+#                               limits (``stream``, ``top_logprobs``).
 #
-# Anything still outside all three is refused -- and refused *by name*. Unknown
-# stays fail-closed on purpose: OpenRouter's request surface is additive, and a
-# field invented after this code was written is exactly the one that might buy
-# compute. The fix for the incident above is not "accept everything", it is
-# "accept everything harmless, and say which key was not".
+# Provider support was established empirically against the pinned v7 model
+# rather than from documentation -- see the table in the PR. Two findings drive
+# the placements below:
+#
+#  * OpenRouter EXCLUDES an endpoint that lacks a requested parameter rather
+#    than routing to it and failing. Pinning ``order: [amazon-bedrock]`` (which
+#    advertises no ``response_format``) returns 404 "No endpoints found" with
+#    the field present and succeeds without it. Under the v7 aggregate route
+#    (``allow_fallbacks: true``) the request simply lands on one of the eight
+#    supporting providers, so forwarding ``response_format`` cannot manufacture
+#    a 400.
+#  * ``reasoning_effort`` is the one field that HARD-FAILS: OpenRouter answers
+#    400 `"reasoning_effort" and "reasoning.effort" are both provided with
+#    conflicting values` whenever it disagrees with the pinned block. Forwarding
+#    it would break every request that sets it to anything but ``medium``.
 
-# Route identity or a compute lever. Accepted and then replaced wholesale with
-# the ticket's own value; see ``_locked_upstream_payload``.
+# The anti-cheat boundary. Accepted, then replaced or removed so the ticket's
+# value governs; see ``_locked_upstream_payload``.
 _PINNED_REQUEST_FIELDS = {
     # Substituted by ``_locked_grant_model``: the grant pins the model.
     "model",
@@ -485,68 +516,96 @@ _PINNED_REQUEST_FIELDS = {
     "max_completion_tokens",
     # Forced to 1. Extra completions are extra billed generations.
     "n",
-    # Nested reasoning control. Replaced with ``benchmark_reasoning(model)``, so
-    # ``{"effort": "high"}`` is served as the pinned ``medium``.
+    # Buys N server-side generations and bills for all of them.
+    "best_of",
+    # Replaced with ``benchmark_reasoning(model)``, so ``{"effort": "high"}`` is
+    # served as the pinned ``medium`` -- and so is ``{"effort": "none"}``, which
+    # would otherwise let an agent opt out of v7's mandatory reasoning entirely.
     "reasoning",
+    # The flat sibling. Removed rather than forwarded: OpenRouter hard-400s when
+    # it disagrees with ``reasoning.effort`` (verified), so forwarding it would
+    # break every harness that sets it. Removing it makes the pinned nested
+    # value the single source of truth, which is also the anti-cheat action.
+    "reasoning_effort",
+    # OpenRouter's legacy boolean for returning reasoning. Removed so the pinned
+    # ``exclude: true`` cannot be overridden into echoing reasoning back.
+    "include_reasoning",
+    # Selects a provider priority/cost tier -- ``priority`` buys faster compute
+    # at a higher price. A compute lever the ticket did not grant.
+    "service_tier",
+    # The platform derives trusted cost from the response's usage block
+    # (``_bounded_provider_cost`` under aggregate routing). A caller must not be
+    # able to reshape the input to its own metering.
+    "usage",
+    # Controls provider-side prompt-cache bucketing. Two agents could collide on
+    # a bucket, or one could deliberately target another's, which is cross-miner
+    # interference rather than a private choice.
+    "prompt_cache_key",
 }
 
-# Accepted, then stripped before the request leaves this process.
+# Accepted, then stripped. Each has zero effect on the completion AND zero
+# effect on what the harness can observe, which is what makes stripping inert
+# rather than a silent behaviour change.
 _DROPPED_REQUEST_FIELDS = {
-    # Buys N server-side generations and bills for all of them. Dropping is
-    # strictly cheaper than the ticket already allows.
-    "best_of",
-    # The *flat* sibling of ``reasoning`` -- a different key, and a harness may
-    # plausibly send either. Dropped rather than pinned: the pinned effort
-    # already arrives via ``reasoning``, and forwarding both leaves provider-side
-    # precedence between them undefined.
-    "reasoning_effort",
-    # Selects a provider priority/cost tier. A compute lever the ticket did not
-    # grant.
-    "service_tier",
-    # Free-form caller-controlled strings shipped verbatim to a third party.
-    # The harness runs sandboxed with no egress; forwarding these would hand it
-    # one. Neither affects the completion.
+    # Caller-controlled strings that travel to a third party under the
+    # ``data_collection: "deny"`` / ``zdr: true`` posture this proxy pins, and
+    # that identify or fingerprint the agent behind the request. None of them
+    # affects the completion, so dropping cannot change a harness's results.
     "user",
     "metadata",
-    # Asks the provider to retain the completion, contradicting the
-    # ``data_collection: "deny"`` / ``zdr: true`` preferences this proxy pins.
+    "safety_identifier",
+    # Asks the provider to retain the completion, directly contradicting the
+    # pinned retention posture above.
     "store",
     # Only meaningful alongside ``stream: true``, which this lane refuses.
     "stream_options",
-    # Constrained/grammar decoding materially changes the output distribution
-    # and its latency profile, so two agents differing only in this field are no
-    # longer comparable runs. Dropped for benchmark comparability, not safety.
-    "response_format",
-    # Do not change sampling, but inflate the response body hard (``top_logprobs``
-    # carries up to 20 alternatives per token) against ``response_body_bytes``,
-    # and ``_public_provider_response`` strips them, so the caller could never
-    # read them back regardless.
-    "logprobs",
-    "top_logprobs",
-    # Unbounded in size, and keyed by *tokenizer-specific* token ids. Because the
-    # served model is the ticket's rather than the one the caller named, a bias
-    # map built against another tokenizer silently biases unrelated tokens.
-    # Dropped for correctness and comparability.
-    "logit_bias",
 }
 
-# Validated and passed through untouched.
+# Everything else a reasonable OpenAI-compatible harness sends. Validated where
+# a malformed value would be a genuine error, then passed through untouched.
 _FORWARDED_REQUEST_FIELDS = {
     "messages",
-    "temperature",
-    "top_p",
-    "seed",
-    "stop",
     "tools",
     "tool_choice",
     "parallel_tool_calls",
-    # Same class as ``temperature``/``top_p``/``seed``, which this lane has
-    # always forwarded: per-request sampling knobs that cost nothing extra and
-    # that the miner's own agent design is entitled to choose. Silently dropping
-    # a deliberately-set sampling knob would change an agent's behaviour behind
-    # its back -- the exact failure mode this change exists to remove.
+    # Sampling knobs. The miner's agent design owns these; they cost nothing
+    # extra and silently dropping one would change an agent's behaviour behind
+    # its back. ``seed`` and ``stop`` were always forwarded; the rest are the
+    # same class and were only ever excluded by the allowlist's silence.
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "top_a",
+    "seed",
+    "stop",
     "frequency_penalty",
     "presence_penalty",
+    "repetition_penalty",
+    # Biases token selection. Buys no compute and grants no model. The earlier
+    # tokenizer-mismatch worry does not survive contact: the grant pins
+    # gpt-oss-20b and the exchange response tells the harness exactly which
+    # model it is talking to, so a bias map is built against the served model.
+    "logit_bias",
+    # Purely observational -- it does not alter generation at all, so there was
+    # never a determinism or comparability argument against it, only the
+    # allowlist's silence. Plumbed through ``_public_provider_response`` so it
+    # is genuinely returned rather than accepted and quietly discarded.
+    # (``top_logprobs`` is refused separately: see the response-size limit.)
+    "logprobs",
+    # Structured outputs. Verified end to end against the pinned v7 model on all
+    # five supporting providers tested, WITH the pinned reasoning block active:
+    # ``json_schema`` conforms every time. ``json_object`` is honoured by most
+    # providers but is advisory -- prefer ``json_schema``.
+    "response_format",
+    "structured_outputs",
+    # Speculative decoding. Rejected prediction tokens bill as completion
+    # tokens, but the prediction blob rides in the request body, so it inflates
+    # the caller's own byte-derived reservation and chargeable ceiling first.
+    # Self-limiting.
+    "prediction",
+    # Generation-length hint on newer OpenAI-compatible surfaces.
+    "verbosity",
     # Refused when true (see below), but must parse as a known field so the
     # refusal can explain itself.
     "stream",
@@ -557,8 +616,59 @@ _ALLOWED_REQUEST_FIELDS = (
 )
 
 
+# Fields refused on purpose, each with the reason the caller gets told. A
+# refusal is only acceptable when it is legible, so every entry here explains
+# itself rather than saying "unsupported".
+_REFUSED_REQUEST_FIELDS = {
+    # Route identity and model selection. The platform sets provider preferences
+    # itself; letting a caller choose is the evasion path this lane exists to
+    # close.
+    "models": "the model is pinned by the ticket, not chosen by the request",
+    "provider": "provider routing is pinned by the platform",
+    "route": "provider routing is pinned by the platform",
+    "preset": "provider routing is pinned by the platform",
+    "transforms": "prompt transforms would change benchmark semantics",
+    # Server-side network egress. The harness runs sandboxed without egress and
+    # these would hand it some through the provider.
+    "plugins": "server-side plugins are not available on this lane",
+    "web_search_options": "server-side web search is not available on this lane",
+    # Deprecated tool spellings. No provider serving this model advertises them,
+    # so forwarding would leave the harness silently toolless -- name the modern
+    # equivalent instead.
+    "functions": "use tools instead",
+    "function_call": "use tool_choice instead",
+    # This lane's response contract is text-only (`_public_provider_response`);
+    # a non-text modality would surface as a 502 blamed on the provider.
+    "audio": "this lane serves text completions only",
+    "modalities": "this lane serves text completions only",
+    # Capability limit, not a policy choice. `top_logprobs` multiplies the
+    # response body by roughly 80 bytes per token per alternative: measured
+    # against this model, `logprobs` alone extrapolates to ~0.81 MiB at the 8192
+    # -token ceiling and fits, while top_logprobs=3 reaches ~2.65 MiB and
+    # top_logprobs=20 ~13.3 MiB, both past the 2 MiB response cap. Breaching it
+    # raises a 502 that is attributed to the PROVIDER and cools the shared
+    # route, so a caller's own choice would be charged to infrastructure.
+    # Refused rather than clamped because no non-zero value is safe at the
+    # ceiling. Raising `response_body_bytes` would unlock it.
+    "top_logprobs": (
+        "logprobs is supported but top_logprobs is not: it would exceed this "
+        "lane's response size limit"
+    ),
+}
+
+
 def _validate_request_schema(payload: dict[str, Any]) -> None:
-    """Accept only the text/tool subset used by the benchmark harness."""
+    """Accept the OpenAI-compatible surface, pinning only what protects the grant."""
+    # Named refusals first, so a caller sending one gets the reason rather than
+    # a bare "unsupported parameter".
+    refused = sorted(set(payload) & set(_REFUSED_REQUEST_FIELDS))
+    if refused:
+        reasons = "; ".join(
+            f"{key} ({_REFUSED_REQUEST_FIELDS[key]})" for key in refused
+        )
+        raise HTTPException(
+            status_code=400, detail=f"unsupported inference parameter: {reasons}"
+        )
     unknown = set(payload) - _ALLOWED_REQUEST_FIELDS
     if unknown:
         # Name the keys. A harness author reading this over stderr has no other
@@ -568,7 +678,18 @@ def _validate_request_schema(payload: dict[str, Any]) -> None:
             status_code=400,
             detail=f"unsupported inference parameter: {', '.join(sorted(unknown))}",
         )
-    for name in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
+    # Validation stays deliberately light. Over-validating a forwarded field
+    # recreates the problem this change exists to fix: the point is to reject
+    # only what is genuinely malformed, not what is merely unfamiliar.
+    for name in (
+        "temperature",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "min_p",
+        "top_a",
+        "repetition_penalty",
+    ):
         value = payload.get(name)
         if value is not None and (
             not isinstance(value, (int, float))
@@ -580,6 +701,20 @@ def _validate_request_schema(payload: dict[str, Any]) -> None:
         penalty = payload.get(name)
         if penalty is not None and not -2 <= penalty <= 2:
             raise HTTPException(status_code=400, detail=f"invalid {name}")
+    for name in ("min_p", "top_a"):
+        value = payload.get(name)
+        if value is not None and not 0 <= value <= 1:
+            raise HTTPException(status_code=400, detail=f"invalid {name}")
+    repetition_penalty = payload.get("repetition_penalty")
+    if repetition_penalty is not None and not 0 < repetition_penalty <= 2:
+        raise HTTPException(status_code=400, detail="invalid repetition_penalty")
+    top_k = payload.get("top_k")
+    if top_k is not None and (
+        not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 0
+    ):
+        raise HTTPException(status_code=400, detail="invalid top_k")
+    if "logprobs" in payload and not isinstance(payload["logprobs"], bool):
+        raise HTTPException(status_code=400, detail="invalid logprobs")
     temperature = payload.get("temperature")
     if temperature is not None and not 0 <= temperature <= 2:
         raise HTTPException(status_code=400, detail="invalid temperature")
@@ -794,9 +929,22 @@ def _locked_upstream_payload(
     # none of them reaches the provider. See ``_DROPPED_REQUEST_FIELDS``.
     for field in _DROPPED_REQUEST_FIELDS:
         upstream.pop(field, None)
-    # Collapsed into the single clamped ``max_tokens`` computed by
-    # ``_output_token_limit``; forwarding both would re-open the alias bypass.
-    upstream.pop("max_completion_tokens", None)
+    # Pinned by removal: the ticket's value governs, and for these that value is
+    # "whatever the platform's own request says", so the caller's key must go.
+    # ``reasoning_effort`` in particular is not merely ignored upstream -- it
+    # hard-400s when it disagrees with the pinned ``reasoning.effort``.
+    for field in (
+        "best_of",
+        "reasoning_effort",
+        "include_reasoning",
+        "service_tier",
+        "usage",
+        "prompt_cache_key",
+        # Collapsed into the single clamped ``max_tokens`` computed by
+        # ``_output_token_limit``; forwarding both re-opens the alias bypass.
+        "max_completion_tokens",
+    ):
+        upstream.pop(field, None)
     upstream["model"] = model
     upstream["max_tokens"] = max_tokens
     upstream["n"] = 1
