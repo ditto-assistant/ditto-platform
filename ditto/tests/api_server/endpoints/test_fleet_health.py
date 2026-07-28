@@ -1,6 +1,8 @@
 """Classification and privacy tests for public fleet-health reporting."""
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -10,7 +12,14 @@ from ditto.api_server.endpoints.public import (
     _benchmark_stalled,
     _fleet_classification,
     _public_system_metrics,
+    _validator_heartbeats_response,
 )
+from ditto.db.queries.orphaned_leases import OrphanedLease
+
+# Real hotkeys from the 2026-07-27 eviction incident: the wire model pins
+# validator hotkeys to the SS58 shape, so a placeholder will not serialize.
+_HOTKEY = "5HmP9732JFjnut2RY9yg4Gz2qJ38vF8xFwZb5dQVPF7FsmZz"
+_OTHER_HOTKEY = "5CFtzzb4vym9eysfeF9cxxp6D7gksuUVTKYNq1mchnrMs118"
 
 
 @pytest.fixture
@@ -136,3 +145,126 @@ def test_running_benchmark_is_never_stalled_on_wall_clock_alone() -> None:
     # A count that has plainly not kept up with the clock is the one case that
     # does flag: 3 checks cannot account for an hour.
     assert _benchmark_stalled("running_benchmark", started, now, completed=3) is True
+
+
+class TestOrphanedSlotSerialization:
+    """A slot the platform evicted while the validator kept running must never
+    reconcile to a clean "idle".
+
+    The serializer cannot derive this from its other two inputs, which is the
+    whole reason it takes a third: the evicted lease is gone from
+    ``assignments`` by construction, and the ingest filter drops its slot from
+    the stored capacity that backs ``active_work``. Both halves therefore agree
+    the slot is free while the host is still burning a benchmark's worth of CPU
+    on it.
+    """
+
+    @staticmethod
+    def _heartbeat_row(hotkey: str = _HOTKEY) -> SimpleNamespace:
+        now = datetime.now(UTC)
+        return SimpleNamespace(
+            validator_hotkey=hotkey,
+            software_version="0.35.2",
+            protocol_version=16,
+            code_digest="ab" * 32,
+            state="running_benchmark",
+            active_agent_id=None,
+            first_seen_at=now - timedelta(days=1),
+            reported_at=now - timedelta(seconds=5),
+            seen_at=now - timedelta(seconds=5),
+            system_metrics=None,
+            capabilities=None,
+            stack=None,
+            stack_health=None,
+            benchmark_capacity={
+                "configured_slots": 2,
+                "healthy_slots": ["slot-0", "slot-1"],
+                "admission": "accepting",
+                "active": [],
+            },
+            claimed_slots=[{"slot_id": "slot-0", "agent_id": str(uuid4())}],
+        )
+
+    @staticmethod
+    def _orphan(state: str, *, slot_id: str = "slot-0") -> OrphanedLease:
+        now = datetime.now(UTC)
+        return OrphanedLease(
+            audit_id=uuid4(),
+            validator_hotkey=_HOTKEY,
+            slot_id=slot_id,
+            agent_id=uuid4(),
+            agent_name="mnemox-v55",
+            bench_version=7,
+            state=state,  # type: ignore[arg-type]
+            reason="validator_still_claims_slot",
+            evicted_at=now - timedelta(minutes=23),
+            orphaned_for_seconds=1380.0,
+            original_deadline=now + timedelta(minutes=44),
+            protocol_version=16,
+        )
+
+    def test_an_orphaned_slot_is_published_on_its_validator(self) -> None:
+        response = _validator_heartbeats_response(
+            rows=[self._heartbeat_row()],
+            assignments=[],
+            active_work=[],
+            orphaned_leases=[self._orphan("still_running")],
+            now=datetime.now(UTC),
+            active_bench_version=7,
+        )
+
+        [entry] = response.validators
+        assert [(slot.slot_id, slot.state) for slot in entry.orphaned_slots] == [
+            ("slot-0", "still_running")
+        ]
+        assert entry.orphaned_slots[0].agent_name == "mnemox-v55"
+        assert entry.orphaned_slots[0].orphaned_for_seconds == 1380.0
+        # The lie this exists to stop: the same snapshot reconciles to no
+        # assignment and no active work, so nothing else on the entry says the
+        # host is busy.
+        assert entry.active_benchmarks == []
+        assert entry.assigned_benchmarks == []
+
+    def test_an_indeterminate_slot_is_published_rather_than_guessed_away(
+        self,
+    ) -> None:
+        response = _validator_heartbeats_response(
+            rows=[self._heartbeat_row()],
+            assignments=[],
+            active_work=[],
+            orphaned_leases=[self._orphan("indeterminate")],
+            now=datetime.now(UTC),
+            active_bench_version=7,
+        )
+
+        [entry] = response.validators
+        assert [slot.state for slot in entry.orphaned_slots] == ["indeterminate"]
+
+    def test_a_released_slot_keeps_rendering_as_idle(self) -> None:
+        """``released`` is the one state with positive evidence the container is
+        gone, so publishing it would put a warning on a genuinely free slot."""
+        response = _validator_heartbeats_response(
+            rows=[self._heartbeat_row()],
+            assignments=[],
+            active_work=[],
+            orphaned_leases=[self._orphan("released")],
+            now=datetime.now(UTC),
+            active_bench_version=7,
+        )
+
+        [entry] = response.validators
+        assert entry.orphaned_slots == []
+
+    def test_orphans_land_on_the_validator_that_holds_them(self) -> None:
+        response = _validator_heartbeats_response(
+            rows=[self._heartbeat_row(), self._heartbeat_row(_OTHER_HOTKEY)],
+            assignments=[],
+            active_work=[],
+            orphaned_leases=[self._orphan("still_running")],
+            now=datetime.now(UTC),
+            active_bench_version=7,
+        )
+
+        by_hotkey = {entry.validator_hotkey: entry for entry in response.validators}
+        assert len(by_hotkey[_HOTKEY].orphaned_slots) == 1
+        assert by_hotkey[_OTHER_HOTKEY].orphaned_slots == []

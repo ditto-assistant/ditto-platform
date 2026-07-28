@@ -216,6 +216,50 @@ base budget of two with zero scores that way. The eviction route passes
 k=3 gate in `submit_score` exactly like any superseded lease. Nothing reaches the
 ledger.
 
+### Seeing the run the eviction did not stop
+
+That last paragraph is correct and it used to be invisible. Eviction releases the
+platform's half of the lease at once; the container keeps executing, so for
+minutes to over an hour a host is burning a full benchmark's worth of CPU on a
+run that cannot produce a score — and every platform surface said the slot was
+free. On 2026-07-27, nine bench-7 evictions revoked five leases across three
+validators and the fleet view rendered each of those slots `Idle` beside a
+"Running benchmark" badge. Read as headroom, the obvious next move (raise the
+slot cap) makes it worse.
+
+`ditto/db/queries/orphaned_leases.py` derives the missing state and
+`PublicValidatorHeartbeat.orphaned_slots` publishes it. It is a read: nothing
+there cancels, revokes, or re-leases.
+
+The "was evicted" half is exact — the `validator_lease_audit` rows above. The
+"still running" half comes from `ValidatorHeartbeat.claimed_slots`, **not**
+`benchmark_capacity`, and that distinction is the whole mechanism. The stored
+capacity is filtered at ingest to slots confirmable against a *live* ticket, and
+an evicted lease has none, so an orphaned slot is always missing from
+`benchmark_capacity.active` no matter what the validator reported.
+`claimed_slots` is the same signed claim captured before that filter. Production
+confirms it: 23 minutes after the incident, the two orphaned hosts had
+`benchmark_capacity.active = []` and their orphaned run visible only there.
+
+| state | derived from | rendered as |
+|---|---|---|
+| `still_running` | the claim still lists this slot, held by the evicted agent | `Evicted · still running · 23m` |
+| `released` | the slot is gone from a **v16** claim, or another agent now holds it (any protocol — a slot runs one benchmark at a time) | nothing; the slot is genuinely idle |
+| `indeterminate` | everything else | `Evicted · state unknown · 23m` |
+
+The third state exists because the fleet is mixed. Through protocol 15 a
+validator omits a claimed-but-quiet slot entirely, so its silence distinguishes
+nothing; from protocol 16 (ditto-subnet#274, accepted by #499) it announces the
+slot from the moment it is claimed. Absence is therefore evidence on 16 and only
+silence on 15, and no branch guesses: the fix for a false `Idle` must not
+introduce a false "still running" in the other direction.
+
+A slot the platform has since re-leased drops out (its row already shows real
+work). An `indeterminate` orphan stops being reported once its original deadline
+plus a short grace has passed — the validator's own run timeout has fired by
+then. A `still_running` orphan is never dropped on a timer: that is a stuck
+container, and hiding it is the bug.
+
 ### Reversing an eviction
 
 `POST .../reinstate` (confirmation `REINSTATE TO VALIDATOR QUEUE`) puts an

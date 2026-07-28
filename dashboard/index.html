@@ -7714,6 +7714,12 @@
           if (benchmark && benchmark.slot_id) seen[benchmark.slot_id] = true;
         });
       });
+      // An evicted slot has no lease and no confirmed capacity entry, so it
+      // reaches none of the lists above. Omitting it here is what let a host
+      // still executing a benchmark render as a full row of idle slots.
+      (entry.orphaned_slots || []).forEach(function (orphan) {
+        if (orphan && orphan.slot_id) seen[orphan.slot_id] = true;
+      });
       return Object.keys(seen).sort(function (a, b) {
         return slotOrdinal(a) - slotOrdinal(b);
       });
@@ -7722,6 +7728,38 @@
     function slotOrdinal(slotId) {
       var parsed = parseInt(String(slotId).replace(/^slot-/, ""), 10);
       return isNaN(parsed) ? Number.MAX_SAFE_INTEGER : parsed;
+    }
+
+    // A slot whose lease an operator evicted while the validator's benchmark
+    // container may still be executing. The platform releases its half of the
+    // lease at once; the container runs to completion and has its late score
+    // refused with a 409, so for that window the host is doing a full
+    // benchmark's worth of work that can never produce a score. This slot is
+    // NOT free, and the two states below are deliberately never collapsed:
+    // "still running" is the validator's own signed claim, "state unknown" is
+    // the honest answer for a heartbeat protocol below 16, which omits a
+    // claimed-but-quiet slot entirely and so cannot tell an exited container
+    // apart from one between progress reports.
+    function orphanedSlotLabel(orphan) {
+      var age = relDuration(orphan.orphaned_for_seconds);
+      var agent = (orphan.agent_name || "Agent") + " · " + String(orphan.agent_id || "").slice(0, 8);
+      var selfTerminates = orphan.original_deadline
+        ? " Expected to self-terminate by its original deadline (" + relTimeUntil(orphan.original_deadline) + ")."
+        : "";
+      var detail = orphan.state === "still_running"
+        ? "The validator still reports this slot occupied by " + agent + ", " + age +
+          " after the platform evicted the lease. The run cannot produce a score — its result will be refused with a 409." +
+          selfTerminates + " This slot is not free."
+        : "The lease was evicted " + age + " ago and the platform cannot tell whether the container is still running. " +
+          "Heartbeat protocol " + String(orphan.protocol_version || "unknown") +
+          " omits a claimed-but-quiet slot, so silence here is not evidence the slot is free (" + orphan.reason + ")." +
+          selfTerminates + " Do not count this slot as headroom.";
+      var label = orphan.state === "still_running"
+        ? "Evicted · still running · " + age
+        : "Evicted · state unknown · " + age;
+      return '<span class="stage warn" title="' + esc(detail) + '">' + esc(label) + '</span>' +
+        '<span class="current-agent" title="' + esc(String(orphan.agent_id || "")) + '">' +
+        entityAnchor("agent", orphan.agent_id, agent) + '</span>';
     }
 
     // True when any slot is reporting a stage, not just the lowest one. Keying
@@ -7918,6 +7956,25 @@
       report += vstat("Slots", esc(
         String((entry.healthy_slots || []).length) + " healthy of " +
         String(entry.configured_slots || 1) + " · " + String(entry.admission || "accepting")));
+      // Above the running slots deliberately: an operator opening this modal is
+      // usually asking "does this host have room", and the answer is no while
+      // any of these are listed.
+      (entry.orphaned_slots || []).slice().sort(function (a, b) {
+        return slotOrdinal(a.slot_id) - slotOrdinal(b.slot_id);
+      }).forEach(function (orphan) {
+        report += vstat(
+          (orphan.slot_id || "slot-0") + " · evicted lease",
+          orphanedSlotLabel(orphan) +
+            '<span class="assignment-detail"><b>Lease released</b> ' + isoTimeHtml(orphan.evicted_at) +
+            // The deadline is usually still ahead, and relTime floors a future
+            // instant to "0s ago" — which reads as "already over" for the one
+            // number that says when this stops burning CPU.
+            (orphan.original_deadline
+              ? ' · <b>Self-terminates by</b> <span class="fleet-time" title="' + esc(orphan.original_deadline) + '">' + esc(relTimeUntil(orphan.original_deadline)) + '</span>'
+              : "") +
+            ' · bench v' + esc(String(orphan.bench_version)) + '</span>'
+        );
+      });
       var activeSlots = entry.active_benchmarks || [];
       if (activeSlots.length) {
         // One row per running job. The modal used to show only the lowest slot,
@@ -8217,16 +8274,27 @@
           (entry.assigned_benchmarks || []).forEach(function (benchmark) {
             assignedBySlot[benchmark.slot_id || "slot-0"] = benchmark;
           });
+          var orphanBySlot = {};
+          (entry.orphaned_slots || []).forEach(function (orphan) {
+            if (orphan && orphan.slot_id) orphanBySlot[orphan.slot_id] = orphan;
+          });
           var healthySlots = entry.healthy_slots || [];
           var slotRows = validatorSlotIds(entry).map(function (slotId) {
             var benchmark = activeBySlot[slotId] || assignedBySlot[slotId];
+            var orphan = orphanBySlot[slotId];
+            // Order matters: real leased work outranks an orphan record, and an
+            // orphan outranks every free-slot reading below it. "Idle" and
+            // "Unavailable" are the two claims the eviction window makes false,
+            // so nothing may reach them while an orphan is on the slot.
             var slotState = benchmark
               ? renderBenchmarkProgress(benchmark, true)
-              : (entry.admission !== "accepting"
+              : (orphan
+                ? orphanedSlotLabel(orphan)
+                : (entry.admission !== "accepting"
                 ? '<span class="stage warn">' + esc(entry.admission) + '</span>'
                 : (healthySlots.indexOf(slotId) >= 0
                   ? '<span class="stage success">Idle</span>'
-                  : '<span class="stage warn">Unavailable</span>'));
+                  : '<span class="stage warn">Unavailable</span>')));
             return '<div class="fleet-slot" title="' + esc(slotId) + '"><span class="fleet-protocol">' + esc(slotId) + '</span> ' + slotState + '</div>';
           });
           slotWork = slotRows.join("");

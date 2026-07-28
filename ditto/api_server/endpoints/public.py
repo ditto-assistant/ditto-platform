@@ -93,6 +93,7 @@ from ditto.api_models import (
     PublicLeaderboardResponse,
     PublicMetricDoc,
     PublicOperationsResponse,
+    PublicOrphanedSlot,
     PublicProvisionalScore,
     PublicRunModels,
     PublicScreenerHeartbeat,
@@ -238,6 +239,7 @@ from ditto.db.queries.heartbeats import (
     live_validator_fleet_supports_protocol,
 )
 from ditto.db.queries.king_reign import KingReveal, get_king_reveal
+from ditto.db.queries.orphaned_leases import OrphanedLease, list_orphaned_leases
 from ditto.db.queries.queue_order import (
     QueueGate,
     QueuePreviewEntry,
@@ -2602,15 +2604,61 @@ async def health(
     )
 
 
+def _leased_slots(
+    assignments: list[ActiveValidatorAssignment],
+) -> set[tuple[str, str]]:
+    """``(validator_hotkey, slot_id)`` pairs holding a live lease right now."""
+    return {
+        (assignment.ticket.validator_hotkey, assignment.ticket.slot_id)
+        for assignment in assignments
+    }
+
+
+def _public_orphaned_slot(orphan: OrphanedLease) -> PublicOrphanedSlot:
+    """One evicted-but-possibly-still-executing slot, as the fleet view sees it."""
+    return PublicOrphanedSlot(
+        slot_id=orphan.slot_id,
+        agent_id=orphan.agent_id,
+        agent_name=orphan.agent_name,
+        bench_version=orphan.bench_version,
+        # ``released`` is filtered out before this is reached: a released slot is
+        # genuinely free and must keep rendering as idle.
+        state=cast(Literal["still_running", "indeterminate"], orphan.state),
+        reason=orphan.reason,
+        evicted_at=orphan.evicted_at,
+        orphaned_for_seconds=orphan.orphaned_for_seconds,
+        original_deadline=orphan.original_deadline,
+        protocol_version=orphan.protocol_version,
+    )
+
+
 def _validator_heartbeats_response(
     *,
     rows: list[Any],
     assignments: list[ActiveValidatorAssignment],
     active_work: list[ActiveValidatorWork],
+    orphaned_leases: list[OrphanedLease],
     now: datetime,
     active_bench_version: int,
 ) -> PublicValidatorHeartbeatsResponse:
-    """Reconcile platform leases and signed heartbeat claims without conflating them."""
+    """Reconcile platform leases and signed heartbeat claims without conflating them.
+
+    ``orphaned_leases`` is the third input, and it is not derivable from the
+    other two: a lease an operator evicted is gone from ``assignments`` by
+    construction, and its slot is filtered out of the stored capacity that backs
+    ``active_work`` for the same reason -- yet the validator may still be running
+    the container. Without it every such slot reconciles cleanly to "idle", which
+    is exactly the false headroom this argument exists to stop reporting.
+    Required rather than defaulted so no future call site can silently reproduce
+    it.
+    """
+    orphans_by_hotkey: dict[str, list[PublicOrphanedSlot]] = {}
+    for orphan in orphaned_leases:
+        if orphan.state == "released":
+            continue
+        orphans_by_hotkey.setdefault(orphan.validator_hotkey, []).append(
+            _public_orphaned_slot(orphan)
+        )
     assignments_by_hotkey: dict[str, list[ActiveValidatorAssignment]] = {}
     for assignment_row in assignments:
         assignments_by_hotkey.setdefault(
@@ -2768,6 +2816,7 @@ def _validator_heartbeats_response(
                 admission=(capacity.admission if capacity else "accepting"),
                 active_benchmarks=active_benchmarks,
                 assigned_benchmarks=assigned_benchmarks,
+                orphaned_slots=orphans_by_hotkey.get(row.validator_hotkey, []),
                 first_seen_at=_aware(row.first_seen_at),
                 reported_at=cast(datetime, _aware(row.reported_at)),
                 seen_at=seen_at,
@@ -2835,11 +2884,15 @@ async def validators(
     """Signed reports reconciled with the platform's current assignment truth."""
     response.headers["Cache-Control"] = _CACHE_CONTROL
     now = datetime.now(UTC)
+    assignments = await list_active_validator_assignments(session, now=now)
     return _validator_heartbeats_response(
         rows=await list_validator_heartbeats(session),
-        assignments=await list_active_validator_assignments(session, now=now),
+        assignments=assignments,
         active_work=await list_active_validator_work(
             session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
+        ),
+        orphaned_leases=await list_orphaned_leases(
+            session, now=now, live_slots=_leased_slots(assignments)
         ),
         now=now,
         active_bench_version=await active_bench_version(session),
@@ -3691,6 +3744,9 @@ async def operations(
         rows=heartbeat_rows,
         assignments=assignments,
         active_work=active_work,
+        orphaned_leases=await list_orphaned_leases(
+            session, now=now, live_slots=_leased_slots(assignments)
+        ),
         now=now,
         active_bench_version=active_version,
     )
