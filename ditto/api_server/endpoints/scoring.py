@@ -35,7 +35,7 @@ from ditto.api_models import ConfirmationScoreRecord, LedgerEntry, LedgerRespons
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_models.validator import LedgerScoreProof
 from ditto.api_server.continual_retest_settings import aggregate_is_active
-from ditto.api_server.crn import champion_anchored_seeds
+from ditto.api_server.crn import fold_seed_bound
 from ditto.api_server.efficiency import effective_composite
 from ditto.api_server.endpoints.validator import (
     ChainDep,
@@ -45,7 +45,6 @@ from ditto.api_server.endpoints.validator import (
     _verify_signature,
 )
 from ditto.api_server.koth import (
-    TOP5_MAX_CONFIRMATION_SEEDS,
     KothEntry,
     emission_set,
     project_koth,
@@ -380,10 +379,13 @@ async def scores(
         },
         mode=continual_settings.wave_membership,
         anchored_seeds=(
-            champion_anchored_seeds(
-                raw_member_ids[0],
-                version=canonical_version,
-                max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+            fold_seed_bound(
+                champion_agent_id=raw_member_ids[0],
+                anchor_version=canonical_version,
+                seeds_by_agent={
+                    agent_id: tuple(row.seed for row in agent_history)
+                    for agent_id, agent_history in history.items()
+                },
             )
             if raw_member_ids
             else None

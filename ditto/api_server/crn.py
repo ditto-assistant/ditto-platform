@@ -19,8 +19,10 @@ The int63 masking mirrors dittobench-api's ``gen.FreshSeed`` (``int64(uint64 >>
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from uuid import UUID
+
+from ditto.api_server.koth import TOP5_MAX_CONFIRMATION_SEEDS
 
 # Mask to a non-negative signed-63-bit integer, matching dittobench-api's
 # FreshSeed (``int64(uint64 >> 1)``): JSON-clean and never negative.
@@ -79,3 +81,46 @@ def champion_anchored_seeds(
     return confirmation_seeds(
         [str(champion_agent_id)], version=version, count=max_seeds
     )
+
+
+def fold_seed_bound(
+    *,
+    champion_agent_id: UUID,
+    anchor_version: int,
+    seeds_by_agent: Mapping[UUID, Iterable[int]],
+    max_seeds: int = TOP5_MAX_CONFIRMATION_SEEDS,
+) -> tuple[int, ...]:
+    """The seeds the fold may consider: the live anchor plus everything recorded.
+
+    The fold has to be bounded by the same set issuance leases against, or the
+    lane pays for runs the fold then ignores. ditto-platform#547 widened issuance
+    to ``anchor | universe`` -- catch-up sends every cohort member to any seed a
+    peer holds, including seeds from an earlier reign -- but left the fold on the
+    champion's anchor alone. That is the worst of both: validators converge the
+    cohort onto a seed and the fold refuses to count it.
+
+    It also silently narrowed what already worked. The anchor is keyed on the
+    champion's agent id, so it describes ONE reign of at most ``max_seeds``
+    seeds. Scoping the fold to it discards every cross-reign seed the cohort
+    genuinely shares: on the 2026-07-28 board the fold fell from ten shared seeds
+    to four while the shallowest member of the raw top five held sixteen. Those
+    six were not noise -- they were datasets every member had been scored on.
+
+    Cross-reign seeds are valid paired evidence. A seed IS a dataset, and two
+    agents holding it were measured on the same one whatever anchored it. The
+    dethrone test has always relied on exactly this, pairing over shared seeds
+    with no anchor filter at all (``koth._paired_statistic``). The anchor's job
+    is to introduce NEW unpredictable seeds, which it still does -- it is the
+    growth frontier, not the window.
+
+    The anchor stays in the bound even though the universe is derived from
+    recorded rows: a freshly crowned champion's seeds are in nobody's history
+    yet, and the first one to land has to be foldable immediately.
+    """
+    universe: set[int] = set()
+    for seeds in seeds_by_agent.values():
+        universe.update(seeds)
+    anchor = champion_anchored_seeds(
+        champion_agent_id, version=anchor_version, max_seeds=max_seeds
+    )
+    return (*anchor, *sorted(universe.difference(anchor)))

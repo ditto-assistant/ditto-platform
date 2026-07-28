@@ -149,7 +149,7 @@ from ditto.api_server.artifact_audit import client_ip, request_detail
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.benchmark_rollout import rolling_qualification_blockers
 from ditto.api_server.continual_retest_settings import aggregate_is_active
-from ditto.api_server.crn import champion_anchored_seeds
+from ditto.api_server.crn import fold_seed_bound
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.efficiency import (
     EfficiencyBoardView,
@@ -177,7 +177,6 @@ from ditto.api_server.koth import (
     KOTH_MARGIN,
     KOTH_RANK_SHARES,
     KOTH_TAIL_SIZE,
-    TOP5_MAX_CONFIRMATION_SEEDS,
     KothEntry,
     effective_composite,
     project_koth,
@@ -1729,10 +1728,12 @@ def _completed_wave_data(
         },
         mode=wave_membership,
         anchored_seeds=(
-            champion_anchored_seeds(
-                raw_projection.champion.agent_id,
-                version=anchor_version,
-                max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+            fold_seed_bound(
+                champion_agent_id=raw_projection.champion.agent_id,
+                anchor_version=anchor_version,
+                seeds_by_agent={
+                    agent_id: values.keys() for agent_id, values in by_seed.items()
+                },
             )
             if raw_projection is not None and anchor_version is not None
             else None
