@@ -439,11 +439,100 @@ def _provider_preferences(
     return preferences
 
 
-_ALLOWED_REQUEST_FIELDS = {
+# How this gate treats an unexpected request field, and why it changed
+# ---------------------------------------------------------------------
+#
+# This used to be one flat allowlist, and anything outside it was a 400 raised
+# *before* ``begin_inference_request``. That combination was quietly expensive:
+# no ``inference_requests`` row is written on that path, so the rejections were
+# invisible in telemetry, and the error body did not name the offending key. A
+# rank-15 miner (``Cooking``) burned three submissions adding a single line that
+# sent ``reasoning: {"effort": "medium"}`` -- the very value this platform was
+# already stamping on their request for them (``benchmark_reasoning`` below) --
+# and had no way to discover which field killed the run.
+#
+# The philosophy is now the broker's: normalise rather than refuse, wherever
+# refusing buys no safety. ``dittobench-api`` already overwrites the caller's
+# ``model`` instead of refusing a request that names one, and pins its own
+# embedding model and nonce. The same reasoning applies field by field here, so
+# the allowlist is split into three sets by what the field can actually do:
+#
+# ``_PINNED_REQUEST_FIELDS``   accepted, then *overwritten* with the value the
+#                              ticket grants, in ``_locked_upstream_payload``.
+#                              The caller's value never reaches the provider, so
+#                              asking for more than the ticket granted is inert
+#                              rather than fatal.
+# ``_DROPPED_REQUEST_FIELDS``  accepted, then removed before the provider call.
+#                              These have no bearing on the answer the harness
+#                              gets, and each one is dropped for a stated reason
+#                              (cost lever, egress channel, determinism, or dead
+#                              weight against a contract we already refuse).
+# ``_FORWARDED_REQUEST_FIELDS`` validated and passed through unchanged.
+#
+# Anything still outside all three is refused -- and refused *by name*. Unknown
+# stays fail-closed on purpose: OpenRouter's request surface is additive, and a
+# field invented after this code was written is exactly the one that might buy
+# compute. The fix for the incident above is not "accept everything", it is
+# "accept everything harmless, and say which key was not".
+
+# Route identity or a compute lever. Accepted and then replaced wholesale with
+# the ticket's own value; see ``_locked_upstream_payload``.
+_PINNED_REQUEST_FIELDS = {
+    # Substituted by ``_locked_grant_model``: the grant pins the model.
     "model",
-    "messages",
+    # Clamped down to the ticket ceiling by ``_output_token_limit``.
     "max_tokens",
     "max_completion_tokens",
+    # Forced to 1. Extra completions are extra billed generations.
+    "n",
+    # Nested reasoning control. Replaced with ``benchmark_reasoning(model)``, so
+    # ``{"effort": "high"}`` is served as the pinned ``medium``.
+    "reasoning",
+}
+
+# Accepted, then stripped before the request leaves this process.
+_DROPPED_REQUEST_FIELDS = {
+    # Buys N server-side generations and bills for all of them. Dropping is
+    # strictly cheaper than the ticket already allows.
+    "best_of",
+    # The *flat* sibling of ``reasoning`` -- a different key, and a harness may
+    # plausibly send either. Dropped rather than pinned: the pinned effort
+    # already arrives via ``reasoning``, and forwarding both leaves provider-side
+    # precedence between them undefined.
+    "reasoning_effort",
+    # Selects a provider priority/cost tier. A compute lever the ticket did not
+    # grant.
+    "service_tier",
+    # Free-form caller-controlled strings shipped verbatim to a third party.
+    # The harness runs sandboxed with no egress; forwarding these would hand it
+    # one. Neither affects the completion.
+    "user",
+    "metadata",
+    # Asks the provider to retain the completion, contradicting the
+    # ``data_collection: "deny"`` / ``zdr: true`` preferences this proxy pins.
+    "store",
+    # Only meaningful alongside ``stream: true``, which this lane refuses.
+    "stream_options",
+    # Constrained/grammar decoding materially changes the output distribution
+    # and its latency profile, so two agents differing only in this field are no
+    # longer comparable runs. Dropped for benchmark comparability, not safety.
+    "response_format",
+    # Do not change sampling, but inflate the response body hard (``top_logprobs``
+    # carries up to 20 alternatives per token) against ``response_body_bytes``,
+    # and ``_public_provider_response`` strips them, so the caller could never
+    # read them back regardless.
+    "logprobs",
+    "top_logprobs",
+    # Unbounded in size, and keyed by *tokenizer-specific* token ids. Because the
+    # served model is the ticket's rather than the one the caller named, a bias
+    # map built against another tokenizer silently biases unrelated tokens.
+    # Dropped for correctness and comparability.
+    "logit_bias",
+}
+
+# Validated and passed through untouched.
+_FORWARDED_REQUEST_FIELDS = {
+    "messages",
     "temperature",
     "top_p",
     "seed",
@@ -451,24 +540,45 @@ _ALLOWED_REQUEST_FIELDS = {
     "tools",
     "tool_choice",
     "parallel_tool_calls",
-    "n",
-    "best_of",
+    # Same class as ``temperature``/``top_p``/``seed``, which this lane has
+    # always forwarded: per-request sampling knobs that cost nothing extra and
+    # that the miner's own agent design is entitled to choose. Silently dropping
+    # a deliberately-set sampling knob would change an agent's behaviour behind
+    # its back -- the exact failure mode this change exists to remove.
+    "frequency_penalty",
+    "presence_penalty",
+    # Refused when true (see below), but must parse as a known field so the
+    # refusal can explain itself.
     "stream",
 }
+
+_ALLOWED_REQUEST_FIELDS = (
+    _PINNED_REQUEST_FIELDS | _DROPPED_REQUEST_FIELDS | _FORWARDED_REQUEST_FIELDS
+)
 
 
 def _validate_request_schema(payload: dict[str, Any]) -> None:
     """Accept only the text/tool subset used by the benchmark harness."""
     unknown = set(payload) - _ALLOWED_REQUEST_FIELDS
     if unknown:
-        raise HTTPException(status_code=400, detail="unsupported inference parameter")
-    for name in ("temperature", "top_p"):
+        # Name the keys. A harness author reading this over stderr has no other
+        # way to learn which of their fields was the problem, and the broker now
+        # forwards this detail verbatim (dittobench-api ``forwardChatCompletion``).
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported inference parameter: {', '.join(sorted(unknown))}",
+        )
+    for name in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
         value = payload.get(name)
         if value is not None and (
             not isinstance(value, (int, float))
             or isinstance(value, bool)
             or not math.isfinite(value)
         ):
+            raise HTTPException(status_code=400, detail=f"invalid {name}")
+    for name in ("frequency_penalty", "presence_penalty"):
+        penalty = payload.get(name)
+        if penalty is not None and not -2 <= penalty <= 2:
             raise HTTPException(status_code=400, detail=f"invalid {name}")
     temperature = payload.get("temperature")
     if temperature is not None and not 0 <= temperature <= 2:
@@ -493,16 +603,31 @@ def _validate_request_schema(payload: dict[str, Any]) -> None:
         )
     ):
         raise HTTPException(status_code=400, detail="invalid stop")
-    for name in ("parallel_tool_calls", "stream"):
+    for name in ("parallel_tool_calls", "stream", "store"):
         if name in payload and not isinstance(payload[name], bool):
             raise HTTPException(status_code=400, detail=f"invalid {name}")
-    n = payload.get("n", 1)
-    if not isinstance(n, int) or isinstance(n, bool) or n != 1:
+    # One of the few genuine refusals left. ``stream`` is not normalised to
+    # false because this lane answers with a single non-streaming JSON body: a
+    # caller that asked for SSE and silently received one would fail parsing it,
+    # which is a worse and far less legible outcome than being told.
+    if payload.get("stream") not in {None, False}:
         raise HTTPException(
-            status_code=400, detail="multiple completions are not supported"
+            status_code=400,
+            detail=(
+                "unsupported inference parameter: stream "
+                "(this lane answers with a single non-streaming response)"
+            ),
         )
-    if "best_of" in payload:
-        raise HTTPException(status_code=400, detail="best_of is not supported")
+    # ``n`` and ``best_of`` are pinned/dropped in ``_locked_upstream_payload``
+    # rather than refused: the provider is asked for exactly one completion no
+    # matter what arrives here, so an over-ask cannot buy a second generation.
+    # A malformed value is still a malformed request and is still named.
+    for name in ("n", "best_of"):
+        value = payload.get(name)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ):
+            raise HTTPException(status_code=400, detail=f"invalid {name}")
     tool_choice = payload.get("tool_choice")
     if tool_choice is not None:
         valid_named_choice = (
@@ -586,31 +711,39 @@ def _validate_request_schema(payload: dict[str, Any]) -> None:
 
 
 def _output_token_limit(payload: dict[str, Any], maximum: int) -> int:
-    """Normalize OpenAI's aliases without allowing one to bypass the other."""
+    """Normalize OpenAI's aliases without allowing one to bypass the other.
+
+    Both an over-ask and a disagreement between the two aliases are resolved
+    *downward* rather than refused. Asking for more output than the ticket
+    grants is the single most likely way for an ordinary OpenAI-compatible
+    harness to trip this gate, and killing the run over it buys nothing: the
+    clamp already guarantees the ticket's ceiling holds, which is the only
+    property that was ever at stake. A caller cannot obtain more output by
+    asking for more, by asking twice, or by disagreeing with itself.
+    """
     max_tokens_value = payload.get("max_tokens")
     max_completion_tokens = payload.get("max_completion_tokens")
-    if (
-        max_tokens_value is not None
-        and max_completion_tokens is not None
-        and max_tokens_value != max_completion_tokens
+    for name, candidate in (
+        ("max_tokens", max_tokens_value),
+        ("max_completion_tokens", max_completion_tokens),
     ):
-        raise HTTPException(status_code=400, detail="conflicting output token limits")
-    value = (
-        max_tokens_value
-        if max_tokens_value is not None
-        else max_completion_tokens
-        if max_completion_tokens is not None
-        else maximum
-    )
-    if (
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or not 1 <= value <= maximum
-    ):
-        raise HTTPException(
-            status_code=400, detail="max_tokens exceeds the ticket limit"
-        )
-    return value
+        if candidate is not None and (
+            not isinstance(candidate, int) or isinstance(candidate, bool)
+        ):
+            raise HTTPException(status_code=400, detail=f"invalid {name}")
+        # A non-positive ceiling is a malformed request rather than an over-ask,
+        # and there is no conservative direction to normalise it in: clamping it
+        # up would hand the caller output it did not ask for.
+        if candidate is not None and candidate < 1:
+            raise HTTPException(status_code=400, detail=f"invalid {name}")
+    requested = [
+        value
+        for value in (max_tokens_value, max_completion_tokens)
+        if value is not None
+    ]
+    # Aliases that disagree resolve to the smaller, so neither can raise the
+    # other. Absent both, the ticket ceiling is the default it always was.
+    return min(*requested, maximum) if requested else maximum
 
 
 def _locked_grant_model(grant: Any, *, requested: str, config: Any) -> str:
@@ -648,14 +781,30 @@ def _locked_grant_model(grant: Any, *, requested: str, config: Any) -> str:
 def _locked_upstream_payload(
     payload: dict[str, Any], *, model: str, max_tokens: int
 ) -> dict[str, Any]:
-    """Force consensus model/reasoning fields before provider routing."""
+    """Force consensus model/reasoning fields before provider routing.
+
+    This is the half of the schema policy that makes permissiveness safe. Every
+    field the gate now *accepts* rather than refuses is either replaced here
+    with the ticket's own value or removed here before the request leaves the
+    process, so accepting it cannot buy the caller compute, a model, or a
+    reasoning effort its ticket did not grant.
+    """
     upstream = dict(payload)
+    # Accepted at the door purely so the caller is not killed for sending them;
+    # none of them reaches the provider. See ``_DROPPED_REQUEST_FIELDS``.
+    for field in _DROPPED_REQUEST_FIELDS:
+        upstream.pop(field, None)
+    # Collapsed into the single clamped ``max_tokens`` computed by
+    # ``_output_token_limit``; forwarding both would re-open the alias bypass.
     upstream.pop("max_completion_tokens", None)
-    upstream.pop("best_of", None)
     upstream["model"] = model
     upstream["max_tokens"] = max_tokens
     upstream["n"] = 1
     upstream["stream"] = False
+    # Unconditional assignment, not a default: the caller's value is discarded
+    # whatever its shape, so ``{"effort": "high"}`` and a malformed reasoning
+    # object are both served as the pinned contract. On a bench version with no
+    # reasoning contract the field is removed outright rather than passed on.
     reasoning = benchmark_reasoning(model)
     if reasoning is None:
         upstream.pop("reasoning", None)
@@ -897,8 +1046,13 @@ async def proxy_chat_completions(
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail="invalid JSON request") from error
-    if not isinstance(payload, dict) or payload.get("stream") not in {None, False}:
-        raise HTTPException(status_code=400, detail="streaming is not supported")
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400, detail="inference request must be a JSON object"
+        )
+    # Every field-level decision, including the streaming refusal, lives in one
+    # function now. It used to be split across here and the schema check, which
+    # is how the two most common refusals ended up with two different wordings.
     _validate_request_schema(payload)
     requested_model = payload.get("model")
     if not isinstance(requested_model, str):

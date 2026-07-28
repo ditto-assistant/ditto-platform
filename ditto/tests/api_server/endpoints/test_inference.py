@@ -11,6 +11,10 @@ from fastapi import HTTPException
 
 from ditto.api_models.inference import InferenceExchangeRequest, InferenceGrantOffer
 from ditto.api_server.endpoints.inference import (
+    _ALLOWED_REQUEST_FIELDS,
+    _DROPPED_REQUEST_FIELDS,
+    _FORWARDED_REQUEST_FIELDS,
+    _PINNED_REQUEST_FIELDS,
     _bounded_provider_cost,
     _estimated_tokens,
     _exchange_message,
@@ -212,11 +216,31 @@ def test_embedding_contract_is_exact_and_response_is_sanitized() -> None:
 
 
 def test_output_token_alias_cannot_bypass_ticket_limit() -> None:
-    with pytest.raises(HTTPException):
+    # Disagreeing aliases resolve downward, so neither can raise the other.
+    assert (
         _output_token_limit({"max_tokens": 1, "max_completion_tokens": 999_999}, 8192)
-    with pytest.raises(HTTPException):
-        _output_token_limit({"max_completion_tokens": 8193}, 8192)
+        == 1
+    )
+    assert (
+        _output_token_limit({"max_tokens": 999_999, "max_completion_tokens": 1}, 8192)
+        == 1
+    )
+    # An over-ask is clamped to the ticket ceiling instead of killing the run.
+    assert _output_token_limit({"max_completion_tokens": 8193}, 8192) == 8192
+    assert _output_token_limit({"max_tokens": 10**9}, 8192) == 8192
     assert _output_token_limit({"max_completion_tokens": 32}, 8192) == 32
+    assert _output_token_limit({}, 8192) == 8192
+    # A non-positive or non-integer ceiling has no conservative normalisation
+    # and stays a named refusal.
+    for key, bad in (
+        ("max_tokens", {"max_tokens": 0}),
+        ("max_tokens", {"max_tokens": -1}),
+        ("max_completion_tokens", {"max_completion_tokens": True}),
+        ("max_completion_tokens", {"max_completion_tokens": "many"}),
+    ):
+        with pytest.raises(HTTPException) as invalid:
+            _output_token_limit(bad, 8192)
+        assert str(invalid.value.detail) == f"invalid {key}"
 
 
 @pytest.mark.parametrize(
@@ -225,7 +249,8 @@ def test_output_token_alias_cannot_bypass_ticket_limit() -> None:
         {"models": ["attacker/model"]},
         {"plugins": [{"id": "web"}]},
         {"provider": {"allow_fallbacks": True}},
-        {"reasoning": {"effort": "high"}},
+        {"transforms": ["middle-out"]},
+        {"route": "fallback"},
         {
             "messages": [
                 {
@@ -319,8 +344,11 @@ def test_proxy_schema_rejects_non_text_content_parts(content: object) -> None:
         {"parallel_tool_calls": 1},
         {"stream": "false"},
         {"n": True},
-        {"n": 2},
-        {"best_of": 1},
+        {"n": 0},
+        {"best_of": 0},
+        {"frequency_penalty": 2.5},
+        {"presence_penalty": float("inf")},
+        {"store": "yes"},
         {"tool_choice": {"type": "function", "function": {"name": ""}}},
         {"tool_choice": {"type": "function", "function": {"name": "x", "x": 1}}},
     ],
@@ -389,6 +417,156 @@ def test_v7_upstream_profile_pins_medium_reasoning_without_changing_v6() -> None
 
     v6 = _locked_upstream_payload(payload, model="qwen/qwen3-32b", max_tokens=256)
     assert "reasoning" not in v6
+
+
+def test_caller_reasoning_is_accepted_then_overwritten_with_the_pinned_effort() -> None:
+    """The rejection that cost `Cooking` three submissions is now a normalisation.
+
+    The platform already stamps `{"effort": "medium", "exclude": True}` on every
+    v7 request (`benchmark_reasoning`), so the miner was 400'd for redundantly
+    requesting exactly what it was being given. Accepting the field is safe for
+    the same reason it was pointless to refuse it: the value is replaced.
+    """
+    for effort in ({"effort": "high"}, {"effort": "low"}, {"max_tokens": 100_000}, {}):
+        payload = {
+            "model": "openai/gpt-oss-20b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning": effort,
+        }
+        _validate_request_schema(payload)
+        upstream = _locked_upstream_payload(
+            payload, model="openai/gpt-oss-20b", max_tokens=256
+        )
+        assert upstream["reasoning"] == {"effort": "medium", "exclude": True}
+
+    # `reasoning_effort` is the *flat* OpenAI sibling and a different key. It is
+    # accepted so no harness dies on it, and dropped so it cannot compete with
+    # the pinned nested value at the provider.
+    flat = {
+        "model": "openai/gpt-oss-20b",
+        "messages": [{"role": "user", "content": "hello"}],
+        "reasoning_effort": "high",
+    }
+    _validate_request_schema(flat)
+    upstream = _locked_upstream_payload(
+        flat, model="openai/gpt-oss-20b", max_tokens=256
+    )
+    assert "reasoning_effort" not in upstream
+    assert upstream["reasoning"] == {"effort": "medium", "exclude": True}
+
+
+def test_harmless_client_defaults_are_accepted_and_never_reach_the_provider() -> None:
+    """Fields mainstream OpenAI clients emit by default cost nobody a run.
+
+    Each is accepted at the door and stripped before the upstream call, so the
+    harness is not killed for sending it and the provider never sees it.
+    """
+    payload: dict[str, object] = {
+        "model": "openai/gpt-oss-20b",
+        "messages": [{"role": "user", "content": "hello"}],
+        "user": "agent-7",
+        "metadata": {"run": "abc"},
+        "store": False,
+        "stream_options": {"include_usage": True},
+        "response_format": {"type": "json_object"},
+        "logprobs": True,
+        "top_logprobs": 5,
+        "logit_bias": {"1234": -100},
+        "service_tier": "priority",
+        "best_of": 4,
+        "n": 3,
+    }
+    _validate_request_schema(payload)
+    upstream = _locked_upstream_payload(
+        payload, model="openai/gpt-oss-20b", max_tokens=256
+    )
+    for dropped in (
+        "user",
+        "metadata",
+        "store",
+        "stream_options",
+        "response_format",
+        "logprobs",
+        "top_logprobs",
+        "logit_bias",
+        "service_tier",
+        "best_of",
+    ):
+        assert dropped not in upstream, dropped
+    # `n` is pinned rather than dropped: exactly one billed generation.
+    assert upstream["n"] == 1
+
+
+def test_sampling_knobs_the_miner_owns_are_forwarded_unchanged() -> None:
+    """Same class as temperature/top_p/seed, which this lane always forwarded.
+
+    Dropping a deliberately-set sampling knob would silently change an agent's
+    behaviour behind its back -- the exact failure mode this change removes.
+    """
+    payload = {
+        "model": "openai/gpt-oss-20b",
+        "messages": [{"role": "user", "content": "hello"}],
+        "frequency_penalty": 0.5,
+        "presence_penalty": -0.25,
+        "temperature": 0.0,
+        "seed": 42,
+    }
+    _validate_request_schema(payload)
+    upstream = _locked_upstream_payload(
+        payload, model="openai/gpt-oss-20b", max_tokens=256
+    )
+    assert upstream["frequency_penalty"] == 0.5
+    assert upstream["presence_penalty"] == -0.25
+    assert upstream["temperature"] == 0.0
+    assert upstream["seed"] == 42
+
+
+def test_unsupported_parameter_error_names_every_offending_key() -> None:
+    """A miner must be able to discover which field broke the run."""
+    with pytest.raises(HTTPException) as refused:
+        _validate_request_schema(
+            {
+                "model": "openai/gpt-oss-20b",
+                "messages": [{"role": "user", "content": "hello"}],
+                "plugins": [{"id": "web"}],
+                "models": ["attacker/model"],
+            }
+        )
+    assert refused.value.status_code == 400
+    detail = str(refused.value.detail)
+    assert "unsupported inference parameter" in detail
+    # Sorted, so the message is stable across dict ordering.
+    assert "models, plugins" in detail
+
+    with pytest.raises(HTTPException) as streaming:
+        _validate_request_schema(
+            {
+                "model": "openai/gpt-oss-20b",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            }
+        )
+    assert "stream" in str(streaming.value.detail)
+
+
+def test_every_accepted_field_is_pinned_dropped_or_deliberately_forwarded() -> None:
+    """The anti-cheat property, stated as a partition over the allowlist.
+
+    Nothing may be accepted without a decided fate. A field that is neither
+    pinned nor dropped is forwarded to the provider verbatim, so this partition
+    is what makes "accept it" reviewable one field at a time.
+    """
+    assert (
+        _PINNED_REQUEST_FIELDS | _DROPPED_REQUEST_FIELDS | _FORWARDED_REQUEST_FIELDS
+        == _ALLOWED_REQUEST_FIELDS
+    )
+    assert not _PINNED_REQUEST_FIELDS & _DROPPED_REQUEST_FIELDS
+    assert not _PINNED_REQUEST_FIELDS & _FORWARDED_REQUEST_FIELDS
+    assert not _DROPPED_REQUEST_FIELDS & _FORWARDED_REQUEST_FIELDS
+    # Nothing that selects a model, a route, or server-side network egress may
+    # be accepted at any tier.
+    for escape in ("models", "provider", "plugins", "transforms", "route"):
+        assert escape not in _ALLOWED_REQUEST_FIELDS
 
 
 def test_caller_shape_rejections_do_not_cool_shared_provider_route() -> None:
