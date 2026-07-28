@@ -192,7 +192,7 @@ class TestDashboard:
             "function isRegistered(e) { return !!e && e.registered === true; }" in body
         )
         assert "e.emission_eligible === true" in body
-        assert ">registration unknown</span>" in body
+        assert ">unconfirmed</span>" in body
         assert 'class="quorum-badge"' in body
         assert ">Best-scoring agent</span>" in body
         assert 'class="miner-uid" title="Current SN118 UID">UID ' in body

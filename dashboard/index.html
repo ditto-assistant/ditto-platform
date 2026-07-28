@@ -5035,10 +5035,10 @@
         var registrationBadge = registered
           ? ""
           : e.registered === false
-          ? '<span class="prov" title="This hotkey is not currently registered on SN118. Its score is retained, but it is excluded from active weights and emissions until the same hotkey registers again.">registration inactive</span>'
+          ? '<span class="prov tip-chip" data-tooltip="This hotkey is not currently registered on SN118. Its score is retained, but it is excluded from active weights and emissions until the same hotkey registers again.">not registered</span>'
           : chainRegistrationUnknown
           ? ""
-          : '<span class="prov" title="Current SN118 registration could not be confirmed. The score is retained, but active weight and emission eligibility are unknown.">registration unknown</span>';
+          : '<span class="prov tip-chip" data-tooltip="Current SN118 registration could not be confirmed. The score is retained, but active weight and emission eligibility are unknown.">unconfirmed</span>';
         return '' +
           '<tr data-i="' + i + '"' + (isChamp ? ' class="champion"' : '') +
             ' tabindex="0" aria-label="' + esc(rowLabel) + '">' +
