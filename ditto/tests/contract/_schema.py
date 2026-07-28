@@ -31,6 +31,18 @@ SHARED_MODELS = [
     "ValidatorHeartbeatResponse",
     "LedgerEntry",
     "LedgerResponse",
+    # The ticket hand-back. ditto-subnet added these to *its* copy of this list
+    # when `failure_detail` landed (#282); this side never did, so the golden
+    # ditto-subnet checks itself against was generated from ditto-subnet's own
+    # models rather than from the platform -- a golden with no authority behind
+    # it, which is the one thing this file exists to prevent. `failure_detail`
+    # is precisely the field that needs it: its shape (optional, defaulted,
+    # length-bounded) *is* the backward-compatibility guarantee, and the length
+    # bound is a number the two repos must agree on exactly. Widening it 200 ->
+    # 4096 on one side only is now a failing contract test instead of a silent
+    # 422 in production against a mixed-version fleet.
+    "FailJobRequest",
+    "FailJobResponse",
 ]
 
 # Cosmetic JSON-Schema keys that carry prose/illustration, not structure.

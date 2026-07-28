@@ -274,10 +274,33 @@ ditto-subnet#279 read twelve `infrastructure` verdicts off these rows and still
 could not name which of the validator's five sandbox codes fired, because the
 wire had nowhere to put it and the code survived only in a log line on the
 validator host. `failure_detail` carries it. It is validator-supplied,
-advisory (unsigned, drives no policy), bounded to 200 characters, optional —
+advisory (unsigned, drives no policy), bounded to 4096 characters, optional —
 a validator predating the field simply sends nothing — and written and cleared
 with `failure_reason`, so the pair is read as one report. It appears on every
 admin ticket projection, which is where a triage session already looks.
+
+That bound was 200 for one day. It was enough for a failure *code* and nothing
+else, and the first time the field carried a real diagnostic message it cut it
+mid-word — losing the clause that named what the platform had done to the
+harness's inference requests, while leaving behind a half-sentence that read as
+a complete finding. 4096 is ~16x the longest message observed and still a
+ceiling: this row is written by a validator, on a hot table, from strings a
+miner's harness can influence, so "unbounded" would be a storage and
+log-volume liability with an adversarial input path into it. Overflow past the
+cap is truncated by the *sender*, never rejected here — a 422 would lose the
+whole hand-back and leave the lease to expire silently, trading the diagnosis
+for the ambiguity the field exists to remove — and the sender now appends an
+explicit `...[truncated, N chars]` marker so an amputated message is
+recognizable as one.
+
+Mixed fleet versions are safe in both directions. Widening a `max_length` only
+ever admits more, so every validator still on the 200-char truncation (0.34.1
+through 0.37.3 at time of writing) validates unchanged. In the other direction —
+a widened validator against a platform not yet carrying this change — the
+validator retries a 422'd hand-back once with the detail re-truncated to the
+legacy 200, so the report still lands and only the tail of the message is lost.
+Deploy order is therefore not load-bearing, though platform-first keeps the
+full message.
 
 ## Retirement: when the benchmark generation closed instead
 
