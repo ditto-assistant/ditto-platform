@@ -35,6 +35,12 @@ _CONTRACTS = {
     # 20B and rotates the generated surface. Capability advertisement remains
     # separately gated on reviewed provider-specific starter-kit baselines.
     7: BenchmarkContract(7, 9, True),
+    # v8 is the urgent difficulty bump on the existing v7 infrastructure. It
+    # keeps the policy-9 screener floor and verified archive requirement. The
+    # deeper-history redesign is reserved for v9 rather than rushed into this
+    # contract. Shipping this entry exposes an operator target; it does not
+    # open or activate a rollout.
+    8: BenchmarkContract(8, 9, True),
 }
 
 
